@@ -664,6 +664,10 @@ static int mpegts_set_stream_info(AVStream *st, PESContext *pes,
 
 static void new_pes_packet(PESContext *pes, AVPacket *pkt)
 {
+    if(pkt->data) {
+      av_log(pes->stream, AV_LOG_ERROR, "ignoring previously allocated packet on stream %d\n", pkt->stream_index);
+      av_free_packet(pkt);
+    }
     av_init_packet(pkt);
 
     pkt->destruct = av_destruct_packet;
@@ -2117,6 +2121,8 @@ static int mpegts_read_packet(AVFormatContext *s,
     int ret, i;
 
     ts->pkt = pkt;
+    ts->pkt->data = NULL;
+
     ret = handle_packets(ts, 0);
     if (ret < 0) {
         /* flush pes data left */
