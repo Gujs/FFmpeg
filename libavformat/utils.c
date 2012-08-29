@@ -1910,11 +1910,13 @@ int av_seek_frame(AVFormatContext *s, int stream_index, int64_t timestamp, int f
         ff_read_frame_flush(s);
         ret = s->iformat->read_seek(s, stream_index, timestamp, flags);
     } else
-        ret = -1;
+        ret = AVERROR(ENOSYS);
     )
     if (ret >= 0) {
         return 0;
     }
+    if (ret != AVERROR(ENOSYS))
+        return ret;
 
     if (s->iformat->read_timestamp && !(s->iformat->flags & AVFMT_NOBINSEARCH)) {
         ff_read_frame_flush(s);

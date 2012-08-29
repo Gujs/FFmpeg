@@ -1280,7 +1280,7 @@ static int asf_read_seek(AVFormatContext *s, int stream_index, int64_t pts, int 
     AVStream *st = s->streams[stream_index];
 
     if (s->packet_size <= 0)
-        return AVERROR(ENOSYS);
+        return -1;
 
     /* Try using the protocol's read_seek if available */
     if(s->pb) {

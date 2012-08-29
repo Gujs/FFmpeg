@@ -2048,7 +2048,7 @@ static int matroska_read_seek(AVFormatContext *s, int stream_index,
     }
 
     if (!st->nb_index_entries)
-        return 0;
+        return -1;
     timestamp = FFMAX(timestamp, st->index_entries[0].timestamp);
 
     if ((index = av_index_search_timestamp(st, timestamp, flags)) < 0) {
