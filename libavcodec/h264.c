@@ -2372,6 +2372,7 @@ static void flush_dpb(AVCodecContext *avctx){
             h->delayed_pic[i]->f.reference = 0;
         h->delayed_pic[i]= NULL;
     }
+	h->got_first_iframe = 0;
     h->outputed_poc=h->next_outputed_poc= INT_MIN;
     h->prev_interlaced_frame = 1;
     idr(h);
@@ -2819,6 +2820,7 @@ static int decode_slice_header(H264Context *h, H264Context *h0){
         }
         s->first_field = 0;
         h->prev_interlaced_frame = 1;
+        h->got_first_iframe = 0;
 
         init_scan_tables(h);
         if (ff_h264_alloc_tables(h) < 0) {
