@@ -238,6 +238,7 @@ Advanced options (experts only):
   --arch=ARCH              select architecture [$arch]
   --cpu=CPU                select the minimum required CPU (affects
                            instruction selection, may crash on older CPUs)
+  --custom-libname-with-major=NAME  custom library name with major [$SLIBNAME_WITH_MAJOR]
   --disable-asm            disable all assembler optimizations
   --disable-altivec        disable AltiVec optimizations
   --disable-amd3dnow       disable 3DNow! optimizations
@@ -1298,6 +1299,7 @@ CMDLINE_SET="
     cpu
     cross_prefix
     cxx
+    custom_libname_with_major
     dep_cc
     extra_version
     host_cc
@@ -2777,6 +2779,8 @@ build the shared libraries as well. To only build the shared libraries specify
 EOF
     exit 1;
 fi
+
+test -n "$custom_libname_with_major" && SLIBNAME_WITH_MAJOR="$custom_libname_with_major"
 
 die_license_disabled() {
     enabled $1 || { enabled $2 && die "$2 is $1 and --enable-$1 is not specified."; }
