@@ -443,6 +443,9 @@ static int get_dvb_stream_type(AVFormatContext *s, AVStream *st)
             stream_type = STREAM_TYPE_PRIVATE_DATA;
         }
         break;
+    case AV_CODEC_ID_SCTE_35:
+        stream_type = STREAM_TYPE_SCTE_DATA_SCTE_35;
+        break;
     default:
         av_log_once(s, AV_LOG_WARNING, AV_LOG_DEBUG, &ts_st->data_st_warning,
                     "Stream %d, codec %s, is muxed as a private data stream "
@@ -528,6 +531,15 @@ static int mpegts_write_pmt(AVFormatContext *s, MpegTSService *service)
         put16(&q, 0x0fff);  // CA_System_ID
         *q++ = 0xfc;        // private_data_byte
         *q++ = 0xfc;        // private_data_byte
+    }
+
+    /* Add CUEI registration descriptor if any stream is SCTE-35 */
+    for (i = 0; i < s->nb_streams; i++) {
+        AVStream *st = s->streams[i];
+        if (st->codecpar->codec_id == AV_CODEC_ID_SCTE_35) {
+            put_registration_descriptor(&q, MKTAG('C', 'U', 'E', 'I'));
+            break;
+        }
     }
 
     val = 0xf000 | (q - program_info_length_ptr - 2);
@@ -827,6 +839,8 @@ static int mpegts_write_pmt(AVFormatContext *s, MpegTSService *service)
                 putbuf(&q, tag, strlen(tag));
                 *q++ = 0;            /* metadata service ID */
                 *q++ = 0xF;          /* metadata_locator_record_flag|MPEG_carriage_flags|reserved */
+            } else if (codec_id == AV_CODEC_ID_SCTE_35) {
+                put_registration_descriptor(&q, MKTAG('C', 'U', 'E', 'I'));
             }
             break;
         }
