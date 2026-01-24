@@ -268,6 +268,51 @@ typedef struct MpegTSWriteStream {
     DVBAC3Descriptor *dvb_ac3_desc;
 } MpegTSWriteStream;
 
+/* Write raw SCTE-35 section data (already includes CRC) as TS packets.
+ * Unlike mpegts_write_section, this does NOT recalculate CRC since the
+ * splice_info_section data from the demuxer already has valid CRC. */
+static void mpegts_write_scte35_section(AVFormatContext *s, AVStream *st,
+                                        const uint8_t *buf, int len)
+{
+    MpegTSWriteStream *ts_st = st->priv_data;
+    MpegTSWrite *ts = s->priv_data;
+    uint8_t packet[TS_PACKET_SIZE];
+    const uint8_t *buf_ptr = buf;
+    uint8_t *q;
+    int first = 1;
+    int len1, left;
+
+    while (len > 0) {
+        q = packet;
+        *q++ = SYNC_BYTE;
+        *q++ = (ts_st->pid >> 8) | (first ? 0x40 : 0x00);
+        *q++ = ts_st->pid;
+        ts_st->cc = (ts_st->cc + 1) & 0xf;
+        *q++ = 0x10 | ts_st->cc;
+
+        if (first)
+            *q++ = 0; /* pointer_field: section starts immediately */
+
+        len1 = TS_PACKET_SIZE - (q - packet);
+        if (len1 > len)
+            len1 = len;
+        memcpy(q, buf_ptr, len1);
+        q += len1;
+
+        /* Pad with stuffing bytes */
+        left = TS_PACKET_SIZE - (q - packet);
+        if (left > 0)
+            memset(q, STUFFING_BYTE, left);
+
+        avio_write(s->pb, packet, TS_PACKET_SIZE);
+        ts->total_size += TS_PACKET_SIZE;
+
+        buf_ptr += len1;
+        len -= len1;
+        first = 0;
+    }
+}
+
 static void mpegts_write_pat(AVFormatContext *s)
 {
     MpegTSWrite *ts = s->priv_data;
@@ -1880,6 +1925,14 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
                                         &side_data_size);
     if (side_data)
         stream_id = side_data[0];
+
+    /* SCTE-35 must be written as section data, not PES.
+     * The splice_info_section data from the demuxer already has valid CRC. */
+    if (st->codecpar->codec_id == AV_CODEC_ID_SCTE_35) {
+        if (size > 0)
+            mpegts_write_scte35_section(s, st, buf, size);
+        return 0;
+    }
 
     if (!ts->first_dts_checked && dts != AV_NOPTS_VALUE) {
         ts->first_pcr += dts * SYSTEM_CLOCK_FREQUENCY_DIVISOR;
