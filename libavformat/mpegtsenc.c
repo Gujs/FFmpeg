@@ -342,28 +342,29 @@ static int64_t scte35_get_splice_time(const uint8_t *buf, int len, int *splice_t
 /* Adjust SCTE-35 splice_time to compensate for timestamp rebasing.
  * When transcoding with -avoid_negative_ts or +genpts, output timestamps are rebased
  * but the splice_time inside SCTE-35 messages is not adjusted.
- * This function detects the mismatch and rewrites splice_time directly.
+ * This function applies the same timestamp offset to splice_time.
  *
- * Approach: Rewrite splice_time to be on the output timeline, keeping pts_adjustment
- * unchanged. This is more compatible with decoders that may not handle 33-bit
- * wraparound correctly in pts_adjustment.
+ * Approach: Apply the mux_ts_offset (same offset used for packet timestamps) to
+ * splice_time. This preserves the original preroll timing exactly - if the source
+ * had splice_time 8 seconds ahead of the packet, the output will also have
+ * splice_time 8 seconds ahead of the (rebased) packet.
  *
  * Parameters:
+ *   s: format context for logging
+ *   st: the SCTE-35 stream (to access mux_ts_offset)
  *   buf: SCTE-35 section data (will be modified in place)
  *   len: length of section data
  *   pkt_pts: the packet PTS in 90kHz (already rebased by FFmpeg)
  *
  * Returns 0 on success, negative on error.
  */
-static int scte35_adjust_pts(AVFormatContext *s, uint8_t *buf, int len, int64_t pkt_pts)
+static int scte35_adjust_pts(AVFormatContext *s, AVStream *st, uint8_t *buf, int len, int64_t pkt_pts)
 {
+    FFStream *sti = ffstream(st);
     int64_t splice_time, new_splice_time;
-    int64_t delta;
+    int64_t ts_offset;
     int splice_time_offset;
     uint32_t crc;
-
-    if (pkt_pts == AV_NOPTS_VALUE)
-        return 0; /* No adjustment possible without packet PTS */
 
     if (len < 17) /* Minimum section with splice_time and CRC */
         return 0;
@@ -373,34 +374,47 @@ static int scte35_adjust_pts(AVFormatContext *s, uint8_t *buf, int len, int64_t 
     if (splice_time == AV_NOPTS_VALUE || splice_time_offset < 0)
         return 0; /* No splice_time to adjust */
 
-    /* Calculate the delta between splice_time and packet PTS.
-     * Normally splice_time is a few seconds ahead of the announcement packet.
-     * If delta is very large (> 60 seconds), timestamp rebasing likely occurred. */
-    delta = splice_time - pkt_pts;
+    /* Get the timestamp offset that was applied to packet timestamps.
+     * This is the same offset FFmpeg uses when rebasing with -avoid_negative_ts
+     * or +genpts. By applying it to splice_time, we preserve the original
+     * timing relationship between the SCTE-35 announcement and the splice point. */
+    ts_offset = sti->mux_ts_offset;
 
-    /* Allow up to 60 seconds of normal preroll - beyond that assume rebasing */
-    if (delta >= 0 && delta < 60 * 90000)
-        return 0; /* Normal case, no adjustment needed */
+    /* If no rebasing occurred (offset is 0), check if splice_time is reasonable
+     * relative to packet PTS. Allow up to 60 seconds of normal preroll. */
+    if (ts_offset == 0) {
+        if (pkt_pts != AV_NOPTS_VALUE) {
+            int64_t delta = splice_time - pkt_pts;
+            if (delta >= 0 && delta < 60 * 90000)
+                return 0; /* Normal case, no adjustment needed */
+        } else {
+            return 0; /* No offset and no PTS to validate against */
+        }
+    }
 
-    /* Calculate new splice_time on the output timeline.
-     * The splice_time should point to when the actual splice (discontinuity)
-     * occurs. SCTE-35 packets typically arrive 5-8 seconds before the splice
-     * point (preroll time for ad insertion systems to prepare).
-     *
-     * We use 6 seconds as a typical preroll value. This matches common
-     * broadcast practice and ensures ad insertion systems have time to
-     * prepare the replacement content. */
-    new_splice_time = pkt_pts + 6 * 90000; /* 6 seconds after packet */
+    /* Apply the same timestamp offset to splice_time.
+     * This preserves the original preroll timing exactly. */
+    new_splice_time = splice_time + ts_offset;
 
     /* Ensure new_splice_time is valid (positive and fits in 33 bits) */
     if (new_splice_time < 0)
         new_splice_time = 0;
     new_splice_time &= 0x1FFFFFFFFULL;
 
-    av_log(s, AV_LOG_INFO, "SCTE-35: Rewriting splice_time from %"PRId64" (%.3fs) to %"PRId64
-           " (%.3fs) to match output timeline\n",
-           splice_time, splice_time / 90000.0,
-           new_splice_time, new_splice_time / 90000.0);
+    /* Log the adjustment with the preroll time for debugging */
+    if (pkt_pts != AV_NOPTS_VALUE) {
+        int64_t preroll = new_splice_time - pkt_pts;
+        av_log(s, AV_LOG_INFO, "SCTE-35: Rewriting splice_time from %"PRId64" (%.3fs) to %"PRId64
+               " (%.3fs), preroll %.3fs\n",
+               splice_time, splice_time / 90000.0,
+               new_splice_time, new_splice_time / 90000.0,
+               preroll / 90000.0);
+    } else {
+        av_log(s, AV_LOG_INFO, "SCTE-35: Rewriting splice_time from %"PRId64" (%.3fs) to %"PRId64
+               " (%.3fs)\n",
+               splice_time, splice_time / 90000.0,
+               new_splice_time, new_splice_time / 90000.0);
+    }
 
     /* Write new splice_time back (33 bits at splice_time_offset) */
     buf[splice_time_offset] = (buf[splice_time_offset] & 0xFE) | ((new_splice_time >> 32) & 0x01);
@@ -435,10 +449,10 @@ static void mpegts_write_scte35_section(AVFormatContext *s, AVStream *st,
     int first = 1;
     int len1, left;
 
-    /* Make a copy of the section data if we might need to modify it */
-    if (pkt_pts != AV_NOPTS_VALUE && len <= sizeof(section_buf)) {
+    /* Make a copy of the section data so we can modify splice_time if needed */
+    if (len <= sizeof(section_buf)) {
         memcpy(section_buf, buf, len);
-        scte35_adjust_pts(s, section_buf, len, pkt_pts);
+        scte35_adjust_pts(s, st, section_buf, len, pkt_pts);
         write_buf = section_buf;
     } else {
         write_buf = buf;
