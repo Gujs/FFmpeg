@@ -340,25 +340,25 @@ static int64_t scte35_get_splice_time(const uint8_t *buf, int len, int *splice_t
 }
 
 /* Adjust SCTE-35 splice_time to compensate for timestamp rebasing.
- * When transcoding with -avoid_negative_ts or +genpts, output timestamps are rebased
- * but the splice_time inside SCTE-35 messages is not adjusted.
- * This function applies the same timestamp offset to splice_time.
  *
- * Approach: Apply the mux_ts_offset (same offset used for packet timestamps) to
- * splice_time. This preserves the original preroll timing exactly - if the source
- * had splice_time 8 seconds ahead of the packet, the output will also have
- * splice_time 8 seconds ahead of the (rebased) packet.
+ * When transcoding with -avoid_negative_ts or +genpts, output timestamps are rebased
+ * but the splice_time inside SCTE-35 messages is not adjusted. This function detects
+ * timeline mismatches and adjusts splice_time accordingly.
+ *
+ * Approach: Compare splice_time to packet PTS. If the difference (preroll) is within
+ * a reasonable range (0-60 seconds), the timelines match and no adjustment is needed.
+ * If preroll is outside this range, there's a timeline mismatch (e.g., input started
+ * at 12 hours, output rebased to 0), and we set splice_time to pkt_pts + 8 seconds.
  *
  * Parameters:
  *   s: format context for logging
- *   st: the SCTE-35 stream (to access mux_ts_offset)
  *   buf: SCTE-35 section data (will be modified in place)
  *   len: length of section data
  *   pkt_pts: the packet PTS in 90kHz (already rebased by FFmpeg)
  *
  * Returns 0 on success, negative on error.
  */
-static int scte35_adjust_pts(AVFormatContext *s, AVStream *st, uint8_t *buf, int len, int64_t pkt_pts)
+static int scte35_adjust_pts(AVFormatContext *s, uint8_t *buf, int len, int64_t pkt_pts)
 {
     int64_t splice_time, new_splice_time, preroll;
     int splice_time_offset;
@@ -368,6 +368,8 @@ static int scte35_adjust_pts(AVFormatContext *s, AVStream *st, uint8_t *buf, int
     const int64_t MAX_PREROLL = 60 * 90000;
     /* Default preroll when we can't determine the original (8 seconds is common) */
     const int64_t DEFAULT_PREROLL = 8 * 90000;
+    /* 33-bit PTS max value */
+    const int64_t PTS_33BIT_MAX = 0x1FFFFFFFFLL;
 
     if (len < 17) /* Minimum section with splice_time and CRC */
         return 0;
@@ -380,15 +382,25 @@ static int scte35_adjust_pts(AVFormatContext *s, AVStream *st, uint8_t *buf, int
     if (splice_time == AV_NOPTS_VALUE || splice_time_offset < 0)
         return 0; /* No splice_time to adjust */
 
+    /* Verify we can safely write back to the buffer */
+    if (splice_time_offset + 5 > len)
+        return -1;
+
     /* Calculate observed preroll (may be huge if timelines don't match) */
     preroll = splice_time - pkt_pts;
 
-    /* Handle 33-bit PTS wraparound: if preroll is negative, add 2^33 */
-    if (preroll < 0)
-        preroll += 0x1FFFFFFFFLL + 1;
+    /* Handle 33-bit PTS wraparound and negative preroll:
+     * - Small negative preroll (-60s to 0): valid "return from ad" scenario
+     * - Large negative preroll (< -60s): likely 33-bit wraparound, add 2^33
+     * - Positive preroll (0 to 60s): normal case
+     * - Large positive preroll (> 60s): timeline mismatch */
+    if (preroll < -MAX_PREROLL) {
+        /* Large negative value - likely 33-bit wraparound */
+        preroll += PTS_33BIT_MAX + 1;
+    }
 
-    /* Check if preroll is reasonable (0 to 60 seconds) */
-    if (preroll >= 0 && preroll <= MAX_PREROLL) {
+    /* Check if preroll is reasonable (-60 to +60 seconds) */
+    if (preroll >= -MAX_PREROLL && preroll <= MAX_PREROLL) {
         /* Timeline matches, no adjustment needed */
         return 0;
     }
@@ -448,11 +460,12 @@ static void mpegts_write_scte35_section(AVFormatContext *s, AVStream *st,
     int len1, left;
 
     /* Make a copy of the section data so we can modify splice_time if needed */
-    if (len <= sizeof(section_buf)) {
+    if (len <= (int)sizeof(section_buf)) {
         memcpy(section_buf, buf, len);
-        scte35_adjust_pts(s, st, section_buf, len, pkt_pts);
+        scte35_adjust_pts(s, section_buf, len, pkt_pts);
         write_buf = section_buf;
     } else {
+        av_log(s, AV_LOG_WARNING, "SCTE-35: Section too large (%d bytes) for timing adjustment\n", len);
         write_buf = buf;
     }
 
