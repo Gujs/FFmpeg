@@ -198,6 +198,10 @@ typedef struct SchMuxStream {
     // an EOF was generated while flushing the pre-mux queue
     int                 init_eof;
 
+    // sparse streams (data, subtitle) have infrequent packets and
+    // should not block timing calculations
+    int                 sparse;
+
     ////////////////////////////////////////////////////////////
     // The following are protected by Scheduler.schedule_lock //
 
@@ -447,6 +451,10 @@ static int64_t trailing_dts(const Scheduler *sch, int count_finished)
 
             if (ms->source_finished && !count_finished)
                 continue;
+            // sparse streams (data, subtitle) have irregular timing and
+            // should never contribute to trailing_dts calculation
+            if (ms->sparse)
+                continue;
             if (ms->last_dts == AV_NOPTS_VALUE)
                 return AV_NOPTS_VALUE;
 
@@ -687,6 +695,21 @@ int sch_add_mux_stream(Scheduler *sch, unsigned mux_idx)
     ms->last_dts = AV_NOPTS_VALUE;
 
     return stream_idx;
+}
+
+void sch_mux_stream_set_sparse(Scheduler *sch, unsigned mux_idx,
+                               unsigned stream_idx, int sparse)
+{
+    SchMux *mux;
+    SchMuxStream *ms;
+
+    av_assert0(mux_idx < sch->nb_mux);
+    mux = &sch->mux[mux_idx];
+
+    av_assert0(stream_idx < mux->nb_streams);
+    ms = &mux->streams[stream_idx];
+
+    ms->sparse = sparse;
 }
 
 static const AVClass sch_demux_class = {
