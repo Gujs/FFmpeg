@@ -82,6 +82,10 @@ typedef struct DemuxStream {
     /// dts of the last packet read for this stream (in AV_TIME_BASE units)
     int64_t                  dts;
 
+    /// per-stream discontinuity handling
+    int64_t                  ts_offset_discont;  ///< per-stream timestamp offset
+    int                      discontinuity_detected; ///< flag set when discontinuity just detected
+
     const AVCodecDescriptor *codec_desc;
 
     AVDictionary            *decoder_opts;
@@ -246,6 +250,9 @@ static void ts_discontinuity_detect(Demuxer *d, InputStream *ist,
             if (FFABS(delta) > 1LL * dts_delta_threshold * AV_TIME_BASE ||
                 pkt_dts + AV_TIME_BASE/10 < ds->dts) {
                 d->ts_offset_discont -= delta;
+                ds->ts_offset_discont -= delta;
+                ds->discontinuity_detected = 1;
+                pkt->flags |= AV_PKT_FLAG_DISCONTINUITY;
                 av_log(ist, AV_LOG_WARNING,
                        "timestamp discontinuity "
                        "(stream id=%d): %"PRId64", new offset= %"PRId64"\n",
@@ -277,6 +284,9 @@ static void ts_discontinuity_detect(Demuxer *d, InputStream *ist,
         int64_t delta = pkt_dts - d->last_ts;
         if (FFABS(delta) > 1LL * dts_delta_threshold * AV_TIME_BASE) {
             d->ts_offset_discont -= delta;
+            ds->ts_offset_discont -= delta;
+            ds->discontinuity_detected = 1;
+            pkt->flags |= AV_PKT_FLAG_DISCONTINUITY;
             av_log(ist, AV_LOG_DEBUG,
                    "Inter stream timestamp discontinuity %"PRId64", new offset= %"PRId64"\n",
                    delta, d->ts_offset_discont);

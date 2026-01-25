@@ -709,6 +709,14 @@ static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
     if (pkt && pkt->size == 0)
         return 0;
 
+    // Flush decoder on timestamp discontinuity to clear stale reference frames
+    if (pkt && (pkt->flags & AV_PKT_FLAG_DISCONTINUITY)) {
+        av_log(dp, AV_LOG_INFO,
+               "Flushing %s decoder due to timestamp discontinuity\n",
+               type_desc);
+        avcodec_flush_buffers(dec);
+    }
+
     if (pkt && (dp->flags & DECODER_FLAG_TS_UNRELIABLE)) {
         pkt->pts = AV_NOPTS_VALUE;
         pkt->dts = AV_NOPTS_VALUE;
