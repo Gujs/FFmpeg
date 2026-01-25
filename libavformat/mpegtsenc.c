@@ -268,19 +268,173 @@ typedef struct MpegTSWriteStream {
     DVBAC3Descriptor *dvb_ac3_desc;
 } MpegTSWriteStream;
 
-/* Write raw SCTE-35 section data (already includes CRC) as TS packets.
- * Unlike mpegts_write_section, this does NOT recalculate CRC since the
- * splice_info_section data from the demuxer already has valid CRC. */
+/* Parse SCTE-35 splice_info_section to extract splice_time for the first
+ * splice_insert command with time_specified_flag set.
+ * Returns the splice_time in 90kHz ticks, or AV_NOPTS_VALUE if not found. */
+static int64_t scte35_get_splice_time(const uint8_t *buf, int len)
+{
+    int section_length, splice_command_type;
+    int offset;
+
+    if (len < 15 || buf[0] != 0xFC) /* table_id must be 0xFC */
+        return AV_NOPTS_VALUE;
+
+    section_length = ((buf[1] & 0x0F) << 8) | buf[2];
+    if (section_length + 3 > len)
+        return AV_NOPTS_VALUE;
+
+    /* Skip to splice_command_type (offset 13) */
+    splice_command_type = buf[13];
+
+    if (splice_command_type != 0x05) /* Only handle splice_insert */
+        return AV_NOPTS_VALUE;
+
+    /* Parse splice_insert - starts at offset 14 */
+    offset = 14;
+    if (offset + 5 > len)
+        return AV_NOPTS_VALUE;
+
+    /* Skip splice_event_id (4 bytes) */
+    offset += 4;
+
+    /* splice_event_cancel_indicator */
+    if (buf[offset] & 0x80)
+        return AV_NOPTS_VALUE; /* Cancelled, no splice_time */
+
+    offset++;
+    if (offset >= len)
+        return AV_NOPTS_VALUE;
+
+    /* Check flags: out_of_network(1), program_splice_flag(1), duration_flag(1), splice_immediate_flag(1) */
+    int program_splice_flag = (buf[offset] >> 6) & 1;
+    int splice_immediate_flag = (buf[offset] >> 4) & 1;
+
+    if (!program_splice_flag || splice_immediate_flag)
+        return AV_NOPTS_VALUE; /* No splice_time in these cases */
+
+    offset++;
+    if (offset >= len)
+        return AV_NOPTS_VALUE;
+
+    /* splice_time() - check time_specified_flag */
+    if (!(buf[offset] & 0x80))
+        return AV_NOPTS_VALUE; /* time_specified_flag = 0 */
+
+    /* Extract 33-bit pts_time */
+    if (offset + 5 > len)
+        return AV_NOPTS_VALUE;
+
+    int64_t pts_time = ((int64_t)(buf[offset] & 0x01) << 32) |
+                       ((int64_t)buf[offset + 1] << 24) |
+                       ((int64_t)buf[offset + 2] << 16) |
+                       ((int64_t)buf[offset + 3] << 8) |
+                       buf[offset + 4];
+
+    return pts_time;
+}
+
+/* Adjust SCTE-35 pts_adjustment field to compensate for timestamp rebasing.
+ * When transcoding with -avoid_negative_ts, output timestamps are rebased
+ * but the splice_time inside SCTE-35 messages is not adjusted.
+ * This function detects the mismatch and updates pts_adjustment accordingly.
+ *
+ * Parameters:
+ *   buf: SCTE-35 section data (will be modified in place)
+ *   len: length of section data
+ *   pkt_pts: the packet PTS in 90kHz (already rebased by FFmpeg)
+ *
+ * Returns 0 on success, negative on error.
+ */
+static int scte35_adjust_pts(AVFormatContext *s, uint8_t *buf, int len, int64_t pkt_pts)
+{
+    int64_t splice_time;
+    int64_t delta;
+    uint64_t old_pts_adj, new_pts_adj;
+    uint32_t crc;
+
+    if (pkt_pts == AV_NOPTS_VALUE)
+        return 0; /* No adjustment possible without packet PTS */
+
+    if (len < 17) /* Minimum section with pts_adjustment and CRC */
+        return 0;
+
+    /* Get splice_time from the section */
+    splice_time = scte35_get_splice_time(buf, len);
+    if (splice_time == AV_NOPTS_VALUE)
+        return 0; /* No splice_time to compare against */
+
+    /* Calculate the delta between splice_time and packet PTS.
+     * Normally splice_time is a few seconds ahead of the announcement packet.
+     * If delta is very large (> 60 seconds), timestamp rebasing likely occurred. */
+    delta = splice_time - pkt_pts;
+
+    /* Allow up to 60 seconds of normal preroll - beyond that assume rebasing */
+    if (delta >= 0 && delta < 60 * 90000)
+        return 0; /* Normal case, no adjustment needed */
+
+    av_log(s, AV_LOG_DEBUG, "SCTE-35: splice_time=%"PRId64" pkt_pts=%"PRId64" delta=%"PRId64
+           " - adjusting pts_adjustment\n", splice_time, pkt_pts, delta);
+
+    /* Extract current pts_adjustment (33-bit value at bytes 4-8) */
+    old_pts_adj = ((uint64_t)(buf[4] & 0x01) << 32) |
+                  ((uint64_t)buf[5] << 24) |
+                  ((uint64_t)buf[6] << 16) |
+                  ((uint64_t)buf[7] << 8) |
+                  buf[8];
+
+    /* Calculate new pts_adjustment to compensate for the rebasing.
+     * The goal is: splice_time + new_pts_adjustment = target_time
+     * where target_time should be relative to the output timeline.
+     *
+     * We want the splice to occur at roughly (pkt_pts + small_preroll).
+     * Using 5 seconds as typical preroll. */
+    int64_t target_splice_time = pkt_pts + 5 * 90000; /* 5 seconds after packet */
+    int64_t adjustment_delta = target_splice_time - splice_time;
+
+    /* New pts_adjustment = old_pts_adjustment + adjustment_delta (mod 2^33) */
+    new_pts_adj = (old_pts_adj + adjustment_delta) & 0x1FFFFFFFFULL;
+
+    av_log(s, AV_LOG_INFO, "SCTE-35: Adjusting pts_adjustment from %"PRIu64" to %"PRIu64
+           " (delta=%"PRId64")\n", old_pts_adj, new_pts_adj, adjustment_delta);
+
+    /* Write new pts_adjustment back */
+    buf[4] = (buf[4] & 0xFE) | ((new_pts_adj >> 32) & 0x01);
+    buf[5] = (new_pts_adj >> 24) & 0xFF;
+    buf[6] = (new_pts_adj >> 16) & 0xFF;
+    buf[7] = (new_pts_adj >> 8) & 0xFF;
+    buf[8] = new_pts_adj & 0xFF;
+
+    /* Recalculate CRC32 (last 4 bytes of section) */
+    crc = av_crc(av_crc_get_table(AV_CRC_32_IEEE), 0xFFFFFFFF, buf, len - 4);
+    crc ^= 0xFFFFFFFF; /* MPEG CRC is inverted */
+    AV_WB32(buf + len - 4, crc);
+
+    return 0;
+}
+
+/* Write SCTE-35 section data as TS packets.
+ * If pkt_pts is provided and timestamp rebasing is detected, the pts_adjustment
+ * field is updated to maintain correct splice timing relative to video. */
 static void mpegts_write_scte35_section(AVFormatContext *s, AVStream *st,
-                                        const uint8_t *buf, int len)
+                                        const uint8_t *buf, int len, int64_t pkt_pts)
 {
     MpegTSWriteStream *ts_st = st->priv_data;
     MpegTSWrite *ts = s->priv_data;
     uint8_t packet[TS_PACKET_SIZE];
-    const uint8_t *buf_ptr = buf;
+    uint8_t section_buf[SECTION_LENGTH + 3]; /* Max section size */
+    const uint8_t *write_buf;
     uint8_t *q;
     int first = 1;
     int len1, left;
+
+    /* Make a copy of the section data if we might need to modify it */
+    if (pkt_pts != AV_NOPTS_VALUE && len <= sizeof(section_buf)) {
+        memcpy(section_buf, buf, len);
+        scte35_adjust_pts(s, section_buf, len, pkt_pts);
+        write_buf = section_buf;
+    } else {
+        write_buf = buf;
+    }
 
     while (len > 0) {
         q = packet;
@@ -296,7 +450,7 @@ static void mpegts_write_scte35_section(AVFormatContext *s, AVStream *st,
         len1 = TS_PACKET_SIZE - (q - packet);
         if (len1 > len)
             len1 = len;
-        memcpy(q, buf_ptr, len1);
+        memcpy(q, write_buf, len1);
         q += len1;
 
         /* Pad with stuffing bytes */
@@ -307,7 +461,7 @@ static void mpegts_write_scte35_section(AVFormatContext *s, AVStream *st,
         avio_write(s->pb, packet, TS_PACKET_SIZE);
         ts->total_size += TS_PACKET_SIZE;
 
-        buf_ptr += len1;
+        write_buf += len1;
         len -= len1;
         first = 0;
     }
@@ -1941,10 +2095,11 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
         stream_id = side_data[0];
 
     /* SCTE-35 must be written as section data, not PES.
-     * The splice_info_section data from the demuxer already has valid CRC. */
+     * The splice_info_section data from the demuxer already has valid CRC.
+     * Pass packet PTS to allow adjusting pts_adjustment when timestamps are rebased. */
     if (st->codecpar->codec_id == AV_CODEC_ID_SCTE_35) {
         if (size > 0)
-            mpegts_write_scte35_section(s, st, buf, size);
+            mpegts_write_scte35_section(s, st, buf, size, pts);
         return 0;
     }
 
