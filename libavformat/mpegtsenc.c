@@ -410,10 +410,13 @@ static int scte35_adjust_pts(AVFormatContext *s, uint8_t *buf, int len, int64_t 
     buf[splice_time_offset + 3] = (new_splice_time >> 8) & 0xFF;
     buf[splice_time_offset + 4] = new_splice_time & 0xFF;
 
-    /* Recalculate CRC32 (last 4 bytes of section) */
-    crc = av_crc(av_crc_get_table(AV_CRC_32_IEEE), 0xFFFFFFFF, buf, len - 4);
-    crc ^= 0xFFFFFFFF; /* MPEG CRC is inverted */
-    AV_WB32(buf + len - 4, crc);
+    /* Recalculate CRC32 (last 4 bytes of section)
+     * Use the same CRC calculation as mpegts_write_section1() */
+    crc = av_bswap32(av_crc(av_crc_get_table(AV_CRC_32_IEEE), -1, buf, len - 4));
+    buf[len - 4] = (crc >> 24) & 0xff;
+    buf[len - 3] = (crc >> 16) & 0xff;
+    buf[len - 2] = (crc >>  8) & 0xff;
+    buf[len - 1] = (crc      ) & 0xff;
 
     return 0;
 }
