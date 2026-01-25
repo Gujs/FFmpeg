@@ -384,14 +384,13 @@ static int scte35_adjust_pts(AVFormatContext *s, uint8_t *buf, int len, int64_t 
 
     /* Calculate new splice_time on the output timeline.
      * The splice_time should point to when the actual splice (discontinuity)
-     * occurs. Since the SCTE-35 packet typically arrives just before the splice
-     * point, we use a small preroll (1 second) to position the splice_time
-     * slightly after the packet but close to the actual event.
+     * occurs. SCTE-35 packets typically arrive 5-8 seconds before the splice
+     * point (preroll time for ad insertion systems to prepare).
      *
-     * Note: Original preroll times vary (1-10+ seconds). Using a small fixed
-     * value ensures splice_time is near the actual splice point without
-     * overshooting past the discontinuity. */
-    new_splice_time = pkt_pts + 1 * 90000; /* 1 second after packet */
+     * We use 6 seconds as a typical preroll value. This matches common
+     * broadcast practice and ensures ad insertion systems have time to
+     * prepare the replacement content. */
+    new_splice_time = pkt_pts + 6 * 90000; /* 6 seconds after packet */
 
     /* Ensure new_splice_time is valid (positive and fits in 33 bits) */
     if (new_splice_time < 0)
