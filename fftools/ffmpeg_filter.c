@@ -2067,6 +2067,40 @@ static int configure_filtergraph(FilterGraph *fg, FilterGraphThread *fgt)
     int have_input_eof = 0;
     const char *graph_desc = fg->graph_desc;
 
+    /* Drain output sinks before cleanup to preserve frames that would otherwise
+     * be lost when the old graph is freed. Queue them to frame_queue_out for
+     * delivery after the new graph is configured. */
+    if (fgt->graph && fgt->frame_queue_out) {
+        int drained_count = 0;
+        for (i = 0; i < fg->nb_outputs; i++) {
+            OutputFilterPriv *ofp = ofp_from_ofilter(fg->outputs[i]);
+            if (ofp->ofilter.filter) {
+                AVFrame *drain_frame = av_frame_alloc();
+                if (drain_frame) {
+                    int drain_ret;
+                    while ((drain_ret = av_buffersink_get_frame_flags(
+                            ofp->ofilter.filter, drain_frame,
+                            AV_BUFFERSINK_FLAG_NO_REQUEST)) >= 0) {
+                        if (av_fifo_write(fgt->frame_queue_out, &drain_frame, 1) < 0) {
+                            av_frame_free(&drain_frame);
+                            break;
+                        }
+                        drained_count++;
+                        drain_frame = av_frame_alloc();
+                        if (!drain_frame)
+                            break;
+                    }
+                    av_frame_free(&drain_frame);
+                }
+            }
+        }
+        if (drained_count > 0) {
+            av_log(fg, AV_LOG_VERBOSE,
+                   "[BUFFER] Drained %d frames from output sinks before reconfiguration\n",
+                   drained_count);
+        }
+    }
+
     cleanup_filtergraph(fg, fgt);
     fgt->graph = avfilter_graph_alloc();
     if (!fgt->graph)
@@ -2223,6 +2257,37 @@ static int configure_filtergraph(FilterGraph *fg, FilterGraphThread *fgt)
         ret = avfilter_graph_request_oldest(fgt->graph);
         if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF)
             goto fail;
+    }
+
+    /* Deliver queued output frames that were drained from the old graph.
+     * These frames are already processed, so send them directly to the
+     * encoder via the scheduler (bypassing the new filter graph). */
+    if (fgt->frame_queue_out) {
+        AVFrame *queued_frame;
+        int delivered_count = 0;
+        while (av_fifo_read(fgt->frame_queue_out, &queued_frame, 1) >= 0) {
+            /* Send to first output - for multi-output graphs this may need
+             * to track which output each frame came from */
+            if (fg->nb_outputs > 0) {
+                OutputFilterPriv *ofp = ofp_from_ofilter(fg->outputs[0]);
+                ret = sch_filter_send(fgp->sch, fgp->sch_idx,
+                                      ofp->ofilter.index, queued_frame);
+                if (ret < 0) {
+                    av_frame_unref(queued_frame);
+                    av_log(fg, AV_LOG_WARNING,
+                           "[BUFFER] Failed to deliver queued frame: %s\n",
+                           av_err2str(ret));
+                } else {
+                    delivered_count++;
+                }
+            }
+            av_frame_free(&queued_frame);
+        }
+        if (delivered_count > 0) {
+            av_log(fg, AV_LOG_VERBOSE,
+                   "[BUFFER] Delivered %d queued frames after reconfiguration\n",
+                   delivered_count);
+        }
     }
 
     return 0;
@@ -3164,6 +3229,25 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
         if (ret < 0)
             return ret;
 
+        /* Buffer the triggering frame BEFORE reconfiguration.
+         * This frame has the new format/resolution that triggered need_reinit.
+         * It will be processed after the new graph is configured via the
+         * input queue drain in configure_filtergraph(). */
+        if (frame->buf[0]) {
+            AVFrame *trigger_frame = av_frame_clone(frame);
+            if (trigger_frame) {
+                ret = av_fifo_write(ifp->frame_queue, &trigger_frame, 1);
+                if (ret < 0) {
+                    av_frame_free(&trigger_frame);
+                    av_log(fg, AV_LOG_WARNING,
+                           "[BUFFER] Failed to buffer triggering frame during reconfiguration\n");
+                } else {
+                    av_log(fg, AV_LOG_VERBOSE,
+                           "[BUFFER] Buffered triggering frame for reconfiguration\n");
+                }
+            }
+        }
+
         if (fgt->graph) {
             AVBPrint reason;
             av_bprint_init(&reason, 0, AV_BPRINT_SIZE_AUTOMATIC);
@@ -3204,6 +3288,12 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
             av_log(fg, AV_LOG_ERROR, "Error reinitializing filters!\n");
             return ret;
         }
+
+        /* The triggering frame was already buffered and will be processed
+         * via the input queue drain in configure_filtergraph(). Return early
+         * to avoid processing the same frame twice. */
+        av_frame_unref(frame);
+        return 0;
     }
 
     frame->pts       = av_rescale_q(frame->pts,      frame->time_base, ifp->time_base);
