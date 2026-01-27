@@ -47,6 +47,7 @@
 #include "libavutil/opt.h"
 #include "libavutil/parseutils.h"
 #include "libavutil/stereo3d.h"
+#include "libavutil/thread.h"
 #include "graph/graphprint.h"
 
 HWDevice *filter_hw_device;
@@ -1432,6 +1433,178 @@ static const OptionGroupDef groups[] = {
     [GROUP_DECODER] = { "loopback decoder", "dec", OPT_DECODER },
 };
 
+/**
+ * Thread argument for parallel input opening
+ */
+typedef struct InputOpenThreadArg {
+    const OptionsContext *o;
+    const char *filename;
+    void *io_result;  // IfileOpenIOResult*, opaque pointer
+    int ret;
+} InputOpenThreadArg;
+
+/**
+ * Thread wrapper for ifile_open_io()
+ */
+static void *input_open_thread(void *arg)
+{
+    InputOpenThreadArg *ta = arg;
+    ta->ret = ifile_open_io(ta->o, ta->filename, ta->io_result);
+    return NULL;
+}
+
+/**
+ * Open input files in parallel.
+ * Phase 1: Spawn threads for parallel I/O (avformat_open_input, avformat_find_stream_info)
+ * Phase 2: Finalize sequentially (allocate indices, register with scheduler)
+ */
+static int open_input_files_parallel(OptionGroupList *l, Scheduler *sch)
+{
+    int i, ret = 0;
+    int nb_inputs = l->nb_groups;
+    pthread_t *threads = NULL;
+    InputOpenThreadArg *thread_args = NULL;
+    OptionsContext *opts = NULL;
+    void *io_results = NULL;
+    size_t io_result_size;
+
+    if (nb_inputs == 0)
+        return 0;
+
+    if (nb_inputs == 1) {
+        /* Single input: use sequential path */
+        OptionGroup *g = &l->groups[0];
+        OptionsContext o;
+
+        init_options(&o);
+        o.g = g;
+
+        ret = parse_optgroup(&o, g, options);
+        if (ret < 0) {
+            av_log(NULL, AV_LOG_ERROR, "Error parsing options for input file "
+                   "%s.\n", g->arg);
+            uninit_options(&o);
+            return ret;
+        }
+
+        av_log(NULL, AV_LOG_DEBUG, "Opening an input file: %s.\n", g->arg);
+        ret = ifile_open(&o, g->arg, sch);
+        uninit_options(&o);
+        if (ret < 0) {
+            av_log(NULL, AV_LOG_ERROR, "Error opening input file %s.\n", g->arg);
+            return ret;
+        }
+        av_log(NULL, AV_LOG_DEBUG, "Successfully opened the file.\n");
+        return 0;
+    }
+
+    /* Multiple inputs: use parallel I/O */
+    av_log(NULL, AV_LOG_INFO, "Opening %d input files in parallel...\n", nb_inputs);
+
+    io_result_size = ifile_open_io_result_size();
+
+    threads = av_calloc(nb_inputs, sizeof(*threads));
+    thread_args = av_calloc(nb_inputs, sizeof(*thread_args));
+    opts = av_calloc(nb_inputs, sizeof(*opts));
+    io_results = av_calloc(nb_inputs, io_result_size);
+
+    if (!threads || !thread_args || !opts || !io_results) {
+        ret = AVERROR(ENOMEM);
+        goto cleanup;
+    }
+
+    /* Phase 1: Parse options and spawn I/O threads */
+    for (i = 0; i < nb_inputs; i++) {
+        OptionGroup *g = &l->groups[i];
+
+        init_options(&opts[i]);
+        opts[i].g = g;
+
+        ret = parse_optgroup(&opts[i], g, options);
+        if (ret < 0) {
+            av_log(NULL, AV_LOG_ERROR, "Error parsing options for input file "
+                   "%s.\n", g->arg);
+            /* Clean up already spawned threads */
+            for (int j = 0; j < i; j++) {
+                pthread_join(threads[j], NULL);
+                uninit_options(&opts[j]);
+            }
+            uninit_options(&opts[i]);
+            goto cleanup;
+        }
+
+        thread_args[i].o = &opts[i];
+        thread_args[i].filename = g->arg;
+        thread_args[i].io_result = (char*)io_results + i * io_result_size;
+        thread_args[i].ret = 0;
+
+        av_log(NULL, AV_LOG_DEBUG, "Spawning I/O thread for input %d: %s\n", i, g->arg);
+        ret = pthread_create(&threads[i], NULL, input_open_thread, &thread_args[i]);
+        if (ret) {
+            av_log(NULL, AV_LOG_ERROR, "pthread_create() failed for input %d: %s\n",
+                   i, strerror(ret));
+            ret = AVERROR(ret);
+            /* Clean up already spawned threads */
+            for (int j = 0; j < i; j++) {
+                pthread_join(threads[j], NULL);
+                uninit_options(&opts[j]);
+            }
+            uninit_options(&opts[i]);
+            goto cleanup;
+        }
+    }
+
+    /* Wait for all I/O threads to complete */
+    for (i = 0; i < nb_inputs; i++) {
+        pthread_join(threads[i], NULL);
+        av_log(NULL, AV_LOG_DEBUG, "I/O thread for input %d completed with ret=%d\n",
+               i, thread_args[i].ret);
+    }
+
+    /* Check for I/O errors - if any thread failed, report but continue to try others */
+    for (i = 0; i < nb_inputs; i++) {
+        if (thread_args[i].ret < 0) {
+            av_log(NULL, AV_LOG_ERROR, "Error opening input file %s.\n",
+                   l->groups[i].arg);
+            ret = thread_args[i].ret;
+            /* Clean up all options */
+            for (int j = 0; j < nb_inputs; j++) {
+                uninit_options(&opts[j]);
+            }
+            goto cleanup;
+        }
+    }
+
+    /* Phase 2: Finalize inputs sequentially (this assigns indices) */
+    for (i = 0; i < nb_inputs; i++) {
+        OptionGroup *g = &l->groups[i];
+        void *io_result = (char*)io_results + i * io_result_size;
+
+        av_log(NULL, AV_LOG_DEBUG, "Finalizing input %d: %s\n", i, g->arg);
+        ret = ifile_open_from_io(&opts[i], g->arg, sch, io_result);
+        uninit_options(&opts[i]);
+
+        if (ret < 0) {
+            av_log(NULL, AV_LOG_ERROR, "Error finalizing input file %s.\n", g->arg);
+            /* Clean up remaining options */
+            for (int j = i + 1; j < nb_inputs; j++) {
+                uninit_options(&opts[j]);
+            }
+            goto cleanup;
+        }
+        av_log(NULL, AV_LOG_DEBUG, "Successfully opened input file %d.\n", i);
+    }
+
+    av_log(NULL, AV_LOG_INFO, "All %d input files opened successfully.\n", nb_inputs);
+
+cleanup:
+    av_freep(&threads);
+    av_freep(&thread_args);
+    av_freep(&opts);
+    av_freep(&io_results);
+    return ret;
+}
+
 static int open_files(OptionGroupList *l, const char *inout, Scheduler *sch,
                       int (*open_file)(const OptionsContext*, const char*,
                                        Scheduler*))
@@ -1502,8 +1675,8 @@ int ffmpeg_parse_options(int argc, char **argv, Scheduler *sch)
             goto fail;
     }
 
-    /* open input files */
-    ret = open_files(&octx.groups[GROUP_INFILE], "input", sch, ifile_open);
+    /* open input files - use parallel I/O for multiple inputs */
+    ret = open_input_files_parallel(&octx.groups[GROUP_INFILE], sch);
     if (ret < 0) {
         errmsg = "opening input files";
         goto fail;
