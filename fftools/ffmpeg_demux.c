@@ -119,6 +119,11 @@ typedef struct Demuxer {
 
     int64_t               wallclock_start;
 
+    // Input stall detection (for debugging input vs internal issues)
+    int64_t               last_read_time;      // wallclock time of last successful read
+    int64_t               stall_threshold_us;  // threshold in microseconds (0 = disabled)
+    int                   stall_warning_count; // number of consecutive stall warnings
+
     /**
      * Extra timestamp offset added by discontinuity handling.
      */
@@ -744,6 +749,22 @@ static int input_thread(void *arg)
     d->read_started    = 1;
     d->wallclock_start = av_gettime_relative();
 
+    // Initialize input stall detection from environment variable
+    {
+        const char *stall_env = getenv("FFMPEG_INPUT_STALL_MS");
+        if (stall_env) {
+            int stall_ms = atoi(stall_env);
+            if (stall_ms > 0) {
+                d->stall_threshold_us = stall_ms * 1000LL;
+                av_log(d, AV_LOG_INFO,
+                       "[INPUT-MONITOR] Input stall detection enabled: warning every %dms of no input\n",
+                       stall_ms);
+            }
+        }
+        d->last_read_time = av_gettime_relative();
+        d->stall_warning_count = 0;
+    }
+
     while (1) {
         DemuxStream *ds;
         unsigned send_flags = 0;
@@ -751,6 +772,19 @@ static int input_thread(void *arg)
         ret = av_read_frame(f->ctx, dt.pkt_demux);
 
         if (ret == AVERROR(EAGAIN)) {
+            // Check for input stall if monitoring is enabled
+            if (d->stall_threshold_us > 0) {
+                int64_t now = av_gettime_relative();
+                int64_t stall_duration = now - d->last_read_time;
+                int expected_warnings = (int)(stall_duration / d->stall_threshold_us);
+
+                if (expected_warnings > d->stall_warning_count) {
+                    av_log(d, AV_LOG_WARNING,
+                           "[INPUT-MONITOR] No input data for %.3f seconds\n",
+                           stall_duration / 1000000.0);
+                    d->stall_warning_count = expected_warnings;
+                }
+            }
             av_usleep(10000);
             continue;
         }
@@ -782,6 +816,19 @@ static int input_thread(void *arg)
             }
 
             break;
+        }
+
+        // Successful packet read - reset stall detection
+        if (d->stall_threshold_us > 0) {
+            if (d->stall_warning_count > 0) {
+                int64_t now = av_gettime_relative();
+                int64_t stall_duration = now - d->last_read_time;
+                av_log(d, AV_LOG_INFO,
+                       "[INPUT-MONITOR] Input resumed after %.3f seconds stall\n",
+                       stall_duration / 1000000.0);
+            }
+            d->last_read_time = av_gettime_relative();
+            d->stall_warning_count = 0;
         }
 
         if (do_pkt_dump) {
