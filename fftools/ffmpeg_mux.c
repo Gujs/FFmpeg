@@ -163,6 +163,41 @@ static int mux_fixup_ts(Muxer *mux, MuxStream *ms, AVPacket *pkt)
         av_packet_rescale_ts(pkt, pkt->time_base, ost->st->time_base);
     pkt->time_base = ost->st->time_base;
 
+    /* Gap closing: DISABLED - incompatible with B-frame reordering.
+     * With B-frames, PTS values don't increase monotonically in packet order,
+     * so gap detection based on PTS differences causes timestamp corruption.
+     * This feature needs redesign to track based on DTS or to operate
+     * before the encoder where frames are in presentation order. */
+#if 0
+    if (pkt->pts != AV_NOPTS_VALUE &&
+        (ost->type == AVMEDIA_TYPE_VIDEO || ost->type == AVMEDIA_TYPE_AUDIO)) {
+        if (!ms->gap_offset_initialized) {
+            ms->last_output_pts = pkt->pts;
+            ms->gap_offset = 0;
+            ms->gap_offset_initialized = 1;
+        } else {
+            int64_t gap_threshold = av_rescale_q(AV_TIME_BASE, AV_TIME_BASE_Q, ost->st->time_base);
+            int64_t pts_delta = pkt->pts - ms->last_output_pts;
+
+            if (pts_delta > gap_threshold) {
+                int64_t gap_size = pts_delta - gap_threshold / 10;
+                ms->gap_offset += gap_size;
+                av_log(ost, AV_LOG_INFO,
+                       "[GAP-CLOSE] Detected %"PRId64" ms gap, closing with offset (total offset: %"PRId64" ms)\n",
+                       av_rescale_q(gap_size, ost->st->time_base, (AVRational){1, 1000}),
+                       av_rescale_q(ms->gap_offset, ost->st->time_base, (AVRational){1, 1000}));
+            }
+        }
+
+        if (ms->gap_offset > 0) {
+            pkt->pts -= ms->gap_offset;
+            if (pkt->dts != AV_NOPTS_VALUE)
+                pkt->dts -= ms->gap_offset;
+        }
+        ms->last_output_pts = pkt->pts + ms->gap_offset;
+    }
+#endif
+
     if (!(mux->fc->oformat->flags & AVFMT_NOTIMESTAMPS)) {
         if (pkt->dts != AV_NOPTS_VALUE &&
             pkt->pts != AV_NOPTS_VALUE &&

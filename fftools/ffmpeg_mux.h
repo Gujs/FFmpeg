@@ -90,6 +90,12 @@ typedef struct MuxStream {
     int             force_fps;
 
     const char     *apad;
+
+    // Gap closing: when input has timestamp gaps, we offset subsequent
+    // packets to maintain continuous output timestamps
+    int64_t         gap_offset;         // accumulated offset to close gaps (stream timebase)
+    int64_t         last_output_pts;    // last PTS we output (stream timebase)
+    int             gap_offset_initialized;
 } MuxStream;
 
 typedef struct Muxer {
