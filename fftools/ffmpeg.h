@@ -938,6 +938,30 @@ int64_t of_filesize(OutputFile *of);
 int ifile_open(const OptionsContext *o, const char *filename, Scheduler *sch);
 void ifile_close(InputFile **f);
 
+/**
+ * Structure to hold results from parallel I/O phase of input opening.
+ */
+typedef struct IfileOpenIOResult IfileOpenIOResult;
+
+/**
+ * Perform only the I/O operations for opening an input file.
+ * This function is thread-safe and can be called from multiple threads in parallel.
+ * The result should be passed to ifile_open_from_io() for sequential finalization.
+ */
+int ifile_open_io(const OptionsContext *o, const char *filename, IfileOpenIOResult *result);
+
+/**
+ * Finalize input file opening from I/O result.
+ * Must be called sequentially (not thread-safe) after ifile_open_io().
+ */
+int ifile_open_from_io(const OptionsContext *o, const char *filename, Scheduler *sch,
+                       IfileOpenIOResult *io_result);
+
+/**
+ * Size of IfileOpenIOResult structure for allocation.
+ */
+size_t ifile_open_io_result_size(void);
+
 int ist_use(InputStream *ist, int decoding_needed,
             const ViewSpecifier *vs, SchedulerNode *src);
 int ist_filter_add(InputStream *ist, InputFilter *ifilter, int is_simple,

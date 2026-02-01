@@ -1857,6 +1857,411 @@ static const AVClass input_file_class = {
     .category   = AV_CLASS_CATEGORY_DEMUXER,
 };
 
+/* Forward declaration for demux_alloc - used by ifile_open_from_io */
+static Demuxer *demux_alloc(void);
+
+/**
+ * Structure to hold results from parallel I/O phase of input opening.
+ * Used by ifile_open_io() and ifile_open_from_io() for parallel input opening.
+ */
+typedef struct IfileOpenIOResult {
+    AVFormatContext *ic;                // opened format context
+    const AVInputFormat *file_iformat;  // detected input format
+    int scan_all_pmts_set;              // whether scan_all_pmts was auto-set
+    int ret;                            // return value (0 on success, negative on error)
+    char error_msg[256];                // error message if ret < 0
+
+    // preserved values from OptionsContext needed for finalization
+    int64_t start_time;
+    int64_t start_time_eof;
+    int64_t stop_time;
+    int64_t recording_time;
+    int find_stream_info;
+} IfileOpenIOResult;
+
+/**
+ * Perform only the I/O operations for opening an input file.
+ * This function is safe to call from multiple threads in parallel.
+ * The result should be passed to ifile_open_from_io() for sequential finalization.
+ */
+int ifile_open_io(const OptionsContext *o, const char *filename, IfileOpenIOResult *result)
+{
+    AVFormatContext *ic;
+    const AVInputFormat *file_iformat = NULL;
+    int err, ret = 0;
+    const char*    video_codec_name = NULL;
+    const char*    audio_codec_name = NULL;
+    const char* subtitle_codec_name = NULL;
+    const char*     data_codec_name = NULL;
+
+    memset(result, 0, sizeof(*result));
+    result->start_time = o->start_time;
+    result->start_time_eof = o->start_time_eof;
+    result->stop_time = o->stop_time;
+    result->recording_time = o->recording_time;
+    result->find_stream_info = o->find_stream_info;
+
+    if (o->format) {
+        if (!(file_iformat = av_find_input_format(o->format))) {
+            snprintf(result->error_msg, sizeof(result->error_msg),
+                     "Unknown input format: '%s'", o->format);
+            result->ret = AVERROR(EINVAL);
+            return result->ret;
+        }
+    }
+    result->file_iformat = file_iformat;
+
+    if (!strcmp(filename, "-"))
+        filename = "fd:";
+
+    /* get default parameters from command line */
+    ic = avformat_alloc_context();
+    if (!ic) {
+        result->ret = AVERROR(ENOMEM);
+        return result->ret;
+    }
+
+    if (o->audio_sample_rate.nb_opt) {
+        av_dict_set_int(&o->g->format_opts, "sample_rate", o->audio_sample_rate.opt[o->audio_sample_rate.nb_opt - 1].u.i, 0);
+    }
+    if (o->audio_channels.nb_opt) {
+        const AVClass *priv_class;
+        if (file_iformat && (priv_class = file_iformat->priv_class) &&
+            av_opt_find(&priv_class, "ch_layout", NULL, 0,
+                        AV_OPT_SEARCH_FAKE_OBJ)) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%dC", o->audio_channels.opt[o->audio_channels.nb_opt - 1].u.i);
+            av_dict_set(&o->g->format_opts, "ch_layout", buf, 0);
+        }
+    }
+    if (o->audio_ch_layouts.nb_opt) {
+        const AVClass *priv_class;
+        if (file_iformat && (priv_class = file_iformat->priv_class) &&
+            av_opt_find(&priv_class, "ch_layout", NULL, 0,
+                        AV_OPT_SEARCH_FAKE_OBJ)) {
+            av_dict_set(&o->g->format_opts, "ch_layout", o->audio_ch_layouts.opt[o->audio_ch_layouts.nb_opt - 1].u.str, 0);
+        }
+    }
+    if (o->frame_rates.nb_opt) {
+        const AVClass *priv_class;
+        if (file_iformat && (priv_class = file_iformat->priv_class) &&
+            av_opt_find(&priv_class, "framerate", NULL, 0,
+                        AV_OPT_SEARCH_FAKE_OBJ)) {
+            av_dict_set(&o->g->format_opts, "framerate",
+                        o->frame_rates.opt[o->frame_rates.nb_opt - 1].u.str, 0);
+        }
+    }
+    if (o->frame_sizes.nb_opt) {
+        av_dict_set(&o->g->format_opts, "video_size", o->frame_sizes.opt[o->frame_sizes.nb_opt - 1].u.str, 0);
+    }
+    if (o->frame_pix_fmts.nb_opt)
+        av_dict_set(&o->g->format_opts, "pixel_format", o->frame_pix_fmts.opt[o->frame_pix_fmts.nb_opt - 1].u.str, 0);
+
+    video_codec_name    = opt_match_per_type_str(&o->codec_names, 'v');
+    audio_codec_name    = opt_match_per_type_str(&o->codec_names, 'a');
+    subtitle_codec_name = opt_match_per_type_str(&o->codec_names, 's');
+    data_codec_name     = opt_match_per_type_str(&o->codec_names, 'd');
+
+    if (video_codec_name)
+        ret = err_merge(ret, find_codec(NULL, video_codec_name   , AVMEDIA_TYPE_VIDEO   , 0,
+                                        &ic->video_codec));
+    if (audio_codec_name)
+        ret = err_merge(ret, find_codec(NULL, audio_codec_name   , AVMEDIA_TYPE_AUDIO   , 0,
+                                        &ic->audio_codec));
+    if (subtitle_codec_name)
+        ret = err_merge(ret, find_codec(NULL, subtitle_codec_name, AVMEDIA_TYPE_SUBTITLE, 0,
+                                        &ic->subtitle_codec));
+    if (data_codec_name)
+        ret = err_merge(ret, find_codec(NULL, data_codec_name    , AVMEDIA_TYPE_DATA,     0,
+                                        &ic->data_codec));
+    if (ret < 0) {
+        avformat_free_context(ic);
+        result->ret = ret;
+        return ret;
+    }
+
+    ic->video_codec_id     = video_codec_name    ? ic->video_codec->id    : AV_CODEC_ID_NONE;
+    ic->audio_codec_id     = audio_codec_name    ? ic->audio_codec->id    : AV_CODEC_ID_NONE;
+    ic->subtitle_codec_id  = subtitle_codec_name ? ic->subtitle_codec->id : AV_CODEC_ID_NONE;
+    ic->data_codec_id      = data_codec_name     ? ic->data_codec->id     : AV_CODEC_ID_NONE;
+
+    ic->flags |= AVFMT_FLAG_NONBLOCK;
+    if (o->bitexact)
+        ic->flags |= AVFMT_FLAG_BITEXACT;
+    ic->interrupt_callback = int_cb;
+
+    if (!av_dict_get(o->g->format_opts, "scan_all_pmts", NULL, AV_DICT_MATCH_CASE)) {
+        av_dict_set(&o->g->format_opts, "scan_all_pmts", "1", AV_DICT_DONT_OVERWRITE);
+        result->scan_all_pmts_set = 1;
+    }
+
+    /* open the input file with generic avformat function - THIS IS THE BLOCKING CALL */
+    err = avformat_open_input(&ic, filename, file_iformat, &o->g->format_opts);
+    if (err < 0) {
+        if (err != AVERROR_EXIT) {
+            snprintf(result->error_msg, sizeof(result->error_msg),
+                     "Error opening input: %s", av_err2str(err));
+        }
+        if (err == AVERROR_PROTOCOL_NOT_FOUND) {
+            snprintf(result->error_msg + strlen(result->error_msg),
+                     sizeof(result->error_msg) - strlen(result->error_msg),
+                     " Did you mean file:%s?", filename);
+        }
+        result->ret = err;
+        return err;
+    }
+
+    if (result->scan_all_pmts_set)
+        av_dict_set(&o->g->format_opts, "scan_all_pmts", NULL, AV_DICT_MATCH_CASE);
+
+    /* find stream info - ALSO A BLOCKING CALL */
+    if (o->find_stream_info) {
+        AVDictionary **opts;
+        int orig_nb_streams = ic->nb_streams;
+
+        ret = setup_find_stream_info_opts(ic, o->g->codec_opts, &opts);
+        if (ret < 0) {
+            avformat_close_input(&ic);
+            result->ret = ret;
+            return ret;
+        }
+
+        ret = avformat_find_stream_info(ic, opts);
+
+        for (int i = 0; i < orig_nb_streams; i++)
+            av_dict_free(&opts[i]);
+        av_freep(&opts);
+
+        if (ret < 0) {
+            snprintf(result->error_msg, sizeof(result->error_msg),
+                     "could not find codec parameters");
+            if (ic->nb_streams == 0) {
+                avformat_close_input(&ic);
+                result->ret = ret;
+                return ret;
+            }
+        }
+    }
+
+    result->ic = ic;
+    result->ret = 0;
+    return 0;
+}
+
+size_t ifile_open_io_result_size(void)
+{
+    return sizeof(IfileOpenIOResult);
+}
+
+/**
+ * Finalize input file opening from I/O result.
+ * Must be called sequentially (not thread-safe) after ifile_open_io().
+ */
+int ifile_open_from_io(const OptionsContext *o, const char *filename, Scheduler *sch,
+                       IfileOpenIOResult *io_result)
+{
+    Demuxer   *d;
+    InputFile *f;
+    AVFormatContext *ic = io_result->ic;
+    int ret = 0;
+    int64_t timestamp;
+    AVDictionary *opts_used = NULL;
+
+    int64_t start_time     = io_result->start_time;
+    int64_t start_time_eof = io_result->start_time_eof;
+    int64_t stop_time      = io_result->stop_time;
+    int64_t recording_time = io_result->recording_time;
+
+    if (io_result->ret < 0)
+        return io_result->ret;
+
+    d = demux_alloc();
+    if (!d)
+        return AVERROR(ENOMEM);
+
+    f = &d->f;
+
+    ret = sch_add_demux(sch, input_thread, d);
+    if (ret < 0)
+        return ret;
+    d->sch = sch;
+
+    f->ctx = ic;
+
+    if (stop_time != INT64_MAX && recording_time != INT64_MAX) {
+        stop_time = INT64_MAX;
+        av_log(d, AV_LOG_WARNING, "-t and -to cannot be used together; using -t.\n");
+    }
+
+    if (stop_time != INT64_MAX && recording_time == INT64_MAX) {
+        int64_t start = start_time == AV_NOPTS_VALUE ? 0 : start_time;
+        if (stop_time <= start) {
+            av_log(d, AV_LOG_ERROR, "-to value smaller than -ss; aborting.\n");
+            return AVERROR(EINVAL);
+        } else {
+            recording_time = stop_time - start;
+        }
+    }
+
+    av_strlcat(d->log_name, "/",               sizeof(d->log_name));
+    av_strlcat(d->log_name, ic->iformat->name, sizeof(d->log_name));
+
+    if (io_result->scan_all_pmts_set)
+        av_dict_set(&o->g->format_opts, "scan_all_pmts", NULL, AV_DICT_MATCH_CASE);
+    remove_avoptions(&o->g->format_opts, o->g->codec_opts);
+
+    ret = check_avoptions(o->g->format_opts);
+    if (ret < 0)
+        return ret;
+
+    /* apply forced codec ids */
+    for (int i = 0; i < ic->nb_streams; i++) {
+        const AVCodec *dummy;
+        ret = choose_decoder(o, f, ic, ic->streams[i], HWACCEL_NONE, AV_HWDEVICE_TYPE_NONE,
+                             &dummy);
+        if (ret < 0)
+            return ret;
+    }
+
+    if (start_time != AV_NOPTS_VALUE && start_time_eof != AV_NOPTS_VALUE) {
+        av_log(d, AV_LOG_WARNING, "Cannot use -ss and -sseof both, using -ss\n");
+        start_time_eof = AV_NOPTS_VALUE;
+    }
+
+    if (start_time_eof != AV_NOPTS_VALUE) {
+        if (start_time_eof >= 0) {
+            av_log(d, AV_LOG_ERROR, "-sseof value must be negative; aborting\n");
+            return AVERROR(EINVAL);
+        }
+        if (ic->duration > 0) {
+            start_time = start_time_eof + ic->duration;
+            if (start_time < 0) {
+                av_log(d, AV_LOG_WARNING, "-sseof value seeks to before start of file; ignored\n");
+                start_time = AV_NOPTS_VALUE;
+            }
+        } else
+            av_log(d, AV_LOG_WARNING, "Cannot use -sseof, file duration not known\n");
+    }
+    timestamp = (start_time == AV_NOPTS_VALUE) ? 0 : start_time;
+    /* add the stream start time */
+    if (!o->seek_timestamp && ic->start_time != AV_NOPTS_VALUE)
+        timestamp += ic->start_time;
+
+    /* if seeking requested, we execute it */
+    if (start_time != AV_NOPTS_VALUE) {
+        int64_t seek_timestamp = timestamp;
+
+        if (!(ic->iformat->flags & AVFMT_SEEK_TO_PTS)) {
+            int dts_heuristic = 0;
+            for (int i = 0; i < ic->nb_streams; i++) {
+                const AVCodecParameters *par = ic->streams[i]->codecpar;
+                if (par->video_delay) {
+                    dts_heuristic = 1;
+                    break;
+                }
+            }
+            if (dts_heuristic) {
+                seek_timestamp -= 3*AV_TIME_BASE / 23;
+            }
+        }
+        ret = avformat_seek_file(ic, -1, INT64_MIN, seek_timestamp, seek_timestamp, 0);
+        if (ret < 0) {
+            av_log(d, AV_LOG_WARNING, "could not seek to position %0.3f\n",
+                   (double)timestamp / AV_TIME_BASE);
+        }
+    }
+
+    f->start_time = start_time;
+    d->recording_time = recording_time;
+    f->input_sync_ref = o->input_sync_ref;
+    f->input_ts_offset = o->input_ts_offset;
+    f->ts_offset  = o->input_ts_offset - (copy_ts ? (start_at_zero && ic->start_time != AV_NOPTS_VALUE ? ic->start_time : 0) : timestamp);
+    d->accurate_seek   = o->accurate_seek;
+    d->loop = o->loop;
+    d->nb_streams_warn = ic->nb_streams;
+
+    d->duration        = (Timestamp){ .ts = 0,              .tb = (AVRational){ 1, 1 } };
+    d->min_pts         = (Timestamp){ .ts = AV_NOPTS_VALUE, .tb = (AVRational){ 1, 1 } };
+    d->max_pts         = (Timestamp){ .ts = AV_NOPTS_VALUE, .tb = (AVRational){ 1, 1 } };
+
+    d->readrate = o->readrate ? o->readrate : 0.0;
+    if (d->readrate < 0.0f) {
+        av_log(d, AV_LOG_ERROR, "Option -readrate is %0.3f; it must be non-negative.\n", d->readrate);
+        return AVERROR(EINVAL);
+    }
+    if (o->rate_emu) {
+        if (d->readrate) {
+            av_log(d, AV_LOG_WARNING, "Both -readrate and -re set. Using -readrate %0.3f.\n", d->readrate);
+        } else
+            d->readrate = 1.0f;
+    }
+
+    if (d->readrate) {
+        d->readrate_initial_burst = o->readrate_initial_burst ? o->readrate_initial_burst : 0.5;
+        if (d->readrate_initial_burst < 0.0) {
+            av_log(d, AV_LOG_ERROR,
+                   "Option -readrate_initial_burst is %0.3f; it must be non-negative.\n",
+                   d->readrate_initial_burst);
+            return AVERROR(EINVAL);
+        }
+        d->readrate_catchup = o->readrate_catchup ? o->readrate_catchup : d->readrate * 1.05;
+        if (d->readrate_catchup < d->readrate) {
+            av_log(d, AV_LOG_ERROR,
+                   "Option -readrate_catchup is %0.3f; it must be at least equal to %0.3f.\n",
+                   d->readrate_catchup, d->readrate);
+            return AVERROR(EINVAL);
+        }
+    } else {
+        if (o->readrate_initial_burst) {
+            av_log(d, AV_LOG_WARNING, "Option -readrate_initial_burst ignored "
+                   "since neither -readrate nor -re were given\n");
+        }
+        if (o->readrate_catchup) {
+            av_log(d, AV_LOG_WARNING, "Option -readrate_catchup ignored "
+                   "since neither -readrate nor -re were given\n");
+        }
+    }
+
+    /* Add all the streams from the given input file to the demuxer */
+    for (int i = 0; i < ic->nb_streams; i++) {
+        ret = ist_add(o, d, ic->streams[i], &opts_used);
+        if (ret < 0) {
+            av_dict_free(&opts_used);
+            return ret;
+        }
+    }
+
+    /* Add all the stream groups from the given input file to the demuxer */
+    for (int i = 0; i < ic->nb_stream_groups; i++) {
+        ret = istg_add(o, d, ic->stream_groups[i]);
+        if (ret < 0)
+            return ret;
+    }
+
+    /* dump the file content */
+    av_dump_format(ic, f->index, filename, 0);
+
+    /* check if all codec options have been used */
+    ret = check_avoptions_used(o->g->codec_opts, opts_used, d, 1);
+    av_dict_free(&opts_used);
+    if (ret < 0)
+        return ret;
+
+    for (int i = 0; i < o->dump_attachment.nb_opt; i++) {
+        for (int j = 0; j < f->nb_streams; j++) {
+            InputStream *ist = f->streams[j];
+
+            if (check_stream_specifier(ic, ist->st, o->dump_attachment.opt[i].specifier) == 1) {
+                ret = dump_attachment(ist, o->dump_attachment.opt[i].u.str);
+                if (ret < 0)
+                    return ret;
+            }
+        }
+    }
+
+    return 0;
+}
+
 static Demuxer *demux_alloc(void)
 {
     Demuxer *d = allocate_array_elem(&input_files, sizeof(*d), &nb_input_files);
