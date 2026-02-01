@@ -323,6 +323,10 @@ static int mux_gap_fill(Muxer *mux, MuxStream *ms, AVPacket *pkt)
         pkt_dts_scaled = av_rescale_q(pkt->dts, pkt->time_base, ost->st->time_base);
     }
 
+    /* Calculate DTS gap in microseconds for comparison with wall clock gap */
+    int64_t dts_gap = pkt_dts_scaled - ms->last_mux_dts;
+    int64_t dts_gap_us = av_rescale_q(dts_gap, ost->st->time_base, (AVRational){1, 1000000});
+
     /* Detect timestamp reset/discontinuity - when new DTS is LOWER than last written DTS.
      * This happens when discontinuity handling rebases timestamps to a new timeline.
      * In this case, we cannot fill the gap because the timestamp space has changed.
@@ -332,6 +336,28 @@ static int mux_gap_fill(Muxer *mux, MuxStream *ms, AVPacket *pkt)
                "[GAP-FILL] %"PRId64" ms wall gap, but timestamp reset detected "
                "(pkt_dts=%"PRId64" < last_mux_dts=%"PRId64") - cannot fill, new timeline\n",
                wallclock_gap_us / 1000, pkt_dts_scaled, ms->last_mux_dts);
+        /* Update keyframe cache if this is a keyframe */
+        if (pkt->flags & AV_PKT_FLAG_KEY) {
+            if (!ms->last_video_pkt)
+                ms->last_video_pkt = av_packet_alloc();
+            if (ms->last_video_pkt) {
+                av_packet_unref(ms->last_video_pkt);
+                av_packet_ref(ms->last_video_pkt, pkt);
+            }
+        }
+        ms->last_pkt_wallclock = now_us;
+        return 0;
+    }
+
+    /* Check for timestamp rebasing: wall clock shows large gap but DTS shows small gap.
+     * This happens when discontinuity handling adjusts timestamps to maintain continuity.
+     * In this case, trust DTS (timestamps were rebased to be continuous) and skip filling.
+     * Only fill if DTS gap is at least 25% of wall clock gap. */
+    if (dts_gap_us < wallclock_gap_us / 4) {
+        av_log(ost, AV_LOG_WARNING,
+               "[GAP-FILL] %"PRId64" ms wall gap, but DTS gap only %"PRId64" ms "
+               "(timestamps rebased by discontinuity handler) - skipping fill\n",
+               wallclock_gap_us / 1000, dts_gap_us / 1000);
         /* Update keyframe cache if this is a keyframe */
         if (pkt->flags & AV_PKT_FLAG_KEY) {
             if (!ms->last_video_pkt)
