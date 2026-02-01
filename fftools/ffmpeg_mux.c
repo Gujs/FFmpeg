@@ -206,6 +206,155 @@ static int mux_fixup_ts(Muxer *mux, MuxStream *ms, AVPacket *pkt)
     return 0;
 }
 
+/* Gap-fill: detect DTS gaps and fill them with duplicate keyframes.
+ * Uses ms->last_mux_dts to ensure fill frames have correct DTS values
+ * that are properly sequenced with what the muxer has actually sent. */
+static int mux_gap_fill(Muxer *mux, MuxStream *ms, AVPacket *pkt)
+{
+    OutputStream *ost = &ms->ost;
+    AVFormatContext *s = mux->fc;
+    int64_t gap_threshold, dts_gap;
+    int fill_count = 0;
+    int ret;
+
+    /* Log first video packet for each stream */
+    if (!ms->gap_fill_initialized && ost->type == AVMEDIA_TYPE_VIDEO) {
+        av_log(ost, AV_LOG_WARNING,
+               "[GAP-FILL] First video packet, DTS=%"PRId64" PTS=%"PRId64" last_mux_dts=%"PRId64" key=%d size=%d\n",
+               pkt->dts, pkt->pts, ms->last_mux_dts, !!(pkt->flags & AV_PKT_FLAG_KEY), pkt->size);
+    }
+
+    if (ost->type != AVMEDIA_TYPE_VIDEO)
+        return 0;
+
+    if (pkt->dts == AV_NOPTS_VALUE)
+        return 0;
+
+    if (!ms->gap_fill_initialized) {
+        /* Calculate expected frame duration - try multiple sources */
+        int64_t frame_dur = 0;
+
+        /* Try stream avg_frame_rate first (most reliable for encoded streams) */
+        if (ost->st->avg_frame_rate.num > 0 && ost->st->avg_frame_rate.den > 0) {
+            frame_dur = av_rescale_q(1, av_inv_q(ost->st->avg_frame_rate),
+                                     ost->st->time_base);
+        }
+        /* Fall back to r_frame_rate */
+        if (frame_dur <= 0 && ost->st->r_frame_rate.num > 0 && ost->st->r_frame_rate.den > 0) {
+            frame_dur = av_rescale_q(1, av_inv_q(ost->st->r_frame_rate),
+                                     ost->st->time_base);
+        }
+        /* Fall back to ms->frame_rate */
+        if (frame_dur <= 0 && ms->frame_rate.num > 0 && ms->frame_rate.den > 0) {
+            frame_dur = av_rescale_q(1, av_inv_q(ms->frame_rate),
+                                     ost->st->time_base);
+        }
+        /* Fall back to packet duration if it looks reasonable */
+        if (frame_dur <= 0 && pkt->duration > 100) {
+            frame_dur = pkt->duration;
+        }
+        /* Last resort: assume 30fps */
+        if (frame_dur <= 0) {
+            frame_dur = av_rescale_q(1, (AVRational){1, 30},
+                                     ost->st->time_base);
+        }
+
+        ms->expected_frame_dur = frame_dur;
+        ms->gap_fill_initialized = 1;
+        av_log(ost, AV_LOG_INFO,
+               "[GAP-FILL] Initialized, frame_dur=%"PRId64" timebase=%d/%d avg_fr=%d/%d r_fr=%d/%d\n",
+               ms->expected_frame_dur, ost->st->time_base.num, ost->st->time_base.den,
+               ost->st->avg_frame_rate.num, ost->st->avg_frame_rate.den,
+               ost->st->r_frame_rate.num, ost->st->r_frame_rate.den);
+        /* Store initial keyframe if available */
+        if (pkt->flags & AV_PKT_FLAG_KEY) {
+            ms->last_video_pkt = av_packet_alloc();
+            if (ms->last_video_pkt)
+                av_packet_ref(ms->last_video_pkt, pkt);
+            av_log(ost, AV_LOG_INFO,
+                   "[GAP-FILL] Stored initial keyframe (size=%d)\n", pkt->size);
+        }
+        return 0;
+    }
+
+    /* Use last_mux_dts for gap detection - this is the actual DTS the muxer last processed */
+    if (ms->last_mux_dts == AV_NOPTS_VALUE)
+        return 0;
+
+    gap_threshold = av_rescale_q(500000, AV_TIME_BASE_Q, ost->st->time_base);
+    dts_gap = pkt->dts - ms->last_mux_dts;
+
+    /* No gap or small gap - just update keyframe cache */
+    if (dts_gap <= gap_threshold) {
+        if (pkt->flags & AV_PKT_FLAG_KEY) {
+            if (!ms->last_video_pkt)
+                ms->last_video_pkt = av_packet_alloc();
+            if (ms->last_video_pkt) {
+                av_packet_unref(ms->last_video_pkt);
+                av_packet_ref(ms->last_video_pkt, pkt);
+            }
+        }
+        return 0;
+    }
+
+    /* Gap detected - check if we have a keyframe to fill with */
+    if (!ms->last_video_pkt || !ms->last_video_pkt->data ||
+        !(ms->last_video_pkt->flags & AV_PKT_FLAG_KEY)) {
+        av_log(ost, AV_LOG_WARNING,
+               "[GAP-FILL] Gap of %"PRId64" ms detected but no keyframe available\n",
+               av_rescale_q(dts_gap, ost->st->time_base, (AVRational){1, 1000}));
+        return 0;
+    }
+
+    av_log(ost, AV_LOG_INFO,
+           "[GAP-FILL] Detected %"PRId64" ms gap (last_mux_dts=%"PRId64" pkt_dts=%"PRId64"), filling\n",
+           av_rescale_q(dts_gap, ost->st->time_base, (AVRational){1, 1000}),
+           ms->last_mux_dts, pkt->dts);
+
+    /* Fill the gap with keyframe duplicates starting from last_mux_dts */
+    int64_t fill_dts = ms->last_mux_dts + ms->expected_frame_dur;
+    while (fill_dts < pkt->dts - ms->expected_frame_dur / 2) {
+        AVPacket *fill_pkt = av_packet_clone(ms->last_video_pkt);
+        if (!fill_pkt) break;
+
+        fill_pkt->dts = fill_dts;
+        fill_pkt->pts = fill_dts + (ms->last_video_pkt->pts - ms->last_video_pkt->dts);
+        fill_pkt->duration = ms->expected_frame_dur;
+        fill_pkt->stream_index = ost->index;
+
+        ret = av_interleaved_write_frame(s, fill_pkt);
+        av_packet_free(&fill_pkt);
+        if (ret < 0) {
+            av_log(ost, AV_LOG_WARNING,
+                   "[GAP-FILL] Write failed at fill_dts=%"PRId64": %s\n",
+                   fill_dts, av_err2str(ret));
+            break;
+        }
+
+        fill_count++;
+        fill_dts += ms->expected_frame_dur;
+        ms->gap_fill_count++;
+        if (fill_count > 900) break; /* Safety limit: 30 seconds at 30fps */
+    }
+
+    if (fill_count > 0) {
+        av_log(ost, AV_LOG_INFO,
+               "[GAP-FILL] Filled with %d frames, last_fill_dts=%"PRId64" (total: %"PRIu64")\n",
+               fill_count, fill_dts - ms->expected_frame_dur, ms->gap_fill_count);
+        if (s->pb) {
+            avio_flush(s->pb);
+        }
+    }
+
+    /* Update keyframe cache */
+    if (pkt->flags & AV_PKT_FLAG_KEY) {
+        av_packet_unref(ms->last_video_pkt);
+        av_packet_ref(ms->last_video_pkt, pkt);
+    }
+
+    return fill_count;
+}
+
 static int write_packet(Muxer *mux, OutputStream *ost, AVPacket *pkt)
 {
     MuxStream *ms = ms_from_ost(ost);
@@ -220,6 +369,9 @@ static int write_packet(Muxer *mux, OutputStream *ost, AVPacket *pkt)
         ret = AVERROR_EOF;
         goto fail;
     }
+
+    /* Fill gaps BEFORE mux_fixup_ts updates last_mux_dts */
+    mux_gap_fill(mux, ms, pkt);
 
     ret = mux_fixup_ts(mux, ms, pkt);
     if (ret < 0)
@@ -829,6 +981,7 @@ static void ost_free(OutputStream **post)
     av_packet_free(&ms->bsf_pkt);
 
     av_packet_free(&ms->pkt);
+    av_packet_free(&ms->last_video_pkt);
 
     av_freep(&ost->kf.pts);
     av_expr_free(ost->kf.pexpr);
