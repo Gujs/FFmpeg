@@ -147,6 +147,12 @@ typedef struct InputFilterPriv {
     int                 downmixinfo_present;
     AVDownmixInfo       downmixinfo;
 
+    // Resolution change hysteresis to filter out spurious changes from corruption
+    // Only trigger reconfiguration after seeing N consecutive frames at new resolution
+    int                 pending_width, pending_height;
+    int                 resolution_stable_count;
+#define RESOLUTION_HYSTERESIS_FRAMES 3  // Require 3 consecutive frames (~100ms at 30fps)
+
     struct {
         AVFrame *frame;
 
@@ -3312,13 +3318,60 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
             need_reinit |= AUDIO_CHANGED;
         break;
     case AVMEDIA_TYPE_VIDEO:
+        /* Format, colorspace, etc. changes trigger immediately */
         if (ifp->format != frame->format ||
-            ifp->width  != frame->width ||
-            ifp->height != frame->height ||
             ifp->color_space != frame->colorspace ||
             ifp->color_range != frame->color_range ||
             ifp->alpha_mode != frame->alpha_mode)
             need_reinit |= VIDEO_CHANGED;
+
+        /* Resolution changes use hysteresis to filter out spurious changes from corruption.
+         * Corrupted SPS can cause decoder to report wrong resolution for a few frames.
+         * Require RESOLUTION_HYSTERESIS_FRAMES consecutive frames at new resolution. */
+        if (ifp->width != frame->width || ifp->height != frame->height) {
+            if (ifp->pending_width == frame->width && ifp->pending_height == frame->height) {
+                /* Same as pending resolution - increment counter */
+                ifp->resolution_stable_count++;
+                if (ifp->resolution_stable_count >= RESOLUTION_HYSTERESIS_FRAMES) {
+                    av_log(fg, AV_LOG_INFO,
+                           "[HW-PATCH] Resolution change confirmed after %d frames: %dx%d -> %dx%d\n",
+                           ifp->resolution_stable_count, ifp->width, ifp->height,
+                           frame->width, frame->height);
+                    need_reinit |= VIDEO_CHANGED;
+                    ifp->resolution_stable_count = 0;
+                    ifp->pending_width = ifp->pending_height = 0;
+                } else {
+                    av_log(fg, AV_LOG_INFO,
+                           "[HW-PATCH] Resolution change pending (%d/%d): %dx%d -> %dx%d\n",
+                           ifp->resolution_stable_count, RESOLUTION_HYSTERESIS_FRAMES,
+                           ifp->width, ifp->height, frame->width, frame->height);
+                }
+            } else {
+                /* New pending resolution - reset counter */
+                if (ifp->pending_width && ifp->pending_height) {
+                    av_log(fg, AV_LOG_WARNING,
+                           "[HW-PATCH] Spurious resolution change rejected: %dx%d (was pending %dx%d, now %dx%d)\n",
+                           ifp->pending_width, ifp->pending_height,
+                           ifp->pending_width, ifp->pending_height, frame->width, frame->height);
+                }
+                ifp->pending_width = frame->width;
+                ifp->pending_height = frame->height;
+                ifp->resolution_stable_count = 1;
+                av_log(fg, AV_LOG_INFO,
+                       "[HW-PATCH] Resolution change detected, starting hysteresis: %dx%d -> %dx%d\n",
+                       ifp->width, ifp->height, frame->width, frame->height);
+            }
+        } else {
+            /* Resolution matches current - reset pending state */
+            if (ifp->pending_width || ifp->pending_height) {
+                av_log(fg, AV_LOG_WARNING,
+                       "[HW-PATCH] Spurious resolution change filtered out: %dx%d briefly saw %dx%d (%d frames)\n",
+                       ifp->width, ifp->height, ifp->pending_width, ifp->pending_height,
+                       ifp->resolution_stable_count);
+                ifp->pending_width = ifp->pending_height = 0;
+                ifp->resolution_stable_count = 0;
+            }
+        }
         break;
     }
 
