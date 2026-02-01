@@ -820,6 +820,17 @@ static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
                    "corrupt decoded frame\n");
             if (exit_on_error)
                 return AVERROR_INVALIDDATA;
+
+            /* Drop corrupt frames if FFMPEG_DROP_CORRUPT_FRAMES is set.
+             * This creates a gap in the output that gap-fill can replace
+             * with clean keyframe duplicates, instead of encoding garbage. */
+            if (getenv("FFMPEG_DROP_CORRUPT_FRAMES")) {
+                av_log(dp, AV_LOG_INFO,
+                       "[CORRUPT-DROP] Dropping corrupt frame (PTS=%"PRId64") - gap-fill will replace\n",
+                       frame->pts);
+                av_frame_unref(frame);
+                continue;
+            }
         }
 
         fd      = frame_data(frame);
