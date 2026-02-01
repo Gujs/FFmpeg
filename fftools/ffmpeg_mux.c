@@ -296,6 +296,28 @@ static int mux_gap_fill(Muxer *mux, MuxStream *ms, AVPacket *pkt)
         return 0;
     }
 
+    /* Detect timestamp reset/discontinuity - when new DTS is LOWER than last written DTS.
+     * This happens when discontinuity handling rebases timestamps to a new timeline.
+     * In this case, we cannot fill the gap because the timestamp space has changed.
+     * Just reset our tracking and continue with the new timeline. */
+    if (pkt->dts < ms->last_mux_dts) {
+        av_log(ost, AV_LOG_WARNING,
+               "[GAP-FILL] Timestamp reset detected (pkt_dts=%"PRId64" < last_mux_dts=%"PRId64"), "
+               "resetting gap-fill tracking for new timeline\n",
+               pkt->dts, ms->last_mux_dts);
+        /* Update keyframe cache if this is a keyframe */
+        if (pkt->flags & AV_PKT_FLAG_KEY) {
+            if (!ms->last_video_pkt)
+                ms->last_video_pkt = av_packet_alloc();
+            if (ms->last_video_pkt) {
+                av_packet_unref(ms->last_video_pkt);
+                av_packet_ref(ms->last_video_pkt, pkt);
+            }
+        }
+        ms->last_pkt_wallclock = now_us;
+        return 0;
+    }
+
     /* Calculate wall clock gap - this detects real time elapsed even if
      * DTS values have been rebased by discontinuity handling */
     wallclock_gap_us = now_us - ms->last_pkt_wallclock;
