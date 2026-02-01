@@ -229,11 +229,11 @@ static int mux_gap_fill(Muxer *mux, MuxStream *ms, AVPacket *pkt)
     /* Get current wall clock time */
     now_us = av_gettime_relative();
 
-    /* Log first video packet for each stream */
+    /* Log first video packet for each stream (debug level only) */
     if (!ms->gap_fill_initialized && ost->type == AVMEDIA_TYPE_VIDEO) {
-        av_log(ost, AV_LOG_WARNING,
-               "[GAP-FILL] First video packet, DTS=%"PRId64" PTS=%"PRId64" last_mux_dts=%"PRId64" key=%d size=%d\n",
-               pkt->dts, pkt->pts, ms->last_mux_dts, !!(pkt->flags & AV_PKT_FLAG_KEY), pkt->size);
+        av_log(ost, AV_LOG_DEBUG,
+               "[GAP-FILL] First video packet, DTS=%"PRId64" PTS=%"PRId64" key=%d size=%d\n",
+               pkt->dts, pkt->pts, !!(pkt->flags & AV_PKT_FLAG_KEY), pkt->size);
     }
 
     if (ost->type != AVMEDIA_TYPE_VIDEO)
@@ -274,7 +274,7 @@ static int mux_gap_fill(Muxer *mux, MuxStream *ms, AVPacket *pkt)
         ms->expected_frame_dur = frame_dur;
         ms->gap_fill_initialized = 1;
         ms->last_pkt_wallclock = now_us;  /* Initialize wall clock tracking */
-        av_log(ost, AV_LOG_INFO,
+        av_log(ost, AV_LOG_DEBUG,
                "[GAP-FILL] Initialized, frame_dur=%"PRId64" timebase=%d/%d avg_fr=%d/%d r_fr=%d/%d\n",
                ms->expected_frame_dur, ost->st->time_base.num, ost->st->time_base.den,
                ost->st->avg_frame_rate.num, ost->st->avg_frame_rate.den,
@@ -284,28 +284,19 @@ static int mux_gap_fill(Muxer *mux, MuxStream *ms, AVPacket *pkt)
             ms->last_video_pkt = av_packet_alloc();
             if (ms->last_video_pkt)
                 av_packet_ref(ms->last_video_pkt, pkt);
-            av_log(ost, AV_LOG_INFO,
+            av_log(ost, AV_LOG_DEBUG,
                    "[GAP-FILL] Stored initial keyframe (size=%d)\n", pkt->size);
         }
         return 0;
     }
 
-    /* Use last_mux_dts for gap detection - this is the actual DTS the muxer last processed */
-    if (ms->last_mux_dts == AV_NOPTS_VALUE) {
-        ms->last_pkt_wallclock = now_us;
-        return 0;
-    }
+    /* Calculate wall clock gap FIRST - this detects real time elapsed even if
+     * DTS values have been rebased by discontinuity handling */
+    wallclock_gap_us = now_us - ms->last_pkt_wallclock;
 
-    /* Detect timestamp reset/discontinuity - when new DTS is LOWER than last written DTS.
-     * This happens when discontinuity handling rebases timestamps to a new timeline.
-     * In this case, we cannot fill the gap because the timestamp space has changed.
-     * Just reset our tracking and continue with the new timeline. */
-    if (pkt->dts < ms->last_mux_dts) {
-        av_log(ost, AV_LOG_WARNING,
-               "[GAP-FILL] Timestamp reset detected (pkt_dts=%"PRId64" < last_mux_dts=%"PRId64"), "
-               "resetting gap-fill tracking for new timeline\n",
-               pkt->dts, ms->last_mux_dts);
-        /* Update keyframe cache if this is a keyframe */
+    /* No gap or small gap - just update keyframe cache and wall clock.
+     * No need to check timestamps since we're not trying to fill anything. */
+    if (wallclock_gap_us <= gap_threshold_us) {
         if (pkt->flags & AV_PKT_FLAG_KEY) {
             if (!ms->last_video_pkt)
                 ms->last_video_pkt = av_packet_alloc();
@@ -318,12 +309,30 @@ static int mux_gap_fill(Muxer *mux, MuxStream *ms, AVPacket *pkt)
         return 0;
     }
 
-    /* Calculate wall clock gap - this detects real time elapsed even if
-     * DTS values have been rebased by discontinuity handling */
-    wallclock_gap_us = now_us - ms->last_pkt_wallclock;
+    /* Wall clock gap detected - now check if we can fill it.
+     * We need last_mux_dts to calculate fill frame timestamps. */
+    if (ms->last_mux_dts == AV_NOPTS_VALUE) {
+        ms->last_pkt_wallclock = now_us;
+        return 0;
+    }
 
-    /* No gap or small gap - just update keyframe cache and wall clock */
-    if (wallclock_gap_us <= gap_threshold_us) {
+    /* Rescale packet DTS to stream timebase for comparison with last_mux_dts.
+     * last_mux_dts is in stream timebase (set by mux_fixup_ts on previous packets). */
+    int64_t pkt_dts_scaled = pkt->dts;
+    if (pkt->time_base.num > 0 && pkt->time_base.den > 0) {
+        pkt_dts_scaled = av_rescale_q(pkt->dts, pkt->time_base, ost->st->time_base);
+    }
+
+    /* Detect timestamp reset/discontinuity - when new DTS is LOWER than last written DTS.
+     * This happens when discontinuity handling rebases timestamps to a new timeline.
+     * In this case, we cannot fill the gap because the timestamp space has changed.
+     * Just reset our tracking and continue with the new timeline. */
+    if (pkt_dts_scaled < ms->last_mux_dts) {
+        av_log(ost, AV_LOG_WARNING,
+               "[GAP-FILL] %"PRId64" ms wall gap, but timestamp reset detected "
+               "(pkt_dts=%"PRId64" < last_mux_dts=%"PRId64") - cannot fill, new timeline\n",
+               wallclock_gap_us / 1000, pkt_dts_scaled, ms->last_mux_dts);
+        /* Update keyframe cache if this is a keyframe */
         if (pkt->flags & AV_PKT_FLAG_KEY) {
             if (!ms->last_video_pkt)
                 ms->last_video_pkt = av_packet_alloc();
