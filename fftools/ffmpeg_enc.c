@@ -736,6 +736,12 @@ static enum AVPictureType forced_kf_apply(void *logctx, KeyframeForceCtx *kf,
 {
     double pts_time;
 
+    /* Preserve pict_type if already set to I-frame (e.g., from filter graph reconfiguration).
+     * This allows filter graph to force keyframes without requiring -force_key_frames source. */
+    if (frame->pict_type == AV_PICTURE_TYPE_I) {
+        return AV_PICTURE_TYPE_I;
+    }
+
     if (kf->ref_pts == AV_NOPTS_VALUE)
         kf->ref_pts = frame->pts;
 
