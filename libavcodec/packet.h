@@ -660,6 +660,12 @@ typedef struct AVPacketList {
  * be discarded by the decoder.  I.e. Non-reference frames.
  */
 #define AV_PKT_FLAG_DISPOSABLE 0x0010
+/**
+ * The packet follows a timestamp discontinuity in the stream.
+ * The decoder should flush its internal state before decoding this packet
+ * to avoid using stale reference frames from the previous segment.
+ */
+#define AV_PKT_FLAG_DISCONTINUITY 0x0020
 
 enum AVSideDataParamChangeFlags {
     AV_SIDE_DATA_PARAM_CHANGE_SAMPLE_RATE    = 0x0004,

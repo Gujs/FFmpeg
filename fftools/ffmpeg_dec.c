@@ -709,6 +709,52 @@ static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
     if (pkt && pkt->size == 0)
         return 0;
 
+    // Drain and flush decoder on timestamp discontinuity to clear stale reference frames
+    // First drain any pending frames, then flush to reset decoder state
+    if (pkt && (pkt->flags & AV_PKT_FLAG_DISCONTINUITY)) {
+        int drained_count = 0;
+
+        // Drain pending frames from decoder before flushing
+        // These are frames from the previous segment that haven't been output yet
+        while (1) {
+            AVFrame *drain_frame = av_frame_alloc();
+            if (!drain_frame)
+                break;
+
+            int drain_ret = avcodec_receive_frame(dec, drain_frame);
+            if (drain_ret == AVERROR(EAGAIN) || drain_ret == AVERROR_EOF) {
+                av_frame_free(&drain_frame);
+                break;
+            }
+            if (drain_ret < 0) {
+                av_frame_free(&drain_frame);
+                break;
+            }
+
+            // Set time_base for the drained frame
+            drain_frame->time_base = dec->pkt_timebase;
+
+            // Send drained frame to scheduler (first output only)
+            drain_ret = sch_dec_send(dp->sch, dp->sch_idx, 0, drain_frame);
+            if (drain_ret < 0) {
+                av_frame_free(&drain_frame);
+                break;
+            }
+            drained_count++;
+        }
+
+        if (drained_count > 0) {
+            av_log(dp, AV_LOG_VERBOSE,
+                   "[BUFFER] Drained %d frames before %s decoder flush\n",
+                   drained_count, type_desc);
+        }
+
+        av_log(dp, AV_LOG_INFO,
+               "Flushing %s decoder due to timestamp discontinuity\n",
+               type_desc);
+        avcodec_flush_buffers(dec);
+    }
+
     if (pkt && (dp->flags & DECODER_FLAG_TS_UNRELIABLE)) {
         pkt->pts = AV_NOPTS_VALUE;
         pkt->dts = AV_NOPTS_VALUE;
