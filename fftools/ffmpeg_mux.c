@@ -206,16 +206,28 @@ static int mux_fixup_ts(Muxer *mux, MuxStream *ms, AVPacket *pkt)
     return 0;
 }
 
-/* Gap-fill: detect DTS gaps and fill them with duplicate keyframes.
- * Uses ms->last_mux_dts to ensure fill frames have correct DTS values
- * that are properly sequenced with what the muxer has actually sent. */
+/* Gap-fill: detect gaps and fill them with duplicate keyframes.
+ *
+ * IMPORTANT: Gap detection uses WALL CLOCK time, not DTS values.
+ * This is because timestamp discontinuity handling may rebase DTS values,
+ * making the DTS gap appear small even when real time has passed.
+ *
+ * Example: 12 seconds of wall clock time with no packets, but DTS values
+ * have been adjusted so the DTS gap is only 500ms.
+ *
+ * The fill frames are written with interpolated DTS values to maintain
+ * proper timing in the output stream. */
 static int mux_gap_fill(Muxer *mux, MuxStream *ms, AVPacket *pkt)
 {
     OutputStream *ost = &ms->ost;
     AVFormatContext *s = mux->fc;
-    int64_t gap_threshold, dts_gap;
+    int64_t now_us, wallclock_gap_us;
+    int64_t gap_threshold_us = 500000;  /* 500ms in microseconds */
     int fill_count = 0;
     int ret;
+
+    /* Get current wall clock time */
+    now_us = av_gettime_relative();
 
     /* Log first video packet for each stream */
     if (!ms->gap_fill_initialized && ost->type == AVMEDIA_TYPE_VIDEO) {
@@ -261,6 +273,7 @@ static int mux_gap_fill(Muxer *mux, MuxStream *ms, AVPacket *pkt)
 
         ms->expected_frame_dur = frame_dur;
         ms->gap_fill_initialized = 1;
+        ms->last_pkt_wallclock = now_us;  /* Initialize wall clock tracking */
         av_log(ost, AV_LOG_INFO,
                "[GAP-FILL] Initialized, frame_dur=%"PRId64" timebase=%d/%d avg_fr=%d/%d r_fr=%d/%d\n",
                ms->expected_frame_dur, ost->st->time_base.num, ost->st->time_base.den,
@@ -278,14 +291,17 @@ static int mux_gap_fill(Muxer *mux, MuxStream *ms, AVPacket *pkt)
     }
 
     /* Use last_mux_dts for gap detection - this is the actual DTS the muxer last processed */
-    if (ms->last_mux_dts == AV_NOPTS_VALUE)
+    if (ms->last_mux_dts == AV_NOPTS_VALUE) {
+        ms->last_pkt_wallclock = now_us;
         return 0;
+    }
 
-    gap_threshold = av_rescale_q(500000, AV_TIME_BASE_Q, ost->st->time_base);
-    dts_gap = pkt->dts - ms->last_mux_dts;
+    /* Calculate wall clock gap - this detects real time elapsed even if
+     * DTS values have been rebased by discontinuity handling */
+    wallclock_gap_us = now_us - ms->last_pkt_wallclock;
 
-    /* No gap or small gap - just update keyframe cache */
-    if (dts_gap <= gap_threshold) {
+    /* No gap or small gap - just update keyframe cache and wall clock */
+    if (wallclock_gap_us <= gap_threshold_us) {
         if (pkt->flags & AV_PKT_FLAG_KEY) {
             if (!ms->last_video_pkt)
                 ms->last_video_pkt = av_packet_alloc();
@@ -294,6 +310,7 @@ static int mux_gap_fill(Muxer *mux, MuxStream *ms, AVPacket *pkt)
                 av_packet_ref(ms->last_video_pkt, pkt);
             }
         }
+        ms->last_pkt_wallclock = now_us;
         return 0;
     }
 
@@ -301,19 +318,27 @@ static int mux_gap_fill(Muxer *mux, MuxStream *ms, AVPacket *pkt)
     if (!ms->last_video_pkt || !ms->last_video_pkt->data ||
         !(ms->last_video_pkt->flags & AV_PKT_FLAG_KEY)) {
         av_log(ost, AV_LOG_WARNING,
-               "[GAP-FILL] Gap of %"PRId64" ms detected but no keyframe available\n",
-               av_rescale_q(dts_gap, ost->st->time_base, (AVRational){1, 1000}));
+               "[GAP-FILL] Wall clock gap of %"PRId64" ms detected but no keyframe available\n",
+               wallclock_gap_us / 1000);
+        ms->last_pkt_wallclock = now_us;
         return 0;
     }
 
-    av_log(ost, AV_LOG_INFO,
-           "[GAP-FILL] Detected %"PRId64" ms gap (last_mux_dts=%"PRId64" pkt_dts=%"PRId64"), filling\n",
-           av_rescale_q(dts_gap, ost->st->time_base, (AVRational){1, 1000}),
-           ms->last_mux_dts, pkt->dts);
+    av_log(ost, AV_LOG_WARNING,
+           "[GAP-FILL] Detected %"PRId64" ms wall clock gap (last_mux_dts=%"PRId64" pkt_dts=%"PRId64"), filling\n",
+           wallclock_gap_us / 1000, ms->last_mux_dts, pkt->dts);
 
-    /* Fill the gap with keyframe duplicates starting from last_mux_dts */
+    /* Calculate how many frames to fill based on wall clock time.
+     * This is more accurate than DTS gap when timestamps have been rebased. */
+    int64_t frame_dur_us = av_rescale_q(ms->expected_frame_dur, ost->st->time_base, (AVRational){1, 1000000});
+    int64_t frames_to_fill = (wallclock_gap_us - gap_threshold_us / 2) / frame_dur_us;
+    if (frames_to_fill > 900) frames_to_fill = 900;  /* Safety limit: 30 seconds at 30fps */
+    if (frames_to_fill < 1) frames_to_fill = 0;
+
+    /* Fill the gap with keyframe duplicates.
+     * DTS values are interpolated from last_mux_dts to maintain proper timing. */
     int64_t fill_dts = ms->last_mux_dts + ms->expected_frame_dur;
-    while (fill_dts < pkt->dts - ms->expected_frame_dur / 2) {
+    for (int i = 0; i < frames_to_fill; i++) {
         AVPacket *fill_pkt = av_packet_clone(ms->last_video_pkt);
         if (!fill_pkt) break;
 
@@ -334,23 +359,27 @@ static int mux_gap_fill(Muxer *mux, MuxStream *ms, AVPacket *pkt)
         fill_count++;
         fill_dts += ms->expected_frame_dur;
         ms->gap_fill_count++;
-        if (fill_count > 900) break; /* Safety limit: 30 seconds at 30fps */
     }
 
     if (fill_count > 0) {
-        av_log(ost, AV_LOG_INFO,
-               "[GAP-FILL] Filled with %d frames, last_fill_dts=%"PRId64" (total: %"PRIu64")\n",
-               fill_count, fill_dts - ms->expected_frame_dur, ms->gap_fill_count);
+        av_log(ost, AV_LOG_WARNING,
+               "[GAP-FILL] Filled with %d frames (wanted %"PRId64"), last_fill_dts=%"PRId64" (total: %"PRIu64")\n",
+               fill_count, frames_to_fill, fill_dts - ms->expected_frame_dur, ms->gap_fill_count);
         if (s->pb) {
             avio_flush(s->pb);
         }
     }
 
-    /* Update keyframe cache */
+    /* Update keyframe cache and wall clock */
     if (pkt->flags & AV_PKT_FLAG_KEY) {
-        av_packet_unref(ms->last_video_pkt);
-        av_packet_ref(ms->last_video_pkt, pkt);
+        if (!ms->last_video_pkt)
+            ms->last_video_pkt = av_packet_alloc();
+        if (ms->last_video_pkt) {
+            av_packet_unref(ms->last_video_pkt);
+            av_packet_ref(ms->last_video_pkt, pkt);
+        }
     }
+    ms->last_pkt_wallclock = now_us;
 
     return fill_count;
 }
