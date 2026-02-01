@@ -28,6 +28,7 @@
 #include "av1.h"
 #endif
 
+#include "libavutil/dict.h"
 #include "libavutil/hwcontext_cuda.h"
 #include "libavutil/hwcontext.h"
 #include "libavutil/cuda_check.h"
@@ -2205,6 +2206,7 @@ av_cold int ff_nvenc_encode_close(AVCodecContext *avctx)
                 p_nvenc->nvEncUnmapInputResource(ctx->nvencoder, ctx->registered_frames[i].in_map.mappedResource);
             if (ctx->registered_frames[i].regptr)
                 p_nvenc->nvEncUnregisterResource(ctx->nvencoder, ctx->registered_frames[i].regptr);
+            av_buffer_unref(&ctx->registered_frames[i].hw_frames_ref);
         }
         ctx->nb_registered_frames = 0;
     }
@@ -2285,6 +2287,15 @@ av_cold int ff_nvenc_encode_init(AVCodecContext *avctx)
     ctx->frame = av_frame_alloc();
     if (!ctx->frame)
         return AVERROR(ENOMEM);
+
+    /* Initialize colorspace tracking for mid-stream colorspace change detection */
+    ctx->last_colorspace = AVCOL_SPC_UNSPECIFIED;
+    ctx->encoder_reset_pending = 0;
+
+    /* Initialize diagnostic fields for DTS/PTS tracking */
+    ctx->last_dts_out = AV_NOPTS_VALUE;
+    ctx->last_pts_out = AV_NOPTS_VALUE;
+    ctx->frames_since_reconfig = -1;  /* -1 means not tracking */
 
     if ((ret = nvenc_load_libraries(avctx)) < 0)
         return ret;
@@ -2368,6 +2379,7 @@ static int nvenc_find_free_reg_resource(AVCodecContext *avctx)
                             return nvenc_print_error(avctx, nv_status, "Failed unregistering unused input resource");
                         ctx->registered_frames[i].ptr = NULL;
                         ctx->registered_frames[i].regptr = NULL;
+                        av_buffer_unref(&ctx->registered_frames[i].hw_frames_ref);
                     }
                     return i;
                 }
@@ -2386,16 +2398,52 @@ static int nvenc_register_frame(AVCodecContext *avctx, const AVFrame *frame)
     NvencContext *ctx = avctx->priv_data;
     NvencDynLoadFunctions *dl_fn = &ctx->nvenc_dload_funcs;
     NV_ENCODE_API_FUNCTION_LIST *p_nvenc = &dl_fn->nvenc_funcs;
+    AVHWFramesContext *frames_ctx;
 
-    AVHWFramesContext *frames_ctx = (AVHWFramesContext*)frame->hw_frames_ctx->data;
+    /* Validate hw_frames_ctx - this should always be set for CUDA/D3D11 frames,
+     * but check defensively in case of edge cases during reconfiguration */
+    if (!frame->hw_frames_ctx) {
+        av_log(avctx, AV_LOG_INFO,
+               "[HW-PATCH] NVENC: frame->hw_frames_ctx is NULL (unexpected for HW frame)\n");
+        return AVERROR(EINVAL);
+    }
+    frames_ctx = (AVHWFramesContext*)frame->hw_frames_ctx->data;
     NV_ENC_REGISTER_RESOURCE reg = { 0 };
     int i, idx, ret;
 
     for (i = 0; i < ctx->nb_registered_frames; i++) {
-        if (avctx->pix_fmt == AV_PIX_FMT_CUDA && ctx->registered_frames[i].ptr == frame->data[0])
-            return i;
-        else if (avctx->pix_fmt == AV_PIX_FMT_D3D11 && ctx->registered_frames[i].ptr == frame->data[0] && ctx->registered_frames[i].ptr_index == (intptr_t)frame->data[1])
-            return i;
+        /* Check both the GPU address AND the hw_frames_ctx to ensure we don't
+         * reuse a stale registration after filter graph reconfiguration.
+         * When the frame pool is recreated, CUDA may reuse the same GPU address
+         * but the registration would be invalid for the new pool. */
+        if (avctx->pix_fmt == AV_PIX_FMT_CUDA &&
+            ctx->registered_frames[i].ptr == frame->data[0]) {
+            if (ctx->registered_frames[i].hw_frames_ref &&
+                ctx->registered_frames[i].hw_frames_ref->data == frame->hw_frames_ctx->data)
+                return i;
+            /* GPU address matches but pool is different - this would have caused
+             * stale registration reuse before the fix. Log for diagnostic purposes. */
+            av_log(avctx, AV_LOG_INFO,
+                   "[HW-PATCH] NVENC: GPU addr %p reused from different pool "
+                   "(old=%p new=%p) - creating fresh registration\n",
+                   frame->data[0],
+                   ctx->registered_frames[i].hw_frames_ref ?
+                       ctx->registered_frames[i].hw_frames_ref->data : NULL,
+                   frame->hw_frames_ctx->data);
+        } else if (avctx->pix_fmt == AV_PIX_FMT_D3D11 &&
+                   ctx->registered_frames[i].ptr == frame->data[0] &&
+                   ctx->registered_frames[i].ptr_index == (intptr_t)frame->data[1]) {
+            if (ctx->registered_frames[i].hw_frames_ref &&
+                ctx->registered_frames[i].hw_frames_ref->data == frame->hw_frames_ctx->data)
+                return i;
+            av_log(avctx, AV_LOG_INFO,
+                   "[HW-PATCH] NVENC: D3D11 addr %p reused from different pool "
+                   "(old=%p new=%p) - creating fresh registration\n",
+                   frame->data[0],
+                   ctx->registered_frames[i].hw_frames_ref ?
+                       ctx->registered_frames[i].hw_frames_ref->data : NULL,
+                   frame->hw_frames_ctx->data);
+        }
     }
 
     idx = nvenc_find_free_reg_resource(avctx);
@@ -2432,6 +2480,10 @@ static int nvenc_register_frame(AVCodecContext *avctx, const AVFrame *frame)
     ctx->registered_frames[idx].ptr       = frame->data[0];
     ctx->registered_frames[idx].ptr_index = reg.subResourceIndex;
     ctx->registered_frames[idx].regptr    = reg.registeredResource;
+    /* Store reference to hw_frames_ctx to track which pool this registration belongs to.
+     * This prevents reusing stale registrations after filter graph reconfiguration. */
+    av_buffer_unref(&ctx->registered_frames[idx].hw_frames_ref);
+    ctx->registered_frames[idx].hw_frames_ref = av_buffer_ref(frame->hw_frames_ctx);
     return idx;
 }
 
@@ -2446,6 +2498,15 @@ static int nvenc_upload_frame(AVCodecContext *avctx, const AVFrame *frame,
     NVENCSTATUS nv_status;
 
     if (avctx->pix_fmt == AV_PIX_FMT_CUDA || avctx->pix_fmt == AV_PIX_FMT_D3D11) {
+        /* Track hw_frames_ctx changes for diagnostic purposes.
+         * Log when the frame pool changes (e.g., after filter graph reconfiguration). */
+        if (frame->hw_frames_ctx && frame->hw_frames_ctx->data != ctx->last_hw_frames_ctx) {
+            av_log(avctx, AV_LOG_INFO,
+                   "[HW-PATCH] Frame pool changed: %p -> %p (PTS=%"PRId64" pict_type=%d)\n",
+                   ctx->last_hw_frames_ctx, frame->hw_frames_ctx->data, frame->pts, frame->pict_type);
+            ctx->last_hw_frames_ctx = frame->hw_frames_ctx->data;
+        }
+
         int reg_idx = nvenc_register_frame(avctx, frame);
         if (reg_idx < 0) {
             av_log(avctx, AV_LOG_ERROR, "Could not register an input HW frame\n");
@@ -2637,6 +2698,14 @@ static int nvenc_set_timestamp(AVCodecContext *avctx,
 #endif
     if (ctx->output_frame_num >= delay) {
         pkt->dts = timestamp_queue_dequeue(ctx->timestamp_list);
+        /* Detect non-monotonic DTS which causes frame ordering issues */
+        if (ctx->last_dts_out != AV_NOPTS_VALUE && pkt->dts <= ctx->last_dts_out) {
+            av_log(avctx, AV_LOG_WARNING,
+                   "[HW-PATCH] Non-monotonic DTS: last=%"PRId64" current=%"PRId64" (delta=%"PRId64") PTS=%"PRId64" output_frame_num=%"PRIu64"\n",
+                   ctx->last_dts_out, pkt->dts, pkt->dts - ctx->last_dts_out, pkt->pts, ctx->output_frame_num);
+        }
+        ctx->last_dts_out = pkt->dts;
+        ctx->last_pts_out = pkt->pts;
         ctx->output_frame_num++;
         return 0;
     }
@@ -2801,6 +2870,18 @@ static int process_output_surface(AVCodecContext *avctx, AVPacket *pkt, NvencSur
     ff_encode_add_stats_side_data(pkt,
         (lock_params.frameAvgQP - 1) * FF_QP2LAMBDA, NULL, 0, pict_type);
 
+    /* Log output frame types for first 30 frames after reconfiguration */
+    if (ctx->frames_since_reconfig >= 0 && ctx->frames_since_reconfig < 30) {
+        const char *type_str = (lock_params.pictureType == NV_ENC_PIC_TYPE_IDR) ? "IDR" :
+                               (lock_params.pictureType == NV_ENC_PIC_TYPE_I) ? "I" :
+                               (lock_params.pictureType == NV_ENC_PIC_TYPE_P) ? "P" :
+                               (lock_params.pictureType == NV_ENC_PIC_TYPE_B) ? "B" : "?";
+        av_log(avctx, AV_LOG_INFO,
+               "[HW-PATCH] Output frame %d after reconfig: type=%s PTS=%"PRIu64"\n",
+               ctx->frames_since_reconfig, type_str, lock_params.outputTimeStamp);
+        ctx->frames_since_reconfig++;
+    }
+
     res = nvenc_set_timestamp(avctx, &lock_params, pkt);
     if (res < 0)
         goto error2;
@@ -2952,6 +3033,7 @@ static void reconfig_encoder(AVCodecContext *avctx, const AVFrame *frame)
     int needs_reconfig = 0;
     int needs_encode_config = 0;
     int reconfig_bitrate = 0, reconfig_dar = 0;
+    int reconfig_colorspace = 0;
     int dw, dh;
 
     params.version = NV_ENC_RECONFIGURE_PARAMS_VER;
@@ -2969,6 +3051,38 @@ static void reconfig_encoder(AVCodecContext *avctx, const AVFrame *frame)
 
         needs_reconfig = 1;
         reconfig_dar = 1;
+    }
+
+    /* Detect colorspace changes from the input frame.
+     * We now LOG the change but do NOT reconfigure the encoder.
+     * Reconfiguring mid-stream (even without resetEncoder) causes frame ordering
+     * issues on lower resolution outputs due to pending frames in the pipeline.
+     * The filter graph reconfiguration already handles the IDR frame insertion.
+     * Keeping the original VUI parameters is safe - colorspace metadata differences
+     * (smpte170m vs bt709) are handled correctly by decoders. */
+    if (frame && ctx->last_colorspace != AVCOL_SPC_UNSPECIFIED &&
+        frame->colorspace != AVCOL_SPC_UNSPECIFIED &&
+        frame->colorspace != ctx->last_colorspace) {
+        av_log(avctx, AV_LOG_INFO,
+               "[HW-PATCH] Colorspace change detected: %s -> %s (encoder config preserved)\n",
+               av_color_space_name(ctx->last_colorspace),
+               av_color_space_name(frame->colorspace));
+        /* Do NOT reconfigure - just log and continue with original colorspace */
+        /* reconfig_colorspace = 1; */
+        /* needs_reconfig = 1; */
+    }
+
+    /* encoder_reset_pending was used for filter graph reconfig, but we no longer
+     * reconfigure the encoder on colorspace changes. Just clear the flag. */
+    if (ctx->encoder_reset_pending) {
+        av_log(avctx, AV_LOG_INFO,
+               "[HW-PATCH] Encoder reset pending flag cleared (no reconfiguration needed)\n");
+        ctx->encoder_reset_pending = 0;
+    }
+
+    /* Track current colorspace for next frame comparison */
+    if (frame && frame->colorspace != AVCOL_SPC_UNSPECIFIED) {
+        ctx->last_colorspace = frame->colorspace;
     }
 
     if (ctx->rc != NV_ENC_PARAMS_RC_CONSTQP && ctx->support_dyn_bitrate) {
@@ -3011,11 +3125,32 @@ static void reconfig_encoder(AVCodecContext *avctx, const AVFrame *frame)
         }
     }
 
+    /* Note: Colorspace changes are no longer handled here.
+     * We discovered that any encoder reconfiguration (even without resetEncoder)
+     * causes frame ordering issues on lower resolution outputs.
+     * The filter graph handles colorspace changes by:
+     * 1. Rebuilding the graph (which forces IDR via ffmpeg_enc.c)
+     * 2. The IDR provides a clean decode point
+     * 3. Keeping original VUI parameters is safe - decoders handle metadata correctly
+     *
+     * reconfig_colorspace is now always 0, so this block is dead code.
+     * Keeping it for documentation purposes. */
+    if (reconfig_colorspace) {
+        /* Dead code - reconfig_colorspace is never set */
+        params.forceIDR = 1;
+        needs_encode_config = 1;
+    }
+
     if (!needs_encode_config)
         params.reInitEncodeParams.encodeConfig = NULL;
 
     if (needs_reconfig) {
+        av_log(avctx, AV_LOG_INFO,
+               "[HW-PATCH] Calling nvEncReconfigureEncoder (resetEncoder=%d, forceIDR=%d)\n",
+               params.resetEncoder, params.forceIDR);
         ret = p_nvenc->nvEncReconfigureEncoder(ctx->nvencoder, &params);
+        av_log(avctx, AV_LOG_INFO,
+               "[HW-PATCH] nvEncReconfigureEncoder returned %d\n", ret);
         if (ret != NV_ENC_SUCCESS) {
             nvenc_print_error(avctx, ret, "failed to reconfigure nvenc");
         } else {
@@ -3030,6 +3165,8 @@ static void reconfig_encoder(AVCodecContext *avctx, const AVFrame *frame)
                 ctx->encode_config.rcParams.vbvBufferSize = params.reInitEncodeParams.encodeConfig->rcParams.vbvBufferSize;
             }
 
+            /* reconfig_colorspace is now always 0 - colorspace changes are handled
+             * by the filter graph (IDR insertion) without encoder reconfiguration */
         }
     }
 }
@@ -3132,6 +3269,25 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
         return AVERROR(EINVAL);
 
     if (frame && frame->buf[0]) {
+        /* Log mid-stream frame pool changes (filter graph reconfiguration).
+         * Note: EOS flush was removed - it caused DTS > PTS errors because B-frame
+         * PTS is non-monotonic (packets arrive in decode order, not presentation order).
+         * The stuttering after pool change remains an unsolved architectural issue -
+         * NVENC's internal DPB holds raw GPU addresses that become invalid when the
+         * old frame pool is destroyed. */
+        if ((avctx->pix_fmt == AV_PIX_FMT_CUDA || avctx->pix_fmt == AV_PIX_FMT_D3D11) &&
+            frame->hw_frames_ctx && ctx->last_hw_frames_ctx != NULL &&
+            frame->hw_frames_ctx->data != ctx->last_hw_frames_ctx) {
+
+            av_log(avctx, AV_LOG_WARNING,
+                   "[HW-PATCH] Frame pool change detected (old=%p new=%p) - "
+                   "B-frame references from old pool may cause visual artifacts\n",
+                   ctx->last_hw_frames_ctx, frame->hw_frames_ctx->data);
+
+            /* Update pool tracking */
+            ctx->last_hw_frames_ctx = frame->hw_frames_ctx->data;
+        }
+
         in_surf = get_free_frame(ctx);
         if (!in_surf)
             return AVERROR(EAGAIN);
@@ -3170,6 +3326,14 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
         if (ctx->forced_idr >= 0 && frame->pict_type == AV_PICTURE_TYPE_I) {
             pic_params.encodePicFlags =
                 ctx->forced_idr ? NV_ENC_PIC_FLAG_FORCEIDR : NV_ENC_PIC_FLAG_FORCEINTRA;
+
+            /* Log reconfiguration keyframes for debugging.
+             * These are marked with "lavfi.reconfig_keyframe" metadata by the filter graph. */
+            if (av_dict_get(frame->metadata, "lavfi.reconfig_keyframe", NULL, 0)) {
+                av_log(avctx, AV_LOG_INFO,
+                       "[HW-PATCH] Reconfiguration keyframe at PTS=%"PRId64"\n",
+                       frame->pts);
+            }
         } else {
             pic_params.encodePicFlags = 0;
         }

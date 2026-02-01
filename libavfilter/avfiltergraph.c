@@ -614,7 +614,12 @@ retry:
              */
             for (k = num_conv - 1; k >= 0; k--) {
                 const AVFilter *filter;
+                const char *filter_name = conv_filters[k];
                 char inst_name[30];
+
+                av_log(log_ctx, AV_LOG_INFO,
+                       "[HW-PATCH] Auto-inserting conversion filter '%s' between '%s' and '%s'\n",
+                       filter_name, link->src->name, link->dst->name);
 
                 if (fffiltergraph(graph)->disable_auto_convert) {
                     av_log(log_ctx, AV_LOG_ERROR,
@@ -625,15 +630,112 @@ retry:
                     return AVERROR(EINVAL);
                 }
 
-                if (!(filter = avfilter_get_by_name(conv_filters[k]))) {
+                /* For video format conversion, check if we need a hardware-aware filter.
+                 * When formats include hardware pixel formats (CUDA, VideoToolbox, etc.),
+                 * use the appropriate hardware filter to avoid CPU fallback.
+                 *
+                 * Different conversion types need different handling:
+                 * - Pixel format conversion: scale_cuda (CUDA) or scale_vt (VideoToolbox)
+                 * - Colorspace conversion: NOT supported by CUDA filters, use software path
+                 * - Color range conversion: colorspace_cuda (CUDA) - but limited support
+                 *
+                 * Note: colorspace_cuda only supports range (tv/pc) conversion, not
+                 * actual colorspace (bt709/smpte170m) conversion.
+                 */
+                if (link->type == AVMEDIA_TYPE_VIDEO && !strcmp(filter_name, "scale")) {
+                    AVFilterFormats *fmts_in  = link->incfg.formats;
+                    AVFilterFormats *fmts_out = link->outcfg.formats;
+                    enum AVPixelFormat hw_fmt = AV_PIX_FMT_NONE;
+                    unsigned i;
+                    int is_colorspace_conversion = 0;
+
+                    /* Determine what type of conversion this is by checking the merger.
+                     * The mergers array for video is: [0]=pixel_fmt, [1]=colorspace, [2]=color_range, [3]=alpha
+                     * If merger name contains "Color" it's colorspace/range conversion */
+                    if (k < num_mergers && mergers[k]) {
+                        const char *merger_name = mergers[k]->name;
+                        if (merger_name && (strstr(merger_name, "Color") || strstr(merger_name, "color"))) {
+                            is_colorspace_conversion = 1;
+                            av_log(log_ctx, AV_LOG_INFO,
+                                   "[HW-PATCH] Phase1: Detected colorspace/range conversion (merger: %s)\n",
+                                   merger_name);
+                        }
+                    }
+
+                    /* Check source filter's output formats for hardware formats */
+                    if (fmts_in) {
+                        for (i = 0; i < fmts_in->nb_formats; i++) {
+                            const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(fmts_in->formats[i]);
+                            if (desc && (desc->flags & AV_PIX_FMT_FLAG_HWACCEL)) {
+                                hw_fmt = fmts_in->formats[i];
+                                break;
+                            }
+                        }
+                    }
+
+                    /* Check destination filter's input formats if source wasn't hardware */
+                    if (hw_fmt == AV_PIX_FMT_NONE && fmts_out) {
+                        for (i = 0; i < fmts_out->nb_formats; i++) {
+                            const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(fmts_out->formats[i]);
+                            if (desc && (desc->flags & AV_PIX_FMT_FLAG_HWACCEL)) {
+                                hw_fmt = fmts_out->formats[i];
+                                break;
+                            }
+                        }
+                    }
+
+                    /* Use hardware-aware filter if hardware format detected */
+                    if (hw_fmt != AV_PIX_FMT_NONE) {
+                        const char *hw_filter = NULL;
+
+                        /* Choose appropriate CUDA filter based on conversion type */
+                        if (hw_fmt == AV_PIX_FMT_CUDA) {
+                            if (is_colorspace_conversion) {
+                                /* CUDA filters cannot do colorspace conversion (bt709<->smpte170m).
+                                 * colorspace_cuda only handles color range (tv/pc), not colorspace.
+                                 * Let FFmpeg use software path for colorspace conversion. */
+                                av_log(log_ctx, AV_LOG_INFO,
+                                       "[HW-PATCH] Phase1: Colorspace conversion in CUDA pipeline - "
+                                       "CUDA cannot convert colorspace, skipping hardware filter "
+                                       "(link '%s' -> '%s')\n",
+                                       link->src->name, link->dst->name);
+                                /* Don't set hw_filter - let FFmpeg use default software path */
+                            } else {
+                                /* Pixel format conversion can use scale_cuda */
+                                hw_filter = ff_get_video_conversion_filter(hw_fmt);
+                            }
+                        } else {
+                            /* Non-CUDA hardware formats (VideoToolbox, etc.) */
+                            hw_filter = ff_get_video_conversion_filter(hw_fmt);
+                        }
+
+                        if (hw_filter && strcmp(hw_filter, "scale")) {
+                            av_log(log_ctx, AV_LOG_INFO,
+                                   "[HW-PATCH] Phase1: Using hardware filter '%s' instead of 'scale' "
+                                   "(detected hw format: %s) for link '%s' -> '%s'\n",
+                                   hw_filter, av_get_pix_fmt_name(hw_fmt),
+                                   link->src->name, link->dst->name);
+                            filter_name = hw_filter;
+                        } else if (!hw_filter) {
+                            av_log(log_ctx, AV_LOG_INFO,
+                                   "[HW-PATCH] Phase1: Hardware format %s detected but no suitable hw filter, using 'scale'\n",
+                                   av_get_pix_fmt_name(hw_fmt));
+                        }
+                    } else {
+                        av_log(log_ctx, AV_LOG_INFO,
+                               "[HW-PATCH] Phase1: No hardware format detected, using software 'scale'\n");
+                    }
+                }
+
+                if (!(filter = avfilter_get_by_name(filter_name))) {
                     av_log(log_ctx, AV_LOG_ERROR,
                            "'%s' filter not present, cannot convert formats.\n",
-                           conv_filters[k]);
+                           filter_name);
                     print_link_formats(log_ctx, AV_LOG_ERROR, link, mergers, num_mergers);
                     return AVERROR(EINVAL);
                 }
                 snprintf(inst_name, sizeof(inst_name), "auto_%s_%d",
-                         conv_filters[k], converter_count++);
+                         filter_name, converter_count++);
                 ret = avfilter_graph_create_filter(&conv[k], filter, inst_name,
                                                    conv_opts[k], NULL, graph);
                 if (ret < 0)
