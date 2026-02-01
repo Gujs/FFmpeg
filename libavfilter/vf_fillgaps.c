@@ -27,9 +27,9 @@
  * it duplicates the last frame to fill the gap, maintaining continuous output.
  */
 
+#include "libavutil/internal.h"
 #include "libavutil/opt.h"
 #include "libavutil/time.h"
-#include "libavutil/imgutils.h"
 #include "avfilter.h"
 #include "filters.h"
 #include "video.h"
@@ -81,7 +81,8 @@ static av_cold void uninit(AVFilterContext *ctx)
 static int config_input(AVFilterLink *inlink)
 {
     FillGapsContext *s = inlink->dst->priv;
-    AVRational frame_rate = inlink->frame_rate;
+    FilterLink *il = ff_filter_link(inlink);
+    AVRational frame_rate = il->frame_rate;
 
     /* Calculate frame duration in stream timebase */
     if (frame_rate.num > 0 && frame_rate.den > 0) {
@@ -122,26 +123,43 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
         return ff_filter_frame(outlink, frame);
     }
 
-    /* Check for wall clock gap */
+    /* Check for gaps - either wall clock OR PTS based */
     int64_t wallclock_gap = now_us - s->last_wallclock;
+    int64_t pts_gap = frame->pts - s->last_pts;
+    int64_t expected_pts_gap = s->frame_duration * 2; /* Allow 1 frame tolerance */
 
-    if (wallclock_gap > s->threshold && s->last_frame) {
-        /* Gap detected - calculate how many frames to fill */
-        int64_t frame_dur_us = av_rescale_q(s->frame_duration, inlink->time_base,
-                                            (AVRational){1, 1000000});
-        if (frame_dur_us <= 0) frame_dur_us = 33333; /* fallback 30fps */
+    /*
+     * Detect gaps in two ways:
+     * 1. Wall clock gap > threshold (decoder stalled waiting for keyframe)
+     * 2. PTS gap > expected (frames dropped at decoder level, e.g. corrupt frames)
+     */
+    int wallclock_gap_detected = (wallclock_gap > s->threshold);
+    int pts_gap_detected = (pts_gap > expected_pts_gap);
 
-        int64_t gap_to_fill = wallclock_gap - s->threshold / 2;
-        if (gap_to_fill > s->max_fill) gap_to_fill = s->max_fill;
+    if ((wallclock_gap_detected || pts_gap_detected) && s->last_frame) {
+        /*
+         * Gap detected - calculate frames to fill based on PTS gap.
+         * This maintains A/V sync since audio PTS wasn't adjusted.
+         */
+        int64_t frames_to_fill = (pts_gap / s->frame_duration) - 1;
 
-        int64_t frames_to_fill = gap_to_fill / frame_dur_us;
+        /* Clamp to reasonable limits */
+        if (frames_to_fill < 0) frames_to_fill = 0;
         if (frames_to_fill > 900) frames_to_fill = 900; /* safety limit */
+
+        /* Also check against max_fill in time units */
+        int64_t max_fill_frames = av_rescale_q(s->max_fill, (AVRational){1, 1000000}, inlink->time_base) / s->frame_duration;
+        if (frames_to_fill > max_fill_frames) frames_to_fill = max_fill_frames;
 
         if (frames_to_fill > 0) {
             av_log(ctx, AV_LOG_WARNING,
-                   "[FILLGAPS] Detected %"PRId64"ms wall clock gap, "
+                   "[FILLGAPS] Gap detected: wallclock=%"PRId64"ms%s, PTS=%"PRId64"ms%s, "
                    "filling with %"PRId64" duplicate frames\n",
-                   wallclock_gap / 1000, frames_to_fill);
+                   wallclock_gap / 1000,
+                   wallclock_gap_detected ? " (TRIGGERED)" : "",
+                   av_rescale_q(pts_gap, inlink->time_base, (AVRational){1, 1000}),
+                   pts_gap_detected ? " (TRIGGERED)" : "",
+                   frames_to_fill);
 
             int64_t fill_pts = s->last_pts + s->frame_duration;
 
@@ -153,9 +171,6 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
                 }
 
                 dup->pts = fill_pts;
-                #if FF_API_PKT_DURATION
-                dup->pkt_duration = s->frame_duration;
-                #endif
                 dup->duration = s->frame_duration;
 
                 ret = ff_filter_frame(outlink, dup);
@@ -171,12 +186,12 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
                 fill_pts += s->frame_duration;
             }
 
-            /* Adjust incoming frame's PTS to continue after fill frames */
-            frame->pts = fill_pts;
-
+            /* Do NOT adjust incoming frame's PTS - keep original for A/V sync */
             av_log(ctx, AV_LOG_WARNING,
-                   "[FILLGAPS] Filled %"PRId64" frames, adjusted incoming PTS to %"PRId64"\n",
-                   frames_to_fill, frame->pts);
+                   "[FILLGAPS] Filled %"PRId64" frames (PTS %"PRId64" to %"PRId64"), "
+                   "incoming frame PTS %"PRId64"\n",
+                   frames_to_fill, s->last_pts + s->frame_duration,
+                   fill_pts - s->frame_duration, frame->pts);
         }
     }
 
