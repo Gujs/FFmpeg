@@ -244,8 +244,37 @@ static void stream_update_ts(SyncQueue *sq, unsigned int stream_idx, int64_t ts)
 {
     SyncQueueStream *st = &sq->streams[stream_idx];
 
-    if (ts == AV_NOPTS_VALUE ||
-        (st->head_ts != AV_NOPTS_VALUE && st->head_ts >= ts))
+    if (ts == AV_NOPTS_VALUE)
+        return;
+
+    /* Handle timestamp discontinuities: if timestamp jumped backwards
+     * significantly (more than 1 second), it's likely due to a stream
+     * discontinuity where timestamps were adjusted. Reset head_ts for
+     * all streams to allow the sync queue to continue processing. */
+    if (st->head_ts != AV_NOPTS_VALUE && ts < st->head_ts) {
+        int64_t delta_us = av_rescale_q(st->head_ts - ts, st->tb, AV_TIME_BASE_Q);
+        if (delta_us > 1LL * AV_TIME_BASE) {
+            av_log(sq->logctx, AV_LOG_WARNING,
+                   "sync queue: stream %u timestamp discontinuity "
+                   "(jumped back %"PRId64"s), resetting all streams\n",
+                   stream_idx, delta_us / AV_TIME_BASE);
+            av_log(sq->logctx, AV_LOG_INFO,
+                   "[DISCONT-DIAG] Sync queue reset triggered: stream %u, old_ts=%"PRId64", new_ts=%"PRId64", "
+                   "delta=%"PRId64"s, nb_streams=%u\n",
+                   stream_idx, st->head_ts, ts, delta_us / AV_TIME_BASE, sq->nb_streams);
+            /* Reset head_ts for ALL streams to avoid deadlock where some
+             * streams have old high timestamps and others have new low ones */
+            for (unsigned int i = 0; i < sq->nb_streams; i++) {
+                sq->streams[i].head_ts = AV_NOPTS_VALUE;
+            }
+            sq->head_stream = -1;
+        } else {
+            /* Small backwards jump - ignore as before */
+            return;
+        }
+    }
+
+    if (st->head_ts != AV_NOPTS_VALUE && st->head_ts >= ts)
         return;
 
     st->head_ts = ts;
