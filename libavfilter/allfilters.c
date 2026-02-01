@@ -292,6 +292,7 @@ extern const FFFilter ff_vf_fieldhint;
 extern const FFFilter ff_vf_fieldmatch;
 extern const FFFilter ff_vf_fieldorder;
 extern const FFFilter ff_vf_fillborders;
+extern const FFFilter ff_vf_fillgaps;
 extern const FFFilter ff_vf_find_rect;
 extern const FFFilter ff_vf_flip_vulkan;
 extern const FFFilter ff_vf_floodfill;
