@@ -1322,3 +1322,43 @@ int ff_formats_check_channel_layouts(void *log, const AVFilterChannelLayouts *fm
     }
     return 0;
 }
+
+const char *ff_get_video_conversion_filter(enum AVPixelFormat fmt)
+{
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(fmt);
+
+    /* Check if this is a hardware format */
+    if (desc && (desc->flags & AV_PIX_FMT_FLAG_HWACCEL)) {
+        switch (fmt) {
+        case AV_PIX_FMT_CUDA:
+            if (avfilter_get_by_name("scale_cuda"))
+                return "scale_cuda";
+            break;
+        case AV_PIX_FMT_VIDEOTOOLBOX:
+            if (avfilter_get_by_name("scale_vt"))
+                return "scale_vt";
+            break;
+        case AV_PIX_FMT_QSV:
+            if (avfilter_get_by_name("scale_qsv"))
+                return "scale_qsv";
+            break;
+        case AV_PIX_FMT_VAAPI:
+            if (avfilter_get_by_name("scale_vaapi"))
+                return "scale_vaapi";
+            break;
+        case AV_PIX_FMT_D3D11:
+            if (avfilter_get_by_name("scale_d3d11"))
+                return "scale_d3d11";
+            break;
+        case AV_PIX_FMT_VULKAN:
+            if (avfilter_get_by_name("scale_vulkan"))
+                return "scale_vulkan";
+            break;
+        default:
+            break;
+        }
+    }
+
+    /* Default to CPU scale filter */
+    return "scale";
+}

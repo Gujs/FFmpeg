@@ -36,6 +36,7 @@
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/pixfmt.h"
+#include "libavutil/hwcontext.h"
 #include "libavutil/samplefmt.h"
 #include "libavutil/time.h"
 #include "libavutil/timestamp.h"
@@ -244,6 +245,10 @@ typedef struct OutputFilterPriv {
     FPSConvContext          fps;
 
     unsigned                flags;
+
+    // Counter for forcing IDR frames after filter graph reconfiguration.
+    // Multiple IDR frames can help flush encoder's lookahead buffer.
+    int                     force_keyframe_count;
 } OutputFilterPriv;
 
 static OutputFilterPriv *ofp_from_ofilter(OutputFilter *ofilter)
@@ -1590,6 +1595,113 @@ static int insert_trim(void *logctx, int64_t start_time, int64_t duration,
     return 0;
 }
 
+/**
+ * Detect hardware acceleration type by examining filter names in the chain.
+ * Returns the hardware pixel format if a hardware filter is found,
+ * AV_PIX_FMT_NONE otherwise.
+ *
+ * This works at filter creation time before format negotiation,
+ * by looking at the filter names rather than negotiated formats.
+ */
+static enum AVPixelFormat detect_hw_accel_from_filter_chain(AVFilterContext *ctx)
+{
+    AVFilterContext *cur;
+    int visited = 0;
+    const int max_depth = 32;  /* Prevent infinite loops */
+
+    av_log(ctx, AV_LOG_INFO, "[HW-PATCH] detect_hw_accel: starting from filter '%s'\n",
+           ctx ? ctx->filter->name : "NULL");
+
+    /* Walk back through the filter chain looking for hardware filter names */
+    for (cur = ctx; cur && visited < max_depth; visited++) {
+        const char *name = cur->filter->name;
+
+        av_log(cur, AV_LOG_INFO, "[HW-PATCH] detect_hw_accel: examining filter[%d] '%s'\n",
+               visited, name);
+
+        /* Check for CUDA filters */
+        if (strstr(name, "_cuda") || strstr(name, "hwupload_cuda") ||
+            strstr(name, "hwdownload_cuda")) {
+            av_log(cur, AV_LOG_INFO, "[HW-PATCH] detect_hw_accel: found CUDA filter '%s'\n", name);
+            return AV_PIX_FMT_CUDA;
+        }
+
+        /* Check for VideoToolbox filters */
+        if (strstr(name, "_vt") || strstr(name, "_videotoolbox") ||
+            strstr(name, "hwupload_videotoolbox"))
+            return AV_PIX_FMT_VIDEOTOOLBOX;
+
+        /* Check for QSV filters */
+        if (strstr(name, "_qsv") || strstr(name, "hwupload_qsv"))
+            return AV_PIX_FMT_QSV;
+
+        /* Check for VAAPI filters */
+        if (strstr(name, "_vaapi") || strstr(name, "hwupload_vaapi"))
+            return AV_PIX_FMT_VAAPI;
+
+        /* Check for D3D11 filters */
+        if (strstr(name, "_d3d11"))
+            return AV_PIX_FMT_D3D11;
+
+        /* Check for Vulkan filters */
+        if (strstr(name, "_vulkan") || strstr(name, "hwupload_vulkan"))
+            return AV_PIX_FMT_VULKAN;
+
+        /* Move to the first input filter if available */
+        if (cur->nb_inputs > 0 && cur->inputs[0])
+            cur = cur->inputs[0]->src;
+        else {
+            av_log(ctx, AV_LOG_INFO, "[HW-PATCH] detect_hw_accel: reached end of chain (no more inputs)\n");
+            break;
+        }
+    }
+
+    av_log(ctx, AV_LOG_INFO, "[HW-PATCH] detect_hw_accel: no hardware filter found, returning NONE\n");
+    return AV_PIX_FMT_NONE;
+}
+
+/**
+ * Get the appropriate scale filter for a given pixel format.
+ * Returns hardware-specific scale filter for hardware formats,
+ * or "scale" for software formats.
+ */
+static const char *get_scale_filter_for_format(enum AVPixelFormat fmt)
+{
+    if (fmt == AV_PIX_FMT_NONE)
+        return "scale";
+
+    switch (fmt) {
+    case AV_PIX_FMT_CUDA:
+        if (avfilter_get_by_name("scale_cuda"))
+            return "scale_cuda";
+        break;
+    case AV_PIX_FMT_VIDEOTOOLBOX:
+        if (avfilter_get_by_name("scale_vt"))
+            return "scale_vt";
+        break;
+    case AV_PIX_FMT_QSV:
+        if (avfilter_get_by_name("scale_qsv"))
+            return "scale_qsv";
+        break;
+    case AV_PIX_FMT_VAAPI:
+        if (avfilter_get_by_name("scale_vaapi"))
+            return "scale_vaapi";
+        break;
+    case AV_PIX_FMT_D3D11:
+        if (avfilter_get_by_name("scale_d3d11"))
+            return "scale_d3d11";
+        break;
+    case AV_PIX_FMT_VULKAN:
+        if (avfilter_get_by_name("scale_vulkan"))
+            return "scale_vulkan";
+        break;
+    default:
+        break;
+    }
+
+    return "scale";
+}
+
 static int insert_filter(AVFilterContext **last_filter, int *pad_idx,
                          const char *filter_name, const char *args)
 {
@@ -1625,6 +1737,12 @@ static int configure_output_video_filter(FilterGraphPriv *fgp, AVFilterGraph *gr
     int pad_idx = out->pad_idx;
     int ret;
     char name[255];
+
+    av_log(ofilter, AV_LOG_INFO,
+           "[HW-PATCH] configure_output_video_filter called for output '%s' "
+           "(last_filter=%s, width=%d, height=%d, autoscale=%d)\n",
+           ofilter->output_name, last_filter ? last_filter->filter->name : "NULL",
+           ofp->width, ofp->height, !!(ofp->flags & OFILTER_FLAG_AUTOSCALE));
 
     snprintf(name, sizeof(name), "out_%s", ofilter->output_name);
     ret = avfilter_graph_create_filter(&ofilter->filter,
@@ -1686,6 +1804,10 @@ static int configure_output_video_filter(FilterGraphPriv *fgp, AVFilterGraph *gr
         AVFilterContext *filter;
         const AVDictionaryEntry *e = NULL;
 
+        av_log(ofilter, AV_LOG_INFO,
+               "[HW-PATCH] Phase2: Creating scaler_out (width=%d, height=%d, autoscale=1)\n",
+               ofp->width, ofp->height);
+
         snprintf(args, sizeof(args), "%d:%d",
                  ofp->width, ofp->height);
 
@@ -1694,9 +1816,46 @@ static int configure_output_video_filter(FilterGraphPriv *fgp, AVFilterGraph *gr
         }
 
         snprintf(name, sizeof(name), "scaler_out_%s", ofilter->output_name);
-        if ((ret = avfilter_graph_create_filter(&filter, avfilter_get_by_name("scale"),
-                                                name, args, NULL, graph)) < 0)
-            return ret;
+
+        /* Select appropriate scale filter based on input pipeline type.
+         * For hardware pipelines (CUDA, VideoToolbox, etc.), use the
+         * corresponding hardware scale filter to avoid format conversion issues.
+         * We detect hardware usage by examining filter names since format
+         * negotiation hasn't happened yet at this point. */
+        {
+            enum AVPixelFormat hw_fmt = detect_hw_accel_from_filter_chain(last_filter);
+            const char *scale_filter_name = get_scale_filter_for_format(hw_fmt);
+            const AVFilter *scale_filter = avfilter_get_by_name(scale_filter_name);
+
+            av_log(ofilter, AV_LOG_INFO,
+                   "[HW-PATCH] Phase2: detect_hw_accel returned %s, selected filter: %s\n",
+                   hw_fmt != AV_PIX_FMT_NONE ? av_get_pix_fmt_name(hw_fmt) : "none",
+                   scale_filter_name);
+
+            if (!scale_filter) {
+                av_log(ofilter, AV_LOG_INFO,
+                       "[HW-PATCH] Phase2: Scale filter '%s' not found, falling back to 'scale'\n",
+                       scale_filter_name);
+                scale_filter = avfilter_get_by_name("scale");
+                if (!scale_filter)
+                    return AVERROR_FILTER_NOT_FOUND;
+            }
+
+            if (hw_fmt != AV_PIX_FMT_NONE) {
+                av_log(ofilter, AV_LOG_INFO,
+                       "[HW-PATCH] Phase2: Using hardware scale filter '%s' for scaler_out_%s "
+                       "(detected hw format: %s)\n",
+                       scale_filter_name, ofilter->output_name, av_get_pix_fmt_name(hw_fmt));
+            } else {
+                av_log(ofilter, AV_LOG_INFO,
+                       "[HW-PATCH] Phase2: Using software 'scale' for scaler_out_%s (no hw detected)\n",
+                       ofilter->output_name);
+            }
+
+            if ((ret = avfilter_graph_create_filter(&filter, scale_filter,
+                                                    name, args, NULL, graph)) < 0)
+                return ret;
+        }
         if ((ret = avfilter_link(last_filter, pad_idx, filter, 0)) < 0)
             return ret;
 
@@ -2071,6 +2230,29 @@ static int configure_filtergraph(FilterGraph *fg, FilterGraphThread *fgt)
     const char *graph_desc = fg->graph_desc;
 
     cleanup_filtergraph(fg, fgt);
+
+    /* Reset colorspace/range constraints before reconfiguration.
+     * This allows the filter graph to accept new input parameters
+     * without trying to convert back to the old colorspace.
+     * The values will be re-locked after successful configuration.
+     *
+     * Note: We reset both the single value (color_space) and the list
+     * (color_spaces) to ensure choose_color_spaces() returns early
+     * without adding any constraint to the format filter. */
+    for (int i = 0; i < fg->nb_outputs; i++) {
+        OutputFilterPriv *ofp = ofp_from_ofilter(fg->outputs[i]);
+        if (ofp->color_space != AVCOL_SPC_UNSPECIFIED) {
+            av_log(fg, AV_LOG_INFO,
+                   "[HW-PATCH] Resetting output %d colorspace constraint "
+                   "(was %s) for reconfiguration\n",
+                   i, av_color_space_name(ofp->color_space));
+        }
+        ofp->color_space = AVCOL_SPC_UNSPECIFIED;
+        ofp->color_spaces = NULL;  /* Clear list to avoid any constraint */
+        ofp->color_range = AVCOL_RANGE_UNSPECIFIED;
+        ofp->color_ranges = NULL;  /* Clear list to avoid any constraint */
+    }
+
     fgt->graph = avfilter_graph_alloc();
     if (!fgt->graph)
         return AVERROR(ENOMEM);
@@ -2226,6 +2408,29 @@ static int configure_filtergraph(FilterGraph *fg, FilterGraphThread *fgt)
         ret = avfilter_graph_request_oldest(fgt->graph);
         if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF)
             goto fail;
+    }
+
+    /* After filter graph (re)configuration, force IDR frame(s) to reset encoder
+     * state and clear B-frame references. This prevents visual glitches from
+     * stale references after colorspace/resolution changes.
+     *
+     * Default is 1 IDR frame. Can be increased via FFMPEG_RECONFIG_IDR_COUNT
+     * environment variable if encoder has deep lookahead buffer. */
+    {
+        const char *env_count = getenv("FFMPEG_RECONFIG_IDR_COUNT");
+        int idr_count = env_count ? atoi(env_count) : 1;
+        if (idr_count < 0) idr_count = 0;
+        if (idr_count > 100) idr_count = 100;
+
+        for (int i = 0; i < fg->nb_outputs; i++) {
+            OutputFilterPriv *ofp = ofp_from_ofilter(fg->outputs[i]);
+            if (ofp->ofilter.type == AVMEDIA_TYPE_VIDEO) {
+                ofp->force_keyframe_count = idr_count;
+                av_log(ofp, AV_LOG_INFO,
+                       "[HW-PATCH] Will force %d keyframe(s) after filter graph configuration\n",
+                       idr_count);
+            }
+        }
     }
 
     return 0;
@@ -2731,6 +2936,20 @@ static int fg_output_frame(OutputFilterPriv *ofp, FilterGraphThread *fgt,
             if (ofp->fps.dropped_keyframe) {
                 frame_out->flags |= AV_FRAME_FLAG_KEY;
                 ofp->fps.dropped_keyframe = 0;
+            }
+
+            /* Force keyframe(s) after filter graph reconfiguration to flush encoder
+             * lookahead buffer and reset B-frame references. */
+            if (ofp->force_keyframe_count > 0) {
+                frame_out->pict_type = AV_PICTURE_TYPE_I;
+                frame_out->flags |= AV_FRAME_FLAG_KEY;
+                /* Mark this as a reconfiguration keyframe so encoder can reset timing state.
+                 * This distinguishes it from regular source keyframes. */
+                av_dict_set(&frame_out->metadata, "lavfi.reconfig_keyframe", "1", 0);
+                ofp->force_keyframe_count--;
+                av_log(ofp, AV_LOG_INFO,
+                       "[HW-PATCH] Forcing keyframe after filter graph reconfiguration (%d remaining)\n",
+                       ofp->force_keyframe_count);
             }
         } else {
             frame->pts = (frame->pts == AV_NOPTS_VALUE) ? ofp->next_pts :

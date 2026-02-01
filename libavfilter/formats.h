@@ -661,4 +661,16 @@ typedef struct AVFilterNegotiation {
 
 const AVFilterNegotiation *ff_filter_get_negotiation(const AVFilterLink *link);
 
+/**
+ * Get the appropriate video conversion filter name for a pixel format.
+ *
+ * Returns hardware-specific scale filter for hardware formats (e.g., "scale_cuda"
+ * for AV_PIX_FMT_CUDA), or "scale" for software formats. This allows automatic
+ * conversion filters to stay on the hardware when possible.
+ *
+ * @param fmt the pixel format to get conversion filter for
+ * @return filter name string (static, do not free)
+ */
+const char *ff_get_video_conversion_filter(enum AVPixelFormat fmt);
+
 #endif /* AVFILTER_FORMATS_H */
