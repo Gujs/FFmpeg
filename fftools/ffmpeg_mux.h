@@ -90,6 +90,12 @@ typedef struct MuxStream {
     int             force_fps;
 
     const char     *apad;
+
+    /* Gap-fill state - uses existing last_mux_dts for DTS tracking */
+    AVPacket       *last_video_pkt;      /* Last keyframe for gap filling */
+    int64_t         expected_frame_dur;  /* Expected frame duration in stream timebase */
+    int             gap_fill_initialized;
+    uint64_t        gap_fill_count;      /* Total frames filled */
 } MuxStream;
 
 typedef struct Muxer {
