@@ -248,6 +248,7 @@ typedef struct NvencContext
         NV_ENC_REGISTERED_PTR regptr;
         int mapped;
         NV_ENC_MAP_INPUT_RESOURCE in_map;
+        AVBufferRef *hw_frames_ref;  // Track which frame pool this registration belongs to
     } registered_frames[MAX_REGISTERED_FRAMES];
     int nb_registered_frames;
 
@@ -321,6 +322,21 @@ typedef struct NvencContext
     int cbr_padding;
     int multiview, multiview_supported;
     int display_sei_sent;
+
+    // Track last frame's colorspace for detecting colorspace changes
+    // Used to trigger encoder reset when colorspace changes mid-stream
+    enum AVColorSpace last_colorspace;
+    int encoder_reset_pending;  // Set when encoder reset is needed
+
+    // Track last hw_frames_ctx to detect frame pool changes (diagnostic)
+    void *last_hw_frames_ctx;
+
+    // Track last DTS/PTS for detecting non-monotonic timestamps (diagnostic)
+    int64_t last_dts_out;
+    int64_t last_pts_out;
+
+    // Track frames after reconfiguration for diagnostics
+    int frames_since_reconfig;  // Count frames output since last reconfiguration
 } NvencContext;
 
 int ff_nvenc_encode_init(AVCodecContext *avctx);
