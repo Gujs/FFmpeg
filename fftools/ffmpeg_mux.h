@@ -96,6 +96,7 @@ typedef struct MuxStream {
     int64_t         expected_frame_dur;  /* Expected frame duration in stream timebase */
     int             gap_fill_initialized;
     uint64_t        gap_fill_count;      /* Total frames filled */
+    int64_t         last_pkt_wallclock;  /* Wall clock time of last packet (microseconds) */
 } MuxStream;
 
 typedef struct Muxer {
