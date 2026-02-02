@@ -229,7 +229,14 @@ static int process_frame(AVFilterContext *ctx, AVFrame *frame)
                    "[FILLGAPS] Exiting proactive mode after %"PRId64" frames "
                    "(input timing recovered)\n", s->proactive_frames);
             s->in_proactive_mode = 0;
-            /* Fall through to normal processing with adjusted state */
+
+            /* CRITICAL: Reset wall clock tracking to prevent false gap detection.
+             * Use the output_pts we've been maintaining, not the incoming frame's PTS. */
+            s->last_wallclock = now_us;
+            s->last_pts = s->output_pts - s->frame_duration;
+            s->last_output_time = now_us;
+
+            /* Fall through to normal processing with fresh state */
         } else {
             /* Still in proactive mode - use generated PTS */
             frame->pts = s->output_pts;
@@ -304,6 +311,12 @@ static int process_frame(AVFilterContext *ctx, AVFrame *frame)
         /*
          * If timestamps were rebased and proactive mode is enabled,
          * enter proactive mode for recovery period.
+         *
+         * In proactive mode, we DON'T bulk-fill frames here. Instead, we:
+         * 1. Enter proactive mode and set up the output_pts
+         * 2. Output just a few frames (up to 10) to start
+         * 3. Let activate() output the rest one at a time at wall-clock rate
+         * This prevents buffer buildup from dumping hundreds of frames at once.
          */
         if (timestamps_rebased && s->proactive) {
             av_log(ctx, AV_LOG_WARNING,
@@ -317,14 +330,18 @@ static int process_frame(AVFilterContext *ctx, AVFrame *frame)
             s->proactive_sessions++;
             s->recovery_wall_time = 0;
 
-            /* Fill based on wall clock, using generated timestamps */
+            /* Start output PTS from where we left off */
             s->output_pts = s->last_pts + s->frame_duration;
 
-            av_log(ctx, AV_LOG_WARNING,
-                   "[FILLGAPS] Proactive mode: filling %"PRId64" frames with generated PTS "
-                   "starting at %"PRId64"\n", frames_to_fill, s->output_pts);
+            /* Fill only a small burst (max 10 frames) to get started.
+             * activate() will output the rest at wall-clock rate. */
+            int64_t initial_fill = frames_to_fill > 10 ? 10 : frames_to_fill;
 
-            for (int64_t i = 0; i < frames_to_fill; i++) {
+            av_log(ctx, AV_LOG_INFO,
+                   "[FILLGAPS] Proactive mode: initial fill %"PRId64" frames, "
+                   "activate() will handle the rest at wall-clock rate\n", initial_fill);
+
+            for (int64_t i = 0; i < initial_fill; i++) {
                 ret = output_dup_frame(ctx, outlink, s, s->output_pts);
                 if (ret < 0) break;
                 s->output_pts += s->frame_duration;
@@ -341,6 +358,9 @@ static int process_frame(AVFilterContext *ctx, AVFrame *frame)
             s->last_wallclock = now_us;
             av_frame_free(&s->last_frame);
             s->last_frame = av_frame_clone(frame);
+
+            /* Schedule activate() to output more frames */
+            ff_filter_set_ready(ctx, 100);
 
             s->frames_out++;
             return ff_filter_frame(outlink, frame);
