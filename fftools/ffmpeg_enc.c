@@ -736,10 +736,15 @@ static enum AVPictureType forced_kf_apply(void *logctx, KeyframeForceCtx *kf,
 {
     double pts_time;
 
-    /* Preserve pict_type if already set to I-frame (e.g., from filter graph reconfiguration).
-     * This allows filter graph to force keyframes without requiring -force_key_frames source. */
-    if (frame->pict_type == AV_PICTURE_TYPE_I) {
-        return AV_PICTURE_TYPE_I;
+    /* Preserve pict_type if set to I-frame by our filter graph reconfiguration logic.
+     * Only honor the pict_type if our metadata marker is present, to avoid forcing
+     * I-frames from filters that set pict_type=I on composite/synthetic frames
+     * (e.g., overlay filter combining multiple sources). */
+    {
+        AVDictionaryEntry *e = av_dict_get(frame->metadata, "lavfi.reconfig_keyframe", NULL, 0);
+        if (e && frame->pict_type == AV_PICTURE_TYPE_I) {
+            return AV_PICTURE_TYPE_I;
+        }
     }
 
     if (kf->ref_pts == AV_NOPTS_VALUE)
