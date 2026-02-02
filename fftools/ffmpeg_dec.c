@@ -102,6 +102,9 @@ typedef struct DecoderPriv {
         AVDictionary       *opts;
         const AVCodec      *codec;
     } standalone_init;
+
+    // Track frames since last decoder flush for corrupt frame grace period
+    int64_t frames_since_flush;
 } DecoderPriv;
 
 static DecoderPriv *dp_from_dec(Decoder *d)
@@ -769,6 +772,9 @@ static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
             continue;
         }
 
+        /* Track frames since last flush for grace period */
+        dp->frames_since_flush++;
+
         if (frame->decode_error_flags || (frame->flags & AV_FRAME_FLAG_CORRUPT)) {
             av_log(dp, exit_on_error ? AV_LOG_FATAL : AV_LOG_WARNING,
                    "corrupt decoded frame\n");
@@ -777,13 +783,26 @@ static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
 
             /* Drop corrupt frames if FFMPEG_DROP_CORRUPT_FRAMES is set.
              * This creates a small gap in the output instead of encoding garbage.
-             * Downstream handling (vsync, gap-fill) may duplicate frames to fill. */
-            if (getenv("FFMPEG_DROP_CORRUPT_FRAMES")) {
+             * Downstream handling (vsync, gap-fill) may duplicate frames to fill.
+             *
+             * GRACE PERIOD: Don't drop corrupt frames for the first 10 frames after
+             * a decoder flush. After a discontinuity, the decoder needs reference
+             * frames to produce clean output - dropping early frames just makes
+             * the gap longer without benefit. */
+            #define CORRUPT_DROP_GRACE_FRAMES 10
+            if (getenv("FFMPEG_DROP_CORRUPT_FRAMES") &&
+                dp->frames_since_flush > CORRUPT_DROP_GRACE_FRAMES) {
                 av_log(dp, AV_LOG_INFO,
                        "[CORRUPT-DROP] Dropping corrupt frame (PTS=%"PRId64")\n",
                        frame->pts);
                 av_frame_unref(frame);
                 continue;
+            } else if (getenv("FFMPEG_DROP_CORRUPT_FRAMES") &&
+                       dp->frames_since_flush <= CORRUPT_DROP_GRACE_FRAMES) {
+                av_log(dp, AV_LOG_INFO,
+                       "[CORRUPT-DROP] Passing corrupt frame in grace period "
+                       "(frame %"PRId64"/%d after flush, PTS=%"PRId64")\n",
+                       dp->frames_since_flush, CORRUPT_DROP_GRACE_FRAMES, frame->pts);
             }
         }
 
@@ -990,6 +1009,7 @@ static int decoder_thread(void *arg)
             }
 
             avcodec_flush_buffers(dp->dec_ctx);
+            dp->frames_since_flush = 0;  // Reset grace period counter
         } else if (ret < 0) {
             av_log(dp, AV_LOG_ERROR, "Error processing packet in decoder: %s\n",
                    av_err2str(ret));
