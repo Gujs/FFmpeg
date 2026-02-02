@@ -157,6 +157,37 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
         int64_t max_fill_frames = s->max_fill / frame_dur_us;
         if (frames_to_fill > max_fill_frames) frames_to_fill = max_fill_frames;
 
+        /*
+         * CRITICAL: Don't fill past the incoming frame's PTS!
+         * After a discontinuity, wall clock gap can be large (decoder waiting
+         * for keyframe) but the PTS gap may be small (timestamps were rebased).
+         * Filling past the incoming frame causes PTS to go backwards.
+         */
+        if (frame->pts != AV_NOPTS_VALUE && s->last_pts != AV_NOPTS_VALUE &&
+            s->frame_duration > 0) {
+            int64_t pts_gap = frame->pts - s->last_pts;
+            if (pts_gap > 0) {
+                /* How many frames fit in the PTS gap (leave room for incoming frame) */
+                int64_t max_pts_frames = (pts_gap / s->frame_duration) - 1;
+                if (max_pts_frames < 0) max_pts_frames = 0;
+
+                if (frames_to_fill > max_pts_frames) {
+                    av_log(ctx, AV_LOG_INFO,
+                           "[FILLGAPS] Capping fill from %"PRId64" to %"PRId64" frames "
+                           "(wall=%"PRId64"ms but PTS gap=%"PRId64" allows only %"PRId64")\n",
+                           frames_to_fill, max_pts_frames,
+                           wallclock_gap / 1000, pts_gap, max_pts_frames);
+                    frames_to_fill = max_pts_frames;
+                }
+            } else {
+                /* PTS went backwards or stayed same - don't fill at all */
+                av_log(ctx, AV_LOG_INFO,
+                       "[FILLGAPS] Skipping fill: PTS gap=%"PRId64" (last=%"PRId64" incoming=%"PRId64")\n",
+                       pts_gap, s->last_pts, frame->pts);
+                frames_to_fill = 0;
+            }
+        }
+
         if (frames_to_fill > 0) {
             av_log(ctx, AV_LOG_WARNING,
                    "[FILLGAPS] Wall clock gap detected: %"PRId64"ms > threshold %"PRId64"ms, "
