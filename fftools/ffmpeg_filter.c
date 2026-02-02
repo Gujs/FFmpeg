@@ -3318,12 +3318,27 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
             need_reinit |= AUDIO_CHANGED;
         break;
     case AVMEDIA_TYPE_VIDEO:
-        /* Format, colorspace, etc. changes trigger immediately */
+        /* Format and alpha mode changes trigger immediately */
         if (ifp->format != frame->format ||
-            ifp->color_space != frame->colorspace ||
-            ifp->color_range != frame->color_range ||
             ifp->alpha_mode != frame->alpha_mode)
             need_reinit |= VIDEO_CHANGED;
+
+        /* Colorspace/range changes: DON'T trigger reconfiguration for HW pipelines.
+         * CUDA/VideoToolbox filters don't do colorspace conversion anyway.
+         * Reconfiguring destroys hw_frames_ctx causing B-frame reference issues.
+         * Just update tracked values and continue - output uses source colorspace. */
+        if (ifp->color_space != frame->colorspace ||
+            ifp->color_range != frame->color_range) {
+            av_log(fg, AV_LOG_INFO,
+                   "[HW-PATCH] Colorspace change detected: %s/%s -> %s/%s (no reconfig)\n",
+                   av_color_space_name(ifp->color_space),
+                   av_color_range_name(ifp->color_range),
+                   av_color_space_name(frame->colorspace),
+                   av_color_range_name(frame->color_range));
+            /* Update tracked values without triggering reconfiguration */
+            ifp->color_space = frame->colorspace;
+            ifp->color_range = frame->color_range;
+        }
 
         /* Resolution changes use hysteresis to filter out spurious changes from corruption.
          * Corrupted SPS can cause decoder to report wrong resolution for a few frames.
