@@ -3342,8 +3342,29 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
 
         /* Resolution changes use hysteresis to filter out spurious changes from corruption.
          * Corrupted SPS can cause decoder to report wrong resolution for a few frames.
-         * Require RESOLUTION_HYSTERESIS_FRAMES consecutive frames at new resolution. */
-        if (ifp->width != frame->width || ifp->height != frame->height) {
+         * Require RESOLUTION_HYSTERESIS_FRAMES consecutive NON-CORRUPT frames at new resolution.
+         *
+         * IMPORTANT: Corrupt frames are excluded from hysteresis counting because their
+         * resolution metadata is unreliable (may come from corrupted SPS/PPS data). */
+        int frame_is_corrupt = (frame->flags & AV_FRAME_FLAG_CORRUPT) != 0;
+
+        if (frame_is_corrupt && (ifp->width != frame->width || ifp->height != frame->height)) {
+            /* Corrupt frame with different resolution - don't trust it, reset hysteresis */
+            if (ifp->pending_width || ifp->pending_height) {
+                av_log(fg, AV_LOG_WARNING,
+                       "[HW-PATCH] Ignoring resolution from corrupt frame: %dx%d (keeping current %dx%d, "
+                       "was pending %dx%d with %d frames)\n",
+                       frame->width, frame->height, ifp->width, ifp->height,
+                       ifp->pending_width, ifp->pending_height, ifp->resolution_stable_count);
+            } else {
+                av_log(fg, AV_LOG_INFO,
+                       "[HW-PATCH] Ignoring resolution %dx%d from corrupt frame (current %dx%d)\n",
+                       frame->width, frame->height, ifp->width, ifp->height);
+            }
+            /* Reset any pending resolution change - corrupt data invalidates the sequence */
+            ifp->pending_width = ifp->pending_height = 0;
+            ifp->resolution_stable_count = 0;
+        } else if (ifp->width != frame->width || ifp->height != frame->height) {
             if (ifp->pending_width == frame->width && ifp->pending_height == frame->height) {
                 /* Same as pending resolution - increment counter */
                 ifp->resolution_stable_count++;
