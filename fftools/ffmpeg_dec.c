@@ -103,8 +103,9 @@ typedef struct DecoderPriv {
         const AVCodec      *codec;
     } standalone_init;
 
-    // Track frames since last decoder flush for corrupt frame grace period
-    int64_t frames_since_flush;
+    // Discontinuity diagnostics
+    int64_t frames_since_flush;     ///< frames decoded since last discontinuity flush
+    int64_t last_flush_time;        ///< wall clock time of last flush (microseconds)
 } DecoderPriv;
 
 static DecoderPriv *dp_from_dec(Decoder *d)
@@ -712,6 +713,58 @@ static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
     if (pkt && pkt->size == 0)
         return 0;
 
+    // Drain and flush decoder on timestamp discontinuity to clear stale reference frames
+    // First drain any pending frames, then flush to reset decoder state
+    if (pkt && (pkt->flags & AV_PKT_FLAG_DISCONTINUITY)) {
+        int64_t flush_start = av_gettime_relative();
+        int drained_count = 0;
+
+        av_log(dp, AV_LOG_INFO,
+               "[DISCONT] Discontinuity packet received for %s decoder (PTS=%"PRId64" DTS=%"PRId64"), "
+               "draining pending frames...\n",
+               type_desc, pkt->pts, pkt->dts);
+
+        // Drain pending frames from decoder before flushing
+        // These are frames from the previous segment that haven't been output yet
+        while (1) {
+            AVFrame *drain_frame = av_frame_alloc();
+            if (!drain_frame)
+                break;
+
+            int drain_ret = avcodec_receive_frame(dec, drain_frame);
+            if (drain_ret == AVERROR(EAGAIN) || drain_ret == AVERROR_EOF) {
+                av_frame_free(&drain_frame);
+                break;
+            }
+            if (drain_ret < 0) {
+                av_frame_free(&drain_frame);
+                break;
+            }
+
+            // Set time_base for the drained frame
+            drain_frame->time_base = dec->pkt_timebase;
+
+            // Send drained frame to scheduler (first output only)
+            drain_ret = sch_dec_send(dp->sch, dp->sch_idx, 0, drain_frame);
+            if (drain_ret < 0) {
+                av_frame_free(&drain_frame);
+                break;
+            }
+            drained_count++;
+        }
+
+        // Flush the decoder
+        avcodec_flush_buffers(dec);
+        dp->frames_since_flush = 0;
+        dp->last_flush_time = av_gettime_relative();
+
+        int64_t flush_duration = dp->last_flush_time - flush_start;
+        av_log(dp, AV_LOG_INFO,
+               "[DISCONT] %s decoder flushed: drained %d pending frames, took %"PRId64"us, "
+               "waiting for keyframe...\n",
+               type_desc, drained_count, flush_duration);
+    }
+
     if (pkt && (dp->flags & DECODER_FLAG_TS_UNRELIABLE)) {
         pkt->pts = AV_NOPTS_VALUE;
         pkt->dts = AV_NOPTS_VALUE;
@@ -772,38 +825,26 @@ static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
             continue;
         }
 
-        /* Track frames since last flush for grace period */
+        /* Track frames since last discontinuity flush */
         dp->frames_since_flush++;
+
+        /* Log first few frames after discontinuity for diagnostics */
+        if (dp->frames_since_flush <= 5) {
+            int64_t time_since_flush = av_gettime_relative() - dp->last_flush_time;
+            av_log(dp, AV_LOG_INFO,
+                   "[DISCONT] Post-flush frame %"PRId64": PTS=%"PRId64" key=%d corrupt=%d "
+                   "time_since_flush=%"PRId64"ms\n",
+                   dp->frames_since_flush, frame->pts,
+                   (frame->flags & AV_FRAME_FLAG_KEY) ? 1 : 0,
+                   (frame->decode_error_flags || (frame->flags & AV_FRAME_FLAG_CORRUPT)) ? 1 : 0,
+                   time_since_flush / 1000);
+        }
 
         if (frame->decode_error_flags || (frame->flags & AV_FRAME_FLAG_CORRUPT)) {
             av_log(dp, exit_on_error ? AV_LOG_FATAL : AV_LOG_WARNING,
                    "corrupt decoded frame\n");
             if (exit_on_error)
                 return AVERROR_INVALIDDATA;
-
-            /* Drop corrupt frames if FFMPEG_DROP_CORRUPT_FRAMES is set.
-             * This creates a small gap in the output instead of encoding garbage.
-             * Downstream handling (vsync, gap-fill) may duplicate frames to fill.
-             *
-             * GRACE PERIOD: Don't drop corrupt frames for the first 10 frames after
-             * a decoder flush. After a discontinuity, the decoder needs reference
-             * frames to produce clean output - dropping early frames just makes
-             * the gap longer without benefit. */
-            #define CORRUPT_DROP_GRACE_FRAMES 10
-            if (getenv("FFMPEG_DROP_CORRUPT_FRAMES") &&
-                dp->frames_since_flush > CORRUPT_DROP_GRACE_FRAMES) {
-                av_log(dp, AV_LOG_INFO,
-                       "[CORRUPT-DROP] Dropping corrupt frame (PTS=%"PRId64")\n",
-                       frame->pts);
-                av_frame_unref(frame);
-                continue;
-            } else if (getenv("FFMPEG_DROP_CORRUPT_FRAMES") &&
-                       dp->frames_since_flush <= CORRUPT_DROP_GRACE_FRAMES) {
-                av_log(dp, AV_LOG_INFO,
-                       "[CORRUPT-DROP] Passing corrupt frame in grace period "
-                       "(frame %"PRId64"/%d after flush, PTS=%"PRId64")\n",
-                       dp->frames_since_flush, CORRUPT_DROP_GRACE_FRAMES, frame->pts);
-            }
         }
 
         fd      = frame_data(frame);
@@ -1009,7 +1050,6 @@ static int decoder_thread(void *arg)
             }
 
             avcodec_flush_buffers(dp->dec_ctx);
-            dp->frames_since_flush = 0;  // Reset grace period counter
         } else if (ret < 0) {
             av_log(dp, AV_LOG_ERROR, "Error processing packet in decoder: %s\n",
                    av_err2str(ret));
