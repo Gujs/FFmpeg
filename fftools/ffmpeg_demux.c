@@ -231,7 +231,7 @@ static int seek_to_start(Demuxer *d, Timestamp end_pts)
 }
 
 static void ts_discontinuity_detect(Demuxer *d, InputStream *ist,
-                                    AVPacket *pkt)
+                                    AVPacket *pkt, FrameData *fd)
 {
     InputFile *ifile = &d->f;
     DemuxStream *ds = ds_from_ist(ist);
@@ -258,6 +258,8 @@ static void ts_discontinuity_detect(Demuxer *d, InputStream *ist,
                 ds->ts_offset_discont -= delta;
                 ds->discontinuity_detected = 1;
                 pkt->flags |= AV_PKT_FLAG_DISCONTINUITY;
+                if (fd)
+                    fd->discontinuity_delta = delta;
                 av_log(ist, AV_LOG_INFO,
                        "[DISCONT] Timestamp discontinuity: stream=%d delta=%"PRId64" (%.3fs) "
                        "prev_dts=%"PRId64" new_dts=%"PRId64" offset=%"PRId64"\n",
@@ -293,6 +295,8 @@ static void ts_discontinuity_detect(Demuxer *d, InputStream *ist,
             ds->ts_offset_discont -= delta;
             ds->discontinuity_detected = 1;
             pkt->flags |= AV_PKT_FLAG_DISCONTINUITY;
+            if (fd)
+                fd->discontinuity_delta = delta;
             av_log(ist, AV_LOG_INFO,
                    "[DISCONT] Inter-stream discontinuity: stream=%d delta=%"PRId64" (%.3fs) "
                    "last_ts=%"PRId64" new_dts=%"PRId64" offset=%"PRId64"\n",
@@ -308,7 +312,7 @@ static void ts_discontinuity_detect(Demuxer *d, InputStream *ist,
 }
 
 static void ts_discontinuity_process(Demuxer *d, InputStream *ist,
-                                     AVPacket *pkt)
+                                     AVPacket *pkt, FrameData *fd)
 {
     int64_t offset = av_rescale_q(d->ts_offset_discont, AV_TIME_BASE_Q,
                                   pkt->time_base);
@@ -325,7 +329,7 @@ static void ts_discontinuity_process(Demuxer *d, InputStream *ist,
     // This prevents A/V desync when audio and video see opposite-direction jumps
     if (ist->par->codec_type == AVMEDIA_TYPE_VIDEO &&
         pkt->dts != AV_NOPTS_VALUE)
-        ts_discontinuity_detect(d, ist, pkt);
+        ts_discontinuity_detect(d, ist, pkt, fd);
 }
 
 static int ist_dts_update(DemuxStream *ds, AVPacket *pkt, FrameData *fd)
@@ -469,7 +473,7 @@ static int ts_fixup(Demuxer *d, AVPacket *pkt, FrameData *fd)
     SHOW_TS_DEBUG("demuxer+tsfixup");
 
     // detect and try to correct for timestamp discontinuities
-    ts_discontinuity_process(d, ist, pkt);
+    ts_discontinuity_process(d, ist, pkt, fd);
 
     // update estimated/predicted dts
     ret = ist_dts_update(ds, pkt, fd);

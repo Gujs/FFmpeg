@@ -738,6 +738,10 @@ typedef struct FrameData {
 
     AVFrameSideData   **side_data;
     int                 nb_side_data;
+
+    // Discontinuity delta in AV_TIME_BASE units (set by demuxer)
+    // Used by decoder to decide if flush is needed (large delta = flush)
+    int64_t discontinuity_delta;
 } FrameData;
 
 extern InputFile   **input_files;

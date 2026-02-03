@@ -715,15 +715,32 @@ static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
     if (pkt && pkt->size == 0)
         return 0;
 
-    // Log timestamp discontinuity but DO NOT flush decoder
-    // Timestamp rebasing is handled by demuxer (ts_offset_discont)
-    // Decoder handles content changes naturally via keyframes
-    // Flushing causes unnecessary gaps in output
+    // Handle timestamp discontinuity - flush only for large jumps (>100 seconds)
+    // Small jumps (timestamp oscillations) don't need flush, just rebasing
+    // Large jumps indicate real content changes requiring decoder reset
+#define DISCONTINUITY_FLUSH_THRESHOLD (100LL * AV_TIME_BASE)  // 100 seconds
+
     if (pkt && (pkt->flags & AV_PKT_FLAG_DISCONTINUITY)) {
-        av_log(dp, AV_LOG_INFO,
-               "[DISCONT] Timestamp discontinuity for %s decoder (PTS=%"PRId64" DTS=%"PRId64"), "
-               "continuing without flush (timestamps rebased by demuxer)\n",
-               type_desc, pkt->pts, pkt->dts);
+        FrameData *fd = packet_data(pkt);
+        int64_t delta = fd ? fd->discontinuity_delta : 0;
+        int64_t abs_delta = FFABS(delta);
+
+        if (abs_delta > DISCONTINUITY_FLUSH_THRESHOLD) {
+            // Large jump - flush decoder to clear stale reference frames
+            av_log(dp, AV_LOG_INFO,
+                   "[DISCONT] Large discontinuity for %s decoder (delta=%.1fs, PTS=%"PRId64"), "
+                   "flushing decoder...\n",
+                   type_desc, (double)delta / AV_TIME_BASE, pkt->pts);
+            avcodec_flush_buffers(dec);
+            dp->frames_since_flush = 0;
+            dp->packets_since_flush = 0;
+        } else {
+            // Small jump - just log and continue without flush
+            av_log(dp, AV_LOG_INFO,
+                   "[DISCONT] Small discontinuity for %s decoder (delta=%.1fs, PTS=%"PRId64"), "
+                   "continuing without flush\n",
+                   type_desc, (double)delta / AV_TIME_BASE, pkt->pts);
+        }
         // Clear the flag so downstream doesn't re-process
         pkt->flags &= ~AV_PKT_FLAG_DISCONTINUITY;
     }
