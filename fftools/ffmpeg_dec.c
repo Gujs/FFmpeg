@@ -717,7 +717,22 @@ static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
 
     // Drain and flush decoder on timestamp discontinuity to clear stale reference frames
     // First drain any pending frames, then flush to reset decoder state
+    // Use cooldown to prevent rapid re-flushing when timestamps oscillate
+#define DISCONTINUITY_COOLDOWN_US (3 * 1000000)  // 3 seconds cooldown
+
     if (pkt && (pkt->flags & AV_PKT_FLAG_DISCONTINUITY)) {
+        int64_t now = av_gettime_relative();
+        int64_t time_since_flush = dp->last_flush_time > 0 ? (now - dp->last_flush_time) : INT64_MAX;
+
+        if (time_since_flush < DISCONTINUITY_COOLDOWN_US) {
+            av_log(dp, AV_LOG_INFO,
+                   "[DISCONT] Skipping flush for %s decoder (PTS=%"PRId64" DTS=%"PRId64"), "
+                   "cooldown active (%.2fs since last flush, need %.2fs)\n",
+                   type_desc, pkt->pts, pkt->dts,
+                   time_since_flush / 1000000.0, DISCONTINUITY_COOLDOWN_US / 1000000.0);
+            // Clear the discontinuity flag so we don't keep logging
+            pkt->flags &= ~AV_PKT_FLAG_DISCONTINUITY;
+        } else {
         int64_t flush_start = av_gettime_relative();
         int drained_count = 0;
 
@@ -767,6 +782,7 @@ static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
                "[DISCONT] %s decoder flushed: drained %d pending frames, took %"PRId64"us, "
                "waiting for keyframe...\n",
                type_desc, drained_count, flush_duration);
+        }  // end of else block (cooldown not active)
     }
 
     if (pkt && (dp->flags & DECODER_FLAG_TS_UNRELIABLE)) {
