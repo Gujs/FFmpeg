@@ -106,6 +106,8 @@ typedef struct DecoderPriv {
     // Discontinuity diagnostics and corrupt frame grace period
     int64_t frames_since_flush;     ///< frames decoded since last discontinuity flush
     int64_t last_flush_time;        ///< wall clock time of last flush (microseconds)
+    int64_t packets_since_flush;    ///< packets sent to decoder since last flush
+    int64_t last_keyframe_wait_log; ///< last time we logged keyframe wait status
 } DecoderPriv;
 
 static DecoderPriv *dp_from_dec(Decoder *d)
@@ -756,6 +758,8 @@ static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
         // Flush the decoder
         avcodec_flush_buffers(dec);
         dp->frames_since_flush = 0;
+        dp->packets_since_flush = 0;
+        dp->last_keyframe_wait_log = 0;
         dp->last_flush_time = av_gettime_relative();
 
         int64_t flush_duration = dp->last_flush_time - flush_start;
@@ -797,6 +801,10 @@ static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
             return ret;
     }
 
+    /* Track packets sent since last flush (for keyframe wait diagnostics) */
+    if (pkt && dp->last_flush_time > 0)
+        dp->packets_since_flush++;
+
     while (1) {
         FrameData *fd;
         unsigned outputs_mask = 1;
@@ -812,6 +820,25 @@ static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
 
         if (ret == AVERROR(EAGAIN)) {
             av_assert0(pkt); // should never happen during flushing
+
+            /* Log keyframe wait status periodically (every 2 seconds) when we're
+             * sending packets but decoder isn't producing frames (waiting for keyframe) */
+            if (dp->last_flush_time > 0 && dp->frames_since_flush == 0 &&
+                dp->packets_since_flush > 0) {
+                int64_t now = av_gettime_relative();
+                int64_t time_since_flush = now - dp->last_flush_time;
+                int64_t time_since_log = now - dp->last_keyframe_wait_log;
+
+                /* Log every 2 seconds */
+                if (time_since_log >= 2000000) {
+                    av_log(dp, AV_LOG_WARNING,
+                           "[DISCONT] Waiting for keyframe: %"PRId64" packets sent, "
+                           "0 frames decoded, waiting %.1fs\n",
+                           dp->packets_since_flush, time_since_flush / 1000000.0);
+                    dp->last_keyframe_wait_log = now;
+                }
+            }
+
             return 0;
         } else if (ret == AVERROR_EOF) {
             return ret;
@@ -829,15 +856,15 @@ static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
         dp->frames_since_flush++;
 
         /* Log first few frames after discontinuity for diagnostics */
-        if (dp->frames_since_flush <= 5) {
+        if (dp->frames_since_flush <= 5 && dp->last_flush_time > 0) {
             int64_t time_since_flush = av_gettime_relative() - dp->last_flush_time;
             av_log(dp, AV_LOG_INFO,
                    "[DISCONT] Post-flush frame %"PRId64": PTS=%"PRId64" key=%d corrupt=%d "
-                   "time_since_flush=%"PRId64"ms\n",
+                   "time_since_flush=%"PRId64"ms packets_consumed=%"PRId64"\n",
                    dp->frames_since_flush, frame->pts,
                    (frame->flags & AV_FRAME_FLAG_KEY) ? 1 : 0,
                    (frame->decode_error_flags || (frame->flags & AV_FRAME_FLAG_CORRUPT)) ? 1 : 0,
-                   time_since_flush / 1000);
+                   time_since_flush / 1000, dp->packets_since_flush);
         }
 
 
@@ -1076,6 +1103,8 @@ static int decoder_thread(void *arg)
 
             avcodec_flush_buffers(dp->dec_ctx);
             dp->frames_since_flush = 0;  // Reset grace period counter
+            dp->packets_since_flush = 0;
+            dp->last_keyframe_wait_log = 0;
         } else if (ret < 0) {
             av_log(dp, AV_LOG_ERROR, "Error processing packet in decoder: %s\n",
                    av_err2str(ret));
