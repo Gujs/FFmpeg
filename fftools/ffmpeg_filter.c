@@ -151,7 +151,7 @@ typedef struct InputFilterPriv {
     // Only trigger reconfiguration after seeing N consecutive frames at new resolution
     int                 pending_width, pending_height;
     int                 resolution_stable_count;
-#define RESOLUTION_HYSTERESIS_FRAMES 3  // Require 3 consecutive frames (~100ms at 30fps)
+#define RESOLUTION_HYSTERESIS_FRAMES 10  // Require 10 consecutive clean frames (~333ms at 30fps)
 
     struct {
         AVFrame *frame;
@@ -3345,8 +3345,11 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
          * Require RESOLUTION_HYSTERESIS_FRAMES consecutive NON-CORRUPT frames at new resolution.
          *
          * IMPORTANT: Corrupt frames are excluded from hysteresis counting because their
-         * resolution metadata is unreliable (may come from corrupted SPS/PPS data). */
-        int frame_is_corrupt = (frame->flags & AV_FRAME_FLAG_CORRUPT) != 0;
+         * resolution metadata is unreliable (may come from corrupted SPS/PPS data).
+         * We check BOTH decode_error_flags (set by decoder for concealment) AND
+         * AV_FRAME_FLAG_CORRUPT (set when frame is explicitly marked corrupt). */
+        int frame_is_corrupt = frame->decode_error_flags ||
+                               (frame->flags & AV_FRAME_FLAG_CORRUPT);
 
         if (frame_is_corrupt && (ifp->width != frame->width || ifp->height != frame->height)) {
             /* Corrupt frame with different resolution - don't trust it, reset hysteresis */
