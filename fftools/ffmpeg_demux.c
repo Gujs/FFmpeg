@@ -320,9 +320,10 @@ static void ts_discontinuity_process(Demuxer *d, InputStream *ist,
     if (pkt->pts != AV_NOPTS_VALUE)
         pkt->pts += offset;
 
-    // detect timestamp discontinuities for audio/video
-    if ((ist->par->codec_type == AVMEDIA_TYPE_VIDEO ||
-         ist->par->codec_type == AVMEDIA_TYPE_AUDIO) &&
+    // detect timestamp discontinuities for VIDEO ONLY (video-master mode)
+    // Audio streams receive the same offset as video but don't trigger detection
+    // This prevents A/V desync when audio and video see opposite-direction jumps
+    if (ist->par->codec_type == AVMEDIA_TYPE_VIDEO &&
         pkt->dts != AV_NOPTS_VALUE)
         ts_discontinuity_detect(d, ist, pkt);
 }
