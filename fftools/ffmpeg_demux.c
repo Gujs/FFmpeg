@@ -253,10 +253,11 @@ static void ts_discontinuity_detect(Demuxer *d, InputStream *ist,
                 ds->ts_offset_discont -= delta;
                 ds->discontinuity_detected = 1;
                 pkt->flags |= AV_PKT_FLAG_DISCONTINUITY;
-                av_log(ist, AV_LOG_WARNING,
-                       "timestamp discontinuity "
-                       "(stream id=%d): %"PRId64", new offset= %"PRId64"\n",
-                       ist->st->id, delta, d->ts_offset_discont);
+                av_log(ist, AV_LOG_INFO,
+                       "[DISCONT] Timestamp discontinuity: stream=%d delta=%"PRId64" (%.3fs) "
+                       "prev_dts=%"PRId64" new_dts=%"PRId64" offset=%"PRId64"\n",
+                       ist->st->id, delta, (double)delta / AV_TIME_BASE,
+                       ds->next_dts, pkt_dts, d->ts_offset_discont);
                 pkt->dts -= av_rescale_q(delta, AV_TIME_BASE_Q, pkt->time_base);
                 if (pkt->pts != AV_NOPTS_VALUE)
                     pkt->pts -= av_rescale_q(delta, AV_TIME_BASE_Q, pkt->time_base);
@@ -287,9 +288,11 @@ static void ts_discontinuity_detect(Demuxer *d, InputStream *ist,
             ds->ts_offset_discont -= delta;
             ds->discontinuity_detected = 1;
             pkt->flags |= AV_PKT_FLAG_DISCONTINUITY;
-            av_log(ist, AV_LOG_DEBUG,
-                   "Inter stream timestamp discontinuity %"PRId64", new offset= %"PRId64"\n",
-                   delta, d->ts_offset_discont);
+            av_log(ist, AV_LOG_INFO,
+                   "[DISCONT] Inter-stream discontinuity: stream=%d delta=%"PRId64" (%.3fs) "
+                   "last_ts=%"PRId64" new_dts=%"PRId64" offset=%"PRId64"\n",
+                   ist->st->id, delta, (double)delta / AV_TIME_BASE,
+                   d->last_ts, pkt_dts, d->ts_offset_discont);
             pkt->dts -= av_rescale_q(delta, AV_TIME_BASE_Q, pkt->time_base);
             if (pkt->pts != AV_NOPTS_VALUE)
                 pkt->pts -= av_rescale_q(delta, AV_TIME_BASE_Q, pkt->time_base);
