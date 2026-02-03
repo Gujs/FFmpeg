@@ -102,6 +102,10 @@ typedef struct DecoderPriv {
         AVDictionary       *opts;
         const AVCodec      *codec;
     } standalone_init;
+
+    // Discontinuity diagnostics
+    int64_t frames_since_flush;     ///< frames decoded since last discontinuity flush
+    int64_t last_flush_time;        ///< wall clock time of last flush (microseconds)
 } DecoderPriv;
 
 static DecoderPriv *dp_from_dec(Decoder *d)
@@ -712,7 +716,13 @@ static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
     // Drain and flush decoder on timestamp discontinuity to clear stale reference frames
     // First drain any pending frames, then flush to reset decoder state
     if (pkt && (pkt->flags & AV_PKT_FLAG_DISCONTINUITY)) {
+        int64_t flush_start = av_gettime_relative();
         int drained_count = 0;
+
+        av_log(dp, AV_LOG_INFO,
+               "[DISCONT] Discontinuity packet received for %s decoder (PTS=%"PRId64" DTS=%"PRId64"), "
+               "draining pending frames...\n",
+               type_desc, pkt->pts, pkt->dts);
 
         // Drain pending frames from decoder before flushing
         // These are frames from the previous segment that haven't been output yet
@@ -743,16 +753,16 @@ static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
             drained_count++;
         }
 
-        if (drained_count > 0) {
-            av_log(dp, AV_LOG_VERBOSE,
-                   "[BUFFER] Drained %d frames before %s decoder flush\n",
-                   drained_count, type_desc);
-        }
-
-        av_log(dp, AV_LOG_INFO,
-               "Flushing %s decoder due to timestamp discontinuity\n",
-               type_desc);
+        // Flush the decoder
         avcodec_flush_buffers(dec);
+        dp->frames_since_flush = 0;
+        dp->last_flush_time = av_gettime_relative();
+
+        int64_t flush_duration = dp->last_flush_time - flush_start;
+        av_log(dp, AV_LOG_INFO,
+               "[DISCONT] %s decoder flushed: drained %d pending frames, took %"PRId64"us, "
+               "waiting for keyframe...\n",
+               type_desc, drained_count, flush_duration);
     }
 
     if (pkt && (dp->flags & DECODER_FLAG_TS_UNRELIABLE)) {
@@ -813,6 +823,21 @@ static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
                 return ret;
 
             continue;
+        }
+
+        /* Track frames since last discontinuity flush */
+        dp->frames_since_flush++;
+
+        /* Log first few frames after discontinuity for diagnostics */
+        if (dp->frames_since_flush <= 5) {
+            int64_t time_since_flush = av_gettime_relative() - dp->last_flush_time;
+            av_log(dp, AV_LOG_INFO,
+                   "[DISCONT] Post-flush frame %"PRId64": PTS=%"PRId64" key=%d corrupt=%d "
+                   "time_since_flush=%"PRId64"ms\n",
+                   dp->frames_since_flush, frame->pts,
+                   (frame->flags & AV_FRAME_FLAG_KEY) ? 1 : 0,
+                   (frame->decode_error_flags || (frame->flags & AV_FRAME_FLAG_CORRUPT)) ? 1 : 0,
+                   time_since_flush / 1000);
         }
 
         if (frame->decode_error_flags || (frame->flags & AV_FRAME_FLAG_CORRUPT)) {
