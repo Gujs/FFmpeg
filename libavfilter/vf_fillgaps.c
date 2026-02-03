@@ -461,6 +461,14 @@ static int activate(AVFilterContext *ctx)
                        "output %"PRId64" frames\n",
                        s->max_fill / 1000, s->proactive_frames);
                 s->in_proactive_mode = 0;
+
+                /* CRITICAL: Reset wall clock tracking to prevent immediate re-entry.
+                 * Without this, the next input frame sees a huge wallclock_gap
+                 * (since last_wallclock wasn't updated during proactive output)
+                 * and immediately re-enters proactive mode. */
+                s->last_wallclock = now;
+                s->last_pts = s->output_pts - s->frame_duration;
+                s->last_output_time = now;
             }
         } else {
             /* Not time yet - but schedule next check */
