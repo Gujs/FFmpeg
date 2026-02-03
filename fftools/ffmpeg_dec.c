@@ -715,74 +715,17 @@ static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
     if (pkt && pkt->size == 0)
         return 0;
 
-    // Drain and flush decoder on timestamp discontinuity to clear stale reference frames
-    // First drain any pending frames, then flush to reset decoder state
-    // Use cooldown to prevent rapid re-flushing when timestamps oscillate
-#define DISCONTINUITY_COOLDOWN_US (3 * 1000000)  // 3 seconds cooldown
-
+    // Log timestamp discontinuity but DO NOT flush decoder
+    // Timestamp rebasing is handled by demuxer (ts_offset_discont)
+    // Decoder handles content changes naturally via keyframes
+    // Flushing causes unnecessary gaps in output
     if (pkt && (pkt->flags & AV_PKT_FLAG_DISCONTINUITY)) {
-        int64_t now = av_gettime_relative();
-        int64_t time_since_flush = dp->last_flush_time > 0 ? (now - dp->last_flush_time) : INT64_MAX;
-
-        if (time_since_flush < DISCONTINUITY_COOLDOWN_US) {
-            av_log(dp, AV_LOG_INFO,
-                   "[DISCONT] Skipping flush for %s decoder (PTS=%"PRId64" DTS=%"PRId64"), "
-                   "cooldown active (%.2fs since last flush, need %.2fs)\n",
-                   type_desc, pkt->pts, pkt->dts,
-                   time_since_flush / 1000000.0, DISCONTINUITY_COOLDOWN_US / 1000000.0);
-            // Clear the discontinuity flag so we don't keep logging
-            pkt->flags &= ~AV_PKT_FLAG_DISCONTINUITY;
-        } else {
-        int64_t flush_start = av_gettime_relative();
-        int drained_count = 0;
-
         av_log(dp, AV_LOG_INFO,
-               "[DISCONT] Discontinuity packet received for %s decoder (PTS=%"PRId64" DTS=%"PRId64"), "
-               "draining pending frames...\n",
+               "[DISCONT] Timestamp discontinuity for %s decoder (PTS=%"PRId64" DTS=%"PRId64"), "
+               "continuing without flush (timestamps rebased by demuxer)\n",
                type_desc, pkt->pts, pkt->dts);
-
-        // Drain pending frames from decoder before flushing
-        // These are frames from the previous segment that haven't been output yet
-        while (1) {
-            AVFrame *drain_frame = av_frame_alloc();
-            if (!drain_frame)
-                break;
-
-            int drain_ret = avcodec_receive_frame(dec, drain_frame);
-            if (drain_ret == AVERROR(EAGAIN) || drain_ret == AVERROR_EOF) {
-                av_frame_free(&drain_frame);
-                break;
-            }
-            if (drain_ret < 0) {
-                av_frame_free(&drain_frame);
-                break;
-            }
-
-            // Set time_base for the drained frame
-            drain_frame->time_base = dec->pkt_timebase;
-
-            // Send drained frame to scheduler (first output only)
-            drain_ret = sch_dec_send(dp->sch, dp->sch_idx, 0, drain_frame);
-            if (drain_ret < 0) {
-                av_frame_free(&drain_frame);
-                break;
-            }
-            drained_count++;
-        }
-
-        // Flush the decoder
-        avcodec_flush_buffers(dec);
-        dp->frames_since_flush = 0;
-        dp->packets_since_flush = 0;
-        dp->last_keyframe_wait_log = 0;
-        dp->last_flush_time = av_gettime_relative();
-
-        int64_t flush_duration = dp->last_flush_time - flush_start;
-        av_log(dp, AV_LOG_INFO,
-               "[DISCONT] %s decoder flushed: drained %d pending frames, took %"PRId64"us, "
-               "waiting for keyframe...\n",
-               type_desc, drained_count, flush_duration);
-        }  // end of else block (cooldown not active)
+        // Clear the flag so downstream doesn't re-process
+        pkt->flags &= ~AV_PKT_FLAG_DISCONTINUITY;
     }
 
     if (pkt && (dp->flags & DECODER_FLAG_TS_UNRELIABLE)) {
