@@ -42,7 +42,6 @@ typedef struct AResampleContext {
     double ratio;
     struct SwrContext *swr;
     int64_t next_pts;
-    int64_t last_in_pts;    ///< last input pts for discontinuity detection
     int more_data;
 } AResampleContext;
 
@@ -51,7 +50,6 @@ static av_cold int preinit(AVFilterContext *ctx)
     AResampleContext *aresample = ctx->priv;
 
     aresample->next_pts = AV_NOPTS_VALUE;
-    aresample->last_in_pts = AV_NOPTS_VALUE;
     aresample->swr = swr_alloc();
     if (!aresample->swr)
         return AVERROR(ENOMEM);
@@ -222,30 +220,6 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *insamplesref, AVFrame **o
     int ret;
 
     *outsamplesref_ret = NULL;
-
-    /* Discontinuity detection: if PTS jumped backwards by more than 1 second,
-     * reset the swresample context to avoid generating excessive audio trying
-     * to compensate for the timestamp gap. This happens during stream
-     * discontinuities where timestamps are rebased. */
-    if (insamplesref->pts != AV_NOPTS_VALUE &&
-        aresample->last_in_pts != AV_NOPTS_VALUE) {
-        int64_t pts_delta = aresample->last_in_pts - insamplesref->pts;
-        /* Convert to samples using input timebase for threshold comparison */
-        int64_t delta_samples = av_rescale(pts_delta, inlink->sample_rate,
-                                           inlink->time_base.den / inlink->time_base.num);
-        /* 1 second threshold in samples */
-        if (delta_samples > inlink->sample_rate) {
-            av_log(ctx, AV_LOG_WARNING,
-                   "aresample: timestamp discontinuity detected (jumped back %"PRId64" samples), "
-                   "resetting resampler state\n", delta_samples);
-            /* Reinitialize swresample to clear internal compensation state */
-            swr_close(aresample->swr);
-            swr_init(aresample->swr);
-            aresample->next_pts = AV_NOPTS_VALUE;
-        }
-    }
-    aresample->last_in_pts = insamplesref->pts;
-
     delay = swr_get_delay(aresample->swr, outlink->sample_rate);
     if (delay > 0)
         n_out += FFMIN(delay, FFMAX(4096, n_out));
