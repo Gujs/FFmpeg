@@ -339,17 +339,6 @@ static void ts_discontinuity_process(Demuxer *d, InputStream *ist,
     if (ist->par->codec_type == AVMEDIA_TYPE_VIDEO &&
         pkt->dts != AV_NOPTS_VALUE)
         ts_discontinuity_detect(d, ist, pkt, fd);
-
-    // Propagate discontinuity signal to audio streams (for flush)
-    // Video-master mode sets discontinuity_pending when video detects a jump;
-    // audio needs this signal to flush its decoder/filter buffers
-    if (ist->par->codec_type == AVMEDIA_TYPE_AUDIO && d->discontinuity_pending) {
-        pkt->flags |= AV_PKT_FLAG_DISCONTINUITY;
-        d->discontinuity_pending = 0;  // Clear after first audio packet sees it
-        av_log(ist, AV_LOG_INFO,
-               "[DISCONT] Propagating discontinuity to audio stream %d for flush\n",
-               ist->st->id);
-    }
 }
 
 static int ist_dts_update(DemuxStream *ds, AVPacket *pkt, FrameData *fd)
