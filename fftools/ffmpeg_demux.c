@@ -134,13 +134,6 @@ typedef struct Demuxer {
     int64_t               ts_offset_discont;
     int64_t               last_ts;
 
-    /**
-     * Global discontinuity signal - set when video detects discontinuity,
-     * cleared after all streams have seen it. Used to propagate flush signal
-     * to audio streams in video-master mode.
-     */
-    int                   discontinuity_pending;
-
     int64_t               recording_time;
     int                   accurate_seek;
 
@@ -264,7 +257,6 @@ static void ts_discontinuity_detect(Demuxer *d, InputStream *ist,
                 d->ts_offset_discont -= delta;
                 ds->ts_offset_discont -= delta;
                 ds->discontinuity_detected = 1;
-                d->discontinuity_pending = 1;  // Signal to flush audio streams
                 pkt->flags |= AV_PKT_FLAG_DISCONTINUITY;
                 if (fd)
                     fd->discontinuity_delta = delta;
@@ -302,7 +294,6 @@ static void ts_discontinuity_detect(Demuxer *d, InputStream *ist,
             d->ts_offset_discont -= delta;
             ds->ts_offset_discont -= delta;
             ds->discontinuity_detected = 1;
-            d->discontinuity_pending = 1;  // Signal to flush audio streams
             pkt->flags |= AV_PKT_FLAG_DISCONTINUITY;
             if (fd)
                 fd->discontinuity_delta = delta;
