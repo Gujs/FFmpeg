@@ -28,6 +28,7 @@
 #include "libavutil/mem.h"
 #include "libavutil/samplefmt.h"
 #include "libavutil/timestamp.h"
+#include "libavutil/time.h"
 
 #include "sync_queue.h"
 
@@ -243,6 +244,8 @@ static void queue_head_update(SyncQueue *sq)
 static void stream_update_ts(SyncQueue *sq, unsigned int stream_idx, int64_t ts)
 {
     SyncQueueStream *st = &sq->streams[stream_idx];
+    static int64_t last_log_time = 0;
+    int64_t now;
 
     if (ts == AV_NOPTS_VALUE)
         return;
@@ -267,6 +270,24 @@ static void stream_update_ts(SyncQueue *sq, unsigned int stream_idx, int64_t ts)
         /* For small backwards jumps (<100ms), fall through and accept the frame
          * rather than dropping it. This handles minor timestamp jitter without
          * causing frame loss. */
+    }
+
+    /* Diagnostic logging: periodically log sync queue state */
+    now = av_gettime_relative();
+    if (now - last_log_time > 5000000) {  /* Every 5 seconds */
+        av_log(sq->logctx, AV_LOG_INFO,
+               "[SQ-DIAG] stream %u: new_ts=%"PRId64" head_ts=%"PRId64" head_stream=%d tb=%d/%d\n",
+               stream_idx, ts, st->head_ts, sq->head_stream, st->tb.num, st->tb.den);
+        /* Log all stream states */
+        for (unsigned int i = 0; i < sq->nb_streams; i++) {
+            SyncQueueStream *s = &sq->streams[i];
+            int64_t head_sec = (s->head_ts != AV_NOPTS_VALUE && s->tb.den) ?
+                               av_rescale_q(s->head_ts, s->tb, (AVRational){1,1}) : -1;
+            av_log(sq->logctx, AV_LOG_INFO,
+                   "[SQ-DIAG]   stream[%u]: head_ts=%"PRId64" (~%"PRId64"s) limiting=%d finished=%d\n",
+                   i, s->head_ts, head_sec, s->limiting, s->finished);
+        }
+        last_log_time = now;
     }
 
     if (st->head_ts != AV_NOPTS_VALUE && st->head_ts >= ts)
