@@ -716,16 +716,30 @@ static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
         return 0;
 
     // Timestamp discontinuity handling:
-    // DO NOT flush decoder - flushing causes gaps and corruption at segment boundaries
-    // The demuxer already rebases timestamps to maintain continuous timeline
-    // Decoder continues normally and will naturally resync on next keyframe
+    // - VIDEO: DO NOT flush - flushing causes gaps while waiting for keyframe
+    // - AUDIO: DO flush - audio has no keyframe dependencies and flush clears
+    //          filter latency that would otherwise cause backwards timestamps
     if (pkt && (pkt->flags & AV_PKT_FLAG_DISCONTINUITY)) {
         FrameData *fd = packet_data(pkt);
         int64_t delta = fd ? fd->discontinuity_delta : 0;
-        av_log(dp, AV_LOG_INFO,
-               "[DISCONT] Timestamp discontinuity for %s decoder (delta=%.1fs), "
-               "continuing without flush (demuxer rebased timestamps)\n",
-               type_desc, (double)delta / AV_TIME_BASE);
+
+        if (dp->dec_ctx->codec_type == AVMEDIA_TYPE_AUDIO) {
+            // Flush audio decoder to clear filter chain latency
+            // This prevents backwards timestamps at encoder input
+            av_log(dp, AV_LOG_INFO,
+                   "[DISCONT] Timestamp discontinuity for %s decoder (delta=%.1fs), "
+                   "flushing audio decoder to clear filter latency\n",
+                   type_desc, (double)delta / AV_TIME_BASE);
+            avcodec_flush_buffers(dp->dec_ctx);
+            dp->last_frame_pts = AV_NOPTS_VALUE;
+            dp->last_filter_in_rescale_delta = AV_NOPTS_VALUE;
+        } else {
+            // Video: don't flush, let decoder continue with error concealment
+            av_log(dp, AV_LOG_INFO,
+                   "[DISCONT] Timestamp discontinuity for %s decoder (delta=%.1fs), "
+                   "continuing without flush (demuxer rebased timestamps)\n",
+                   type_desc, (double)delta / AV_TIME_BASE);
+        }
         // Clear the flag so downstream doesn't re-process
         pkt->flags &= ~AV_PKT_FLAG_DISCONTINUITY;
     }

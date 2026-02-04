@@ -134,6 +134,13 @@ typedef struct Demuxer {
     int64_t               ts_offset_discont;
     int64_t               last_ts;
 
+    /**
+     * Global discontinuity signal - set when video detects discontinuity,
+     * cleared after all streams have seen it. Used to propagate flush signal
+     * to audio streams in video-master mode.
+     */
+    int                   discontinuity_pending;
+
     int64_t               recording_time;
     int                   accurate_seek;
 
@@ -257,6 +264,7 @@ static void ts_discontinuity_detect(Demuxer *d, InputStream *ist,
                 d->ts_offset_discont -= delta;
                 ds->ts_offset_discont -= delta;
                 ds->discontinuity_detected = 1;
+                d->discontinuity_pending = 1;  // Signal to flush audio streams
                 pkt->flags |= AV_PKT_FLAG_DISCONTINUITY;
                 if (fd)
                     fd->discontinuity_delta = delta;
@@ -294,6 +302,7 @@ static void ts_discontinuity_detect(Demuxer *d, InputStream *ist,
             d->ts_offset_discont -= delta;
             ds->ts_offset_discont -= delta;
             ds->discontinuity_detected = 1;
+            d->discontinuity_pending = 1;  // Signal to flush audio streams
             pkt->flags |= AV_PKT_FLAG_DISCONTINUITY;
             if (fd)
                 fd->discontinuity_delta = delta;
@@ -330,6 +339,17 @@ static void ts_discontinuity_process(Demuxer *d, InputStream *ist,
     if (ist->par->codec_type == AVMEDIA_TYPE_VIDEO &&
         pkt->dts != AV_NOPTS_VALUE)
         ts_discontinuity_detect(d, ist, pkt, fd);
+
+    // Propagate discontinuity signal to audio streams (for flush)
+    // Video-master mode sets discontinuity_pending when video detects a jump;
+    // audio needs this signal to flush its decoder/filter buffers
+    if (ist->par->codec_type == AVMEDIA_TYPE_AUDIO && d->discontinuity_pending) {
+        pkt->flags |= AV_PKT_FLAG_DISCONTINUITY;
+        d->discontinuity_pending = 0;  // Clear after first audio packet sees it
+        av_log(ist, AV_LOG_INFO,
+               "[DISCONT] Propagating discontinuity to audio stream %d for flush\n",
+               ist->st->id);
+    }
 }
 
 static int ist_dts_update(DemuxStream *ds, AVPacket *pkt, FrameData *fd)
