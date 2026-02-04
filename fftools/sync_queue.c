@@ -272,6 +272,33 @@ static void stream_update_ts(SyncQueue *sq, unsigned int stream_idx, int64_t ts)
          * causing frame loss. */
     }
 
+    /* Handle forward discontinuity: if this stream jumps significantly forward
+     * (more than 5 seconds) compared to its previous position, AND other streams
+     * are now far behind, reset the sync queue. This happens when video timestamps
+     * are rebased after discontinuity but audio packets in pipeline still have old timestamps. */
+    if (st->head_ts != AV_NOPTS_VALUE && ts > st->head_ts) {
+        int64_t forward_jump_us = av_rescale_q(ts - st->head_ts, st->tb, AV_TIME_BASE_Q);
+        if (forward_jump_us > 5 * AV_TIME_BASE) {  /* 5 second forward jump */
+            /* Check if any other stream is now far behind this one */
+            for (unsigned int i = 0; i < sq->nb_streams; i++) {
+                if (i != stream_idx && sq->streams[i].head_ts != AV_NOPTS_VALUE) {
+                    int64_t gap_us = av_rescale_q(ts, st->tb, AV_TIME_BASE_Q) -
+                                     av_rescale_q(sq->streams[i].head_ts, sq->streams[i].tb, AV_TIME_BASE_Q);
+                    if (gap_us > 5 * AV_TIME_BASE) {  /* 5 second gap between streams */
+                        av_log(sq->logctx, AV_LOG_WARNING,
+                               "sync queue: stream %u jumped forward %.1fs, stream %u is %.1fs behind, resetting all\n",
+                               stream_idx, forward_jump_us / 1000000.0, i, gap_us / 1000000.0);
+                        for (unsigned int j = 0; j < sq->nb_streams; j++) {
+                            sq->streams[j].head_ts = AV_NOPTS_VALUE;
+                        }
+                        sq->head_stream = -1;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     /* Diagnostic logging: periodically log sync queue state */
     now = av_gettime_relative();
     if (now - last_log_time > 5000000) {  /* Every 5 seconds */
