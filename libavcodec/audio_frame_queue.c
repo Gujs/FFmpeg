@@ -19,6 +19,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <inttypes.h>
 #include "libavutil/attributes.h"
 #include "libavutil/mem.h"
 #include "audio_frame_queue.h"
@@ -57,8 +58,35 @@ int ff_af_queue_add(AudioFrameQueue *afq, const AVFrame *f)
                                       afq->avctx->time_base,
                                       (AVRational){ 1, afq->avctx->sample_rate });
         new->pts -= afq->remaining_delay;
-        if(afq->frame_count && new[-1].pts >= new->pts)
-            av_log(afq->avctx, AV_LOG_WARNING, "Queue input is backward in time\n");
+        if(afq->frame_count && new[-1].pts >= new->pts) {
+            /* Timestamp jumped backwards - likely a stream discontinuity.
+             * Calculate the backwards delta to decide how to handle it. */
+            int64_t delta_samples = new[-1].pts - new->pts;
+            int64_t delta_ms = delta_samples * 1000 / afq->avctx->sample_rate;
+
+            if (delta_ms > 50) {
+                /* Large backwards jump (>50ms) - clear old frames from queue.
+                 * This happens during stream discontinuities where the demuxer
+                 * rebases timestamps. Old frames in the queue have stale timestamps
+                 * that would cause A/V desync if mixed with new rebased frames. */
+                av_log(afq->avctx, AV_LOG_WARNING,
+                       "Queue input backward by %"PRId64"ms, clearing %d stale frames\n",
+                       delta_ms, afq->frame_count);
+                /* Reset queue - keep the new frame we just added but drop old ones */
+                afq->frame_count = 0;
+                afq->remaining_samples = afq->remaining_delay + f->nb_samples;
+                /* Recalculate new frame position since we cleared the queue */
+                new = afq->frames;
+                new->duration = f->nb_samples + afq->remaining_delay;
+                new->pts = av_rescale_q(f->pts,
+                                        afq->avctx->time_base,
+                                        (AVRational){ 1, afq->avctx->sample_rate });
+                new->pts -= afq->remaining_delay;
+            } else {
+                /* Small backwards jump (<50ms) - just warn, likely jitter */
+                av_log(afq->avctx, AV_LOG_WARNING, "Queue input is backward in time\n");
+            }
+        }
     } else {
         new->pts = AV_NOPTS_VALUE;
     }
