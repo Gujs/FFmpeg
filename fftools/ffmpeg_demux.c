@@ -517,28 +517,57 @@ static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
     qsort(buf->packets, buf->nb_packets, sizeof(DiscontinuityPacket *),
           discont_packet_compare);
 
-    /* Emit new-timeline packets, discard old-timeline packets */
+    /* Determine which timeline to keep:
+     * 1. If only one timeline has packets, keep those (e.g., stream starts mid-file)
+     * 2. For forward jump (delta > 0): Keep OLD (current content), discard NEW (jumped ahead)
+     * 3. For backward jump (delta < 0): Keep NEW (current content), discard OLD (from past)
+     */
     {
         int sent_count = 0, discarded_count = 0;
-        int first_new_sent = 0;
+        int first_sent = 0;
+        int old_count = 0, new_count = 0;
+        int keep_timeline;
+
+        /* Count packets in each timeline */
+        for (int i = 0; i < buf->nb_packets; i++) {
+            if (buf->packets[i]->timeline == 0) old_count++;
+            else if (buf->packets[i]->timeline == 1) new_count++;
+        }
+
+        /* Decide which timeline to keep */
+        if (old_count == 0) {
+            keep_timeline = 1;  /* No old packets, keep new */
+            av_log(d, AV_LOG_INFO, "[DISCONT-BUF] No old-timeline packets, keeping all new (%d)\n", new_count);
+        } else if (new_count == 0) {
+            keep_timeline = 0;  /* No new packets, keep old */
+            av_log(d, AV_LOG_INFO, "[DISCONT-BUF] No new-timeline packets, keeping all old (%d)\n", old_count);
+        } else {
+            /* Both timelines have packets - use jump direction */
+            keep_timeline = (buf->timeline_delta > 0) ? 0 : 1;
+            av_log(d, AV_LOG_INFO, "[DISCONT-BUF] Jump %s (delta=%.3fs), keeping %s timeline (old=%d, new=%d)\n",
+                   buf->timeline_delta > 0 ? "forward" : "backward",
+                   (double)buf->timeline_delta / AV_TIME_BASE,
+                   keep_timeline == 0 ? "old" : "new",
+                   old_count, new_count);
+        }
 
         for (int i = 0; i < buf->nb_packets; i++) {
             DiscontinuityPacket *dp = buf->packets[i];
             DemuxStream *ds;
             unsigned send_flags = 0;
 
-            /* Discard old-timeline packets */
-            if (dp->timeline == 0) {
-                av_log(d, AV_LOG_DEBUG, "[DISCONT-BUF] Discarding old-timeline packet %d stream=%d dts=%"PRId64"\n",
-                       i + 1, dp->stream_idx, dp->raw_dts);
+            /* Discard packets from the timeline we don't want */
+            if (dp->timeline != keep_timeline && dp->timeline >= 0) {
+                av_log(d, AV_LOG_DEBUG, "[DISCONT-BUF] Discarding %s-timeline packet %d stream=%d dts=%"PRId64"\n",
+                       dp->timeline == 0 ? "old" : "new", i + 1, dp->stream_idx, dp->raw_dts);
                 discarded_count++;
                 av_packet_free(&dp->pkt);
                 av_freep(&buf->packets[i]);
                 continue;
             }
 
-            av_log(d, AV_LOG_DEBUG, "[DISCONT-BUF] Processing new-timeline packet %d/%d stream=%d dts=%"PRId64"\n",
-                   i + 1, buf->nb_packets, dp->stream_idx, dp->raw_dts);
+            av_log(d, AV_LOG_DEBUG, "[DISCONT-BUF] Processing %s-timeline packet %d/%d stream=%d dts=%"PRId64"\n",
+                   dp->timeline == 0 ? "old" : "new", i + 1, buf->nb_packets, dp->stream_idx, dp->raw_dts);
 
             if (dp->stream_idx >= f->nb_streams) {
                 av_log(d, AV_LOG_WARNING, "[DISCONT-BUF] Invalid stream index %d\n",
@@ -550,10 +579,10 @@ static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
 
             ds = ds_from_ist(f->streams[dp->stream_idx]);
 
-            /* Mark first packet after discontinuity with flag */
-            if (!first_new_sent) {
+            /* Mark first kept packet with discontinuity flag */
+            if (!first_sent) {
                 dp->pkt->flags |= AV_PKT_FLAG_DISCONTINUITY;
-                first_new_sent = 1;
+                first_sent = 1;
             }
 
             /* Process through normal timestamp fixup path */
