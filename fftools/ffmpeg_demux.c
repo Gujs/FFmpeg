@@ -66,6 +66,7 @@ typedef struct DiscontinuityBuffer {
     int timeline_established;    /* 1 if both old and new bases are known */
 
     int active;                  /* 1 if currently buffering packets */
+    int flushing;                /* 1 if currently flushing (skip detection) */
     int64_t buffer_start_time;   /* Wall clock time when buffering started (us) */
 
     uint8_t *stream_transitioned; /* Per-stream flag: 1 if stream has transitioned to new timeline */
@@ -470,9 +471,10 @@ static int discont_packet_compare(const void *a, const void *b)
         return pa->stream_idx - pb->stream_idx;  /* Stable sort by stream */
 }
 
-/* Forward declaration */
+/* Forward declarations */
 static int demux_send(Demuxer *d, DemuxThreadContext *dt, DemuxStream *ds,
                       AVPacket *pkt, unsigned flags);
+static int input_packet_process(Demuxer *d, AVPacket *pkt, unsigned *send_flags);
 
 /**
  * Flush the discontinuity buffer, applying timestamp corrections and
@@ -492,71 +494,100 @@ static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
         return 0;
     }
 
-    av_log(d, AV_LOG_INFO,
-           "[DISCONT-BUF] Flushing %d buffered packets (timeline delta: %.3fs)\n",
-           buf->nb_packets, (double)buf->timeline_delta / AV_TIME_BASE);
+    /* Set flushing flag to prevent re-detection during processing */
+    buf->flushing = 1;
 
     /* Classify all packets */
-    for (int i = 0; i < buf->nb_packets; i++) {
-        DiscontinuityPacket *dp = buf->packets[i];
-        if (dp->timeline < 0)
-            dp->timeline = discont_classify_timeline(buf, dp->raw_dts);
-    }
-
-    /* Apply timestamp adjustment to old-timeline packets */
-    for (int i = 0; i < buf->nb_packets; i++) {
-        DiscontinuityPacket *dp = buf->packets[i];
-        if (dp->timeline == 0) {  /* OLD timeline */
-            /* Adjust raw_dts for sorting (will be applied to actual packet during send) */
-            dp->raw_dts += buf->timeline_delta;
-
-            /* Also adjust actual packet timestamps */
-            if (dp->pkt->dts != AV_NOPTS_VALUE)
-                dp->pkt->dts += av_rescale_q(buf->timeline_delta,
-                                             AV_TIME_BASE_Q, dp->pkt->time_base);
-            if (dp->pkt->pts != AV_NOPTS_VALUE)
-                dp->pkt->pts += av_rescale_q(buf->timeline_delta,
-                                             AV_TIME_BASE_Q, dp->pkt->time_base);
+    {
+        int old_count = 0, new_count = 0;
+        for (int i = 0; i < buf->nb_packets; i++) {
+            DiscontinuityPacket *dp = buf->packets[i];
+            if (dp->timeline < 0)
+                dp->timeline = discont_classify_timeline(buf, dp->raw_dts);
+            if (dp->timeline == 0) old_count++;
+            else if (dp->timeline == 1) new_count++;
         }
+        av_log(d, AV_LOG_INFO,
+               "[DISCONT-BUF] Flushing %d buffered packets (old=%d, new=%d, delta=%.3fs)\n",
+               buf->nb_packets, old_count, new_count,
+               (double)buf->timeline_delta / AV_TIME_BASE);
     }
 
-    /* Sort packets by adjusted DTS */
+    /* Sort new-timeline packets by DTS for proper ordering */
     qsort(buf->packets, buf->nb_packets, sizeof(DiscontinuityPacket *),
           discont_packet_compare);
 
-    /* Emit packets in order */
-    for (int i = 0; i < buf->nb_packets; i++) {
-        DiscontinuityPacket *dp = buf->packets[i];
-        DemuxStream *ds;
+    /* Emit new-timeline packets, discard old-timeline packets */
+    {
+        int sent_count = 0, discarded_count = 0;
+        int first_new_sent = 0;
 
-        if (dp->stream_idx >= f->nb_streams) {
-            av_log(d, AV_LOG_WARNING, "[DISCONT-BUF] Invalid stream index %d\n",
-                   dp->stream_idx);
-            continue;
+        for (int i = 0; i < buf->nb_packets; i++) {
+            DiscontinuityPacket *dp = buf->packets[i];
+            DemuxStream *ds;
+            unsigned send_flags = 0;
+
+            /* Discard old-timeline packets */
+            if (dp->timeline == 0) {
+                av_log(d, AV_LOG_DEBUG, "[DISCONT-BUF] Discarding old-timeline packet %d stream=%d dts=%"PRId64"\n",
+                       i + 1, dp->stream_idx, dp->raw_dts);
+                discarded_count++;
+                av_packet_free(&dp->pkt);
+                av_freep(&buf->packets[i]);
+                continue;
+            }
+
+            av_log(d, AV_LOG_DEBUG, "[DISCONT-BUF] Processing new-timeline packet %d/%d stream=%d dts=%"PRId64"\n",
+                   i + 1, buf->nb_packets, dp->stream_idx, dp->raw_dts);
+
+            if (dp->stream_idx >= f->nb_streams) {
+                av_log(d, AV_LOG_WARNING, "[DISCONT-BUF] Invalid stream index %d\n",
+                       dp->stream_idx);
+                av_packet_free(&dp->pkt);
+                av_freep(&buf->packets[i]);
+                continue;
+            }
+
+            ds = ds_from_ist(f->streams[dp->stream_idx]);
+
+            /* Mark first packet after discontinuity with flag */
+            if (!first_new_sent) {
+                dp->pkt->flags |= AV_PKT_FLAG_DISCONTINUITY;
+                first_new_sent = 1;
+            }
+
+            /* Process through normal timestamp fixup path */
+            ret = input_packet_process(d, dp->pkt, &send_flags);
+            if (ret < 0) {
+                av_log(d, AV_LOG_ERROR, "[DISCONT-BUF] Failed to process packet: %s\n",
+                       av_err2str(ret));
+                av_packet_free(&dp->pkt);
+                av_freep(&buf->packets[i]);
+                break;
+            }
+
+            ret = demux_send(d, dt, ds, dp->pkt, send_flags);
+            if (ret < 0) {
+                av_log(d, AV_LOG_ERROR, "[DISCONT-BUF] Failed to send packet: %s\n",
+                       av_err2str(ret));
+                av_packet_free(&dp->pkt);
+                av_freep(&buf->packets[i]);
+                break;
+            }
+
+            sent_count++;
+
+            /* Clean up this packet entry */
+            av_packet_free(&dp->pkt);
+            av_freep(&buf->packets[i]);
         }
 
-        ds = ds_from_ist(f->streams[dp->stream_idx]);
-
-        /* Mark first packet after discontinuity with flag */
-        if (i == 0 || (i > 0 && buf->packets[i-1]->timeline != dp->timeline))
-            dp->pkt->flags |= AV_PKT_FLAG_DISCONTINUITY;
-
-        ret = demux_send(d, dt, ds, dp->pkt, 0);
-        if (ret < 0) {
-            av_log(d, AV_LOG_ERROR, "[DISCONT-BUF] Failed to send packet: %s\n",
-                   av_err2str(ret));
-            break;
-        }
-
-        /* Clean up this packet entry */
-        av_packet_free(&dp->pkt);
-        av_freep(&buf->packets[i]);
+        av_log(d, AV_LOG_INFO, "[DISCONT-BUF] Flush complete: %d sent, %d discarded\n",
+               sent_count, discarded_count);
     }
 
-    av_log(d, AV_LOG_INFO, "[DISCONT-BUF] Flush complete, %d packets sent\n",
-           buf->nb_packets);
-
-    /* Reset buffer */
+    /* Clear flushing flag and reset buffer */
+    buf->flushing = 0;
     discont_buffer_reset(buf);
 
     return ret;
@@ -576,6 +607,10 @@ static int discont_detect_jump(Demuxer *d, InputStream *ist, AVPacket *pkt,
     DemuxStream *ds = ds_from_ist(ist);
     DiscontinuityBuffer *buf = &d->discont_buf;
     int64_t delta;
+
+    /* Skip detection if we're currently flushing the buffer */
+    if (buf->flushing)
+        return 0;
 
     /* Only detect on video/audio streams */
     if (ist->par->codec_type != AVMEDIA_TYPE_VIDEO &&
