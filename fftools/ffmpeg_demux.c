@@ -40,6 +40,38 @@
 
 #include "libavformat/avformat.h"
 
+/* Discontinuity buffer structures for handling interleaved packets
+ * at discontinuity boundaries (e.g., ad splices without discontinuity_indicator) */
+
+#define DISCONT_BUFFER_DEFAULT_SIZE   256
+#define DISCONT_THRESHOLD_US          (1 * AV_TIME_BASE)   /* 1 second */
+#define DISCONT_TIMEOUT_US            (500 * 1000)         /* 500ms */
+#define DISCONT_TIMELINE_TOLERANCE_US (100 * 1000)         /* 100ms */
+
+typedef struct DiscontinuityPacket {
+    AVPacket *pkt;
+    int stream_idx;
+    int64_t raw_dts;         /* Original DTS before adjustment (AV_TIME_BASE units) */
+    int timeline;            /* 0=old, 1=new, -1=unknown */
+} DiscontinuityPacket;
+
+typedef struct DiscontinuityBuffer {
+    DiscontinuityPacket **packets;
+    int nb_packets;
+    int capacity;
+
+    int64_t old_timeline_base;   /* DTS of last packet before discontinuity (AV_TIME_BASE units) */
+    int64_t new_timeline_base;   /* DTS of first packet in new timeline (AV_TIME_BASE units) */
+    int64_t timeline_delta;      /* Adjustment to apply: new_base - old_base */
+    int timeline_established;    /* 1 if both old and new bases are known */
+
+    int active;                  /* 1 if currently buffering packets */
+    int64_t buffer_start_time;   /* Wall clock time when buffering started (us) */
+
+    uint8_t *stream_transitioned; /* Per-stream flag: 1 if stream has transitioned to new timeline */
+    int nb_streams;
+} DiscontinuityBuffer;
+
 typedef struct DemuxStream {
     InputStream              ist;
 
@@ -102,6 +134,11 @@ typedef struct DemuxStream {
     int64_t                  resume_pts;
     // measure of how far behind packet reading is against spceified readrate
     int64_t                  lag;
+
+    /* Per-stream discontinuity handling */
+    int64_t                  ts_offset_discont;      /* Per-stream timestamp offset */
+    int                      discontinuity_pending;  /* Flag when discontinuity just detected */
+    int64_t                  last_raw_dts;           /* Last DTS before any adjustment (AV_TIME_BASE) */
 } DemuxStream;
 
 typedef struct DemuxStreamGroup {
@@ -151,6 +188,12 @@ typedef struct Demuxer {
     int                   read_started;
     int                   nb_streams_used;
     int                   nb_streams_finished;
+
+    /* Discontinuity packet buffer for handling interleaved packets */
+    DiscontinuityBuffer   discont_buf;
+    int64_t               discont_threshold;     /* Jump threshold (default: 1 second) */
+    int                   discont_buffer_size;   /* Max packets to buffer (default: 256) */
+    int64_t               discont_timeout_us;    /* Timeout before forced flush (default: 500ms) */
 } Demuxer;
 
 typedef struct DemuxThreadContext {
@@ -219,6 +262,359 @@ static int seek_to_start(Demuxer *d, Timestamp end_pts)
         d->loop--;
 
     return ret;
+}
+
+/* ========== Discontinuity Buffer Functions ========== */
+
+/**
+ * Initialize the discontinuity buffer for the given number of streams.
+ * @param buf     The buffer to initialize
+ * @param capacity Maximum number of packets to buffer
+ * @param nb_streams Number of streams in the demuxer
+ * @return 0 on success, negative AVERROR on failure
+ */
+static int discont_buffer_init(DiscontinuityBuffer *buf, int capacity, int nb_streams)
+{
+    memset(buf, 0, sizeof(*buf));
+
+    buf->packets = av_calloc(capacity, sizeof(*buf->packets));
+    if (!buf->packets)
+        return AVERROR(ENOMEM);
+
+    buf->stream_transitioned = av_calloc(nb_streams, sizeof(*buf->stream_transitioned));
+    if (!buf->stream_transitioned) {
+        av_freep(&buf->packets);
+        return AVERROR(ENOMEM);
+    }
+
+    buf->capacity = capacity;
+    buf->nb_streams = nb_streams;
+    buf->nb_packets = 0;
+    buf->active = 0;
+    buf->timeline_established = 0;
+    buf->old_timeline_base = AV_NOPTS_VALUE;
+    buf->new_timeline_base = AV_NOPTS_VALUE;
+    buf->timeline_delta = 0;
+    buf->buffer_start_time = 0;
+
+    return 0;
+}
+
+/**
+ * Reset the discontinuity buffer state without freeing memory.
+ * Called after a successful flush.
+ */
+static void discont_buffer_reset(DiscontinuityBuffer *buf)
+{
+    /* Free any remaining packets */
+    for (int i = 0; i < buf->nb_packets; i++) {
+        if (buf->packets[i]) {
+            av_packet_free(&buf->packets[i]->pkt);
+            av_freep(&buf->packets[i]);
+        }
+    }
+    buf->nb_packets = 0;
+
+    /* Reset per-stream transition flags */
+    if (buf->stream_transitioned)
+        memset(buf->stream_transitioned, 0, buf->nb_streams * sizeof(*buf->stream_transitioned));
+
+    buf->active = 0;
+    buf->timeline_established = 0;
+    buf->old_timeline_base = AV_NOPTS_VALUE;
+    buf->new_timeline_base = AV_NOPTS_VALUE;
+    buf->timeline_delta = 0;
+    buf->buffer_start_time = 0;
+}
+
+/**
+ * Free all resources associated with the discontinuity buffer.
+ */
+static void discont_buffer_free(DiscontinuityBuffer *buf)
+{
+    if (!buf)
+        return;
+
+    discont_buffer_reset(buf);
+    av_freep(&buf->packets);
+    av_freep(&buf->stream_transitioned);
+    buf->capacity = 0;
+    buf->nb_streams = 0;
+}
+
+/**
+ * Add a packet to the discontinuity buffer.
+ * @param buf         The discontinuity buffer
+ * @param pkt         The packet to add (will be cloned)
+ * @param stream_idx  Stream index of the packet
+ * @param raw_dts     Original DTS in AV_TIME_BASE units before any adjustment
+ * @return 0 on success, negative AVERROR on failure
+ */
+static int discont_buffer_add(DiscontinuityBuffer *buf, AVPacket *pkt,
+                              int stream_idx, int64_t raw_dts)
+{
+    DiscontinuityPacket *dp;
+
+    if (buf->nb_packets >= buf->capacity)
+        return AVERROR(ENOSPC);
+
+    dp = av_mallocz(sizeof(*dp));
+    if (!dp)
+        return AVERROR(ENOMEM);
+
+    dp->pkt = av_packet_clone(pkt);
+    if (!dp->pkt) {
+        av_freep(&dp);
+        return AVERROR(ENOMEM);
+    }
+
+    dp->stream_idx = stream_idx;
+    dp->raw_dts = raw_dts;
+    dp->timeline = -1;  /* Unknown until classified */
+
+    buf->packets[buf->nb_packets++] = dp;
+
+    return 0;
+}
+
+/**
+ * Classify a packet to OLD (0) or NEW (1) timeline.
+ * @param buf      The discontinuity buffer
+ * @param raw_dts  The packet's raw DTS in AV_TIME_BASE units
+ * @return 0 for old timeline, 1 for new timeline, -1 if unknown
+ */
+static int discont_classify_timeline(DiscontinuityBuffer *buf, int64_t raw_dts)
+{
+    int64_t dist_to_old, dist_to_new;
+
+    if (!buf->timeline_established)
+        return -1;  /* Can't classify yet */
+
+    dist_to_old = llabs(raw_dts - buf->old_timeline_base);
+    dist_to_new = llabs(raw_dts - buf->new_timeline_base);
+
+    /* Use tolerance for classification */
+    if (dist_to_old < dist_to_new && dist_to_old < DISCONT_TIMELINE_TOLERANCE_US)
+        return 0;  /* OLD timeline */
+    else if (dist_to_new < DISCONT_TIMELINE_TOLERANCE_US)
+        return 1;  /* NEW timeline */
+    else if (dist_to_old < dist_to_new)
+        return 0;  /* Closer to old */
+    else
+        return 1;  /* Closer to new */
+}
+
+/**
+ * Check if all streams have transitioned to the new timeline.
+ * @param buf        The discontinuity buffer
+ * @param f          The input file (to check which streams are active)
+ * @return 1 if all active streams have transitioned, 0 otherwise
+ */
+static int discont_all_streams_transitioned(DiscontinuityBuffer *buf, InputFile *f)
+{
+    for (int i = 0; i < f->nb_streams && i < buf->nb_streams; i++) {
+        InputStream *ist = f->streams[i];
+        DemuxStream *ds = ds_from_ist(ist);
+
+        /* Skip discarded/finished streams */
+        if (ds->discard || ds->finished)
+            continue;
+
+        /* Only check video and audio streams (not data/subtitle) */
+        if (ist->par->codec_type != AVMEDIA_TYPE_VIDEO &&
+            ist->par->codec_type != AVMEDIA_TYPE_AUDIO)
+            continue;
+
+        if (!buf->stream_transitioned[i])
+            return 0;
+    }
+    return 1;
+}
+
+/**
+ * Check if the discontinuity buffer has timed out.
+ * @param buf  The discontinuity buffer
+ * @return 1 if timeout exceeded, 0 otherwise
+ */
+static int discont_buffer_timeout(DiscontinuityBuffer *buf, int64_t timeout_us)
+{
+    int64_t now = av_gettime_relative();
+
+    if (buf->buffer_start_time == 0)
+        return 0;
+
+    return (now - buf->buffer_start_time) > timeout_us;
+}
+
+/**
+ * Compare function for sorting packets by adjusted DTS.
+ */
+static int discont_packet_compare(const void *a, const void *b)
+{
+    const DiscontinuityPacket *pa = *(const DiscontinuityPacket **)a;
+    const DiscontinuityPacket *pb = *(const DiscontinuityPacket **)b;
+    int64_t dts_a, dts_b;
+
+    /* Use adjusted DTS for comparison */
+    dts_a = pa->raw_dts;
+    dts_b = pb->raw_dts;
+
+    /* OLD timeline packets need adjustment */
+    /* (Note: timeline_delta is applied during flush, not here) */
+
+    if (dts_a < dts_b)
+        return -1;
+    else if (dts_a > dts_b)
+        return 1;
+    else
+        return pa->stream_idx - pb->stream_idx;  /* Stable sort by stream */
+}
+
+/* Forward declaration */
+static int demux_send(Demuxer *d, DemuxThreadContext *dt, DemuxStream *ds,
+                      AVPacket *pkt, unsigned flags);
+
+/**
+ * Flush the discontinuity buffer, applying timestamp corrections and
+ * reordering packets by adjusted DTS.
+ * @param d   The demuxer
+ * @param dt  The demux thread context
+ * @return 0 on success, negative AVERROR on failure
+ */
+static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
+{
+    DiscontinuityBuffer *buf = &d->discont_buf;
+    InputFile *f = &d->f;
+    int ret = 0;
+
+    if (buf->nb_packets == 0) {
+        discont_buffer_reset(buf);
+        return 0;
+    }
+
+    av_log(d, AV_LOG_INFO,
+           "[DISCONT-BUF] Flushing %d buffered packets (timeline delta: %.3fs)\n",
+           buf->nb_packets, (double)buf->timeline_delta / AV_TIME_BASE);
+
+    /* Classify all packets */
+    for (int i = 0; i < buf->nb_packets; i++) {
+        DiscontinuityPacket *dp = buf->packets[i];
+        if (dp->timeline < 0)
+            dp->timeline = discont_classify_timeline(buf, dp->raw_dts);
+    }
+
+    /* Apply timestamp adjustment to old-timeline packets */
+    for (int i = 0; i < buf->nb_packets; i++) {
+        DiscontinuityPacket *dp = buf->packets[i];
+        if (dp->timeline == 0) {  /* OLD timeline */
+            /* Adjust raw_dts for sorting (will be applied to actual packet during send) */
+            dp->raw_dts += buf->timeline_delta;
+
+            /* Also adjust actual packet timestamps */
+            if (dp->pkt->dts != AV_NOPTS_VALUE)
+                dp->pkt->dts += av_rescale_q(buf->timeline_delta,
+                                             AV_TIME_BASE_Q, dp->pkt->time_base);
+            if (dp->pkt->pts != AV_NOPTS_VALUE)
+                dp->pkt->pts += av_rescale_q(buf->timeline_delta,
+                                             AV_TIME_BASE_Q, dp->pkt->time_base);
+        }
+    }
+
+    /* Sort packets by adjusted DTS */
+    qsort(buf->packets, buf->nb_packets, sizeof(DiscontinuityPacket *),
+          discont_packet_compare);
+
+    /* Emit packets in order */
+    for (int i = 0; i < buf->nb_packets; i++) {
+        DiscontinuityPacket *dp = buf->packets[i];
+        DemuxStream *ds;
+
+        if (dp->stream_idx >= f->nb_streams) {
+            av_log(d, AV_LOG_WARNING, "[DISCONT-BUF] Invalid stream index %d\n",
+                   dp->stream_idx);
+            continue;
+        }
+
+        ds = ds_from_ist(f->streams[dp->stream_idx]);
+
+        /* Mark first packet after discontinuity with flag */
+        if (i == 0 || (i > 0 && buf->packets[i-1]->timeline != dp->timeline))
+            dp->pkt->flags |= AV_PKT_FLAG_DISCONTINUITY;
+
+        ret = demux_send(d, dt, ds, dp->pkt, 0);
+        if (ret < 0) {
+            av_log(d, AV_LOG_ERROR, "[DISCONT-BUF] Failed to send packet: %s\n",
+                   av_err2str(ret));
+            break;
+        }
+
+        /* Clean up this packet entry */
+        av_packet_free(&dp->pkt);
+        av_freep(&buf->packets[i]);
+    }
+
+    av_log(d, AV_LOG_INFO, "[DISCONT-BUF] Flush complete, %d packets sent\n",
+           buf->nb_packets);
+
+    /* Reset buffer */
+    discont_buffer_reset(buf);
+
+    return ret;
+}
+
+/**
+ * Detect if a packet triggers a discontinuity and should start buffering.
+ * @param d    The demuxer
+ * @param ist  The input stream
+ * @param pkt  The packet being processed
+ * @param raw_dts  The packet's raw DTS in AV_TIME_BASE units
+ * @return 1 if discontinuity detected and buffering should start, 0 otherwise
+ */
+static int discont_detect_jump(Demuxer *d, InputStream *ist, AVPacket *pkt,
+                               int64_t raw_dts)
+{
+    DemuxStream *ds = ds_from_ist(ist);
+    DiscontinuityBuffer *buf = &d->discont_buf;
+    int64_t delta;
+
+    /* Only detect on video/audio streams */
+    if (ist->par->codec_type != AVMEDIA_TYPE_VIDEO &&
+        ist->par->codec_type != AVMEDIA_TYPE_AUDIO)
+        return 0;
+
+    /* Need previous DTS to compare */
+    if (ds->last_raw_dts == AV_NOPTS_VALUE)
+        return 0;
+
+    /* Calculate delta */
+    delta = raw_dts - ds->last_raw_dts;
+
+    /* Check for significant jump (forward or backward) */
+    if (llabs(delta) > d->discont_threshold) {
+        av_log(ist, AV_LOG_WARNING,
+               "[DISCONT-BUF] Detected timestamp jump on stream %d: "
+               "delta=%.3fs (threshold=%.3fs)\n",
+               ist->index, (double)delta / AV_TIME_BASE,
+               (double)d->discont_threshold / AV_TIME_BASE);
+
+        /* Set up timeline bases */
+        if (!buf->timeline_established) {
+            buf->old_timeline_base = ds->last_raw_dts;
+            buf->new_timeline_base = raw_dts;
+            buf->timeline_delta = raw_dts - ds->last_raw_dts;
+            buf->timeline_established = 1;
+
+            av_log(d, AV_LOG_INFO,
+                   "[DISCONT-BUF] Established timelines: old=%.3fs, new=%.3fs, delta=%.3fs\n",
+                   (double)buf->old_timeline_base / AV_TIME_BASE,
+                   (double)buf->new_timeline_base / AV_TIME_BASE,
+                   (double)buf->timeline_delta / AV_TIME_BASE);
+        }
+
+        return 1;
+    }
+
+    return 0;
 }
 
 static void ts_discontinuity_detect(Demuxer *d, InputStream *ist,
@@ -810,6 +1206,88 @@ static int input_thread(void *arg)
             }
         }
 
+        /* Capture raw DTS before ts_fixup for discontinuity detection */
+        {
+            InputStream *ist = f->streams[dt.pkt_demux->stream_index];
+            int64_t raw_dts = AV_NOPTS_VALUE;
+
+            if (dt.pkt_demux->dts != AV_NOPTS_VALUE) {
+                raw_dts = av_rescale_q_rnd(dt.pkt_demux->dts,
+                                           ist->st->time_base, AV_TIME_BASE_Q,
+                                           AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+            }
+
+            /* Check if this packet triggers discontinuity buffering */
+            if (!d->discont_buf.active && raw_dts != AV_NOPTS_VALUE) {
+                if (discont_detect_jump(d, ist, dt.pkt_demux, raw_dts)) {
+                    d->discont_buf.active = 1;
+                    d->discont_buf.buffer_start_time = av_gettime_relative();
+                    av_log(d, AV_LOG_INFO,
+                           "[DISCONT-BUF] Starting packet buffering (%d stream capacity)\n",
+                           d->discont_buf.nb_streams);
+                }
+            }
+
+            /* If buffering is active, add packet to buffer */
+            if (d->discont_buf.active) {
+                int timeline;
+
+                ret = discont_buffer_add(&d->discont_buf, dt.pkt_demux,
+                                         dt.pkt_demux->stream_index, raw_dts);
+                if (ret == AVERROR(ENOSPC)) {
+                    /* Buffer full, force flush */
+                    av_log(d, AV_LOG_WARNING,
+                           "[DISCONT-BUF] Buffer full (%d packets), forcing flush\n",
+                           d->discont_buf.nb_packets);
+                    ret = discont_buffer_flush(d, &dt);
+                    if (ret < 0)
+                        break;
+
+                    /* Re-add this packet now that buffer is cleared */
+                    ret = discont_buffer_add(&d->discont_buf, dt.pkt_demux,
+                                             dt.pkt_demux->stream_index, raw_dts);
+                }
+                if (ret < 0) {
+                    av_log(d, AV_LOG_ERROR,
+                           "[DISCONT-BUF] Failed to add packet to buffer: %s\n",
+                           av_err2str(ret));
+                    break;
+                }
+
+                /* Mark this stream as transitioned if packet is on new timeline */
+                timeline = discont_classify_timeline(&d->discont_buf, raw_dts);
+                if (timeline == 1 && dt.pkt_demux->stream_index < d->discont_buf.nb_streams) {
+                    d->discont_buf.stream_transitioned[dt.pkt_demux->stream_index] = 1;
+                }
+
+                /* Check if we should flush */
+                if (discont_all_streams_transitioned(&d->discont_buf, f) ||
+                    discont_buffer_timeout(&d->discont_buf, d->discont_timeout_us)) {
+
+                    if (discont_buffer_timeout(&d->discont_buf, d->discont_timeout_us)) {
+                        av_log(d, AV_LOG_WARNING,
+                               "[DISCONT-BUF] Timeout reached, flushing buffer\n");
+                    } else {
+                        av_log(d, AV_LOG_INFO,
+                               "[DISCONT-BUF] All streams transitioned, flushing buffer\n");
+                    }
+
+                    ret = discont_buffer_flush(d, &dt);
+                    if (ret < 0)
+                        break;
+                }
+
+                /* Update last_raw_dts for this stream */
+                ds->last_raw_dts = raw_dts;
+
+                av_packet_unref(dt.pkt_demux);
+                continue;  /* Don't process this packet through normal path */
+            }
+
+            /* Update last_raw_dts for discontinuity detection */
+            ds->last_raw_dts = raw_dts;
+        }
+
         ret = input_packet_process(d, dt.pkt_demux, &send_flags);
         if (ret < 0)
             break;
@@ -928,6 +1406,9 @@ void ifile_close(InputFile **pf)
     avformat_close_input(&f->ctx);
 
     av_packet_free(&d->pkt_heartbeat);
+
+    /* Free discontinuity buffer */
+    discont_buffer_free(&d->discont_buf);
 
     av_freep(pf);
 }
@@ -2142,6 +2623,17 @@ int ifile_open(const OptionsContext *o, const char *filename, Scheduler *sch)
                     return ret;
             }
         }
+    }
+
+    /* Initialize discontinuity buffer for handling interleaved packets */
+    d->discont_threshold = DISCONT_THRESHOLD_US;
+    d->discont_buffer_size = DISCONT_BUFFER_DEFAULT_SIZE;
+    d->discont_timeout_us = DISCONT_TIMEOUT_US;
+
+    ret = discont_buffer_init(&d->discont_buf, d->discont_buffer_size, f->nb_streams);
+    if (ret < 0) {
+        av_log(d, AV_LOG_ERROR, "Failed to initialize discontinuity buffer\n");
+        return ret;
     }
 
     return 0;
