@@ -47,7 +47,6 @@
 #define DISCONT_THRESHOLD_US          (1 * AV_TIME_BASE)   /* 1 second */
 #define DISCONT_TIMEOUT_US            (500 * 1000)         /* 500ms */
 #define DISCONT_TIMELINE_TOLERANCE_US (100 * 1000)         /* 100ms */
-#define DISCONT_SMALL_JUMP_US         (30 * AV_TIME_BASE)  /* 30 seconds - threshold for source gap vs timeline shift */
 
 typedef struct DiscontinuityPacket {
     AVPacket *pkt;
@@ -525,9 +524,8 @@ static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
           discont_packet_compare);
 
     /* Determine which timeline to keep:
-     * 1. If only one timeline has packets, keep those (e.g., stream starts mid-file)
-     * 2. For forward jump (delta > 0): Keep OLD (current content), discard NEW (jumped ahead)
-     * 3. For backward jump (delta < 0): Keep NEW (current content), discard OLD (from past)
+     * 1. If only one timeline has packets, keep those
+     * 2. If both timelines have packets, always keep NEW (the continued content)
      */
     {
         int sent_count = 0, discarded_count = 0;
@@ -591,40 +589,27 @@ static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
             /* Old packets already have cumulative offset applied via last_sent_dts tracking */
             av_log(d, AV_LOG_INFO, "[DISCONT-BUF] No new-timeline packets, keeping all old (%d)\n", old_count);
         } else {
-            /* Both timelines have packets - decide which to keep.
+            /* Both timelines have packets - always keep NEW.
              *
-             * For backward jumps: keep NEW (continued content from current position).
-             * For forward jumps, distinguish two cases:
-             *   - Small forward jump (< 30s): Source content gap (ad break, network
-             *     dropout). NEW packets are the resumed content after the gap.
-             *     Keep NEW to continue playback.
-             *   - Large forward jump (>= 30s): Timeline shift to a different time
-             *     reference. OLD packets are the current content. Keep OLD.
+             * The NEW timeline represents where the source is going next,
+             * regardless of whether the jump is forward or backward.
+             * The OLD side typically has just 1 packet (the last before the
+             * jump was detected), while NEW has the continued content.
              */
-            if (buf->timeline_delta > 0 &&
-                buf->timeline_delta >= DISCONT_SMALL_JUMP_US) {
-                keep_timeline = 0;  /* Large forward jump - keep old (current content) */
+            keep_timeline = 1;
+
+            /* Calculate offset to continue from old position */
+            if (buf->last_sent_dts != AV_NOPTS_VALUE) {
+                rebase_offset = buf->last_sent_dts - buf->new_timeline_base;
             } else {
-                keep_timeline = 1;  /* Backward jump or small forward jump - keep new */
+                rebase_offset = buf->old_timeline_base - buf->new_timeline_base;
             }
+            buf->cumulative_ts_offset = rebase_offset;  /* SET, not increment */
 
-            if (keep_timeline == 1) {
-                /* Keeping NEW packets - calculate offset to continue from old position */
-                if (buf->last_sent_dts != AV_NOPTS_VALUE) {
-                    rebase_offset = buf->last_sent_dts - buf->new_timeline_base;
-                } else {
-                    rebase_offset = buf->old_timeline_base - buf->new_timeline_base;
-                }
-                buf->cumulative_ts_offset = rebase_offset;  /* SET, not increment */
-            }
-
-            av_log(d, AV_LOG_INFO, "[DISCONT-BUF] Jump %s (delta=%.3fs%s), keeping %s (old=%d, new=%d), "
+            av_log(d, AV_LOG_INFO, "[DISCONT-BUF] Jump %s (delta=%.3fs), keeping new (old=%d, new=%d), "
                    "cumulative=%.3fs\n",
                    buf->timeline_delta > 0 ? "forward" : "backward",
                    (double)buf->timeline_delta / AV_TIME_BASE,
-                   (buf->timeline_delta > 0 && buf->timeline_delta < DISCONT_SMALL_JUMP_US) ?
-                       ", small gap" : "",
-                   keep_timeline == 0 ? "old" : "new",
                    old_count, new_count,
                    (double)buf->cumulative_ts_offset / AV_TIME_BASE);
         }
