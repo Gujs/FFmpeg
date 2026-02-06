@@ -661,9 +661,12 @@ typedef struct AVPacketList {
  */
 #define AV_PKT_FLAG_DISPOSABLE 0x0010
 /**
- * The packet follows a timestamp discontinuity in the stream.
- * The decoder should flush its internal state before decoding this packet
- * to avoid using stale reference frames from the previous segment.
+ * The packet belongs to a timestamp discontinuity boundary.
+ *
+ * Set when the demuxer detects a significant timestamp jump (forward
+ * or backward) that indicates a stream discontinuity, such as ad
+ * splices or content transitions. This flag signals to downstream
+ * components that special handling may be needed.
  */
 #define AV_PKT_FLAG_DISCONTINUITY 0x0020
 
