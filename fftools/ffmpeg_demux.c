@@ -804,6 +804,26 @@ static int discont_detect_jump(Demuxer *d, InputStream *ist, AVPacket *pkt,
     DiscontinuityBuffer *buf = &d->discont_buf;
     int64_t delta;
 
+    /* Lazy initialization: if the ifile_open init hunk didn't apply to the
+     * production base, defaults will be 0. Detect and fix this. */
+    if (d->discont_threshold == 0) {
+        InputFile *f = &d->f;
+        d->discont_threshold = DISCONT_THRESHOLD_US;
+        d->discont_buffer_size = DISCONT_BUFFER_DEFAULT_SIZE;
+        d->discont_timeout_us = DISCONT_TIMEOUT_US;
+        if (buf->capacity == 0 && f->nb_streams > 0) {
+            int ret = discont_buffer_init(buf, d->discont_buffer_size, f->nb_streams);
+            if (ret < 0) {
+                av_log(d, AV_LOG_ERROR, "[DISCONT-BUF] Lazy init failed\n");
+                return 0;
+            }
+            av_log(d, AV_LOG_INFO,
+                   "[DISCONT-BUF] Lazy init: threshold=%.3fs, capacity=%d, streams=%d\n",
+                   (double)d->discont_threshold / AV_TIME_BASE,
+                   buf->capacity, buf->nb_streams);
+        }
+    }
+
     /* Skip detection if we're currently flushing the buffer */
     if (buf->flushing)
         return 0;
