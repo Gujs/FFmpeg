@@ -47,6 +47,7 @@
 #define DISCONT_THRESHOLD_US          (1 * AV_TIME_BASE)   /* 1 second */
 #define DISCONT_TIMEOUT_US            (500 * 1000)         /* 500ms */
 #define DISCONT_TIMELINE_TOLERANCE_US (100 * 1000)         /* 100ms */
+#define DISCONT_SMALL_JUMP_US         (30 * AV_TIME_BASE)  /* 30 seconds - threshold for source gap vs timeline shift */
 
 typedef struct DiscontinuityPacket {
     AVPacket *pkt;
@@ -590,8 +591,22 @@ static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
             /* Old packets already have cumulative offset applied via last_sent_dts tracking */
             av_log(d, AV_LOG_INFO, "[DISCONT-BUF] No new-timeline packets, keeping all old (%d)\n", old_count);
         } else {
-            /* Both timelines have packets - use jump direction */
-            keep_timeline = (buf->timeline_delta > 0) ? 0 : 1;
+            /* Both timelines have packets - decide which to keep.
+             *
+             * For backward jumps: keep NEW (continued content from current position).
+             * For forward jumps, distinguish two cases:
+             *   - Small forward jump (< 30s): Source content gap (ad break, network
+             *     dropout). NEW packets are the resumed content after the gap.
+             *     Keep NEW to continue playback.
+             *   - Large forward jump (>= 30s): Timeline shift to a different time
+             *     reference. OLD packets are the current content. Keep OLD.
+             */
+            if (buf->timeline_delta > 0 &&
+                buf->timeline_delta >= DISCONT_SMALL_JUMP_US) {
+                keep_timeline = 0;  /* Large forward jump - keep old (current content) */
+            } else {
+                keep_timeline = 1;  /* Backward jump or small forward jump - keep new */
+            }
 
             if (keep_timeline == 1) {
                 /* Keeping NEW packets - calculate offset to continue from old position */
@@ -603,10 +618,12 @@ static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
                 buf->cumulative_ts_offset = rebase_offset;  /* SET, not increment */
             }
 
-            av_log(d, AV_LOG_INFO, "[DISCONT-BUF] Jump %s (delta=%.3fs), keeping %s (old=%d, new=%d), "
+            av_log(d, AV_LOG_INFO, "[DISCONT-BUF] Jump %s (delta=%.3fs%s), keeping %s (old=%d, new=%d), "
                    "cumulative=%.3fs\n",
                    buf->timeline_delta > 0 ? "forward" : "backward",
                    (double)buf->timeline_delta / AV_TIME_BASE,
+                   (buf->timeline_delta > 0 && buf->timeline_delta < DISCONT_SMALL_JUMP_US) ?
+                       ", small gap" : "",
                    keep_timeline == 0 ? "old" : "new",
                    old_count, new_count,
                    (double)buf->cumulative_ts_offset / AV_TIME_BASE);
