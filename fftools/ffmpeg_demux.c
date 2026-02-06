@@ -144,6 +144,15 @@ typedef struct DemuxStream {
     int64_t                  ts_offset_discont;      /* Per-stream timestamp offset */
     int                      discontinuity_pending;  /* Flag when discontinuity just detected */
     int64_t                  last_raw_dts;           /* Last DTS before any adjustment (AV_TIME_BASE) */
+
+    /* Drop non-keyframe video packets after a discontinuity boundary.
+     * The source sends corrupt packets at splice points that poison the
+     * decoder's reference frames. All subsequent P/B frames decode as
+     * garbage until the next IDR keyframe resets the decoder. By dropping
+     * non-keyframe packets, the decoder produces no output during this
+     * period and cfr mode duplicates the last good frame (clean freeze)
+     * instead of outputting 10s of visual corruption. */
+    int                      discont_drop_until_keyframe;
 } DemuxStream;
 
 typedef struct DemuxStreamGroup {
@@ -614,6 +623,22 @@ static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
                    (double)buf->cumulative_ts_offset / AV_TIME_BASE);
         }
 
+        /* Set drop-until-keyframe for video streams when keeping NEW timeline.
+         * This prevents corrupt splice boundary packets from poisoning the
+         * decoder's reference frames, which would cause ~10s of garbage output
+         * until the next IDR keyframe arrives. */
+        if (keep_timeline == 1 && (old_count > 0 || !is_stream_start)) {
+            for (int s = 0; s < f->nb_streams; s++) {
+                InputStream *ist_s = f->streams[s];
+                if (ist_s->par->codec_type == AVMEDIA_TYPE_VIDEO) {
+                    DemuxStream *ds_vid = ds_from_ist(ist_s);
+                    ds_vid->discont_drop_until_keyframe = 1;
+                    av_log(d, AV_LOG_INFO,
+                           "[DISCONT-BUF] Dropping non-keyframe video packets on stream %d until keyframe\n", s);
+                }
+            }
+        }
+
         for (int i = 0; i < buf->nb_packets; i++) {
             DiscontinuityPacket *dp = buf->packets[i];
             DemuxStream *ds;
@@ -631,6 +656,30 @@ static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
 
             av_log(d, AV_LOG_DEBUG, "[DISCONT-BUF] Processing %s-timeline packet %d/%d stream=%d dts=%"PRId64"\n",
                    dp->timeline == 0 ? "old" : "new", i + 1, buf->nb_packets, dp->stream_idx, dp->raw_dts);
+
+            /* Drop non-keyframe video packets after discontinuity to prevent
+             * corrupt splice boundary data from reaching the decoder */
+            if (dp->stream_idx < f->nb_streams) {
+                InputStream *ist_chk = f->streams[dp->stream_idx];
+                DemuxStream *ds_chk = ds_from_ist(ist_chk);
+                if (ds_chk->discont_drop_until_keyframe &&
+                    ist_chk->par->codec_type == AVMEDIA_TYPE_VIDEO) {
+                    if (dp->pkt->flags & AV_PKT_FLAG_KEY) {
+                        ds_chk->discont_drop_until_keyframe = 0;
+                        av_log(d, AV_LOG_INFO,
+                               "[DISCONT-BUF] Keyframe found in buffer for stream %d, resuming video\n",
+                               dp->stream_idx);
+                    } else {
+                        av_log(d, AV_LOG_DEBUG,
+                               "[DISCONT-BUF] Dropping non-keyframe video packet from buffer: stream=%d dts=%"PRId64"\n",
+                               dp->stream_idx, dp->raw_dts);
+                        discarded_count++;
+                        av_packet_free(&dp->pkt);
+                        av_freep(&buf->packets[i]);
+                        continue;
+                    }
+                }
+            }
 
             if (dp->stream_idx >= f->nb_streams) {
                 av_log(d, AV_LOG_WARNING, "[DISCONT-BUF] Invalid stream index %d\n",
@@ -1556,6 +1605,27 @@ static int input_thread(void *arg)
             /* Mark packet as having discontinuity correction applied so
              * ts_discontinuity_process doesn't double-adjust it */
             dt.pkt_demux->flags |= AV_PKT_FLAG_DISCONTINUITY;
+        }
+
+        /* Drop non-keyframe video packets after discontinuity boundary.
+         * The source's new content stream is joined mid-GOP, so non-IDR
+         * packets reference frames our decoder has never seen. They would
+         * either decode as garbage or fail entirely for ~10s until the next
+         * IDR arrives. Dropping them lets cfr duplicate the last good frame. */
+        if (ds->discont_drop_until_keyframe &&
+            ds->ist.par->codec_type == AVMEDIA_TYPE_VIDEO) {
+            if (dt.pkt_demux->flags & AV_PKT_FLAG_KEY) {
+                ds->discont_drop_until_keyframe = 0;
+                av_log(&ds->ist, AV_LOG_INFO,
+                       "[DISCONT-BUF] Keyframe arrived on stream %d, resuming video decode\n",
+                       dt.pkt_demux->stream_index);
+            } else {
+                av_log(&ds->ist, AV_LOG_DEBUG,
+                       "[DISCONT-BUF] Dropping non-keyframe video packet: stream=%d dts=%"PRId64"\n",
+                       dt.pkt_demux->stream_index, dt.pkt_demux->dts);
+                av_packet_unref(dt.pkt_demux);
+                continue;
+            }
         }
 
         ret = input_packet_process(d, dt.pkt_demux, &send_flags);
