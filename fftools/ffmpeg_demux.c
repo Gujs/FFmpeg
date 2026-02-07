@@ -1470,13 +1470,25 @@ static int input_thread(void *arg)
     while (1) {
         DemuxStream *ds;
         unsigned send_flags = 0;
+        int64_t read_start, read_elapsed;
 
+        /* Flush diagnostics before potentially blocking in av_read_frame */
+        discont_diag_log(d);
+
+        read_start = av_gettime_relative();
         ret = av_read_frame(f->ctx, dt.pkt_demux);
+        read_elapsed = av_gettime_relative() - read_start;
+
+        if (read_elapsed > 1000000) {
+            av_log(d, AV_LOG_WARNING,
+                   "[DISCONT-DIAG] av_read_frame blocked for %.3fs (ret=%s)\n",
+                   (double)read_elapsed / AV_TIME_BASE,
+                   av_err2str(ret));
+        }
 
         if (ret == AVERROR(EAGAIN)) {
             d->diag.eagain_count++;
             av_usleep(10000);
-            discont_diag_log(d);
             continue;
         }
         if (ret < 0) {
