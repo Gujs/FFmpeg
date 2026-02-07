@@ -208,6 +208,21 @@ typedef struct Demuxer {
     int64_t               discont_threshold;     /* Jump threshold (default: 1 second) */
     int                   discont_buffer_size;   /* Max packets to buffer (default: 256) */
     int64_t               discont_timeout_us;    /* Timeout before forced flush (default: 500ms) */
+
+    /* Diagnostic packet flow counters (per-second summary) */
+    struct {
+        int64_t interval_start;    /* Wall clock start of current 1s interval */
+        int     pkts_read;         /* Packets read from av_read_frame */
+        int     pkts_discarded;    /* Packets on wrong/finished streams */
+        int     pkts_buffered;     /* Packets held in discont buffer */
+        int     pkts_buf_flushed;  /* Packets released from buffer flush */
+        int     pkts_dropped_kf;   /* Packets dropped by drop-until-keyframe */
+        int     pkts_dropped_corrupt; /* Packets with AV_PKT_FLAG_CORRUPT */
+        int     pkts_sent;         /* Packets sent to decoder (normal path) */
+        int     vid_pkts_sent;     /* Video packets sent to decoder */
+        int     aud_pkts_sent;     /* Audio packets sent to decoder */
+        int     eagain_count;      /* EAGAIN returns from av_read_frame */
+    } diag;
 } Demuxer;
 
 typedef struct DemuxThreadContext {
@@ -772,6 +787,7 @@ static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
             }
 
             sent_count++;
+            d->diag.pkts_buf_flushed++;
 
             /* Clean up this packet entry */
             av_packet_free(&dp->pkt);
@@ -787,6 +803,50 @@ static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
     discont_buffer_reset(buf);
 
     return ret;
+}
+
+/**
+ * Log diagnostic packet flow counters once per second.
+ * Only logs when something looks abnormal (no video sent, buffer active,
+ * packets dropped, or excessive EAGAIN). Zero overhead during normal operation.
+ */
+static void discont_diag_log(Demuxer *d)
+{
+    int64_t now = av_gettime_relative();
+    int64_t elapsed_us = now - d->diag.interval_start;
+
+    if (elapsed_us < 1000000)  /* Not yet 1 second */
+        return;
+
+    /* Only log when something looks wrong:
+     * - Zero video packets sent to decoder
+     * - Buffer was active (packets held)
+     * - Packets were dropped
+     * - av_read_frame returned EAGAIN many times */
+    if (d->diag.vid_pkts_sent == 0 ||
+        d->diag.pkts_buffered > 0 ||
+        d->diag.pkts_dropped_kf > 0 ||
+        d->diag.eagain_count > 10) {
+
+        av_log(d, AV_LOG_WARNING,
+               "[DISCONT-DIAG] 1s: read=%d discard=%d buffered=%d "
+               "flushed=%d drop_kf=%d corrupt=%d sent=%d "
+               "(vid=%d aud=%d) eagain=%d\n",
+               d->diag.pkts_read,
+               d->diag.pkts_discarded,
+               d->diag.pkts_buffered,
+               d->diag.pkts_buf_flushed,
+               d->diag.pkts_dropped_kf,
+               d->diag.pkts_dropped_corrupt,
+               d->diag.pkts_sent,
+               d->diag.vid_pkts_sent,
+               d->diag.aud_pkts_sent,
+               d->diag.eagain_count);
+    }
+
+    /* Reset for next interval */
+    memset(&d->diag, 0, sizeof(d->diag));
+    d->diag.interval_start = now;
 }
 
 /**
@@ -1405,6 +1465,7 @@ static int input_thread(void *arg)
 
     d->read_started    = 1;
     d->wallclock_start = av_gettime_relative();
+    d->diag.interval_start = av_gettime_relative();
 
     while (1) {
         DemuxStream *ds;
@@ -1413,7 +1474,9 @@ static int input_thread(void *arg)
         ret = av_read_frame(f->ctx, dt.pkt_demux);
 
         if (ret == AVERROR(EAGAIN)) {
+            d->diag.eagain_count++;
             av_usleep(10000);
+            discont_diag_log(d);
             continue;
         }
         if (ret < 0) {
@@ -1446,6 +1509,8 @@ static int input_thread(void *arg)
             break;
         }
 
+        d->diag.pkts_read++;
+
         if (do_pkt_dump) {
             av_pkt_dump_log2(NULL, AV_LOG_INFO, dt.pkt_demux, do_hex_dump,
                              f->ctx->streams[dt.pkt_demux->stream_index]);
@@ -1456,12 +1521,14 @@ static int input_thread(void *arg)
         ds = dt.pkt_demux->stream_index < f->nb_streams ?
              ds_from_ist(f->streams[dt.pkt_demux->stream_index]) : NULL;
         if (!ds || ds->discard || ds->finished) {
+            d->diag.pkts_discarded++;
             report_new_stream(d, dt.pkt_demux);
             av_packet_unref(dt.pkt_demux);
             continue;
         }
 
         if (dt.pkt_demux->flags & AV_PKT_FLAG_CORRUPT) {
+            d->diag.pkts_dropped_corrupt++;
             av_log(d, exit_on_error ? AV_LOG_FATAL : AV_LOG_WARNING,
                    "corrupt input packet in stream %d\n",
                    dt.pkt_demux->stream_index);
@@ -1498,6 +1565,7 @@ static int input_thread(void *arg)
             if (d->discont_buf.active) {
                 int timeline;
 
+                d->diag.pkts_buffered++;
                 ret = discont_buffer_add(&d->discont_buf, dt.pkt_demux,
                                          dt.pkt_demux->stream_index, raw_dts);
                 if (ret == AVERROR(ENOSPC)) {
@@ -1620,6 +1688,7 @@ static int input_thread(void *arg)
                        "[DISCONT-BUF] Keyframe arrived on stream %d, resuming video decode\n",
                        dt.pkt_demux->stream_index);
             } else {
+                d->diag.pkts_dropped_kf++;
                 av_log(&ds->ist, AV_LOG_DEBUG,
                        "[DISCONT-BUF] Dropping non-keyframe video packet: stream=%d dts=%"PRId64"\n",
                        dt.pkt_demux->stream_index, dt.pkt_demux->dts);
@@ -1638,6 +1707,12 @@ static int input_thread(void *arg)
         ret = demux_send(d, &dt, ds, dt.pkt_demux, send_flags);
         if (ret < 0)
             break;
+
+        d->diag.pkts_sent++;
+        if (ds->ist.par->codec_type == AVMEDIA_TYPE_VIDEO)
+            d->diag.vid_pkts_sent++;
+        else if (ds->ist.par->codec_type == AVMEDIA_TYPE_AUDIO)
+            d->diag.aud_pkts_sent++;
 
         /* Track last sent position (END of packet, not start) for discontinuity buffer
          * cumulative offset calculation. Using end time ensures new content starts
@@ -1665,6 +1740,8 @@ static int input_thread(void *arg)
             if (output_end > d->discont_buf.last_sent_dts || d->discont_buf.last_sent_dts == AV_NOPTS_VALUE)
                 d->discont_buf.last_sent_dts = output_end;
         }
+
+        discont_diag_log(d);
     }
 
     // EOF/EXIT is normal termination
