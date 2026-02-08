@@ -3452,6 +3452,7 @@ int of_setup_cc_extraction(OutputFile *ofile)
             cc_st->codecpar->codec_type = AVMEDIA_TYPE_SUBTITLE;
             cc_ms->last_mux_dts = AV_NOPTS_VALUE;
             cc_ms->max_frames   = INT64_MAX;
+            cc_ms->sq_idx_mux   = -1;
 
             /* register with scheduler */
             ret = GROW_ARRAY(mux->sch_stream_idx, mux->nb_sch_stream_idx);
