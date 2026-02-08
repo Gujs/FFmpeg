@@ -2176,8 +2176,50 @@ static int create_streams(Muxer *mux, const OptionsContext *o)
 
                 /* Set language metadata for the teletext descriptor in PMT.
                  * The MPEG-TS muxer reads this to write the language code
-                 * in the teletext descriptor (0x56). */
-                av_dict_set(&cc_st->metadata, "language", "eng", 0);
+                 * in the teletext descriptor (0x56).
+                 * Priority: -cc_lang override > auto-detect from audio > "eng" */
+                {
+                    const char *cc_lang_override = NULL;
+                    const char *cc_lang = "eng"; /* default fallback */
+
+                    opt_match_per_stream_str(video_ost, &o->cc_lang, oc,
+                                             video_ost->st, &cc_lang_override);
+
+                    if (cc_lang_override && cc_lang_override[0]) {
+                        cc_lang = cc_lang_override;
+                        av_log(mux, AV_LOG_INFO,
+                               "CC subtitle language: \"%s\" (from -cc_lang)\n",
+                               cc_lang);
+                    } else {
+                        /* Auto-detect: use first audio stream's language from
+                         * the same input file as the video */
+                        const InputFile *ifile = video_ost->ist->file;
+                        int detected = 0;
+                        for (int j = 0; j < ifile->nb_streams; j++) {
+                            const InputStream *ist_a = ifile->streams[j];
+                            if (ist_a->par->codec_type == AVMEDIA_TYPE_AUDIO) {
+                                const AVDictionaryEntry *e =
+                                    av_dict_get(ist_a->st->metadata,
+                                                "language", NULL, 0);
+                                if (e && e->value[0] &&
+                                    strcmp(e->value, "und") != 0) {
+                                    cc_lang = e->value;
+                                    detected = 1;
+                                    av_log(mux, AV_LOG_INFO,
+                                           "CC subtitle language: \"%s\" "
+                                           "(auto-detected from audio stream %d)\n",
+                                           cc_lang, ist_a->index);
+                                    break;
+                                }
+                            }
+                        }
+                        if (!detected)
+                            av_log(mux, AV_LOG_INFO,
+                                   "CC subtitle language: \"eng\" (default)\n");
+                    }
+
+                    av_dict_set(&cc_st->metadata, "language", cc_lang, 0);
+                }
 
                 /* wire: CC decoder output → subtitle encoder → mux stream */
                 ret = sch_connect(mux->sch,
