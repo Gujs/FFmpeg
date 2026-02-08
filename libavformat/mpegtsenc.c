@@ -420,7 +420,7 @@ static int scte35_adjust_pts(AVFormatContext *s, uint8_t *buf, int len, int64_t 
     /* Ensure new_splice_time fits in 33 bits */
     new_splice_time &= 0x1FFFFFFFFULL;
 
-    av_log(s, AV_LOG_INFO, "SCTE-35: Timeline mismatch detected (preroll %.3fs too large). "
+    av_log(s, AV_LOG_VERBOSE, "SCTE-35: Timeline mismatch detected (preroll %.3fs too large). "
            "Adjusting splice_time %"PRId64" (%.3fs) -> %"PRId64" (%.3fs), using %.1fs preroll\n",
            preroll / 90000.0,
            splice_time, splice_time / 90000.0,
@@ -2457,6 +2457,31 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
         mpegts_write_pes(s, st, buf, size, pts, dts,
                          pkt->flags & AV_PKT_FLAG_KEY, stream_id);
         return 0;
+    }
+
+    /* Flush aggregated audio if timestamp is irregular (discontinuity recovery).
+     * This prevents PES packets with computed frame timestamps that overlap the next PES. */
+    if (ts_st->payload_size && ts_st->payload_dts != AV_NOPTS_VALUE &&
+        dts != AV_NOPTS_VALUE && st->codecpar->sample_rate > 0 &&
+        st->codecpar->frame_size > 0) {
+        int64_t frame_dur = av_rescale(st->codecpar->frame_size, 90000,
+                                       st->codecpar->sample_rate);
+        int avg_frame_bytes = (st->codecpar->bit_rate > 0)
+            ? (int)av_rescale(st->codecpar->bit_rate, st->codecpar->frame_size,
+                              8LL * st->codecpar->sample_rate)
+            : 0;
+        int frame_count = (avg_frame_bytes > 0)
+            ? ts_st->payload_size / avg_frame_bytes : 1;
+        if (frame_count < 1) frame_count = 1;
+        int64_t expected_next_dts = ts_st->payload_dts + frame_count * frame_dur;
+        int64_t delta = dts - expected_next_dts;
+        if (FFABS(delta) > frame_dur / 4) {
+            mpegts_write_pes(s, st, ts_st->payload, ts_st->payload_size,
+                             ts_st->payload_pts, ts_st->payload_dts,
+                             ts_st->payload_flags & AV_PKT_FLAG_KEY, stream_id);
+            ts_st->payload_size = 0;
+            ts_st->opus_queued_samples = 0;
+        }
     }
 
     if (ts_st->payload_size && (ts_st->payload_size + size > ts->pes_payload_size ||
