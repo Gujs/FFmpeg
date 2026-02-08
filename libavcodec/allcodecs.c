@@ -729,6 +729,7 @@ extern const FFCodec ff_ass_decoder;
 extern const FFCodec ff_ccaption_decoder;
 extern const FFCodec ff_dvbsub_encoder;
 extern const FFCodec ff_dvbsub_decoder;
+extern const FFCodec ff_dvb_teletext_encoder;
 extern const FFCodec ff_dvdsub_encoder;
 extern const FFCodec ff_dvdsub_decoder;
 extern const FFCodec ff_jacosub_decoder;

@@ -2079,11 +2079,17 @@ static int create_streams(Muxer *mux, const OptionsContext *o)
             if (ret < 0)
                 return ret;
 
-            /* find subtitle encoder: try "srt" as default text subtitle codec */
-            cc_enc_codec = avcodec_find_encoder(AV_CODEC_ID_SUBRIP);
+            /* find subtitle encoder: prefer DVB Teletext for standard MPEG-TS
+             * subtitle PIDs, fall back to SRT (muxed as PRIVATE_DATA) */
+            cc_enc_codec = avcodec_find_encoder(AV_CODEC_ID_DVB_TELETEXT);
+            if (!cc_enc_codec) {
+                av_log(video_ost, AV_LOG_INFO,
+                       "DVB Teletext encoder not available, falling back to SRT\n");
+                cc_enc_codec = avcodec_find_encoder(AV_CODEC_ID_SUBRIP);
+            }
             if (!cc_enc_codec) {
                 av_log(video_ost, AV_LOG_ERROR,
-                       "No SRT subtitle encoder found for CC extraction\n");
+                       "No subtitle encoder found for CC extraction\n");
                 return AVERROR_ENCODER_NOT_FOUND;
             }
 
@@ -2167,6 +2173,11 @@ static int create_streams(Muxer *mux, const OptionsContext *o)
                 snprintf(cc_ms->log_name, sizeof(cc_ms->log_name),
                          "cc_sub#%d:%d/%s", mux->of.index, cc_ost->index,
                          cc_enc_codec->name);
+
+                /* Set language metadata for the teletext descriptor in PMT.
+                 * The MPEG-TS muxer reads this to write the language code
+                 * in the teletext descriptor (0x56). */
+                av_dict_set(&cc_st->metadata, "language", "eng", 0);
 
                 /* wire: CC decoder output → subtitle encoder → mux stream */
                 ret = sch_connect(mux->sch,
