@@ -1229,6 +1229,11 @@ static int ost_add(Muxer *mux, const OptionsContext *o, enum AVMediaType type,
         av_assert0(ret == mux->nb_sch_stream_idx - 1);
         mux->sch_stream_idx[ret] = ms->ost.index;
         ms->sch_idx              = ret;
+
+        // mark data and subtitle streams as sparse - they have infrequent
+        // packets and should not block timing calculations
+        if (type == AVMEDIA_TYPE_DATA || type == AVMEDIA_TYPE_SUBTITLE)
+            sch_mux_stream_set_sparse(mux->sch, mux->sch_idx, ret, 1);
     }
 
     ost = &ms->ost;
