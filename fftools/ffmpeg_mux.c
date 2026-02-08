@@ -43,10 +43,7 @@ typedef struct MuxThreadContext {
     AVPacket *fix_sub_duration_pkt;
 } MuxThreadContext;
 
-static Muxer *mux_from_of(OutputFile *of)
-{
-    return (Muxer*)of;
-}
+/* mux_from_of is now in ffmpeg_mux.h as static inline */
 
 static int64_t filesize(AVIOContext *pb)
 {
