@@ -3570,6 +3570,21 @@ int of_setup_cc_extraction(OutputFile *ofile)
                    video_ost->file->index, video_ost->index,
                    cc_ost->file->index, cc_ost->index,
                    cc_enc_codec->name);
+
+            /* Reduce max_interleave_delta to prevent the sparse CC subtitle
+             * stream from blocking the lavf interleaver.
+             *
+             * The interleaver auto-flushes only when ALL interleaved streams
+             * have buffered data (mux.c:969).  During discontinuity handling
+             * and keyframe-wait, no video frames are decoded so no CC
+             * keepalives are emitted — the subtitle stream goes silent.
+             * With the default delta of 10s, video/audio buffer up for 10s
+             * before a forced flush, creating a visible gap in the output.
+             *
+             * 100ms is sufficient for correct interleaving of live video
+             * (33ms per frame at 30fps) and audio (23ms per AAC frame). */
+            if (oc->max_interleave_delta > 100000)
+                oc->max_interleave_delta = 100000; /* 100ms */
         }
 
         video_ms->cc_extract_pending = 0;
