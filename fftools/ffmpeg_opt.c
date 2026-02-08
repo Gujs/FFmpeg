@@ -2026,6 +2026,9 @@ const OptionDef options[] = {
         "set this video output stream to be a heartbeat stream for "
         "fix_sub_duration, according to which subtitles should be split at "
         "random access points" },
+    { "extract_cc",                 OPT_TYPE_BOOL,   OPT_VIDEO | OPT_PERSTREAM | OPT_OUTPUT,
+        { .off = OFFSET(extract_cc) },
+        "extract closed captions from video to a separate subtitle stream" },
 
     /* audio options */
     { "aframes",          OPT_TYPE_FUNC,    OPT_AUDIO | OPT_FUNC_ARG | OPT_PERFILE | OPT_OUTPUT | OPT_EXPERT | OPT_HAS_CANON,
