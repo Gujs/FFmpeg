@@ -1476,6 +1476,18 @@ static int input_thread(void *arg)
     d->wallclock_start = av_gettime_relative();
     d->diag.interval_start = av_gettime_relative();
 
+    /* Lazy init: if discontinuity buffer wasn't initialized in ifile_open
+     * (e.g., when using parallel input opening via ifile_open_from_io),
+     * initialize it now before the demux loop starts. */
+    if (d->discont_threshold == 0) {
+        d->discont_threshold = DISCONT_THRESHOLD_US;
+        d->discont_buffer_size = DISCONT_BUFFER_DEFAULT_SIZE;
+        d->discont_timeout_us = DISCONT_TIMEOUT_US;
+        ret = discont_buffer_init(&d->discont_buf, d->discont_buffer_size, f->nb_streams);
+        if (ret < 0)
+            goto finish;
+    }
+
     while (1) {
         DemuxStream *ds;
         unsigned send_flags = 0;
