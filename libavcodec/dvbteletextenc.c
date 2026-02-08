@@ -284,8 +284,18 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
     int offset = 0;
     int i, ret;
 
-    if (!sub || sub->num_rects == 0)
+    if (!sub)
         return 0;
+
+    /* Empty subtitle (no rects): send an empty page header as keepalive.
+     * This prevents the MPEG-TS interleaver from blocking video/audio
+     * while waiting for sparse subtitle data. */
+    if (sub->num_rects == 0) {
+        if (bufsize < 1 + 46)
+            return 0;
+        buf[0] = TELETEXT_DATA_IDENTIFIER;
+        return 1 + write_page_header(buf + 1, ctx, 0); /* no erase */
+    }
 
     /* We need at minimum:
      * 1 byte (data_identifier) + 46 bytes (page header) + 46*2 (content rows) = 139

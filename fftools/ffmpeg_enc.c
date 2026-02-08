@@ -791,8 +791,14 @@ static int frame_encode(OutputStream *ost, AVFrame *frame, AVPacket *pkt)
                                      (AVSubtitle*)frame->buf[0]->data : NULL;
 
         // no flushing for subtitles
-        return subtitle && subtitle->num_rects ?
-               do_subtitle_out(of, ost, subtitle, pkt) : 0;
+        if (!subtitle)
+            return 0;
+        /* Pass empty subtitles for DVB Teletext as keepalive to prevent
+         * MPEG-TS interleaver from blocking video/audio on sparse streams */
+        if (!subtitle->num_rects &&
+            e->enc_ctx->codec_id != AV_CODEC_ID_DVB_TELETEXT)
+            return 0;
+        return do_subtitle_out(of, ost, subtitle, pkt);
     }
 
     if (frame) {
