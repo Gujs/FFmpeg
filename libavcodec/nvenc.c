@@ -2290,12 +2290,10 @@ av_cold int ff_nvenc_encode_init(AVCodecContext *avctx)
 
     /* Initialize colorspace tracking for mid-stream colorspace change detection */
     ctx->last_colorspace = AVCOL_SPC_UNSPECIFIED;
-    ctx->encoder_reset_pending = 0;
 
     /* Initialize diagnostic fields for DTS/PTS tracking */
     ctx->last_dts_out = AV_NOPTS_VALUE;
     ctx->last_pts_out = AV_NOPTS_VALUE;
-    ctx->frames_since_reconfig = -1;  /* -1 means not tracking */
 
     if ((ret = nvenc_load_libraries(avctx)) < 0)
         return ret;
@@ -2403,7 +2401,7 @@ static int nvenc_register_frame(AVCodecContext *avctx, const AVFrame *frame)
     /* Validate hw_frames_ctx - this should always be set for CUDA/D3D11 frames,
      * but check defensively in case of edge cases during reconfiguration */
     if (!frame->hw_frames_ctx) {
-        av_log(avctx, AV_LOG_INFO,
+        av_log(avctx, AV_LOG_DEBUG,
                "[HW-PATCH] NVENC: frame->hw_frames_ctx is NULL (unexpected for HW frame)\n");
         return AVERROR(EINVAL);
     }
@@ -2423,7 +2421,7 @@ static int nvenc_register_frame(AVCodecContext *avctx, const AVFrame *frame)
                 return i;
             /* GPU address matches but pool is different - this would have caused
              * stale registration reuse before the fix. Log for diagnostic purposes. */
-            av_log(avctx, AV_LOG_INFO,
+            av_log(avctx, AV_LOG_DEBUG,
                    "[HW-PATCH] NVENC: GPU addr %p reused from different pool "
                    "(old=%p new=%p) - creating fresh registration\n",
                    frame->data[0],
@@ -2436,7 +2434,7 @@ static int nvenc_register_frame(AVCodecContext *avctx, const AVFrame *frame)
             if (ctx->registered_frames[i].hw_frames_ref &&
                 ctx->registered_frames[i].hw_frames_ref->data == frame->hw_frames_ctx->data)
                 return i;
-            av_log(avctx, AV_LOG_INFO,
+            av_log(avctx, AV_LOG_DEBUG,
                    "[HW-PATCH] NVENC: D3D11 addr %p reused from different pool "
                    "(old=%p new=%p) - creating fresh registration\n",
                    frame->data[0],
@@ -2501,7 +2499,7 @@ static int nvenc_upload_frame(AVCodecContext *avctx, const AVFrame *frame,
         /* Track hw_frames_ctx changes for diagnostic purposes.
          * Log when the frame pool changes (e.g., after filter graph reconfiguration). */
         if (frame->hw_frames_ctx && frame->hw_frames_ctx->data != ctx->last_hw_frames_ctx) {
-            av_log(avctx, AV_LOG_INFO,
+            av_log(avctx, AV_LOG_DEBUG,
                    "[HW-PATCH] Frame pool changed: %p -> %p (PTS=%"PRId64" pict_type=%d)\n",
                    ctx->last_hw_frames_ctx, frame->hw_frames_ctx->data, frame->pts, frame->pict_type);
             ctx->last_hw_frames_ctx = frame->hw_frames_ctx->data;
@@ -2870,18 +2868,6 @@ static int process_output_surface(AVCodecContext *avctx, AVPacket *pkt, NvencSur
     ff_encode_add_stats_side_data(pkt,
         (lock_params.frameAvgQP - 1) * FF_QP2LAMBDA, NULL, 0, pict_type);
 
-    /* Log output frame types for first 30 frames after reconfiguration */
-    if (ctx->frames_since_reconfig >= 0 && ctx->frames_since_reconfig < 30) {
-        const char *type_str = (lock_params.pictureType == NV_ENC_PIC_TYPE_IDR) ? "IDR" :
-                               (lock_params.pictureType == NV_ENC_PIC_TYPE_I) ? "I" :
-                               (lock_params.pictureType == NV_ENC_PIC_TYPE_P) ? "P" :
-                               (lock_params.pictureType == NV_ENC_PIC_TYPE_B) ? "B" : "?";
-        av_log(avctx, AV_LOG_INFO,
-               "[HW-PATCH] Output frame %d after reconfig: type=%s PTS=%"PRIu64"\n",
-               ctx->frames_since_reconfig, type_str, lock_params.outputTimeStamp);
-        ctx->frames_since_reconfig++;
-    }
-
     res = nvenc_set_timestamp(avctx, &lock_params, pkt);
     if (res < 0)
         goto error2;
@@ -3033,7 +3019,6 @@ static void reconfig_encoder(AVCodecContext *avctx, const AVFrame *frame)
     int needs_reconfig = 0;
     int needs_encode_config = 0;
     int reconfig_bitrate = 0, reconfig_dar = 0;
-    int reconfig_colorspace = 0;
     int dw, dh;
 
     params.version = NV_ENC_RECONFIGURE_PARAMS_VER;
@@ -3063,21 +3048,13 @@ static void reconfig_encoder(AVCodecContext *avctx, const AVFrame *frame)
     if (frame && ctx->last_colorspace != AVCOL_SPC_UNSPECIFIED &&
         frame->colorspace != AVCOL_SPC_UNSPECIFIED &&
         frame->colorspace != ctx->last_colorspace) {
-        av_log(avctx, AV_LOG_INFO,
+        av_log(avctx, AV_LOG_VERBOSE,
                "[HW-PATCH] Colorspace change detected: %s -> %s (encoder config preserved)\n",
                av_color_space_name(ctx->last_colorspace),
                av_color_space_name(frame->colorspace));
         /* Do NOT reconfigure - just log and continue with original colorspace */
         /* reconfig_colorspace = 1; */
         /* needs_reconfig = 1; */
-    }
-
-    /* encoder_reset_pending was used for filter graph reconfig, but we no longer
-     * reconfigure the encoder on colorspace changes. Just clear the flag. */
-    if (ctx->encoder_reset_pending) {
-        av_log(avctx, AV_LOG_INFO,
-               "[HW-PATCH] Encoder reset pending flag cleared (no reconfiguration needed)\n");
-        ctx->encoder_reset_pending = 0;
     }
 
     /* Track current colorspace for next frame comparison */
@@ -3145,11 +3122,11 @@ static void reconfig_encoder(AVCodecContext *avctx, const AVFrame *frame)
         params.reInitEncodeParams.encodeConfig = NULL;
 
     if (needs_reconfig) {
-        av_log(avctx, AV_LOG_INFO,
+        av_log(avctx, AV_LOG_DEBUG,
                "[HW-PATCH] Calling nvEncReconfigureEncoder (resetEncoder=%d, forceIDR=%d)\n",
                params.resetEncoder, params.forceIDR);
         ret = p_nvenc->nvEncReconfigureEncoder(ctx->nvencoder, &params);
-        av_log(avctx, AV_LOG_INFO,
+        av_log(avctx, AV_LOG_DEBUG,
                "[HW-PATCH] nvEncReconfigureEncoder returned %d\n", ret);
         if (ret != NV_ENC_SUCCESS) {
             nvenc_print_error(avctx, ret, "failed to reconfigure nvenc");
@@ -3330,7 +3307,7 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
             /* Log reconfiguration keyframes for debugging.
              * These are marked with "lavfi.reconfig_keyframe" metadata by the filter graph. */
             if (av_dict_get(frame->metadata, "lavfi.reconfig_keyframe", NULL, 0)) {
-                av_log(avctx, AV_LOG_INFO,
+                av_log(avctx, AV_LOG_DEBUG,
                        "[HW-PATCH] Reconfiguration keyframe at PTS=%"PRId64"\n",
                        frame->pts);
             }
