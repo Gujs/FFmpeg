@@ -2046,6 +2046,149 @@ static int create_streams(Muxer *mux, const OptionsContext *o)
         }
     }
 
+    /* create subtitle streams for CC extraction from video streams */
+    {
+        int nb_streams_before_cc = mux->of.nb_streams;
+        for (int i = 0; i < nb_streams_before_cc; i++) {
+            OutputStream *video_ost = mux->of.streams[i];
+            OutputStream *cc_ost;
+            MuxStream    *cc_ms;
+            SchedulerNode cc_src;
+            const AVCodec *cc_enc_codec;
+            int extract_cc_val = 0;
+
+            if (video_ost->type != AVMEDIA_TYPE_VIDEO || !video_ost->ist)
+                continue;
+
+            opt_match_per_stream_int(video_ost, &o->extract_cc, oc, video_ost->st,
+                                     &extract_cc_val);
+            if (!extract_cc_val)
+                continue;
+
+            if (!video_ost->ist->decoder) {
+                av_log(video_ost, AV_LOG_WARNING,
+                       "-extract_cc requires transcoding, ignoring for stream copy\n");
+                continue;
+            }
+
+            /* set up CC extraction on the video decoder */
+            ret = dec_setup_cc_extract(video_ost->ist->decoder, &cc_src);
+            if (ret < 0)
+                return ret;
+
+            /* find subtitle encoder: try "srt" as default text subtitle codec */
+            cc_enc_codec = avcodec_find_encoder(AV_CODEC_ID_SUBRIP);
+            if (!cc_enc_codec) {
+                av_log(video_ost, AV_LOG_ERROR,
+                       "No SRT subtitle encoder found for CC extraction\n");
+                return AVERROR_ENCODER_NOT_FOUND;
+            }
+
+            /* create the subtitle output stream */
+            {
+                AVStream *cc_st = avformat_new_stream(oc, NULL);
+                if (!cc_st)
+                    return AVERROR(ENOMEM);
+
+                cc_ms = mux_stream_alloc(mux, AVMEDIA_TYPE_SUBTITLE);
+                if (!cc_ms)
+                    return AVERROR(ENOMEM);
+
+                cc_ost = &cc_ms->ost;
+                cc_ost->st  = cc_st;
+                cc_ost->ist = video_ost->ist;
+                cc_ost->kf.ref_pts = AV_NOPTS_VALUE;
+                cc_ms->par_in = avcodec_parameters_alloc();
+                if (!cc_ms->par_in)
+                    return AVERROR(ENOMEM);
+                cc_ms->par_in->codec_type   = AVMEDIA_TYPE_SUBTITLE;
+                cc_st->codecpar->codec_type = AVMEDIA_TYPE_SUBTITLE;
+                cc_ms->last_mux_dts = AV_NOPTS_VALUE;
+                cc_ms->max_frames   = INT64_MAX;
+
+                /* register with scheduler */
+                ret = GROW_ARRAY(mux->sch_stream_idx, mux->nb_sch_stream_idx);
+                if (ret < 0)
+                    return ret;
+
+                ret = sch_add_mux_stream(mux->sch, mux->sch_idx);
+                if (ret < 0)
+                    return ret;
+
+                av_assert0(ret == mux->nb_sch_stream_idx - 1);
+                mux->sch_stream_idx[ret] = cc_ost->index;
+                cc_ms->sch_idx           = ret;
+
+                /* subtitle streams are sparse */
+                sch_mux_stream_set_sparse(mux->sch, mux->sch_idx, cc_ms->sch_idx, 1);
+
+                /* create subtitle encoder */
+                ret = sch_add_enc(mux->sch, encoder_thread, cc_ost,
+                                  NULL /* subtitles open immediately */);
+                if (ret < 0)
+                    return ret;
+                cc_ms->sch_idx_enc = ret;
+
+                ret = enc_alloc(&cc_ost->enc, cc_enc_codec, mux->sch,
+                                cc_ms->sch_idx_enc, cc_ost);
+                if (ret < 0)
+                    return ret;
+
+                /* The SRT encoder needs the ASS subtitle header from cc_dec.
+                 * dec_setup_cc_extract() stores it in Decoder.subtitle_header
+                 * via the cc_dec context, and we set it here on the encoder. */
+                {
+                    const uint8_t *sub_hdr;
+                    int sub_hdr_size;
+
+                    ret = dec_get_cc_subtitle_header(video_ost->ist->decoder,
+                                                     &sub_hdr, &sub_hdr_size);
+                    if (ret >= 0 && sub_hdr && sub_hdr_size > 0) {
+                        cc_ost->enc->enc_ctx->subtitle_header =
+                            av_mallocz(sub_hdr_size + 1);
+                        if (cc_ost->enc->enc_ctx->subtitle_header) {
+                            memcpy(cc_ost->enc->enc_ctx->subtitle_header,
+                                   sub_hdr, sub_hdr_size);
+                            cc_ost->enc->enc_ctx->subtitle_header_size = sub_hdr_size;
+                        }
+                    }
+                }
+
+                if (oc->oformat->flags & AVFMT_GLOBALHEADER)
+                    cc_ost->enc->enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+                cc_ms->pkt = av_packet_alloc();
+                if (!cc_ms->pkt)
+                    return AVERROR(ENOMEM);
+
+                snprintf(cc_ms->log_name, sizeof(cc_ms->log_name),
+                         "cc_sub#%d:%d/%s", mux->of.index, cc_ost->index,
+                         cc_enc_codec->name);
+
+                /* wire: CC decoder output → subtitle encoder → mux stream */
+                ret = sch_connect(mux->sch,
+                                  cc_src, SCH_ENC(cc_ms->sch_idx_enc));
+                if (ret < 0)
+                    return ret;
+
+                ret = sch_connect(mux->sch,
+                                  SCH_ENC(cc_ms->sch_idx_enc),
+                                  SCH_MSTREAM(mux->sch_idx, cc_ms->sch_idx));
+                if (ret < 0)
+                    return ret;
+
+                sch_mux_stream_buffering(mux->sch, mux->sch_idx, cc_ms->sch_idx,
+                                         128, 50 * 1024 * 1024);
+
+                av_log(mux, AV_LOG_INFO,
+                       "CC extraction: video stream %d:%d → subtitle stream %d:%d (%s)\n",
+                       video_ost->file->index, video_ost->index,
+                       cc_ost->file->index, cc_ost->index,
+                       cc_enc_codec->name);
+            }
+        }
+    }
+
     ret = of_add_attachments(mux, o);
     if (ret < 0)
         return ret;
