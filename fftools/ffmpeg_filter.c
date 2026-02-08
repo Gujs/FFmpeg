@@ -1615,20 +1615,20 @@ static enum AVPixelFormat detect_hw_accel_from_filter_chain(AVFilterContext *ctx
     int visited = 0;
     const int max_depth = 32;  /* Prevent infinite loops */
 
-    av_log(ctx, AV_LOG_INFO, "[HW-PATCH] detect_hw_accel: starting from filter '%s'\n",
+    av_log(ctx, AV_LOG_DEBUG, "[HW-PATCH] detect_hw_accel: starting from filter '%s'\n",
            ctx ? ctx->filter->name : "NULL");
 
     /* Walk back through the filter chain looking for hardware filter names */
     for (cur = ctx; cur && visited < max_depth; visited++) {
         const char *name = cur->filter->name;
 
-        av_log(cur, AV_LOG_INFO, "[HW-PATCH] detect_hw_accel: examining filter[%d] '%s'\n",
+        av_log(cur, AV_LOG_DEBUG, "[HW-PATCH] detect_hw_accel: examining filter[%d] '%s'\n",
                visited, name);
 
         /* Check for CUDA filters */
         if (strstr(name, "_cuda") || strstr(name, "hwupload_cuda") ||
             strstr(name, "hwdownload_cuda")) {
-            av_log(cur, AV_LOG_INFO, "[HW-PATCH] detect_hw_accel: found CUDA filter '%s'\n", name);
+            av_log(cur, AV_LOG_DEBUG, "[HW-PATCH] detect_hw_accel: found CUDA filter '%s'\n", name);
             return AV_PIX_FMT_CUDA;
         }
 
@@ -1657,12 +1657,12 @@ static enum AVPixelFormat detect_hw_accel_from_filter_chain(AVFilterContext *ctx
         if (cur->nb_inputs > 0 && cur->inputs[0])
             cur = cur->inputs[0]->src;
         else {
-            av_log(ctx, AV_LOG_INFO, "[HW-PATCH] detect_hw_accel: reached end of chain (no more inputs)\n");
+            av_log(ctx, AV_LOG_DEBUG, "[HW-PATCH] detect_hw_accel: reached end of chain (no more inputs)\n");
             break;
         }
     }
 
-    av_log(ctx, AV_LOG_INFO, "[HW-PATCH] detect_hw_accel: no hardware filter found, returning NONE\n");
+    av_log(ctx, AV_LOG_DEBUG, "[HW-PATCH] detect_hw_accel: no hardware filter found, returning NONE\n");
     return AV_PIX_FMT_NONE;
 }
 
@@ -1744,7 +1744,7 @@ static int configure_output_video_filter(FilterGraphPriv *fgp, AVFilterGraph *gr
     int ret;
     char name[255];
 
-    av_log(ofilter, AV_LOG_INFO,
+    av_log(ofilter, AV_LOG_DEBUG,
            "[HW-PATCH] configure_output_video_filter called for output '%s' "
            "(last_filter=%s, width=%d, height=%d, autoscale=%d)\n",
            ofilter->output_name, last_filter ? last_filter->filter->name : "NULL",
@@ -1810,7 +1810,7 @@ static int configure_output_video_filter(FilterGraphPriv *fgp, AVFilterGraph *gr
         AVFilterContext *filter;
         const AVDictionaryEntry *e = NULL;
 
-        av_log(ofilter, AV_LOG_INFO,
+        av_log(ofilter, AV_LOG_DEBUG,
                "[HW-PATCH] Phase2: Creating scaler_out (width=%d, height=%d, autoscale=1)\n",
                ofp->width, ofp->height);
 
@@ -1833,13 +1833,13 @@ static int configure_output_video_filter(FilterGraphPriv *fgp, AVFilterGraph *gr
             const char *scale_filter_name = get_scale_filter_for_format(hw_fmt);
             const AVFilter *scale_filter = avfilter_get_by_name(scale_filter_name);
 
-            av_log(ofilter, AV_LOG_INFO,
+            av_log(ofilter, AV_LOG_DEBUG,
                    "[HW-PATCH] Phase2: detect_hw_accel returned %s, selected filter: %s\n",
                    hw_fmt != AV_PIX_FMT_NONE ? av_get_pix_fmt_name(hw_fmt) : "none",
                    scale_filter_name);
 
             if (!scale_filter) {
-                av_log(ofilter, AV_LOG_INFO,
+                av_log(ofilter, AV_LOG_DEBUG,
                        "[HW-PATCH] Phase2: Scale filter '%s' not found, falling back to 'scale'\n",
                        scale_filter_name);
                 scale_filter = avfilter_get_by_name("scale");
@@ -1848,12 +1848,12 @@ static int configure_output_video_filter(FilterGraphPriv *fgp, AVFilterGraph *gr
             }
 
             if (hw_fmt != AV_PIX_FMT_NONE) {
-                av_log(ofilter, AV_LOG_INFO,
+                av_log(ofilter, AV_LOG_DEBUG,
                        "[HW-PATCH] Phase2: Using hardware scale filter '%s' for scaler_out_%s "
                        "(detected hw format: %s)\n",
                        scale_filter_name, ofilter->output_name, av_get_pix_fmt_name(hw_fmt));
             } else {
-                av_log(ofilter, AV_LOG_INFO,
+                av_log(ofilter, AV_LOG_DEBUG,
                        "[HW-PATCH] Phase2: Using software 'scale' for scaler_out_%s (no hw detected)\n",
                        ofilter->output_name);
             }
@@ -2248,7 +2248,7 @@ static int configure_filtergraph(FilterGraph *fg, FilterGraphThread *fgt)
     for (int i = 0; i < fg->nb_outputs; i++) {
         OutputFilterPriv *ofp = ofp_from_ofilter(fg->outputs[i]);
         if (ofp->color_space != AVCOL_SPC_UNSPECIFIED) {
-            av_log(fg, AV_LOG_INFO,
+            av_log(fg, AV_LOG_DEBUG,
                    "[HW-PATCH] Resetting output %d colorspace constraint "
                    "(was %s) for reconfiguration\n",
                    i, av_color_space_name(ofp->color_space));
@@ -2432,7 +2432,7 @@ static int configure_filtergraph(FilterGraph *fg, FilterGraphThread *fgt)
             OutputFilterPriv *ofp = ofp_from_ofilter(fg->outputs[i]);
             if (ofp->ofilter.type == AVMEDIA_TYPE_VIDEO) {
                 ofp->force_keyframe_count = idr_count;
-                av_log(ofp, AV_LOG_INFO,
+                av_log(ofp, AV_LOG_DEBUG,
                        "[HW-PATCH] Will force %d keyframe(s) after filter graph configuration\n",
                        idr_count);
             }
@@ -2953,7 +2953,7 @@ static int fg_output_frame(OutputFilterPriv *ofp, FilterGraphThread *fgt,
                  * This distinguishes it from regular source keyframes. */
                 av_dict_set(&frame_out->metadata, "lavfi.reconfig_keyframe", "1", 0);
                 ofp->force_keyframe_count--;
-                av_log(ofp, AV_LOG_INFO,
+                av_log(ofp, AV_LOG_DEBUG,
                        "[HW-PATCH] Forcing keyframe after filter graph reconfiguration (%d remaining)\n",
                        ofp->force_keyframe_count);
             }
@@ -3329,7 +3329,7 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
          * Just update tracked values and continue - output uses source colorspace. */
         if (ifp->color_space != frame->colorspace ||
             ifp->color_range != frame->color_range) {
-            av_log(fg, AV_LOG_INFO,
+            av_log(fg, AV_LOG_VERBOSE,
                    "[HW-PATCH] Colorspace change detected: %s/%s -> %s/%s (no reconfig)\n",
                    av_color_space_name(ifp->color_space),
                    av_color_range_name(ifp->color_range),
@@ -3357,7 +3357,7 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
                        frame->width, frame->height, ifp->width, ifp->height,
                        ifp->pending_width, ifp->pending_height, ifp->resolution_stable_count);
             } else {
-                av_log(fg, AV_LOG_INFO,
+                av_log(fg, AV_LOG_DEBUG,
                        "[HW-PATCH] Ignoring resolution %dx%d from corrupt frame (current %dx%d)\n",
                        frame->width, frame->height, ifp->width, ifp->height);
             }
@@ -3369,7 +3369,7 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
                 /* Same as pending resolution - increment counter */
                 ifp->resolution_stable_count++;
                 if (ifp->resolution_stable_count >= RESOLUTION_HYSTERESIS_FRAMES) {
-                    av_log(fg, AV_LOG_INFO,
+                    av_log(fg, AV_LOG_VERBOSE,
                            "[HW-PATCH] Resolution change confirmed after %d frames: %dx%d -> %dx%d\n",
                            ifp->resolution_stable_count, ifp->width, ifp->height,
                            frame->width, frame->height);
@@ -3377,7 +3377,7 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
                     ifp->resolution_stable_count = 0;
                     ifp->pending_width = ifp->pending_height = 0;
                 } else {
-                    av_log(fg, AV_LOG_INFO,
+                    av_log(fg, AV_LOG_DEBUG,
                            "[HW-PATCH] Resolution change pending (%d/%d): %dx%d -> %dx%d\n",
                            ifp->resolution_stable_count, RESOLUTION_HYSTERESIS_FRAMES,
                            ifp->width, ifp->height, frame->width, frame->height);
@@ -3393,7 +3393,7 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
                 ifp->pending_width = frame->width;
                 ifp->pending_height = frame->height;
                 ifp->resolution_stable_count = 1;
-                av_log(fg, AV_LOG_INFO,
+                av_log(fg, AV_LOG_DEBUG,
                        "[HW-PATCH] Resolution change detected, starting hysteresis: %dx%d -> %dx%d\n",
                        ifp->width, ifp->height, frame->width, frame->height);
             }

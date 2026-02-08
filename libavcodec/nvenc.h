@@ -326,7 +326,6 @@ typedef struct NvencContext
     // Track last frame's colorspace for detecting colorspace changes
     // Used to trigger encoder reset when colorspace changes mid-stream
     enum AVColorSpace last_colorspace;
-    int encoder_reset_pending;  // Set when encoder reset is needed
 
     // Track last hw_frames_ctx to detect frame pool changes (diagnostic)
     void *last_hw_frames_ctx;
@@ -334,9 +333,6 @@ typedef struct NvencContext
     // Track last DTS/PTS for detecting non-monotonic timestamps (diagnostic)
     int64_t last_dts_out;
     int64_t last_pts_out;
-
-    // Track frames after reconfiguration for diagnostics
-    int frames_since_reconfig;  // Count frames output since last reconfiguration
 } NvencContext;
 
 int ff_nvenc_encode_init(AVCodecContext *avctx);

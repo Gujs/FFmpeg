@@ -617,7 +617,7 @@ retry:
                 const char *filter_name = conv_filters[k];
                 char inst_name[30];
 
-                av_log(log_ctx, AV_LOG_INFO,
+                av_log(log_ctx, AV_LOG_DEBUG,
                        "[HW-PATCH] Auto-inserting conversion filter '%s' between '%s' and '%s'\n",
                        filter_name, link->src->name, link->dst->name);
 
@@ -656,7 +656,7 @@ retry:
                         const char *merger_name = mergers[k]->name;
                         if (merger_name && (strstr(merger_name, "Color") || strstr(merger_name, "color"))) {
                             is_colorspace_conversion = 1;
-                            av_log(log_ctx, AV_LOG_INFO,
+                            av_log(log_ctx, AV_LOG_DEBUG,
                                    "[HW-PATCH] Phase1: Detected colorspace/range conversion (merger: %s)\n",
                                    merger_name);
                         }
@@ -694,7 +694,7 @@ retry:
                                 /* CUDA filters cannot do colorspace conversion (bt709<->smpte170m).
                                  * colorspace_cuda only handles color range (tv/pc), not colorspace.
                                  * Let FFmpeg use software path for colorspace conversion. */
-                                av_log(log_ctx, AV_LOG_INFO,
+                                av_log(log_ctx, AV_LOG_DEBUG,
                                        "[HW-PATCH] Phase1: Colorspace conversion in CUDA pipeline - "
                                        "CUDA cannot convert colorspace, skipping hardware filter "
                                        "(link '%s' -> '%s')\n",
@@ -710,19 +710,19 @@ retry:
                         }
 
                         if (hw_filter && strcmp(hw_filter, "scale")) {
-                            av_log(log_ctx, AV_LOG_INFO,
+                            av_log(log_ctx, AV_LOG_DEBUG,
                                    "[HW-PATCH] Phase1: Using hardware filter '%s' instead of 'scale' "
                                    "(detected hw format: %s) for link '%s' -> '%s'\n",
                                    hw_filter, av_get_pix_fmt_name(hw_fmt),
                                    link->src->name, link->dst->name);
                             filter_name = hw_filter;
                         } else if (!hw_filter) {
-                            av_log(log_ctx, AV_LOG_INFO,
+                            av_log(log_ctx, AV_LOG_DEBUG,
                                    "[HW-PATCH] Phase1: Hardware format %s detected but no suitable hw filter, using 'scale'\n",
                                    av_get_pix_fmt_name(hw_fmt));
                         }
                     } else {
-                        av_log(log_ctx, AV_LOG_INFO,
+                        av_log(log_ctx, AV_LOG_DEBUG,
                                "[HW-PATCH] Phase1: No hardware format detected, using software 'scale'\n");
                     }
                 }
