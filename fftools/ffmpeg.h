@@ -259,6 +259,7 @@ typedef struct OptionsContext {
     SpecifierOptList enc_stats_post_fmt;
     SpecifierOptList mux_stats_fmt;
     SpecifierOptList extract_cc;
+    SpecifierOptList cc_lang;
 
     int depth;
 } OptionsContext;

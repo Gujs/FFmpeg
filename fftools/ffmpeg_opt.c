@@ -2029,6 +2029,9 @@ const OptionDef options[] = {
     { "extract_cc",                 OPT_TYPE_BOOL,   OPT_VIDEO | OPT_PERSTREAM | OPT_OUTPUT,
         { .off = OFFSET(extract_cc) },
         "extract closed captions from video to a separate subtitle stream" },
+    { "cc_lang",                    OPT_TYPE_STRING, OPT_VIDEO | OPT_PERSTREAM | OPT_OUTPUT | OPT_EXPERT,
+        { .off = OFFSET(cc_lang) },
+        "set language for extracted CC subtitle stream (default: auto-detect from audio)" },
 
     /* audio options */
     { "aframes",          OPT_TYPE_FUNC,    OPT_AUDIO | OPT_FUNC_ARG | OPT_PERFILE | OPT_OUTPUT | OPT_EXPERT | OPT_HAS_CANON,
