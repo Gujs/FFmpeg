@@ -3053,8 +3053,6 @@ static void reconfig_encoder(AVCodecContext *avctx, const AVFrame *frame)
                av_color_space_name(ctx->last_colorspace),
                av_color_space_name(frame->colorspace));
         /* Do NOT reconfigure - just log and continue with original colorspace */
-        /* reconfig_colorspace = 1; */
-        /* needs_reconfig = 1; */
     }
 
     /* Track current colorspace for next frame comparison */
@@ -3102,22 +3100,6 @@ static void reconfig_encoder(AVCodecContext *avctx, const AVFrame *frame)
         }
     }
 
-    /* Note: Colorspace changes are no longer handled here.
-     * We discovered that any encoder reconfiguration (even without resetEncoder)
-     * causes frame ordering issues on lower resolution outputs.
-     * The filter graph handles colorspace changes by:
-     * 1. Rebuilding the graph (which forces IDR via ffmpeg_enc.c)
-     * 2. The IDR provides a clean decode point
-     * 3. Keeping original VUI parameters is safe - decoders handle metadata correctly
-     *
-     * reconfig_colorspace is now always 0, so this block is dead code.
-     * Keeping it for documentation purposes. */
-    if (reconfig_colorspace) {
-        /* Dead code - reconfig_colorspace is never set */
-        params.forceIDR = 1;
-        needs_encode_config = 1;
-    }
-
     if (!needs_encode_config)
         params.reInitEncodeParams.encodeConfig = NULL;
 
@@ -3141,9 +3123,6 @@ static void reconfig_encoder(AVCodecContext *avctx, const AVFrame *frame)
                 ctx->encode_config.rcParams.maxBitRate = params.reInitEncodeParams.encodeConfig->rcParams.maxBitRate;
                 ctx->encode_config.rcParams.vbvBufferSize = params.reInitEncodeParams.encodeConfig->rcParams.vbvBufferSize;
             }
-
-            /* reconfig_colorspace is now always 0 - colorspace changes are handled
-             * by the filter graph (IDR insertion) without encoder reconfiguration */
         }
     }
 }
