@@ -1538,6 +1538,15 @@ int ffmpeg_parse_options(int argc, char **argv, Scheduler *sch)
         goto fail;
     }
 
+    // set up CC extraction now that decoders exist for all streams
+    for (int i = 0; i < nb_output_files; i++) {
+        ret = of_setup_cc_extraction(output_files[i]);
+        if (ret < 0) {
+            errmsg = "setting up CC extraction";
+            goto fail;
+        }
+    }
+
     correct_input_start_times();
 
     ret = apply_sync_offsets();

@@ -950,6 +950,7 @@ int of_stream_init(OutputFile *of, OutputStream *ost,
                    const AVCodecContext *enc_ctx);
 int of_write_trailer(OutputFile *of);
 int of_open(const OptionsContext *o, const char *filename, Scheduler *sch);
+int of_setup_cc_extraction(OutputFile *of);
 void of_free(OutputFile **pof);
 
 void of_enc_stats_close(void);
