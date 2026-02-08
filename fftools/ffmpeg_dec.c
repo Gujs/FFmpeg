@@ -80,6 +80,7 @@ typedef struct DecoderPriv {
     unsigned            cc_out_idx;       /* scheduler decoder output index for CC */
     AVCodecContext     *cc_dec_ctx;       /* EIA-608 decoder (cc_dec) context */
     AVFrame            *cc_frame;         /* reusable frame for CC subtitle output */
+    int64_t             cc_last_sub_pts;  /* PTS of last sent subtitle (for keepalive throttle) */
 
     Scheduler          *sch;
     unsigned            sch_idx;
@@ -754,9 +755,6 @@ static int extract_cc_subtitle(DecoderPriv *dp, AVFrame *frame)
     }
 
     if (got_sub && subtitle.num_rects > 0) {
-        AVFrame *cc_frame = dp->cc_frame;
-        av_frame_unref(cc_frame);
-
         /* cc_dec real_time mode sets end_display_time to -1 (UINT32_MAX)
          * because it doesn't know when the next CC event will arrive.
          * Clamp to a reasonable maximum — the next subtitle replaces it anyway. */
@@ -769,6 +767,28 @@ static int extract_cc_subtitle(DecoderPriv *dp, AVFrame *frame)
          * but the video frames are always monotonic after our
          * discontinuity handling. The encoder reads sub->pts directly. */
         subtitle.pts = av_rescale_q(frame->pts, frame->time_base, AV_TIME_BASE_Q);
+    } else {
+        int64_t cur_pts = av_rescale_q(frame->pts, frame->time_base, AV_TIME_BASE_Q);
+
+        /* No new CC content — send empty subtitle keepalive at ~1Hz.
+         * Without periodic subtitle packets, the MPEG-TS interleaver
+         * blocks video/audio waiting for sparse subtitle data,
+         * causing large gaps (up to max_interleave_delta) in output.
+         * Throttle to 1 per second to avoid excessive overhead. */
+        if (dp->cc_last_sub_pts != AV_NOPTS_VALUE &&
+            cur_pts - dp->cc_last_sub_pts < 1000000) { /* 1 second in AV_TIME_BASE */
+            avsubtitle_free(&subtitle);
+            goto strip;
+        }
+
+        avsubtitle_free(&subtitle);
+        memset(&subtitle, 0, sizeof(subtitle));
+        subtitle.pts = cur_pts;
+    }
+
+    {
+        AVFrame *cc_frame = dp->cc_frame;
+        av_frame_unref(cc_frame);
 
         ret = subtitle_wrap_frame(cc_frame, &subtitle, 0);
         if (ret < 0) {
@@ -789,8 +809,8 @@ static int extract_cc_subtitle(DecoderPriv *dp, AVFrame *frame)
             }
             goto strip;
         }
-    } else {
-        avsubtitle_free(&subtitle);
+
+        dp->cc_last_sub_pts = av_rescale_q(frame->pts, frame->time_base, AV_TIME_BASE_Q);
     }
 
 strip:
@@ -1252,7 +1272,8 @@ int dec_setup_cc_extract(Decoder *d, SchedulerNode *src)
         return AVERROR(ENOMEM);
     }
 
-    dp->cc_extract = 1;
+    dp->cc_extract       = 1;
+    dp->cc_last_sub_pts  = AV_NOPTS_VALUE;
 
     av_log(dp, AV_LOG_INFO,
            "CC extraction enabled: EIA-608 → subtitle output %u\n",
