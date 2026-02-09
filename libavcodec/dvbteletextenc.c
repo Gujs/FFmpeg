@@ -134,9 +134,10 @@ static int write_data_unit(uint8_t *buf, int magazine, int row,
     buf[0] = subtitle ? TELETEXT_DATA_UNIT_SUBTITLE
                       : TELETEXT_DATA_UNIT_NONSUBT;
     buf[1] = TELETEXT_DATA_UNIT_LENGTH; /* 44 bytes */
-    /* field_parity (1 bit) | line_offset (4 bits) | reserved (3 bits)
-     * field_parity=0 (first field), line_offset varies with row */
-    buf[2] = 0x02 | ((row < 16 ? 7 : 20) << 3);
+    /* Per EN 300 472 section 4.4:
+     * bits 7-6: reserved "11", bit 5: field_parity, bits 4-0: line_offset
+     * field_parity=0 (first field), line_offset=7 (standard VBI line) */
+    buf[2] = 0xC0 | (0 << 5) | 7;
     buf[3] = TELETEXT_FRAMING_CODE;
 
     /* MRAG */
@@ -170,9 +171,11 @@ static int write_page_header(uint8_t *buf, DVBTeletextEncContext *ctx, int erase
     int page_units, page_tens;
     int i;
 
-    buf[0] = TELETEXT_DATA_UNIT_NONSUBT;
+    buf[0] = TELETEXT_DATA_UNIT_SUBTITLE;
     buf[1] = TELETEXT_DATA_UNIT_LENGTH;
-    buf[2] = 0x02 | (7 << 3); /* field_parity=0, line_offset=7 */
+    /* Per EN 300 472 section 4.4:
+     * bits 7-6: reserved "11", bit 5: field_parity, bits 4-0: line_offset */
+    buf[2] = 0xC0 | (0 << 5) | 7;
     buf[3] = TELETEXT_FRAMING_CODE;
 
     /* MRAG for row 0 */
@@ -186,13 +189,19 @@ static int write_page_header(uint8_t *buf, DVBTeletextEncContext *ctx, int erase
 
     /* Sub-code bytes (S1, S2, S3, S4) + control bits
      * Per ETS 300 706 section 9.3.1.2
-     * S1=0, S2=0 (sub-code), C4=erase flag */
+     * S1=0, S2=0 (sub-code), C4=erase flag
+     *
+     * For subtitle pages, set C7 (Suppress Header) and C8 (Update Indicator).
+     * The libzvbi teletext decoder (used by ffplay/VLC) identifies subtitle
+     * pages by checking: !(C6) && C7 && C8.
+     * Byte 7 nibble: D1=S4, D2=C5(Newsflash), D3=C6(Subtitle), D4=C7(SuppressHdr)
+     * Byte 8 nibble: D1=C8(Update), D2=C9, D3=C10, D4=C11 */
     buf[8]  = hamming84_encode[0];               /* S1 */
     buf[9]  = hamming84_encode[(erase ? 0x08 : 0x00)]; /* S2 + C4 (erase page) */
     buf[10] = hamming84_encode[0];               /* S3 */
-    buf[11] = hamming84_encode[0];               /* S4 + C5-C7 */
-    buf[12] = hamming84_encode[0];               /* C8-C11 */
-    buf[13] = hamming84_encode[0];               /* C12-C14 */
+    buf[11] = hamming84_encode[0x08];            /* S4=0, C5=0, C6=0, C7=1 (Suppress Header) */
+    buf[12] = hamming84_encode[0x01];            /* C8=1 (Update Indicator), C9=0, C10=0, C11=0 */
+    buf[13] = hamming84_encode[0];               /* C12-C14 (charset=0, Latin G0) */
 
     /* Header display area: 26 bytes (positions 14-39 in data unit payload,
      * 8..33 in the character area after the 8 control bytes).
