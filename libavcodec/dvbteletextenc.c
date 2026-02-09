@@ -50,8 +50,8 @@
 #define TELETEXT_DATA_UNIT_LENGTH   0x2C  /* 44 bytes per data unit */
 #define TELETEXT_FRAMING_CODE       0xE4  /* clock run-in + framing code */
 #define TELETEXT_CHARS_PER_ROW      40    /* characters per teletext row */
-#define TELETEXT_SUBTITLE_ROW1      23    /* first subtitle row */
-#define TELETEXT_SUBTITLE_ROW2      24    /* second subtitle row (bottom) */
+#define TELETEXT_SUBTITLE_ROW1      22    /* first subtitle row (two-line) */
+#define TELETEXT_SUBTITLE_ROW2      23    /* second subtitle row (bottom) */
 #define TELETEXT_DATA_UNIT_STUFFING 0xFF  /* stuffing data unit, EN 300 472 */
 
 /*
@@ -145,12 +145,19 @@ static const uint8_t vbi_reverse_8[256] = {
     0x1F, 0x9F, 0x5F, 0xDF, 0x3F, 0xBF, 0x7F, 0xFF
 };
 
+/* Clear displayed subtitle page after this many microseconds with no
+ * new CC content.  Prevents stale text from persisting through ad breaks
+ * or other content transitions where CC stops. */
+#define TELETEXT_ERASE_TIMEOUT_US  10000000  /* 10 seconds */
+
 typedef struct DVBTeletextEncContext {
     AVClass *class;
     ASSSplitContext *ass_ctx;
     int magazine;           /* magazine number 1-8, default 8 */
     int page;               /* page number in hex (0x00-0xFF), default 0x88 */
     int page_counter;       /* erase page sequence counter (C4 flag) */
+    int content_active;     /* 1 if display has content (needs erase eventually) */
+    int64_t last_content_pts; /* PTS (AV_TIME_BASE) of last content subtitle */
 } DVBTeletextEncContext;
 
 /**
@@ -197,7 +204,7 @@ static int write_data_unit(uint8_t *buf, int magazine, int row,
      * bits 7-6: reserved "11", bit 5: field_parity, bits 4-0: line_offset
      * Each data unit in a PES must have a unique line_offset since they
      * represent different VBI lines within one video field. */
-    buf[2] = 0xC0 | (0 << 5) | (line_offset & 0x1F);
+    buf[2] = 0xE0 | (line_offset & 0x1F); /* reserved="11", field_parity=1 (first field) */
     buf[3] = TELETEXT_FRAMING_CODE;
 
     /* MRAG */
@@ -260,7 +267,7 @@ static int write_page_header(uint8_t *buf, DVBTeletextEncContext *ctx,
     buf[1] = TELETEXT_DATA_UNIT_LENGTH;
     /* Per EN 300 472 section 4.4:
      * bits 7-6: reserved "11", bit 5: field_parity, bits 4-0: line_offset */
-    buf[2] = 0xC0 | (0 << 5) | (line_offset & 0x1F);
+    buf[2] = 0xE0 | (line_offset & 0x1F); /* reserved="11", field_parity=1 (first field) */
     buf[3] = TELETEXT_FRAMING_CODE;
 
     /* MRAG for row 0 */
@@ -305,6 +312,140 @@ static int write_page_header(uint8_t *buf, DVBTeletextEncContext *ctx,
         buf[4 + i] = vbi_reverse_8[buf[4 + i]];
 
     return 46;
+}
+
+/**
+ * Convert a UTF-8 string to teletext Latin G0 (7-bit ASCII subset).
+ *
+ * EIA-608 cc_dec outputs Unicode for special characters (e.g. U+2019
+ * RIGHT SINGLE QUOTATION MARK for apostrophes). Teletext only supports
+ * 7-bit characters, so we must map multi-byte UTF-8 sequences to their
+ * closest ASCII equivalents. Without this, each byte of a multi-byte
+ * sequence would be replaced by a space (e.g. "he's" → "he   s").
+ *
+ * @param src  UTF-8 input string
+ * @return     Allocated ASCII string (caller frees with av_free), or NULL on OOM
+ */
+static char *utf8_to_teletext_g0(const char *src)
+{
+    AVBPrint bp;
+    const uint8_t *s = (const uint8_t *)src;
+    int i = 0;
+    char *result;
+
+    av_bprint_init(&bp, 0, 256);
+
+    while (s[i]) {
+        uint32_t cp;
+        int n;
+
+        if (s[i] < 0x80) {
+            cp = s[i]; n = 1;
+        } else if ((s[i] & 0xE0) == 0xC0 && (s[i + 1] & 0xC0) == 0x80) {
+            cp = ((uint32_t)(s[i] & 0x1F) << 6) | (s[i + 1] & 0x3F);
+            n = 2;
+        } else if ((s[i] & 0xF0) == 0xE0 && (s[i + 1] & 0xC0) == 0x80 &&
+                   (s[i + 2] & 0xC0) == 0x80) {
+            cp = ((uint32_t)(s[i] & 0x0F) << 12) | ((uint32_t)(s[i + 1] & 0x3F) << 6) |
+                 (s[i + 2] & 0x3F);
+            n = 3;
+        } else if ((s[i] & 0xF8) == 0xF0 && (s[i + 1] & 0xC0) == 0x80 &&
+                   (s[i + 2] & 0xC0) == 0x80 && (s[i + 3] & 0xC0) == 0x80) {
+            cp = ((uint32_t)(s[i] & 0x07) << 18) | ((uint32_t)(s[i + 1] & 0x3F) << 12) |
+                 ((uint32_t)(s[i + 2] & 0x3F) << 6) | (s[i + 3] & 0x3F);
+            n = 4;
+        } else {
+            i++; /* invalid byte, skip */
+            continue;
+        }
+        i += n;
+
+        /* Map codepoint to teletext Latin G0 character.
+         * Complete coverage of all 79 non-ASCII characters that EIA-608
+         * cc_dec can output (ccaption_dec.c charset_overrides[4][128]). */
+        if (cp >= 0x20 && cp < 0x7F) {
+            av_bprint_chars(&bp, (char)cp, 1);
+        } else {
+            switch (cp) {
+            /* Quotation marks */
+            case 0x2018: case 0x2019:             /* ' ' smart single quotes */
+                av_bprint_chars(&bp, '\'', 1); break;
+            case 0x201C: case 0x201D:             /* " " smart double quotes */
+            case 0x00AB: case 0x00BB:             /* « » guillemets */
+                av_bprint_chars(&bp, '"', 1);  break;
+            /* Dashes and dots */
+            case 0x2013: case 0x2014:             /* – — en/em dash */
+                av_bprint_chars(&bp, '-', 1);  break;
+            case 0x2026:                          /* … ellipsis */
+                av_bprintf(&bp, "...");         break;
+            case 0x00B7:                          /* · middle dot */
+                av_bprint_chars(&bp, '.', 1);  break;
+            case 0x00B4:                          /* ´ acute accent */
+                av_bprint_chars(&bp, '\'', 1); break;
+            /* Lowercase accented vowels */
+            case 0x00E0: case 0x00E1: case 0x00E2: case 0x00E3: case 0x00E4: case 0x00E5:
+                av_bprint_chars(&bp, 'a', 1); break; /* àáâãäå */
+            case 0x00E8: case 0x00E9: case 0x00EA: case 0x00EB:
+                av_bprint_chars(&bp, 'e', 1); break; /* èéêë */
+            case 0x00EC: case 0x00ED: case 0x00EE: case 0x00EF:
+                av_bprint_chars(&bp, 'i', 1); break; /* ìíîï */
+            case 0x00F2: case 0x00F3: case 0x00F4: case 0x00F5: case 0x00F6: case 0x00F8:
+                av_bprint_chars(&bp, 'o', 1); break; /* òóôõöø */
+            case 0x00F9: case 0x00FA: case 0x00FB: case 0x00FC:
+                av_bprint_chars(&bp, 'u', 1); break; /* ùúûü */
+            case 0x00F1: av_bprint_chars(&bp, 'n', 1); break; /* ñ */
+            case 0x00E7: av_bprint_chars(&bp, 'c', 1); break; /* ç */
+            /* Capital accented vowels */
+            case 0x00C0: case 0x00C1: case 0x00C2: case 0x00C3: case 0x00C4: case 0x00C5:
+                av_bprint_chars(&bp, 'A', 1); break; /* ÀÁÂÃÄÅ */
+            case 0x00C8: case 0x00C9: case 0x00CA: case 0x00CB:
+                av_bprint_chars(&bp, 'E', 1); break; /* ÈÉÊË */
+            case 0x00CC: case 0x00CD: case 0x00CE: case 0x00CF:
+                av_bprint_chars(&bp, 'I', 1); break; /* ÌÍÎÏ */
+            case 0x00D2: case 0x00D3: case 0x00D4: case 0x00D5: case 0x00D6: case 0x00D8:
+                av_bprint_chars(&bp, 'O', 1); break; /* ÒÓÔÕÖØ */
+            case 0x00D9: case 0x00DA: case 0x00DB: case 0x00DC:
+                av_bprint_chars(&bp, 'U', 1); break; /* ÙÚÛÜ */
+            case 0x00D1: av_bprint_chars(&bp, 'N', 1); break; /* Ñ */
+            case 0x00C7: av_bprint_chars(&bp, 'C', 1); break; /* Ç */
+            /* German */
+            case 0x00DF: av_bprintf(&bp, "ss");        break; /* ß */
+            /* Punctuation */
+            case 0x00BF: av_bprint_chars(&bp, '?', 1); break; /* ¿ */
+            case 0x00A1: av_bprint_chars(&bp, '!', 1); break; /* ¡ */
+            /* Symbols */
+            case 0x00AE: av_bprintf(&bp, "(R)");       break; /* ® */
+            case 0x00A9: av_bprintf(&bp, "(C)");       break; /* © */
+            case 0x2122: av_bprintf(&bp, "TM");        break; /* ™ */
+            case 0x2120: av_bprintf(&bp, "SM");        break; /* ℠ */
+            case 0x00B0: av_bprint_chars(&bp, 'o', 1); break; /* ° degree */
+            case 0x00BD: av_bprintf(&bp, "1/2");       break; /* ½ */
+            case 0x00F7: av_bprint_chars(&bp, '/', 1); break; /* ÷ */
+            case 0x266A: av_bprint_chars(&bp, '#', 1); break; /* ♪ music note */
+            /* Currency */
+            case 0x00A2: av_bprint_chars(&bp, 'c', 1); break; /* ¢ */
+            case 0x00A3: av_bprint_chars(&bp, '#', 1); break; /* £ (teletext G0 0x23) */
+            case 0x00A5: av_bprint_chars(&bp, 'Y', 1); break; /* ¥ */
+            case 0x00A4: av_bprint_chars(&bp, '$', 1); break; /* ¤ generic currency */
+            case 0x00A6: av_bprint_chars(&bp, '|', 1); break; /* ¦ broken bar */
+            /* Whitespace */
+            case 0x00A0: av_bprint_chars(&bp, ' ', 1); break; /* NBSP */
+            /* Box drawing, full block → space (not displayable) */
+            case 0x2588:                              /* █ */
+            case 0x250C: case 0x2510:                 /* ┌ ┐ */
+            case 0x2514: case 0x2518:                 /* └ ┘ */
+            default:
+                av_bprint_chars(&bp, ' ', 1); break;
+            }
+        }
+    }
+
+    if (!av_bprint_is_complete(&bp)) {
+        av_bprint_finalize(&bp, NULL);
+        return NULL;
+    }
+    av_bprint_finalize(&bp, &result);
+    return result;
 }
 
 /**
@@ -387,17 +528,36 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
     if (!sub)
         return 0;
 
-    /* Empty subtitle (no rects): send an empty page header as keepalive.
-     * This prevents the MPEG-TS interleaver from blocking video/audio
-     * while waiting for sparse subtitle data. */
+    /* Empty subtitle (no rects): either erase stale content or send
+     * stuffing-only keepalive for the MPEG-TS interleaver.
+     *
+     * If content was displayed and no new CC has arrived for 10 seconds,
+     * send a page header with erase flag to clear the display. This
+     * prevents stale subtitles from persisting through ad breaks.
+     *
+     * Otherwise send stuffing-only data units which decoders ignore,
+     * preserving the currently displayed text while satisfying the
+     * MPEG-TS muxer's interleaving requirements. */
     if (sub->num_rects == 0) {
         if (bufsize < 1 + 46 * TELETEXT_MIN_DATA_UNITS)
             return 0;
+
+        if (ctx->content_active && sub->pts != AV_NOPTS_VALUE &&
+            ctx->last_content_pts != AV_NOPTS_VALUE &&
+            sub->pts - ctx->last_content_pts >= TELETEXT_ERASE_TIMEOUT_US) {
+            /* Erase stale content: page header with C4 (erase) flag */
+            buf[0] = TELETEXT_DATA_IDENTIFIER;
+            offset = 1 + write_page_header(buf + 1, ctx, 1, 7);
+            offset += write_stuffing_unit(buf + offset);
+            offset += write_stuffing_unit(buf + offset);
+            ctx->content_active = 0;
+            return offset;
+        }
+
         buf[0] = TELETEXT_DATA_IDENTIFIER;
-        offset = 1 + write_page_header(buf + 1, ctx, 0, 7); /* no erase, line 7 */
-        /* Pad with stuffing to reach 3 data units for PES alignment */
-        offset += write_stuffing_unit(buf + offset);
-        offset += write_stuffing_unit(buf + offset);
+        offset = 1;
+        for (i = 0; i < TELETEXT_MIN_DATA_UNITS; i++)
+            offset += write_stuffing_unit(buf + offset);
         return offset;
     }
 
@@ -472,7 +632,8 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
     /* Content rows: place subtitle text at rows 23 and 24 (bottom of screen)
      * Each data unit gets a unique VBI line offset (8, 9, ...) */
     for (i = 0; i < nb_lines; i++) {
-        const char *line = lines[i];
+        char *safe_line = utf8_to_teletext_g0(lines[i]);
+        const char *line = safe_line ? safe_line : lines[i];
         int len, pad_left, j;
         int row = (nb_lines == 1) ? TELETEXT_SUBTITLE_ROW2
                                   : (i == 0 ? TELETEXT_SUBTITLE_ROW1
@@ -499,7 +660,6 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
         row_text[pad_left + 1] = 0x0B; /* Start Box (double for background) */
         for (j = 0; j < len; j++) {
             unsigned char c = line[j];
-            /* Map to teletext character set (7-bit, Latin G0) */
             if (c < 0x20 || c >= 0x7F)
                 c = ' ';
             row_text[pad_left + 2 + j] = c;
@@ -509,9 +669,12 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
 
         offset += write_data_unit(buf + offset, ctx->magazine, row,
                                   row_text, 1, 8 + i);
+        av_free(safe_line);
     }
 
     ctx->page_counter++;
+    ctx->content_active    = 1;
+    ctx->last_content_pts  = sub->pts;
 
     /* Pad with stuffing data units to reach TELETEXT_MIN_DATA_UNITS total.
      * This ensures (pkt_size + 45) % 184 == 0 for the libzvbi decoder. */
