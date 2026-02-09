@@ -130,15 +130,16 @@ static void encode_mrag(int magazine, int row, uint8_t *dst)
 /**
  * Write a data unit containing one teletext row.
  *
- * @param buf       Output buffer
- * @param magazine  Magazine number (1-8)
- * @param row       Row number (0-31)
- * @param text      40-byte text content (space-padded, 7-bit ASCII)
- * @param subtitle  1 for subtitle data unit (0x03), 0 for non-subtitle (0x02)
+ * @param buf         Output buffer
+ * @param magazine    Magazine number (1-8)
+ * @param row         Row number (0-31)
+ * @param text        40-byte text content (space-padded, 7-bit ASCII)
+ * @param subtitle    1 for subtitle data unit (0x03), 0 for non-subtitle (0x02)
+ * @param line_offset VBI line offset (7-22), must be unique per data unit in a PES
  * @return number of bytes written (always 46: 1+1+1+1+2+40)
  */
 static int write_data_unit(uint8_t *buf, int magazine, int row,
-                           const uint8_t *text, int subtitle)
+                           const uint8_t *text, int subtitle, int line_offset)
 {
     int i;
 
@@ -147,8 +148,9 @@ static int write_data_unit(uint8_t *buf, int magazine, int row,
     buf[1] = TELETEXT_DATA_UNIT_LENGTH; /* 44 bytes */
     /* Per EN 300 472 section 4.4:
      * bits 7-6: reserved "11", bit 5: field_parity, bits 4-0: line_offset
-     * field_parity=0 (first field), line_offset=7 (standard VBI line) */
-    buf[2] = 0xC0 | (0 << 5) | 7;
+     * Each data unit in a PES must have a unique line_offset since they
+     * represent different VBI lines within one video field. */
+    buf[2] = 0xC0 | (0 << 5) | (line_offset & 0x1F);
     buf[3] = TELETEXT_FRAMING_CODE;
 
     /* MRAG */
@@ -186,12 +188,14 @@ static int write_stuffing_unit(uint8_t *buf)
  * The page header contains the page address and control bits encoded
  * with Hamming 8/4, followed by 32 bytes of display text (typically spaces).
  *
- * @param buf       Output buffer
- * @param ctx       Encoder context
- * @param erase     1 to set the erase page flag (C4)
+ * @param buf         Output buffer
+ * @param ctx         Encoder context
+ * @param erase       1 to set the erase page flag (C4)
+ * @param line_offset VBI line offset (7-22)
  * @return number of bytes written
  */
-static int write_page_header(uint8_t *buf, DVBTeletextEncContext *ctx, int erase)
+static int write_page_header(uint8_t *buf, DVBTeletextEncContext *ctx,
+                             int erase, int line_offset)
 {
     uint8_t header_text[TELETEXT_CHARS_PER_ROW];
     int page_units, page_tens;
@@ -201,7 +205,7 @@ static int write_page_header(uint8_t *buf, DVBTeletextEncContext *ctx, int erase
     buf[1] = TELETEXT_DATA_UNIT_LENGTH;
     /* Per EN 300 472 section 4.4:
      * bits 7-6: reserved "11", bit 5: field_parity, bits 4-0: line_offset */
-    buf[2] = 0xC0 | (0 << 5) | 7;
+    buf[2] = 0xC0 | (0 << 5) | (line_offset & 0x1F);
     buf[3] = TELETEXT_FRAMING_CODE;
 
     /* MRAG for row 0 */
@@ -329,7 +333,7 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
         if (bufsize < 1 + 46 * TELETEXT_MIN_DATA_UNITS)
             return 0;
         buf[0] = TELETEXT_DATA_IDENTIFIER;
-        offset = 1 + write_page_header(buf + 1, ctx, 0); /* no erase */
+        offset = 1 + write_page_header(buf + 1, ctx, 0, 7); /* no erase, line 7 */
         /* Pad with stuffing to reach 3 data units for PES alignment */
         offset += write_stuffing_unit(buf + offset);
         offset += write_stuffing_unit(buf + offset);
@@ -401,10 +405,11 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
     /* Data identifier byte */
     buf[offset++] = TELETEXT_DATA_IDENTIFIER;
 
-    /* Page header (row 0) — erase page before new content */
-    offset += write_page_header(buf + offset, ctx, 1);
+    /* Page header (row 0) — erase page before new content, VBI line 7 */
+    offset += write_page_header(buf + offset, ctx, 1, 7);
 
-    /* Content rows: place subtitle text at rows 23 and 24 (bottom of screen) */
+    /* Content rows: place subtitle text at rows 23 and 24 (bottom of screen)
+     * Each data unit gets a unique VBI line offset (8, 9, ...) */
     for (i = 0; i < nb_lines; i++) {
         const char *line = lines[i];
         int len, pad_left, j;
@@ -429,7 +434,7 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
         }
 
         offset += write_data_unit(buf + offset, ctx->magazine, row,
-                                  row_text, 1);
+                                  row_text, 1, 8 + i);
     }
 
     ctx->page_counter++;
