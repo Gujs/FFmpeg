@@ -77,6 +77,13 @@ typedef struct DecoderPriv {
 
     /* closed caption extraction */
     int                 cc_extract;       /* 1 if CC extraction enabled */
+    /* CC debounce: buffer subtitle text and only emit after it stops
+     * changing for CC_DEBOUNCE_US microseconds. This eliminates the
+     * rapid incremental fragments from cc_dec real_time=1 mode. */
+    AVSubtitle          cc_pending_sub;   /* buffered subtitle waiting for debounce */
+    int                 cc_pending_valid; /* 1 if cc_pending_sub has data */
+    int64_t             cc_pending_pts;   /* PTS when pending text last changed */
+    char               *cc_pending_text;  /* text of pending subtitle (for comparison) */
     unsigned            cc_out_idx;       /* scheduler decoder output index for CC */
     AVCodecContext     *cc_dec_ctx;       /* EIA-608 decoder (cc_dec) context */
     AVFrame            *cc_frame;         /* reusable frame for CC subtitle output */
@@ -148,6 +155,9 @@ void dec_free(Decoder **pdec)
 
     avcodec_free_context(&dp->cc_dec_ctx);
     av_frame_free(&dp->cc_frame);
+    if (dp->cc_pending_valid)
+        avsubtitle_free(&dp->cc_pending_sub);
+    av_freep(&dp->cc_pending_text);
 
     av_freep(&dp->parent_name);
 
@@ -707,14 +717,59 @@ static int transcode_subtitles(DecoderPriv *dp, const AVPacket *pkt,
     return process_subtitle(dp, frame);
 }
 
+/* Debounce interval: only emit subtitle after text stops changing for this
+ * long.  cc_dec real_time=1 mode fires a new subtitle on every CC buffer
+ * change (character-by-character for roll-up), producing rapid incremental
+ * fragments.  Buffering until a 500 ms quiet period eliminates the flicker
+ * and only emits complete phrases. */
+#define CC_DEBOUNCE_US  500000  /* 500 ms */
+
+/**
+ * Send a subtitle (content or empty keepalive) to the CC encoder.
+ * Returns 0 on success. On AVERROR_EOF the CC output is disabled.
+ */
+static int cc_send_subtitle(DecoderPriv *dp, AVSubtitle *sub, AVFrame *frame)
+{
+    AVFrame *cc_frame = dp->cc_frame;
+    int ret;
+
+    av_frame_unref(cc_frame);
+
+    /* subtitle_wrap_frame with copy=0 moves ownership: it memdup's the
+     * AVSubtitle and zeroes the caller's copy. On failure the data may be
+     * lost (OOM), but there is nothing useful to do in that case. */
+    ret = subtitle_wrap_frame(cc_frame, sub, 0);
+    if (ret < 0)
+        return ret;
+
+    cc_frame->pts       = frame->pts;
+    cc_frame->time_base = frame->time_base;
+
+    ret = sch_dec_send(dp->sch, dp->sch_idx, dp->cc_out_idx, cc_frame);
+    if (ret < 0) {
+        av_frame_unref(cc_frame);
+        if (ret == AVERROR_EOF) {
+            dp->cc_extract = 0;
+            ret = 0;
+        }
+        return ret;
+    }
+
+    dp->cc_last_sub_pts = av_rescale_q(frame->pts, frame->time_base,
+                                       AV_TIME_BASE_Q);
+    return 0;
+}
+
 /**
  * Extract closed captions from decoded video frame and send as subtitle.
  *
  * Extracts AV_FRAME_DATA_A53_CC side data from the video frame, decodes
- * EIA-608 captions to ASS subtitles using cc_dec, wraps the result in
- * an AVFrame, and sends it to the CC decoder output for encoding as a
- * separate subtitle stream. Also strips CC from the video frame so the
- * video encoder does not re-inject it into SEI.
+ * EIA-608 captions to ASS subtitles using cc_dec, and debounces the output
+ * so that only complete phrases are emitted (not character-by-character
+ * incremental fragments from real_time=1 mode).
+ *
+ * Also strips CC from the video frame so the video encoder does not
+ * re-inject it into SEI.
  */
 static int extract_cc_subtitle(DecoderPriv *dp, AVFrame *frame)
 {
@@ -723,13 +778,30 @@ static int extract_cc_subtitle(DecoderPriv *dp, AVFrame *frame)
     AVSubtitle subtitle = { 0 };
     int got_sub = 0;
     int ret = 0;
+    int64_t cur_pts;
 
     if (!dp->cc_extract || !dp->cc_dec_ctx)
         return 0;
 
+    if (frame->pts == AV_NOPTS_VALUE)
+        goto strip;
+
+    cur_pts = av_rescale_q(frame->pts, frame->time_base, AV_TIME_BASE_Q);
+
+    /* If PTS jumped forward significantly (discontinuity / ad boundary),
+     * flush any pending subtitle immediately rather than losing it. */
+    if (dp->cc_pending_valid &&
+        cur_pts - dp->cc_pending_pts > 2 * CC_DEBOUNCE_US) {
+        ret = cc_send_subtitle(dp, &dp->cc_pending_sub, frame);
+        dp->cc_pending_valid = 0;
+        if (ret < 0)
+            goto strip;
+    }
+
+    /* --- Decode CC side data from this video frame --- */
     sd = av_frame_get_side_data(frame, AV_FRAME_DATA_A53_CC);
     if (!sd || sd->size < 3)
-        goto strip;
+        goto check_pending;
 
     cc_pkt = av_packet_alloc();
     if (!cc_pkt)
@@ -741,9 +813,9 @@ static int extract_cc_subtitle(DecoderPriv *dp, AVFrame *frame)
         return ret;
     }
     memcpy(cc_pkt->data, sd->data, sd->size);
-    cc_pkt->pts = av_rescale_q(frame->pts, frame->time_base, AV_TIME_BASE_Q);
+    cc_pkt->pts = cur_pts;
 
-    subtitle.pts = cc_pkt->pts;
+    subtitle.pts = cur_pts;
 
     ret = avcodec_decode_subtitle2(dp->cc_dec_ctx, &subtitle, &got_sub, cc_pkt);
     av_packet_free(&cc_pkt);
@@ -751,66 +823,62 @@ static int extract_cc_subtitle(DecoderPriv *dp, AVFrame *frame)
     if (ret < 0) {
         av_log(dp, AV_LOG_WARNING, "CC decode error: %s\n", av_err2str(ret));
         ret = 0;
-        goto strip;
+        goto check_pending;
     }
 
+    /* --- Debounce: buffer new text, emit only after it stabilises --- */
     if (got_sub && subtitle.num_rects > 0) {
-        /* cc_dec real_time mode sets end_display_time to -1 (UINT32_MAX)
-         * because it doesn't know when the next CC event will arrive.
-         * Clamp to a reasonable maximum — the next subtitle replaces it anyway. */
-        if (subtitle.end_display_time == UINT32_MAX ||
-            subtitle.end_display_time > 10000)
-            subtitle.end_display_time = 10000; /* 10 seconds max */
+        const char *new_text = subtitle.rects[0]->ass ? subtitle.rects[0]->ass : "";
 
-        /* Override subtitle PTS with the video frame PTS.
-         * cc_dec's internal buffer_time can jump non-monotonically,
-         * but the video frames are always monotonic after our
-         * discontinuity handling. The encoder reads sub->pts directly. */
-        subtitle.pts = av_rescale_q(frame->pts, frame->time_base, AV_TIME_BASE_Q);
-    } else {
-        int64_t cur_pts = av_rescale_q(frame->pts, frame->time_base, AV_TIME_BASE_Q);
+        if (!dp->cc_pending_text || strcmp(new_text, dp->cc_pending_text)) {
+            /* Text changed — replace pending buffer and reset debounce timer */
+            if (dp->cc_pending_valid)
+                avsubtitle_free(&dp->cc_pending_sub);
 
-        /* No new CC content — send empty subtitle keepalive at ~1Hz.
-         * Without periodic subtitle packets, the MPEG-TS interleaver
-         * blocks video/audio waiting for sparse subtitle data,
-         * causing large gaps (up to max_interleave_delta) in output.
-         * Throttle to 1 per second to avoid excessive overhead. */
-        if (dp->cc_last_sub_pts != AV_NOPTS_VALUE &&
-            cur_pts - dp->cc_last_sub_pts < 1000000) { /* 1 second in AV_TIME_BASE */
-            avsubtitle_free(&subtitle);
+            /* Clamp end_display_time (cc_dec real_time sets UINT32_MAX) */
+            if (subtitle.end_display_time == UINT32_MAX ||
+                subtitle.end_display_time > 10000)
+                subtitle.end_display_time = 10000;
+
+            subtitle.pts = cur_pts;
+            dp->cc_pending_sub   = subtitle;
+            dp->cc_pending_valid = 1;
+            dp->cc_pending_pts   = cur_pts;
+
+            av_freep(&dp->cc_pending_text);
+            dp->cc_pending_text = av_strdup(new_text);
+
+            /* Ownership transferred to pending — do NOT free subtitle */
             goto strip;
         }
-
+        /* Same text as pending — leave timer unchanged, free duplicate */
         avsubtitle_free(&subtitle);
-        memset(&subtitle, 0, sizeof(subtitle));
-        subtitle.pts = cur_pts;
+    } else {
+        avsubtitle_free(&subtitle);
     }
 
-    {
-        AVFrame *cc_frame = dp->cc_frame;
-        av_frame_unref(cc_frame);
+check_pending:
+    /* Emit pending subtitle once text has been stable for CC_DEBOUNCE_US */
+    if (dp->cc_pending_valid &&
+        cur_pts - dp->cc_pending_pts >= CC_DEBOUNCE_US) {
 
-        ret = subtitle_wrap_frame(cc_frame, &subtitle, 0);
-        if (ret < 0) {
-            avsubtitle_free(&subtitle);
+        ret = cc_send_subtitle(dp, &dp->cc_pending_sub, frame);
+        dp->cc_pending_valid = 0;  /* subtitle_wrap_frame zeroed the struct */
+        if (ret < 0)
             goto strip;
-        }
+    }
+    /* Keepalive: send empty subtitle at ~1 Hz to prevent MPEG-TS interleaver
+     * from stalling on the sparse subtitle stream. */
+    else if (!dp->cc_pending_valid &&
+             dp->cc_last_sub_pts != AV_NOPTS_VALUE &&
+             cur_pts - dp->cc_last_sub_pts >= 1000000) {
 
-        cc_frame->pts       = frame->pts;
-        cc_frame->time_base = frame->time_base;
+        AVSubtitle empty = { 0 };
+        empty.pts = cur_pts;
 
-        ret = sch_dec_send(dp->sch, dp->sch_idx, dp->cc_out_idx, cc_frame);
-        if (ret < 0) {
-            av_frame_unref(cc_frame);
-            if (ret == AVERROR_EOF) {
-                /* CC consumer finished, disable extraction */
-                dp->cc_extract = 0;
-                ret = 0;
-            }
+        ret = cc_send_subtitle(dp, &empty, frame);
+        if (ret < 0)
             goto strip;
-        }
-
-        dp->cc_last_sub_pts = av_rescale_q(frame->pts, frame->time_base, AV_TIME_BASE_Q);
     }
 
 strip:
