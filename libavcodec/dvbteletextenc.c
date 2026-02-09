@@ -274,14 +274,16 @@ static int write_page_header(uint8_t *buf, DVBTeletextEncContext *ctx,
      * Per ETS 300 706 section 9.3.1.2
      * S1=0, S2=0 (sub-code), C4=erase flag
      *
-     * For subtitle pages per ETS 300 706:
-     * C6=1 (Subtitle page), C7=1 (Suppress Header), C8=1 (Update Indicator)
+     * For subtitle pages: C6=0, C7=1 (Suppress Header), C8=1 (Update Indicator)
+     * libzvbi (used by VLC/ffplay) identifies subtitle pages via:
+     *   !(C6) && C7 && C8  (C6 must be 0!)
+     * CCExtractor/telxcc checks C7 bit for subtitle detection, not C6.
      * Nibble for byte[11]: D1=S4, D2=C5(Newsflash), D3=C6(Subtitle), D4=C7(SuppressHdr)
      * Nibble for byte[12]: D1=C8(Update), D2=C9, D3=C10, D4=C11 */
     buf[8]  = hamming84_encode[0];               /* S1 */
     buf[9]  = hamming84_encode[(erase ? 0x08 : 0x00)]; /* S2 + C4 (erase page) */
     buf[10] = hamming84_encode[0];               /* S3 */
-    buf[11] = hamming84_encode[0x0C];            /* S4=0, C5=0, C6=1(Subtitle), C7=1(SuppressHdr) */
+    buf[11] = hamming84_encode[0x08];            /* S4=0, C5=0, C6=0, C7=1(SuppressHdr) */
     buf[12] = hamming84_encode[0x01];            /* C8=1 (Update Indicator), C9=0, C10=0, C11=0 */
     buf[13] = hamming84_encode[0];               /* C12-C14 (charset=0, Latin G0) */
 
