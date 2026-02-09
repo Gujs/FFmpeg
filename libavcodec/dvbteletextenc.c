@@ -211,11 +211,13 @@ static int write_data_unit(uint8_t *buf, int magazine, int row,
         buf[6 + i] = odd_parity[c & 0x7F];
     }
 
-    /* Bit-reverse the 44-byte teletext payload (bytes 2-45).
+    /* Bit-reverse the 42-byte MRAG + content area (bytes 4-45).
      * DVB PES uses MSB-first convention; decoders reverse each byte
-     * to recover the standard LSB-first teletext representation. */
-    for (i = 0; i < 44; i++)
-        buf[2 + i] = vbi_reverse_8[buf[2 + i]];
+     * to recover the standard LSB-first teletext representation.
+     * Bytes 2-3 (field_parity, framing_code) are EN 300 472 fields
+     * read directly by decoders without reversal. */
+    for (i = 0; i < 42; i++)
+        buf[4 + i] = vbi_reverse_8[buf[4 + i]];
 
     return 46; /* 1 + 1 + 1 + 1 + 2 + 40 = 46 */
 }
@@ -297,9 +299,10 @@ static int write_page_header(uint8_t *buf, DVBTeletextEncContext *ctx,
     for (i = 0; i < 32; i++)
         buf[14 + i] = odd_parity[header_text[i] & 0x7F];
 
-    /* Bit-reverse the 44-byte teletext payload (bytes 2-45) */
-    for (i = 0; i < 44; i++)
-        buf[2 + i] = vbi_reverse_8[buf[2 + i]];
+    /* Bit-reverse the 42-byte MRAG + content area (bytes 4-45).
+     * Bytes 2-3 (field_parity, framing_code) are NOT reversed. */
+    for (i = 0; i < 42; i++)
+        buf[4 + i] = vbi_reverse_8[buf[4 + i]];
 
     return 46;
 }
