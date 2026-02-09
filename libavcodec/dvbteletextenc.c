@@ -52,6 +52,17 @@
 #define TELETEXT_CHARS_PER_ROW      40    /* characters per teletext row */
 #define TELETEXT_SUBTITLE_ROW1      23    /* first subtitle row */
 #define TELETEXT_SUBTITLE_ROW2      24    /* second subtitle row (bottom) */
+#define TELETEXT_DATA_UNIT_STUFFING 0xFF  /* stuffing data unit, EN 300 472 */
+
+/*
+ * The libzvbi teletext decoder requires PES packets to be exact multiples
+ * of 184 bytes (one TS packet payload). With 45-byte PES header:
+ *   (pkt_size + 45) % 184 == 0
+ * Each data unit is 46 bytes, payload = 1 (data_id) + 46*N.
+ * Since 184 = 4*46, we need N ≡ 3 (mod 4), i.e., 3, 7, 11, or 15 units.
+ * We always pad to exactly 3 data units (the minimum that passes).
+ */
+#define TELETEXT_MIN_DATA_UNITS     3
 
 /*
  * Hamming 8/4 encoding table.
@@ -152,6 +163,21 @@ static int write_data_unit(uint8_t *buf, int magazine, int row,
     }
 
     return 46; /* 1 + 1 + 1 + 1 + 2 + 40 = 46 */
+}
+
+/**
+ * Write a stuffing data unit to pad PES payload to required alignment.
+ * Per EN 300 472, data_unit_id 0xFF with length 0x2C.
+ *
+ * @param buf  Output buffer (at least 46 bytes)
+ * @return number of bytes written (always 46)
+ */
+static int write_stuffing_unit(uint8_t *buf)
+{
+    buf[0] = TELETEXT_DATA_UNIT_STUFFING;
+    buf[1] = TELETEXT_DATA_UNIT_LENGTH; /* 44 bytes */
+    memset(&buf[2], 0xFF, 44);
+    return 46;
 }
 
 /**
@@ -300,10 +326,14 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
      * This prevents the MPEG-TS interleaver from blocking video/audio
      * while waiting for sparse subtitle data. */
     if (sub->num_rects == 0) {
-        if (bufsize < 1 + 46)
+        if (bufsize < 1 + 46 * TELETEXT_MIN_DATA_UNITS)
             return 0;
         buf[0] = TELETEXT_DATA_IDENTIFIER;
-        return 1 + write_page_header(buf + 1, ctx, 0); /* no erase */
+        offset = 1 + write_page_header(buf + 1, ctx, 0); /* no erase */
+        /* Pad with stuffing to reach 3 data units for PES alignment */
+        offset += write_stuffing_unit(buf + offset);
+        offset += write_stuffing_unit(buf + offset);
+        return offset;
     }
 
     /* We need at minimum:
@@ -403,6 +433,17 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
     }
 
     ctx->page_counter++;
+
+    /* Pad with stuffing data units to reach TELETEXT_MIN_DATA_UNITS total.
+     * This ensures (pkt_size + 45) % 184 == 0 for the libzvbi decoder. */
+    {
+        /* Count data units written: 1 (page header) + nb_lines (content rows) */
+        int data_units = 1 + nb_lines;
+        while (data_units < TELETEXT_MIN_DATA_UNITS) {
+            offset += write_stuffing_unit(buf + offset);
+            data_units++;
+        }
+    }
 
 cleanup:
     for (i = 0; i < nb_lines; i++)
