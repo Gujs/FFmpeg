@@ -330,6 +330,9 @@ typedef struct NvencContext
     // Track last hw_frames_ctx to detect frame pool changes (diagnostic)
     void *last_hw_frames_ctx;
 
+    // Force FORCEIDR on next frame after pool change (DPB reset safety net)
+    int pool_change_force_idr;
+
     // Track last DTS/PTS for detecting non-monotonic timestamps (diagnostic)
     int64_t last_dts_out;
     int64_t last_pts_out;
