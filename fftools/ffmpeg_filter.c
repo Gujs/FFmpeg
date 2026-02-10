@@ -3435,9 +3435,33 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
     if (!(ifp->opts.flags & IFILTER_FLAG_REINIT) && fgt->graph)
         need_reinit = 0;
 
-    if (!!ifp->hw_frames_ctx != !!frame->hw_frames_ctx ||
-        (ifp->hw_frames_ctx && ifp->hw_frames_ctx->data != frame->hw_frames_ctx->data))
+    if (!!ifp->hw_frames_ctx != !!frame->hw_frames_ctx) {
+        /* HW <-> SW transition - must reconfigure */
         need_reinit |= HWACCEL_CHANGED;
+    } else if (ifp->hw_frames_ctx && ifp->hw_frames_ctx->data != frame->hw_frames_ctx->data) {
+        /* hw_frames_ctx pointer changed. Decoder may recreate hw_frames_ctx
+         * on metadata-only SPS changes (e.g., colorspace). Only reconfigure
+         * if the actual frame format changed - suppress if parameters match
+         * to avoid unnecessary NVENC pool changes that cause displaced frames. */
+        AVHWFramesContext *old_hwfc = (AVHWFramesContext *)ifp->hw_frames_ctx->data;
+        AVHWFramesContext *new_hwfc = (AVHWFramesContext *)frame->hw_frames_ctx->data;
+        if (old_hwfc->sw_format  != new_hwfc->sw_format  ||
+            old_hwfc->width      != new_hwfc->width      ||
+            old_hwfc->height     != new_hwfc->height     ||
+            old_hwfc->device_ref->data != new_hwfc->device_ref->data) {
+            need_reinit |= HWACCEL_CHANGED;
+        } else {
+            av_log(fg, AV_LOG_VERBOSE,
+                   "[HW-PATCH] hw_frames_ctx changed (%p -> %p) but parameters "
+                   "identical (%s %dx%d) - suppressing reconfig\n",
+                   (void *)ifp->hw_frames_ctx->data,
+                   (void *)frame->hw_frames_ctx->data,
+                   av_get_pix_fmt_name(new_hwfc->sw_format),
+                   new_hwfc->width, new_hwfc->height);
+            /* Update stored reference so subsequent frames don't re-trigger */
+            av_buffer_replace(&ifp->hw_frames_ctx, frame->hw_frames_ctx);
+        }
+    }
 
     if (need_reinit) {
         ret = ifilter_parameters_from_frame(ifilter, frame);
