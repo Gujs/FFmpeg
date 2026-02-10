@@ -3221,24 +3221,28 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
     NV_ENC_PIC_PARAMS pic_params = { 0 };
     pic_params.version = NV_ENC_PIC_PARAMS_VER;
 
+    int is_reconfig_idr = 0;
+
     if ((!ctx->cu_context && !ctx->d3d11_device) || !ctx->nvencoder)
         return AVERROR(EINVAL);
 
     if (frame && frame->buf[0]) {
-        /* Log mid-stream frame pool changes (filter graph reconfiguration).
-         * Note: EOS flush was removed - it caused DTS > PTS errors because B-frame
-         * PTS is non-monotonic (packets arrive in decode order, not presentation order).
-         * The stuttering after pool change remains an unsolved architectural issue -
-         * NVENC's internal DPB holds raw GPU addresses that become invalid when the
-         * old frame pool is destroyed. */
+        /* Detect mid-stream frame pool changes (filter graph reconfiguration).
+         * When detected: (1) set safety-net flag to force FORCEIDR on the first
+         * frame from the new pool (resetting the DPB), (2) clean up stale
+         * registration entries from the old pool, (3) call nvEncInvalidateRefFrames
+         * after encoding the IDR. This prevents the permanent frame displacement bug
+         * where NVENC references GPU addresses from the destroyed old pool. */
         if ((avctx->pix_fmt == AV_PIX_FMT_CUDA || avctx->pix_fmt == AV_PIX_FMT_D3D11) &&
             frame->hw_frames_ctx && ctx->last_hw_frames_ctx != NULL &&
             frame->hw_frames_ctx->data != ctx->last_hw_frames_ctx) {
 
             av_log(avctx, AV_LOG_WARNING,
                    "[HW-PATCH] Frame pool change detected (old=%p new=%p) - "
-                   "B-frame references from old pool may cause visual artifacts\n",
+                   "forcing IDR to reset DPB\n",
                    ctx->last_hw_frames_ctx, frame->hw_frames_ctx->data);
+
+            ctx->pool_change_force_idr = 1;
 
             /* Update pool tracking */
             ctx->last_hw_frames_ctx = frame->hw_frames_ctx->data;
@@ -3251,6 +3255,32 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
         res = nvenc_push_context(avctx);
         if (res < 0)
             return res;
+
+        /* Clean up stale registration entries from old pool after pool change.
+         * Must be inside CUDA context because nvEncUnregisterResource requires it. */
+        if (ctx->pool_change_force_idr && frame->hw_frames_ctx) {
+            int stale_count = 0;
+            for (int j = 0; j < ctx->nb_registered_frames; j++) {
+                if (ctx->registered_frames[j].regptr &&
+                    !ctx->registered_frames[j].mapped &&
+                    ctx->registered_frames[j].hw_frames_ref &&
+                    ctx->registered_frames[j].hw_frames_ref->data != frame->hw_frames_ctx->data) {
+                    NVENCSTATUS nv_st = p_nvenc->nvEncUnregisterResource(
+                        ctx->nvencoder, ctx->registered_frames[j].regptr);
+                    if (nv_st != NV_ENC_SUCCESS)
+                        av_log(avctx, AV_LOG_WARNING,
+                               "[HW-PATCH] Failed to unregister stale frame %d\n", j);
+                    ctx->registered_frames[j].ptr = NULL;
+                    ctx->registered_frames[j].regptr = NULL;
+                    av_buffer_unref(&ctx->registered_frames[j].hw_frames_ref);
+                    stale_count++;
+                }
+            }
+            if (stale_count)
+                av_log(avctx, AV_LOG_VERBOSE,
+                       "[HW-PATCH] Cleaned up %d stale registration entries from old pool\n",
+                       stale_count);
+        }
 
         reconfig_encoder(avctx, frame);
 
@@ -3279,19 +3309,24 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
             pic_params.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
         }
 
-        if (ctx->forced_idr >= 0 && frame->pict_type == AV_PICTURE_TYPE_I) {
-            pic_params.encodePicFlags =
-                ctx->forced_idr ? NV_ENC_PIC_FLAG_FORCEIDR : NV_ENC_PIC_FLAG_FORCEINTRA;
+        {
+            int is_reconfig = frame->pict_type == AV_PICTURE_TYPE_I &&
+                              av_dict_get(frame->metadata, "lavfi.reconfig_keyframe", NULL, 0) != NULL;
 
-            /* Log reconfiguration keyframes for debugging.
-             * These are marked with "lavfi.reconfig_keyframe" metadata by the filter graph. */
-            if (av_dict_get(frame->metadata, "lavfi.reconfig_keyframe", NULL, 0)) {
-                av_log(avctx, AV_LOG_DEBUG,
-                       "[HW-PATCH] Reconfiguration keyframe at PTS=%"PRId64"\n",
+            if (is_reconfig || ctx->pool_change_force_idr) {
+                pic_params.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
+                av_log(avctx, AV_LOG_VERBOSE,
+                       "[HW-PATCH] %s at PTS=%"PRId64" -> FORCEIDR (DPB reset)\n",
+                       is_reconfig ? "Reconfiguration keyframe" : "Pool change safety net",
                        frame->pts);
+                ctx->pool_change_force_idr = 0;
+                is_reconfig_idr = 1;
+            } else if (ctx->forced_idr >= 0 && frame->pict_type == AV_PICTURE_TYPE_I) {
+                pic_params.encodePicFlags =
+                    ctx->forced_idr ? NV_ENC_PIC_FLAG_FORCEIDR : NV_ENC_PIC_FLAG_FORCEINTRA;
+            } else {
+                pic_params.encodePicFlags = 0;
             }
-        } else {
-            pic_params.encodePicFlags = 0;
         }
 
         pic_params.frameIdx = ctx->frame_idx_counter++;
@@ -3371,6 +3406,21 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
         return res;
 
     nv_status = p_nvenc->nvEncEncodePicture(ctx->nvencoder, &pic_params);
+
+    /* After encoding a reconfig IDR, invalidate all reference frames in NVENC's
+     * DPB to ensure it doesn't reference stale surfaces from the old pool. */
+    if (is_reconfig_idr && nv_status == NV_ENC_SUCCESS &&
+        p_nvenc->nvEncInvalidateRefFrames) {
+        NVENCSTATUS inv_st = p_nvenc->nvEncInvalidateRefFrames(
+            ctx->nvencoder, (uint64_t)frame->pts);
+        if (inv_st != NV_ENC_SUCCESS)
+            av_log(avctx, AV_LOG_WARNING,
+                   "[HW-PATCH] nvEncInvalidateRefFrames failed (status=%d)\n", inv_st);
+        else
+            av_log(avctx, AV_LOG_VERBOSE,
+                   "[HW-PATCH] Invalidated all ref frames before PTS=%"PRId64"\n",
+                   frame->pts);
+    }
 
     for (i = 0; i < sei_count; i++)
         av_freep(&(ctx->sei_data[i].payload));
