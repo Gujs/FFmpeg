@@ -153,6 +153,14 @@ typedef struct InputFilterPriv {
     int                 resolution_stable_count;
 #define RESOLUTION_HYSTERESIS_FRAMES 3  // Require 3 consecutive frames (~100ms at 30fps)
 
+    // Audio parameter change hysteresis to filter transient changes at splice boundaries
+    // Discontinuities can cause decoder to briefly output different channel layout/format
+    int                 pending_audio_sample_rate;
+    enum AVSampleFormat pending_audio_format;
+    AVChannelLayout     pending_audio_ch_layout;
+    int                 audio_stable_count;
+#define AUDIO_HYSTERESIS_FRAMES 5  // Require 5 consecutive frames (~100ms at 48kHz/1024)
+
     struct {
         AVFrame *frame;
 
@@ -1049,6 +1057,7 @@ void fg_free(FilterGraph **pfg)
         av_frame_free(&ifp->opts.fallback);
 
         av_buffer_unref(&ifp->hw_frames_ctx);
+        av_channel_layout_uninit(&ifp->pending_audio_ch_layout);
         av_freep(&ifilter->linklabel);
         av_freep(&ifp->opts.name);
         av_frame_side_data_free(&ifp->side_data, &ifp->nb_side_data);
@@ -3312,10 +3321,63 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
     /* determine if the parameters for this input changed */
     switch (ifilter->type) {
     case AVMEDIA_TYPE_AUDIO:
+        /* Audio parameter changes use hysteresis to filter transient changes
+         * at splice/discontinuity boundaries. The decoder may briefly output
+         * different channel layout or sample format during transitions.
+         * Require AUDIO_HYSTERESIS_FRAMES consecutive frames at new parameters
+         * before triggering reconfiguration (which rebuilds the ENTIRE filter
+         * graph including video CUDA filters). */
         if (ifp->format      != frame->format ||
             ifp->sample_rate != frame->sample_rate ||
-            av_channel_layout_compare(&ifp->ch_layout, &frame->ch_layout))
-            need_reinit |= AUDIO_CHANGED;
+            av_channel_layout_compare(&ifp->ch_layout, &frame->ch_layout)) {
+
+            int same_as_pending = (ifp->pending_audio_format == frame->format &&
+                                   ifp->pending_audio_sample_rate == frame->sample_rate &&
+                                   !av_channel_layout_compare(&ifp->pending_audio_ch_layout, &frame->ch_layout));
+
+            if (same_as_pending) {
+                ifp->audio_stable_count++;
+                if (ifp->audio_stable_count >= AUDIO_HYSTERESIS_FRAMES) {
+                    av_log(fg, AV_LOG_INFO,
+                           "[HW-PATCH] Audio change confirmed after %d frames: %dHz %s -> %dHz %s\n",
+                           ifp->audio_stable_count,
+                           ifp->sample_rate,
+                           av_get_sample_fmt_name(ifp->format),
+                           frame->sample_rate,
+                           av_get_sample_fmt_name(frame->format));
+                    need_reinit |= AUDIO_CHANGED;
+                    ifp->audio_stable_count = 0;
+                    av_channel_layout_uninit(&ifp->pending_audio_ch_layout);
+                } else {
+                    av_log(fg, AV_LOG_DEBUG,
+                           "[HW-PATCH] Audio change pending (%d/%d)\n",
+                           ifp->audio_stable_count, AUDIO_HYSTERESIS_FRAMES);
+                }
+            } else {
+                /* New pending audio params - reset counter */
+                ifp->pending_audio_format = frame->format;
+                ifp->pending_audio_sample_rate = frame->sample_rate;
+                av_channel_layout_uninit(&ifp->pending_audio_ch_layout);
+                av_channel_layout_copy(&ifp->pending_audio_ch_layout, &frame->ch_layout);
+                ifp->audio_stable_count = 1;
+                av_log(fg, AV_LOG_DEBUG,
+                       "[HW-PATCH] Audio change detected, starting hysteresis: "
+                       "%dHz %s -> %dHz %s\n",
+                       ifp->sample_rate,
+                       av_get_sample_fmt_name(ifp->format),
+                       frame->sample_rate,
+                       av_get_sample_fmt_name(frame->format));
+            }
+        } else {
+            /* Parameters match current - reset any pending change */
+            if (ifp->audio_stable_count) {
+                av_log(fg, AV_LOG_INFO,
+                       "[HW-PATCH] Transient audio change filtered out after %d frames\n",
+                       ifp->audio_stable_count);
+                ifp->audio_stable_count = 0;
+                av_channel_layout_uninit(&ifp->pending_audio_ch_layout);
+            }
+        }
         break;
     case AVMEDIA_TYPE_VIDEO:
         /* Format and alpha mode changes trigger immediately */
