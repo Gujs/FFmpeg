@@ -327,11 +327,21 @@ typedef struct NvencContext
     // Used to trigger encoder reset when colorspace changes mid-stream
     enum AVColorSpace last_colorspace;
 
-    // Track last hw_frames_ctx to detect frame pool changes (diagnostic)
+    // Track last hw_frames_ctx to detect frame pool changes
     void *last_hw_frames_ctx;
 
-    // Force FORCEIDR on next frame after pool change (DPB reset safety net)
+    // Track hw_frames_ctx parameters to distinguish benign pool swaps
+    // (audio-triggered reconfig, same video params) from genuine changes
+    enum AVPixelFormat last_hw_sw_format;
+    int last_hw_width;
+    int last_hw_height;
+    void *last_hw_device;
+
+    // Force FORCEIDR on next frame after genuine pool change (DPB reset safety net)
     int pool_change_force_idr;
+
+    // Clean up stale registrations from old pool (set on any pool change)
+    int pool_change_cleanup;
 
     // Track last DTS/PTS for detecting non-monotonic timestamps (diagnostic)
     int64_t last_dts_out;
