@@ -2497,12 +2497,18 @@ static int nvenc_upload_frame(AVCodecContext *avctx, const AVFrame *frame,
 
     if (avctx->pix_fmt == AV_PIX_FMT_CUDA || avctx->pix_fmt == AV_PIX_FMT_D3D11) {
         /* Track hw_frames_ctx changes for diagnostic purposes.
-         * Log when the frame pool changes (e.g., after filter graph reconfiguration). */
+         * Log when the frame pool changes (e.g., after filter graph reconfiguration).
+         * Also store parameters for the pool change comparison in ff_nvenc_encode_frame. */
         if (frame->hw_frames_ctx && frame->hw_frames_ctx->data != ctx->last_hw_frames_ctx) {
+            AVHWFramesContext *hwfc = (AVHWFramesContext *)frame->hw_frames_ctx->data;
             av_log(avctx, AV_LOG_DEBUG,
                    "[HW-PATCH] Frame pool changed: %p -> %p (PTS=%"PRId64" pict_type=%d)\n",
                    ctx->last_hw_frames_ctx, frame->hw_frames_ctx->data, frame->pts, frame->pict_type);
             ctx->last_hw_frames_ctx = frame->hw_frames_ctx->data;
+            ctx->last_hw_sw_format  = hwfc->sw_format;
+            ctx->last_hw_width      = hwfc->width;
+            ctx->last_hw_height     = hwfc->height;
+            ctx->last_hw_device     = hwfc->device_ref->data;
         }
 
         int reg_idx = nvenc_register_frame(avctx, frame);
@@ -3228,24 +3234,54 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
 
     if (frame && frame->buf[0]) {
         /* Detect mid-stream frame pool changes (filter graph reconfiguration).
-         * When detected: (1) set safety-net flag to force FORCEIDR on the first
-         * frame from the new pool (resetting the DPB), (2) clean up stale
-         * registration entries from the old pool, (3) call nvEncInvalidateRefFrames
-         * after encoding the IDR. This prevents the permanent frame displacement bug
-         * where NVENC references GPU addresses from the destroyed old pool. */
+         *
+         * Two cases:
+         * (a) BENIGN pool swap: audio parameter change triggers full filter graph
+         *     rebuild, creating a new hw_frames_ctx with identical video parameters.
+         *     NVENC copies input to internal surfaces and DPB is NVENC-owned memory,
+         *     so a pool swap with same params is safe — just clean stale registrations.
+         * (b) GENUINE pool change: video format/resolution actually changed.
+         *     Force IDR to reset DPB and invalidate old references.
+         *
+         * Distinguish by comparing hw_frames_ctx parameters, not just pointers. */
         if ((avctx->pix_fmt == AV_PIX_FMT_CUDA || avctx->pix_fmt == AV_PIX_FMT_D3D11) &&
             frame->hw_frames_ctx && ctx->last_hw_frames_ctx != NULL &&
             frame->hw_frames_ctx->data != ctx->last_hw_frames_ctx) {
 
-            av_log(avctx, AV_LOG_WARNING,
-                   "[HW-PATCH] Frame pool change detected (old=%p new=%p) - "
-                   "forcing IDR to reset DPB\n",
-                   ctx->last_hw_frames_ctx, frame->hw_frames_ctx->data);
+            AVHWFramesContext *new_hwfc = (AVHWFramesContext *)frame->hw_frames_ctx->data;
+            int params_match = (new_hwfc->sw_format == ctx->last_hw_sw_format &&
+                                new_hwfc->width     == ctx->last_hw_width     &&
+                                new_hwfc->height    == ctx->last_hw_height    &&
+                                new_hwfc->device_ref->data == ctx->last_hw_device);
 
-            ctx->pool_change_force_idr = 1;
+            /* Always clean stale registrations from old pool */
+            ctx->pool_change_cleanup = 1;
 
-            /* Update pool tracking */
+            if (params_match) {
+                /* Benign pool swap (e.g. audio-triggered filter graph rebuild).
+                 * Video parameters are identical - no DPB reset needed.
+                 * Just clean stale registrations and continue encoding. */
+                av_log(avctx, AV_LOG_INFO,
+                       "[HW-PATCH] Pool pointer changed (old=%p new=%p) but video "
+                       "parameters identical (%dx%d %s) - no DPB reset\n",
+                       ctx->last_hw_frames_ctx, frame->hw_frames_ctx->data,
+                       new_hwfc->width, new_hwfc->height,
+                       av_get_pix_fmt_name(new_hwfc->sw_format));
+            } else {
+                /* Genuine pool change - video parameters differ. Force IDR. */
+                av_log(avctx, AV_LOG_WARNING,
+                       "[HW-PATCH] Genuine frame pool change detected (old=%p new=%p) - "
+                       "forcing IDR to reset DPB\n",
+                       ctx->last_hw_frames_ctx, frame->hw_frames_ctx->data);
+                ctx->pool_change_force_idr = 1;
+            }
+
+            /* Update pool tracking (both pointer and parameters) */
             ctx->last_hw_frames_ctx = frame->hw_frames_ctx->data;
+            ctx->last_hw_sw_format  = new_hwfc->sw_format;
+            ctx->last_hw_width      = new_hwfc->width;
+            ctx->last_hw_height     = new_hwfc->height;
+            ctx->last_hw_device     = new_hwfc->device_ref->data;
         }
 
         in_surf = get_free_frame(ctx);
@@ -3256,9 +3292,11 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
         if (res < 0)
             return res;
 
-        /* Clean up stale registration entries from old pool after pool change.
+        /* Clean up stale registration entries from old pool after any pool change
+         * (both benign swaps and genuine changes). Stale entries reference CUDA
+         * surfaces in the old pool that will never be reused.
          * Must be inside CUDA context because nvEncUnregisterResource requires it. */
-        if (ctx->pool_change_force_idr && frame->hw_frames_ctx) {
+        if (ctx->pool_change_cleanup && frame->hw_frames_ctx) {
             int stale_count = 0;
             for (int j = 0; j < ctx->nb_registered_frames; j++) {
                 if (ctx->registered_frames[j].regptr &&
@@ -3280,6 +3318,7 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
                 av_log(avctx, AV_LOG_VERBOSE,
                        "[HW-PATCH] Cleaned up %d stale registration entries from old pool\n",
                        stale_count);
+            ctx->pool_change_cleanup = 0;
         }
 
         reconfig_encoder(avctx, frame);
