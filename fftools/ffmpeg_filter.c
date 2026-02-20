@@ -3500,6 +3500,10 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
     if (!!ifp->hw_frames_ctx != !!frame->hw_frames_ctx) {
         /* HW <-> SW transition - must reconfigure */
         need_reinit |= HWACCEL_CHANGED;
+        av_log(fg, AV_LOG_INFO,
+               "[HW-PATCH] HW<->SW transition detected (had_hw=%d frame_hw=%d) - "
+               "triggering HWACCEL_CHANGED reconfig\n",
+               !!ifp->hw_frames_ctx, !!frame->hw_frames_ctx);
     } else if (ifp->hw_frames_ctx && ifp->hw_frames_ctx->data != frame->hw_frames_ctx->data) {
         /* hw_frames_ctx pointer changed. Decoder may recreate hw_frames_ctx
          * on metadata-only SPS changes (e.g., colorspace). Only reconfigure
@@ -3512,8 +3516,16 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
             old_hwfc->height     != new_hwfc->height     ||
             old_hwfc->device_ref->data != new_hwfc->device_ref->data) {
             need_reinit |= HWACCEL_CHANGED;
+            av_log(fg, AV_LOG_INFO,
+                   "[HW-PATCH] hw_frames_ctx changed with DIFFERENT parameters "
+                   "(%p %s %dx%d dev=%p -> %p %s %dx%d dev=%p) - "
+                   "triggering HWACCEL_CHANGED reconfig\n",
+                   (void *)old_hwfc, av_get_pix_fmt_name(old_hwfc->sw_format),
+                   old_hwfc->width, old_hwfc->height, (void *)old_hwfc->device_ref->data,
+                   (void *)new_hwfc, av_get_pix_fmt_name(new_hwfc->sw_format),
+                   new_hwfc->width, new_hwfc->height, (void *)new_hwfc->device_ref->data);
         } else {
-            av_log(fg, AV_LOG_VERBOSE,
+            av_log(fg, AV_LOG_INFO,
                    "[HW-PATCH] hw_frames_ctx changed (%p -> %p) but parameters "
                    "identical (%s %dx%d) - suppressing reconfig\n",
                    (void *)ifp->hw_frames_ctx->data,
