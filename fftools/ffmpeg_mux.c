@@ -233,7 +233,20 @@ static int write_packet(Muxer *mux, OutputStream *ost, AVPacket *pkt)
     if (ms->stats.io)
         enc_stats_write(ost, &ms->stats, NULL, pkt, frame_num);
 
-    ret = av_interleaved_write_frame(s, pkt);
+    {
+        int64_t before_write = av_gettime_relative();
+        ret = av_interleaved_write_frame(s, pkt);
+        int64_t write_dur = av_gettime_relative() - before_write;
+        if (write_dur > 1000000) { /* >1s: WARNING */
+            av_log(ost, AV_LOG_WARNING,
+                   "[WRITE-STALL] av_interleaved_write_frame blocked for %.3fs\n",
+                   write_dur / 1000000.0);
+        } else if (write_dur > 500000) { /* >500ms: INFO */
+            av_log(ost, AV_LOG_INFO,
+                   "[WRITE-STALL] av_interleaved_write_frame blocked for %.3fs\n",
+                   write_dur / 1000000.0);
+        }
+    }
     if (ret < 0) {
         av_log(ost, AV_LOG_ERROR,
                "Error submitting a packet to the muxer: %s\n",
@@ -412,12 +425,30 @@ int muxer_thread(void *arg)
     MuxThreadContext mt;
 
     int        ret = 0;
+    int64_t    last_write_wc_video = 0;
+    int64_t    last_write_wc_audio = 0;
+
+    /* DTS continuity tracking (first video stream) */
+    int64_t    last_video_dts = AV_NOPTS_VALUE;
+    int        last_video_dts_stream = -1;
+
+    /* Rate monitoring (10-second windows) */
+    int64_t    rate_monitor_start = 0;
+    int64_t    video_pkts_interval = 0;
+    int64_t    video_pkts_total = 0;
+    int64_t    max_gap_interval_us = 0;
+    int64_t    session_start_wc = 0;
 
     ret = mux_thread_init(&mt);
     if (ret < 0)
         goto finish;
 
     thread_set_name(mux);
+
+    last_write_wc_video = av_gettime_relative();
+    last_write_wc_audio = last_write_wc_video;
+    rate_monitor_start  = last_write_wc_video;
+    session_start_wc    = last_write_wc_video;
 
     while (1) {
         OutputStream *ost;
@@ -434,6 +465,83 @@ int muxer_thread(void *arg)
         ost = of->streams[mux->sch_stream_idx[stream_idx]];
         mt.pkt->stream_index = ost->index;
         mt.pkt->flags       &= ~AV_PKT_FLAG_TRUSTED;
+
+        if (ost->type == AVMEDIA_TYPE_VIDEO) {
+            int64_t now = av_gettime_relative();
+            int64_t gap_us = now - last_write_wc_video;
+
+            /* Wall-clock gap: tiered thresholds */
+            if (gap_us > 1000000) { /* >1s: WARNING */
+                av_log(mux, AV_LOG_WARNING,
+                       "[OUTPUT-GAP] No video packets for %.3fs (stream %d)\n",
+                       gap_us / 1000000.0, ost->index);
+            } else if (gap_us > 500000) { /* >500ms: INFO */
+                av_log(mux, AV_LOG_INFO,
+                       "[OUTPUT-GAP] No video packets for %.3fs (stream %d)\n",
+                       gap_us / 1000000.0, ost->index);
+            }
+
+            /* Track max gap in this monitoring interval */
+            if (gap_us > max_gap_interval_us)
+                max_gap_interval_us = gap_us;
+
+            last_write_wc_video = now;
+
+            /* DTS continuity: check for timestamp gaps in output */
+            if (mt.pkt->dts != AV_NOPTS_VALUE) {
+                if (last_video_dts != AV_NOPTS_VALUE &&
+                    last_video_dts_stream == ost->index) {
+                    int64_t dts_gap_us = av_rescale_q(
+                        mt.pkt->dts - last_video_dts,
+                        ost->st->time_base, AV_TIME_BASE_Q);
+                    if (dts_gap_us > 80000) { /* >80ms = >2 frames at 25fps */
+                        av_log(mux, AV_LOG_INFO,
+                               "[OUTPUT-DTS-GAP] Video DTS gap: %.3fs "
+                               "(stream %d, prev_dts=%"PRId64" cur_dts=%"PRId64")\n",
+                               dts_gap_us / 1000000.0, ost->index,
+                               last_video_dts, mt.pkt->dts);
+                    }
+                }
+                last_video_dts = mt.pkt->dts;
+                last_video_dts_stream = ost->index;
+            }
+
+            video_pkts_interval++;
+            video_pkts_total++;
+        } else if (ost->type == AVMEDIA_TYPE_AUDIO) {
+            int64_t now = av_gettime_relative();
+            int64_t gap_us = now - last_write_wc_audio;
+            if (gap_us > 1000000) { /* >1s: WARNING */
+                av_log(mux, AV_LOG_WARNING,
+                       "[OUTPUT-GAP] No audio packets for %.3fs (stream %d)\n",
+                       gap_us / 1000000.0, ost->index);
+            } else if (gap_us > 500000) { /* >500ms: INFO */
+                av_log(mux, AV_LOG_INFO,
+                       "[OUTPUT-GAP] No audio packets for %.3fs (stream %d)\n",
+                       gap_us / 1000000.0, ost->index);
+            }
+            last_write_wc_audio = now;
+        }
+
+        /* Rate monitor: log stats every 10 seconds, only if anomalous */
+        {
+            int64_t now = av_gettime_relative();
+            int64_t interval_elapsed = now - rate_monitor_start;
+            if (interval_elapsed >= 10000000) { /* 10s */
+                if (max_gap_interval_us > 500000) { /* only log if max gap >500ms */
+                    double elapsed_total = (now - session_start_wc) / 1000000.0;
+                    av_log(mux, AV_LOG_INFO,
+                           "[OUTPUT-RATE] 10s: vid_pkts=%"PRId64" max_gap=%.3fs "
+                           "total_pkts=%"PRId64" uptime=%.0fs\n",
+                           video_pkts_interval,
+                           max_gap_interval_us / 1000000.0,
+                           video_pkts_total, elapsed_total);
+                }
+                video_pkts_interval = 0;
+                max_gap_interval_us = 0;
+                rate_monitor_start = now;
+            }
+        }
 
         ret = mux_packet_filter(mux, &mt, ost, ret < 0 ? NULL : mt.pkt, &stream_eof);
         av_packet_unref(mt.pkt);
