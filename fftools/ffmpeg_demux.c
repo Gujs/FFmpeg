@@ -744,6 +744,9 @@ static int input_thread(void *arg)
     d->read_started    = 1;
     d->wallclock_start = av_gettime_relative();
 
+    int64_t last_read_wc_video = d->wallclock_start;
+    int64_t last_read_wc_audio = d->wallclock_start;
+
     while (1) {
         DemuxStream *ds;
         unsigned send_flags = 0;
@@ -753,6 +756,38 @@ static int input_thread(void *arg)
         if (ret == AVERROR(EAGAIN)) {
             av_usleep(10000);
             continue;
+        }
+
+        if (ret >= 0) {
+            int stream_idx = dt.pkt_demux->stream_index;
+            enum AVMediaType mtype = f->ctx->streams[stream_idx]->codecpar->codec_type;
+            if (mtype == AVMEDIA_TYPE_VIDEO) {
+                int64_t now = av_gettime_relative();
+                int64_t gap_us = now - last_read_wc_video;
+                if (gap_us > 1000000) { /* >1s: WARNING */
+                    av_log(d, AV_LOG_WARNING,
+                           "[INPUT-GAP] No video packets for %.3fs (stream %d)\n",
+                           gap_us / 1000000.0, stream_idx);
+                } else if (gap_us > 500000) { /* >500ms: INFO */
+                    av_log(d, AV_LOG_INFO,
+                           "[INPUT-GAP] No video packets for %.3fs (stream %d)\n",
+                           gap_us / 1000000.0, stream_idx);
+                }
+                last_read_wc_video = now;
+            } else if (mtype == AVMEDIA_TYPE_AUDIO) {
+                int64_t now = av_gettime_relative();
+                int64_t gap_us = now - last_read_wc_audio;
+                if (gap_us > 1000000) { /* >1s: WARNING */
+                    av_log(d, AV_LOG_WARNING,
+                           "[INPUT-GAP] No audio packets for %.3fs (stream %d)\n",
+                           gap_us / 1000000.0, stream_idx);
+                } else if (gap_us > 500000) { /* >500ms: INFO */
+                    av_log(d, AV_LOG_INFO,
+                           "[INPUT-GAP] No audio packets for %.3fs (stream %d)\n",
+                           gap_us / 1000000.0, stream_idx);
+                }
+                last_read_wc_audio = now;
+            }
         }
         if (ret < 0) {
             int ret_bsf;
