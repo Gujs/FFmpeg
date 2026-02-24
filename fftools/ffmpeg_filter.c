@@ -3480,12 +3480,26 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
     } else if (ifp->displaymatrix_present)
         need_reinit |= MATRIX_CHANGED;
 
+    /* Downmix metadata changes: DON'T trigger full filter graph reconfiguration.
+     * Downmix info is advisory metadata from the audio decoder and can flutter
+     * at splice/discontinuity boundaries (e.g., AC3 decode errors).
+     * Rebuilding the entire filter graph (including CUDA video filters) just
+     * because downmix metadata changed is catastrophic — it creates new
+     * hw_frames_ctx pools that displace NVENC output frames for ~10-45 seconds.
+     * Just update the tracked values so they propagate correctly. */
     if (sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DOWNMIX_INFO)) {
         if (!ifp->downmixinfo_present ||
-            memcmp(sd->data, &ifp->downmixinfo, sizeof(ifp->downmixinfo)))
-            need_reinit |= DOWNMIX_CHANGED;
-    } else if (ifp->downmixinfo_present)
-        need_reinit |= DOWNMIX_CHANGED;
+            memcmp(sd->data, &ifp->downmixinfo, sizeof(ifp->downmixinfo))) {
+            av_log(fg, AV_LOG_VERBOSE,
+                   "[HW-PATCH] Downmix metadata changed (no reconfig)\n");
+            memcpy(&ifp->downmixinfo, sd->data, sizeof(ifp->downmixinfo));
+            ifp->downmixinfo_present = 1;
+        }
+    } else if (ifp->downmixinfo_present) {
+        av_log(fg, AV_LOG_VERBOSE,
+               "[HW-PATCH] Downmix metadata removed (no reconfig)\n");
+        ifp->downmixinfo_present = 0;
+    }
 
     if (need_reinit && fgt->graph && (ifp->opts.flags & IFILTER_FLAG_DROPCHANGED)) {
             ifp->nb_dropped++;
@@ -3511,19 +3525,21 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
          * to avoid unnecessary NVENC pool changes that cause displaced frames. */
         AVHWFramesContext *old_hwfc = (AVHWFramesContext *)ifp->hw_frames_ctx->data;
         AVHWFramesContext *new_hwfc = (AVHWFramesContext *)frame->hw_frames_ctx->data;
+        /* Compare video surface parameters only — NOT the device pointer.
+         * hwupload_cuda creates a new AVHWDeviceContext allocation on each
+         * filter graph rebuild, even for the same physical GPU. */
         if (old_hwfc->sw_format  != new_hwfc->sw_format  ||
             old_hwfc->width      != new_hwfc->width      ||
-            old_hwfc->height     != new_hwfc->height     ||
-            old_hwfc->device_ref->data != new_hwfc->device_ref->data) {
+            old_hwfc->height     != new_hwfc->height) {
             need_reinit |= HWACCEL_CHANGED;
             av_log(fg, AV_LOG_INFO,
                    "[HW-PATCH] hw_frames_ctx changed with DIFFERENT parameters "
-                   "(%p %s %dx%d dev=%p -> %p %s %dx%d dev=%p) - "
+                   "(%p %s %dx%d -> %p %s %dx%d) - "
                    "triggering HWACCEL_CHANGED reconfig\n",
                    (void *)old_hwfc, av_get_pix_fmt_name(old_hwfc->sw_format),
-                   old_hwfc->width, old_hwfc->height, (void *)old_hwfc->device_ref->data,
+                   old_hwfc->width, old_hwfc->height,
                    (void *)new_hwfc, av_get_pix_fmt_name(new_hwfc->sw_format),
-                   new_hwfc->width, new_hwfc->height, (void *)new_hwfc->device_ref->data);
+                   new_hwfc->width, new_hwfc->height);
         } else {
             av_log(fg, AV_LOG_INFO,
                    "[HW-PATCH] hw_frames_ctx changed (%p -> %p) but parameters "
