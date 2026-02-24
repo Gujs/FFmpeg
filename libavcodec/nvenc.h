@@ -331,11 +331,13 @@ typedef struct NvencContext
     void *last_hw_frames_ctx;
 
     // Track hw_frames_ctx parameters to distinguish benign pool swaps
-    // (audio-triggered reconfig, same video params) from genuine changes
+    // (audio-triggered reconfig, same video params) from genuine changes.
+    // Note: device pointer is NOT compared — hwupload_cuda creates a new
+    // AVHWDeviceContext allocation on each filter graph rebuild even for
+    // the same physical GPU, causing false-positive "genuine" detections.
     enum AVPixelFormat last_hw_sw_format;
     int last_hw_width;
     int last_hw_height;
-    void *last_hw_device;
 
     // Force FORCEIDR on next frame after genuine pool change (DPB reset safety net)
     int pool_change_force_idr;

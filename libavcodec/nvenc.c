@@ -2508,7 +2508,6 @@ static int nvenc_upload_frame(AVCodecContext *avctx, const AVFrame *frame,
             ctx->last_hw_sw_format  = hwfc->sw_format;
             ctx->last_hw_width      = hwfc->width;
             ctx->last_hw_height     = hwfc->height;
-            ctx->last_hw_device     = hwfc->device_ref->data;
         }
 
         int reg_idx = nvenc_register_frame(avctx, frame);
@@ -3249,10 +3248,16 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
             frame->hw_frames_ctx->data != ctx->last_hw_frames_ctx) {
 
             AVHWFramesContext *new_hwfc = (AVHWFramesContext *)frame->hw_frames_ctx->data;
+            /* Compare video surface parameters only — NOT the device pointer.
+             * When filter graph rebuilds (e.g., from audio metadata changes),
+             * hwupload_cuda creates a new AVHWDeviceContext allocation even
+             * though it targets the same physical GPU.  Comparing device_ref->data
+             * would false-positive every rebuild as "genuine".
+             * NVENC is already bound to a specific GPU, so the device can't
+             * actually change mid-stream. */
             int params_match = (new_hwfc->sw_format == ctx->last_hw_sw_format &&
                                 new_hwfc->width     == ctx->last_hw_width     &&
-                                new_hwfc->height    == ctx->last_hw_height    &&
-                                new_hwfc->device_ref->data == ctx->last_hw_device);
+                                new_hwfc->height    == ctx->last_hw_height);
 
             /* Always clean stale registrations from old pool */
             ctx->pool_change_cleanup = 1;
@@ -3276,12 +3281,11 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
                 ctx->pool_change_force_idr = 1;
             }
 
-            /* Update pool tracking (both pointer and parameters) */
+            /* Update pool tracking (pointer and video parameters) */
             ctx->last_hw_frames_ctx = frame->hw_frames_ctx->data;
             ctx->last_hw_sw_format  = new_hwfc->sw_format;
             ctx->last_hw_width      = new_hwfc->width;
             ctx->last_hw_height     = new_hwfc->height;
-            ctx->last_hw_device     = new_hwfc->device_ref->data;
         }
 
         in_surf = get_free_frame(ctx);
