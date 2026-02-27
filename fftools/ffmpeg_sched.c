@@ -442,6 +442,7 @@ static void task_init(Scheduler *sch, SchTask *task, enum SchedulerNodeType type
 static int64_t trailing_dts(const Scheduler *sch)
 {
     int64_t min_dts = INT64_MAX;
+    int have_non_sparse = 0;
 
     for (unsigned i = 0; i < sch->nb_mux; i++) {
         const SchMux *mux = &sch->mux[i];
@@ -452,13 +453,35 @@ static int64_t trailing_dts(const Scheduler *sch)
             if (ms->source_finished)
                 continue;
             // sparse streams (data, subtitle) have irregular timing and
-            // should never contribute to trailing_dts calculation
+            // should not contribute to trailing_dts when regular streams
+            // are present
             if (ms->sparse)
                 continue;
+            have_non_sparse = 1;
             if (ms->last_dts == AV_NOPTS_VALUE)
                 return AV_NOPTS_VALUE;
 
             min_dts = FFMIN(min_dts, ms->last_dts);
+        }
+    }
+
+    // if ALL active streams are sparse (e.g. subtitle-only conversion),
+    // fall back to including them so the scheduler has a valid baseline
+    // and does not deadlock by permanently choking downstream queues
+    if (!have_non_sparse) {
+        for (unsigned i = 0; i < sch->nb_mux; i++) {
+            const SchMux *mux = &sch->mux[i];
+
+            for (unsigned j = 0; j < mux->nb_streams; j++) {
+                const SchMuxStream *ms = &mux->streams[j];
+
+                if (ms->source_finished && !count_finished)
+                    continue;
+                if (ms->last_dts == AV_NOPTS_VALUE)
+                    return AV_NOPTS_VALUE;
+
+                min_dts = FFMIN(min_dts, ms->last_dts);
+            }
         }
     }
 
