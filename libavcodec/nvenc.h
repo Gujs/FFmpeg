@@ -248,6 +248,7 @@ typedef struct NvencContext
         NV_ENC_REGISTERED_PTR regptr;
         int mapped;
         NV_ENC_MAP_INPUT_RESOURCE in_map;
+        AVBufferRef *hw_frames_ref;  // Track which frame pool this registration belongs to
     } registered_frames[MAX_REGISTERED_FRAMES];
     int nb_registered_frames;
 
@@ -321,6 +322,32 @@ typedef struct NvencContext
     int cbr_padding;
     int multiview, multiview_supported;
     int display_sei_sent;
+
+    // Track last frame's colorspace for detecting colorspace changes
+    // Used to trigger encoder reset when colorspace changes mid-stream
+    enum AVColorSpace last_colorspace;
+
+    // Track last hw_frames_ctx to detect frame pool changes
+    void *last_hw_frames_ctx;
+
+    // Track hw_frames_ctx parameters to distinguish benign pool swaps
+    // (audio-triggered reconfig, same video params) from genuine changes.
+    // Note: device pointer is NOT compared — hwupload_cuda creates a new
+    // AVHWDeviceContext allocation on each filter graph rebuild even for
+    // the same physical GPU, causing false-positive "genuine" detections.
+    enum AVPixelFormat last_hw_sw_format;
+    int last_hw_width;
+    int last_hw_height;
+
+    // Force FORCEIDR on next frame after genuine pool change (DPB reset safety net)
+    int pool_change_force_idr;
+
+    // Clean up stale registrations from old pool (set on any pool change)
+    int pool_change_cleanup;
+
+    // Track last DTS/PTS for detecting non-monotonic timestamps (diagnostic)
+    int64_t last_dts_out;
+    int64_t last_pts_out;
 } NvencContext;
 
 int ff_nvenc_encode_init(AVCodecContext *avctx);

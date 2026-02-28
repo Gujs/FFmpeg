@@ -58,10 +58,10 @@ typedef struct BufferSourceContext {
     AVBufferRef *hw_frames_ctx;
 
     /* audio only */
-    int sample_rate;
-    enum AVSampleFormat sample_fmt;
-    int channels;
-    AVChannelLayout ch_layout;
+    int sample_rate, prev_sample_rate;
+    enum AVSampleFormat sample_fmt, prev_sample_fmt;
+    int channels, prev_channels;
+    AVChannelLayout ch_layout, prev_ch_layout;
     AVFrameSideData **side_data;
     int nb_side_data;
 
@@ -95,13 +95,24 @@ typedef struct BufferSourceContext {
     }
 
 #define CHECK_AUDIO_PARAM_CHANGE(s, c, srate, layout, format, pts)\
-    if (c->sample_fmt != format || c->sample_rate != srate ||\
-        av_channel_layout_compare(&c->ch_layout, &layout) || c->channels != layout.nb_channels) {\
-        av_log(s, AV_LOG_INFO, "filter context - fmt: %s r: %d layout: %"PRIX64" ch: %d, incoming frame - fmt: %s r: %d layout: %"PRIX64" ch: %d pts_time: %s\n",\
+    c->link_delta = c->sample_fmt != format || c->sample_rate != srate ||\
+                    av_channel_layout_compare(&c->ch_layout, &layout) || c->channels != layout.nb_channels;\
+    c->prev_delta = c->prev_sample_fmt != format || c->prev_sample_rate != srate ||\
+                    av_channel_layout_compare(&c->prev_ch_layout, &layout) || c->prev_channels != layout.nb_channels;\
+    if (c->link_delta) {\
+        int loglevel = c->prev_delta ? AV_LOG_WARNING : AV_LOG_DEBUG;\
+        av_log(s, loglevel, "Changing audio frame properties on the fly is not supported by all filters.\n");\
+        av_log(s, loglevel, "filter context - fmt: %s r: %d layout: %"PRIX64" ch: %d, incoming frame - fmt: %s r: %d layout: %"PRIX64" ch: %d pts_time: %s\n",\
                av_get_sample_fmt_name(c->sample_fmt), c->sample_rate, c->ch_layout.order == AV_CHANNEL_ORDER_NATIVE ? c->ch_layout.u.mask : 0, c->channels,\
                av_get_sample_fmt_name(format), srate, layout.order == AV_CHANNEL_ORDER_NATIVE ? layout.u.mask : 0, layout.nb_channels, av_ts2timestr(pts, &s->outputs[0]->time_base));\
-        av_log(s, AV_LOG_ERROR, "Changing audio frame properties on the fly is not supported.\n");\
-        return AVERROR(EINVAL);\
+    }\
+    if (c->prev_delta) {\
+        if (!c->link_delta)\
+            av_log(s, AV_LOG_VERBOSE, "audio frame properties congruent with link at pts_time: %s\n", av_ts2timestr(pts, &s->outputs[0]->time_base));\
+        c->prev_sample_rate = srate;\
+        c->prev_sample_fmt = format;\
+        c->prev_channels = layout.nb_channels;\
+        av_channel_layout_copy(&c->prev_ch_layout, &layout);\
     }
 
 AVBufferSrcParameters *av_buffersrc_parameters_alloc(void)
@@ -439,6 +450,13 @@ static av_cold int init_audio(AVFilterContext *ctx)
     if (!s->time_base.num)
         s->time_base = (AVRational){1, s->sample_rate};
 
+    s->prev_sample_rate = s->sample_rate;
+    s->prev_sample_fmt  = s->sample_fmt;
+    s->prev_channels    = s->channels;
+    ret = av_channel_layout_copy(&s->prev_ch_layout, &s->ch_layout);
+    if (ret < 0)
+        return ret;
+
     av_log(ctx, AV_LOG_VERBOSE,
            "tb:%d/%d samplefmt:%s samplerate:%d chlayout:%s\n",
            s->time_base.num, s->time_base.den, av_get_sample_fmt_name(s->sample_fmt),
@@ -452,6 +470,7 @@ static av_cold void uninit(AVFilterContext *ctx)
     BufferSourceContext *s = ctx->priv;
     av_buffer_unref(&s->hw_frames_ctx);
     av_channel_layout_uninit(&s->ch_layout);
+    av_channel_layout_uninit(&s->prev_ch_layout);
     av_frame_side_data_free(&s->side_data, &s->nb_side_data);
 }
 
