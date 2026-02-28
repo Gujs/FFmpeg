@@ -3349,12 +3349,17 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
                     ifp->audio_stable_count = 0;
                     av_channel_layout_uninit(&ifp->pending_audio_ch_layout);
                 } else {
+                    /* Hysteresis in progress - drop frame because downstream
+                     * filters (anull, aresample) cannot handle channel layout
+                     * changes mid-stream and return AVERROR_PATCHWELCOME. */
                     av_log(fg, AV_LOG_DEBUG,
-                           "[HW-PATCH] Audio change pending (%d/%d)\n",
+                           "[HW-PATCH] Audio change pending (%d/%d) - dropping frame\n",
                            ifp->audio_stable_count, AUDIO_HYSTERESIS_FRAMES);
+                    av_frame_unref(frame);
+                    return 0;
                 }
             } else {
-                /* New pending audio params - reset counter */
+                /* New pending audio params - reset counter and drop frame */
                 ifp->pending_audio_format = frame->format;
                 ifp->pending_audio_sample_rate = frame->sample_rate;
                 av_channel_layout_uninit(&ifp->pending_audio_ch_layout);
@@ -3362,11 +3367,13 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
                 ifp->audio_stable_count = 1;
                 av_log(fg, AV_LOG_DEBUG,
                        "[HW-PATCH] Audio change detected, starting hysteresis: "
-                       "%dHz %s -> %dHz %s\n",
+                       "%dHz %s -> %dHz %s (dropping frame)\n",
                        ifp->sample_rate,
                        av_get_sample_fmt_name(ifp->format),
                        frame->sample_rate,
                        av_get_sample_fmt_name(frame->format));
+                av_frame_unref(frame);
+                return 0;
             }
         } else {
             /* Parameters match current - reset any pending change */
