@@ -352,6 +352,7 @@ OBJS-$(CONFIG_DSS_SP_DECODER)          += dss_sp.o
 OBJS-$(CONFIG_DST_DECODER)             += dstdec.o dsd.o
 OBJS-$(CONFIG_DVBSUB_DECODER)          += dvbsubdec.o
 OBJS-$(CONFIG_DVBSUB_ENCODER)          += dvbsubenc.o
+OBJS-$(CONFIG_DVB_TELETEXT_ENCODER)    += dvbteletextenc.o ass.o
 OBJS-$(CONFIG_DVDSUB_DECODER)          += dvdsubdec.o dvdsub.o
 OBJS-$(CONFIG_DVDSUB_ENCODER)          += dvdsubenc.o dvdsub.o
 OBJS-$(CONFIG_DVAUDIO_DECODER)         += dvaudiodec.o

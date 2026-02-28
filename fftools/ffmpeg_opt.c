@@ -1711,6 +1711,15 @@ int ffmpeg_parse_options(int argc, char **argv, Scheduler *sch)
         goto fail;
     }
 
+    // set up CC extraction now that decoders exist for all streams
+    for (int i = 0; i < nb_output_files; i++) {
+        ret = of_setup_cc_extraction(output_files[i]);
+        if (ret < 0) {
+            errmsg = "setting up CC extraction";
+            goto fail;
+        }
+    }
+
     correct_input_start_times();
 
     ret = apply_sync_offsets();
@@ -2199,6 +2208,12 @@ const OptionDef options[] = {
         "set this video output stream to be a heartbeat stream for "
         "fix_sub_duration, according to which subtitles should be split at "
         "random access points" },
+    { "extract_cc",                 OPT_TYPE_BOOL,   OPT_VIDEO | OPT_PERSTREAM | OPT_OUTPUT,
+        { .off = OFFSET(extract_cc) },
+        "extract closed captions from video to a separate subtitle stream" },
+    { "cc_lang",                    OPT_TYPE_STRING, OPT_VIDEO | OPT_PERSTREAM | OPT_OUTPUT | OPT_EXPERT,
+        { .off = OFFSET(cc_lang) },
+        "set language for extracted CC subtitle stream (default: auto-detect from audio)" },
 
     /* audio options */
     { "aframes",          OPT_TYPE_FUNC,    OPT_AUDIO | OPT_FUNC_ARG | OPT_PERFILE | OPT_OUTPUT | OPT_EXPERT | OPT_HAS_CANON,

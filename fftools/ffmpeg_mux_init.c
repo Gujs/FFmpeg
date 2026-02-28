@@ -2049,6 +2049,66 @@ static int create_streams(Muxer *mux, const OptionsContext *o)
         }
     }
 
+    /* Mark video output streams for deferred CC extraction.
+     * The actual setup happens in of_setup_cc_extraction() after
+     * fg_finalise_bindings() ensures decoders exist. */
+    for (int i = 0; i < mux->of.nb_streams; i++) {
+        OutputStream *video_ost = mux->of.streams[i];
+        MuxStream    *video_ms  = ms_from_ost(video_ost);
+        int extract_cc_val = 0;
+        InputStream *source_ist;
+        const char *cc_lang_override = NULL;
+
+        if (video_ost->type != AVMEDIA_TYPE_VIDEO)
+            continue;
+
+        opt_match_per_stream_int(video_ost, &o->extract_cc, oc, video_ost->st,
+                                 &extract_cc_val);
+        if (!extract_cc_val)
+            continue;
+
+        /* Find the source input stream: either directly mapped
+         * (ost->ist) or through filter graph inputs */
+        source_ist = video_ost->ist;
+        if (!source_ist && video_ost->filter) {
+            FilterGraph *fg = video_ost->filter->graph;
+            for (int fi = 0; fi < fg->nb_inputs; fi++) {
+                if (fg->inputs[fi]->type == AVMEDIA_TYPE_VIDEO) {
+                    for (int j = 0; j < nb_input_files; j++) {
+                        InputFile *ifile = input_files[j];
+                        for (int k = 0; k < ifile->nb_streams; k++) {
+                            InputStream *ist = ifile->streams[k];
+                            if (ist->par->codec_type == AVMEDIA_TYPE_VIDEO) {
+                                source_ist = ist;
+                                goto found_cc_ist;
+                            }
+                        }
+                    }
+                }
+            }
+found_cc_ist:;
+        }
+        if (!source_ist) {
+            av_log(video_ost, AV_LOG_WARNING,
+                   "-extract_cc: no source video input stream found\n");
+            continue;
+        }
+
+        video_ms->cc_extract_pending    = 1;
+        video_ms->cc_extract_source_ist = source_ist;
+
+        /* Resolve language now while OptionsContext is available */
+        opt_match_per_stream_str(video_ost, &o->cc_lang, oc,
+                                 video_ost->st, &cc_lang_override);
+        if (cc_lang_override && cc_lang_override[0])
+            video_ms->cc_extract_lang = av_strdup(cc_lang_override);
+        /* else NULL → auto-detect in of_setup_cc_extraction() */
+
+        av_log(video_ost, AV_LOG_VERBOSE,
+               "-extract_cc: deferred CC extraction setup for stream %d:%d\n",
+               video_ost->file->index, video_ost->index);
+    }
+
     ret = of_add_attachments(mux, o);
     if (ret < 0)
         return ret;
@@ -3328,6 +3388,212 @@ static Muxer *mux_alloc(void)
     snprintf(mux->log_name, sizeof(mux->log_name), "out#%d", mux->of.index);
 
     return mux;
+}
+
+int of_setup_cc_extraction(OutputFile *ofile)
+{
+    Muxer *mux = mux_from_of(ofile);
+    AVFormatContext *oc = mux->fc;
+    int ret;
+
+    for (int i = 0; i < ofile->nb_streams; i++) {
+        OutputStream *video_ost = ofile->streams[i];
+        MuxStream    *video_ms  = ms_from_ost(video_ost);
+        InputStream  *source_ist;
+        OutputStream *cc_ost;
+        MuxStream    *cc_ms;
+        SchedulerNode cc_src;
+        const AVCodec *cc_enc_codec;
+
+        if (!video_ms->cc_extract_pending)
+            continue;
+
+        source_ist = video_ms->cc_extract_source_ist;
+        if (!source_ist || !source_ist->decoder) {
+            av_log(video_ost, AV_LOG_WARNING,
+                   "-extract_cc requires transcoding, ignoring for stream copy\n");
+            continue;
+        }
+
+        /* set up CC extraction on the video decoder */
+        ret = dec_setup_cc_extract(source_ist->decoder, &cc_src);
+        if (ret < 0)
+            return ret;
+
+        /* find subtitle encoder: prefer DVB Teletext for standard MPEG-TS
+         * subtitle PIDs, fall back to SRT (muxed as PRIVATE_DATA) */
+        cc_enc_codec = avcodec_find_encoder(AV_CODEC_ID_DVB_TELETEXT);
+        if (!cc_enc_codec) {
+            av_log(video_ost, AV_LOG_INFO,
+                   "DVB Teletext encoder not available, falling back to SRT\n");
+            cc_enc_codec = avcodec_find_encoder(AV_CODEC_ID_SUBRIP);
+        }
+        if (!cc_enc_codec) {
+            av_log(video_ost, AV_LOG_ERROR,
+                   "No subtitle encoder found for CC extraction\n");
+            return AVERROR_ENCODER_NOT_FOUND;
+        }
+
+        /* create the subtitle output stream */
+        {
+            AVStream *cc_st = avformat_new_stream(oc, NULL);
+            if (!cc_st)
+                return AVERROR(ENOMEM);
+
+            cc_ms = mux_stream_alloc(mux, AVMEDIA_TYPE_SUBTITLE);
+            if (!cc_ms)
+                return AVERROR(ENOMEM);
+
+            cc_ost = &cc_ms->ost;
+            cc_ost->st  = cc_st;
+            cc_ost->ist = source_ist;
+            cc_ost->kf.ref_pts = AV_NOPTS_VALUE;
+            cc_ms->par_in = avcodec_parameters_alloc();
+            if (!cc_ms->par_in)
+                return AVERROR(ENOMEM);
+            cc_ms->par_in->codec_type   = AVMEDIA_TYPE_SUBTITLE;
+            cc_st->codecpar->codec_type = AVMEDIA_TYPE_SUBTITLE;
+            cc_ms->last_mux_dts = AV_NOPTS_VALUE;
+            cc_ms->max_frames   = INT64_MAX;
+            cc_ms->sq_idx_mux   = -1;
+
+            /* register with scheduler */
+            ret = GROW_ARRAY(mux->sch_stream_idx, mux->nb_sch_stream_idx);
+            if (ret < 0)
+                return ret;
+
+            ret = sch_add_mux_stream(mux->sch, mux->sch_idx);
+            if (ret < 0)
+                return ret;
+
+            av_assert0(ret == mux->nb_sch_stream_idx - 1);
+            mux->sch_stream_idx[ret] = cc_ost->index;
+            cc_ms->sch_idx           = ret;
+
+            /* subtitle streams are sparse */
+            sch_mux_stream_set_sparse(mux->sch, mux->sch_idx, cc_ms->sch_idx, 1);
+
+            /* create subtitle encoder */
+            ret = sch_add_enc(mux->sch, encoder_thread, cc_ost,
+                              NULL /* subtitles open immediately */);
+            if (ret < 0)
+                return ret;
+            cc_ms->sch_idx_enc = ret;
+
+            ret = enc_alloc(&cc_ost->enc, cc_enc_codec, mux->sch,
+                            cc_ms->sch_idx_enc, cc_ost);
+            if (ret < 0)
+                return ret;
+
+            /* The SRT encoder needs the ASS subtitle header from cc_dec */
+            {
+                const uint8_t *sub_hdr;
+                int sub_hdr_size;
+
+                ret = dec_get_cc_subtitle_header(source_ist->decoder,
+                                                 &sub_hdr, &sub_hdr_size);
+                if (ret >= 0 && sub_hdr && sub_hdr_size > 0) {
+                    cc_ost->enc->enc_ctx->subtitle_header =
+                        av_mallocz(sub_hdr_size + 1);
+                    if (cc_ost->enc->enc_ctx->subtitle_header) {
+                        memcpy(cc_ost->enc->enc_ctx->subtitle_header,
+                               sub_hdr, sub_hdr_size);
+                        cc_ost->enc->enc_ctx->subtitle_header_size = sub_hdr_size;
+                    }
+                }
+            }
+
+            if (oc->oformat->flags & AVFMT_GLOBALHEADER)
+                cc_ost->enc->enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+            cc_ms->pkt = av_packet_alloc();
+            if (!cc_ms->pkt)
+                return AVERROR(ENOMEM);
+
+            snprintf(cc_ms->log_name, sizeof(cc_ms->log_name),
+                     "cc_sub#%d:%d/%s", mux->of.index, cc_ost->index,
+                     cc_enc_codec->name);
+
+            /* Set language metadata for the teletext descriptor in PMT */
+            {
+                const char *cc_lang = "eng"; /* default fallback */
+
+                if (video_ms->cc_extract_lang) {
+                    cc_lang = video_ms->cc_extract_lang;
+                    av_log(mux, AV_LOG_INFO,
+                           "CC subtitle language: \"%s\" (from -cc_lang)\n",
+                           cc_lang);
+                } else {
+                    /* Auto-detect from first audio stream in same input file */
+                    const InputFile *ifile = source_ist->file;
+                    int detected = 0;
+                    for (int j = 0; j < ifile->nb_streams; j++) {
+                        const InputStream *ist_a = ifile->streams[j];
+                        if (ist_a->par->codec_type == AVMEDIA_TYPE_AUDIO) {
+                            const AVDictionaryEntry *e =
+                                av_dict_get(ist_a->st->metadata,
+                                            "language", NULL, 0);
+                            if (e && e->value[0] &&
+                                strcmp(e->value, "und") != 0) {
+                                cc_lang = e->value;
+                                detected = 1;
+                                av_log(mux, AV_LOG_INFO,
+                                       "CC subtitle language: \"%s\" "
+                                       "(auto-detected from audio stream %d)\n",
+                                       cc_lang, ist_a->index);
+                                break;
+                            }
+                        }
+                    }
+                    if (!detected)
+                        av_log(mux, AV_LOG_INFO,
+                               "CC subtitle language: \"eng\" (default)\n");
+                }
+
+                av_dict_set(&cc_st->metadata, "language", cc_lang, 0);
+            }
+
+            /* wire: CC decoder output → subtitle encoder → mux stream */
+            ret = sch_connect(mux->sch,
+                              cc_src, SCH_ENC(cc_ms->sch_idx_enc));
+            if (ret < 0)
+                return ret;
+
+            ret = sch_connect(mux->sch,
+                              SCH_ENC(cc_ms->sch_idx_enc),
+                              SCH_MSTREAM(mux->sch_idx, cc_ms->sch_idx));
+            if (ret < 0)
+                return ret;
+
+            sch_mux_stream_buffering(mux->sch, mux->sch_idx, cc_ms->sch_idx,
+                                     128, 50 * 1024 * 1024);
+
+            av_log(mux, AV_LOG_INFO,
+                   "CC extraction: video stream %d:%d → subtitle stream %d:%d (%s)\n",
+                   video_ost->file->index, video_ost->index,
+                   cc_ost->file->index, cc_ost->index,
+                   cc_enc_codec->name);
+
+            /* Reduce max_interleave_delta to prevent the sparse CC subtitle
+             * stream from blocking the lavf interleaver.
+             *
+             * The interleaver auto-flushes only when ALL interleaved streams
+             * have buffered data (mux.c:969).  During discontinuity handling
+             * and keyframe-wait, no video frames are decoded so no CC
+             * keepalives are emitted — the subtitle stream goes silent.
+             * With the default delta of 10s, video/audio buffer up for 10s
+             * before a forced flush, creating a visible gap in the output.
+             *
+             * 100ms is sufficient for correct interleaving of live video
+             * (33ms per frame at 30fps) and audio (23ms per AAC frame). */
+            if (oc->max_interleave_delta > 100000)
+                oc->max_interleave_delta = 100000; /* 100ms */
+        }
+
+        video_ms->cc_extract_pending = 0;
+    }
+
+    return 0;
 }
 
 int of_open(const OptionsContext *o, const char *filename, Scheduler *sch)

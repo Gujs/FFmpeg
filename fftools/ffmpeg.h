@@ -258,6 +258,8 @@ typedef struct OptionsContext {
     SpecifierOptList enc_stats_pre_fmt;
     SpecifierOptList enc_stats_post_fmt;
     SpecifierOptList mux_stats_fmt;
+    SpecifierOptList extract_cc;
+    SpecifierOptList cc_lang;
 
     int depth;
 } OptionsContext;
@@ -913,6 +915,23 @@ int dec_filter_add(Decoder *dec, InputFilter *ifilter, InputFilterOptions *opts,
 int dec_request_view(Decoder *dec, const ViewSpecifier *vs,
                      SchedulerNode *src);
 
+/**
+ * Enable closed caption extraction for a video decoder.
+ *
+ * Adds a secondary decoder output for EIA-608 subtitle data extracted
+ * from AV_FRAME_DATA_A53_CC frame side data. The output produces
+ * AVFrames containing AVSubtitle (ASS format from cc_dec).
+ *
+ * @param src scheduler node from which CC subtitle frames will originate
+ */
+int dec_setup_cc_extract(Decoder *dec, SchedulerNode *src);
+
+/**
+ * Get the ASS subtitle header from the CC decoder (cc_dec).
+ * Must be called after dec_setup_cc_extract().
+ */
+int dec_get_cc_subtitle_header(Decoder *dec, const uint8_t **header, int *header_size);
+
 int enc_alloc(Encoder **penc, const AVCodec *codec,
               Scheduler *sch, unsigned sch_idx, void *log_parent);
 void enc_free(Encoder **penc);
@@ -931,6 +950,7 @@ int of_stream_init(OutputFile *of, OutputStream *ost,
                    const AVCodecContext *enc_ctx);
 int of_write_trailer(OutputFile *of);
 int of_open(const OptionsContext *o, const char *filename, Scheduler *sch);
+int of_setup_cc_extraction(OutputFile *of);
 void of_free(OutputFile **pof);
 
 void of_enc_stats_close(void);
