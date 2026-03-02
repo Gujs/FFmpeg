@@ -1663,11 +1663,15 @@ static int input_thread(void *arg)
 
             /* Check if this packet triggers discontinuity buffering */
             if (!d->discont_buf.active && raw_dts != AV_NOPTS_VALUE) {
+                int64_t old_wrap_corr = ds_wrap->pts_wrap_correction;
                 int jump_ret = discont_detect_jump(d, ist, dt.pkt_demux, raw_dts);
                 if (jump_ret == 2) {
-                    /* PTS wrap detected - apply correction to THIS packet
-                     * (future packets are corrected by the block above) */
-                    int64_t corr_tb = av_rescale_q(ds_wrap->pts_wrap_correction,
+                    /* PTS wrap detected - apply only the NEWLY ADDED correction
+                     * to this packet. The previous correction was already applied
+                     * at line 1614 above; applying the full accumulated value
+                     * would double-count the old portion. */
+                    int64_t new_delta = ds_wrap->pts_wrap_correction - old_wrap_corr;
+                    int64_t corr_tb = av_rescale_q(new_delta,
                                                    AV_TIME_BASE_Q, ist->st->time_base);
                     dt.pkt_demux->dts += corr_tb;
                     if (dt.pkt_demux->pts != AV_NOPTS_VALUE)
