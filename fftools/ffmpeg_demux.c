@@ -153,6 +153,13 @@ typedef struct DemuxStream {
      * period and cfr mode duplicates the last good frame (clean freeze)
      * instead of outputting 10s of visual corruption. */
     int                      discont_drop_until_keyframe;
+
+    /* Per-stream PTS wrap correction (AV_TIME_BASE units).
+     * MPEG-TS uses a 33-bit counter that wraps every ~26.5 hours. Different
+     * streams may wrap at slightly different times. This tracks the cumulative
+     * wrap correction for each stream independently so that a video wrap
+     * doesn't corrupt audio timestamps (and vice versa). */
+    int64_t                  pts_wrap_correction;
 } DemuxStream;
 
 typedef struct DemuxStreamGroup {
@@ -889,6 +896,29 @@ static int discont_detect_jump(Demuxer *d, InputStream *ist, AVPacket *pkt,
     /* Calculate delta */
     delta = raw_dts - ds->last_raw_dts;
 
+    /* Check for PTS wrap (33-bit counter wraps every ~26.5 hours).
+     * A wrap looks like a huge jump whose magnitude is close to the
+     * wrap value (2^pts_wrap_bits in stream timebase, rescaled).
+     * We detect this BEFORE treating it as a real discontinuity. */
+    if (ist->st->pts_wrap_bits > 0 && ist->st->pts_wrap_bits < 64) {
+        int64_t wrap_value = av_rescale_q(1LL << ist->st->pts_wrap_bits,
+                                          ist->st->time_base, AV_TIME_BASE_Q);
+        if (llabs(delta) > d->discont_threshold &&
+            llabs(llabs(delta) - wrap_value) < 2 * AV_TIME_BASE) {
+            /* This is a counter wrap, not a real discontinuity.
+             * Record per-stream correction so the caller can adjust
+             * this packet and all future packets on this stream. */
+            ds->pts_wrap_correction -= delta;
+            av_log(ist, AV_LOG_WARNING,
+                   "[DISCONT-BUF] Timestamp jump %.3fs on stream %d is a PTS wrap "
+                   "(wrap=%.3fs), per-stream correction now %.3fs\n",
+                   (double)delta / AV_TIME_BASE, ist->index,
+                   (double)wrap_value / AV_TIME_BASE,
+                   (double)ds->pts_wrap_correction / AV_TIME_BASE);
+            return 2;  /* wrap detected, caller applies correction */
+        }
+    }
+
     /* Check for significant jump (forward or backward) */
     if (llabs(delta) > d->discont_threshold) {
         av_log(ist, AV_LOG_WARNING,
@@ -1610,7 +1640,20 @@ static int input_thread(void *arg)
         /* Capture raw DTS before ts_fixup for discontinuity detection */
         {
             InputStream *ist = f->streams[dt.pkt_demux->stream_index];
+            DemuxStream *ds_wrap = ds_from_ist(ist);
             int64_t raw_dts = AV_NOPTS_VALUE;
+
+            /* Apply per-stream PTS wrap correction BEFORE computing raw_dts.
+             * This corrects all future packets after a wrap has been detected
+             * on this stream. */
+            if (ds_wrap->pts_wrap_correction != 0 &&
+                dt.pkt_demux->dts != AV_NOPTS_VALUE) {
+                int64_t corr_tb = av_rescale_q(ds_wrap->pts_wrap_correction,
+                                               AV_TIME_BASE_Q, ist->st->time_base);
+                dt.pkt_demux->dts += corr_tb;
+                if (dt.pkt_demux->pts != AV_NOPTS_VALUE)
+                    dt.pkt_demux->pts += corr_tb;
+            }
 
             if (dt.pkt_demux->dts != AV_NOPTS_VALUE) {
                 raw_dts = av_rescale_q_rnd(dt.pkt_demux->dts,
@@ -1620,7 +1663,19 @@ static int input_thread(void *arg)
 
             /* Check if this packet triggers discontinuity buffering */
             if (!d->discont_buf.active && raw_dts != AV_NOPTS_VALUE) {
-                if (discont_detect_jump(d, ist, dt.pkt_demux, raw_dts)) {
+                int jump_ret = discont_detect_jump(d, ist, dt.pkt_demux, raw_dts);
+                if (jump_ret == 2) {
+                    /* PTS wrap detected - apply correction to THIS packet
+                     * (future packets are corrected by the block above) */
+                    int64_t corr_tb = av_rescale_q(ds_wrap->pts_wrap_correction,
+                                                   AV_TIME_BASE_Q, ist->st->time_base);
+                    dt.pkt_demux->dts += corr_tb;
+                    if (dt.pkt_demux->pts != AV_NOPTS_VALUE)
+                        dt.pkt_demux->pts += corr_tb;
+                    raw_dts = av_rescale_q_rnd(dt.pkt_demux->dts,
+                                               ist->st->time_base, AV_TIME_BASE_Q,
+                                               AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+                } else if (jump_ret == 1) {
                     d->discont_buf.active = 1;
                     d->discont_buf.buffer_start_time = av_gettime_relative();
                     av_log(d, AV_LOG_VERBOSE,
