@@ -1780,9 +1780,18 @@ static int input_thread(void *arg)
          * This offset is calculated by the discontinuity buffer to maintain
          * continuous timestamps across source discontinuities. All packets
          * (not just flushed ones) need this adjustment after a discontinuity
-         * has been detected and handled. */
+         * has been detected and handled.
+         *
+         * Skip DATA streams (e.g. SCTE-35): they don't participate in
+         * discontinuity detection, so their DTS may be from a stale timeline.
+         * Applying the offset to a stale DTS creates a hugely wrong value
+         * that crashes the muxer with "non monotonically increasing dts".
+         * SCTE-35 is copy-through; consumers use section pts_time, not PES DTS. */
         if (d->discont_buf.cumulative_ts_offset != 0 && dt.pkt_demux->dts != AV_NOPTS_VALUE) {
             InputStream *ist_pkt = f->streams[dt.pkt_demux->stream_index];
+
+            if (ist_pkt->par->codec_type == AVMEDIA_TYPE_DATA)
+                goto skip_cumulative_offset;
             AVRational time_base = ist_pkt->st->time_base;
             int64_t pkt_offset = av_rescale_q(d->discont_buf.cumulative_ts_offset,
                                               AV_TIME_BASE_Q, time_base);
@@ -1801,6 +1810,7 @@ static int input_thread(void *arg)
              * ts_discontinuity_process doesn't double-adjust it */
             dt.pkt_demux->flags |= AV_PKT_FLAG_DISCONTINUITY;
         }
+skip_cumulative_offset:
 
         /* Drop non-keyframe video packets after discontinuity boundary.
          * The source's new content stream is joined mid-GOP, so non-IDR
