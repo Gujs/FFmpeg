@@ -3105,6 +3105,26 @@ static void reconfig_encoder(AVCodecContext *avctx, const AVFrame *frame)
         }
     }
 
+    /* Pool change: reset encoder to flush internal pipeline.
+     * NVENC's lookahead and B-frame reorder buffers may reference CUDA surfaces
+     * from the old frame pool.  resetEncoder=1 flushes all pending frames and
+     * resets internal state, ensuring no stale references remain.
+     * forceIDR=1 ensures the first frame after reset is an IDR.
+     *
+     * IMPORTANT: encodeConfig MUST be included (not NULL) when resetEncoder=1.
+     * Session 25 found that nvEncReconfigureEncoder crashes with NULL encodeConfig
+     * when resetEncoder is set. We pass the current config unchanged. */
+    if (ctx->pool_change_reset) {
+        params.resetEncoder = 1;
+        params.forceIDR = 1;
+        needs_encode_config = 1;
+        needs_reconfig = 1;
+        ctx->pool_change_reset = 0;
+
+        av_log(avctx, AV_LOG_INFO,
+               "[HW-PATCH] Pool change: resetting encoder (resetEncoder=1, forceIDR=1)\n");
+    }
+
     if (!needs_encode_config)
         params.reInitEncodeParams.encodeConfig = NULL;
 
@@ -3226,7 +3246,6 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
     NV_ENC_PIC_PARAMS pic_params = { 0 };
     pic_params.version = NV_ENC_PIC_PARAMS_VER;
 
-    int is_reconfig_idr = 0;
 
     if ((!ctx->cu_context && !ctx->d3d11_device) || !ctx->nvencoder)
         return AVERROR(EINVAL);
@@ -3234,27 +3253,23 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
     if (frame && frame->buf[0]) {
         /* Detect mid-stream frame pool changes (filter graph reconfiguration).
          *
-         * Two cases:
-         * (a) BENIGN pool swap: audio parameter change triggers full filter graph
-         *     rebuild, creating a new hw_frames_ctx with identical video parameters.
-         *     NVENC copies input to internal surfaces and DPB is NVENC-owned memory,
-         *     so a pool swap with same params is safe — just clean stale registrations.
-         * (b) GENUINE pool change: video format/resolution actually changed.
-         *     Force IDR to reset DPB and invalidate old references.
+         * When the filter graph rebuilds (audio param change, hwaccel change, etc.),
+         * hwupload_cuda creates a new hw_frames_ctx with new CUDA surface allocations.
+         * Even if the video parameters (format, width, height) are identical, the
+         * CUDA surface pointers differ.  NVENC's registered input resources reference
+         * the old CUDA surfaces.
          *
-         * Distinguish by comparing hw_frames_ctx parameters, not just pointers. */
+         * Always force IDR on any pool change to ensure a clean encoder reset.
+         * The cfr frame duplication path may consume the filter graph's reconfig
+         * keyframe on a duplicate of the PREVIOUS frame (old pool), leaving the
+         * first NEW-pool frame without FORCEIDR — causing P/B frames to reference
+         * stale DPB content.  Setting pool_change_force_idr guarantees the IDR
+         * happens exactly when the pool actually changes. */
         if ((avctx->pix_fmt == AV_PIX_FMT_CUDA || avctx->pix_fmt == AV_PIX_FMT_D3D11) &&
             frame->hw_frames_ctx && ctx->last_hw_frames_ctx != NULL &&
             frame->hw_frames_ctx->data != ctx->last_hw_frames_ctx) {
 
             AVHWFramesContext *new_hwfc = (AVHWFramesContext *)frame->hw_frames_ctx->data;
-            /* Compare video surface parameters only — NOT the device pointer.
-             * When filter graph rebuilds (e.g., from audio metadata changes),
-             * hwupload_cuda creates a new AVHWDeviceContext allocation even
-             * though it targets the same physical GPU.  Comparing device_ref->data
-             * would false-positive every rebuild as "genuine".
-             * NVENC is already bound to a specific GPU, so the device can't
-             * actually change mid-stream. */
             int params_match = (new_hwfc->sw_format == ctx->last_hw_sw_format &&
                                 new_hwfc->width     == ctx->last_hw_width     &&
                                 new_hwfc->height    == ctx->last_hw_height);
@@ -3262,23 +3277,41 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
             /* Always clean stale registrations from old pool */
             ctx->pool_change_cleanup = 1;
 
+            /* Always force IDR on pool change — even when video parameters match.
+             * This is essential because the reconfig keyframe from the filter graph
+             * may arrive on a cfr-duplicated frame (old pool), not on the first
+             * new-pool frame.  Without this, the new-pool frame would be encoded
+             * as P/B with stale DPB references. */
+            ctx->pool_change_force_idr = 1;
+
+            /* Also trigger a full encoder reset via nvEncReconfigureEncoder.
+             * FORCEIDR resets the DPB, but NVENC's internal pipeline (lookahead,
+             * B-frame reorder) may retain references to old-pool CUDA surfaces.
+             * resetEncoder=1 flushes pending frames and resets all internal state.
+             * This addresses permanent corruption that persists after pool changes.
+             *
+             * Previous sessions found issues with encoder reconfig for COLORSPACE
+             * changes (frames in pipeline encoded with wrong VUI params), but
+             * pool changes are different — we don't change any encoding parameters,
+             * just reset the pipeline to clear stale surface references. */
+            ctx->pool_change_reset = 1;
+
             if (params_match) {
-                /* Benign pool swap (e.g. audio-triggered filter graph rebuild).
-                 * Video parameters are identical - no DPB reset needed.
-                 * Just clean stale registrations and continue encoding. */
                 av_log(avctx, AV_LOG_INFO,
-                       "[HW-PATCH] Pool pointer changed (old=%p new=%p) but video "
-                       "parameters identical (%dx%d %s) - no DPB reset\n",
+                       "[HW-PATCH] Pool pointer changed (old=%p new=%p), video "
+                       "parameters identical (%dx%d %s) - forcing IDR for safety\n",
                        ctx->last_hw_frames_ctx, frame->hw_frames_ctx->data,
                        new_hwfc->width, new_hwfc->height,
                        av_get_pix_fmt_name(new_hwfc->sw_format));
             } else {
-                /* Genuine pool change - video parameters differ. Force IDR. */
                 av_log(avctx, AV_LOG_WARNING,
-                       "[HW-PATCH] Genuine frame pool change detected (old=%p new=%p) - "
-                       "forcing IDR to reset DPB\n",
-                       ctx->last_hw_frames_ctx, frame->hw_frames_ctx->data);
-                ctx->pool_change_force_idr = 1;
+                       "[HW-PATCH] Genuine frame pool change detected "
+                       "(old=%p new=%p, %dx%d %s -> %dx%d %s) - forcing IDR\n",
+                       ctx->last_hw_frames_ctx, frame->hw_frames_ctx->data,
+                       ctx->last_hw_width, ctx->last_hw_height,
+                       av_get_pix_fmt_name(ctx->last_hw_sw_format),
+                       new_hwfc->width, new_hwfc->height,
+                       av_get_pix_fmt_name(new_hwfc->sw_format));
             }
 
             /* Update pool tracking (pointer and video parameters) */
@@ -3358,12 +3391,12 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
 
             if (is_reconfig || ctx->pool_change_force_idr) {
                 pic_params.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
-                av_log(avctx, AV_LOG_VERBOSE,
+                av_log(avctx, AV_LOG_INFO,
                        "[HW-PATCH] %s at PTS=%"PRId64" -> FORCEIDR (DPB reset)\n",
-                       is_reconfig ? "Reconfiguration keyframe" : "Pool change safety net",
+                       is_reconfig ? "Reconfiguration keyframe" :
+                       ctx->pool_change_force_idr ? "Pool change" : "Unknown",
                        frame->pts);
                 ctx->pool_change_force_idr = 0;
-                is_reconfig_idr = 1;
             } else if (ctx->forced_idr >= 0 && frame->pict_type == AV_PICTURE_TYPE_I) {
                 pic_params.encodePicFlags =
                     ctx->forced_idr ? NV_ENC_PIC_FLAG_FORCEIDR : NV_ENC_PIC_FLAG_FORCEINTRA;
@@ -3450,20 +3483,11 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
 
     nv_status = p_nvenc->nvEncEncodePicture(ctx->nvencoder, &pic_params);
 
-    /* After encoding a reconfig IDR, invalidate all reference frames in NVENC's
-     * DPB to ensure it doesn't reference stale surfaces from the old pool. */
-    if (is_reconfig_idr && nv_status == NV_ENC_SUCCESS &&
-        p_nvenc->nvEncInvalidateRefFrames) {
-        NVENCSTATUS inv_st = p_nvenc->nvEncInvalidateRefFrames(
-            ctx->nvencoder, (uint64_t)frame->pts);
-        if (inv_st != NV_ENC_SUCCESS)
-            av_log(avctx, AV_LOG_WARNING,
-                   "[HW-PATCH] nvEncInvalidateRefFrames failed (status=%d)\n", inv_st);
-        else
-            av_log(avctx, AV_LOG_VERBOSE,
-                   "[HW-PATCH] Invalidated all ref frames before PTS=%"PRId64"\n",
-                   frame->pts);
-    }
+    /* Note: nvEncInvalidateRefFrames is NOT called here.
+     * It consistently fails with NV_ENC_ERR_UNSUPPORTED_PARAM (status=12)
+     * on CUDA encoding paths and is redundant with FORCEIDR, which already
+     * resets the DPB by definition (no frame after IDR can reference
+     * anything before it). */
 
     for (i = 0; i < sei_count; i++)
         av_freep(&(ctx->sei_data[i].payload));
