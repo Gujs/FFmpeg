@@ -339,8 +339,13 @@ typedef struct NvencContext
     int last_hw_width;
     int last_hw_height;
 
-    // Force FORCEIDR on next frame after genuine pool change (DPB reset safety net)
+    // Force FORCEIDR on next frame after pool change
     int pool_change_force_idr;
+
+    // Full encoder reset (nvEncReconfigureEncoder with resetEncoder=1) on pool change.
+    // Flushes NVENC pipeline and resets all internal state including lookahead/B-frame
+    // reorder buffers that may reference old-pool CUDA surfaces.
+    int pool_change_reset;
 
     // Clean up stale registrations from old pool (set on any pool change)
     int pool_change_cleanup;
