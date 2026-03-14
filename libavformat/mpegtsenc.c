@@ -2226,8 +2226,9 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
         }
     } else if (st->codecpar->codec_id == AV_CODEC_ID_AAC) {
         if (pkt->size < 2) {
-            av_log(s, AV_LOG_ERROR, "AAC packet too short\n");
-            return AVERROR_INVALIDDATA;
+            av_log(s, AV_LOG_WARNING, "AAC packet too short (%d bytes), skipping\n",
+                   pkt->size);
+            return 0;
         }
         if ((AV_RB16(pkt->data) & 0xfff0) != 0xfff0) {
             int ret;
