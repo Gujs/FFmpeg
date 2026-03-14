@@ -475,7 +475,7 @@ static int64_t trailing_dts(const Scheduler *sch)
             for (unsigned j = 0; j < mux->nb_streams; j++) {
                 const SchMuxStream *ms = &mux->streams[j];
 
-                if (ms->source_finished && !count_finished)
+                if (ms->source_finished)
                     continue;
                 if (ms->last_dts == AV_NOPTS_VALUE)
                     return AV_NOPTS_VALUE;
