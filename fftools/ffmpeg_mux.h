@@ -90,6 +90,12 @@ typedef struct MuxStream {
     int             force_fps;
 
     const char     *apad;
+
+    /* Deferred CC extraction: stored during create_streams(),
+     * processed by of_setup_cc_extraction() after decoders exist */
+    int             cc_extract_pending;
+    InputStream    *cc_extract_source_ist;
+    char           *cc_extract_lang;
 } MuxStream;
 
 typedef struct Muxer {
@@ -122,6 +128,11 @@ typedef struct Muxer {
 } Muxer;
 
 int mux_check_init(void *arg);
+
+static inline Muxer *mux_from_of(OutputFile *of)
+{
+    return (Muxer*)of;
+}
 
 static inline MuxStream *ms_from_ost(OutputStream *ost)
 {
