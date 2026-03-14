@@ -560,16 +560,28 @@ static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
     /* Classify all packets */
     {
         int old_count = 0, new_count = 0;
+        int old_vid = 0, old_aud = 0, new_vid = 0, new_aud = 0;
         for (int i = 0; i < buf->nb_packets; i++) {
             DiscontinuityPacket *dp = buf->packets[i];
             if (dp->timeline < 0)
                 dp->timeline = discont_classify_timeline(buf, dp->raw_dts);
-            if (dp->timeline == 0) old_count++;
-            else if (dp->timeline == 1) new_count++;
+            if (dp->timeline == 0) {
+                old_count++;
+                if (dp->stream_idx < f->nb_streams) {
+                    if (f->streams[dp->stream_idx]->par->codec_type == AVMEDIA_TYPE_VIDEO) old_vid++;
+                    else if (f->streams[dp->stream_idx]->par->codec_type == AVMEDIA_TYPE_AUDIO) old_aud++;
+                }
+            } else if (dp->timeline == 1) {
+                new_count++;
+                if (dp->stream_idx < f->nb_streams) {
+                    if (f->streams[dp->stream_idx]->par->codec_type == AVMEDIA_TYPE_VIDEO) new_vid++;
+                    else if (f->streams[dp->stream_idx]->par->codec_type == AVMEDIA_TYPE_AUDIO) new_aud++;
+                }
+            }
         }
-        av_log(d, AV_LOG_VERBOSE,
-               "[DISCONT-BUF] Flushing %d buffered packets (old=%d, new=%d, delta=%.3fs)\n",
-               buf->nb_packets, old_count, new_count,
+        av_log(d, AV_LOG_INFO,
+               "[DISCONT-BUF] Flushing %d packets: old=%d (v:%d a:%d) new=%d (v:%d a:%d) delta=%.3fs\n",
+               buf->nb_packets, old_count, old_vid, old_aud, new_count, new_vid, new_aud,
                (double)buf->timeline_delta / AV_TIME_BASE);
     }
 
@@ -613,7 +625,7 @@ static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
 
             if (is_stream_start && buf->old_timeline_base < AV_TIME_BASE) {
                 /* True stream start - no rebasing needed */
-                av_log(d, AV_LOG_VERBOSE, "[DISCONT-BUF] Stream start, keeping all new (%d), no rebase\n", new_count);
+                av_log(d, AV_LOG_INFO, "[DISCONT-BUF] Stream start, keeping all new (%d), no rebase\n", new_count);
             } else {
                 /* Mid-stream jump - calculate offset to continue from last output position
                  *
@@ -630,8 +642,8 @@ static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
                 }
                 buf->cumulative_ts_offset = rebase_offset;  /* SET, not increment */
 
-                av_log(d, AV_LOG_VERBOSE, "[DISCONT-BUF] %s jump (delta=%.3fs), keeping new (%d), "
-                       "cumulative=%.3fs (last_sent=%.3fs, new_base=%.3fs)\n",
+                av_log(d, AV_LOG_INFO, "[DISCONT-BUF] %s jump (delta=%.3fs), keeping NEW (%d pkts), "
+                       "cumulative_offset=%.3fs (last_sent=%.3fs, new_base=%.3fs)\n",
                        buf->timeline_delta > 0 ? "Forward" : "Backward",
                        (double)buf->timeline_delta / AV_TIME_BASE, new_count,
                        (double)buf->cumulative_ts_offset / AV_TIME_BASE,
@@ -641,7 +653,7 @@ static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
         } else if (new_count == 0 && old_count > 0) {
             keep_timeline = 0;  /* No new packets, keep old */
             /* Old packets already have cumulative offset applied via last_sent_dts tracking */
-            av_log(d, AV_LOG_VERBOSE, "[DISCONT-BUF] No new-timeline packets, keeping all old (%d)\n", old_count);
+            av_log(d, AV_LOG_INFO, "[DISCONT-BUF] No new-timeline packets, keeping all OLD (%d)\n", old_count);
         } else {
             /* Both timelines have packets - always keep NEW.
              *
@@ -660,8 +672,8 @@ static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
             }
             buf->cumulative_ts_offset = rebase_offset;  /* SET, not increment */
 
-            av_log(d, AV_LOG_VERBOSE, "[DISCONT-BUF] Jump %s (delta=%.3fs), keeping new (old=%d, new=%d), "
-                   "cumulative=%.3fs\n",
+            av_log(d, AV_LOG_INFO, "[DISCONT-BUF] Jump %s (delta=%.3fs), keeping NEW (old=%d, new=%d), "
+                   "cumulative_offset=%.3fs\n",
                    buf->timeline_delta > 0 ? "forward" : "backward",
                    (double)buf->timeline_delta / AV_TIME_BASE,
                    old_count, new_count,
@@ -678,8 +690,8 @@ static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
                 if (ist_s->par->codec_type == AVMEDIA_TYPE_VIDEO) {
                     DemuxStream *ds_vid = ds_from_ist(ist_s);
                     ds_vid->discont_drop_until_keyframe = 1;
-                    av_log(d, AV_LOG_VERBOSE,
-                           "[DISCONT-BUF] Dropping non-keyframe video packets on stream %d until keyframe\n", s);
+                    av_log(d, AV_LOG_INFO,
+                           "[DISCONT-BUF] Will drop non-keyframe video on stream %d until IDR\n", s);
                 }
             }
         }
@@ -711,7 +723,7 @@ static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
                     ist_chk->par->codec_type == AVMEDIA_TYPE_VIDEO) {
                     if (dp->pkt->flags & AV_PKT_FLAG_KEY) {
                         ds_chk->discont_drop_until_keyframe = 0;
-                        av_log(d, AV_LOG_VERBOSE,
+                        av_log(d, AV_LOG_INFO,
                                "[DISCONT-BUF] Keyframe found in buffer for stream %d, resuming video\n",
                                dp->stream_idx);
                     } else {
@@ -810,7 +822,7 @@ static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
             av_freep(&buf->packets[i]);
         }
 
-        av_log(d, AV_LOG_VERBOSE, "[DISCONT-BUF] Flush complete: %d sent, %d discarded\n",
+        av_log(d, AV_LOG_INFO, "[DISCONT-BUF] Flush complete: %d sent, %d discarded\n",
                sent_count, discarded_count);
     }
 
@@ -844,7 +856,7 @@ static void discont_diag_log(Demuxer *d)
         d->diag.pkts_dropped_kf > 0 ||
         d->diag.eagain_count > 10) {
 
-        av_log(d, AV_LOG_VERBOSE,
+        av_log(d, AV_LOG_INFO,
                "[DISCONT-DIAG] 1s: read=%d discard=%d buffered=%d "
                "flushed=%d drop_kf=%d corrupt=%d sent=%d "
                "(vid=%d aud=%d) eagain=%d\n",
@@ -934,8 +946,8 @@ static int discont_detect_jump(Demuxer *d, InputStream *ist, AVPacket *pkt,
             buf->timeline_delta = raw_dts - ds->last_raw_dts;
             buf->timeline_established = 1;
 
-            av_log(d, AV_LOG_VERBOSE,
-                   "[DISCONT-BUF] Established timelines: old=%.3fs, new=%.3fs, delta=%.3fs\n",
+            av_log(d, AV_LOG_INFO,
+                   "[DISCONT-BUF] Timelines: old=%.3fs, new=%.3fs, delta=%.3fs\n",
                    (double)buf->old_timeline_base / AV_TIME_BASE,
                    (double)buf->new_timeline_base / AV_TIME_BASE,
                    (double)buf->timeline_delta / AV_TIME_BASE);
@@ -1647,9 +1659,12 @@ static int input_thread(void *arg)
                 } else if (jump_ret == 1) {
                     d->discont_buf.active = 1;
                     d->discont_buf.buffer_start_time = av_gettime_relative();
-                    av_log(d, AV_LOG_VERBOSE,
-                           "[DISCONT-BUF] Starting packet buffering (%d stream capacity)\n",
-                           d->discont_buf.nb_streams);
+                    av_log(d, AV_LOG_INFO,
+                           "[DISCONT-BUF] Started buffering on stream %d jump (%.3fs → %.3fs, delta=%.3fs)\n",
+                           ist->index,
+                           (double)ds_wrap->last_raw_dts / AV_TIME_BASE,
+                           (double)raw_dts / AV_TIME_BASE,
+                           (double)(raw_dts - ds_wrap->last_raw_dts) / AV_TIME_BASE);
                 }
             }
 
@@ -1691,11 +1706,30 @@ static int input_thread(void *arg)
                     discont_buffer_timeout(&d->discont_buf, d->discont_timeout_us)) {
 
                     if (discont_buffer_timeout(&d->discont_buf, d->discont_timeout_us)) {
+                        /* Log which streams did NOT transition */
+                        char not_transitioned[256] = "";
+                        int pos = 0;
+                        for (int s = 0; s < f->nb_streams && s < d->discont_buf.nb_streams; s++) {
+                            InputStream *ist_s = f->streams[s];
+                            DemuxStream *ds_s = ds_from_ist(ist_s);
+                            if (ds_s->discard || ds_s->finished) continue;
+                            if (ist_s->par->codec_type != AVMEDIA_TYPE_VIDEO &&
+                                ist_s->par->codec_type != AVMEDIA_TYPE_AUDIO) continue;
+                            if (!d->discont_buf.stream_transitioned[s]) {
+                                pos += snprintf(not_transitioned + pos, sizeof(not_transitioned) - pos,
+                                                " s%d(%s)", s,
+                                                ist_s->par->codec_type == AVMEDIA_TYPE_VIDEO ? "vid" : "aud");
+                            }
+                        }
                         av_log(d, AV_LOG_WARNING,
-                               "[DISCONT-BUF] Timeout reached, flushing buffer\n");
+                               "[DISCONT-BUF] Timeout after %dms, flushing %d pkts (not transitioned:%s)\n",
+                               (int)((av_gettime_relative() - d->discont_buf.buffer_start_time) / 1000),
+                               d->discont_buf.nb_packets, not_transitioned);
                     } else {
-                        av_log(d, AV_LOG_VERBOSE,
-                               "[DISCONT-BUF] All streams transitioned, flushing buffer\n");
+                        av_log(d, AV_LOG_INFO,
+                               "[DISCONT-BUF] All streams transitioned after %dms, flushing %d pkts\n",
+                               (int)((av_gettime_relative() - d->discont_buf.buffer_start_time) / 1000),
+                               d->discont_buf.nb_packets);
                     }
 
                     ret = discont_buffer_flush(d, &dt);
@@ -1786,7 +1820,7 @@ skip_cumulative_offset:
             ds->ist.par->codec_type == AVMEDIA_TYPE_VIDEO) {
             if (dt.pkt_demux->flags & AV_PKT_FLAG_KEY) {
                 ds->discont_drop_until_keyframe = 0;
-                av_log(&ds->ist, AV_LOG_VERBOSE,
+                av_log(&ds->ist, AV_LOG_INFO,
                        "[DISCONT-BUF] Keyframe arrived on stream %d, resuming video decode\n",
                        dt.pkt_demux->stream_index);
             } else {
