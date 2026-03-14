@@ -269,6 +269,238 @@ typedef struct MpegTSWriteStream {
     DVBAC3Descriptor *dvb_ac3_desc;
 } MpegTSWriteStream;
 
+/* Parse SCTE-35 splice_info_section to find splice_time location and value.
+ * Returns the splice_time in 90kHz ticks, or AV_NOPTS_VALUE if not found.
+ * If splice_time_offset is not NULL, stores the byte offset of splice_time. */
+static int64_t scte35_get_splice_time(const uint8_t *buf, int len, int *splice_time_offset)
+{
+    int section_length, splice_command_type;
+    int offset;
+
+    if (splice_time_offset)
+        *splice_time_offset = -1;
+
+    if (len < 15 || buf[0] != 0xFC) /* table_id must be 0xFC */
+        return AV_NOPTS_VALUE;
+
+    section_length = ((buf[1] & 0x0F) << 8) | buf[2];
+    if (section_length + 3 > len)
+        return AV_NOPTS_VALUE;
+
+    /* Skip to splice_command_type (offset 13) */
+    splice_command_type = buf[13];
+
+    if (splice_command_type != 0x05) /* Only handle splice_insert */
+        return AV_NOPTS_VALUE;
+
+    /* Parse splice_insert - starts at offset 14 */
+    offset = 14;
+    if (offset + 5 > len)
+        return AV_NOPTS_VALUE;
+
+    /* Skip splice_event_id (4 bytes) */
+    offset += 4;
+
+    /* splice_event_cancel_indicator */
+    if (buf[offset] & 0x80)
+        return AV_NOPTS_VALUE; /* Cancelled, no splice_time */
+
+    offset++;
+    if (offset >= len)
+        return AV_NOPTS_VALUE;
+
+    /* Check flags: out_of_network(1), program_splice_flag(1), duration_flag(1), splice_immediate_flag(1) */
+    int program_splice_flag = (buf[offset] >> 6) & 1;
+    int splice_immediate_flag = (buf[offset] >> 4) & 1;
+
+    if (!program_splice_flag || splice_immediate_flag)
+        return AV_NOPTS_VALUE; /* No splice_time in these cases */
+
+    offset++;
+    if (offset >= len)
+        return AV_NOPTS_VALUE;
+
+    /* splice_time() - check time_specified_flag */
+    if (!(buf[offset] & 0x80))
+        return AV_NOPTS_VALUE; /* time_specified_flag = 0 */
+
+    /* Extract 33-bit pts_time */
+    if (offset + 5 > len)
+        return AV_NOPTS_VALUE;
+
+    if (splice_time_offset)
+        *splice_time_offset = offset;
+
+    int64_t pts_time = ((int64_t)(buf[offset] & 0x01) << 32) |
+                       ((int64_t)buf[offset + 1] << 24) |
+                       ((int64_t)buf[offset + 2] << 16) |
+                       ((int64_t)buf[offset + 3] << 8) |
+                       buf[offset + 4];
+
+    return pts_time;
+}
+
+/* Adjust SCTE-35 splice_time to compensate for timestamp rebasing.
+ *
+ * When transcoding with -avoid_negative_ts or +genpts, output timestamps are rebased
+ * but the splice_time inside SCTE-35 messages is not adjusted. This function detects
+ * timeline mismatches and adjusts splice_time accordingly.
+ *
+ * Approach: Compare splice_time to packet PTS. If the difference (preroll) is within
+ * a reasonable range (0-60 seconds), the timelines match and no adjustment is needed.
+ * If preroll is outside this range, there's a timeline mismatch (e.g., input started
+ * at 12 hours, output rebased to 0), and we set splice_time to pkt_pts + 8 seconds.
+ *
+ * Parameters:
+ *   s: format context for logging
+ *   buf: SCTE-35 section data (will be modified in place)
+ *   len: length of section data
+ *   pkt_pts: the packet PTS in 90kHz (already rebased by FFmpeg)
+ *
+ * Returns 0 on success, negative on error.
+ */
+static int scte35_adjust_pts(AVFormatContext *s, uint8_t *buf, int len, int64_t pkt_pts)
+{
+    int64_t splice_time, new_splice_time, preroll;
+    int splice_time_offset;
+    uint32_t crc;
+
+    /* Maximum reasonable preroll is 60 seconds (typical is 5-30 seconds) */
+    const int64_t MAX_PREROLL = 60 * 90000;
+    /* Default preroll when we can't determine the original (8 seconds is common) */
+    const int64_t DEFAULT_PREROLL = 8 * 90000;
+    /* 33-bit PTS max value */
+    const int64_t PTS_33BIT_MAX = 0x1FFFFFFFFLL;
+
+    if (len < 17) /* Minimum section with splice_time and CRC */
+        return 0;
+
+    if (pkt_pts == AV_NOPTS_VALUE)
+        return 0; /* Need packet PTS to calculate correct timing */
+
+    /* Get splice_time and its offset in the section */
+    splice_time = scte35_get_splice_time(buf, len, &splice_time_offset);
+    if (splice_time == AV_NOPTS_VALUE || splice_time_offset < 0)
+        return 0; /* No splice_time to adjust */
+
+    /* Verify we can safely write back to the buffer */
+    if (splice_time_offset + 5 > len)
+        return -1;
+
+    /* Calculate observed preroll (may be huge if timelines don't match) */
+    preroll = splice_time - pkt_pts;
+
+    /* Handle 33-bit PTS wraparound and negative preroll:
+     * - Small negative preroll (-60s to 0): valid "return from ad" scenario
+     * - Large negative preroll (< -60s): likely 33-bit wraparound, add 2^33
+     * - Positive preroll (0 to 60s): normal case
+     * - Large positive preroll (> 60s): timeline mismatch */
+    if (preroll < -MAX_PREROLL) {
+        /* Large negative value - likely 33-bit wraparound */
+        preroll += PTS_33BIT_MAX + 1;
+    }
+
+    /* Check if preroll is reasonable (-60 to +60 seconds) */
+    if (preroll >= -MAX_PREROLL && preroll <= MAX_PREROLL) {
+        /* Timeline matches, no adjustment needed */
+        return 0;
+    }
+
+    /* Timeline mismatch detected: splice_time is in a different timeline
+     * than pkt_pts (e.g., input stream started at 12 hours, output rebased to 0).
+     *
+     * We can't reliably recover the original preroll because we don't have
+     * access to the input packet PTS before rebasing. Use a default preroll
+     * that's typical for SCTE-35 (8 seconds).
+     *
+     * This ensures Metropolitan and other ad insertion systems can detect
+     * the splice point at a reasonable time relative to the current video. */
+    new_splice_time = pkt_pts + DEFAULT_PREROLL;
+
+    /* Ensure new_splice_time fits in 33 bits */
+    new_splice_time &= 0x1FFFFFFFFULL;
+
+    av_log(s, AV_LOG_VERBOSE, "SCTE-35: Timeline mismatch detected (preroll %.3fs too large). "
+           "Adjusting splice_time %"PRId64" (%.3fs) -> %"PRId64" (%.3fs), using %.1fs preroll\n",
+           preroll / 90000.0,
+           splice_time, splice_time / 90000.0,
+           new_splice_time, new_splice_time / 90000.0,
+           DEFAULT_PREROLL / 90000.0);
+
+    /* Write new splice_time back (33 bits at splice_time_offset) */
+    buf[splice_time_offset] = (buf[splice_time_offset] & 0xFE) | ((new_splice_time >> 32) & 0x01);
+    buf[splice_time_offset + 1] = (new_splice_time >> 24) & 0xFF;
+    buf[splice_time_offset + 2] = (new_splice_time >> 16) & 0xFF;
+    buf[splice_time_offset + 3] = (new_splice_time >> 8) & 0xFF;
+    buf[splice_time_offset + 4] = new_splice_time & 0xFF;
+
+    /* Recalculate CRC32 (last 4 bytes of section)
+     * Use the same CRC calculation as mpegts_write_section1() */
+    crc = av_bswap32(av_crc(av_crc_get_table(AV_CRC_32_IEEE), -1, buf, len - 4));
+    buf[len - 4] = (crc >> 24) & 0xff;
+    buf[len - 3] = (crc >> 16) & 0xff;
+    buf[len - 2] = (crc >>  8) & 0xff;
+    buf[len - 1] = (crc      ) & 0xff;
+
+    return 0;
+}
+
+/* Write SCTE-35 section data as TS packets.
+ * If pkt_pts is provided and timestamp rebasing is detected, the pts_adjustment
+ * field is updated to maintain correct splice timing relative to video. */
+static void mpegts_write_scte35_section(AVFormatContext *s, AVStream *st,
+                                        const uint8_t *buf, int len, int64_t pkt_pts)
+{
+    MpegTSWriteStream *ts_st = st->priv_data;
+    MpegTSWrite *ts = s->priv_data;
+    uint8_t packet[TS_PACKET_SIZE];
+    uint8_t section_buf[SECTION_LENGTH + 3]; /* Max section size */
+    const uint8_t *write_buf;
+    uint8_t *q;
+    int first = 1;
+    int len1, left;
+
+    /* Make a copy of the section data so we can modify splice_time if needed */
+    if (len <= (int)sizeof(section_buf)) {
+        memcpy(section_buf, buf, len);
+        scte35_adjust_pts(s, section_buf, len, pkt_pts);
+        write_buf = section_buf;
+    } else {
+        av_log(s, AV_LOG_WARNING, "SCTE-35: Section too large (%d bytes) for timing adjustment\n", len);
+        write_buf = buf;
+    }
+
+    while (len > 0) {
+        q = packet;
+        *q++ = SYNC_BYTE;
+        *q++ = (ts_st->pid >> 8) | (first ? 0x40 : 0x00);
+        *q++ = ts_st->pid;
+        ts_st->cc = (ts_st->cc + 1) & 0xf;
+        *q++ = 0x10 | ts_st->cc;
+
+        if (first)
+            *q++ = 0; /* pointer_field: section starts immediately */
+
+        len1 = TS_PACKET_SIZE - (q - packet);
+        if (len1 > len)
+            len1 = len;
+        memcpy(q, write_buf, len1);
+        q += len1;
+
+        /* Pad with stuffing bytes */
+        left = TS_PACKET_SIZE - (q - packet);
+        if (left > 0)
+            memset(q, STUFFING_BYTE, left);
+
+        avio_write(s->pb, packet, TS_PACKET_SIZE);
+        ts->total_size += TS_PACKET_SIZE;
+
+        write_buf += len1;
+        len -= len1;
+        first = 0;
+    }
+}
+
 static void mpegts_write_pat(AVFormatContext *s)
 {
     MpegTSWrite *ts = s->priv_data;
@@ -444,6 +676,9 @@ static int get_dvb_stream_type(AVFormatContext *s, AVStream *st)
             stream_type = STREAM_TYPE_PRIVATE_DATA;
         }
         break;
+    case AV_CODEC_ID_SCTE_35:
+        stream_type = STREAM_TYPE_SCTE_DATA_SCTE_35;
+        break;
     default:
         av_log_once(s, AV_LOG_WARNING, AV_LOG_DEBUG, &ts_st->data_st_warning,
                     "Stream %d, codec %s, is muxed as a private data stream "
@@ -529,6 +764,15 @@ static int mpegts_write_pmt(AVFormatContext *s, MpegTSService *service)
         put16(&q, 0x0fff);  // CA_System_ID
         *q++ = 0xfc;        // private_data_byte
         *q++ = 0xfc;        // private_data_byte
+    }
+
+    /* Add CUEI registration descriptor if any stream is SCTE-35 */
+    for (i = 0; i < s->nb_streams; i++) {
+        AVStream *st = s->streams[i];
+        if (st->codecpar->codec_id == AV_CODEC_ID_SCTE_35) {
+            put_registration_descriptor(&q, MKTAG('C', 'U', 'E', 'I'));
+            break;
+        }
     }
 
     val = 0xf000 | (q - program_info_length_ptr - 2);
@@ -828,6 +1072,8 @@ static int mpegts_write_pmt(AVFormatContext *s, MpegTSService *service)
                 putbuf(&q, tag, strlen(tag));
                 *q++ = 0;            /* metadata service ID */
                 *q++ = 0xF;          /* metadata_locator_record_flag|MPEG_carriage_flags|reserved */
+            } else if (codec_id == AV_CODEC_ID_SCTE_35) {
+                put_registration_descriptor(&q, MKTAG('C', 'U', 'E', 'I'));
             }
             break;
         }
@@ -1886,6 +2132,15 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
     if (stream_id_p)
         stream_id = stream_id_p[0];
 
+    /* SCTE-35 must be written as section data, not PES.
+     * The splice_info_section data from the demuxer already has valid CRC.
+     * Pass packet PTS to allow adjusting pts_adjustment when timestamps are rebased. */
+    if (st->codecpar->codec_id == AV_CODEC_ID_SCTE_35) {
+        if (size > 0)
+            mpegts_write_scte35_section(s, st, buf, size, pts);
+        return 0;
+    }
+
     if (!ts->first_dts_checked && dts != AV_NOPTS_VALUE) {
         ts->first_pcr += dts * SYSTEM_CLOCK_FREQUENCY_DIVISOR;
         ts->first_dts_checked = 1;
@@ -2200,6 +2455,31 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
         mpegts_write_pes(s, st, buf, size, pts, dts,
                          pkt->flags & AV_PKT_FLAG_KEY, stream_id);
         return 0;
+    }
+
+    /* Flush aggregated audio if timestamp is irregular (discontinuity recovery).
+     * This prevents PES packets with computed frame timestamps that overlap the next PES. */
+    if (ts_st->payload_size && ts_st->payload_dts != AV_NOPTS_VALUE &&
+        dts != AV_NOPTS_VALUE && st->codecpar->sample_rate > 0 &&
+        st->codecpar->frame_size > 0) {
+        int64_t frame_dur = av_rescale(st->codecpar->frame_size, 90000,
+                                       st->codecpar->sample_rate);
+        int avg_frame_bytes = (st->codecpar->bit_rate > 0)
+            ? (int)av_rescale(st->codecpar->bit_rate, st->codecpar->frame_size,
+                              8LL * st->codecpar->sample_rate)
+            : 0;
+        int frame_count = (avg_frame_bytes > 0)
+            ? ts_st->payload_size / avg_frame_bytes : 1;
+        if (frame_count < 1) frame_count = 1;
+        int64_t expected_next_dts = ts_st->payload_dts + frame_count * frame_dur;
+        int64_t delta = dts - expected_next_dts;
+        if (FFABS(delta) > frame_dur / 4) {
+            mpegts_write_pes(s, st, ts_st->payload, ts_st->payload_size,
+                             ts_st->payload_pts, ts_st->payload_dts,
+                             ts_st->payload_flags & AV_PKT_FLAG_KEY, stream_id);
+            ts_st->payload_size = 0;
+            ts_st->opus_queued_samples = 0;
+        }
     }
 
     if (ts_st->payload_size && (ts_st->payload_size + size > ts->pes_payload_size ||

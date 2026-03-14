@@ -292,6 +292,20 @@ void sch_mux_stream_buffering(Scheduler *sch, unsigned mux_idx, unsigned stream_
 int sch_mux_stream_ready(Scheduler *sch, unsigned mux_idx, unsigned stream_idx);
 
 /**
+ * Mark a muxed stream as sparse (having infrequent packets).
+ *
+ * Sparse streams like subtitles or data streams (SCTE-35, teletext) may not
+ * have packets for extended periods. This flag prevents them from blocking
+ * timing calculations used for progress reporting.
+ *
+ * @param mux_idx index previously returned by sch_add_mux()
+ * @param stream_idx index previously returned by sch_add_mux_stream()
+ * @param sparse 1 to mark as sparse, 0 to mark as regular
+ */
+void sch_mux_stream_set_sparse(Scheduler *sch, unsigned mux_idx,
+                               unsigned stream_idx, int sparse);
+
+/**
  * Set the file path for the SDP.
  *
  * The SDP is written when either of the following is true:
