@@ -275,6 +275,15 @@ av_cold int swr_init(struct SwrContext *s){
     } else
         s->firstpts = AV_NOPTS_VALUE;
 
+    if (s->jump_comp > 0) {
+        if (!s->async) {
+            av_log(s, AV_LOG_WARNING, "jump_comp requires async, enabling async=1\n");
+            s->async = 1;
+        }
+        s->jump_comp_prev_delta = 0;
+        s->jump_comp_initialized = 0;
+    }
+
     if (s->async) {
         if (s->min_compensation >= FLT_MAX/2)
             s->min_compensation = 0.001;
@@ -935,6 +944,35 @@ int64_t swr_next_pts(struct SwrContext *s, int64_t pts){
 
     if(s->min_compensation >= FLT_MAX) {
         return (s->outpts = pts - swr_get_delay(s, s->in_sample_rate * (int64_t)s->out_sample_rate));
+    } else if (s->jump_comp > 0) {
+        int64_t delta = pts - swr_get_delay(s, s->in_sample_rate * (int64_t)s->out_sample_rate) - s->outpts + s->drop_output*(int64_t)s->in_sample_rate;
+
+        if (!s->jump_comp_initialized) {
+            s->jump_comp_prev_delta = delta;
+            s->jump_comp_initialized = 1;
+            av_log(s, AV_LOG_VERBOSE, "jump_comp: baseline delta=%.3f\n",
+                   delta / (double)(s->in_sample_rate * (int64_t)s->out_sample_rate));
+            return s->outpts;
+        }
+
+        {
+            int64_t jump = delta - s->jump_comp_prev_delta;
+            double fjump = jump / (double)(s->in_sample_rate * (int64_t)s->out_sample_rate);
+
+            if (fabs(fjump) > s->jump_comp) {
+                int ret;
+                av_log(s, AV_LOG_INFO, "jump_comp: detected jump of %.3fs, compensating\n", fjump);
+                if (jump > 0) ret = swr_inject_silence(s,  jump / s->out_sample_rate);
+                else          ret = swr_drop_output   (s, -jump / s->in_sample_rate);
+                if (ret < 0)
+                    av_log(s, AV_LOG_ERROR, "jump_comp: failed to compensate for jump of %.3fs\n", fjump);
+                /* recompute delta after compensation to establish new baseline */
+                delta = pts - swr_get_delay(s, s->in_sample_rate * (int64_t)s->out_sample_rate) - s->outpts + s->drop_output*(int64_t)s->in_sample_rate;
+            }
+            s->jump_comp_prev_delta = delta;
+        }
+
+        return s->outpts;
     } else {
         int64_t delta = pts - swr_get_delay(s, s->in_sample_rate * (int64_t)s->out_sample_rate) - s->outpts + s->drop_output*(int64_t)s->in_sample_rate;
         double fdelta = delta /(double)(s->in_sample_rate * (int64_t)s->out_sample_rate);
