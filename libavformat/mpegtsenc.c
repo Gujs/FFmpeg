@@ -2230,6 +2230,11 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
                    pkt->size);
             return 0;
         }
+        if (pkt->size > 16383) {
+            av_log(s, AV_LOG_WARNING, "AAC packet too large (%d bytes, max 16383), skipping\n",
+                   pkt->size);
+            return 0;
+        }
         if ((AV_RB16(pkt->data) & 0xfff0) != 0xfff0) {
             int ret;
             AVPacket *pkt2 = ts->pkt;
@@ -2251,7 +2256,9 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
                 ret = av_write_frame(ts_st->amux, pkt2);
                 if (ret < 0) {
                     ffio_free_dyn_buf(&ts_st->amux->pb);
-                    return ret;
+                    av_log(s, AV_LOG_WARNING, "AAC ADTS framing failed (%d bytes), skipping\n",
+                           pkt->size);
+                    return 0;
                 }
                 size            = avio_close_dyn_buf(ts_st->amux->pb, &data);
                 ts_st->amux->pb = NULL;
