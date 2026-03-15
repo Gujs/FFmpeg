@@ -107,6 +107,8 @@ static const AVOption options[]={
                                                         , OFFSET(max_soft_compensation),AV_OPT_TYPE_FLOAT ,{.dbl=0                     }, INT_MIN, INT_MAX   , PARAM },
 {"async"                , "simplified 1 parameter audio timestamp matching, 0(disabled), 1(filling and trimming), >1(maximum stretch/squeeze in samples per second)"
                                                         , OFFSET(async)          , AV_OPT_TYPE_FLOAT ,{.dbl=0                     }, INT_MIN, INT_MAX   , PARAM },
+{"jump_comp"            , "compensate only for sudden timestamp jumps larger than threshold (in seconds), ignoring gradual drift (requires async)"
+                                                        , OFFSET(jump_comp)      , AV_OPT_TYPE_FLOAT ,{.dbl=0                     }, 0      , INT_MAX   , PARAM },
 {"first_pts"            , "Assume the first pts should be this value (in samples)."
                                                         , OFFSET(firstpts_in_samples), AV_OPT_TYPE_INT64 ,{.i64=AV_NOPTS_VALUE    }, INT64_MIN,INT64_MAX, PARAM },
 
