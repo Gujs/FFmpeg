@@ -280,6 +280,12 @@ av_cold int swr_init(struct SwrContext *s){
             av_log(s, AV_LOG_WARNING, "jump_comp requires async, enabling async=1\n");
             s->async = 1;
         }
+        /* enable gentle drift correction: correct up to 0.01% rate error
+         * over 1-second windows, only when delta exceeds 10ms */
+        if (!s->max_soft_compensation)
+            s->max_soft_compensation = 0.0001;
+        if (!s->soft_compensation_duration)
+            s->soft_compensation_duration = 1;
         s->jump_comp_prev_delta = 0;
         s->jump_comp_initialized = 0;
     }
@@ -958,16 +964,26 @@ int64_t swr_next_pts(struct SwrContext *s, int64_t pts){
         {
             int64_t jump = delta - s->jump_comp_prev_delta;
             double fjump = jump / (double)(s->in_sample_rate * (int64_t)s->out_sample_rate);
+            double fdelta = delta / (double)(s->in_sample_rate * (int64_t)s->out_sample_rate);
 
             if (fabs(fjump) > s->jump_comp) {
                 int ret;
-                av_log(s, AV_LOG_INFO, "jump_comp: detected jump of %.3fs, compensating\n", fjump);
+                av_log(s, AV_LOG_INFO, "jump_comp: detected jump of %.3fs, compensating (delta=%.3fs)\n", fjump, fdelta);
                 if (jump > 0) ret = swr_inject_silence(s,  jump / s->out_sample_rate);
                 else          ret = swr_drop_output   (s, -jump / s->in_sample_rate);
                 if (ret < 0)
                     av_log(s, AV_LOG_ERROR, "jump_comp: failed to compensate for jump of %.3fs\n", fjump);
                 /* recompute delta after compensation to establish new baseline */
                 delta = pts - swr_get_delay(s, s->in_sample_rate * (int64_t)s->out_sample_rate) - s->outpts + s->drop_output*(int64_t)s->in_sample_rate;
+                fdelta = delta / (double)(s->in_sample_rate * (int64_t)s->out_sample_rate);
+            } else if (s->soft_compensation_duration && fabs(fdelta) > s->min_compensation) {
+                /* gradual drift correction: gently push delta back toward zero
+                 * without tracking the source clock */
+                double max_soft = s->max_soft_compensation / (s->max_soft_compensation < 0 ? -s->in_sample_rate : 1);
+                int duration = s->out_sample_rate * s->soft_compensation_duration;
+                int comp = av_clipf(fdelta, -max_soft, max_soft) * duration;
+                if (comp)
+                    swr_set_compensation(s, comp, duration);
             }
             s->jump_comp_prev_delta = delta;
         }
