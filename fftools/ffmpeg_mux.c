@@ -237,12 +237,8 @@ static int write_packet(Muxer *mux, OutputStream *ost, AVPacket *pkt)
         int64_t before_write = av_gettime_relative();
         ret = av_interleaved_write_frame(s, pkt);
         int64_t write_dur = av_gettime_relative() - before_write;
-        if (write_dur > 1000000) { /* >1s: WARNING */
+        if (write_dur > 1000000) { /* >1s */
             av_log(ost, AV_LOG_WARNING,
-                   "[WRITE-STALL] av_interleaved_write_frame blocked for %.3fs\n",
-                   write_dur / 1000000.0);
-        } else if (write_dur > 500000) { /* >500ms: INFO */
-            av_log(ost, AV_LOG_INFO,
                    "[WRITE-STALL] av_interleaved_write_frame blocked for %.3fs\n",
                    write_dur / 1000000.0);
         }
@@ -470,13 +466,9 @@ int muxer_thread(void *arg)
             int64_t now = av_gettime_relative();
             int64_t gap_us = now - last_write_wc_video;
 
-            /* Wall-clock gap: tiered thresholds */
-            if (gap_us > 1000000) { /* >1s: WARNING */
+            /* Wall-clock gap: >1s */
+            if (gap_us > 1000000) {
                 av_log(mux, AV_LOG_WARNING,
-                       "[OUTPUT-GAP] No video packets for %.3fs (stream %d)\n",
-                       gap_us / 1000000.0, ost->index);
-            } else if (gap_us > 500000) { /* >500ms: INFO */
-                av_log(mux, AV_LOG_INFO,
                        "[OUTPUT-GAP] No video packets for %.3fs (stream %d)\n",
                        gap_us / 1000000.0, ost->index);
             }
@@ -494,8 +486,8 @@ int muxer_thread(void *arg)
                     int64_t dts_gap_us = av_rescale_q(
                         mt.pkt->dts - last_video_dts,
                         ost->st->time_base, AV_TIME_BASE_Q);
-                    if (dts_gap_us > 80000) { /* >80ms = >2 frames at 25fps */
-                        av_log(mux, AV_LOG_INFO,
+                    if (dts_gap_us > 1000000) { /* >1s */
+                        av_log(mux, AV_LOG_WARNING,
                                "[OUTPUT-DTS-GAP] Video DTS gap: %.3fs "
                                "(stream %d, prev_dts=%"PRId64" cur_dts=%"PRId64")\n",
                                dts_gap_us / 1000000.0, ost->index,
@@ -511,12 +503,8 @@ int muxer_thread(void *arg)
         } else if (ost->type == AVMEDIA_TYPE_AUDIO) {
             int64_t now = av_gettime_relative();
             int64_t gap_us = now - last_write_wc_audio;
-            if (gap_us > 1000000) { /* >1s: WARNING */
+            if (gap_us > 1000000) { /* >1s */
                 av_log(mux, AV_LOG_WARNING,
-                       "[OUTPUT-GAP] No audio packets for %.3fs (stream %d)\n",
-                       gap_us / 1000000.0, ost->index);
-            } else if (gap_us > 500000) { /* >500ms: INFO */
-                av_log(mux, AV_LOG_INFO,
                        "[OUTPUT-GAP] No audio packets for %.3fs (stream %d)\n",
                        gap_us / 1000000.0, ost->index);
             }
@@ -528,7 +516,7 @@ int muxer_thread(void *arg)
             int64_t now = av_gettime_relative();
             int64_t interval_elapsed = now - rate_monitor_start;
             if (interval_elapsed >= 10000000) { /* 10s */
-                if (max_gap_interval_us > 500000) { /* only log if max gap >500ms */
+                if (max_gap_interval_us > 1000000) { /* only log if max gap >1s */
                     double elapsed_total = (now - session_start_wc) / 1000000.0;
                     av_log(mux, AV_LOG_INFO,
                            "[OUTPUT-RATE] 10s: vid_pkts=%"PRId64" max_gap=%.3fs "
