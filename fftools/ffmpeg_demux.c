@@ -767,12 +767,8 @@ static int input_thread(void *arg)
             if (mtype == AVMEDIA_TYPE_VIDEO) {
                 int64_t now = av_gettime_relative();
                 int64_t gap_us = now - last_read_wc_video;
-                if (gap_us > 1000000) { /* >1s: WARNING */
+                if (gap_us > 1000000) { /* >1s */
                     av_log(d, AV_LOG_WARNING,
-                           "[INPUT-GAP] No video packets for %.3fs (stream %d)\n",
-                           gap_us / 1000000.0, stream_idx);
-                } else if (gap_us > 500000) { /* >500ms: INFO */
-                    av_log(d, AV_LOG_INFO,
                            "[INPUT-GAP] No video packets for %.3fs (stream %d)\n",
                            gap_us / 1000000.0, stream_idx);
                 }
@@ -780,12 +776,8 @@ static int input_thread(void *arg)
             } else if (mtype == AVMEDIA_TYPE_AUDIO) {
                 int64_t now = av_gettime_relative();
                 int64_t gap_us = now - last_read_wc_audio;
-                if (gap_us > 1000000) { /* >1s: WARNING */
+                if (gap_us > 1000000) { /* >1s */
                     av_log(d, AV_LOG_WARNING,
-                           "[INPUT-GAP] No audio packets for %.3fs (stream %d)\n",
-                           gap_us / 1000000.0, stream_idx);
-                } else if (gap_us > 500000) { /* >500ms: INFO */
-                    av_log(d, AV_LOG_INFO,
                            "[INPUT-GAP] No audio packets for %.3fs (stream %d)\n",
                            gap_us / 1000000.0, stream_idx);
                 }
