@@ -537,7 +537,24 @@ typedef struct {
 static void text_extract_cb(void *priv, const char *text, int len)
 {
     TextExtractCtx *ctx = priv;
-    av_bprint_append_data(&ctx->buf, text, len);
+    int i;
+    /* ASS \h (hard space) and \n (soft newline) are not handled by
+     * ff_ass_split_override_codes and arrive as literal text.
+     * Replace them inline: \h → space, \n → newline. */
+    for (i = 0; i < len; i++) {
+        if (text[i] == '\\' && i + 1 < len) {
+            if (text[i + 1] == 'h') {
+                av_bprint_chars(&ctx->buf, ' ', 1);
+                i++;
+                continue;
+            } else if (text[i + 1] == 'n') {
+                av_bprint_chars(&ctx->buf, '\n', 1);
+                i++;
+                continue;
+            }
+        }
+        av_bprint_chars(&ctx->buf, text[i], 1);
+    }
 }
 
 static void text_newline_cb(void *priv, int forced)
@@ -607,7 +624,7 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
     DVBTeletextEncContext *ctx = avctx->priv_data;
     TextExtractCtx extract = { 0 };
     ASSDialog *dialog;
-    char *lines[4] = { NULL, NULL, NULL, NULL };
+    char *lines[2] = { NULL, NULL };
     int nb_lines = 0;
     uint8_t row_text[TELETEXT_CHARS_PER_ROW];
     int offset = 0;
@@ -650,9 +667,9 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
     }
 
     /* We need at minimum:
-     * 1 byte (data_identifier) + 46 bytes (page header) + 46*4 (content rows) = 231
-     * With padding to 7 data units: 1 + 46*7 = 323. Keep generous margin. */
-    if (bufsize < 1 + 46 * 7) {
+     * 1 byte (data_identifier) + 46 bytes (page header) + 46*2 (content rows) = 139
+     * With padding to 3 data units: 1 + 46*3 = 139. */
+    if (bufsize < 1 + 46 * 3) {
         av_log(avctx, AV_LOG_ERROR, "Buffer too small for teletext packet\n");
         return AVERROR_BUFFER_TOO_SMALL;
     }
@@ -687,7 +704,7 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
         return 0;
     }
 
-    /* Split text into lines (max 4 for subtitle rows 20-23) */
+    /* Split text into lines (max 2 for subtitle rows 22-23) */
     {
         char *text_str = NULL;
         char *p, *saveptr = NULL;
@@ -697,7 +714,7 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
             return AVERROR(ENOMEM);
 
         p = av_strtok(text_str, "\n", &saveptr);
-        while (p && nb_lines < 4) {
+        while (p && nb_lines < 2) {
             /* skip empty lines */
             if (*p != '\0')
                 lines[nb_lines++] = av_strdup(p);
@@ -725,14 +742,15 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
         offset += write_page_header(buf + offset, ctx, erase, 7);
     }
 
-    /* Content rows: place subtitle text at bottom of screen (rows 20-23).
-     * 1 line: row 23. 2 lines: rows 22-23. 3 lines: rows 21-23. 4 lines: rows 20-23.
+    /* Content rows: place subtitle text at rows 22 and 23 (bottom of screen)
      * Each data unit gets a unique VBI line offset (8, 9, ...) */
     for (i = 0; i < nb_lines; i++) {
         char *safe_line = utf8_to_teletext_g0(lines[i], ctx->g0_subset);
         const char *line = safe_line ? safe_line : lines[i];
         int len, pad_left, j;
-        int row = 24 - nb_lines + i; /* 1 line→23, 2→22-23, 3→21-23, 4→20-23 */
+        int row = (nb_lines == 1) ? TELETEXT_SUBTITLE_ROW2
+                                  : (i == 0 ? TELETEXT_SUBTITLE_ROW1
+                                            : TELETEXT_SUBTITLE_ROW2);
 
         /* Build row text: center the text in 40-char row, wrapped in
          * Start Box (0x0B) / End Box (0x0A) markers. Teletext subtitle
@@ -772,14 +790,12 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
     ctx->last_nb_lines     = nb_lines;
     ctx->last_content_pts  = sub->pts;
 
-    /* Pad with stuffing data units so total N ≡ 3 (mod 4).
-     * libzvbi requires (pkt_size + 45) % 184 == 0, where 184 = 4*46.
-     * Valid counts: 3, 7, 11, 15. With 1 header + up to 4 content rows = 5,
-     * we may need to pad to 7 data units. */
+    /* Pad with stuffing data units to reach TELETEXT_MIN_DATA_UNITS total.
+     * This ensures (pkt_size + 45) % 184 == 0 for the libzvbi decoder. */
     {
+        /* Count data units written: 1 (page header) + nb_lines (content rows) */
         int data_units = 1 + nb_lines;
-        int target = (data_units <= 3) ? 3 : 7;
-        while (data_units < target) {
+        while (data_units < TELETEXT_MIN_DATA_UNITS) {
             offset += write_stuffing_unit(buf + offset);
             data_units++;
         }
