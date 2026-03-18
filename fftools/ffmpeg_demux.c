@@ -2008,6 +2008,7 @@ typedef struct IfileOpenIOResult {
     AVFormatContext *ic;                // opened format context
     const AVInputFormat *file_iformat;  // detected input format
     int scan_all_pmts_set;              // whether scan_all_pmts was auto-set
+    int disable_stdin_interaction;      // set if input is pipe/fd/stdin
     int ret;                            // return value (0 on success, negative on error)
     char error_msg[256];                // error message if ret < 0
 
@@ -2053,6 +2054,12 @@ int ifile_open_io(const OptionsContext *o, const char *filename, IfileOpenIOResu
 
     if (!strcmp(filename, "-"))
         filename = "fd:";
+
+    /* Flag stdin/pipe inputs for deferred stdin_interaction update (Fix 4) */
+    if (!strncmp(filename, "pipe:", 5) ||
+        !strcmp(filename, "fd:") ||
+        !strcmp(filename, "/dev/stdin"))
+        result->disable_stdin_interaction = 1;
 
     /* get default parameters from command line */
     ic = avformat_alloc_context();
@@ -2154,7 +2161,16 @@ int ifile_open_io(const OptionsContext *o, const char *filename, IfileOpenIOResu
     if (result->scan_all_pmts_set)
         av_dict_set(&o->g->format_opts, "scan_all_pmts", NULL, AV_DICT_MATCH_CASE);
 
-    /* find stream info - ALSO A BLOCKING CALL */
+    /* find stream info - ALSO A BLOCKING CALL
+     *
+     * Known limitation vs ifile_open(): the sequential path calls
+     * choose_decoder() per-stream BEFORE find_stream_info, letting per-stream
+     * codec specifiers (e.g. -c:v:0 h264) influence probing.  Here we lack
+     * an InputFile, so choose_decoder() is deferred to ifile_open_from_io().
+     * Format-level codec hints (ic->video_codec_id etc.) ARE applied above,
+     * so the common case works.  Only per-stream codec overrides on inputs
+     * would behave differently — extremely rare in practice.
+     */
     if (o->find_stream_info) {
         AVDictionary **opts;
         int orig_nb_streams = ic->nb_streams;
@@ -2193,6 +2209,17 @@ size_t ifile_open_io_result_size(void)
     return sizeof(IfileOpenIOResult);
 }
 
+void ifile_open_io_result_cleanup(IfileOpenIOResult *result)
+{
+    if (result && result->ic)
+        avformat_close_input(&result->ic);
+}
+
+const char *ifile_open_io_result_error(const IfileOpenIOResult *result)
+{
+    return (result && result->error_msg[0]) ? result->error_msg : NULL;
+}
+
 /**
  * Finalize input file opening from I/O result.
  * Must be called sequentially (not thread-safe) after ifile_open_io().
@@ -2227,6 +2254,10 @@ int ifile_open_from_io(const OptionsContext *o, const char *filename, Scheduler 
     d->sch = sch;
 
     f->ctx = ic;
+    io_result->ic = NULL;  /* ownership transferred to Demuxer */
+
+    if (io_result->disable_stdin_interaction)
+        stdin_interaction = 0;
 
     if (stop_time != INT64_MAX && recording_time != INT64_MAX) {
         stop_time = INT64_MAX;
@@ -2245,9 +2276,9 @@ int ifile_open_from_io(const OptionsContext *o, const char *filename, Scheduler 
 
     av_strlcat(d->log_name, "/",               sizeof(d->log_name));
     av_strlcat(d->log_name, ic->iformat->name, sizeof(d->log_name));
+    av_freep(&ic->name);
+    ic->name = av_strdup(d->log_name);
 
-    if (io_result->scan_all_pmts_set)
-        av_dict_set(&o->g->format_opts, "scan_all_pmts", NULL, AV_DICT_MATCH_CASE);
     remove_avoptions(&o->g->format_opts, o->g->codec_opts);
 
     ret = check_avoptions(o->g->format_opts);
