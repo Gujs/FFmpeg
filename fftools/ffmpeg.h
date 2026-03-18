@@ -966,6 +966,17 @@ int ifile_open_from_io(const OptionsContext *o, const char *filename, Scheduler 
  */
 size_t ifile_open_io_result_size(void);
 
+/**
+ * Close the AVFormatContext held by an I/O result (if any).
+ * Use to clean up after ifile_open_io() when ifile_open_from_io() won't be called.
+ */
+void ifile_open_io_result_cleanup(IfileOpenIOResult *result);
+
+/**
+ * Return the error message from an I/O result, or NULL if none.
+ */
+const char *ifile_open_io_result_error(const IfileOpenIOResult *result);
+
 int ist_use(InputStream *ist, int decoding_needed,
             const ViewSpecifier *vs, SchedulerNode *src);
 int ist_filter_add(InputStream *ist, InputFilter *ifilter, int is_simple,
