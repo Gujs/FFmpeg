@@ -834,6 +834,8 @@ static void ost_free(OutputStream **post)
 
     av_freep(&ost->attachment_filename);
 
+    av_freep(&ms->cc_extract_lang);
+
     enc_stats_uninit(&ost->enc_stats_pre);
     enc_stats_uninit(&ost->enc_stats_post);
     enc_stats_uninit(&ms->stats);
