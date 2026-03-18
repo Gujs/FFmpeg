@@ -1532,9 +1532,10 @@ static int open_input_files_parallel(OptionGroupList *l, Scheduler *sch)
         if (ret < 0) {
             av_log(NULL, AV_LOG_ERROR, "Error parsing options for input file "
                    "%s.\n", g->arg);
-            /* Clean up already spawned threads */
+            /* Clean up already spawned threads and their I/O results */
             for (int j = 0; j < i; j++) {
                 pthread_join(threads[j], NULL);
+                ifile_open_io_result_cleanup((IfileOpenIOResult *)((char*)io_results + j * io_result_size));
                 uninit_options(&opts[j]);
             }
             uninit_options(&opts[i]);
@@ -1552,9 +1553,10 @@ static int open_input_files_parallel(OptionGroupList *l, Scheduler *sch)
             av_log(NULL, AV_LOG_ERROR, "pthread_create() failed for input %d: %s\n",
                    i, strerror(ret));
             ret = AVERROR(ret);
-            /* Clean up already spawned threads */
+            /* Clean up already spawned threads and their I/O results */
             for (int j = 0; j < i; j++) {
                 pthread_join(threads[j], NULL);
+                ifile_open_io_result_cleanup((IfileOpenIOResult *)((char*)io_results + j * io_result_size));
                 uninit_options(&opts[j]);
             }
             uninit_options(&opts[i]);
@@ -1569,14 +1571,21 @@ static int open_input_files_parallel(OptionGroupList *l, Scheduler *sch)
                i, thread_args[i].ret);
     }
 
-    /* Check for I/O errors - if any thread failed, report but continue to try others */
+    /* Check for I/O errors - if any thread failed, clean up all results */
     for (i = 0; i < nb_inputs; i++) {
         if (thread_args[i].ret < 0) {
-            av_log(NULL, AV_LOG_ERROR, "Error opening input file %s.\n",
-                   l->groups[i].arg);
+            IfileOpenIOResult *r = (IfileOpenIOResult *)((char*)io_results + i * io_result_size);
+            const char *msg = ifile_open_io_result_error(r);
+            if (msg)
+                av_log(NULL, AV_LOG_ERROR, "Error opening input file %s: %s\n",
+                       l->groups[i].arg, msg);
+            else
+                av_log(NULL, AV_LOG_ERROR, "Error opening input file %s.\n",
+                       l->groups[i].arg);
             ret = thread_args[i].ret;
-            /* Clean up all options */
+            /* Clean up all I/O results and options */
             for (int j = 0; j < nb_inputs; j++) {
+                ifile_open_io_result_cleanup((IfileOpenIOResult *)((char*)io_results + j * io_result_size));
                 uninit_options(&opts[j]);
             }
             goto cleanup;
@@ -1594,8 +1603,9 @@ static int open_input_files_parallel(OptionGroupList *l, Scheduler *sch)
 
         if (ret < 0) {
             av_log(NULL, AV_LOG_ERROR, "Error finalizing input file %s.\n", g->arg);
-            /* Clean up remaining options */
+            /* Clean up remaining I/O results and options */
             for (int j = i + 1; j < nb_inputs; j++) {
+                ifile_open_io_result_cleanup((IfileOpenIOResult *)((char*)io_results + j * io_result_size));
                 uninit_options(&opts[j]);
             }
             goto cleanup;
