@@ -1966,9 +1966,12 @@ skip_cumulative_offset:
 
         /* Track per-stream last sent position (END of packet, not start) for
          * discontinuity buffer cumulative offset calculation. Using end time
-         * ensures new content starts AFTER old content ends (no audio overlap). */
+         * ensures new content starts AFTER old content ends (no audio overlap).
+         *
+         * NOTE: Use ds->ist.index, NOT dt.pkt_demux->stream_index — demux_send()
+         * unrefs the packet which resets stream_index to 0. */
         if (ds->last_raw_dts != AV_NOPTS_VALUE && d->discont_buf.capacity > 0) {
-            int sidx = dt.pkt_demux->stream_index;
+            int sidx = ds->ist.index;
             if (sidx < d->discont_buf.nb_streams) {
                 DiscontinuityStreamState *ss = &d->discont_buf.stream_state[sidx];
                 int64_t pkt_duration = discont_estimate_pkt_duration(&ds->ist, dt.pkt_demux);
