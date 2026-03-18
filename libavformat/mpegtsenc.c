@@ -448,7 +448,7 @@ static int scte35_adjust_pts(AVFormatContext *s, uint8_t *buf, int len, int64_t 
     /* Ensure new_splice_time fits in 33 bits */
     new_splice_time &= 0x1FFFFFFFFULL;
 
-    av_log(s, AV_LOG_VERBOSE, "SCTE-35: Timeline mismatch detected (preroll %.3fs too large). "
+    av_log(s, AV_LOG_INFO, "SCTE-35: Timeline mismatch detected (preroll %.3fs too large). "
            "Adjusting splice_time %"PRId64" (%.3fs) -> %"PRId64" (%.3fs), using %.1fs preroll\n",
            preroll / 90000.0,
            splice_time, splice_time / 90000.0,
