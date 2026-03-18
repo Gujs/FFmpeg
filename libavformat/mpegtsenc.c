@@ -283,6 +283,10 @@ static int64_t scte35_get_splice_time(const uint8_t *buf, int len, int *splice_t
     if (len < 15 || buf[0] != 0xFC) /* table_id must be 0xFC */
         return AV_NOPTS_VALUE;
 
+    /* encrypted_packet flag — encrypted sections can't be parsed */
+    if (buf[4] & 0x80)
+        return AV_NOPTS_VALUE;
+
     section_length = ((buf[1] & 0x0F) << 8) | buf[2];
     if (section_length + 3 > len)
         return AV_NOPTS_VALUE;
@@ -290,7 +294,31 @@ static int64_t scte35_get_splice_time(const uint8_t *buf, int len, int *splice_t
     /* Skip to splice_command_type (offset 13) */
     splice_command_type = buf[13];
 
-    if (splice_command_type != 0x05) /* Only handle splice_insert */
+    /* time_signal (0x06): splice_time() starts directly at offset 14 */
+    if (splice_command_type == 0x06) {
+        offset = 14;
+        if (offset >= len)
+            return AV_NOPTS_VALUE;
+
+        /* splice_time() - check time_specified_flag */
+        if (!(buf[offset] & 0x80))
+            return AV_NOPTS_VALUE;
+
+        if (offset + 5 > len)
+            return AV_NOPTS_VALUE;
+
+        if (splice_time_offset)
+            *splice_time_offset = offset;
+
+        int64_t pts_time = ((int64_t)(buf[offset] & 0x01) << 32) |
+                           ((int64_t)buf[offset + 1] << 24) |
+                           ((int64_t)buf[offset + 2] << 16) |
+                           ((int64_t)buf[offset + 3] << 8) |
+                           buf[offset + 4];
+        return pts_time;
+    }
+
+    if (splice_command_type != 0x05) /* Only handle splice_insert and time_signal */
         return AV_NOPTS_VALUE;
 
     /* Parse splice_insert - starts at offset 14 */
@@ -433,6 +461,12 @@ static int scte35_adjust_pts(AVFormatContext *s, uint8_t *buf, int len, int64_t 
     buf[splice_time_offset + 2] = (new_splice_time >> 16) & 0xFF;
     buf[splice_time_offset + 3] = (new_splice_time >> 8) & 0xFF;
     buf[splice_time_offset + 4] = new_splice_time & 0xFF;
+
+    /* Zero pts_adjustment (bytes 4-8) so downstream consumers compute
+     * splice_time + 0 = correct splice time.  Preserve encrypted_packet
+     * and encryption_algorithm bits in byte 4 (top 7 bits). */
+    buf[4] &= 0xFE;           /* clear bit 0 of pts_adjustment (33-bit field) */
+    buf[5] = buf[6] = buf[7] = buf[8] = 0;  /* clear remaining 32 bits */
 
     /* Recalculate CRC32 (last 4 bytes of section)
      * Use the same CRC calculation as mpegts_write_section1() */
