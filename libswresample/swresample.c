@@ -968,9 +968,12 @@ int64_t swr_next_pts(struct SwrContext *s, int64_t pts){
 
             if (fabs(fjump) > s->jump_comp) {
                 int ret;
-                av_log(s, AV_LOG_INFO, "jump_comp: detected jump of %.3fs, compensating (delta=%.3fs)\n", fjump, fdelta);
-                if (jump > 0) ret = swr_inject_silence(s,  jump / s->out_sample_rate);
-                else          ret = swr_drop_output   (s, -jump / s->in_sample_rate);
+                av_log(s, AV_LOG_INFO, "jump_comp: detected jump of %.3fs, compensating full delta=%.3fs\n", fjump, fdelta);
+                /* Compensate the full delta (not just the jump) to prevent
+                 * residual error from accumulating across events. The jump
+                 * triggers detection, but delta includes any prior drift. */
+                if (delta > 0) ret = swr_inject_silence(s,  delta / s->out_sample_rate);
+                else           ret = swr_drop_output   (s, -delta / s->in_sample_rate);
                 if (ret < 0)
                     av_log(s, AV_LOG_ERROR, "jump_comp: failed to compensate for jump of %.3fs\n", fjump);
                 /* recompute delta after compensation to establish new baseline */
