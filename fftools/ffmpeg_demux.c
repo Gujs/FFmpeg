@@ -1671,8 +1671,13 @@ static int input_thread(void *arg)
                 }
             }
 
-            /* If buffering is active, add packet to buffer */
-            if (d->discont_buf.active) {
+            /* If buffering is active, add packet to buffer.
+             * Exempt DATA packets (e.g. SCTE-35): they have no meaningful DTS
+             * for timeline classification, and buffering them risks silent drops
+             * or DTS corruption during flush.  The normal send path already
+             * skips cumulative_ts_offset for DATA (line ~1792). */
+            if (d->discont_buf.active &&
+                ist->par->codec_type != AVMEDIA_TYPE_DATA) {
                 int timeline;
 
                 d->diag.pkts_buffered++;
