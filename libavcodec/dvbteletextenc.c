@@ -150,13 +150,83 @@ static const uint8_t vbi_reverse_8[256] = {
  * or other content transitions where CC stops. */
 #define TELETEXT_ERASE_TIMEOUT_US  10000000  /* 10 seconds */
 
+/*
+ * G0 National Option Subsets per ETS 300 706 Tables 33-39.
+ *
+ * 13 character positions in the G0 Latin set can be replaced with national
+ * characters. The positions (in order) correspond to ASCII codes:
+ *   0x23 0x24 0x40 0x5B 0x5C 0x5D 0x5E 0x5F 0x60 0x7B 0x7C 0x7D 0x7E
+ * Each subset maps these 13 positions to different Unicode codepoints.
+ * Selected via C12-C14 control bits in the page header.
+ */
+#define G0_NATIONAL_POSITIONS 13
+
+static const uint8_t g0_position_bytes[G0_NATIONAL_POSITIONS] = {
+    0x23, 0x24, 0x40, 0x5B, 0x5C, 0x5D, 0x5E, 0x5F,
+    0x60, 0x7B, 0x7C, 0x7D, 0x7E
+};
+
+/* Unicode codepoints for each national subset's 13 positions.
+ * 0 means same as default Latin G0 (no override). */
+static const uint32_t g0_national_subsets[7][G0_NATIONAL_POSITIONS] = {
+    /* Subset 0: English — default G0, no special chars */
+    { 0x00A3, 0x0024, 0x0040, 0x005B, 0x005C, 0x005D,  /* £ $ @ [ \ ]  */
+      0x005E, 0x005F, 0x0060, 0x007B, 0x007C, 0x007D,  /* ^ _ ` { | }  */
+      0x007E },                                          /* ~            */
+    /* Subset 1: German */
+    { 0x0023, 0x0024, 0x00A7, 0x00C4, 0x00D6, 0x00DC,  /* # $ § Ä Ö Ü  */
+      0x005E, 0x005F, 0x00B0, 0x00E4, 0x00F6, 0x00FC,  /* ^ _ ° ä ö ü  */
+      0x00DF },                                          /* ß            */
+    /* Subset 2: Swedish/Finnish/Hungarian */
+    { 0x0023, 0x00A4, 0x00C9, 0x00C4, 0x00D6, 0x00C5,  /* # ¤ É Ä Ö Å  */
+      0x00DC, 0x005F, 0x00E9, 0x00E4, 0x00F6, 0x00E5,  /* Ü _ é ä ö å  */
+      0x00FC },                                          /* ü            */
+    /* Subset 3: Italian */
+    { 0x00A3, 0x0024, 0x00B0, 0x00E7, 0x2192, 0x00E9,  /* £ $ ° ç → é  */
+      0x005E, 0x005F, 0x00F9, 0x00E0, 0x00F2, 0x00E8,  /* ^ _ ù à ò è  */
+      0x00EC },                                          /* ì            */
+    /* Subset 4: French */
+    { 0x00E9, 0x00EF, 0x00E0, 0x00EB, 0x00EA, 0x00F9,  /* é ï à ë ê ù  */
+      0x00EE, 0x0023, 0x00E8, 0x00E2, 0x00F4, 0x00FB,  /* î # è â ô û  */
+      0x00E7 },                                          /* ç            */
+    /* Subset 5: Spanish/Portuguese */
+    { 0x00E7, 0x0024, 0x00A1, 0x00E1, 0x00E9, 0x00ED,  /* ç $ ¡ á é í  */
+      0x00F3, 0x00FA, 0x00BF, 0x00FC, 0x00F1, 0x00E8,  /* ó ú ¿ ü ñ è  */
+      0x00E0 },                                          /* à            */
+    /* Subset 6: Czech/Slovak */
+    { 0x0023, 0x016F, 0x010D, 0x0165, 0x017E, 0x00FD,  /* # ů č ť ž ý  */
+      0x00ED, 0x0159, 0x00E9, 0x00E1, 0x011B, 0x00FA,  /* í ř é á ě ú  */
+      0x0161 },                                          /* š            */
+};
+
+/**
+ * Look up a Unicode codepoint in a G0 national option subset.
+ *
+ * @param cp      Unicode codepoint to look up
+ * @param subset  Subset index (0-6)
+ * @return The teletext byte position (0x23-0x7E), or 0 if not found
+ */
+static uint8_t g0_national_lookup(uint32_t cp, int subset)
+{
+    int i;
+    if (subset < 0 || subset > 6)
+        return 0;
+    for (i = 0; i < G0_NATIONAL_POSITIONS; i++) {
+        if (g0_national_subsets[subset][i] == cp)
+            return g0_position_bytes[i];
+    }
+    return 0;
+}
+
 typedef struct DVBTeletextEncContext {
     AVClass *class;
     ASSSplitContext *ass_ctx;
     int magazine;           /* magazine number 1-8, default 8 */
     int page;               /* page number in hex (0x00-0xFF), default 0x88 */
+    int g0_subset;          /* G0 national option subset (0-6), default 0 (English) */
     int page_counter;       /* erase page sequence counter (C4 flag) */
     int content_active;     /* 1 if display has content (needs erase eventually) */
+    int last_nb_lines;      /* number of content rows in previous subtitle */
     int64_t last_content_pts; /* PTS (AV_TIME_BASE) of last content subtitle */
 } DVBTeletextEncContext;
 
@@ -294,7 +364,7 @@ static int write_page_header(uint8_t *buf, DVBTeletextEncContext *ctx,
     buf[10] = hamming84_encode[0];               /* S3 */
     buf[11] = hamming84_encode[0x08];            /* S4=0, C5=0, C6=0, C7=1(SuppressHdr) */
     buf[12] = hamming84_encode[0x01];            /* C8=1 (Update Indicator), C9=0, C10=0, C11=0 */
-    buf[13] = hamming84_encode[0];               /* C12-C14 (charset=0, Latin G0) */
+    buf[13] = hamming84_encode[ctx->g0_subset & 0x07]; /* C12-C14: national option subset */
 
     /* Header display area: 26 bytes (positions 14-39 in data unit payload,
      * 8..33 in the character area after the 8 control bytes).
@@ -326,7 +396,7 @@ static int write_page_header(uint8_t *buf, DVBTeletextEncContext *ctx,
  * @param src  UTF-8 input string
  * @return     Allocated ASCII string (caller frees with av_free), or NULL on OOM
  */
-static char *utf8_to_teletext_g0(const char *src)
+static char *utf8_to_teletext_g0(const char *src, int g0_subset)
 {
     AVBPrint bp;
     const uint8_t *s = (const uint8_t *)src;
@@ -362,10 +432,19 @@ static char *utf8_to_teletext_g0(const char *src)
 
         /* Map codepoint to teletext Latin G0 character.
          * Complete coverage of all 79 non-ASCII characters that EIA-608
-         * cc_dec can output (ccaption_dec.c charset_overrides[4][128]). */
+         * cc_dec can output (ccaption_dec.c charset_overrides[4][128]).
+         *
+         * First try the G0 national option subset — if the codepoint has
+         * a native representation, emit it directly. Otherwise fall
+         * through to accent-stripping for best-effort ASCII output. */
         if (cp >= 0x20 && cp < 0x7F) {
             av_bprint_chars(&bp, (char)cp, 1);
         } else {
+            uint8_t national_byte = g0_national_lookup(cp, g0_subset);
+            if (national_byte) {
+                av_bprint_chars(&bp, (char)national_byte, 1);
+                continue;
+            }
             switch (cp) {
             /* Quotation marks */
             case 0x2018: case 0x2019:             /* ' ' smart single quotes */
@@ -506,9 +585,18 @@ static av_cold int dvb_teletext_encode_init(AVCodecContext *avctx)
     avctx->extradata      = extradata;
     avctx->extradata_size = 2;
 
-    av_log(avctx, AV_LOG_INFO,
-           "DVB Teletext encoder: magazine %d, page %02X (subtitle)\n",
-           ctx->magazine, ctx->page);
+    {
+        static const char *subset_names[] = {
+            "English", "German", "Swedish/Finnish", "Italian",
+            "French", "Spanish/Portuguese", "Czech/Slovak"
+        };
+        av_log(avctx, AV_LOG_INFO,
+               "DVB Teletext encoder: magazine %d, page %02X, "
+               "G0 subset %d (%s)\n",
+               ctx->magazine, ctx->page, ctx->g0_subset,
+               (ctx->g0_subset >= 0 && ctx->g0_subset <= 6)
+                   ? subset_names[ctx->g0_subset] : "unknown");
+    }
 
     return 0;
 }
@@ -519,7 +607,7 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
     DVBTeletextEncContext *ctx = avctx->priv_data;
     TextExtractCtx extract = { 0 };
     ASSDialog *dialog;
-    char *lines[2] = { NULL, NULL };
+    char *lines[4] = { NULL, NULL, NULL, NULL };
     int nb_lines = 0;
     uint8_t row_text[TELETEXT_CHARS_PER_ROW];
     int offset = 0;
@@ -562,9 +650,9 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
     }
 
     /* We need at minimum:
-     * 1 byte (data_identifier) + 46 bytes (page header) + 46*2 (content rows) = 139
-     * Keep generous margin */
-    if (bufsize < 1 + 46 * 3) {
+     * 1 byte (data_identifier) + 46 bytes (page header) + 46*4 (content rows) = 231
+     * With padding to 7 data units: 1 + 46*7 = 323. Keep generous margin. */
+    if (bufsize < 1 + 46 * 7) {
         av_log(avctx, AV_LOG_ERROR, "Buffer too small for teletext packet\n");
         return AVERROR_BUFFER_TOO_SMALL;
     }
@@ -599,7 +687,7 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
         return 0;
     }
 
-    /* Split text into lines (max 2 for subtitle rows) */
+    /* Split text into lines (max 4 for subtitle rows 20-23) */
     {
         char *text_str = NULL;
         char *p, *saveptr = NULL;
@@ -609,7 +697,7 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
             return AVERROR(ENOMEM);
 
         p = av_strtok(text_str, "\n", &saveptr);
-        while (p && nb_lines < 2) {
+        while (p && nb_lines < 4) {
             /* skip empty lines */
             if (*p != '\0')
                 lines[nb_lines++] = av_strdup(p);
@@ -626,18 +714,25 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
     /* Data identifier byte */
     buf[offset++] = TELETEXT_DATA_IDENTIFIER;
 
-    /* Page header (row 0) — erase page before new content, VBI line 7 */
-    offset += write_page_header(buf + offset, ctx, 1, 7);
+    /* Page header (row 0) — smart erase flag:
+     * Set C4 (erase) only on first subtitle after silence or when the
+     * row count decreases (orphaned rows need clearing). Subsequent
+     * updates use erase=0 so the decoder replaces content in-place
+     * without a visible blank flash between updates. */
+    {
+        int erase = !ctx->content_active ||
+                    (nb_lines < ctx->last_nb_lines);
+        offset += write_page_header(buf + offset, ctx, erase, 7);
+    }
 
-    /* Content rows: place subtitle text at rows 23 and 24 (bottom of screen)
+    /* Content rows: place subtitle text at bottom of screen (rows 20-23).
+     * 1 line: row 23. 2 lines: rows 22-23. 3 lines: rows 21-23. 4 lines: rows 20-23.
      * Each data unit gets a unique VBI line offset (8, 9, ...) */
     for (i = 0; i < nb_lines; i++) {
-        char *safe_line = utf8_to_teletext_g0(lines[i]);
+        char *safe_line = utf8_to_teletext_g0(lines[i], ctx->g0_subset);
         const char *line = safe_line ? safe_line : lines[i];
         int len, pad_left, j;
-        int row = (nb_lines == 1) ? TELETEXT_SUBTITLE_ROW2
-                                  : (i == 0 ? TELETEXT_SUBTITLE_ROW1
-                                            : TELETEXT_SUBTITLE_ROW2);
+        int row = 24 - nb_lines + i; /* 1 line→23, 2→22-23, 3→21-23, 4→20-23 */
 
         /* Build row text: center the text in 40-char row, wrapped in
          * Start Box (0x0B) / End Box (0x0A) markers. Teletext subtitle
@@ -674,14 +769,17 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
 
     ctx->page_counter++;
     ctx->content_active    = 1;
+    ctx->last_nb_lines     = nb_lines;
     ctx->last_content_pts  = sub->pts;
 
-    /* Pad with stuffing data units to reach TELETEXT_MIN_DATA_UNITS total.
-     * This ensures (pkt_size + 45) % 184 == 0 for the libzvbi decoder. */
+    /* Pad with stuffing data units so total N ≡ 3 (mod 4).
+     * libzvbi requires (pkt_size + 45) % 184 == 0, where 184 = 4*46.
+     * Valid counts: 3, 7, 11, 15. With 1 header + up to 4 content rows = 5,
+     * we may need to pad to 7 data units. */
     {
-        /* Count data units written: 1 (page header) + nb_lines (content rows) */
         int data_units = 1 + nb_lines;
-        while (data_units < TELETEXT_MIN_DATA_UNITS) {
+        int target = (data_units <= 3) ? 3 : 7;
+        while (data_units < target) {
             offset += write_stuffing_unit(buf + offset);
             data_units++;
         }
@@ -714,6 +812,9 @@ static const AVOption dvbteletextenc_options[] = {
       AV_OPT_TYPE_INT, { .i64 = 8 }, 1, 8, SE },
     { "page", "teletext page number (hex, e.g. 0x88)", OFFSET(page),
       AV_OPT_TYPE_INT, { .i64 = 0x88 }, 0x00, 0xFF, SE },
+    { "g0_subset", "G0 national option subset (0=English, 1=German, 2=Swedish/Finnish, "
+      "3=Italian, 4=French, 5=Spanish/Portuguese, 6=Czech/Slovak)", OFFSET(g0_subset),
+      AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 6, SE },
     { NULL },
 };
 

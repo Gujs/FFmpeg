@@ -3389,6 +3389,30 @@ static Muxer *mux_alloc(void)
     return mux;
 }
 
+/**
+ * Map ISO 639-2/B language code to G0 national option subset index.
+ * Returns 0 (English) for unknown languages.
+ */
+static int lang_to_g0_subset(const char *lang)
+{
+    if (!lang || !lang[0])
+        return 0;
+    if (!strcmp(lang, "deu") || !strcmp(lang, "ger"))
+        return 1;
+    if (!strcmp(lang, "swe") || !strcmp(lang, "fin") || !strcmp(lang, "hun"))
+        return 2;
+    if (!strcmp(lang, "ita"))
+        return 3;
+    if (!strcmp(lang, "fra") || !strcmp(lang, "fre"))
+        return 4;
+    if (!strcmp(lang, "spa") || !strcmp(lang, "por"))
+        return 5;
+    if (!strcmp(lang, "cze") || !strcmp(lang, "ces") ||
+        !strcmp(lang, "slo") || !strcmp(lang, "slk"))
+        return 6;
+    return 0;
+}
+
 int of_setup_cc_extraction(OutputFile *ofile)
 {
     Muxer *mux = mux_from_of(ofile);
@@ -3513,19 +3537,20 @@ int of_setup_cc_extraction(OutputFile *ofile)
                      "cc_sub#%d:%d/%s", mux->of.index, cc_ost->index,
                      cc_enc_codec->name);
 
-            /* Set language metadata for the teletext descriptor in PMT */
+            /* Set language metadata and G0 national subset for teletext */
             {
+                static const char *subset_names[] = {
+                    "English", "German", "Swedish/Finnish", "Italian",
+                    "French", "Spanish/Portuguese", "Czech/Slovak"
+                };
                 const char *cc_lang = "eng"; /* default fallback */
+                int subset;
 
                 if (video_ms->cc_extract_lang) {
                     cc_lang = video_ms->cc_extract_lang;
-                    av_log(mux, AV_LOG_INFO,
-                           "CC subtitle language: \"%s\" (from -cc_lang)\n",
-                           cc_lang);
                 } else {
                     /* Auto-detect from first audio stream in same input file */
                     const InputFile *ifile = source_ist->file;
-                    int detected = 0;
                     for (int j = 0; j < ifile->nb_streams; j++) {
                         const InputStream *ist_a = ifile->streams[j];
                         if (ist_a->par->codec_type == AVMEDIA_TYPE_AUDIO) {
@@ -3535,19 +3560,19 @@ int of_setup_cc_extraction(OutputFile *ofile)
                             if (e && e->value[0] &&
                                 strcmp(e->value, "und") != 0) {
                                 cc_lang = e->value;
-                                detected = 1;
-                                av_log(mux, AV_LOG_INFO,
-                                       "CC subtitle language: \"%s\" "
-                                       "(auto-detected from audio stream %d)\n",
-                                       cc_lang, ist_a->index);
                                 break;
                             }
                         }
                     }
-                    if (!detected)
-                        av_log(mux, AV_LOG_INFO,
-                               "CC subtitle language: \"eng\" (default)\n");
                 }
+
+                subset = lang_to_g0_subset(cc_lang);
+                av_opt_set_int(cc_ost->enc->enc_ctx->priv_data,
+                               "g0_subset", subset, 0);
+
+                av_log(mux, AV_LOG_INFO,
+                       "CC subtitle language: \"%s\" (G0 subset %d: %s)\n",
+                       cc_lang, subset, subset_names[subset]);
 
                 av_dict_set(&cc_st->metadata, "language", cc_lang, 0);
             }
@@ -3572,21 +3597,6 @@ int of_setup_cc_extraction(OutputFile *ofile)
                    video_ost->file->index, video_ost->index,
                    cc_ost->file->index, cc_ost->index,
                    cc_enc_codec->name);
-
-            /* Reduce max_interleave_delta to prevent the sparse CC subtitle
-             * stream from blocking the lavf interleaver.
-             *
-             * The interleaver auto-flushes only when ALL interleaved streams
-             * have buffered data (mux.c:969).  During discontinuity handling
-             * and keyframe-wait, no video frames are decoded so no CC
-             * keepalives are emitted — the subtitle stream goes silent.
-             * With the default delta of 10s, video/audio buffer up for 10s
-             * before a forced flush, creating a visible gap in the output.
-             *
-             * 100ms is sufficient for correct interleaving of live video
-             * (33ms per frame at 30fps) and audio (23ms per AAC frame). */
-            if (oc->max_interleave_delta > 100000)
-                oc->max_interleave_delta = 100000; /* 100ms */
         }
 
         video_ms->cc_extract_pending = 0;
