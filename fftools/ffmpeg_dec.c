@@ -83,6 +83,7 @@ typedef struct DecoderPriv {
     AVSubtitle          cc_pending_sub;   /* buffered subtitle waiting for debounce */
     int                 cc_pending_valid; /* 1 if cc_pending_sub has data */
     int64_t             cc_pending_pts;   /* PTS when pending text last changed */
+    int64_t             cc_pending_first_pts; /* PTS when current pending cycle started */
     char               *cc_pending_text;  /* text of pending subtitle (for comparison) */
     unsigned            cc_out_idx;       /* scheduler decoder output index for CC */
     AVCodecContext     *cc_dec_ctx;       /* EIA-608 decoder (cc_dec) context */
@@ -719,12 +720,18 @@ static int transcode_subtitles(DecoderPriv *dp, const AVPacket *pkt,
     return process_subtitle(dp, frame);
 }
 
-/* Debounce interval: only emit subtitle after text stops changing for this
- * long.  cc_dec real_time=1 mode fires a new subtitle on every CC buffer
- * change (character-by-character for roll-up), producing rapid incremental
- * fragments.  Buffering until a 500 ms quiet period eliminates the flicker
- * and only emits complete phrases. */
-#define CC_DEBOUNCE_US  500000  /* 500 ms */
+/* Debounce intervals for CC subtitle emission.
+ *
+ * cc_dec real_time=1 fires a new subtitle on every CC buffer change.
+ * Roll-up mode (live news): character-by-character, every ~200ms.
+ * Pop-on mode (scripted): complete blocks with 2-10s natural pauses.
+ *
+ * Two timers control emission:
+ * - CC_DEBOUNCE_US (silence): emit after text unchanged for 500ms (pop-on)
+ * - CC_DEBOUNCE_MAX_US (deadline): emit after 300ms pending regardless
+ *   of ongoing changes (roll-up) */
+#define CC_DEBOUNCE_US      500000  /* 500 ms — silence-based (pop-on) */
+#define CC_DEBOUNCE_MAX_US  300000  /* 300 ms — max pending age (roll-up) */
 
 /**
  * Send a subtitle (content or empty keepalive) to the CC encoder.
@@ -869,6 +876,7 @@ static int extract_cc_subtitle(DecoderPriv *dp, AVFrame *frame)
 
         if (!dp->cc_pending_text || strcmp(new_text, dp->cc_pending_text)) {
             /* Text changed — replace pending buffer and reset debounce timer */
+            int was_pending = dp->cc_pending_valid;
             if (dp->cc_pending_valid)
                 avsubtitle_free(&dp->cc_pending_sub);
 
@@ -880,7 +888,11 @@ static int extract_cc_subtitle(DecoderPriv *dp, AVFrame *frame)
             subtitle.pts = cur_pts;
             dp->cc_pending_sub   = subtitle;
             dp->cc_pending_valid = 1;
-            dp->cc_pending_pts   = cur_pts;
+            dp->cc_pending_pts   = cur_pts;  /* silence timer: resets on each change */
+
+            /* Deadline timer: set only when first entering pending state */
+            if (!was_pending)
+                dp->cc_pending_first_pts = cur_pts;
 
             av_freep(&dp->cc_pending_text);
             dp->cc_pending_text = av_strdup(new_text);
@@ -895,9 +907,11 @@ static int extract_cc_subtitle(DecoderPriv *dp, AVFrame *frame)
     }
 
 check_pending:
-    /* Emit pending subtitle once text has been stable for CC_DEBOUNCE_US */
+    /* Emit pending subtitle once text has been stable for CC_DEBOUNCE_US
+     * (silence timer) or pending for CC_DEBOUNCE_MAX_US (deadline timer) */
     if (dp->cc_pending_valid &&
-        cur_pts - dp->cc_pending_pts >= CC_DEBOUNCE_US) {
+        (cur_pts - dp->cc_pending_pts >= CC_DEBOUNCE_US ||
+         cur_pts - dp->cc_pending_first_pts >= CC_DEBOUNCE_MAX_US)) {
 
         ret = cc_send_subtitle(dp, &dp->cc_pending_sub, frame);
         dp->cc_pending_valid = 0;  /* subtitle_wrap_frame zeroed the struct */
