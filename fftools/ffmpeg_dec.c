@@ -747,6 +747,25 @@ static int cc_send_subtitle(DecoderPriv *dp, AVSubtitle *sub, AVFrame *frame)
     cc_frame->pts       = frame->pts;
     cc_frame->time_base = frame->time_base;
 
+    /* Enforce monotonic subtitle PTS — discontinuity rebasing can produce
+     * out-of-order PTS that crashes the muxer with EINVAL */
+    if (dp->cc_last_sub_pts != AV_NOPTS_VALUE) {
+        int64_t min_pts = dp->cc_last_sub_pts + 1;  /* strictly increasing */
+        int64_t frame_pts_us = av_rescale_q(frame->pts, frame->time_base,
+                                            AV_TIME_BASE_Q);
+        if (frame_pts_us < min_pts) {
+            av_log(dp, AV_LOG_DEBUG,
+                   "[CC] Clamping subtitle PTS from %.3fs to %.3fs (monotonicity)\n",
+                   (double)frame_pts_us / AV_TIME_BASE,
+                   (double)min_pts / AV_TIME_BASE);
+            cc_frame->pts = av_rescale_q(min_pts, AV_TIME_BASE_Q,
+                                         frame->time_base);
+            /* Also fix the subtitle.pts inside the frame buffer */
+            AVSubtitle *wrapped = (AVSubtitle *)cc_frame->buf[0]->data;
+            wrapped->pts = min_pts;
+        }
+    }
+
     ret = sch_dec_send(dp->sch, dp->sch_idx, dp->cc_out_idx, cc_frame);
     if (ret < 0) {
         av_frame_unref(cc_frame);
@@ -757,7 +776,9 @@ static int cc_send_subtitle(DecoderPriv *dp, AVSubtitle *sub, AVFrame *frame)
         return ret;
     }
 
-    dp->cc_last_sub_pts = av_rescale_q(frame->pts, frame->time_base,
+    /* Use cc_frame->pts (potentially clamped for monotonicity) so that
+     * the next call's monotonicity check compares against the sent value */
+    dp->cc_last_sub_pts = av_rescale_q(cc_frame->pts, cc_frame->time_base,
                                        AV_TIME_BASE_Q);
     return 0;
 }
@@ -789,6 +810,20 @@ static int extract_cc_subtitle(DecoderPriv *dp, AVFrame *frame)
         goto strip;
 
     cur_pts = av_rescale_q(frame->pts, frame->time_base, AV_TIME_BASE_Q);
+
+    /* Reset CC state if PTS jumped backward (discontinuity rebased timeline) */
+    if (dp->cc_last_sub_pts != AV_NOPTS_VALUE &&
+        cur_pts < dp->cc_last_sub_pts - 500000) {  /* 500ms tolerance */
+        av_log(dp, AV_LOG_INFO,
+               "[CC] PTS jumped backward (%.3fs -> %.3fs), resetting CC state\n",
+               (double)dp->cc_last_sub_pts / AV_TIME_BASE,
+               (double)cur_pts / AV_TIME_BASE);
+        dp->cc_last_sub_pts = AV_NOPTS_VALUE;
+        if (dp->cc_pending_valid) {
+            avsubtitle_free(&dp->cc_pending_sub);
+            dp->cc_pending_valid = 0;
+        }
+    }
 
     /* If PTS jumped forward significantly (discontinuity / ad boundary),
      * flush any pending subtitle immediately rather than losing it. */
