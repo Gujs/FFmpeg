@@ -973,11 +973,21 @@ int64_t swr_next_pts(struct SwrContext *s, int64_t pts){
                 /* recompute delta after compensation to establish new baseline */
                 delta = pts - swr_get_delay(s, s->in_sample_rate * (int64_t)s->out_sample_rate) - s->outpts + s->drop_output*(int64_t)s->in_sample_rate;
                 fdelta = delta / (double)(s->in_sample_rate * (int64_t)s->out_sample_rate);
+            } else if (fabs(fdelta) > s->min_hard_compensation) {
+                /* Safety net: if delta exceeds min_hard_comp (default 0.1s)
+                 * without a jump being detected, correct it anyway. This
+                 * caps drift on channels without discontinuity events where
+                 * jump_comp would otherwise never fire. Unlike soft comp,
+                 * this does not track source clock — it only fires when
+                 * the accumulated error becomes perceptible. */
+                int ret;
+                av_log(s, AV_LOG_INFO, "jump_comp: delta %.3fs exceeds hard threshold, correcting (no jump detected)\n", fdelta);
+                if (delta > 0) ret = swr_inject_silence(s,  delta / s->out_sample_rate);
+                else           ret = swr_drop_output   (s, -delta / s->in_sample_rate);
+                if (ret < 0)
+                    av_log(s, AV_LOG_ERROR, "jump_comp: failed to correct accumulated delta of %.3fs\n", fdelta);
+                delta = pts - swr_get_delay(s, s->in_sample_rate * (int64_t)s->out_sample_rate) - s->outpts + s->drop_output*(int64_t)s->in_sample_rate;
             }
-            /* No soft compensation for gradual drift: any residual delta
-             * from uncompensated events gets cleared at the next jump via
-             * full-delta hard compensation. Soft comp was removed because
-             * it tracked the source clock (~19ppm drift vs CFR video). */
             s->jump_comp_prev_delta = delta;
         }
 
