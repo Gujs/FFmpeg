@@ -280,6 +280,11 @@ av_cold int swr_init(struct SwrContext *s){
             av_log(s, AV_LOG_WARNING, "jump_comp requires async, enabling async=1\n");
             s->async = 1;
         }
+        /* Use jump_comp value as the hard compensation threshold.
+         * This makes jump_comp=0.03 correct any delta > 30ms,
+         * catching discontinuity residuals while ignoring jitter. */
+        if (s->min_hard_compensation > s->jump_comp)
+            s->min_hard_compensation = s->jump_comp;
     }
 
     if (s->async) {
