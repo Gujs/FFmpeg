@@ -81,8 +81,9 @@ typedef struct DiscontinuityBuffer {
     /* Per-stream offset tracking for multiple discontinuities */
     DiscontinuityStreamState *stream_state;
 
-    /* Video stream's offset, kept for diagnostics logging.
-     * Packets now use per-stream cumulative_ts_offset instead. */
+    /* Single offset applied to ALL streams (preserves A/V sync).
+     * Derived from the video stream's per-stream offset. Per-stream offsets
+     * are still computed for diagnostics but only this value is applied. */
     int64_t applied_offset;
 } DiscontinuityBuffer;
 
@@ -776,19 +777,17 @@ static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
             }
         }
 
-        /* Propagate video's offset and last_sent_dts to DATA/SUBTITLE streams.
-         * DATA (e.g. SCTE-35) and SUBTITLE bypass the discontinuity buffer, so
-         * they have no meaningful DTS for independent offset computation. Give
-         * them the video (or audio) stream's cumulative_ts_offset and
-         * last_sent_dts so the offset-apply path works correctly. */
+        /* Adjust DATA streams' last_sent_dts to the rebased timeline.
+         * DATA (e.g. SCTE-35) bypasses the discontinuity buffer, so its
+         * last_sent_dts reflects the pre-offset output domain. Set it to
+         * the video (or audio) stream's last_sent_dts so that the offset-apply
+         * path can correctly clamp stale DATA packets to monotonic DTS. */
         {
             int64_t ref_dts = AV_NOPTS_VALUE;
-            int64_t ref_offset = 0;
             for (int s = 0; s < buf->nb_streams && s < f->nb_streams; s++) {
                 if (f->streams[s]->par->codec_type == AVMEDIA_TYPE_VIDEO &&
                     buf->stream_state[s].last_sent_dts != AV_NOPTS_VALUE) {
                     ref_dts = buf->stream_state[s].last_sent_dts;
-                    ref_offset = buf->stream_state[s].cumulative_ts_offset;
                     break;
                 }
             }
@@ -797,24 +796,18 @@ static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
                     if (f->streams[s]->par->codec_type == AVMEDIA_TYPE_AUDIO &&
                         buf->stream_state[s].last_sent_dts != AV_NOPTS_VALUE) {
                         ref_dts = buf->stream_state[s].last_sent_dts;
-                        ref_offset = buf->stream_state[s].cumulative_ts_offset;
                         break;
                     }
                 }
             }
             for (int s = 0; s < buf->nb_streams && s < f->nb_streams; s++) {
-                enum AVMediaType type = f->streams[s]->par->codec_type;
-                if ((type == AVMEDIA_TYPE_DATA || type == AVMEDIA_TYPE_SUBTITLE) &&
+                if (f->streams[s]->par->codec_type == AVMEDIA_TYPE_DATA &&
                     ref_dts != AV_NOPTS_VALUE) {
-                    av_log(d, AV_LOG_INFO,
-                           "[DISCONT-BUF] Propagating to %s s%d: offset %.3fs->%.3fs, "
-                           "last_sent_dts %.3fs->%.3fs\n",
-                           av_get_media_type_string(type), s,
-                           (double)buf->stream_state[s].cumulative_ts_offset / AV_TIME_BASE,
-                           (double)ref_offset / AV_TIME_BASE,
+                    av_log(d, AV_LOG_DEBUG,
+                           "[DISCONT-BUF] Adjusting DATA s%d last_sent_dts: %.3fs -> %.3fs (ref)\n",
+                           s,
                            (double)buf->stream_state[s].last_sent_dts / AV_TIME_BASE,
                            (double)ref_dts / AV_TIME_BASE);
-                    buf->stream_state[s].cumulative_ts_offset = ref_offset;
                     buf->stream_state[s].last_sent_dts = ref_dts;
                 }
             }
@@ -888,26 +881,19 @@ static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
 
             ds = ds_from_ist(f->streams[dp->stream_idx]);
 
-            /* Apply per-stream offset for precise A/V sync.
-             * Each stream gets its own cumulative_ts_offset, eliminating the
-             * divergence that caused SWR to overshoot corrections. Fallback
-             * to applied_offset for out-of-range stream indices. */
-            {
-                int64_t stream_offset = (dp->stream_idx < buf->nb_streams)
-                    ? buf->stream_state[dp->stream_idx].cumulative_ts_offset
-                    : buf->applied_offset;
-                if (stream_offset != 0) {
-                    InputStream *ist_pkt = f->streams[dp->stream_idx];
-                    AVRational time_base = ist_pkt->st->time_base;
-                    int64_t pkt_offset = av_rescale_q(stream_offset, AV_TIME_BASE_Q, time_base);
-                    av_log(d, AV_LOG_INFO, "[DISCONT-BUF] Rebasing: stream=%d offset=%.3fs pkt_offset=%"PRId64" orig_dts=%"PRId64"\n",
-                           dp->stream_idx, (double)stream_offset / AV_TIME_BASE, pkt_offset, dp->pkt->dts);
-                    if (dp->pkt->dts != AV_NOPTS_VALUE)
-                        dp->pkt->dts += pkt_offset;
-                    if (dp->pkt->pts != AV_NOPTS_VALUE)
-                        dp->pkt->pts += pkt_offset;
-                    dp->pkt->flags |= AV_PKT_FLAG_DISCONTINUITY;
-                }
+            /* Apply single offset (from video) to ALL streams for A/V sync.
+             * Per-stream offsets are tracked for diagnostics only. */
+            if (buf->applied_offset != 0) {
+                InputStream *ist_pkt = f->streams[dp->stream_idx];
+                AVRational time_base = ist_pkt->st->time_base;
+                int64_t pkt_offset = av_rescale_q(buf->applied_offset, AV_TIME_BASE_Q, time_base);
+                av_log(d, AV_LOG_DEBUG, "[DISCONT-BUF] Rebasing: stream=%d offset=%"PRId64" pkt_offset=%"PRId64" orig_dts=%"PRId64"\n",
+                       dp->stream_idx, buf->applied_offset, pkt_offset, dp->pkt->dts);
+                if (dp->pkt->dts != AV_NOPTS_VALUE)
+                    dp->pkt->dts += pkt_offset;
+                if (dp->pkt->pts != AV_NOPTS_VALUE)
+                    dp->pkt->pts += pkt_offset;
+                dp->pkt->flags |= AV_PKT_FLAG_DISCONTINUITY;
             }
 
             /* Process through normal timestamp fixup path */
@@ -939,16 +925,16 @@ static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
             /* Track per-stream last sent position (END of packet, not start) for
              * cumulative offset calculation in future flushes. Using end time ensures
              * new content starts AFTER old content ends (no audio overlap).
-             * Use per-stream offset since that's what was applied to packets. */
+             * Use applied_offset (not per-stream) since that's what was applied to packets. */
             if (dp->raw_dts != AV_NOPTS_VALUE && dp->stream_idx < buf->nb_streams) {
                 DiscontinuityStreamState *ss = &buf->stream_state[dp->stream_idx];
                 InputStream *ist_pkt = f->streams[dp->stream_idx];
                 int64_t pkt_duration = discont_estimate_pkt_duration(ist_pkt, dp->pkt);
-                int64_t output_dts = dp->raw_dts + ss->cumulative_ts_offset;
+                int64_t output_dts = dp->raw_dts + buf->applied_offset;
                 int64_t output_end = output_dts + pkt_duration;
                 if (output_end > ss->last_sent_dts || ss->last_sent_dts == AV_NOPTS_VALUE) {
                     ss->last_sent_dts = output_end;
-                    av_log(d, AV_LOG_INFO, "[DISCONT-BUF] s%d last_sent_dts=%.3fs (end, start=%.3fs dur=%.3fs)\n",
+                    av_log(d, AV_LOG_DEBUG, "[DISCONT-BUF] s%d last_sent_dts=%.3fs (end, start=%.3fs dur=%.3fs)\n",
                            dp->stream_idx,
                            (double)ss->last_sent_dts / AV_TIME_BASE,
                            (double)output_dts / AV_TIME_BASE,
@@ -1944,67 +1930,62 @@ static int input_thread(void *arg)
             ds->last_raw_dts = raw_dts;
         }
 
-        /* Apply per-stream offset for precise A/V sync.
+        /* Apply single offset (from video) to ALL streams for muxer DTS consistency.
          * DATA streams (SCTE-35) may arrive with stale old-timeline DTS after a
          * discontinuity — the splice_insert announcing the ad break is sent ~6-8s
          * before the boundary, carrying old-timeline DTS. After rebasing, such
          * packets get a wildly negative DTS. Clamp to last_sent_dts+1 to maintain
          * monotonicity while preserving the SCTE-35 section content (pts_time). */
-        {
-            int sidx = dt.pkt_demux->stream_index;
-            int64_t stream_offset = (sidx < d->discont_buf.nb_streams)
-                ? d->discont_buf.stream_state[sidx].cumulative_ts_offset
-                : d->discont_buf.applied_offset;
-            if (stream_offset != 0 && dt.pkt_demux->dts != AV_NOPTS_VALUE) {
-                InputStream *ist_pkt = f->streams[dt.pkt_demux->stream_index];
-                AVRational time_base = ist_pkt->st->time_base;
-                int64_t pkt_offset = av_rescale_q(stream_offset,
-                                                  AV_TIME_BASE_Q, time_base);
+        if (d->discont_buf.applied_offset != 0 && dt.pkt_demux->dts != AV_NOPTS_VALUE) {
+            InputStream *ist_pkt = f->streams[dt.pkt_demux->stream_index];
+            AVRational time_base = ist_pkt->st->time_base;
+            int64_t pkt_offset = av_rescale_q(d->discont_buf.applied_offset,
+                                              AV_TIME_BASE_Q, time_base);
 
-                dt.pkt_demux->dts += pkt_offset;
-                if (dt.pkt_demux->pts != AV_NOPTS_VALUE)
-                    dt.pkt_demux->pts += pkt_offset;
+            dt.pkt_demux->dts += pkt_offset;
+            if (dt.pkt_demux->pts != AV_NOPTS_VALUE)
+                dt.pkt_demux->pts += pkt_offset;
 
-                /* DATA streams (SCTE-35): clamp rebased DTS to ensure monotonicity.
-                 * Stale old-timeline packets get hugely negative DTS after offset.
-                 * Clamp to last_sent_dts + 1 — preserves the packet (ad announcement)
-                 * while giving the muxer a valid DTS. Ad splicers use section-internal
-                 * pts_time, not PES DTS, so clamping is transparent to them.
-                 *
-                 * Note: discont_buffer_flush() adjusts DATA last_sent_dts to the video
-                 * reference when the offset changes, so this comparison is always in
-                 * the correct (rebased) timeline domain. */
-                if (ist_pkt->par->codec_type == AVMEDIA_TYPE_DATA) {
-                    if (sidx < d->discont_buf.nb_streams) {
-                        DiscontinuityStreamState *ss = &d->discont_buf.stream_state[sidx];
-                        if (ss->last_sent_dts != AV_NOPTS_VALUE) {
-                            int64_t dts_us = av_rescale_q(dt.pkt_demux->dts, time_base,
-                                                          AV_TIME_BASE_Q);
-                            if (dts_us <= ss->last_sent_dts) {
-                                int64_t clamped = ss->last_sent_dts + 1;
-                                av_log(ist_pkt, AV_LOG_INFO,
-                                       "[DISCONT-BUF] Clamping stale DATA DTS: %.3fs -> %.3fs "
-                                       "(last_sent=%.3fs)\n",
-                                       (double)dts_us / AV_TIME_BASE,
-                                       (double)clamped / AV_TIME_BASE,
-                                       (double)ss->last_sent_dts / AV_TIME_BASE);
-                                dt.pkt_demux->dts = av_rescale_q(clamped, AV_TIME_BASE_Q,
-                                                                  time_base);
-                                if (dt.pkt_demux->pts != AV_NOPTS_VALUE &&
-                                    dt.pkt_demux->pts < dt.pkt_demux->dts)
-                                    dt.pkt_demux->pts = dt.pkt_demux->dts;
-                                /* Update last_sent_dts so subsequent stale DATA packets
-                                 * get monotonically increasing DTS values */
-                                ss->last_sent_dts = clamped;
-                            }
+            /* DATA streams (SCTE-35): clamp rebased DTS to ensure monotonicity.
+             * Stale old-timeline packets get hugely negative DTS after offset.
+             * Clamp to last_sent_dts + 1 — preserves the packet (ad announcement)
+             * while giving the muxer a valid DTS. Ad splicers use section-internal
+             * pts_time, not PES DTS, so clamping is transparent to them.
+             *
+             * Note: discont_buffer_flush() adjusts DATA last_sent_dts to the video
+             * reference when the offset changes, so this comparison is always in
+             * the correct (rebased) timeline domain. */
+            if (ist_pkt->par->codec_type == AVMEDIA_TYPE_DATA) {
+                int sidx = dt.pkt_demux->stream_index;
+                if (sidx < d->discont_buf.nb_streams) {
+                    DiscontinuityStreamState *ss = &d->discont_buf.stream_state[sidx];
+                    if (ss->last_sent_dts != AV_NOPTS_VALUE) {
+                        int64_t dts_us = av_rescale_q(dt.pkt_demux->dts, time_base,
+                                                      AV_TIME_BASE_Q);
+                        if (dts_us <= ss->last_sent_dts) {
+                            int64_t clamped = ss->last_sent_dts + 1;
+                            av_log(ist_pkt, AV_LOG_INFO,
+                                   "[DISCONT-BUF] Clamping stale DATA DTS: %.3fs -> %.3fs "
+                                   "(last_sent=%.3fs)\n",
+                                   (double)dts_us / AV_TIME_BASE,
+                                   (double)clamped / AV_TIME_BASE,
+                                   (double)ss->last_sent_dts / AV_TIME_BASE);
+                            dt.pkt_demux->dts = av_rescale_q(clamped, AV_TIME_BASE_Q,
+                                                              time_base);
+                            if (dt.pkt_demux->pts != AV_NOPTS_VALUE &&
+                                dt.pkt_demux->pts < dt.pkt_demux->dts)
+                                dt.pkt_demux->pts = dt.pkt_demux->dts;
+                            /* Update last_sent_dts so subsequent stale DATA packets
+                             * get monotonically increasing DTS values */
+                            ss->last_sent_dts = clamped;
                         }
                     }
                 }
-
-                /* Mark packet as having discontinuity correction applied so
-                 * ts_discontinuity_process doesn't double-adjust it */
-                dt.pkt_demux->flags |= AV_PKT_FLAG_DISCONTINUITY;
             }
+
+            /* Mark packet as having discontinuity correction applied so
+             * ts_discontinuity_process doesn't double-adjust it */
+            dt.pkt_demux->flags |= AV_PKT_FLAG_DISCONTINUITY;
         }
 
         /* Drop non-keyframe video packets after discontinuity boundary.
@@ -2057,7 +2038,7 @@ static int input_thread(void *arg)
             if (sidx < d->discont_buf.nb_streams) {
                 DiscontinuityStreamState *ss = &d->discont_buf.stream_state[sidx];
                 int64_t pkt_duration = discont_estimate_pkt_duration(&ds->ist, dt.pkt_demux);
-                int64_t output_dts = ds->last_raw_dts + ss->cumulative_ts_offset;
+                int64_t output_dts = ds->last_raw_dts + d->discont_buf.applied_offset;
                 int64_t output_end = output_dts + pkt_duration;
                 if (output_end > ss->last_sent_dts || ss->last_sent_dts == AV_NOPTS_VALUE)
                     ss->last_sent_dts = output_end;
