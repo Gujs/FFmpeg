@@ -280,8 +280,6 @@ av_cold int swr_init(struct SwrContext *s){
             av_log(s, AV_LOG_WARNING, "jump_comp requires async, enabling async=1\n");
             s->async = 1;
         }
-        s->jump_comp_prev_delta = 0;
-        s->jump_comp_initialized = 0;
     }
 
     if (s->async) {
@@ -945,50 +943,23 @@ int64_t swr_next_pts(struct SwrContext *s, int64_t pts){
     if(s->min_compensation >= FLT_MAX) {
         return (s->outpts = pts - swr_get_delay(s, s->in_sample_rate * (int64_t)s->out_sample_rate));
     } else if (s->jump_comp > 0) {
+        /* Safety-net only: correct when accumulated delta exceeds
+         * min_hard_compensation (default 0.1s). Per-stream discontinuity
+         * offsets in the demuxer now handle splice boundaries, so SWR
+         * sees near-zero delta at those events. This safety net catches
+         * residual drift on channels without discontinuities (19ppm source
+         * clock drift reaches 100ms after ~87 min). */
         int64_t delta = pts - swr_get_delay(s, s->in_sample_rate * (int64_t)s->out_sample_rate) - s->outpts + s->drop_output*(int64_t)s->in_sample_rate;
+        double fdelta = delta / (double)(s->in_sample_rate * (int64_t)s->out_sample_rate);
 
-        if (!s->jump_comp_initialized) {
-            s->jump_comp_prev_delta = delta;
-            s->jump_comp_initialized = 1;
-            av_log(s, AV_LOG_VERBOSE, "jump_comp: baseline delta=%.3f\n",
-                   delta / (double)(s->in_sample_rate * (int64_t)s->out_sample_rate));
-            return s->outpts;
-        }
-
-        {
-            int64_t jump = delta - s->jump_comp_prev_delta;
-            double fjump = jump / (double)(s->in_sample_rate * (int64_t)s->out_sample_rate);
-            double fdelta = delta / (double)(s->in_sample_rate * (int64_t)s->out_sample_rate);
-
-            if (fabs(fjump) > s->jump_comp) {
-                int ret;
-                av_log(s, AV_LOG_INFO, "jump_comp: detected jump of %.3fs, compensating full delta=%.3fs\n", fjump, fdelta);
-                /* Compensate the full delta (not just the jump) to prevent
-                 * residual error from accumulating across events. The jump
-                 * triggers detection, but delta includes any prior drift. */
-                if (delta > 0) ret = swr_inject_silence(s,  delta / s->out_sample_rate);
-                else           ret = swr_drop_output   (s, -delta / s->in_sample_rate);
-                if (ret < 0)
-                    av_log(s, AV_LOG_ERROR, "jump_comp: failed to compensate for jump of %.3fs\n", fjump);
-                /* recompute delta after compensation to establish new baseline */
-                delta = pts - swr_get_delay(s, s->in_sample_rate * (int64_t)s->out_sample_rate) - s->outpts + s->drop_output*(int64_t)s->in_sample_rate;
-                fdelta = delta / (double)(s->in_sample_rate * (int64_t)s->out_sample_rate);
-            } else if (fabs(fdelta) > s->min_hard_compensation) {
-                /* Safety net: if delta exceeds min_hard_comp (default 0.1s)
-                 * without a jump being detected, correct it anyway. This
-                 * caps drift on channels without discontinuity events where
-                 * jump_comp would otherwise never fire. Unlike soft comp,
-                 * this does not track source clock — it only fires when
-                 * the accumulated error becomes perceptible. */
-                int ret;
-                av_log(s, AV_LOG_INFO, "jump_comp: delta %.3fs exceeds hard threshold, correcting (no jump detected)\n", fdelta);
-                if (delta > 0) ret = swr_inject_silence(s,  delta / s->out_sample_rate);
-                else           ret = swr_drop_output   (s, -delta / s->in_sample_rate);
-                if (ret < 0)
-                    av_log(s, AV_LOG_ERROR, "jump_comp: failed to correct accumulated delta of %.3fs\n", fdelta);
-                delta = pts - swr_get_delay(s, s->in_sample_rate * (int64_t)s->out_sample_rate) - s->outpts + s->drop_output*(int64_t)s->in_sample_rate;
-            }
-            s->jump_comp_prev_delta = delta;
+        if (fabs(fdelta) > s->min_hard_compensation) {
+            int ret;
+            av_log(s, AV_LOG_INFO, "jump_comp: delta %.3fs exceeds hard threshold (%.3fs), correcting\n",
+                   fdelta, s->min_hard_compensation);
+            if (delta > 0) ret = swr_inject_silence(s,  delta / s->out_sample_rate);
+            else           ret = swr_drop_output   (s, -delta / s->in_sample_rate);
+            if (ret < 0)
+                av_log(s, AV_LOG_ERROR, "jump_comp: failed to correct delta of %.3fs\n", fdelta);
         }
 
         return s->outpts;
