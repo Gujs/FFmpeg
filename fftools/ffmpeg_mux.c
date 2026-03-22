@@ -491,7 +491,7 @@ int muxer_thread(void *arg)
                     last_video_dts_stream == ost->index) {
                     int64_t dts_gap_us = av_rescale_q(
                         mt.pkt->dts - last_video_dts,
-                        ost->st->time_base, AV_TIME_BASE_Q);
+                        mt.pkt->time_base, AV_TIME_BASE_Q);
                     if (dts_gap_us > 1000000) { /* >1s */
                         av_log(mux, AV_LOG_WARNING,
                                "[OUTPUT-DTS-GAP] Video DTS gap: %.3fs "
@@ -502,7 +502,7 @@ int muxer_thread(void *arg)
                 }
                 last_video_dts = mt.pkt->dts;
                 last_video_dts_stream = ost->index;
-                last_video_dts_tb = ost->st->time_base;
+                last_video_dts_tb = mt.pkt->time_base;
             }
 
             video_pkts_interval++;
@@ -518,7 +518,7 @@ int muxer_thread(void *arg)
             last_write_wc_audio = now;
             if (mt.pkt->dts != AV_NOPTS_VALUE) {
                 last_audio_dts = mt.pkt->dts;
-                last_audio_dts_tb = ost->st->time_base;
+                last_audio_dts_tb = mt.pkt->time_base;
             }
         }
 
