@@ -760,16 +760,19 @@ static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
                 }
             }
 
-            /* Use video offset for all streams; fall back to audio if no video */
-            if (has_vid)
-                buf->applied_offset = vid_offset;
-            else if (has_aud)
+            /* Use audio offset for all streams to eliminate A/V divergence.
+             * Audio gets seamless timestamps; video absorbs the small DTS
+             * error (20-170ms) via CFR dup/drop during the discontinuity
+             * freeze, which is imperceptible. Fall back to video if no audio. */
+            if (has_aud)
                 buf->applied_offset = aud_offset;
+            else if (has_vid)
+                buf->applied_offset = vid_offset;
 
             if (has_vid && has_aud) {
                 av_log(d, AV_LOG_INFO,
-                       "[DISCONT-BUF] Applied offset=%.3fs (from video). "
-                       "Per-stream: vid=%.3fs aud=%.3fs divergence=%.3fs\n",
+                       "[DISCONT-BUF] Applied offset=%.3fs (from audio). "
+                       "Per-stream: vid=%.3fs aud=%.3fs vid_error=%.3fs\n",
                        (double)buf->applied_offset / AV_TIME_BASE,
                        (double)vid_offset / AV_TIME_BASE,
                        (double)aud_offset / AV_TIME_BASE,
