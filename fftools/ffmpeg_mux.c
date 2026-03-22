@@ -427,6 +427,12 @@ int muxer_thread(void *arg)
     /* DTS continuity tracking (first video stream) */
     int64_t    last_video_dts = AV_NOPTS_VALUE;
     int        last_video_dts_stream = -1;
+    AVRational last_video_dts_tb = {0, 1};
+
+    /* A/V sync tracking */
+    int64_t    last_audio_dts = AV_NOPTS_VALUE;
+    AVRational last_audio_dts_tb = {0, 1};
+    int64_t    last_avsync_log_wc = 0;
 
     /* Rate monitoring (10-second windows) */
     int64_t    rate_monitor_start = 0;
@@ -496,6 +502,7 @@ int muxer_thread(void *arg)
                 }
                 last_video_dts = mt.pkt->dts;
                 last_video_dts_stream = ost->index;
+                last_video_dts_tb = ost->st->time_base;
             }
 
             video_pkts_interval++;
@@ -509,6 +516,25 @@ int muxer_thread(void *arg)
                        gap_us / 1000000.0, ost->index);
             }
             last_write_wc_audio = now;
+            if (mt.pkt->dts != AV_NOPTS_VALUE) {
+                last_audio_dts = mt.pkt->dts;
+                last_audio_dts_tb = ost->st->time_base;
+            }
+        }
+
+        /* A/V sync monitor: log offset every 60 seconds */
+        if (last_video_dts != AV_NOPTS_VALUE && last_audio_dts != AV_NOPTS_VALUE) {
+            int64_t now = av_gettime_relative();
+            if (now - last_avsync_log_wc >= 60000000) { /* 60s */
+                double video_sec = last_video_dts * av_q2d(last_video_dts_tb);
+                double audio_sec = last_audio_dts * av_q2d(last_audio_dts_tb);
+                double offset_ms = (video_sec - audio_sec) * 1000.0;
+                double uptime = (now - session_start_wc) / 1000000.0;
+                av_log(mux, AV_LOG_INFO,
+                       "[AV-SYNC] video_dts=%.3fs audio_dts=%.3fs offset=%.3fms uptime=%.0fs\n",
+                       video_sec, audio_sec, offset_ms, uptime);
+                last_avsync_log_wc = now;
+            }
         }
 
         /* Rate monitor: log stats every 10 seconds, only if anomalous */
