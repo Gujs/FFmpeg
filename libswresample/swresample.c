@@ -942,8 +942,12 @@ int64_t swr_next_pts(struct SwrContext *s, int64_t pts){
     if(pts == INT64_MIN)
         return s->outpts;
 
-    if (s->firstpts == AV_NOPTS_VALUE)
+    if (s->firstpts == AV_NOPTS_VALUE) {
         s->outpts = s->firstpts = pts;
+        if (s->jump_comp > 0)
+            av_log(s, AV_LOG_INFO, "jump_comp: outpts reset to %.3fs (filter rebuild)\n",
+                   pts / (double)(s->in_sample_rate * (int64_t)s->out_sample_rate));
+    }
 
     if(s->min_compensation >= FLT_MAX) {
         return (s->outpts = pts - swr_get_delay(s, s->in_sample_rate * (int64_t)s->out_sample_rate));
@@ -963,8 +967,14 @@ int64_t swr_next_pts(struct SwrContext *s, int64_t pts){
                    fdelta, s->min_hard_compensation);
             if (delta > 0) ret = swr_inject_silence(s,  delta / s->out_sample_rate);
             else           ret = swr_drop_output   (s, -delta / s->in_sample_rate);
-            if (ret < 0)
+            if (ret < 0) {
                 av_log(s, AV_LOG_ERROR, "jump_comp: failed to correct delta of %.3fs\n", fdelta);
+            } else {
+                int64_t post_delta = pts - swr_get_delay(s, s->in_sample_rate * (int64_t)s->out_sample_rate)
+                                     - s->outpts + s->drop_output*(int64_t)s->in_sample_rate;
+                double fpost = post_delta / (double)(s->in_sample_rate * (int64_t)s->out_sample_rate);
+                av_log(s, AV_LOG_INFO, "jump_comp: corrected %.3fs -> residual=%.6fs\n", fdelta, fpost);
+            }
         }
 
         return s->outpts;
