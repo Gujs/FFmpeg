@@ -263,13 +263,6 @@ typedef struct OutputFilterPriv {
     // Counter for forcing IDR frames after filter graph reconfiguration.
     // Multiple IDR frames can help flush encoder's lookahead buffer.
     int                     force_keyframe_count;
-
-    // A/V sync correction: lock audio output to video output clock.
-    // Compares audio and video next_pts to detect source clock drift
-    // and corrects audio PTS to stay within 20ms of video.
-    int                     avsync_video_ofp_idx;   // cached video output index, -1 = not found
-    double                  avsync_baseline;        // initial audio-video offset (seconds)
-    int                     avsync_baseline_set;    // whether baseline has been captured
 } OutputFilterPriv;
 
 static OutputFilterPriv *ofp_from_ofilter(OutputFilter *ofilter)
@@ -696,7 +689,6 @@ static OutputFilter *ofilter_alloc(FilterGraph *fg, enum AVMediaType type)
     ofp->color_space  = AVCOL_SPC_UNSPECIFIED;
     ofp->color_range  = AVCOL_RANGE_UNSPECIFIED;
     ofp->alpha_mode   = AVALPHA_MODE_UNSPECIFIED;
-    ofp->avsync_video_ofp_idx = -1;
     ofilter->index    = fg->nb_outputs - 1;
 
     snprintf(ofp->log_name, sizeof(ofp->log_name), "%co%d",
@@ -2985,56 +2977,6 @@ static int fg_output_frame(OutputFilterPriv *ofp, FilterGraphThread *fgt,
                                             ofp->tb_out);
 
             ofp->next_pts = frame->pts + frame->duration;
-
-            /* A/V sync correction: lock audio output to video output clock.
-             * The source audio clock drifts ~19ppm from CFR video's ideal clock.
-             * SWR cannot detect this (both sides track source clock). Compare
-             * audio and video next_pts here (same thread, same FilterGraph)
-             * and correct audio PTS when drift exceeds 20ms. */
-            {
-                FilterGraph *fg = ofp->ofilter.graph;
-                OutputFilterPriv *video_ofp = NULL;
-
-                if (ofp->avsync_video_ofp_idx < 0) {
-                    for (int j = 0; j < fg->nb_outputs; j++) {
-                        if (fg->outputs[j]->type == AVMEDIA_TYPE_VIDEO) {
-                            ofp->avsync_video_ofp_idx = j;
-                            break;
-                        }
-                    }
-                }
-                if (ofp->avsync_video_ofp_idx >= 0)
-                    video_ofp = ofp_from_ofilter(fg->outputs[ofp->avsync_video_ofp_idx]);
-
-                if (video_ofp && video_ofp->next_pts > 0) {
-                    double audio_sec = ofp->next_pts * av_q2d(ofp->tb_out);
-                    double video_sec = video_ofp->next_pts * av_q2d(video_ofp->tb_out);
-                    double offset = audio_sec - video_sec;
-
-                    if (!ofp->avsync_baseline_set ||
-                        fabs(offset - ofp->avsync_baseline) > 2.0) {
-                        ofp->avsync_baseline = offset;
-                        ofp->avsync_baseline_set = 1;
-                    }
-
-                    double drift = offset - ofp->avsync_baseline;
-
-                    if (fabs(drift) > 0.020) {
-                        int64_t correction = av_rescale_q_rnd(
-                            (int64_t)(drift * AV_TIME_BASE),
-                            AV_TIME_BASE_Q, ofp->tb_out,
-                            AV_ROUND_NEAR_INF);
-                        frame->pts -= correction;
-                        ofp->next_pts = frame->pts + frame->duration;
-
-                        av_log(ofp, AV_LOG_INFO,
-                               "[AV-SYNC-FIX] drift=%.3fms, corrected audio PTS by %"PRId64
-                               " (video=%.3fs audio=%.3fs baseline=%.3fs)\n",
-                               drift * 1000.0, correction, video_sec, audio_sec,
-                               ofp->avsync_baseline);
-                    }
-                }
-            }
 
             frame_out = frame;
         }
