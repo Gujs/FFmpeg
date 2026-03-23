@@ -16,6 +16,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
@@ -434,6 +435,15 @@ int muxer_thread(void *arg)
     AVRational last_audio_dts_tb = {0, 1};
     int64_t    last_avsync_log_wc = 0;
 
+    /* A/V sync correction: cumulative DTS adjustment for encoded audio
+     * to compensate for source clock drift (~19ppm). */
+    int64_t    avsync_cumul_correction_us = 0;
+    double     avsync_baseline = 0.0;
+    int        avsync_baseline_set = 0;
+    int        avsync_warmup_count = 0;
+    int64_t    avsync_last_correction_wc = 0;
+    int        avsync_enc_audio_idx = -1;
+
     /* Rate monitoring (10-second windows) */
     int64_t    rate_monitor_start = 0;
     int64_t    video_pkts_interval = 0;
@@ -520,6 +530,8 @@ int muxer_thread(void *arg)
                 last_audio_dts = mt.pkt->dts;
                 last_audio_dts_tb = mt.pkt->time_base;
             }
+            if (avsync_enc_audio_idx < 0 && ost->enc)
+                avsync_enc_audio_idx = ost->index;
         }
 
         /* A/V sync monitor: log offset every 60 seconds */
@@ -555,6 +567,71 @@ int muxer_thread(void *arg)
                 max_gap_interval_us = 0;
                 rate_monitor_start = now;
             }
+        }
+
+        /* A/V sync correction: measure drift and update cumulative correction */
+        if (ost->type == AVMEDIA_TYPE_AUDIO && ost->enc &&
+            mt.pkt->dts != AV_NOPTS_VALUE &&
+            last_video_dts != AV_NOPTS_VALUE &&
+            last_audio_dts != AV_NOPTS_VALUE &&
+            ost->index == avsync_enc_audio_idx) {
+
+            double video_sec = last_video_dts * av_q2d(last_video_dts_tb);
+            double audio_sec = last_audio_dts * av_q2d(last_audio_dts_tb);
+            double cumul_sec = avsync_cumul_correction_us / 1000000.0;
+            double corrected_offset = (video_sec - audio_sec) - cumul_sec;
+
+            if (!avsync_baseline_set) {
+                avsync_warmup_count++;
+                if (avsync_warmup_count >= 100) {
+                    avsync_baseline = corrected_offset;
+                    avsync_baseline_set = 1;
+                    av_log(mux, AV_LOG_INFO,
+                           "[AV-SYNC-CORR] baseline=%.3fms (video=%.3fs audio=%.3fs)\n",
+                           avsync_baseline * 1000.0, video_sec, audio_sec);
+                }
+            } else if (fabs(corrected_offset - avsync_baseline) > 2.0) {
+                av_log(mux, AV_LOG_INFO,
+                       "[AV-SYNC-CORR] baseline reset: was=%.3fms now=%.3fms "
+                       "cumul=%.3fms preserved\n",
+                       avsync_baseline * 1000.0, corrected_offset * 1000.0,
+                       cumul_sec * 1000.0);
+                avsync_baseline_set = 0;
+                avsync_warmup_count = 0;
+            }
+
+            if (avsync_baseline_set) {
+                double drift = corrected_offset - avsync_baseline;
+                int64_t now = av_gettime_relative();
+
+                if (fabs(drift) > 0.020 &&
+                    now - avsync_last_correction_wc >= 5000000) {
+                    double step = drift;
+                    if (step >  0.015) step =  0.015;
+                    if (step < -0.015) step = -0.015;
+
+                    avsync_cumul_correction_us += (int64_t)(step * 1000000.0);
+                    avsync_last_correction_wc = now;
+
+                    av_log(mux, AV_LOG_INFO,
+                           "[AV-SYNC-CORR] drift=%.3fms step=%.3fms "
+                           "cumul=%.3fms (video=%.3fs audio=%.3fs)\n",
+                           drift * 1000.0, step * 1000.0,
+                           avsync_cumul_correction_us / 1000.0,
+                           video_sec, audio_sec);
+                }
+            }
+        }
+
+        /* Apply cumulative A/V sync correction to all encoded audio packets */
+        if (ost->type == AVMEDIA_TYPE_AUDIO && ost->enc &&
+            avsync_cumul_correction_us != 0 &&
+            mt.pkt->dts != AV_NOPTS_VALUE) {
+            int64_t correction_pkt = av_rescale_q(avsync_cumul_correction_us,
+                                                  AV_TIME_BASE_Q, mt.pkt->time_base);
+            mt.pkt->dts += correction_pkt;
+            if (mt.pkt->pts != AV_NOPTS_VALUE)
+                mt.pkt->pts += correction_pkt;
         }
 
         ret = mux_packet_filter(mux, &mt, ost, ret < 0 ? NULL : mt.pkt, &stream_eof);
