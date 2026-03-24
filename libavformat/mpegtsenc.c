@@ -370,24 +370,16 @@ static int64_t scte35_get_splice_time(const uint8_t *buf, int len, int *splice_t
 
 /* Adjust SCTE-35 splice_time to compensate for timestamp rebasing.
  *
- * When transcoding with -avoid_negative_ts or +genpts, output timestamps are rebased
- * but the splice_time inside SCTE-35 messages is not adjusted. This function detects
- * timeline mismatches and adjusts splice_time accordingly.
- *
- * Approach: Compare splice_time to packet PTS. If the difference (preroll) is within
- * a reasonable range (0-60 seconds), the timelines match and no adjustment is needed.
- * If preroll is outside this range, there's a timeline mismatch (e.g., input started
- * at 12 hours, output rebased to 0), and we set splice_time to pkt_pts + 8 seconds.
- *
- * Parameters:
- *   s: format context for logging
- *   buf: SCTE-35 section data (will be modified in place)
- *   len: length of section data
- *   pkt_pts: the packet PTS in 90kHz (already rebased by FFmpeg)
+ * When transcoding with -avoid_negative_ts or discontinuity buffering,
+ * output timestamps are rebased but the splice_time inside SCTE-35
+ * messages is not adjusted. This function detects timeline mismatches
+ * and rebases splice_time using the muxer's mux_ts_offset to preserve
+ * the original preroll exactly.
  *
  * Returns 0 on success, negative on error.
  */
-static int scte35_adjust_pts(AVFormatContext *s, uint8_t *buf, int len, int64_t pkt_pts)
+static int scte35_adjust_pts(AVFormatContext *s, AVStream *st,
+                             uint8_t *buf, int len, int64_t pkt_pts)
 {
     int64_t splice_time, new_splice_time, preroll;
     int splice_time_offset;
@@ -395,8 +387,6 @@ static int scte35_adjust_pts(AVFormatContext *s, uint8_t *buf, int len, int64_t 
 
     /* Maximum reasonable preroll is 60 seconds (typical is 5-30 seconds) */
     const int64_t MAX_PREROLL = 60 * 90000;
-    /* Default preroll when we can't determine the original (8 seconds is common) */
-    const int64_t DEFAULT_PREROLL = 8 * 90000;
     /* 33-bit PTS max value */
     const int64_t PTS_33BIT_MAX = 0x1FFFFFFFFLL;
 
@@ -434,26 +424,47 @@ static int scte35_adjust_pts(AVFormatContext *s, uint8_t *buf, int len, int64_t 
         return 0;
     }
 
-    /* Timeline mismatch detected: splice_time is in a different timeline
-     * than pkt_pts (e.g., input stream started at 12 hours, output rebased to 0).
+    /* Timeline mismatch: splice_time is in the source timeline but pkt_pts
+     * has been rebased (by -avoid_negative_ts or discontinuity buffer).
      *
-     * We can't reliably recover the original preroll because we don't have
-     * access to the input packet PTS before rebasing. Use a default preroll
-     * that's typical for SCTE-35 (8 seconds).
-     *
-     * This ensures Metropolitan and other ad insertion systems can detect
-     * the splice point at a reasonable time relative to the current video. */
-    new_splice_time = pkt_pts + DEFAULT_PREROLL;
+     * Use mux_ts_offset (from avoid_negative_ts) to recover the exact preroll.
+     * mux_ts_offset is ADDED to source timestamps, so:
+     *   pkt_pts = source_pts + mux_ts_offset
+     *   source_pts = pkt_pts - mux_ts_offset
+     *   preroll = splice_time - source_pts = splice_time - pkt_pts + mux_ts_offset
+     *   new_splice_time = pkt_pts + preroll = splice_time + mux_ts_offset */
+    {
+        FFStream *sti = ffstream(st);
+        int64_t mux_offset_90k = av_rescale_q(sti->mux_ts_offset,
+                                               st->time_base,
+                                               (AVRational){1, 90000});
 
-    /* Ensure new_splice_time fits in 33 bits */
-    new_splice_time &= 0x1FFFFFFFFULL;
+        new_splice_time = splice_time + mux_offset_90k;
+        new_splice_time &= 0x1FFFFFFFFULL;
 
-    av_log(s, AV_LOG_INFO, "SCTE-35: Timeline mismatch detected (preroll %.3fs too large). "
-           "Adjusting splice_time %"PRId64" (%.3fs) -> %"PRId64" (%.3fs), using %.1fs preroll\n",
-           preroll / 90000.0,
-           splice_time, splice_time / 90000.0,
-           new_splice_time, new_splice_time / 90000.0,
-           DEFAULT_PREROLL / 90000.0);
+        /* Verify the rebased preroll is reasonable */
+        int64_t rebased_preroll = new_splice_time - pkt_pts;
+        if (rebased_preroll < -MAX_PREROLL)
+            rebased_preroll += PTS_33BIT_MAX + 1;
+
+        if (rebased_preroll < -MAX_PREROLL || rebased_preroll > MAX_PREROLL) {
+            av_log(s, AV_LOG_WARNING,
+                   "SCTE-35: Rebased preroll %.3fs still out of range, "
+                   "splice_time %"PRId64" (%.3fs), mux_offset %.3fs\n",
+                   rebased_preroll / 90000.0,
+                   splice_time, splice_time / 90000.0,
+                   mux_offset_90k / 90000.0);
+            return 0; /* Don't modify if we can't get a valid result */
+        }
+
+        av_log(s, AV_LOG_INFO,
+               "SCTE-35: Rebasing splice_time %"PRId64" (%.3fs) -> %"PRId64
+               " (%.3fs), preroll %.3fs (mux_offset %.3fs)\n",
+               splice_time, splice_time / 90000.0,
+               new_splice_time, new_splice_time / 90000.0,
+               rebased_preroll / 90000.0,
+               mux_offset_90k / 90000.0);
+    }
 
     /* Write new splice_time back (33 bits at splice_time_offset) */
     buf[splice_time_offset] = (buf[splice_time_offset] & 0xFE) | ((new_splice_time >> 32) & 0x01);
@@ -497,7 +508,7 @@ static void mpegts_write_scte35_section(AVFormatContext *s, AVStream *st,
     /* Make a copy of the section data so we can modify splice_time if needed */
     if (len <= (int)sizeof(section_buf)) {
         memcpy(section_buf, buf, len);
-        scte35_adjust_pts(s, section_buf, len, pkt_pts);
+        scte35_adjust_pts(s, st, section_buf, len, pkt_pts);
         write_buf = section_buf;
     } else {
         av_log(s, AV_LOG_WARNING, "SCTE-35: Section too large (%d bytes) for timing adjustment\n", len);
