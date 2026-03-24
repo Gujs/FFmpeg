@@ -41,6 +41,9 @@
 
 #include "libavformat/avformat.h"
 
+#include "libavutil/bswap.h"
+#include "libavutil/crc.h"
+
 /* Discontinuity buffer structures for handling interleaved packets
  * at discontinuity boundaries (e.g., ad splices without discontinuity_indicator) */
 
@@ -1634,6 +1637,132 @@ static int demux_thread_init(DemuxThreadContext *dt)
     return 0;
 }
 
+/**
+ * Rebase SCTE-35 splice_time to match rebased packet timestamps.
+ *
+ * When the discontinuity buffer applies an offset to packet DTS/PTS,
+ * the splice_time inside the SCTE-35 section payload is left unchanged.
+ * This creates a massive preroll mismatch. Fix by adding the same offset
+ * to splice_time and recalculating the CRC.
+ *
+ * Handles splice_insert (0x05) and time_signal (0x06) commands.
+ * Skips encrypted sections and commands without splice_time.
+ */
+static void scte35_rebase_splice_time(Demuxer *d, AVPacket *pkt,
+                                      int64_t applied_offset_us)
+{
+    const uint8_t *buf;
+    uint8_t *wbuf;
+    int len, section_length, splice_command_type, offset, ret;
+    int64_t old_splice_time, new_splice_time, offset_90k;
+    int splice_time_offset = -1;
+    uint32_t crc;
+
+    if (!pkt->data || pkt->size < 15)
+        return;
+
+    buf = pkt->data;
+    len = pkt->size;
+
+    /* table_id must be 0xFC (splice_info_section) */
+    if (buf[0] != 0xFC)
+        return;
+
+    /* Skip encrypted sections */
+    if (buf[4] & 0x80)
+        return;
+
+    section_length = ((buf[1] & 0x0F) << 8) | buf[2];
+    if (section_length + 3 > len)
+        return;
+
+    splice_command_type = buf[13];
+
+    if (splice_command_type == 0x06) {
+        /* time_signal: splice_time() at offset 14 */
+        offset = 14;
+        if (offset + 5 > len)
+            return;
+        if (!(buf[offset] & 0x80)) /* time_specified_flag */
+            return;
+        splice_time_offset = offset;
+    } else if (splice_command_type == 0x05) {
+        /* splice_insert: parse variable-length fields */
+        offset = 14;
+        if (offset + 5 > len)
+            return;
+        offset += 4; /* skip splice_event_id */
+        if (offset >= len)
+            return;
+        if (buf[offset] & 0x80) /* splice_event_cancel_indicator */
+            return;
+        offset++;
+        if (offset >= len)
+            return;
+        int program_splice_flag = (buf[offset] >> 6) & 1;
+        int splice_immediate_flag = (buf[offset] >> 4) & 1;
+        if (!program_splice_flag || splice_immediate_flag)
+            return;
+        offset++;
+        if (offset + 5 > len)
+            return;
+        if (!(buf[offset] & 0x80)) /* time_specified_flag */
+            return;
+        splice_time_offset = offset;
+    } else {
+        return; /* unsupported command type */
+    }
+
+    if (splice_time_offset < 0 || splice_time_offset + 5 > len)
+        return;
+
+    /* Read 33-bit splice_time */
+    old_splice_time = ((int64_t)(buf[splice_time_offset] & 0x01) << 32) |
+                      ((int64_t)buf[splice_time_offset + 1] << 24) |
+                      ((int64_t)buf[splice_time_offset + 2] << 16) |
+                      ((int64_t)buf[splice_time_offset + 3] << 8) |
+                      buf[splice_time_offset + 4];
+
+    /* Convert offset from AV_TIME_BASE (us) to 90kHz ticks */
+    offset_90k = av_rescale(applied_offset_us, 90000, AV_TIME_BASE);
+
+    new_splice_time = (old_splice_time + offset_90k) & 0x1FFFFFFFFLL;
+
+    /* Make packet writable before modifying */
+    ret = av_packet_make_writable(pkt);
+    if (ret < 0)
+        return;
+
+    wbuf = pkt->data;
+
+    /* Write 33-bit splice_time */
+    wbuf[splice_time_offset] = (wbuf[splice_time_offset] & 0xFE) |
+                               ((new_splice_time >> 32) & 0x01);
+    wbuf[splice_time_offset + 1] = (new_splice_time >> 24) & 0xFF;
+    wbuf[splice_time_offset + 2] = (new_splice_time >> 16) & 0xFF;
+    wbuf[splice_time_offset + 3] = (new_splice_time >> 8) & 0xFF;
+    wbuf[splice_time_offset + 4] = new_splice_time & 0xFF;
+
+    /* Zero pts_adjustment (bytes 4-8), preserve encrypted/algorithm bits */
+    wbuf[4] &= 0xFE;
+    wbuf[5] = wbuf[6] = wbuf[7] = wbuf[8] = 0;
+
+    /* Recalculate CRC32 (last 4 bytes) */
+    crc = av_bswap32(av_crc(av_crc_get_table(AV_CRC_32_IEEE), -1,
+                            wbuf, len - 4));
+    wbuf[len - 4] = (crc >> 24) & 0xFF;
+    wbuf[len - 3] = (crc >> 16) & 0xFF;
+    wbuf[len - 2] = (crc >>  8) & 0xFF;
+    wbuf[len - 1] =  crc        & 0xFF;
+
+    av_log(d, AV_LOG_INFO,
+           "[DISCONT-BUF] SCTE-35 splice_time rebased: %.3fs -> %.3fs "
+           "(preroll preserved, offset %.3fs)\n",
+           (double)old_splice_time / 90000.0,
+           (double)new_splice_time / 90000.0,
+           (double)offset_90k / 90000.0);
+}
+
 static int input_thread(void *arg)
 {
     Demuxer   *d = arg;
@@ -1984,6 +2113,15 @@ static int input_thread(void *arg)
                         }
                     }
                 }
+            }
+
+            /* Rebase SCTE-35 splice_time inside the section payload.
+             * DTS/PTS were already adjusted above; now fix the section-internal
+             * splice_time so downstream ad inserters see the original preroll. */
+            if (ist_pkt->par->codec_id == AV_CODEC_ID_SCTE_35 &&
+                dt.pkt_demux->size > 0) {
+                scte35_rebase_splice_time(d, dt.pkt_demux,
+                                          d->discont_buf.applied_offset);
             }
 
             /* Mark packet as having discontinuity correction applied so
