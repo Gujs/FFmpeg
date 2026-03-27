@@ -3120,25 +3120,8 @@ static void reconfig_encoder(AVCodecContext *avctx, const AVFrame *frame)
         }
     }
 
-    /* Pool change: reset encoder to flush internal pipeline.
-     * NVENC's lookahead and B-frame reorder buffers may reference CUDA surfaces
-     * from the old frame pool.  resetEncoder=1 flushes all pending frames and
-     * resets internal state, ensuring no stale references remain.
-     * forceIDR=1 ensures the first frame after reset is an IDR.
-     *
-     * IMPORTANT: encodeConfig MUST be included (not NULL) when resetEncoder=1.
-     * Session 25 found that nvEncReconfigureEncoder crashes with NULL encodeConfig
-     * when resetEncoder is set. We pass the current config unchanged. */
-    if (ctx->pool_change_reset) {
-        params.resetEncoder = 1;
-        params.forceIDR = 1;
-        needs_encode_config = 1;
-        needs_reconfig = 1;
-        ctx->pool_change_reset = 0;
-
-        av_log(avctx, AV_LOG_INFO,
-               "[HW-PATCH] Pool change: resetting encoder (resetEncoder=1, forceIDR=1)\n");
-    }
+    /* Pool changes are now handled by nvenc_rebuild_session() (fix v5).
+     * The resetEncoder=1 path is no longer used for pool changes. */
 
     if (!needs_encode_config)
         params.reInitEncodeParams.encodeConfig = NULL;
@@ -3165,6 +3148,231 @@ static void reconfig_encoder(AVCodecContext *avctx, const AVFrame *frame)
             }
         }
     }
+}
+
+/**
+ * Full NVENC session teardown and rebuild.
+ *
+ * Replaces the resetEncoder=1 approach (fix v4) which left stale registered
+ * frames with mapped>0 after flush — these could never be cleaned up, causing
+ * permanent visual corruption when CUDA reused GPU addresses for new-pool surfaces.
+ *
+ * This function:
+ * 1. Flushes the NVENC pipeline (EOS) and drains all pending output
+ * 2. Force-cleans ALL registered frames (including mapped ones)
+ * 3. Destroys output bitstream buffers and the encoder session
+ * 4. Creates a fresh session with identical parameters
+ * 5. Allocates new bitstream buffers and resets all queues
+ *
+ * Must be called inside a CUDA context (nvenc_push_context already done).
+ */
+static int nvenc_rebuild_session(AVCodecContext *avctx)
+{
+    NvencContext *ctx = avctx->priv_data;
+    NvencDynLoadFunctions *dl_fn = &ctx->nvenc_dload_funcs;
+    NV_ENCODE_API_FUNCTION_LIST *p_nvenc = &dl_fn->nvenc_funcs;
+    NVENCSTATUS nv_status;
+    int i;
+
+    /* Phase 1: Save state that must survive the rebuild */
+    uint64_t saved_output_frame_num = ctx->output_frame_num;
+    int64_t  saved_initial_delay_time = ctx->initial_delay_time;
+    int64_t  saved_last_dts_out = ctx->last_dts_out;
+    int64_t  saved_last_pts_out = ctx->last_pts_out;
+    uint32_t saved_frame_idx_counter = ctx->frame_idx_counter;
+
+    av_log(avctx, AV_LOG_INFO,
+           "[HW-PATCH] NVENC session rebuild starting (output_frame_num=%"PRIu64")\n",
+           saved_output_frame_num);
+
+    /* Phase 2: EOS flush + drain pending output */
+    {
+        NV_ENC_PIC_PARAMS eos_params = { 0 };
+        eos_params.version = NV_ENC_PIC_PARAMS_VER;
+        eos_params.encodePicFlags = NV_ENC_PIC_FLAG_EOS;
+
+        nv_status = p_nvenc->nvEncEncodePicture(ctx->nvencoder, &eos_params);
+        if (nv_status != NV_ENC_SUCCESS)
+            av_log(avctx, AV_LOG_WARNING,
+                   "[HW-PATCH] EOS flush returned %d (non-fatal)\n", nv_status);
+    }
+
+    /* Move all pending → ready */
+    {
+        NvencSurface *tmp_surf;
+        while (av_fifo_read(ctx->output_surface_queue, &tmp_surf, 1) >= 0)
+            av_fifo_write(ctx->output_surface_ready_queue, &tmp_surf, 1);
+    }
+
+    /* Drain all ready surfaces: lock/unlock bitstream, unmap, unref */
+    {
+        NvencSurface *tmp_surf;
+        int drained = 0;
+        while (av_fifo_read(ctx->output_surface_ready_queue, &tmp_surf, 1) >= 0) {
+            NV_ENC_LOCK_BITSTREAM lock_params = { 0 };
+            lock_params.version = NV_ENC_LOCK_BITSTREAM_VER;
+            lock_params.outputBitstream = tmp_surf->output_surface;
+            lock_params.doNotWait = 0;
+
+            nv_status = p_nvenc->nvEncLockBitstream(ctx->nvencoder, &lock_params);
+            if (nv_status == NV_ENC_SUCCESS)
+                p_nvenc->nvEncUnlockBitstream(ctx->nvencoder, tmp_surf->output_surface);
+
+            /* Unmap and unref the input resource */
+            if ((avctx->pix_fmt == AV_PIX_FMT_CUDA || avctx->pix_fmt == AV_PIX_FMT_D3D11) &&
+                tmp_surf->reg_idx >= 0 && tmp_surf->reg_idx < ctx->nb_registered_frames) {
+                if (ctx->registered_frames[tmp_surf->reg_idx].mapped > 0) {
+                    ctx->registered_frames[tmp_surf->reg_idx].mapped--;
+                    if (ctx->registered_frames[tmp_surf->reg_idx].mapped == 0)
+                        p_nvenc->nvEncUnmapInputResource(ctx->nvencoder,
+                            ctx->registered_frames[tmp_surf->reg_idx].in_map.mappedResource);
+                }
+                av_frame_unref(tmp_surf->in_ref);
+                tmp_surf->input_surface = NULL;
+            }
+
+            /* Dequeue the corresponding timestamp */
+            timestamp_queue_dequeue(ctx->timestamp_list);
+            drained++;
+        }
+        if (drained)
+            av_log(avctx, AV_LOG_VERBOSE,
+                   "[HW-PATCH] Drained %d pending surfaces during rebuild\n", drained);
+    }
+
+    /* Phase 3: Force-clean ALL registered frames */
+    if (avctx->pix_fmt == AV_PIX_FMT_CUDA || avctx->pix_fmt == AV_PIX_FMT_D3D11) {
+        int cleaned = 0;
+        for (i = 0; i < ctx->nb_registered_frames; i++) {
+            if (ctx->registered_frames[i].mapped > 0) {
+                p_nvenc->nvEncUnmapInputResource(ctx->nvencoder,
+                    ctx->registered_frames[i].in_map.mappedResource);
+                ctx->registered_frames[i].mapped = 0;
+            }
+            if (ctx->registered_frames[i].regptr) {
+                p_nvenc->nvEncUnregisterResource(ctx->nvencoder,
+                    ctx->registered_frames[i].regptr);
+                cleaned++;
+            }
+            av_buffer_unref(&ctx->registered_frames[i].hw_frames_ref);
+            ctx->registered_frames[i].ptr = NULL;
+            ctx->registered_frames[i].regptr = NULL;
+        }
+        ctx->nb_registered_frames = 0;
+        if (cleaned)
+            av_log(avctx, AV_LOG_VERBOSE,
+                   "[HW-PATCH] Cleaned %d registered frames during rebuild\n", cleaned);
+    }
+
+    /* Phase 4: Destroy output bitstream buffers + encoder session */
+    for (i = 0; i < ctx->nb_surfaces; i++) {
+        if (avctx->pix_fmt != AV_PIX_FMT_CUDA && avctx->pix_fmt != AV_PIX_FMT_D3D11)
+            p_nvenc->nvEncDestroyInputBuffer(ctx->nvencoder, ctx->surfaces[i].input_surface);
+        p_nvenc->nvEncDestroyBitstreamBuffer(ctx->nvencoder, ctx->surfaces[i].output_surface);
+        ctx->surfaces[i].output_surface = NULL;
+        ctx->surfaces[i].input_surface = NULL;
+    }
+
+    p_nvenc->nvEncDestroyEncoder(ctx->nvencoder);
+    ctx->nvencoder = NULL;
+
+    av_log(avctx, AV_LOG_VERBOSE,
+           "[HW-PATCH] Old NVENC session destroyed\n");
+
+    /* Phase 5: Create new session + reinitialize encoder */
+    {
+        int ret = nvenc_open_session(avctx);
+        if (ret < 0) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "[HW-PATCH] Failed to open new NVENC session: %d\n", ret);
+            return ret;
+        }
+    }
+
+    nv_status = p_nvenc->nvEncInitializeEncoder(ctx->nvencoder, &ctx->init_encode_params);
+    if (nv_status != NV_ENC_SUCCESS) {
+        av_log(avctx, AV_LOG_ERROR,
+               "[HW-PATCH] nvEncInitializeEncoder failed during rebuild\n");
+        return nvenc_print_error(avctx, nv_status, "InitializeEncoder failed in rebuild");
+    }
+
+#ifdef NVENC_HAVE_CUSTREAM_PTR
+    if (ctx->cu_stream) {
+        nv_status = p_nvenc->nvEncSetIOCudaStreams(ctx->nvencoder,
+                                                    &ctx->cu_stream, &ctx->cu_stream);
+        if (nv_status != NV_ENC_SUCCESS)
+            av_log(avctx, AV_LOG_WARNING,
+                   "[HW-PATCH] nvEncSetIOCudaStreams failed during rebuild (non-fatal)\n");
+    }
+#endif
+
+    av_log(avctx, AV_LOG_VERBOSE,
+           "[HW-PATCH] New NVENC session created and initialized\n");
+
+    /* Phase 6: Allocate new bitstream buffers + reset queues */
+    for (i = 0; i < ctx->nb_surfaces; i++) {
+        NV_ENC_CREATE_BITSTREAM_BUFFER allocOut = { 0 };
+        allocOut.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
+        NvencSurface *tmp_surface = &ctx->surfaces[i];
+
+        if (avctx->pix_fmt != AV_PIX_FMT_CUDA && avctx->pix_fmt != AV_PIX_FMT_D3D11) {
+            NV_ENC_CREATE_INPUT_BUFFER allocSurf = { 0 };
+            allocSurf.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
+            allocSurf.width = avctx->width;
+            allocSurf.height = avctx->height;
+            allocSurf.bufferFmt = ctx->surfaces[i].format;
+
+            nv_status = p_nvenc->nvEncCreateInputBuffer(ctx->nvencoder, &allocSurf);
+            if (nv_status != NV_ENC_SUCCESS)
+                return nvenc_print_error(avctx, nv_status,
+                    "CreateInputBuffer failed in rebuild");
+            ctx->surfaces[i].input_surface = allocSurf.inputBuffer;
+        }
+
+        nv_status = p_nvenc->nvEncCreateBitstreamBuffer(ctx->nvencoder, &allocOut);
+        if (nv_status != NV_ENC_SUCCESS)
+            return nvenc_print_error(avctx, nv_status,
+                "CreateBitstreamBuffer failed in rebuild");
+        ctx->surfaces[i].output_surface = allocOut.bitstreamBuffer;
+
+        /* Clear any leftover in_ref from drained surfaces */
+        av_frame_unref(ctx->surfaces[i].in_ref);
+        ctx->surfaces[i].reg_idx = -1;
+
+        av_fifo_write(ctx->unused_surface_queue, &tmp_surface, 1);
+    }
+
+    /* Reset all FIFOs — unused_surface_queue already populated above,
+     * but the other three must be empty */
+    av_fifo_reset2(ctx->output_surface_queue);
+    av_fifo_reset2(ctx->output_surface_ready_queue);
+    av_fifo_reset2(ctx->timestamp_list);
+
+    /* Note: unused_surface_queue was written to above; we need to reset it
+     * first and re-populate because it may have had leftover entries */
+    av_fifo_reset2(ctx->unused_surface_queue);
+    for (i = 0; i < ctx->nb_surfaces; i++) {
+        NvencSurface *tmp_surface = &ctx->surfaces[i];
+        av_fifo_write(ctx->unused_surface_queue, &tmp_surface, 1);
+    }
+
+    /* Clean frame_data_array opaque refs */
+    for (i = 0; i < ctx->frame_data_array_nb; i++)
+        av_buffer_unref(&ctx->frame_data_array[i].frame_opaque_ref);
+    ctx->frame_data_array_pos = 0;
+
+    /* Phase 7: Restore saved state */
+    ctx->output_frame_num = saved_output_frame_num;
+    ctx->initial_delay_time = saved_initial_delay_time;
+    ctx->last_dts_out = saved_last_dts_out;
+    ctx->last_pts_out = saved_last_pts_out;
+    ctx->frame_idx_counter = saved_frame_idx_counter;
+
+    av_log(avctx, AV_LOG_INFO,
+           "[HW-PATCH] NVENC session rebuilt (output_frame_num=%"PRIu64")\n",
+           saved_output_frame_num);
+
+    return 0;
 }
 
 #ifdef NVENC_HAVE_HEVC_AND_AV1_MASTERING_METADATA
@@ -3299,17 +3507,13 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
              * as P/B with stale DPB references. */
             ctx->pool_change_force_idr = 1;
 
-            /* Also trigger a full encoder reset via nvEncReconfigureEncoder.
-             * FORCEIDR resets the DPB, but NVENC's internal pipeline (lookahead,
-             * B-frame reorder) may retain references to old-pool CUDA surfaces.
-             * resetEncoder=1 flushes pending frames and resets all internal state.
-             * This addresses permanent corruption that persists after pool changes.
-             *
-             * Previous sessions found issues with encoder reconfig for COLORSPACE
-             * changes (frames in pipeline encoded with wrong VUI params), but
-             * pool changes are different — we don't change any encoding parameters,
-             * just reset the pipeline to clear stale surface references. */
-            ctx->pool_change_reset = 1;
+            /* Trigger full NVENC session teardown/rebuild.
+             * resetEncoder=1 (fix v4) was insufficient: after flush, surfaces in
+             * output queues retain mapped>0, preventing cleanup of their registrations.
+             * When CUDA reuses the same GPU addresses for new-pool surfaces, NVENC
+             * picks up stale mappings → permanent visual corruption on scaled outputs.
+             * Full session rebuild eliminates all registrations cleanly. */
+            ctx->pool_change_rebuild = 1;
 
             if (params_match) {
                 av_log(avctx, AV_LOG_INFO,
@@ -3343,6 +3547,30 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
         res = nvenc_push_context(avctx);
         if (res < 0)
             return res;
+
+        /* Full session rebuild on pool change — return the surface get_free_frame()
+         * already popped, rebuild destroys all surfaces and recreates them,
+         * then re-pop a surface with new bitstream buffers. */
+        if (ctx->pool_change_rebuild) {
+            av_fifo_write(ctx->unused_surface_queue, &in_surf, 1);
+
+            ctx->pool_change_cleanup = 0;  /* rebuild handles everything */
+            int rebuild_ret = nvenc_rebuild_session(avctx);
+            if (rebuild_ret < 0) {
+                av_log(avctx, AV_LOG_ERROR,
+                       "[HW-PATCH] NVENC session rebuild failed: %d\n", rebuild_ret);
+                nvenc_pop_context(avctx);
+                return rebuild_ret;
+            }
+            ctx->pool_change_rebuild = 0;
+
+            /* Re-pop surface — has new bitstream buffer now */
+            in_surf = get_free_frame(ctx);
+            if (!in_surf) {
+                nvenc_pop_context(avctx);
+                return AVERROR(EAGAIN);
+            }
+        }
 
         /* Clean up stale registration entries from old pool after any pool change
          * (both benign swaps and genuine changes). Stale entries reference CUDA
