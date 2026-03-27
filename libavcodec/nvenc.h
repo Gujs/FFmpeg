@@ -347,10 +347,11 @@ typedef struct NvencContext
     // Force FORCEIDR on next frame after pool change
     int pool_change_force_idr;
 
-    // Full encoder reset (nvEncReconfigureEncoder with resetEncoder=1) on pool change.
-    // Flushes NVENC pipeline and resets all internal state including lookahead/B-frame
-    // reorder buffers that may reference old-pool CUDA surfaces.
-    int pool_change_reset;
+    // Full NVENC session teardown/rebuild on pool change.
+    // Destroys and recreates the encoder session to eliminate all stale CUDA surface
+    // registrations.  resetEncoder=1 was insufficient because flushed frames remain
+    // in output queues with mapped>0, preventing cleanup of their registrations.
+    int pool_change_rebuild;
 
     // Clean up stale registrations from old pool (set on any pool change)
     int pool_change_cleanup;
