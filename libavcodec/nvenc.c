@@ -3159,16 +3159,16 @@ static int nvenc_rebuild_session(AVCodecContext *avctx)
     NVENCSTATUS nv_status;
     int i;
 
-    /* Phase 1: Save state that must survive the rebuild */
-    uint64_t saved_output_frame_num = ctx->output_frame_num;
-    int64_t  saved_initial_delay_time = ctx->initial_delay_time;
-    int64_t  saved_last_dts_out = ctx->last_dts_out;
-    int64_t  saved_last_pts_out = ctx->last_pts_out;
+    /* Phase 1: Save state that must survive the rebuild.
+     * output_frame_num and initial_delay_time are NOT preserved — they must
+     * reset to 0 so nvenc_set_timestamp()'s DTS ramp-up code runs for the
+     * first `delay` frames, rebuilding the timestamp queue delay buffer.
+     * Without this, B-frame reordering causes DTS > PTS on every frame. */
     uint32_t saved_frame_idx_counter = ctx->frame_idx_counter;
 
     av_log(avctx, AV_LOG_INFO,
            "[HW-PATCH] NVENC session rebuild starting (output_frame_num=%"PRIu64")\n",
-           saved_output_frame_num);
+           ctx->output_frame_num);
 
     /* Phase 2: EOS flush + drain pending output */
     {
@@ -3346,16 +3346,20 @@ static int nvenc_rebuild_session(AVCodecContext *avctx)
         av_buffer_unref(&ctx->frame_data_array[i].frame_opaque_ref);
     ctx->frame_data_array_pos = 0;
 
-    /* Phase 7: Restore saved state */
-    ctx->output_frame_num = saved_output_frame_num;
-    ctx->initial_delay_time = saved_initial_delay_time;
-    ctx->last_dts_out = saved_last_dts_out;
-    ctx->last_pts_out = saved_last_pts_out;
+    /* Phase 7: Restore saved state + reset DTS tracking.
+     * output_frame_num=0 and initial_delay_time=0 trigger the DTS ramp-up
+     * in nvenc_set_timestamp() — this rebuilds the timestamp delay buffer
+     * for B-frame reordering (delay = frameIntervalP - 1).
+     * last_dts_out/last_pts_out reset because DTS sequence restarts. */
+    ctx->output_frame_num = 0;
+    ctx->initial_delay_time = 0;
+    ctx->last_dts_out = AV_NOPTS_VALUE;
+    ctx->last_pts_out = AV_NOPTS_VALUE;
     ctx->frame_idx_counter = saved_frame_idx_counter;
 
     av_log(avctx, AV_LOG_INFO,
-           "[HW-PATCH] NVENC session rebuilt (output_frame_num=%"PRIu64")\n",
-           saved_output_frame_num);
+           "[HW-PATCH] NVENC session rebuilt (DTS ramp-up will run for %d frames)\n",
+           FFMAX(ctx->encode_config.frameIntervalP - 1, 0));
 
     return 0;
 }
