@@ -154,6 +154,12 @@ typedef struct Demuxer {
     int                   read_started;
     int                   nb_streams_used;
     int                   nb_streams_finished;
+
+    /* Input A/V offset tracking (for muxer PLL reference) */
+    int64_t               input_last_video_dts;  /* Last video DTS (AV_TIME_BASE units) */
+    int64_t               input_last_audio_dts;  /* Last audio DTS (AV_TIME_BASE units) */
+    double                input_av_offset_ema;   /* Smoothed offset (seconds), EMA τ=10s */
+    int64_t               input_av_offset_samples; /* Sample count for EMA init */
 } Demuxer;
 
 typedef struct DemuxThreadContext {
@@ -502,6 +508,34 @@ static int input_packet_process(Demuxer *d, AVPacket *pkt, unsigned *send_flags)
                av_ts2str(pkt->dts), av_ts2timestr(pkt->dts, &pkt->time_base),
                av_ts2str(pkt->duration), av_ts2timestr(pkt->duration, &pkt->time_base),
                av_ts2str(f->ts_offset),  av_ts2timestr(f->ts_offset, &AV_TIME_BASE_Q));
+    }
+
+    /* Track input A/V DTS offset for muxer PLL reference.
+     * Measured AFTER ts_fixup (rebased DTS in AV_TIME_BASE units).
+     * Uses ds->dts which is set by ist_dts_update() inside ts_fixup(). */
+    if (ist->par->codec_type == AVMEDIA_TYPE_VIDEO) {
+        d->input_last_video_dts = ds->dts;
+    } else if (ist->par->codec_type == AVMEDIA_TYPE_AUDIO) {
+        d->input_last_audio_dts = ds->dts;
+    }
+
+    if (d->input_last_video_dts != AV_NOPTS_VALUE &&
+        d->input_last_audio_dts != AV_NOPTS_VALUE) {
+        double offset = (d->input_last_video_dts - d->input_last_audio_dts)
+                        / (double)AV_TIME_BASE;
+
+        /* EMA smoothing: τ=10s at ~75 packets/sec (vid+aud combined) */
+        double alpha = 1.0 / (75.0 * 10.0);
+        if (d->input_av_offset_samples == 0) {
+            d->input_av_offset_ema = offset;
+        } else {
+            d->input_av_offset_ema += alpha * (offset - d->input_av_offset_ema);
+        }
+        d->input_av_offset_samples++;
+
+        /* Publish to InputFile for muxer thread (microseconds) */
+        atomic_store(&f->input_av_offset_us,
+                     (int64_t)(d->input_av_offset_ema * 1000000.0));
     }
 
     return 0;
@@ -2008,6 +2042,11 @@ static Demuxer *demux_alloc(void)
     d->f.index = nb_input_files - 1;
 
     snprintf(d->log_name, sizeof(d->log_name), "in#%d", d->f.index);
+
+    d->input_last_video_dts     = AV_NOPTS_VALUE;
+    d->input_last_audio_dts     = AV_NOPTS_VALUE;
+    d->input_av_offset_ema      = 0.0;
+    d->input_av_offset_samples  = 0;
 
     return d;
 }

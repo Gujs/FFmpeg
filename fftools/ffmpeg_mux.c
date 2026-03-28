@@ -435,20 +435,19 @@ int muxer_thread(void *arg)
     AVRational last_audio_dts_tb = {0, 1};
     int64_t    last_avsync_log_wc = 0;
 
-    /* A/V sync PLL: closed-loop dual-EMA proportional controller.
-     * Measures CORRECTED audio DTS vs video DTS, uses two EMAs:
-     *   fast (τ=60s)  — tracks current offset
-     *   slow (τ=30min) — tracks long-term center (adaptive baseline)
-     * Drift = fast - slow. Only real drift produces a sustained signal;
-     * constant pipeline offsets and jitter are ignored.
-     * Closed-loop: corrections feed back into measurement → self-limiting. */
-    double     pll_fast = 0.0;            /* Fast EMA of corrected offset (τ=60s) */
-    double     pll_slow = 0.0;            /* Slow EMA = adaptive baseline (τ=30min) */
+    /* Input-referenced A/V sync PLL.
+     * Measures output A/V offset, compares to input A/V offset (from demuxer).
+     * The difference = pipeline-induced drift. Correct it proportionally.
+     * No adaptive baseline needed — input offset IS the reference. */
+    double     pll_error_ema = 0.0;       /* Smoothed error: (output_offset - input_offset) */
+    double     pll_error_baseline = 0.0;  /* Initial error (constant pipeline delay) */
+    int        pll_baseline_set = 0;      /* Whether baseline has been captured */
     int64_t    pll_sample_count = 0;      /* Measurement samples collected */
     double     pll_correction_accum = 0.0;/* Sub-tick accumulator (seconds) */
     int64_t    pll_total_ticks = 0;       /* Total audio ticks adjusted */
     int64_t    pll_last_log_wc = 0;       /* Wall-clock of last PLL log */
     int        pll_enc_audio_idx = -1;    /* First encoded audio stream index */
+    int        pll_input_file_idx = (nb_input_files > 0) ? 0 : -1;
 
     /* Rate monitoring (10-second windows) */
     int64_t    rate_monitor_start = 0;
@@ -548,9 +547,13 @@ int muxer_thread(void *arg)
                 double audio_sec = last_audio_dts * av_q2d(last_audio_dts_tb);
                 double offset_ms = (video_sec - audio_sec) * 1000.0;
                 double uptime = (now - session_start_wc) / 1000000.0;
+                double input_offset_ms = 0.0;
+                if (pll_input_file_idx >= 0 && pll_input_file_idx < nb_input_files)
+                    input_offset_ms = atomic_load(&input_files[pll_input_file_idx]->input_av_offset_us) / 1000.0;
                 av_log(mux, AV_LOG_INFO,
-                       "[AV-SYNC] video_dts=%.3fs audio_dts=%.3fs offset=%.3fms uptime=%.0fs\n",
-                       video_sec, audio_sec, offset_ms, uptime);
+                       "[AV-SYNC] video_dts=%.3fs audio_dts=%.3fs offset=%.3fms "
+                       "input_offset=%.3fms uptime=%.0fs\n",
+                       video_sec, audio_sec, offset_ms, input_offset_ms, uptime);
                 last_avsync_log_wc = now;
             }
         }
@@ -575,19 +578,66 @@ int muxer_thread(void *arg)
             }
         }
 
-        /* A/V sync PLL: closed-loop dual-EMA correction.
-         * Step 1: Apply correction from previous state (closed-loop)
-         * Step 2: Measure CORRECTED offset
-         * Step 3: Update dual EMAs and compute drift
-         * Correction feeds back into measurement → self-limiting. */
+        /* Input-referenced A/V sync PLL.
+         * Compares output A/V offset to input A/V offset (from demuxer).
+         * The difference = pipeline-induced drift. Correct proportionally. */
         if (ost->type == AVMEDIA_TYPE_AUDIO && ost->enc &&
             mt.pkt->dts != AV_NOPTS_VALUE &&
             last_video_dts != AV_NOPTS_VALUE) {
 
-            /* Step 1: Apply correction FIRST (closed-loop feedback).
-             * Uses drift computed from PREVIOUS measurement cycle. */
-            if (pll_sample_count >= 1400) {  /* 30s guard */
-                double drift = pll_fast - pll_slow;
+            /* Step 1: Read input A/V offset (atomic, from demuxer thread) */
+            double input_offset = 0.0;
+            if (pll_input_file_idx >= 0 && pll_input_file_idx < nb_input_files) {
+                int64_t input_us = atomic_load(&input_files[pll_input_file_idx]->input_av_offset_us);
+                input_offset = input_us / 1000000.0;
+            }
+
+            /* Step 2: Measure output A/V offset (primary encoded audio only) */
+            if (ost->index == pll_enc_audio_idx) {
+                double video_sec = last_video_dts * av_q2d(last_video_dts_tb);
+                double audio_sec = mt.pkt->dts * av_q2d(mt.pkt->time_base);
+                double output_offset = video_sec - audio_sec;
+
+                /* Step 3: Compute error = output - input */
+                double error = output_offset - input_offset;
+
+                /* EMA smooth the error (τ=60s at ~47 audio packets/sec) */
+                double alpha = 1.0 - exp(-1.0 / (47.0 * 60.0));
+                if (pll_sample_count == 0) {
+                    pll_error_ema = error;
+                } else {
+                    pll_error_ema += alpha * (error - pll_error_ema);
+                }
+                pll_sample_count++;
+
+                /* Capture baseline after 5 min guard (pipeline takes ~2min to fill,
+                 * extra margin for EMA convergence and interleaving jitter).
+                 * Unlike dual-EMA, this baseline is captured once — must be at
+                 * true steady state. 14100 samples ≈ 5 min at 47 pkt/s. */
+                if (!pll_baseline_set && pll_sample_count >= 14100) {
+                    pll_error_baseline = pll_error_ema;
+                    pll_baseline_set = 1;
+                    av_log(mux, AV_LOG_INFO,
+                           "[AV-SYNC-PLL] baseline captured: %.3fms "
+                           "(output=%.3fms input=%.3fms)\n",
+                           pll_error_baseline * 1000.0,
+                           output_offset * 1000.0, input_offset * 1000.0);
+                }
+
+                /* Reset on large step (>5s) — genuine source change */
+                if (pll_baseline_set && fabs(error - pll_error_ema) > 5.0) {
+                    av_log(mux, AV_LOG_INFO,
+                           "[AV-SYNC-PLL] reset: step=%.3fs\n",
+                           error - pll_error_ema);
+                    pll_sample_count = 0;
+                    pll_baseline_set = 0;
+                    pll_error_ema = error;
+                }
+            }
+
+            /* Step 4: Apply correction (after baseline captured) */
+            if (pll_baseline_set) {
+                double drift = pll_error_ema - pll_error_baseline;
 
                 /* Proportional gain: correct at drift/60 per second.
                  * Positive drift → audio falling behind → push audio DTS later.
@@ -610,58 +660,22 @@ int muxer_thread(void *arg)
                 }
             }
 
-            /* Step 2: Measure CORRECTED offset (after correction applied above).
-             * Only on primary encoded audio stream. */
-            if (ost->index == pll_enc_audio_idx) {
-                double video_sec = last_video_dts * av_q2d(last_video_dts_tb);
-                double audio_sec = mt.pkt->dts * av_q2d(mt.pkt->time_base);
-                double offset = video_sec - audio_sec;
-
-                /* Step 3: Update dual EMAs.
-                 * fast (τ=60s): tracks current corrected offset
-                 * slow (τ=30min): adaptive baseline, tracks long-term center */
-                double alpha_fast = 1.0 - exp(-1.0 / (47.0 * 60.0));
-                double alpha_slow = 1.0 - exp(-1.0 / (47.0 * 1800.0));
-
-                if (pll_sample_count == 0) {
-                    pll_fast = offset;
-                    pll_slow = offset;
-                } else {
-                    pll_fast += alpha_fast * (offset - pll_fast);
-                    pll_slow += alpha_slow * (offset - pll_slow);
-                }
-                pll_sample_count++;
-
-                /* Reset on large step (>10s): genuine source change.
-                 * Discontinuity events produce ~2s transient spikes that the
-                 * fast EMA absorbs in a few samples — no reset needed. */
-                if (pll_sample_count > 1400 &&
-                    fabs(offset - pll_fast) > 10.0) {
-                    av_log(mux, AV_LOG_INFO,
-                           "[AV-SYNC-PLL] reset: step=%.3fs "
-                           "(fast=%.3fms raw=%.3fms)\n",
-                           offset - pll_fast,
-                           pll_fast * 1000.0, offset * 1000.0);
-                    pll_sample_count = 0;
-                    pll_fast = offset;
-                    pll_slow = offset;
-                }
-            }
-
             /* PLL log every 60 seconds */
             {
                 int64_t now = av_gettime_relative();
-                if (pll_sample_count >= 1400 &&
-                    now - pll_last_log_wc >= 60000000) {
-                    double drift = pll_fast - pll_slow;
-                    double rate = drift / 60.0;
-                    if (rate >  0.001) rate =  0.001;
-                    if (rate < -0.001) rate = -0.001;
+                if (now - pll_last_log_wc >= 60000000) {
+                    double drift = pll_baseline_set ?
+                                   (pll_error_ema - pll_error_baseline) : 0.0;
                     av_log(mux, AV_LOG_INFO,
-                           "[AV-SYNC-PLL] fast=%.3fms slow=%.3fms "
-                           "drift=%.3fms rate=%.4fms/s total=%"PRId64" ticks\n",
-                           pll_fast * 1000.0, pll_slow * 1000.0,
-                           drift * 1000.0, rate * 1000.0, pll_total_ticks);
+                           "[AV-SYNC-PLL] error=%.3fms baseline=%.3fms "
+                           "drift=%.3fms input=%.3fms total=%"PRId64" ticks\n",
+                           pll_error_ema * 1000.0,
+                           pll_baseline_set ? pll_error_baseline * 1000.0 : 0.0,
+                           drift * 1000.0,
+                           (pll_input_file_idx >= 0 && pll_input_file_idx < nb_input_files ?
+                            atomic_load(&input_files[pll_input_file_idx]->input_av_offset_us) / 1000.0 :
+                            0.0),
+                           pll_total_ticks);
                     pll_last_log_wc = now;
                 }
             }
