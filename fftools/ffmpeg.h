@@ -551,6 +551,11 @@ typedef struct InputFile {
     /* stream groups that ffmpeg is aware of; */
     InputStreamGroup **stream_groups;
     int           nb_stream_groups;
+
+    /* Input A/V DTS offset measured in demuxer thread (microseconds).
+     * Continuously updated via atomic store; muxer reads via atomic load.
+     * Positive = video DTS ahead of audio DTS. */
+    atomic_int_least64_t input_av_offset_us;
 } InputFile;
 
 enum forced_keyframes_const {
