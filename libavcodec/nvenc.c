@@ -3193,13 +3193,6 @@ static int nvenc_rebuild_session(AVCodecContext *avctx)
     NVENCSTATUS nv_status;
     int i;
 
-    /* Phase 1: Save state that must survive the rebuild.
-     * output_frame_num and initial_delay_time are NOT preserved — they must
-     * reset to 0 so nvenc_set_timestamp()'s DTS ramp-up code runs for the
-     * first `delay` frames, rebuilding the timestamp queue delay buffer.
-     * Without this, B-frame reordering causes DTS > PTS on every frame. */
-    uint32_t saved_frame_idx_counter = ctx->frame_idx_counter;
-
     av_log(avctx, AV_LOG_INFO,
            "[HW-PATCH] NVENC session rebuild starting (output_frame_num=%"PRIu64")\n",
            ctx->output_frame_num);
@@ -3389,7 +3382,11 @@ static int nvenc_rebuild_session(AVCodecContext *avctx)
     ctx->initial_delay_time = 0;
     ctx->last_dts_out = AV_NOPTS_VALUE;
     ctx->last_pts_out = AV_NOPTS_VALUE;
-    ctx->frame_idx_counter = saved_frame_idx_counter;
+    /* Reset frame_idx_counter to 0 for a clean start.
+     * A fresh NVENC session receiving large frameIdx values (carried over from
+     * pre-rebuild) may confuse internal reference picture management, causing
+     * periodic single-frame displacement in B-frame GOPs. */
+    ctx->frame_idx_counter = 0;
 
     /* Refresh extradata (SPS/PPS) from the new session.
      * The new NVENC session may generate different SPS/PPS than the original
