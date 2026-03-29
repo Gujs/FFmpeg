@@ -3488,6 +3488,7 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
 
             /* Always clean stale registrations from old pool */
             ctx->pool_change_cleanup = 1;
+            ctx->pool_change_diag_count = 10;
 
             /* Always force IDR on pool change — even when video parameters match.
              * This is essential because the reconfig keyframe from the filter graph
@@ -3544,6 +3545,18 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
             av_fifo_write(ctx->unused_surface_queue, &in_surf, 1);
 
             ctx->pool_change_cleanup = 0;  /* rebuild handles everything */
+
+            /* Synchronize CUDA stream before rebuild to ensure all prior
+             * GPU operations (scale_cuda kernels, etc.) have completed.
+             * After filter graph rebuild, the scale_cuda kernel writes to
+             * GPU surfaces that CUDA may have reused from the freed pool.
+             * Without sync, NVENC could register/read a surface whose
+             * kernel write is still in-flight on the stream. */
+            if (ctx->cu_stream) {
+                CudaFunctions *cu = dl_fn->cuda_dl;
+                CHECK_CU(cu->cuStreamSynchronize(ctx->cu_stream));
+            }
+
             int rebuild_ret = nvenc_rebuild_session(avctx);
             if (rebuild_ret < 0) {
                 av_log(avctx, AV_LOG_ERROR,
@@ -3593,6 +3606,22 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
         reconfig_encoder(avctx, frame);
 
         res = nvenc_upload_frame(avctx, frame, in_surf);
+
+        /* Diagnostic: log GPU address and registration details for first
+         * 10 frames after a pool change to trace stale-data issues. */
+        if (ctx->pool_change_diag_count > 0) {
+            AVHWFramesContext *hwfc = frame->hw_frames_ctx ?
+                (AVHWFramesContext *)frame->hw_frames_ctx->data : NULL;
+            av_log(avctx, AV_LOG_INFO,
+                   "[HW-DIAG] frame=%"PRIu64" PTS=%"PRId64" gpu_addr=%p "
+                   "pool=%p (%dx%d) reg_idx=%d pitch=%d\n",
+                   ctx->output_frame_num, frame->pts,
+                   frame->data[0],
+                   hwfc ? (void *)frame->hw_frames_ctx->data : NULL,
+                   hwfc ? hwfc->width : 0, hwfc ? hwfc->height : 0,
+                   in_surf->reg_idx, frame->linesize[0]);
+            ctx->pool_change_diag_count--;
+        }
 
         res2 = nvenc_pop_context(avctx);
         if (res2 < 0)
