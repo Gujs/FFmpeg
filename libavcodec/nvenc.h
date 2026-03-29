@@ -356,6 +356,9 @@ typedef struct NvencContext
     // Clean up stale registrations from old pool (set on any pool change)
     int pool_change_cleanup;
 
+    // Diagnostic: log N frames after pool change to trace GPU addresses
+    int pool_change_diag_count;
+
     // Track last DTS/PTS for detecting non-monotonic timestamps (diagnostic)
     int64_t last_dts_out;
     int64_t last_pts_out;
