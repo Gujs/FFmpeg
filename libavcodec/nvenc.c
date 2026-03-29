@@ -3391,6 +3391,18 @@ static int nvenc_rebuild_session(AVCodecContext *avctx)
     ctx->last_pts_out = AV_NOPTS_VALUE;
     ctx->frame_idx_counter = saved_frame_idx_counter;
 
+    /* Refresh extradata (SPS/PPS) from the new session.
+     * The new NVENC session may generate different SPS/PPS than the original
+     * (e.g., if pool dimensions changed due to FFALIGN differences).
+     * With repeatSPSPPS=1, the in-band headers will be correct, but some
+     * muxer code paths use avctx->extradata — keep it in sync. */
+    {
+        int ed_ret = nvenc_setup_extradata(avctx);
+        if (ed_ret < 0)
+            av_log(avctx, AV_LOG_WARNING,
+                   "[HW-PATCH] Failed to refresh extradata after rebuild: %d\n", ed_ret);
+    }
+
     av_log(avctx, AV_LOG_INFO,
            "[HW-PATCH] NVENC session rebuilt (DTS ramp-up will run for %d frames)\n",
            FFMAX(ctx->encode_config.frameIntervalP - 1, 0));
@@ -3522,7 +3534,7 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
 
             /* Always clean stale registrations from old pool */
             ctx->pool_change_cleanup = 1;
-            ctx->pool_change_diag_count = 10;
+            ctx->pool_change_diag_count = 5;
 
             /* Always force IDR on pool change — even when video parameters match.
              * This is essential because the reconfig keyframe from the filter graph
@@ -3641,19 +3653,42 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
 
         res = nvenc_upload_frame(avctx, frame, in_surf);
 
-        /* Diagnostic: log GPU address and registration details for first
-         * 10 frames after a pool change to trace stale-data issues. */
+        /* Diagnostic: log GPU address, registration details, and pixel sample
+         * for first 5 frames after a pool change to verify frame content. */
         if (ctx->pool_change_diag_count > 0) {
             AVHWFramesContext *hwfc = frame->hw_frames_ctx ?
                 (AVHWFramesContext *)frame->hw_frames_ctx->data : NULL;
+
+            /* Read 4 luma bytes from center of frame to verify content changes.
+             * Stale/displaced data would show identical values across frames. */
+            uint8_t luma_sample[4] = {0};
+            if (frame->data[0] && avctx->height > 0 && frame->linesize[0] > 0) {
+                CudaFunctions *cu = dl_fn->cuda_dl;
+                /* srcDevice includes horizontal byte offset (no srcX field) */
+                CUDA_MEMCPY2D cpy = {
+                    .srcMemoryType = CU_MEMORYTYPE_DEVICE,
+                    .srcDevice     = (CUdeviceptr)frame->data[0] + (avctx->width / 2),
+                    .srcPitch      = frame->linesize[0],
+                    .srcY          = avctx->height / 2,
+                    .dstMemoryType = CU_MEMORYTYPE_HOST,
+                    .dstHost       = luma_sample,
+                    .dstPitch      = 4,
+                    .WidthInBytes  = 4,
+                    .Height        = 1,
+                };
+                cu->cuMemcpy2D(&cpy);
+            }
+
             av_log(avctx, AV_LOG_INFO,
-                   "[HW-DIAG] frame=%"PRIu64" PTS=%"PRId64" gpu_addr=%p "
-                   "pool=%p (%dx%d) reg_idx=%d pitch=%d\n",
-                   ctx->output_frame_num, frame->pts,
+                   "[HW-DIAG] PTS=%"PRId64" gpu=%p pool=%p (%dx%d) "
+                   "reg=%d pitch=%d luma=[%02x %02x %02x %02x]\n",
+                   frame->pts,
                    frame->data[0],
                    hwfc ? (void *)frame->hw_frames_ctx->data : NULL,
                    hwfc ? hwfc->width : 0, hwfc ? hwfc->height : 0,
-                   in_surf->reg_idx, frame->linesize[0]);
+                   in_surf->reg_idx, frame->linesize[0],
+                   luma_sample[0], luma_sample[1],
+                   luma_sample[2], luma_sample[3]);
             ctx->pool_change_diag_count--;
         }
 
