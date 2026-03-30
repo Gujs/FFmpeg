@@ -3529,46 +3529,22 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
                                 new_hwfc->width     == ctx->last_hw_width     &&
                                 new_hwfc->height    == ctx->last_hw_height);
 
-            /* Always clean stale registrations from old pool */
-            ctx->pool_change_cleanup = 1;
+            /* Full session rebuild on every pool change.
+             * NVENC's driver caches internal state by (width, height, format).
+             * The pool height toggle in scale_cuda ensures dimensions genuinely
+             * change on each filter graph reconfig, so this always triggers. */
+            ctx->pool_change_rebuild = 1;
+            ctx->pool_change_force_idr = 1;
             ctx->pool_change_diag_count = 5;
 
-            /* Always force IDR on pool change — even when video parameters match.
-             * This is essential because the reconfig keyframe from the filter graph
-             * may arrive on a cfr-duplicated frame (old pool), not on the first
-             * new-pool frame.  Without this, the new-pool frame would be encoded
-             * as P/B with stale DPB references. */
-            ctx->pool_change_force_idr = 1;
-
-            if (params_match) {
-                /* Pool pointer changed but dimensions/format identical.
-                 * EOS-flush pending frames to unmap all surfaces, then clean
-                 * ALL old-pool registrations. Session stays alive.
-                 * Without flush, B-frame reorder buffer holds 2-3 mapped surfaces
-                 * from the old pool that can't be cleaned — they pile up across
-                 * reconfigs and may cause NVENC driver to reference stale mappings
-                 * for same-dimension pools (fix v7). */
-                ctx->pool_change_flush = 1;
-                av_log(avctx, AV_LOG_INFO,
-                       "[HW-PATCH] Pool pointer changed (old=%p new=%p), video "
-                       "parameters identical (%dx%d %s) - flush + IDR (no rebuild)\n",
-                       ctx->last_hw_frames_ctx, frame->hw_frames_ctx->data,
-                       new_hwfc->width, new_hwfc->height,
-                       av_get_pix_fmt_name(new_hwfc->sw_format));
-            } else {
-                /* Genuine parameter change — full session rebuild required.
-                 * The encoder config (encodeWidth/Height) may no longer match
-                 * the new pool dimensions. */
-                ctx->pool_change_rebuild = 1;
-                av_log(avctx, AV_LOG_WARNING,
-                       "[HW-PATCH] Genuine frame pool change detected "
-                       "(old=%p new=%p, %dx%d %s -> %dx%d %s) - forcing IDR + rebuild\n",
-                       ctx->last_hw_frames_ctx, frame->hw_frames_ctx->data,
-                       ctx->last_hw_width, ctx->last_hw_height,
-                       av_get_pix_fmt_name(ctx->last_hw_sw_format),
-                       new_hwfc->width, new_hwfc->height,
-                       av_get_pix_fmt_name(new_hwfc->sw_format));
-            }
+            av_log(avctx, AV_LOG_INFO,
+                   "[HW-PATCH] Frame pool change detected "
+                   "(old=%p new=%p, %dx%d %s -> %dx%d %s) - rebuild + IDR\n",
+                   ctx->last_hw_frames_ctx, frame->hw_frames_ctx->data,
+                   ctx->last_hw_width, ctx->last_hw_height,
+                   av_get_pix_fmt_name(ctx->last_hw_sw_format),
+                   new_hwfc->width, new_hwfc->height,
+                   av_get_pix_fmt_name(new_hwfc->sw_format));
 
             /* Update pool tracking (pointer and video parameters) */
             ctx->last_hw_frames_ctx = frame->hw_frames_ctx->data;
@@ -3591,19 +3567,6 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
         if (ctx->pool_change_rebuild) {
             av_fifo_write(ctx->unused_surface_queue, &in_surf, 1);
 
-            ctx->pool_change_cleanup = 0;  /* rebuild handles everything */
-
-            /* Synchronize CUDA stream before rebuild to ensure all prior
-             * GPU operations (scale_cuda kernels, etc.) have completed.
-             * After filter graph rebuild, the scale_cuda kernel writes to
-             * GPU surfaces that CUDA may have reused from the freed pool.
-             * Without sync, NVENC could register/read a surface whose
-             * kernel write is still in-flight on the stream. */
-            if (ctx->cu_stream) {
-                CudaFunctions *cu = dl_fn->cuda_dl;
-                CHECK_CU(cu->cuStreamSynchronize(ctx->cu_stream));
-            }
-
             int rebuild_ret = nvenc_rebuild_session(avctx);
             if (rebuild_ret < 0) {
                 av_log(avctx, AV_LOG_ERROR,
@@ -3621,130 +3584,10 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
             }
         }
 
-        /* EOS-flush for identical-param pool changes: drain pending frames from
-         * NVENC's B-frame reorder buffer, unmap all surfaces, unregister ALL
-         * old-pool entries.  This ensures no old-pool mappings exist when the
-         * first new-pool frame is registered.  Session stays alive.
-         * Also resets DTS state so the ramp-up runs cleanly for the new IDR. */
-        if (ctx->pool_change_flush) {
-            NV_ENC_PIC_PARAMS eos_params = { 0 };
-            eos_params.version = NV_ENC_PIC_PARAMS_VER;
-            eos_params.encodePicFlags = NV_ENC_PIC_FLAG_EOS;
-            p_nvenc->nvEncEncodePicture(ctx->nvencoder, &eos_params);
-
-            /* Move pending → ready, then drain all */
-            {
-                NvencSurface *tmp_surf;
-                while (av_fifo_read(ctx->output_surface_queue, &tmp_surf, 1) >= 0)
-                    av_fifo_write(ctx->output_surface_ready_queue, &tmp_surf, 1);
-            }
-            {
-                NvencSurface *tmp_surf;
-                int drained = 0;
-                while (av_fifo_read(ctx->output_surface_ready_queue, &tmp_surf, 1) >= 0) {
-                    NV_ENC_LOCK_BITSTREAM lock_params = { 0 };
-                    lock_params.version = NV_ENC_LOCK_BITSTREAM_VER;
-                    lock_params.outputBitstream = tmp_surf->output_surface;
-                    lock_params.doNotWait = 0;
-
-                    NVENCSTATUS nv_st = p_nvenc->nvEncLockBitstream(ctx->nvencoder, &lock_params);
-                    if (nv_st == NV_ENC_SUCCESS)
-                        p_nvenc->nvEncUnlockBitstream(ctx->nvencoder, tmp_surf->output_surface);
-
-                    if ((avctx->pix_fmt == AV_PIX_FMT_CUDA || avctx->pix_fmt == AV_PIX_FMT_D3D11) &&
-                        tmp_surf->reg_idx >= 0 && tmp_surf->reg_idx < ctx->nb_registered_frames) {
-                        if (ctx->registered_frames[tmp_surf->reg_idx].mapped > 0) {
-                            ctx->registered_frames[tmp_surf->reg_idx].mapped--;
-                            if (ctx->registered_frames[tmp_surf->reg_idx].mapped == 0)
-                                p_nvenc->nvEncUnmapInputResource(ctx->nvencoder,
-                                    ctx->registered_frames[tmp_surf->reg_idx].in_map.mappedResource);
-                        }
-                        av_frame_unref(tmp_surf->in_ref);
-                        tmp_surf->input_surface = NULL;
-                    }
-                    timestamp_queue_dequeue(ctx->timestamp_list);
-                    av_fifo_write(ctx->unused_surface_queue, &tmp_surf, 1);
-                    drained++;
-                }
-                av_log(avctx, AV_LOG_INFO,
-                       "[HW-PATCH] Pool change flush: drained %d pending frames\n", drained);
-            }
-
-            /* Now ALL registrations should be unmapped — clean them ALL */
-            {
-                int cleaned = 0;
-                for (int j = 0; j < ctx->nb_registered_frames; j++) {
-                    if (ctx->registered_frames[j].regptr) {
-                        if (ctx->registered_frames[j].mapped > 0)
-                            p_nvenc->nvEncUnmapInputResource(ctx->nvencoder,
-                                ctx->registered_frames[j].in_map.mappedResource);
-                        p_nvenc->nvEncUnregisterResource(ctx->nvencoder,
-                            ctx->registered_frames[j].regptr);
-                        ctx->registered_frames[j].mapped = 0;
-                        ctx->registered_frames[j].ptr = NULL;
-                        ctx->registered_frames[j].regptr = NULL;
-                        av_buffer_unref(&ctx->registered_frames[j].hw_frames_ref);
-                        cleaned++;
-                    }
-                }
-                ctx->nb_registered_frames = 0;
-                av_log(avctx, AV_LOG_INFO,
-                       "[HW-PATCH] Pool change flush: cleaned %d registrations\n", cleaned);
-            }
-
-            /* Reset all encode state for clean ramp-up after IDR.
-             * frame_idx_counter MUST be 0 — NVENC's internal reference picture
-             * management uses frameIdx for B-frame ordering. Continuing with
-             * large values after EOS+IDR causes periodic single-frame
-             * displacement (1-2 per GOP).
-             * timestamp_list explicitly cleared to prevent residual entries
-             * from poisoning DTS ramp-up computation. */
-            ctx->output_frame_num = 0;
-            ctx->initial_delay_time = 0;
-            ctx->last_dts_out = AV_NOPTS_VALUE;
-            ctx->last_pts_out = AV_NOPTS_VALUE;
-            ctx->frame_idx_counter = 0;
-            av_fifo_reset2(ctx->timestamp_list);
-
-            ctx->pool_change_flush = 0;
-            ctx->pool_change_cleanup = 0;  /* flush cleaned everything */
-
-            /* Return the surface we popped and re-pop a fresh one */
-            av_fifo_write(ctx->unused_surface_queue, &in_surf, 1);
-            in_surf = get_free_frame(ctx);
-            if (!in_surf) {
-                nvenc_pop_context(avctx);
-                return AVERROR(EAGAIN);
-            }
-        }
-
-        /* Clean up stale registration entries from old pool after any pool change
-         * (both benign swaps and genuine changes). Stale entries reference CUDA
-         * surfaces in the old pool that will never be reused.
-         * Must be inside CUDA context because nvEncUnregisterResource requires it. */
-        if (ctx->pool_change_cleanup && frame->hw_frames_ctx) {
-            int stale_count = 0;
-            for (int j = 0; j < ctx->nb_registered_frames; j++) {
-                if (ctx->registered_frames[j].regptr &&
-                    !ctx->registered_frames[j].mapped &&
-                    ctx->registered_frames[j].hw_frames_ref &&
-                    ctx->registered_frames[j].hw_frames_ref->data != frame->hw_frames_ctx->data) {
-                    NVENCSTATUS nv_st = p_nvenc->nvEncUnregisterResource(
-                        ctx->nvencoder, ctx->registered_frames[j].regptr);
-                    if (nv_st != NV_ENC_SUCCESS)
-                        av_log(avctx, AV_LOG_WARNING,
-                               "[HW-PATCH] Failed to unregister stale frame %d\n", j);
-                    ctx->registered_frames[j].ptr = NULL;
-                    ctx->registered_frames[j].regptr = NULL;
-                    av_buffer_unref(&ctx->registered_frames[j].hw_frames_ref);
-                    stale_count++;
-                }
-            }
-            if (stale_count)
-                av_log(avctx, AV_LOG_VERBOSE,
-                       "[HW-PATCH] Cleaned up %d stale registration entries from old pool\n",
-                       stale_count);
-            ctx->pool_change_cleanup = 0;
+        /* Rebuild handles all cleanup — no separate stale cleanup needed.
+         * The pool height toggle in scale_cuda ensures dimensions always change,
+         * so every pool change triggers the rebuild path above. */
+        if (0) {
         }
 
         reconfig_encoder(avctx, frame);

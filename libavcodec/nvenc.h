@@ -347,17 +347,8 @@ typedef struct NvencContext
     // Force FORCEIDR on next frame after pool change
     int pool_change_force_idr;
 
-    // Full NVENC session teardown/rebuild on pool change.
-    // Destroys and recreates the encoder session to eliminate all stale CUDA surface
-    // registrations.  resetEncoder=1 was insufficient because flushed frames remain
-    // in output queues with mapped>0, preventing cleanup of their registrations.
+    // Full NVENC session teardown/rebuild on pool change
     int pool_change_rebuild;
-
-    // EOS-flush pending frames to unmap all old-pool surfaces (identical-param changes)
-    int pool_change_flush;
-
-    // Clean up stale registrations from old pool (set on any pool change)
-    int pool_change_cleanup;
 
     // Diagnostic: log N frames after pool change to trace GPU addresses
     int pool_change_diag_count;
