@@ -3692,11 +3692,19 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
                        "[HW-PATCH] Pool change flush: cleaned %d registrations\n", cleaned);
             }
 
-            /* Reset DTS state for clean ramp-up after IDR */
+            /* Reset all encode state for clean ramp-up after IDR.
+             * frame_idx_counter MUST be 0 — NVENC's internal reference picture
+             * management uses frameIdx for B-frame ordering. Continuing with
+             * large values after EOS+IDR causes periodic single-frame
+             * displacement (1-2 per GOP).
+             * timestamp_list explicitly cleared to prevent residual entries
+             * from poisoning DTS ramp-up computation. */
             ctx->output_frame_num = 0;
             ctx->initial_delay_time = 0;
             ctx->last_dts_out = AV_NOPTS_VALUE;
             ctx->last_pts_out = AV_NOPTS_VALUE;
+            ctx->frame_idx_counter = 0;
+            av_fifo_reset2(ctx->timestamp_list);
 
             ctx->pool_change_flush = 0;
             ctx->pool_change_cleanup = 0;  /* flush cleaned everything */
