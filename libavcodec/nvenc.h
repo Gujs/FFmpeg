@@ -348,6 +348,9 @@ typedef struct NvencContext
     // in output queues with mapped>0, preventing cleanup of their registrations.
     int pool_change_rebuild;
 
+    // EOS-flush pending frames to unmap all old-pool surfaces (identical-param changes)
+    int pool_change_flush;
+
     // Clean up stale registrations from old pool (set on any pool change)
     int pool_change_cleanup;
 
