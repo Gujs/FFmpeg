@@ -138,6 +138,18 @@ static av_cold int cudascale_init(AVFilterContext *ctx)
     return 0;
 }
 
+/* Pool height padding toggle for NVENC compatibility.
+ * NVENC's driver caches internal state by (width, height, format). When a filter
+ * graph reconfiguration creates a new pool with identical dimensions, the driver
+ * reuses stale cached mappings → permanent B-frame ordering corruption on outputs
+ * that don't change dimensions (all scaled outputs).
+ * Fix: alternate the pool height by ±32 on each filter graph teardown/rebuild
+ * cycle. This forces genuinely different pool dimensions each time, causing
+ * NVENC to invalidate its internal cache.
+ * Toggle once per teardown cycle (first uninit sets it, subsequent are no-ops). */
+static int pool_height_pad = 0;
+static int pool_teardown_toggled = 0;
+
 static av_cold void cudascale_uninit(AVFilterContext *ctx)
 {
     CUDAScaleContext *s = ctx->priv;
@@ -152,6 +164,12 @@ static av_cold void cudascale_uninit(AVFilterContext *ctx)
         CHECK_CU(cu->cuCtxPopCurrent(&dummy));
     }
 
+    /* Toggle pool height padding once per teardown cycle */
+    if (!pool_teardown_toggled) {
+        pool_height_pad = pool_height_pad ? 0 : 32;
+        pool_teardown_toggled = 1;
+    }
+
     av_frame_free(&s->frame);
     av_buffer_unref(&s->frames_ctx);
     av_frame_free(&s->tmp_frame);
@@ -163,6 +181,9 @@ static av_cold int init_hwframe_ctx(CUDAScaleContext *s, AVBufferRef *device_ctx
     AVHWFramesContext *out_ctx;
     int ret;
 
+    /* Reset teardown toggle — new graph config cycle starting */
+    pool_teardown_toggled = 0;
+
     out_ref = av_hwframe_ctx_alloc(device_ctx);
     if (!out_ref)
         return AVERROR(ENOMEM);
@@ -171,7 +192,7 @@ static av_cold int init_hwframe_ctx(CUDAScaleContext *s, AVBufferRef *device_ctx
     out_ctx->format    = AV_PIX_FMT_CUDA;
     out_ctx->sw_format = s->out_fmt;
     out_ctx->width     = FFALIGN(width,  32);
-    out_ctx->height    = FFALIGN(height, 32);
+    out_ctx->height    = FFALIGN(height, 32) + pool_height_pad;
 
     ret = av_hwframe_ctx_init(out_ref);
     if (ret < 0)
