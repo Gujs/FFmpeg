@@ -3540,25 +3540,27 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
              * as P/B with stale DPB references. */
             ctx->pool_change_force_idr = 1;
 
-            /* Trigger full NVENC session teardown/rebuild.
-             * resetEncoder=1 (fix v4) was insufficient: after flush, surfaces in
-             * output queues retain mapped>0, preventing cleanup of their registrations.
-             * When CUDA reuses the same GPU addresses for new-pool surfaces, NVENC
-             * picks up stale mappings → permanent visual corruption on scaled outputs.
-             * Full session rebuild eliminates all registrations cleanly. */
-            ctx->pool_change_rebuild = 1;
-
             if (params_match) {
+                /* Pool pointer changed but dimensions/format identical.
+                 * Do NOT rebuild the session — just force IDR + clean stale
+                 * registrations. The encoder can continue encoding with new-pool
+                 * surfaces that have identical layout.
+                 * Full session rebuild for identical params was causing permanent
+                 * frame ordering corruption on scaled outputs (fix v5 → v6). */
                 av_log(avctx, AV_LOG_INFO,
                        "[HW-PATCH] Pool pointer changed (old=%p new=%p), video "
-                       "parameters identical (%dx%d %s) - forcing IDR for safety\n",
+                       "parameters identical (%dx%d %s) - IDR + cleanup (no rebuild)\n",
                        ctx->last_hw_frames_ctx, frame->hw_frames_ctx->data,
                        new_hwfc->width, new_hwfc->height,
                        av_get_pix_fmt_name(new_hwfc->sw_format));
             } else {
+                /* Genuine parameter change — full session rebuild required.
+                 * The encoder config (encodeWidth/Height) may no longer match
+                 * the new pool dimensions. */
+                ctx->pool_change_rebuild = 1;
                 av_log(avctx, AV_LOG_WARNING,
                        "[HW-PATCH] Genuine frame pool change detected "
-                       "(old=%p new=%p, %dx%d %s -> %dx%d %s) - forcing IDR\n",
+                       "(old=%p new=%p, %dx%d %s -> %dx%d %s) - forcing IDR + rebuild\n",
                        ctx->last_hw_frames_ctx, frame->hw_frames_ctx->data,
                        ctx->last_hw_width, ctx->last_hw_height,
                        av_get_pix_fmt_name(ctx->last_hw_sw_format),
