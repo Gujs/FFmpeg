@@ -3542,14 +3542,16 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
 
             if (params_match) {
                 /* Pool pointer changed but dimensions/format identical.
-                 * Do NOT rebuild the session — just force IDR + clean stale
-                 * registrations. The encoder can continue encoding with new-pool
-                 * surfaces that have identical layout.
-                 * Full session rebuild for identical params was causing permanent
-                 * frame ordering corruption on scaled outputs (fix v5 → v6). */
+                 * EOS-flush pending frames to unmap all surfaces, then clean
+                 * ALL old-pool registrations. Session stays alive.
+                 * Without flush, B-frame reorder buffer holds 2-3 mapped surfaces
+                 * from the old pool that can't be cleaned — they pile up across
+                 * reconfigs and may cause NVENC driver to reference stale mappings
+                 * for same-dimension pools (fix v7). */
+                ctx->pool_change_flush = 1;
                 av_log(avctx, AV_LOG_INFO,
                        "[HW-PATCH] Pool pointer changed (old=%p new=%p), video "
-                       "parameters identical (%dx%d %s) - IDR + cleanup (no rebuild)\n",
+                       "parameters identical (%dx%d %s) - flush + IDR (no rebuild)\n",
                        ctx->last_hw_frames_ctx, frame->hw_frames_ctx->data,
                        new_hwfc->width, new_hwfc->height,
                        av_get_pix_fmt_name(new_hwfc->sw_format));
@@ -3612,6 +3614,95 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
             ctx->pool_change_rebuild = 0;
 
             /* Re-pop surface — has new bitstream buffer now */
+            in_surf = get_free_frame(ctx);
+            if (!in_surf) {
+                nvenc_pop_context(avctx);
+                return AVERROR(EAGAIN);
+            }
+        }
+
+        /* EOS-flush for identical-param pool changes: drain pending frames from
+         * NVENC's B-frame reorder buffer, unmap all surfaces, unregister ALL
+         * old-pool entries.  This ensures no old-pool mappings exist when the
+         * first new-pool frame is registered.  Session stays alive.
+         * Also resets DTS state so the ramp-up runs cleanly for the new IDR. */
+        if (ctx->pool_change_flush) {
+            NV_ENC_PIC_PARAMS eos_params = { 0 };
+            eos_params.version = NV_ENC_PIC_PARAMS_VER;
+            eos_params.encodePicFlags = NV_ENC_PIC_FLAG_EOS;
+            p_nvenc->nvEncEncodePicture(ctx->nvencoder, &eos_params);
+
+            /* Move pending → ready, then drain all */
+            {
+                NvencSurface *tmp_surf;
+                while (av_fifo_read(ctx->output_surface_queue, &tmp_surf, 1) >= 0)
+                    av_fifo_write(ctx->output_surface_ready_queue, &tmp_surf, 1);
+            }
+            {
+                NvencSurface *tmp_surf;
+                int drained = 0;
+                while (av_fifo_read(ctx->output_surface_ready_queue, &tmp_surf, 1) >= 0) {
+                    NV_ENC_LOCK_BITSTREAM lock_params = { 0 };
+                    lock_params.version = NV_ENC_LOCK_BITSTREAM_VER;
+                    lock_params.outputBitstream = tmp_surf->output_surface;
+                    lock_params.doNotWait = 0;
+
+                    NVENCSTATUS nv_st = p_nvenc->nvEncLockBitstream(ctx->nvencoder, &lock_params);
+                    if (nv_st == NV_ENC_SUCCESS)
+                        p_nvenc->nvEncUnlockBitstream(ctx->nvencoder, tmp_surf->output_surface);
+
+                    if ((avctx->pix_fmt == AV_PIX_FMT_CUDA || avctx->pix_fmt == AV_PIX_FMT_D3D11) &&
+                        tmp_surf->reg_idx >= 0 && tmp_surf->reg_idx < ctx->nb_registered_frames) {
+                        if (ctx->registered_frames[tmp_surf->reg_idx].mapped > 0) {
+                            ctx->registered_frames[tmp_surf->reg_idx].mapped--;
+                            if (ctx->registered_frames[tmp_surf->reg_idx].mapped == 0)
+                                p_nvenc->nvEncUnmapInputResource(ctx->nvencoder,
+                                    ctx->registered_frames[tmp_surf->reg_idx].in_map.mappedResource);
+                        }
+                        av_frame_unref(tmp_surf->in_ref);
+                        tmp_surf->input_surface = NULL;
+                    }
+                    timestamp_queue_dequeue(ctx->timestamp_list);
+                    av_fifo_write(ctx->unused_surface_queue, &tmp_surf, 1);
+                    drained++;
+                }
+                av_log(avctx, AV_LOG_INFO,
+                       "[HW-PATCH] Pool change flush: drained %d pending frames\n", drained);
+            }
+
+            /* Now ALL registrations should be unmapped — clean them ALL */
+            {
+                int cleaned = 0;
+                for (int j = 0; j < ctx->nb_registered_frames; j++) {
+                    if (ctx->registered_frames[j].regptr) {
+                        if (ctx->registered_frames[j].mapped > 0)
+                            p_nvenc->nvEncUnmapInputResource(ctx->nvencoder,
+                                ctx->registered_frames[j].in_map.mappedResource);
+                        p_nvenc->nvEncUnregisterResource(ctx->nvencoder,
+                            ctx->registered_frames[j].regptr);
+                        ctx->registered_frames[j].mapped = 0;
+                        ctx->registered_frames[j].ptr = NULL;
+                        ctx->registered_frames[j].regptr = NULL;
+                        av_buffer_unref(&ctx->registered_frames[j].hw_frames_ref);
+                        cleaned++;
+                    }
+                }
+                ctx->nb_registered_frames = 0;
+                av_log(avctx, AV_LOG_INFO,
+                       "[HW-PATCH] Pool change flush: cleaned %d registrations\n", cleaned);
+            }
+
+            /* Reset DTS state for clean ramp-up after IDR */
+            ctx->output_frame_num = 0;
+            ctx->initial_delay_time = 0;
+            ctx->last_dts_out = AV_NOPTS_VALUE;
+            ctx->last_pts_out = AV_NOPTS_VALUE;
+
+            ctx->pool_change_flush = 0;
+            ctx->pool_change_cleanup = 0;  /* flush cleaned everything */
+
+            /* Return the surface we popped and re-pop a fresh one */
+            av_fifo_write(ctx->unused_surface_queue, &in_surf, 1);
             in_surf = get_free_frame(ctx);
             if (!in_surf) {
                 nvenc_pop_context(avctx);
