@@ -345,10 +345,7 @@ typedef struct NvencContext
     // Full NVENC session teardown/rebuild on pool change
     int pool_change_rebuild;
 
-    // Diagnostic: log N frames after pool change to trace GPU addresses
-    int pool_change_diag_count;
-
-    // Track last DTS/PTS for detecting non-monotonic timestamps (diagnostic)
+    // Track last DTS/PTS for detecting non-monotonic timestamps
     int64_t last_dts_out;
     int64_t last_pts_out;
 } NvencContext;
