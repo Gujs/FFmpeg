@@ -3525,17 +3525,15 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
             frame->hw_frames_ctx->data != ctx->last_hw_frames_ctx) {
 
             AVHWFramesContext *new_hwfc = (AVHWFramesContext *)frame->hw_frames_ctx->data;
-            int params_match = (new_hwfc->sw_format == ctx->last_hw_sw_format &&
-                                new_hwfc->width     == ctx->last_hw_width     &&
-                                new_hwfc->height    == ctx->last_hw_height);
 
-            /* Full session rebuild on every pool change.
-             * NVENC's driver caches internal state by (width, height, format).
-             * The pool height toggle in scale_cuda ensures dimensions genuinely
-             * change on each filter graph reconfig, so this always triggers. */
+            /* Full session rebuild on pool change.
+             * After filter graph reconfiguration, scale_cuda (or hwupload_cuda)
+             * creates new CUDA surface pools. NVENC's registered input resources
+             * reference the old pool's surfaces and must be cleaned up.
+             * Full rebuild: EOS flush → drain → clean registrations → destroy →
+             * recreate session → reallocate bitstream buffers. */
             ctx->pool_change_rebuild = 1;
             ctx->pool_change_force_idr = 1;
-            ctx->pool_change_diag_count = 5;
 
             av_log(avctx, AV_LOG_INFO,
                    "[HW-PATCH] Frame pool change detected "
@@ -3584,54 +3582,9 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
             }
         }
 
-        /* Rebuild handles all cleanup — no separate stale cleanup needed.
-         * The pool height toggle in scale_cuda ensures dimensions always change,
-         * so every pool change triggers the rebuild path above. */
-        if (0) {
-        }
-
         reconfig_encoder(avctx, frame);
 
         res = nvenc_upload_frame(avctx, frame, in_surf);
-
-        /* Diagnostic: log GPU address, registration details, and pixel sample
-         * for first 5 frames after a pool change to verify frame content. */
-        if (ctx->pool_change_diag_count > 0) {
-            AVHWFramesContext *hwfc = frame->hw_frames_ctx ?
-                (AVHWFramesContext *)frame->hw_frames_ctx->data : NULL;
-
-            /* Read 4 luma bytes from center of frame to verify content changes.
-             * Stale/displaced data would show identical values across frames. */
-            uint8_t luma_sample[4] = {0};
-            if (frame->data[0] && avctx->height > 0 && frame->linesize[0] > 0) {
-                CudaFunctions *cu = dl_fn->cuda_dl;
-                /* srcDevice includes horizontal byte offset (no srcX field) */
-                CUDA_MEMCPY2D cpy = {
-                    .srcMemoryType = CU_MEMORYTYPE_DEVICE,
-                    .srcDevice     = (CUdeviceptr)frame->data[0] + (avctx->width / 2),
-                    .srcPitch      = frame->linesize[0],
-                    .srcY          = avctx->height / 2,
-                    .dstMemoryType = CU_MEMORYTYPE_HOST,
-                    .dstHost       = luma_sample,
-                    .dstPitch      = 4,
-                    .WidthInBytes  = 4,
-                    .Height        = 1,
-                };
-                cu->cuMemcpy2D(&cpy);
-            }
-
-            av_log(avctx, AV_LOG_INFO,
-                   "[HW-DIAG] PTS=%"PRId64" gpu=%p pool=%p (%dx%d) "
-                   "reg=%d pitch=%d luma=[%02x %02x %02x %02x]\n",
-                   frame->pts,
-                   frame->data[0],
-                   hwfc ? (void *)frame->hw_frames_ctx->data : NULL,
-                   hwfc ? hwfc->width : 0, hwfc ? hwfc->height : 0,
-                   in_surf->reg_idx, frame->linesize[0],
-                   luma_sample[0], luma_sample[1],
-                   luma_sample[2], luma_sample[3]);
-            ctx->pool_change_diag_count--;
-        }
 
         res2 = nvenc_pop_context(avctx);
         if (res2 < 0)
