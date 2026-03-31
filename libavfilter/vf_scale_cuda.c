@@ -147,6 +147,12 @@ static av_cold void cudascale_uninit(AVFilterContext *ctx)
         CUcontext dummy;
 
         CHECK_CU(cu->cuCtxPushCurrent(s->hwctx->cuda_ctx));
+        /* Synchronize before module unload to ensure all in-flight CUDA
+         * kernels have completed. Without this, cuModuleUnload during
+         * filter graph reconfiguration can invalidate kernel code while
+         * the GPU is still executing, leaving the CUDA context in an
+         * undefined state that persists into the next filter instance. */
+        CHECK_CU(cu->cuCtxSynchronize());
         CHECK_CU(cu->cuModuleUnload(s->cu_module));
         s->cu_module = NULL;
         CHECK_CU(cu->cuCtxPopCurrent(&dummy));
@@ -431,6 +437,18 @@ static av_cold int cudascale_config_props(AVFilterLink *outlink)
     if (ret < 0)
         return ret;
 
+    if (!s->passthrough) {
+        AVHWFramesContext *out_hwfc = (AVHWFramesContext *)s->frames_ctx->data;
+        av_log(ctx, AV_LOG_INFO,
+               "[HW-PATCH] scale_cuda configured: %dx%d -> %dx%d, "
+               "pool=%p (%dx%d %s), stream=%p\n",
+               inlink->w, inlink->h, outlink->w, outlink->h,
+               (void *)s->frames_ctx->data,
+               out_hwfc->width, out_hwfc->height,
+               av_get_pix_fmt_name(out_hwfc->sw_format),
+               (void *)s->cu_stream);
+    }
+
     return 0;
 
 fail:
@@ -563,7 +581,7 @@ static int cudascale_scale(AVFilterContext *ctx, AVFrame *out, AVFrame *in)
         return ret;
 
     src = s->frame;
-    ret = av_hwframe_get_buffer(src->hw_frames_ctx, s->tmp_frame, 0);
+    ret = av_hwframe_get_buffer(s->frames_ctx, s->tmp_frame, 0);
     if (ret < 0)
         return ret;
 
