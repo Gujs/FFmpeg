@@ -3436,6 +3436,18 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
                     need_reinit |= VIDEO_CHANGED;
                     ifp->resolution_stable_count = 0;
                     ifp->pending_width = ifp->pending_height = 0;
+                } else if (ifp->hw_frames_ctx) {
+                    /* HW pipeline: drop frame during hysteresis.
+                     * CUDA pools have fixed dimensions — pushing a frame with
+                     * different resolution into the old graph crashes hwupload_cuda
+                     * with CUDA_ERROR_INVALID_VALUE. Drop and let CFR duplicate. */
+                    av_log(fg, AV_LOG_WARNING,
+                           "[HW-PATCH] Dropping HW frame during resolution hysteresis (%d/%d): "
+                           "%dx%d -> %dx%d\n",
+                           ifp->resolution_stable_count, RESOLUTION_HYSTERESIS_FRAMES,
+                           ifp->width, ifp->height, frame->width, frame->height);
+                    av_frame_unref(frame);
+                    return 0;
                 } else {
                     av_log(fg, AV_LOG_DEBUG,
                            "[HW-PATCH] Resolution change pending (%d/%d): %dx%d -> %dx%d\n",
@@ -3453,6 +3465,15 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
                 ifp->pending_width = frame->width;
                 ifp->pending_height = frame->height;
                 ifp->resolution_stable_count = 1;
+                if (ifp->hw_frames_ctx) {
+                    /* HW pipeline: drop first mismatched frame too */
+                    av_log(fg, AV_LOG_WARNING,
+                           "[HW-PATCH] Dropping HW frame at resolution change start: "
+                           "%dx%d -> %dx%d\n",
+                           ifp->width, ifp->height, frame->width, frame->height);
+                    av_frame_unref(frame);
+                    return 0;
+                }
                 av_log(fg, AV_LOG_DEBUG,
                        "[HW-PATCH] Resolution change detected, starting hysteresis: %dx%d -> %dx%d\n",
                        ifp->width, ifp->height, frame->width, frame->height);
