@@ -3662,6 +3662,20 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
         return AVERROR(ENOMEM);
     fd->wallclock[LATENCY_PROBE_FILTER_PRE] = av_gettime_relative();
 
+    /* After filter graph rebuild, the frame that triggered the reconfig may have
+     * dimensions that don't match the rebuilt graph's hw_frames_ctx pool.
+     * For HW pipelines, this causes CUDA_ERROR_INVALID_VALUE in hwupload_cuda.
+     * Drop the frame and let CFR duplicate instead of crashing. */
+    if (ifp->hw_frames_ctx && fgt->graph &&
+        (ifp->width != frame->width || ifp->height != frame->height)) {
+        av_log(fg, AV_LOG_WARNING,
+               "[HW-PATCH] Dropping post-reconfig HW frame with mismatched dimensions: "
+               "graph=%dx%d frame=%dx%d\n",
+               ifp->width, ifp->height, frame->width, frame->height);
+        av_frame_unref(frame);
+        return 0;
+    }
+
     ret = av_buffersrc_add_frame_flags(ifilter->filter, frame,
                                        AV_BUFFERSRC_FLAG_PUSH);
     if (ret < 0) {
