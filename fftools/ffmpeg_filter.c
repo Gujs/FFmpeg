@@ -258,10 +258,6 @@ typedef struct OutputFilterPriv {
     FPSConvContext          fps;
 
     unsigned                flags;
-
-    // Counter for forcing IDR frames after filter graph reconfiguration.
-    // Multiple IDR frames can help flush encoder's lookahead buffer.
-    int                     force_keyframe_count;
 } OutputFilterPriv;
 
 static OutputFilterPriv *ofp_from_ofilter(OutputFilter *ofilter)
@@ -2416,29 +2412,6 @@ static int configure_filtergraph(FilterGraph *fg, FilterGraphThread *fgt)
             goto fail;
     }
 
-    /* After filter graph (re)configuration, force IDR frame(s) to reset encoder
-     * state and clear B-frame references. This prevents visual glitches from
-     * stale references after colorspace/resolution changes.
-     *
-     * Default is 1 IDR frame. Can be increased via FFMPEG_RECONFIG_IDR_COUNT
-     * environment variable if encoder has deep lookahead buffer. */
-    {
-        const char *env_count = getenv("FFMPEG_RECONFIG_IDR_COUNT");
-        int idr_count = env_count ? atoi(env_count) : 1;
-        if (idr_count < 0) idr_count = 0;
-        if (idr_count > 100) idr_count = 100;
-
-        for (int i = 0; i < fg->nb_outputs; i++) {
-            OutputFilterPriv *ofp = ofp_from_ofilter(fg->outputs[i]);
-            if (ofp->ofilter.type == AVMEDIA_TYPE_VIDEO) {
-                ofp->force_keyframe_count = idr_count;
-                av_log(ofp, AV_LOG_DEBUG,
-                       "[HW-PATCH] Will force %d keyframe(s) after filter graph configuration\n",
-                       idr_count);
-            }
-        }
-    }
-
     return 0;
 fail:
     cleanup_filtergraph(fg, fgt);
@@ -2946,20 +2919,6 @@ static int fg_output_frame(OutputFilterPriv *ofp, FilterGraphThread *fgt,
                 frame_out->flags |= AV_FRAME_FLAG_KEY;
                 ofp->fps.dropped_keyframe = 0;
             }
-
-            /* Force keyframe(s) after filter graph reconfiguration to flush encoder
-             * lookahead buffer and reset B-frame references. */
-            if (ofp->force_keyframe_count > 0) {
-                frame_out->pict_type = AV_PICTURE_TYPE_I;
-                frame_out->flags |= AV_FRAME_FLAG_KEY;
-                /* Mark this as a reconfiguration keyframe so encoder can reset timing state.
-                 * This distinguishes it from regular source keyframes. */
-                av_dict_set(&frame_out->metadata, "lavfi.reconfig_keyframe", "1", 0);
-                ofp->force_keyframe_count--;
-                av_log(ofp, AV_LOG_DEBUG,
-                       "[HW-PATCH] Forcing keyframe after filter graph reconfiguration (%d remaining)\n",
-                       ofp->force_keyframe_count);
-            }
         } else {
             frame->pts = (frame->pts == AV_NOPTS_VALUE) ? ofp->next_pts :
                 av_rescale_q(frame->pts,   frame->time_base, ofp->tb_out) -
@@ -3402,12 +3361,13 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
             ifp->color_range = frame->color_range;
         }
 
-        /* Resolution changes use hysteresis to filter out spurious changes from corruption.
-         * Corrupted SPS can cause decoder to report wrong resolution for a few frames.
-         * Require RESOLUTION_HYSTERESIS_FRAMES consecutive NON-CORRUPT frames at new resolution.
+        /* Resolution changes: HW pipelines reconfigure immediately (CUDA pools
+         * have fixed dimensions — delayed reconfig lets mismatched frames crash
+         * hwupload_cuda with CUDA_ERROR_INVALID_VALUE). SW pipelines use
+         * hysteresis to filter out spurious changes from corrupted SPS data.
          *
-         * IMPORTANT: Corrupt frames are excluded from hysteresis counting because their
-         * resolution metadata is unreliable (may come from corrupted SPS/PPS data). */
+         * Corrupt frames are excluded from both paths because their resolution
+         * metadata is unreliable (may come from corrupted SPS/PPS data). */
         int frame_is_corrupt = (frame->flags & AV_FRAME_FLAG_CORRUPT) != 0;
 
         if (frame_is_corrupt && (ifp->width != frame->width || ifp->height != frame->height)) {
@@ -3427,8 +3387,18 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
             ifp->pending_width = ifp->pending_height = 0;
             ifp->resolution_stable_count = 0;
         } else if (ifp->width != frame->width || ifp->height != frame->height) {
-            if (ifp->pending_width == frame->width && ifp->pending_height == frame->height) {
-                /* Same as pending resolution - increment counter */
+            if (ifp->hw_frames_ctx) {
+                /* HW pipeline: reconfigure immediately — no hysteresis.
+                 * CUDA pools have fixed dimensions; delaying reconfig allows
+                 * mismatched frames into the old graph → crash. */
+                av_log(fg, AV_LOG_INFO,
+                       "[HW-PATCH] HW resolution change: %dx%d -> %dx%d (immediate reconfig)\n",
+                       ifp->width, ifp->height, frame->width, frame->height);
+                need_reinit |= VIDEO_CHANGED;
+                ifp->pending_width = ifp->pending_height = 0;
+                ifp->resolution_stable_count = 0;
+            } else if (ifp->pending_width == frame->width && ifp->pending_height == frame->height) {
+                /* SW pipeline: same as pending resolution - increment counter */
                 ifp->resolution_stable_count++;
                 if (ifp->resolution_stable_count >= RESOLUTION_HYSTERESIS_FRAMES) {
                     av_log(fg, AV_LOG_VERBOSE,
@@ -3438,18 +3408,6 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
                     need_reinit |= VIDEO_CHANGED;
                     ifp->resolution_stable_count = 0;
                     ifp->pending_width = ifp->pending_height = 0;
-                } else if (ifp->hw_frames_ctx) {
-                    /* HW pipeline: drop frame during hysteresis.
-                     * CUDA pools have fixed dimensions — pushing a frame with
-                     * different resolution into the old graph crashes hwupload_cuda
-                     * with CUDA_ERROR_INVALID_VALUE. Drop and let CFR duplicate. */
-                    av_log(fg, AV_LOG_WARNING,
-                           "[HW-PATCH] Dropping HW frame during resolution hysteresis (%d/%d): "
-                           "%dx%d -> %dx%d\n",
-                           ifp->resolution_stable_count, RESOLUTION_HYSTERESIS_FRAMES,
-                           ifp->width, ifp->height, frame->width, frame->height);
-                    av_frame_unref(frame);
-                    return 0;
                 } else {
                     av_log(fg, AV_LOG_DEBUG,
                            "[HW-PATCH] Resolution change pending (%d/%d): %dx%d -> %dx%d\n",
@@ -3457,7 +3415,7 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
                            ifp->width, ifp->height, frame->width, frame->height);
                 }
             } else {
-                /* New pending resolution - reset counter */
+                /* SW pipeline: new pending resolution - reset counter */
                 if (ifp->pending_width && ifp->pending_height) {
                     av_log(fg, AV_LOG_WARNING,
                            "[HW-PATCH] Spurious resolution change rejected: %dx%d (was pending %dx%d, now %dx%d)\n",
@@ -3467,15 +3425,6 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
                 ifp->pending_width = frame->width;
                 ifp->pending_height = frame->height;
                 ifp->resolution_stable_count = 1;
-                if (ifp->hw_frames_ctx) {
-                    /* HW pipeline: drop first mismatched frame too */
-                    av_log(fg, AV_LOG_WARNING,
-                           "[HW-PATCH] Dropping HW frame at resolution change start: "
-                           "%dx%d -> %dx%d\n",
-                           ifp->width, ifp->height, frame->width, frame->height);
-                    av_frame_unref(frame);
-                    return 0;
-                }
                 av_log(fg, AV_LOG_DEBUG,
                        "[HW-PATCH] Resolution change detected, starting hysteresis: %dx%d -> %dx%d\n",
                        ifp->width, ifp->height, frame->width, frame->height);
@@ -3663,20 +3612,6 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
     if (!fd)
         return AVERROR(ENOMEM);
     fd->wallclock[LATENCY_PROBE_FILTER_PRE] = av_gettime_relative();
-
-    /* After filter graph rebuild, the frame that triggered the reconfig may have
-     * dimensions that don't match the rebuilt graph's hw_frames_ctx pool.
-     * For HW pipelines, this causes CUDA_ERROR_INVALID_VALUE in hwupload_cuda.
-     * Drop the frame and let CFR duplicate instead of crashing. */
-    if (ifp->hw_frames_ctx && fgt->graph &&
-        (ifp->width != frame->width || ifp->height != frame->height)) {
-        av_log(fg, AV_LOG_WARNING,
-               "[HW-PATCH] Dropping post-reconfig HW frame with mismatched dimensions: "
-               "graph=%dx%d frame=%dx%d\n",
-               ifp->width, ifp->height, frame->width, frame->height);
-        av_frame_unref(frame);
-        return 0;
-    }
 
     ret = av_buffersrc_add_frame_flags(ifilter->filter, frame,
                                        AV_BUFFERSRC_FLAG_PUSH);

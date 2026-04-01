@@ -3609,24 +3609,17 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
             pic_params.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
         }
 
-        {
-            int is_reconfig = frame->pict_type == AV_PICTURE_TYPE_I &&
-                              av_dict_get(frame->metadata, "lavfi.reconfig_keyframe", NULL, 0) != NULL;
-
-            if (is_reconfig || ctx->pool_change_force_idr) {
-                pic_params.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
-                av_log(avctx, AV_LOG_INFO,
-                       "[HW-PATCH] %s at PTS=%"PRId64" -> FORCEIDR (DPB reset)\n",
-                       is_reconfig ? "Reconfiguration keyframe" :
-                       ctx->pool_change_force_idr ? "Pool change" : "Unknown",
-                       frame->pts);
-                ctx->pool_change_force_idr = 0;
-            } else if (ctx->forced_idr >= 0 && frame->pict_type == AV_PICTURE_TYPE_I) {
-                pic_params.encodePicFlags =
-                    ctx->forced_idr ? NV_ENC_PIC_FLAG_FORCEIDR : NV_ENC_PIC_FLAG_FORCEINTRA;
-            } else {
-                pic_params.encodePicFlags = 0;
-            }
+        if (ctx->pool_change_force_idr) {
+            pic_params.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
+            av_log(avctx, AV_LOG_INFO,
+                   "[HW-PATCH] Pool change at PTS=%"PRId64" -> FORCEIDR (DPB reset)\n",
+                   frame->pts);
+            ctx->pool_change_force_idr = 0;
+        } else if (ctx->forced_idr >= 0 && frame->pict_type == AV_PICTURE_TYPE_I) {
+            pic_params.encodePicFlags =
+                ctx->forced_idr ? NV_ENC_PIC_FLAG_FORCEIDR : NV_ENC_PIC_FLAG_FORCEINTRA;
+        } else {
+            pic_params.encodePicFlags = 0;
         }
 
         pic_params.frameIdx = ctx->frame_idx_counter++;
