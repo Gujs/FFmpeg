@@ -3387,48 +3387,18 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
             ifp->pending_width = ifp->pending_height = 0;
             ifp->resolution_stable_count = 0;
         } else if (ifp->width != frame->width || ifp->height != frame->height) {
-            if (ifp->hw_frames_ctx) {
-                /* HW pipeline: reconfigure immediately — no hysteresis.
-                 * CUDA pools have fixed dimensions; delaying reconfig allows
-                 * mismatched frames into the old graph → crash. */
-                av_log(fg, AV_LOG_INFO,
-                       "[HW-PATCH] HW resolution change: %dx%d -> %dx%d (immediate reconfig)\n",
-                       ifp->width, ifp->height, frame->width, frame->height);
-                need_reinit |= VIDEO_CHANGED;
-                ifp->pending_width = ifp->pending_height = 0;
-                ifp->resolution_stable_count = 0;
-            } else if (ifp->pending_width == frame->width && ifp->pending_height == frame->height) {
-                /* SW pipeline: same as pending resolution - increment counter */
-                ifp->resolution_stable_count++;
-                if (ifp->resolution_stable_count >= RESOLUTION_HYSTERESIS_FRAMES) {
-                    av_log(fg, AV_LOG_VERBOSE,
-                           "[HW-PATCH] Resolution change confirmed after %d frames: %dx%d -> %dx%d\n",
-                           ifp->resolution_stable_count, ifp->width, ifp->height,
-                           frame->width, frame->height);
-                    need_reinit |= VIDEO_CHANGED;
-                    ifp->resolution_stable_count = 0;
-                    ifp->pending_width = ifp->pending_height = 0;
-                } else {
-                    av_log(fg, AV_LOG_DEBUG,
-                           "[HW-PATCH] Resolution change pending (%d/%d): %dx%d -> %dx%d\n",
-                           ifp->resolution_stable_count, RESOLUTION_HYSTERESIS_FRAMES,
-                           ifp->width, ifp->height, frame->width, frame->height);
-                }
-            } else {
-                /* SW pipeline: new pending resolution - reset counter */
-                if (ifp->pending_width && ifp->pending_height) {
-                    av_log(fg, AV_LOG_WARNING,
-                           "[HW-PATCH] Spurious resolution change rejected: %dx%d (was pending %dx%d, now %dx%d)\n",
-                           ifp->pending_width, ifp->pending_height,
-                           ifp->pending_width, ifp->pending_height, frame->width, frame->height);
-                }
-                ifp->pending_width = frame->width;
-                ifp->pending_height = frame->height;
-                ifp->resolution_stable_count = 1;
-                av_log(fg, AV_LOG_DEBUG,
-                       "[HW-PATCH] Resolution change detected, starting hysteresis: %dx%d -> %dx%d\n",
-                       ifp->width, ifp->height, frame->width, frame->height);
-            }
+            /* Reconfigure immediately on any resolution change.
+             * Hysteresis was removed because it delays reconfig, allowing
+             * mismatched frames into graphs with fixed-size CUDA pools →
+             * CUDA_ERROR_INVALID_VALUE crash. The input to the graph is CPU
+             * (sw decoder), so ifp->hw_frames_ctx is NULL even when the graph
+             * contains hwupload_cuda internally. Checking hw_frames_ctx doesn't
+             * work. A spurious reconfig from corrupt SPS is harmless (brief
+             * interruption); a crash is not. */
+            av_log(fg, AV_LOG_INFO,
+                   "[HW-PATCH] Resolution change: %dx%d -> %dx%d (immediate reconfig)\n",
+                   ifp->width, ifp->height, frame->width, frame->height);
+            need_reinit |= VIDEO_CHANGED;
         } else {
             /* Resolution matches current - reset pending state */
             if (ifp->pending_width || ifp->pending_height) {
