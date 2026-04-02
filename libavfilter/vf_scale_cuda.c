@@ -98,6 +98,13 @@ typedef struct CUDAScaleContext {
     AVFrame *tmp_frame;
     int passthrough;
 
+    /* Private input pool for GPU-side copy of shared split frames.
+     * Each scale_cuda instance gets its own input pool so that after
+     * filter graph reconfiguration, there is no shared GPU state
+     * between instances — same isolation as independent hwupload_cuda. */
+    AVBufferRef *input_frames_ctx;
+    AVFrame     *input_frame;
+
     /**
      * Output sw format. AV_PIX_FMT_NONE for no conversion.
      */
@@ -135,6 +142,10 @@ static av_cold int cudascale_init(AVFilterContext *ctx)
     if (!s->tmp_frame)
         return AVERROR(ENOMEM);
 
+    s->input_frame = av_frame_alloc();
+    if (!s->input_frame)
+        return AVERROR(ENOMEM);
+
     return 0;
 }
 
@@ -161,6 +172,8 @@ static av_cold void cudascale_uninit(AVFilterContext *ctx)
     av_frame_free(&s->frame);
     av_buffer_unref(&s->frames_ctx);
     av_frame_free(&s->tmp_frame);
+    av_frame_free(&s->input_frame);
+    av_buffer_unref(&s->input_frames_ctx);
 }
 
 static av_cold int init_hwframe_ctx(CUDAScaleContext *s, AVBufferRef *device_ctx, int width, int height)
@@ -287,6 +300,28 @@ static av_cold int init_processing_chain(AVFilterContext *ctx, int in_width, int
         ret = init_hwframe_ctx(s, in_frames_ctx->device_ref, out_width, out_height);
         if (ret < 0)
             return ret;
+
+        /* Create private input pool for GPU-side copy of shared frames.
+         * This gives each scale_cuda instance completely independent GPU
+         * surfaces — same isolation as having separate hwupload_cuda per
+         * output, but without the PCIe roundtrip (GPU-to-GPU copy only). */
+        {
+            AVBufferRef *in_pool = av_hwframe_ctx_alloc(in_frames_ctx->device_ref);
+            if (!in_pool)
+                return AVERROR(ENOMEM);
+            AVHWFramesContext *in_pool_ctx = (AVHWFramesContext *)in_pool->data;
+            in_pool_ctx->format    = AV_PIX_FMT_CUDA;
+            in_pool_ctx->sw_format = in_format;
+            in_pool_ctx->width     = FFALIGN(in_width, 32);
+            in_pool_ctx->height    = FFALIGN(in_height, 32);
+            ret = av_hwframe_ctx_init(in_pool);
+            if (ret < 0) {
+                av_buffer_unref(&in_pool);
+                return ret;
+            }
+            av_buffer_unref(&s->input_frames_ctx);
+            s->input_frames_ctx = in_pool;
+        }
 
         if (in_width == out_width && in_height == out_height &&
             in_format == out_format && s->interp_algo == INTERP_ALGO_DEFAULT)
@@ -613,6 +648,27 @@ static int cudascale_filter_frame(AVFilterLink *link, AVFrame *in)
 
     if (s->passthrough)
         return ff_filter_frame(outlink, in);
+
+    /* Copy input to private pool — completely independent GPU surface.
+     * This eliminates all shared CUDA state between scale_cuda instances
+     * after filter graph reconfiguration. Equivalent to v40's separate
+     * hwupload_cuda per output, but GPU-to-GPU (no PCIe roundtrip). */
+    if (s->input_frames_ctx) {
+        av_frame_unref(s->input_frame);
+        ret = av_hwframe_get_buffer(s->input_frames_ctx, s->input_frame, 0);
+        if (ret < 0)
+            goto fail;
+        s->input_frame->width  = in->width;
+        s->input_frame->height = in->height;
+        ret = av_hwframe_transfer_data(s->input_frame, in, 0);
+        if (ret < 0)
+            goto fail;
+        ret = av_frame_copy_props(s->input_frame, in);
+        if (ret < 0)
+            goto fail;
+        av_frame_unref(in);
+        av_frame_move_ref(in, s->input_frame);
+    }
 
     out = av_frame_alloc();
     if (!out) {
