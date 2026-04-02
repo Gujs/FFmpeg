@@ -90,6 +90,21 @@ static int activate(AVFilterContext *ctx)
                 break;
             }
 
+            /* For HW frames (CUDA, etc.), make each output a private copy.
+             * av_frame_clone shares the same GPU buffer across all outputs.
+             * After filter graph reconfiguration, concurrent texture access
+             * on the shared surface by downstream scale_cuda instances causes
+             * permanent frame displacement. Making each output writable
+             * triggers a GPU-to-GPU copy (cuMemcpy2DAsync, ~10μs for 1080p).
+             * For SW frames or sole references, this is a no-op. */
+            if (buf_out->hw_frames_ctx) {
+                ret = av_frame_make_writable(buf_out);
+                if (ret < 0) {
+                    av_frame_free(&buf_out);
+                    break;
+                }
+            }
+
             ret = ff_filter_frame(ctx->outputs[i], buf_out);
             if (ret < 0)
                 break;

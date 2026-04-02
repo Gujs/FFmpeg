@@ -617,15 +617,6 @@ static int cudascale_filter_frame(AVFilterLink *link, AVFrame *in)
     if (s->passthrough)
         return ff_filter_frame(outlink, in);
 
-    /* Ensure private GPU surface before creating texture objects.
-     * split's av_frame_clone() shares the same GPU buffer across all outputs.
-     * Concurrent texture access on a shared surface causes permanent frame
-     * displacement after filter graph reconfiguration. If the buffer is not
-     * shared (refcount == 1), this is a no-op. */
-    ret = av_frame_make_writable(in);
-    if (ret < 0)
-        goto fail;
-
     out = av_frame_alloc();
     if (!out) {
         ret = AVERROR(ENOMEM);
