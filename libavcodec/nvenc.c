@@ -3309,7 +3309,7 @@ static int nvenc_rebuild_session(AVCodecContext *avctx)
     }
 
 #ifdef NVENC_HAVE_CUSTREAM_PTR
-    if (ctx->cu_stream) {
+    if (ctx->cu_context) {
         nv_status = p_nvenc->nvEncSetIOCudaStreams(ctx->nvencoder,
                                                     &ctx->cu_stream, &ctx->cu_stream);
         if (nv_status != NV_ENC_SUCCESS)
