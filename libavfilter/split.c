@@ -96,11 +96,21 @@ static int activate(AVFilterContext *ctx)
              * frame displacement in downstream CUDA filters (scale_cuda).
              * For SW frames or sole references, this is a no-op. */
             if (buf_out->hw_frames_ctx) {
+                int was_writable = av_frame_is_writable(buf_out);
                 ret = av_frame_make_writable(buf_out);
                 if (ret < 0) {
                     av_frame_free(&buf_out);
                     break;
                 }
+                /* Log if a HW frame was NOT copied (already writable).
+                 * This should not happen with split — all clones share
+                 * the same buffer (refcount > 1). If it does, the frame
+                 * is processed on shared GPU memory. */
+                if (was_writable)
+                    av_log(ctx, AV_LOG_WARNING,
+                           "[HW-PATCH] split output %d: HW frame already writable "
+                           "(refcount=1, NO copy) PTS=%"PRId64"\n",
+                           i, buf_out->pts);
             }
 
             ret = ff_filter_frame(ctx->outputs[i], buf_out);
