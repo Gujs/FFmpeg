@@ -3531,9 +3531,28 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
              * creates new CUDA surface pools. NVENC's registered input resources
              * reference the old pool's surfaces and must be cleaned up.
              * Full rebuild: EOS flush → drain → clean registrations → destroy →
-             * recreate session → reallocate bitstream buffers. */
+             * recreate session → reallocate bitstream buffers.
+             *
+             * CRITICAL: Also update the CUDA context from the new frame's device.
+             * Filter graph reconfig creates a new hwupload_cuda which calls
+             * cuCtxCreate → a NEW CUcontext. scale_cuda kernels run on this new
+             * context's default stream. Without updating, NVENC would continue
+             * using the OLD context's default stream → no ordering guarantee
+             * between scale_cuda writes and NVENC reads → stale frame data. */
             ctx->pool_change_rebuild = 1;
             ctx->pool_change_force_idr = 1;
+
+            if (avctx->pix_fmt == AV_PIX_FMT_CUDA) {
+                AVCUDADeviceContext *new_cuda_hwctx = new_hwfc->device_ctx->hwctx;
+                if (new_cuda_hwctx->cuda_ctx != ctx->cu_context) {
+                    av_log(avctx, AV_LOG_INFO,
+                           "[HW-PATCH] CUDA context changed (old=%p new=%p) - "
+                           "rebuilding NVENC session on new context\n",
+                           ctx->cu_context, new_cuda_hwctx->cuda_ctx);
+                    ctx->cu_context = new_cuda_hwctx->cuda_ctx;
+                    ctx->cu_stream  = new_cuda_hwctx->stream;
+                }
+            }
 
             av_log(avctx, AV_LOG_INFO,
                    "[HW-PATCH] Frame pool change detected "
