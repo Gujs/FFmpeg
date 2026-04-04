@@ -27,6 +27,8 @@
 
 #include "libavutil/attributes.h"
 #include "libavutil/avstring.h"
+#include "libavutil/hwcontext.h"
+#include "libavutil/hwcontext_cuda_internal.h"
 #include "libavutil/internal.h"
 #include "libavutil/opt.h"
 
@@ -38,6 +40,7 @@
 typedef struct SplitContext {
     const AVClass *class;
     int nb_outputs;
+    int hw_copy_logged;  /* one-shot flag for INFO diagnostic */
 } SplitContext;
 
 static av_cold int split_init(AVFilterContext *ctx)
@@ -92,25 +95,58 @@ static int activate(AVFilterContext *ctx)
 
             /* For HW frames, make each output a private copy.
              * av_frame_clone shares the same GPU buffer across all outputs.
-             * After filter graph reconfiguration, shared GPU surfaces cause
-             * frame displacement in downstream CUDA filters (scale_cuda).
+             * Without private copies, all downstream scale_cuda instances
+             * create texture objects on the same shared GPU surface, causing
+             * frame displacement.
+             *
+             * av_frame_make_writable allocates a new GPU surface from the pool
+             * and copies via cuMemcpy2DAsync (device-to-device on default stream).
              * For SW frames or sole references, this is a no-op. */
             if (buf_out->hw_frames_ctx) {
-                int was_writable = av_frame_is_writable(buf_out);
+                void *old_ptr = buf_out->data[0];
                 ret = av_frame_make_writable(buf_out);
                 if (ret < 0) {
                     av_frame_free(&buf_out);
                     break;
                 }
-                /* Log if a HW frame was NOT copied (already writable).
-                 * This should not happen with split — all clones share
-                 * the same buffer (refcount > 1). If it does, the frame
-                 * is processed on shared GPU memory. */
-                if (was_writable)
+                if (buf_out->data[0] == old_ptr) {
+                    /* data[0] unchanged means no copy happened — the frame was
+                     * already writable (refcount=1). This should never happen
+                     * after av_frame_clone. If it does, we have shared GPU memory
+                     * between split outputs → frame displacement. */
                     av_log(ctx, AV_LOG_WARNING,
-                           "[HW-PATCH] split output %d: HW frame already writable "
-                           "(refcount=1, NO copy) PTS=%"PRId64"\n",
-                           i, buf_out->pts);
+                           "[HW-PATCH] split output %d: av_frame_make_writable did NOT copy "
+                           "(ptr unchanged %p) PTS=%"PRId64"\n",
+                           i, old_ptr, buf_out->pts);
+                } else {
+                    SplitContext *sc = ctx->priv;
+                    if (!sc->hw_copy_logged) {
+                        av_log(ctx, AV_LOG_INFO,
+                               "[HW-PATCH] split: HW frame private copy active "
+                               "(cuStreamSynchronize diagnostic enabled, %d outputs)\n",
+                               ctx->nb_outputs);
+                        sc->hw_copy_logged = 1;
+                    }
+                }
+
+                /* DIAGNOSTIC: Force GPU synchronization after the device-to-device
+                 * copy to ensure it completes before downstream filters read.
+                 * If removing this cuStreamSynchronize brings back frame displacement,
+                 * the issue is async CUDA stream ordering.
+                 * TODO: Remove once root cause is confirmed. */
+                {
+                    AVHWFramesContext *hwfc = (AVHWFramesContext *)buf_out->hw_frames_ctx->data;
+                    if (hwfc->format == AV_PIX_FMT_CUDA) {
+                        AVCUDADeviceContext *cuda_hwctx = hwfc->device_ctx->hwctx;
+                        CudaFunctions *cu = cuda_hwctx->internal->cuda_dl;
+                        cu->cuCtxPushCurrent(cuda_hwctx->cuda_ctx);
+                        cu->cuStreamSynchronize(cuda_hwctx->stream);
+                        {
+                            CUcontext dummy;
+                            cu->cuCtxPopCurrent(&dummy);
+                        }
+                    }
+                }
             }
 
             ret = ff_filter_frame(ctx->outputs[i], buf_out);
