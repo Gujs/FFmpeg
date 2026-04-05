@@ -3291,6 +3291,26 @@ static int nvenc_rebuild_session(AVCodecContext *avctx)
     av_log(avctx, AV_LOG_VERBOSE,
            "[HW-PATCH] Old NVENC session destroyed\n");
 
+    /* Apply deferred CUDA context switch (if any).
+     * Done HERE — after the old session is destroyed and all its resources
+     * unmapped/unregistered — so cleanup ran on the correct old context.
+     * nvenc_push_context() pushed the old context; pop it now, update
+     * ctx->cu_context, then push the new context for Phase 5-7. */
+    if (ctx->pending_cu_context) {
+        NvencDynLoadFunctions *dl_fn = &ctx->nvenc_dload_funcs;
+        CudaFunctions *cu = dl_fn->cuda_dl;
+        CUcontext dummy;
+        cu->cuCtxPopCurrent(&dummy);
+        ctx->cu_context       = ctx->pending_cu_context;
+        ctx->cu_stream        = ctx->pending_cu_stream;
+        ctx->pending_cu_context = NULL;
+        ctx->pending_cu_stream  = NULL;
+        av_log(avctx, AV_LOG_INFO,
+               "[HW-PATCH] CUDA context switched to %p for new session\n",
+               ctx->cu_context);
+        CHECK_CU(cu->cuCtxPushCurrent(ctx->cu_context));
+    }
+
     /* Phase 5: Create new session + reinitialize encoder */
     {
         int ret = nvenc_open_session(avctx);
@@ -3545,12 +3565,21 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
             if (avctx->pix_fmt == AV_PIX_FMT_CUDA) {
                 AVCUDADeviceContext *new_cuda_hwctx = new_hwfc->device_ctx->hwctx;
                 if (new_cuda_hwctx->cuda_ctx != ctx->cu_context) {
+                    /* Do NOT update ctx->cu_context here. The old context must
+                     * remain current so that nvenc_push_context() pushes the OLD
+                     * context, letting Phase 1-4 of nvenc_rebuild_session() run
+                     * (EOS flush, drain, unmap, unregister, destroy) on the same
+                     * context the session was opened with. Applying the new context
+                     * before the destroy causes nvEncUnmapInputResource to be called
+                     * with the wrong context active → SIGSEGV.
+                     * The switch is deferred to inside nvenc_rebuild_session(),
+                     * between Phase 4 (destroy) and Phase 5 (open new session). */
                     av_log(avctx, AV_LOG_INFO,
                            "[HW-PATCH] CUDA context changed (old=%p new=%p) - "
-                           "rebuilding NVENC session on new context\n",
+                           "will switch after old session destroyed\n",
                            ctx->cu_context, new_cuda_hwctx->cuda_ctx);
-                    ctx->cu_context = new_cuda_hwctx->cuda_ctx;
-                    ctx->cu_stream  = new_cuda_hwctx->stream;
+                    ctx->pending_cu_context = new_cuda_hwctx->cuda_ctx;
+                    ctx->pending_cu_stream  = new_cuda_hwctx->stream;
                 }
             }
 
