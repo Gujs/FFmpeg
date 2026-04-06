@@ -3174,6 +3174,20 @@ static int nvenc_rebuild_session(AVCodecContext *avctx)
     NVENCSTATUS nv_status;
     int i;
 
+    /* Pin the CUDA device context alive through the entire rebuild.
+     * Phase 3 unrefs all hw_frames_ref — if the filter graph teardown already
+     * released its references, our registered frames may be the LAST holders.
+     * Without this pin, av_buffer_unref cascades: hw_frames_ref → device_ref →
+     * cuCtxDestroy → the pushed CUDA context and the NVENC session's context are
+     * destroyed BEFORE Phase 4's nvEncDestroyEncoder can run → SIGSEGV. */
+    AVBufferRef *device_pin = NULL;
+    if ((avctx->pix_fmt == AV_PIX_FMT_CUDA || avctx->pix_fmt == AV_PIX_FMT_D3D11) &&
+        ctx->nb_registered_frames > 0 && ctx->registered_frames[0].hw_frames_ref) {
+        AVHWFramesContext *hwfc =
+            (AVHWFramesContext *)ctx->registered_frames[0].hw_frames_ref->data;
+        device_pin = av_buffer_ref(hwfc->device_ref);
+    }
+
     av_log(avctx, AV_LOG_INFO,
            "[HW-PATCH] NVENC session rebuild starting (output_frame_num=%"PRIu64")\n",
            ctx->output_frame_num);
@@ -3268,6 +3282,10 @@ static int nvenc_rebuild_session(AVCodecContext *avctx)
 
     p_nvenc->nvEncDestroyEncoder(ctx->nvencoder);
     ctx->nvencoder = NULL;
+
+    /* Release the device pin — the old session is fully destroyed now,
+     * safe to let the old CUDA context be freed if no one else holds it. */
+    av_buffer_unref(&device_pin);
 
     av_log(avctx, AV_LOG_VERBOSE,
            "[HW-PATCH] Old NVENC session destroyed\n");
