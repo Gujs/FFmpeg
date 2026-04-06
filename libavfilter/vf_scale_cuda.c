@@ -436,7 +436,7 @@ static av_cold int cudascale_config_props(AVFilterLink *outlink)
 
     if (!s->passthrough) {
         AVHWFramesContext *out_hwfc = (AVHWFramesContext *)s->frames_ctx->data;
-        av_log(ctx, AV_LOG_INFO,
+        av_log(ctx, AV_LOG_VERBOSE,
                "[HW-PATCH] scale_cuda configured: %dx%d -> %dx%d, "
                "pool=%p (%dx%d %s), stream=%p\n",
                inlink->w, inlink->h, outlink->w, outlink->h,

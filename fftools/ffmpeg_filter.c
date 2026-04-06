@@ -147,12 +147,6 @@ typedef struct InputFilterPriv {
     int                 downmixinfo_present;
     AVDownmixInfo       downmixinfo;
 
-    // Resolution change hysteresis to filter out spurious changes from corruption
-    // Only trigger reconfiguration after seeing N consecutive frames at new resolution
-    int                 pending_width, pending_height;
-    int                 resolution_stable_count;
-#define RESOLUTION_HYSTERESIS_FRAMES 3  // Require 3 consecutive frames (~100ms at 30fps)
-
     // Audio parameter change hysteresis to filter transient changes at splice boundaries
     // Discontinuities can cause decoder to briefly output different channel layout/format
     int                 pending_audio_sample_rate;
@@ -3337,7 +3331,7 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
         } else {
             /* Parameters match current - reset any pending change */
             if (ifp->audio_stable_count) {
-                av_log(fg, AV_LOG_INFO,
+                av_log(fg, AV_LOG_VERBOSE,
                        "[HW-PATCH] Transient audio change filtered out after %d frames\n",
                        ifp->audio_stable_count);
                 ifp->audio_stable_count = 0;
@@ -3378,44 +3372,21 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
         int frame_is_corrupt = (frame->flags & AV_FRAME_FLAG_CORRUPT) != 0;
 
         if (frame_is_corrupt && (ifp->width != frame->width || ifp->height != frame->height)) {
-            /* Corrupt frame with different resolution - don't trust it, reset hysteresis */
-            if (ifp->pending_width || ifp->pending_height) {
-                av_log(fg, AV_LOG_WARNING,
-                       "[HW-PATCH] Ignoring resolution from corrupt frame: %dx%d (keeping current %dx%d, "
-                       "was pending %dx%d with %d frames)\n",
-                       frame->width, frame->height, ifp->width, ifp->height,
-                       ifp->pending_width, ifp->pending_height, ifp->resolution_stable_count);
-            } else {
-                av_log(fg, AV_LOG_DEBUG,
-                       "[HW-PATCH] Ignoring resolution %dx%d from corrupt frame (current %dx%d)\n",
-                       frame->width, frame->height, ifp->width, ifp->height);
-            }
-            /* Reset any pending resolution change - corrupt data invalidates the sequence */
-            ifp->pending_width = ifp->pending_height = 0;
-            ifp->resolution_stable_count = 0;
+            /* Corrupt frame with different resolution — don't trust it.
+             * Corrupt SPS/PPS can report wrong dimensions. */
+            av_log(fg, AV_LOG_DEBUG,
+                   "[HW-PATCH] Ignoring resolution %dx%d from corrupt frame (current %dx%d)\n",
+                   frame->width, frame->height, ifp->width, ifp->height);
         } else if (ifp->width != frame->width || ifp->height != frame->height) {
             /* Reconfigure immediately on any resolution change.
-             * Hysteresis was removed because it delays reconfig, allowing
-             * mismatched frames into graphs with fixed-size CUDA pools →
-             * CUDA_ERROR_INVALID_VALUE crash. The input to the graph is CPU
-             * (sw decoder), so ifp->hw_frames_ctx is NULL even when the graph
-             * contains hwupload_cuda internally. Checking hw_frames_ctx doesn't
-             * work. A spurious reconfig from corrupt SPS is harmless (brief
-             * interruption); a crash is not. */
+             * Corrupt frames are excluded above — their SPS is unreliable.
+             * A spurious reconfig from a brief resolution glitch is harmless
+             * (brief interruption); delaying reconfig lets mismatched frames
+             * into CUDA pools with fixed dimensions → CUDA_ERROR_INVALID_VALUE. */
             av_log(fg, AV_LOG_INFO,
                    "[HW-PATCH] Resolution change: %dx%d -> %dx%d (immediate reconfig)\n",
                    ifp->width, ifp->height, frame->width, frame->height);
             need_reinit |= VIDEO_CHANGED;
-        } else {
-            /* Resolution matches current - reset pending state */
-            if (ifp->pending_width || ifp->pending_height) {
-                av_log(fg, AV_LOG_WARNING,
-                       "[HW-PATCH] Spurious resolution change filtered out: %dx%d briefly saw %dx%d (%d frames)\n",
-                       ifp->width, ifp->height, ifp->pending_width, ifp->pending_height,
-                       ifp->resolution_stable_count);
-                ifp->pending_width = ifp->pending_height = 0;
-                ifp->resolution_stable_count = 0;
-            }
         }
         break;
     }
@@ -3488,7 +3459,7 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
                    (void *)new_hwfc, av_get_pix_fmt_name(new_hwfc->sw_format),
                    new_hwfc->width, new_hwfc->height);
         } else {
-            av_log(fg, AV_LOG_INFO,
+            av_log(fg, AV_LOG_VERBOSE,
                    "[HW-PATCH] hw_frames_ctx changed (%p -> %p) but parameters "
                    "identical (%s %dx%d) - suppressing reconfig\n",
                    (void *)ifp->hw_frames_ctx->data,
