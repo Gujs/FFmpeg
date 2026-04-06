@@ -2510,20 +2510,6 @@ static int nvenc_upload_frame(AVCodecContext *avctx, const AVFrame *frame,
     NVENCSTATUS nv_status;
 
     if (avctx->pix_fmt == AV_PIX_FMT_CUDA || avctx->pix_fmt == AV_PIX_FMT_D3D11) {
-        /* Track hw_frames_ctx changes for diagnostic purposes.
-         * Log when the frame pool changes (e.g., after filter graph reconfiguration).
-         * Also store parameters for the pool change comparison in ff_nvenc_encode_frame. */
-        if (frame->hw_frames_ctx && frame->hw_frames_ctx->data != ctx->last_hw_frames_ctx) {
-            AVHWFramesContext *hwfc = (AVHWFramesContext *)frame->hw_frames_ctx->data;
-            av_log(avctx, AV_LOG_DEBUG,
-                   "[HW-PATCH] Frame pool changed: %p -> %p (PTS=%"PRId64" pict_type=%d)\n",
-                   ctx->last_hw_frames_ctx, frame->hw_frames_ctx->data, frame->pts, frame->pict_type);
-            ctx->last_hw_frames_ctx = frame->hw_frames_ctx->data;
-            ctx->last_hw_sw_format  = hwfc->sw_format;
-            ctx->last_hw_width      = hwfc->width;
-            ctx->last_hw_height     = hwfc->height;
-        }
-
         int reg_idx = nvenc_register_frame(avctx, frame);
         if (reg_idx < 0) {
             av_log(avctx, AV_LOG_ERROR, "Could not register an input HW frame\n");
@@ -3304,7 +3290,7 @@ static int nvenc_rebuild_session(AVCodecContext *avctx)
         ctx->cu_stream        = ctx->pending_cu_stream;
         ctx->pending_cu_context = NULL;
         ctx->pending_cu_stream  = NULL;
-        av_log(avctx, AV_LOG_INFO,
+        av_log(avctx, AV_LOG_VERBOSE,
                "[HW-PATCH] CUDA context switched to %p for new session\n",
                ctx->cu_context);
         CHECK_CU(cu->cuCtxPushCurrent(ctx->cu_context));
@@ -3573,7 +3559,7 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
                      * with the wrong context active → SIGSEGV.
                      * The switch is deferred to inside nvenc_rebuild_session(),
                      * between Phase 4 (destroy) and Phase 5 (open new session). */
-                    av_log(avctx, AV_LOG_INFO,
+                    av_log(avctx, AV_LOG_VERBOSE,
                            "[HW-PATCH] CUDA context changed (old=%p new=%p) - "
                            "will switch after old session destroyed\n",
                            ctx->cu_context, new_cuda_hwctx->cuda_ctx);
@@ -3658,7 +3644,7 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
 
         if (ctx->pool_change_force_idr) {
             pic_params.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
-            av_log(avctx, AV_LOG_INFO,
+            av_log(avctx, AV_LOG_VERBOSE,
                    "[HW-PATCH] Pool change at PTS=%"PRId64" -> FORCEIDR (DPB reset)\n",
                    frame->pts);
             ctx->pool_change_force_idr = 0;
