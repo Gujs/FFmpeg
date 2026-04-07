@@ -342,14 +342,9 @@ typedef struct NvencContext
     // Force FORCEIDR on next frame after pool change
     int pool_change_force_idr;
 
-    // Full NVENC session teardown/rebuild on pool change
+    // Lightweight pool change: flush + clean registrations + force IDR
+    // (no session destroy/recreate — preserves NVENC's B-frame DPB)
     int pool_change_rebuild;
-
-    // Pending CUDA context/stream update — applied inside nvenc_rebuild_session
-    // AFTER the old session is destroyed, so cleanup runs on the correct old context.
-    // Set when a pool change also involves a CUDA context change.
-    CUcontext  pending_cu_context;
-    CUstream   pending_cu_stream;
 
     // Track last DTS/PTS for detecting non-monotonic timestamps
     int64_t last_dts_out;
