@@ -625,10 +625,22 @@ static int cudascale_filter_frame(AVFilterLink *link, AVFrame *in)
         goto fail;
 
     ret = cudascale_scale(ctx, out, in);
+    if (ret < 0) {
+        CHECK_CU(cu->cuCtxPopCurrent(&dummy));
+        goto fail;
+    }
+
+    /* Synchronize the CUDA stream to ensure the scale kernel has completed
+     * before the output frame is sent downstream. After filter graph
+     * reconfiguration, hwupload_cuda creates a new CUcontext. scale_cuda
+     * runs on this new context while NVENC stays on the original context.
+     * Without synchronization, the async kernel launch on context B may
+     * not have written the output pixels before NVENC reads them on
+     * context A — causing B-frame displacement (stale/partial data in
+     * NVENC's reference pictures). */
+    CHECK_CU(cu->cuStreamSynchronize(s->cu_stream));
 
     CHECK_CU(cu->cuCtxPopCurrent(&dummy));
-    if (ret < 0)
-        goto fail;
 
     if (s->reset_sar) {
         out->sample_aspect_ratio = (AVRational){1, 1};
