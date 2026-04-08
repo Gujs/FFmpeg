@@ -158,7 +158,8 @@ typedef struct Demuxer {
     /* Input A/V offset tracking (for muxer PLL reference) */
     int64_t               input_last_video_dts;  /* Last video DTS (AV_TIME_BASE units) */
     int64_t               input_last_audio_dts;  /* Last audio DTS (AV_TIME_BASE units) */
-    double                input_av_offset_ema;   /* Smoothed offset (seconds), EMA τ=10s */
+    int                   input_audio_stream_idx; /* Locked to first audio stream (-1 = unset) */
+    double                input_av_offset_ema;   /* Smoothed offset (seconds), EMA τ=60s */
     int64_t               input_av_offset_samples; /* Sample count for EMA init */
 } Demuxer;
 
@@ -512,11 +513,16 @@ static int input_packet_process(Demuxer *d, AVPacket *pkt, unsigned *send_flags)
 
     /* Track input A/V DTS offset for muxer PLL reference.
      * Measured AFTER ts_fixup (rebased DTS in AV_TIME_BASE units).
-     * Uses ds->dts which is set by ist_dts_update() inside ts_fixup(). */
+     * Uses ds->dts which is set by ist_dts_update() inside ts_fixup().
+     * Only first audio stream is tracked to avoid DTS bouncing with
+     * multi-audio input (e.g., stereo + AC3 copy). */
     if (ist->par->codec_type == AVMEDIA_TYPE_VIDEO) {
         d->input_last_video_dts = ds->dts;
     } else if (ist->par->codec_type == AVMEDIA_TYPE_AUDIO) {
-        d->input_last_audio_dts = ds->dts;
+        if (d->input_audio_stream_idx < 0)
+            d->input_audio_stream_idx = ist->index;
+        if (ist->index == d->input_audio_stream_idx)
+            d->input_last_audio_dts = ds->dts;
     }
 
     if (d->input_last_video_dts != AV_NOPTS_VALUE &&
@@ -524,8 +530,11 @@ static int input_packet_process(Demuxer *d, AVPacket *pkt, unsigned *send_flags)
         double offset = (d->input_last_video_dts - d->input_last_audio_dts)
                         / (double)AV_TIME_BASE;
 
-        /* EMA smoothing: τ=10s at ~75 packets/sec (vid+aud combined) */
-        double alpha = 1.0 / (75.0 * 10.0);
+        /* EMA smoothing: τ=60s at ~75 packets/sec (vid+aud combined).
+         * Longer τ reduces MPEG-TS interleaving noise (~6x vs τ=10s).
+         * Post-discontinuity convergence: ~3min (3τ), acceptable since
+         * discontinuities don't reset the muxer PLL baseline. */
+        double alpha = 1.0 / (75.0 * 60.0);
         if (d->input_av_offset_samples == 0) {
             d->input_av_offset_ema = offset;
         } else {
@@ -2045,6 +2054,7 @@ static Demuxer *demux_alloc(void)
 
     d->input_last_video_dts     = AV_NOPTS_VALUE;
     d->input_last_audio_dts     = AV_NOPTS_VALUE;
+    d->input_audio_stream_idx   = -1;
     d->input_av_offset_ema      = 0.0;
     d->input_av_offset_samples  = 0;
 
