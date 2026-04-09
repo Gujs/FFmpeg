@@ -435,11 +435,13 @@ int muxer_thread(void *arg)
     AVRational last_audio_dts_tb = {0, 1};
     int64_t    last_avsync_log_wc = 0;
 
-    /* Input-referenced A/V sync PLL.
-     * Measures output A/V offset, compares to input A/V offset (from demuxer).
-     * The difference = pipeline-induced drift. Correct it proportionally.
-     * Only primary (first encoded) audio stream is measured and corrected.
-     * No adaptive baseline needed — input offset IS the reference. */
+    /* Input-referenced A/V sync PLL — closed-loop integral controller.
+     * Maintains a cumulative position offset that grows over time to counter
+     * drift from aresample async clock (~34ms/hr) and discontinuity vid_error
+     * residuals (~11ms/hr). Measures CORRECTED output for closed-loop feedback.
+     * History: Session 80 had closed-loop but adaptive baseline (absorbed drift).
+     * Session 83 had input-ref baseline but open-loop (corrections invisible).
+     * This combines input-ref baseline + closed-loop + cumulative offset. */
 #define PLL_WARMUP_SAMPLES   14100   /* ~5min at 47 audio pkt/s */
 #define PLL_RESET_THRESHOLD  5.0     /* seconds — genuine source change */
 #define PLL_AUDIO_PKT_RATE   47.0    /* 48kHz AAC @ 1024 samples/frame */
@@ -447,14 +449,14 @@ int muxer_thread(void *arg)
 #define PLL_MAX_RATE         0.001   /* ±1ms/s max correction rate */
 #define PLL_DEAD_ZONE        0.015   /* 15ms — don't correct sub-perceptual drift */
 
-    double     pll_error_ema = 0.0;       /* Smoothed error: (output_offset - input_offset) */
-    double     pll_error_baseline = 0.0;  /* Initial error (constant pipeline delay) */
-    int        pll_baseline_set = 0;      /* Whether baseline has been captured */
-    int64_t    pll_sample_count = 0;      /* Measurement samples collected */
-    double     pll_correction_accum = 0.0;/* Sub-tick accumulator (seconds) */
-    int64_t    pll_total_ticks = 0;       /* Total audio ticks adjusted */
-    int64_t    pll_last_log_wc = 0;       /* Wall-clock of last PLL log */
-    int        pll_enc_audio_idx = -1;    /* First encoded audio stream index */
+    double     pll_error_ema = 0.0;         /* Smoothed error: (corrected_output - input) */
+    double     pll_error_baseline = 0.0;    /* Initial error (constant pipeline delay) */
+    int        pll_baseline_set = 0;        /* Whether baseline has been captured */
+    int64_t    pll_sample_count = 0;        /* Measurement samples collected */
+    double     pll_cumulative_offset = 0.0; /* Integral: total position correction (seconds) */
+    int64_t    pll_total_ticks = 0;         /* Current offset in ticks (diagnostic) */
+    int64_t    pll_last_log_wc = 0;         /* Wall-clock of last PLL log */
+    int        pll_enc_audio_idx = -1;      /* First encoded audio stream index */
     int        pll_input_file_idx = (nb_input_files > 0) ? 0 : -1;
 
     /* Rate monitoring (10-second windows) */
@@ -539,7 +541,10 @@ int muxer_thread(void *arg)
                        gap_us / 1000000.0, ost->index);
             }
             last_write_wc_audio = now;
-            if (mt.pkt->dts != AV_NOPTS_VALUE) {
+            /* DTS tracking: PLL stream updates AFTER correction (closed-loop);
+             * non-PLL audio streams update here immediately. */
+            if (mt.pkt->dts != AV_NOPTS_VALUE &&
+                !(ost->enc && ost->index == pll_enc_audio_idx)) {
                 last_audio_dts = mt.pkt->dts;
                 last_audio_dts_tb = mt.pkt->time_base;
             }
@@ -586,11 +591,12 @@ int muxer_thread(void *arg)
             }
         }
 
-        /* Input-referenced A/V sync PLL.
-         * Compares output A/V offset to input A/V offset (from demuxer).
-         * The difference = pipeline-induced drift. Correct proportionally.
-         * Only primary (first encoded) audio stream is measured and corrected;
-         * secondary audio streams pass through unmodified. */
+        /* Input-referenced A/V sync PLL — closed-loop integral controller.
+         * Measures CORRECTED output A/V offset (includes cumulative_offset),
+         * compares to input A/V offset from demuxer. The difference = drift.
+         * Integrates proportional correction rate into cumulative position offset.
+         * Closed-loop: PLL sees its own corrections → negative feedback → convergence.
+         * Only primary (first encoded) audio stream is measured and corrected. */
         if (ost->type == AVMEDIA_TYPE_AUDIO && ost->enc &&
             ost->index == pll_enc_audio_idx &&
             mt.pkt->dts != AV_NOPTS_VALUE &&
@@ -603,12 +609,16 @@ int muxer_thread(void *arg)
                 input_offset = input_us / 1000000.0;
             }
 
-            /* Step 2: Measure output A/V offset */
+            /* Step 2: Measure CORRECTED output A/V offset (closed-loop).
+             * Include pll_cumulative_offset so the PLL sees the effect of
+             * its own corrections. This creates negative feedback → convergence.
+             * Without this, the PLL is open-loop and corrections are invisible. */
             double video_sec = last_video_dts * av_q2d(last_video_dts_tb);
-            double audio_sec = mt.pkt->dts * av_q2d(mt.pkt->time_base);
-            double output_offset = video_sec - audio_sec;
+            double raw_audio_sec = mt.pkt->dts * av_q2d(mt.pkt->time_base);
+            double corrected_audio_sec = raw_audio_sec + pll_cumulative_offset;
+            double output_offset = video_sec - corrected_audio_sec;
 
-            /* Step 3: Compute error = output - input */
+            /* Step 3: Compute error = corrected_output - input */
             double error = output_offset - input_offset;
 
             /* EMA smooth the error (τ=60s at ~47 audio packets/sec) */
@@ -628,51 +638,67 @@ int muxer_thread(void *arg)
                 pll_baseline_set = 1;
                 av_log(mux, AV_LOG_INFO,
                        "[AV-SYNC-PLL] baseline captured: %.3fms "
-                       "(output=%.3fms input=%.3fms)\n",
+                       "(output=%.3fms input=%.3fms cumul=%.3fms)\n",
                        pll_error_baseline * 1000.0,
-                       output_offset * 1000.0, input_offset * 1000.0);
+                       output_offset * 1000.0, input_offset * 1000.0,
+                       pll_cumulative_offset * 1000.0);
             }
 
-            /* Reset on large step — genuine source change */
+            /* Reset on large step — genuine source change.
+             * Do NOT reset pll_cumulative_offset: it represents real corrections
+             * already applied. Resetting would cause a DTS discontinuity.
+             * The new baseline will capture the current corrected state. */
             if (pll_baseline_set && fabs(error - pll_error_ema) > PLL_RESET_THRESHOLD) {
                 av_log(mux, AV_LOG_INFO,
-                       "[AV-SYNC-PLL] reset: step=%.3fs\n",
-                       error - pll_error_ema);
+                       "[AV-SYNC-PLL] reset: step=%.3fs cumul=%.3fms\n",
+                       error - pll_error_ema,
+                       pll_cumulative_offset * 1000.0);
                 pll_sample_count = 0;
                 pll_baseline_set = 0;
                 pll_error_ema = error;
             }
 
-            /* Step 4: Apply correction (after baseline captured) */
+            /* Step 4: Integrate correction into cumulative offset */
             if (pll_baseline_set) {
                 double drift = pll_error_ema - pll_error_baseline;
 
                 /* Dead zone: don't correct sub-perceptual drift.
-                 * Reduces noise-chasing (Daystar: 47% rate saturation → <5%).
                  * 15ms threshold is below ITU-R BT.1359 perceptibility. */
                 if (fabs(drift) < PLL_DEAD_ZONE)
                     drift = 0.0;
 
-                /* Proportional gain: correct at drift/60 per second.
-                 * Positive drift → audio falling behind → push audio DTS later.
-                 * Clamp to ±1ms/s to prevent audible artifacts. */
+                /* Proportional gain: correction_rate = drift/60 per second.
+                 * Clamp to ±1ms/s to prevent audible artifacts.
+                 * Integrate: cumulative_offset grows by correction_rate * dt.
+                 * This is the key fix: the offset GROWS over time, creating
+                 * meaningful position correction (unlike the old drain-accumulator
+                 * which created negligible ~0.022ms per-packet shifts). */
                 double correction_rate = drift / PLL_GAIN_PERIOD;
                 if (correction_rate >  PLL_MAX_RATE) correction_rate =  PLL_MAX_RATE;
                 if (correction_rate < -PLL_MAX_RATE) correction_rate = -PLL_MAX_RATE;
 
-                pll_correction_accum += correction_rate / PLL_AUDIO_PKT_RATE;
+                pll_cumulative_offset += correction_rate / PLL_AUDIO_PKT_RATE;
+            }
 
+            /* Step 5: Apply FULL cumulative offset to packet.
+             * Each packet gets the entire accumulated correction because the
+             * encoder produces raw DTS with no memory of prior corrections. */
+            {
                 double tick_size = av_q2d(mt.pkt->time_base);
-                int64_t ticks = (int64_t)(pll_correction_accum / tick_size);
+                int64_t ticks = llrint(pll_cumulative_offset / tick_size);
 
                 if (ticks != 0) {
                     mt.pkt->dts += ticks;
                     if (mt.pkt->pts != AV_NOPTS_VALUE)
                         mt.pkt->pts += ticks;
-                    pll_correction_accum -= ticks * tick_size;
-                    pll_total_ticks += ticks;
                 }
+                pll_total_ticks = ticks;
             }
+
+            /* Update last_audio_dts with CORRECTED DTS (closed-loop feedback).
+             * The [AV-SYNC] diagnostic log will now show corrected output. */
+            last_audio_dts = mt.pkt->dts;
+            last_audio_dts_tb = mt.pkt->time_base;
 
             /* PLL log every 60 seconds */
             {
@@ -682,10 +708,11 @@ int muxer_thread(void *arg)
                                    (pll_error_ema - pll_error_baseline) : 0.0;
                     av_log(mux, AV_LOG_INFO,
                            "[AV-SYNC-PLL] error=%.3fms baseline=%.3fms "
-                           "drift=%.3fms input=%.3fms total=%"PRId64" ticks\n",
+                           "drift=%.3fms cumul=%.3fms input=%.3fms ticks=%"PRId64"\n",
                            pll_error_ema * 1000.0,
                            pll_baseline_set ? pll_error_baseline * 1000.0 : 0.0,
                            drift * 1000.0,
+                           pll_cumulative_offset * 1000.0,
                            (pll_input_file_idx >= 0 && pll_input_file_idx < nb_input_files ?
                             atomic_load(&input_files[pll_input_file_idx]->input_av_offset_us) / 1000.0 :
                             0.0),
