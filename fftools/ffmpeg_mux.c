@@ -590,35 +590,32 @@ int muxer_thread(void *arg)
             }
         }
 
-        /* Input-referenced A/V sync PLL — closed-loop integral controller.
-         * Measures CORRECTED output A/V offset (includes cumulative_offset),
-         * compares to input A/V offset from demuxer. The difference = drift.
-         * Integrates proportional correction rate into cumulative position offset.
-         * Closed-loop: PLL sees its own corrections → negative feedback → convergence.
+        /* A/V sync PLL — closed-loop integral controller.
+         * Measures ABSOLUTE corrected output A/V offset (video_dts - audio_dts).
+         * No input reference: the input-referenced design (Sessions 83-89) cancelled
+         * the 19ppm aresample drift because both input and output share the source
+         * clock — the PLL saw no drift to correct. Absolute measurement detects
+         * the real drift between CFR video and source-clocked audio directly.
+         * Discontinuity vid_error steps are absorbed by the EMA (τ=60s).
+         * Closed-loop: cumulative_offset feeds back into measurement → convergence.
          * Only primary (first encoded) audio stream is measured and corrected. */
         if (ost->type == AVMEDIA_TYPE_AUDIO && ost->enc &&
             ost->index == pll_enc_audio_idx &&
             mt.pkt->dts != AV_NOPTS_VALUE &&
             last_video_dts != AV_NOPTS_VALUE) {
 
-            /* Step 1: Read input A/V offset (atomic, from demuxer thread) */
-            double input_offset = 0.0;
-            if (pll_input_file_idx >= 0 && pll_input_file_idx < nb_input_files) {
-                int64_t input_us = atomic_load(&input_files[pll_input_file_idx]->input_av_offset_us);
-                input_offset = input_us / 1000000.0;
-            }
-
-            /* Step 2: Measure CORRECTED output A/V offset (closed-loop).
+            /* Step 1: Measure CORRECTED output A/V offset (closed-loop).
              * Include pll_cumulative_offset so the PLL sees the effect of
-             * its own corrections. This creates negative feedback → convergence.
-             * Without this, the PLL is open-loop and corrections are invisible. */
+             * its own corrections. This creates negative feedback → convergence. */
             double video_sec = last_video_dts * av_q2d(last_video_dts_tb);
             double raw_audio_sec = mt.pkt->dts * av_q2d(mt.pkt->time_base);
             double corrected_audio_sec = raw_audio_sec + pll_cumulative_offset;
             double output_offset = video_sec - corrected_audio_sec;
 
-            /* Step 3: Compute error = corrected_output - input */
-            double error = output_offset - input_offset;
+            /* Step 2: Error = absolute corrected offset.
+             * No input subtraction — input-referenced design cancelled the drift
+             * we need to correct (both sides share source clock). */
+            double error = output_offset;
 
             /* EMA smooth the error (τ=60s at ~47 audio packets/sec) */
             double alpha = 1.0 - exp(-1.0 / (PLL_AUDIO_PKT_RATE * PLL_GAIN_PERIOD));
@@ -637,9 +634,9 @@ int muxer_thread(void *arg)
                 pll_baseline_set = 1;
                 av_log(mux, AV_LOG_INFO,
                        "[AV-SYNC-PLL] baseline captured: %.3fms "
-                       "(output=%.3fms input=%.3fms cumul=%.3fms)\n",
+                       "(output=%.3fms cumul=%.3fms)\n",
                        pll_error_baseline * 1000.0,
-                       output_offset * 1000.0, input_offset * 1000.0,
+                       output_offset * 1000.0,
                        pll_cumulative_offset * 1000.0);
             }
 
