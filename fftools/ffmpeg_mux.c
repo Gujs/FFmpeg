@@ -447,7 +447,6 @@ int muxer_thread(void *arg)
 #define PLL_AUDIO_PKT_RATE   47.0    /* 48kHz AAC @ 1024 samples/frame */
 #define PLL_GAIN_PERIOD      60.0    /* proportional gain: drift/60 per second */
 #define PLL_MAX_RATE         0.001   /* ±1ms/s max correction rate */
-#define PLL_DEAD_ZONE        0.015   /* 15ms — don't correct sub-perceptual drift */
 
     double     pll_error_ema = 0.0;         /* Smoothed error: (corrected_output - input) */
     double     pll_error_baseline = 0.0;    /* Initial error (constant pipeline delay) */
@@ -661,11 +660,6 @@ int muxer_thread(void *arg)
             /* Step 4: Integrate correction into cumulative offset */
             if (pll_baseline_set) {
                 double drift = pll_error_ema - pll_error_baseline;
-
-                /* Dead zone: don't correct sub-perceptual drift.
-                 * 15ms threshold is below ITU-R BT.1359 perceptibility. */
-                if (fabs(drift) < PLL_DEAD_ZONE)
-                    drift = 0.0;
 
                 /* Proportional gain: correction_rate = drift/60 per second.
                  * Clamp to ±1ms/s to prevent audible artifacts.
