@@ -471,9 +471,11 @@ static av_cold int init_audio(AVFilterContext *ctx)
     s->prev_sample_rate = s->sample_rate;
     s->prev_sample_fmt  = s->sample_fmt;
     s->prev_channels    = s->channels;
-    ret = av_channel_layout_copy(&s->prev_ch_layout, &s->ch_layout);
-    if (ret < 0)
-        return ret;
+    {
+        int ret = av_channel_layout_copy(&s->prev_ch_layout, &s->ch_layout);
+        if (ret < 0)
+            return ret;
+    }
 
     av_log(ctx, AV_LOG_VERBOSE,
            "tb:%d/%d samplefmt:%s samplerate:%d chlayout:%s\n",
