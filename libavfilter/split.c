@@ -27,7 +27,6 @@
 
 #include "libavutil/attributes.h"
 #include "libavutil/avstring.h"
-#include "libavutil/hwcontext.h"
 #include "libavutil/internal.h"
 #include "libavutil/opt.h"
 
@@ -89,25 +88,6 @@ static int activate(AVFilterContext *ctx)
             if (!buf_out) {
                 ret = AVERROR(ENOMEM);
                 break;
-            }
-
-            /* For HW frames, make each output a private copy.
-             * av_frame_clone shares the same GPU buffer across all outputs.
-             * Without private copies, all downstream scale_cuda instances
-             * create texture objects on the same shared GPU surface, causing
-             * frame displacement after filter graph reconfiguration.
-             *
-             * av_frame_make_writable allocates a new GPU surface from the pool
-             * and copies via cuMemcpy2DAsync (device-to-device on default stream).
-             * No explicit sync needed — with -init_hw_device/-filter_hw_device,
-             * all CUDA operations share one context and the default stream
-             * serializes them. */
-            if (buf_out->hw_frames_ctx) {
-                ret = av_frame_make_writable(buf_out);
-                if (ret < 0) {
-                    av_frame_free(&buf_out);
-                    break;
-                }
             }
 
             ret = ff_filter_frame(ctx->outputs[i], buf_out);
