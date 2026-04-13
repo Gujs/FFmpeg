@@ -28,7 +28,6 @@
 #include "libavutil/attributes.h"
 #include "libavutil/avstring.h"
 #include "libavutil/hwcontext.h"
-#include "libavutil/hwcontext_cuda_internal.h"
 #include "libavutil/internal.h"
 #include "libavutil/opt.h"
 
@@ -96,31 +95,18 @@ static int activate(AVFilterContext *ctx)
              * av_frame_clone shares the same GPU buffer across all outputs.
              * Without private copies, all downstream scale_cuda instances
              * create texture objects on the same shared GPU surface, causing
-             * frame displacement.
+             * frame displacement after filter graph reconfiguration.
              *
              * av_frame_make_writable allocates a new GPU surface from the pool
-             * and copies via cuMemcpy2DAsync (device-to-device).
-             * cuStreamSynchronize is required after the copy to ensure it
-             * completes before downstream filters create textures on the
-             * surface. Despite all operations nominally being on the same
-             * CUDA context's default stream, FFmpeg's filter scheduler may
-             * dispatch downstream filters from different thread activations,
-             * breaking the implicit stream ordering guarantee. */
+             * and copies via cuMemcpy2DAsync (device-to-device on default stream).
+             * No explicit sync needed — with -init_hw_device/-filter_hw_device,
+             * all CUDA operations share one context and the default stream
+             * serializes them. */
             if (buf_out->hw_frames_ctx) {
                 ret = av_frame_make_writable(buf_out);
                 if (ret < 0) {
                     av_frame_free(&buf_out);
                     break;
-                }
-
-                AVHWFramesContext *hwfc = (AVHWFramesContext *)buf_out->hw_frames_ctx->data;
-                if (hwfc->format == AV_PIX_FMT_CUDA) {
-                    AVCUDADeviceContext *cuda_hwctx = hwfc->device_ctx->hwctx;
-                    CudaFunctions *cu = cuda_hwctx->internal->cuda_dl;
-                    CUcontext dummy;
-                    cu->cuCtxPushCurrent(cuda_hwctx->cuda_ctx);
-                    cu->cuStreamSynchronize(cuda_hwctx->stream);
-                    cu->cuCtxPopCurrent(&dummy);
                 }
             }
 
