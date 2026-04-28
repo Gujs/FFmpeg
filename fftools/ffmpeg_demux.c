@@ -780,6 +780,27 @@ static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
                        (double)vid_offset / AV_TIME_BASE,
                        (double)aud_offset / AV_TIME_BASE,
                        (double)(vid_offset - aud_offset) / AV_TIME_BASE);
+
+                /* Arm the muxer PLL disturbance window when vid_error is large.
+                 * After the rebase, output video DTS is offset from where the
+                 * audio offset places it by exactly vid_error. The pipeline
+                 * (cfr duplicating, swr injecting silence) absorbs this over
+                 * minutes, polluting the muxer PLL's EMA. Defer baseline
+                 * capture until the EMA settles.
+                 *
+                 * Threshold 1s catches catastrophic events (PATRIOT-TVI's
+                 * 13.4s / 26.3s / 51.6s vid_errors) without arming on routine
+                 * boundary noise (Daystar 2ch/6ch audio change ~50 ms,
+                 * AWE/Euronews SCTE-35 splices ~0 ms). */
+                int64_t vid_err_us = vid_offset - aud_offset;
+                if (vid_err_us < 0)
+                    vid_err_us = -vid_err_us;
+                if (vid_err_us > AV_TIME_BASE) {
+                    ifile_arm_pll_disturbance(f, 5 * 60 * 1000000LL);
+                    av_log(d, AV_LOG_INFO,
+                           "[DISCONT-BUF] arming PLL disturbance window for 5min (vid_error=%.3fs > 1s)\n",
+                           (double)(vid_offset - aud_offset) / AV_TIME_BASE);
+                }
             }
         }
 
