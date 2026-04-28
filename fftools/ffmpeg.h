@@ -556,6 +556,13 @@ typedef struct InputFile {
      * Continuously updated via atomic store; muxer reads via atomic load.
      * Positive = video DTS ahead of audio DTS. */
     atomic_int_least64_t input_av_offset_us;
+
+    /* Disturbance window deadline (av_gettime_relative units, microseconds).
+     * While the wall clock < this value, the muxer's PLL defers baseline
+     * capture to avoid locking onto a polluted EMA. Set forward (max-of)
+     * by demuxer events that make the EMA unreliable: large vid_error in
+     * DISCONT-BUF, INPUT-GAP close, and at process startup. */
+    atomic_int_least64_t pll_disturbance_until_us;
 } InputFile;
 
 enum forced_keyframes_const {
@@ -946,6 +953,17 @@ int64_t of_filesize(OutputFile *of);
 
 int ifile_open(const OptionsContext *o, const char *filename, Scheduler *sch);
 void ifile_close(InputFile **f);
+
+/**
+ * Arm the muxer PLL disturbance window forward by `duration_us` microseconds
+ * from now. While the wall clock is below the deadline, the muxer's PLL
+ * defers baseline capture to avoid locking onto a polluted EMA. Only takes
+ * effect if the resulting deadline is later than the current one (max-of).
+ *
+ * Called from sites that introduce a transient EMA disturbance: large
+ * vid_error in the discontinuity buffer, INPUT-GAP close, process startup.
+ */
+void ifile_arm_pll_disturbance(InputFile *f, int64_t duration_us);
 
 int ist_use(InputStream *ist, int decoding_needed,
             const ViewSpecifier *vs, SchedulerNode *src);

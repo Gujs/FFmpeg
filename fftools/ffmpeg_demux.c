@@ -2063,7 +2063,24 @@ static Demuxer *demux_alloc(void)
     d->input_av_offset_ema      = 0.0;
     d->input_av_offset_samples  = 0;
 
+    /* Arm the PLL disturbance window for the first 5 minutes of process
+     * lifetime. Most of the catastrophically-bad baseline captures observed
+     * in production come from initial-startup chaos (PTS wrap, decoder
+     * warmup, codec parameter discovery). The 5-min initial arm covers that
+     * window; subsequent arms come from demuxer-side disturbance signals.
+     * Sub-perceptible cost: ≤6 ms of uncorrected drift on every channel
+     * during the deferred window (19 ppm × 5 min). */
+    ifile_arm_pll_disturbance(&d->f, 5 * 60 * 1000000LL);
+
     return d;
+}
+
+void ifile_arm_pll_disturbance(InputFile *f, int64_t duration_us)
+{
+    int64_t until = av_gettime_relative() + duration_us;
+    int64_t cur   = atomic_load(&f->pll_disturbance_until_us);
+    if (until > cur)
+        atomic_store(&f->pll_disturbance_until_us, until);
 }
 
 int ifile_open(const OptionsContext *o, const char *filename, Scheduler *sch)
