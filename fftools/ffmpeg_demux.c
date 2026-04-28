@@ -771,6 +771,13 @@ static int input_thread(void *arg)
                     av_log(d, AV_LOG_WARNING,
                            "[INPUT-GAP] No video packets for %.3fs (stream %d)\n",
                            gap_us / 1000000.0, stream_idx);
+                    /* Arm muxer PLL disturbance window for gaps >=5s. cfr fills
+                     * the gap with duplicates while real input is missing,
+                     * leaving the EMA polluted for ~gap_seconds wall clock
+                     * plus EMA settling time. 5s threshold avoids arming on
+                     * routine UDP jitter (1-3s gaps self-recover). */
+                    if (gap_us > 5000000)
+                        ifile_arm_pll_disturbance(f, 5 * 60 * 1000000LL);
                 }
                 last_read_wc_video = now;
             } else if (mtype == AVMEDIA_TYPE_AUDIO) {
@@ -780,6 +787,8 @@ static int input_thread(void *arg)
                     av_log(d, AV_LOG_WARNING,
                            "[INPUT-GAP] No audio packets for %.3fs (stream %d)\n",
                            gap_us / 1000000.0, stream_idx);
+                    if (gap_us > 5000000)
+                        ifile_arm_pll_disturbance(f, 5 * 60 * 1000000LL);
                 }
                 last_read_wc_audio = now;
             }
