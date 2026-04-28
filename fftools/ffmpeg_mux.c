@@ -447,6 +447,9 @@ int muxer_thread(void *arg)
 #define PLL_AUDIO_PKT_RATE   47.0    /* 48kHz AAC @ 1024 samples/frame */
 #define PLL_GAIN_PERIOD      60.0    /* proportional gain: drift/60 per second */
 #define PLL_MAX_RATE         0.001   /* ±1ms/s max correction rate */
+#define PLL_HARD_CEILING_US  (60 * 60 * 1000000LL)  /* 60 min — force capture even if disturbance window stays open */
+#define PLL_STUCK_THRESHOLD  2.0     /* seconds — |baseline| above this = suspect stuck capture */
+#define PLL_STUCK_DRIFT_LIMIT 0.050  /* seconds — |drift| below this = converged (stuck condition) */
 
     double     pll_error_ema = 0.0;         /* Smoothed error: (corrected_output - input) */
     double     pll_error_baseline = 0.0;    /* Initial error (constant pipeline delay) */
@@ -457,6 +460,9 @@ int muxer_thread(void *arg)
     int64_t    pll_last_log_wc = 0;         /* Wall-clock of last PLL log */
     int        pll_enc_audio_idx = -1;      /* First encoded audio stream index */
     int        pll_input_file_idx = (nb_input_files > 0) ? 0 : -1;
+    int64_t    pll_warmup_complete_wc = 0;  /* Wall-clock when warmup first completed (for hard ceiling) */
+    int64_t    pll_last_defer_log_wc = 0;   /* Throttle the "deferred" log to once/min */
+    int        pll_stuck_minutes = 0;       /* Consecutive minutes meeting stuck condition (Fix C) */
 
     /* Rate monitoring (10-second windows) */
     int64_t    rate_monitor_start = 0;
@@ -626,18 +632,49 @@ int muxer_thread(void *arg)
             }
             pll_sample_count++;
 
-            /* Capture baseline after warmup guard (pipeline takes ~2min to fill,
-             * extra margin for EMA convergence and interleaving jitter).
-             * Baseline captured once — must be at true steady state. */
+            /* Capture baseline after warmup guard, BUT only if we are outside
+             * the disturbance window (set by demuxer DISCONT-BUF, INPUT-GAP,
+             * and process startup). The window protects the EMA from being
+             * captured while it is still polluted by transient swr silence
+             * injection or vid_error fallout. Production data showed that
+             * captures landing inside disturbance windows produced multi-
+             * second stuck baselines (e.g., PATRIOT-TVI -3690ms, -4017ms).
+             *
+             * Hard ceiling: if a source is so continuously disturbed that
+             * the window never expires, capture anyway after PLL_HARD_CEILING_US
+             * (60 min) past warmup completion — better an imperfect baseline
+             * than no PLL at all. The captured value will still likely be
+             * better than today since the EMA has had longer to settle. */
             if (!pll_baseline_set && pll_sample_count >= PLL_WARMUP_SAMPLES) {
-                pll_error_baseline = pll_error_ema;
-                pll_baseline_set = 1;
-                av_log(mux, AV_LOG_INFO,
-                       "[AV-SYNC-PLL] baseline captured: %.3fms "
-                       "(output=%.3fms cumul=%.3fms)\n",
-                       pll_error_baseline * 1000.0,
-                       output_offset * 1000.0,
-                       pll_cumulative_offset * 1000.0);
+                int64_t now_wc = av_gettime_relative();
+                if (pll_warmup_complete_wc == 0)
+                    pll_warmup_complete_wc = now_wc;
+
+                int64_t arm_until = (pll_input_file_idx >= 0 && pll_input_file_idx < nb_input_files)
+                    ? atomic_load(&input_files[pll_input_file_idx]->pll_disturbance_until_us)
+                    : 0;
+
+                int forced_by_ceiling =
+                    (now_wc - pll_warmup_complete_wc) > PLL_HARD_CEILING_US;
+                int window_clear = (now_wc > arm_until);
+
+                if (window_clear || forced_by_ceiling) {
+                    pll_error_baseline = pll_error_ema;
+                    pll_baseline_set = 1;
+                    av_log(mux, AV_LOG_INFO,
+                           "[AV-SYNC-PLL] baseline captured: %.3fms "
+                           "(output=%.3fms cumul=%.3fms%s)\n",
+                           pll_error_baseline * 1000.0,
+                           output_offset * 1000.0,
+                           pll_cumulative_offset * 1000.0,
+                           forced_by_ceiling ? " HARD_CEILING" : "");
+                } else if (now_wc - pll_last_defer_log_wc >= 60000000) {
+                    int64_t remaining_s = (arm_until - now_wc) / 1000000;
+                    av_log(mux, AV_LOG_INFO,
+                           "[AV-SYNC-PLL] baseline deferred (%"PRId64"s left in disturbance window)\n",
+                           remaining_s);
+                    pll_last_defer_log_wc = now_wc;
+                }
             }
 
             /* Reset on large step — genuine source change.
