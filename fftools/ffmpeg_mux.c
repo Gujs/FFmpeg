@@ -680,7 +680,14 @@ int muxer_thread(void *arg)
             /* Reset on large step — genuine source change.
              * Do NOT reset pll_cumulative_offset: it represents real corrections
              * already applied. Resetting would cause a DTS discontinuity.
-             * The new baseline will capture the current corrected state. */
+             * The new baseline will capture the current corrected state.
+             *
+             * Re-arm the warmup-completion clock and the deferred-log throttle
+             * so the hard-ceiling check applies relative to the NEW warmup,
+             * not the original one — without this, a reset later in the run
+             * leaves pll_warmup_complete_wc stuck at the first warmup time,
+             * which makes (now - pll_warmup_complete_wc) > 60min trivially
+             * true and bypasses the disturbance window on every reset. */
             if (pll_baseline_set && fabs(error - pll_error_ema) > PLL_RESET_THRESHOLD) {
                 av_log(mux, AV_LOG_INFO,
                        "[AV-SYNC-PLL] reset: step=%.3fs cumul=%.3fms\n",
@@ -689,6 +696,9 @@ int muxer_thread(void *arg)
                 pll_sample_count = 0;
                 pll_baseline_set = 0;
                 pll_error_ema = error;
+                pll_warmup_complete_wc = 0;
+                pll_last_defer_log_wc  = 0;
+                pll_stuck_minutes      = 0;
             }
 
             /* Step 4: Integrate correction into cumulative offset */
