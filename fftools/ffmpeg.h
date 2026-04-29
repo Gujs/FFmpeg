@@ -975,7 +975,6 @@ int ifile_open(const OptionsContext *o, const char *filename, Scheduler *sch);
 void ifile_close(InputFile **f);
 
 /**
-<<<<<<< HEAD
  * Structure to hold results from parallel I/O phase of input opening.
  */
 typedef struct IfileOpenIOResult IfileOpenIOResult;
@@ -1011,8 +1010,6 @@ void ifile_open_io_result_cleanup(IfileOpenIOResult *result);
 const char *ifile_open_io_result_error(const IfileOpenIOResult *result);
 
 /**
-=======
->>>>>>> output-av-sync
  * Arm the muxer PLL disturbance window forward by `duration_us` microseconds
  * from now. While the wall clock is below the deadline, the muxer's PLL
  * defers baseline capture to avoid locking onto a polluted EMA. Only takes
