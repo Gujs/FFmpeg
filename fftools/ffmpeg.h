@@ -553,6 +553,18 @@ typedef struct InputFile {
     /* stream groups that ffmpeg is aware of; */
     InputStreamGroup **stream_groups;
     int           nb_stream_groups;
+
+    /* Input A/V DTS offset measured in demuxer thread (microseconds).
+     * Continuously updated via atomic store; muxer reads via atomic load.
+     * Positive = video DTS ahead of audio DTS. */
+    atomic_int_least64_t input_av_offset_us;
+
+    /* Disturbance window deadline (av_gettime_relative units, microseconds).
+     * While the wall clock < this value, the muxer's PLL defers baseline
+     * capture to avoid locking onto a polluted EMA. Set forward (max-of)
+     * by demuxer events that make the EMA unreliable: large vid_error in
+     * DISCONT-BUF, INPUT-GAP close, and at process startup. */
+    atomic_int_least64_t pll_disturbance_until_us;
 } InputFile;
 
 enum forced_keyframes_const {
@@ -963,6 +975,7 @@ int ifile_open(const OptionsContext *o, const char *filename, Scheduler *sch);
 void ifile_close(InputFile **f);
 
 /**
+<<<<<<< HEAD
  * Structure to hold results from parallel I/O phase of input opening.
  */
 typedef struct IfileOpenIOResult IfileOpenIOResult;
@@ -998,6 +1011,8 @@ void ifile_open_io_result_cleanup(IfileOpenIOResult *result);
 const char *ifile_open_io_result_error(const IfileOpenIOResult *result);
 
 /**
+=======
+>>>>>>> output-av-sync
  * Arm the muxer PLL disturbance window forward by `duration_us` microseconds
  * from now. While the wall clock is below the deadline, the muxer's PLL
  * defers baseline capture to avoid locking onto a polluted EMA. Only takes
