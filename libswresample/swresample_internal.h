@@ -137,6 +137,7 @@ struct SwrContext {
     float soft_compensation_duration;               ///< swr duration over which soft compensation is applied
     float max_soft_compensation;                    ///< swr maximum soft compensation in seconds over soft_compensation_duration
     float async;                                    ///< swr simple 1 parameter async, similar to ffmpegs -async
+    float jump_comp;                                ///< jump compensation: enables safety-net hard correction (0=disabled)
     int64_t firstpts_in_samples;                    ///< swr first pts in samples
 
     int resample_first;                             ///< 1 if resampling must come first, 0 if rematrixing
