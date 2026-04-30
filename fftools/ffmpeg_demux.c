@@ -2029,6 +2029,38 @@ static int input_thread(void *arg)
                     raw_dts = av_rescale_q_rnd(dt.pkt_demux->dts,
                                                ist->st->time_base, AV_TIME_BASE_Q,
                                                AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+
+                    /* Propagate the wrap correction from VIDEO to DATA and
+                     * SUBTITLE streams. discont_detect_jump() only runs wrap
+                     * detection on video/audio (sparse DATA/SUBTITLE packets
+                     * are unreliable for it), so without this, DATA streams
+                     * stay in raw 33-bit space while video extends past it.
+                     * The resulting domain mismatch broke SCTE-35 splice_time
+                     * after every source PCR wrap (~26.5h), causing the
+                     * mpegtsenc fallback to emit splice_times in the wrong
+                     * 33-bit cycle (downstream saw ~56000s preroll).
+                     *
+                     * Use video as the reference because SCTE-35 splice_time
+                     * is keyed to source PCR, which on MPEG-TS lives on the
+                     * video PID. Audio's wrap is detected separately within
+                     * ~1s of video's; not propagating from audio avoids
+                     * double-application. */
+                    if (ist->par->codec_type == AVMEDIA_TYPE_VIDEO) {
+                        for (int s = 0; s < f->nb_streams; s++) {
+                            InputStream *ist_other = f->streams[s];
+                            DemuxStream  *ds_other = ds_from_ist(ist_other);
+                            if (ist_other->par->codec_type != AVMEDIA_TYPE_DATA &&
+                                ist_other->par->codec_type != AVMEDIA_TYPE_SUBTITLE)
+                                continue;
+                            ds_other->pts_wrap_correction += new_delta;
+                            av_log(d, AV_LOG_INFO,
+                                   "[DISCONT-BUF] Propagating video wrap to %s stream %d, "
+                                   "correction now %.3fs\n",
+                                   av_get_media_type_string(ist_other->par->codec_type),
+                                   s,
+                                   (double)ds_other->pts_wrap_correction / AV_TIME_BASE);
+                        }
+                    }
                 } else if (jump_ret == 1) {
                     d->discont_buf.active = 1;
                     d->discont_buf.buffer_start_time = av_gettime_relative();
