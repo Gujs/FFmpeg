@@ -372,15 +372,21 @@ static int64_t scte35_get_splice_time(const uint8_t *buf, int len, int *splice_t
  *
  * Normally the demuxer rebases splice_time when it applies ts_offset or
  * discontinuity offsets to packet DTS/PTS. This function catches any
- * residual mismatch (preroll outside ±60s) and replaces splice_time
- * with pkt_pts + 8s as a last resort.
+ * residual mismatch (preroll outside ±60s in 33-bit modular space) and
+ * replaces splice_time with pkt_pts + 8s as a last resort.
+ *
+ * Modular comparison: splice_time is a 33-bit field by construction.
+ * pkt_pts is int64 in extended time and may be many 2^33 cycles past
+ * splice_time after multiple source PCR wraps (DemuxStream.pts_wrap_correction
+ * accumulates with each wrap). We map pkt_pts into [0, 2^33) before
+ * comparing so the preroll check works for any number of wraps.
  *
  * Returns 0 on success, negative on error.
  */
 static int scte35_adjust_pts(AVFormatContext *s, uint8_t *buf, int len,
                              int64_t pkt_pts)
 {
-    int64_t splice_time, new_splice_time, preroll;
+    int64_t splice_time, new_splice_time, preroll, pkt_pts_mod;
     int splice_time_offset;
     uint32_t crc;
 
@@ -390,6 +396,8 @@ static int scte35_adjust_pts(AVFormatContext *s, uint8_t *buf, int len,
     const int64_t DEFAULT_PREROLL = 8 * 90000;
     /* 33-bit PTS max value */
     const int64_t PTS_33BIT_MAX = 0x1FFFFFFFFLL;
+    /* 33-bit PTS cycle = 2^33 */
+    const int64_t CYCLE = PTS_33BIT_MAX + 1;
 
     if (len < 17) /* Minimum section with splice_time and CRC */
         return 0;
@@ -406,20 +414,20 @@ static int scte35_adjust_pts(AVFormatContext *s, uint8_t *buf, int len,
     if (splice_time_offset + 5 > len)
         return -1;
 
-    /* Calculate observed preroll (may be huge if timelines don't match) */
-    preroll = splice_time - pkt_pts;
+    /* Map pkt_pts into [0, 2^33) so the comparison is in the same modular
+     * space as splice_time, regardless of how many wraps the demuxer's
+     * pts_wrap_correction has accumulated. The double-mod handles negative
+     * inputs defensively (pkt_pts is non-negative in practice, but C99 % can
+     * return negative for negative dividends). */
+    pkt_pts_mod = ((pkt_pts % CYCLE) + CYCLE) % CYCLE;
 
-    /* Handle 33-bit PTS wraparound and negative preroll:
-     * - Small negative preroll (-60s to 0): valid "return from ad" scenario
-     * - Large negative preroll (< -60s): likely 33-bit wraparound, add 2^33
-     * - Positive preroll (0 to 60s): normal case
-     * - Large positive preroll (> 60s): timeline mismatch */
-    if (preroll < -MAX_PREROLL) {
-        /* Large negative value - likely 33-bit wraparound */
-        preroll += PTS_33BIT_MAX + 1;
-    }
+    /* Compute preroll as the smallest-absolute-value 33-bit-modular distance
+     * from pkt_pts to splice_time. Result is in (-2^32, +2^32]. */
+    preroll = splice_time - pkt_pts_mod;
+    if (preroll >  CYCLE / 2) preroll -= CYCLE;
+    if (preroll < -CYCLE / 2) preroll += CYCLE;
 
-    /* Check if preroll is reasonable (-60 to +60 seconds) */
+    /* Check if preroll is reasonable (-60 to +60 seconds in modular space) */
     if (preroll >= -MAX_PREROLL && preroll <= MAX_PREROLL) {
         /* Timeline matches, no adjustment needed */
         return 0;
