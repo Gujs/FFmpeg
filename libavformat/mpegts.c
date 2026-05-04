@@ -1853,10 +1853,21 @@ static void scte_data_cb(MpegTSFilter *filter, const uint8_t *section,
     new_data_packet(section, section_len, ts->pkt);
     ts->pkt->stream_index = idx;
     prg = av_find_program_from_stream(ts->stream, NULL, idx);
-    if (prg && prg->pcr_pid != -1 && prg->discard != AVDISCARD_ALL) {
-        MpegTSFilter *f = ts->pids[prg->pcr_pid];
-        if (f && f->last_pcr != -1)
-            ts->pkt->pts = ts->pkt->dts = f->last_pcr/SYSTEM_CLOCK_FREQUENCY_DIVISOR;
+    if (prg && prg->discard != AVDISCARD_ALL) {
+        /* Use the program's video stream cur_dts as the SCTE-35 packet
+         * timestamp. PCR can run tens of ms ahead of decoded video; with a
+         * downstream re-encoder, mux output PCR follows encoded video DTS,
+         * not source PCR. Anchoring SCTE-35 to video DTS keeps the section
+         * aligned with the timeline the muxer actually emits. */
+        for (int i = 0; i < prg->nb_stream_indexes; i++) {
+            AVStream *pst = ts->stream->streams[prg->stream_index[i]];
+            if (pst && pst->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+                int64_t vdts = ffstream(pst)->cur_dts;
+                if (vdts != AV_NOPTS_VALUE)
+                    ts->pkt->pts = ts->pkt->dts = vdts & 0x1FFFFFFFFLL;
+                break;
+            }
+        }
     }
     ts->stop_parse = 1;
 
