@@ -450,9 +450,6 @@ int muxer_thread(void *arg)
 #define PLL_HARD_CEILING_US  (60 * 60 * 1000000LL)  /* 60 min — force capture even if disturbance window stays open */
 #define PLL_STUCK_THRESHOLD  2.0     /* seconds — |baseline| above this = suspect stuck capture */
 #define PLL_STUCK_DRIFT_LIMIT 0.050  /* seconds — |drift| below this = converged (stuck condition) */
-#define PLL_BLEED_ENGAGE_S   0.050   /* Fix D: engage bleed when |baseline| > 50 ms (ITU-R BT.1359 detectability) */
-#define PLL_BLEED_STOP_S     0.020   /* Fix D: stop when |baseline| < 20 ms (hysteresis) */
-#define PLL_BLEED_RATE_S     0.030   /* Fix D: shift baseline by 30 ms per 60 s (0.5 ms/s, sub-perceptible) */
 
     double     pll_error_ema = 0.0;         /* Smoothed error: (corrected_output - input) */
     double     pll_error_baseline = 0.0;    /* Initial error (constant pipeline delay) */
@@ -466,7 +463,6 @@ int muxer_thread(void *arg)
     int64_t    pll_warmup_complete_wc = 0;  /* Wall-clock when warmup first completed (for hard ceiling) */
     int64_t    pll_last_defer_log_wc = 0;   /* Throttle the "deferred" log to once/min */
     int        pll_stuck_minutes = 0;       /* Consecutive minutes meeting stuck condition (Fix C) */
-    int        pll_bleed_active = 0;        /* Fix D: actively bleeding baseline toward 0 */
 
     /* Rate monitoring (10-second windows) */
     int64_t    rate_monitor_start = 0;
@@ -703,7 +699,6 @@ int muxer_thread(void *arg)
                 pll_warmup_complete_wc = 0;
                 pll_last_defer_log_wc  = 0;
                 pll_stuck_minutes      = 0;
-                pll_bleed_active       = 0;
             }
 
             /* Step 4: Integrate correction into cumulative offset */
@@ -760,36 +755,6 @@ int muxer_thread(void *arg)
                             atomic_load(&input_files[pll_input_file_idx]->input_av_offset_us) / 1000.0 :
                             0.0),
                            pll_total_ticks);
-
-                    /* Fix D: bleed baseline toward zero when residual offset
-                     * exceeds perceptibility threshold (ITU-R BT.1359
-                     * detectability ~125 ms for audio-after-video).
-                     * Hysteresis prevents chatter near the threshold.
-                     * The PLL's integral loop applies the implied drift via
-                     * cumulative_offset at <= 1 ms/s, which is sub-perceptible
-                     * to the viewer (loop never saturates: bleed=0.5 ms/s vs
-                     * PLL_MAX_RATE=1 ms/s). */
-                    if (pll_baseline_set) {
-                        double abs_base = fabs(pll_error_baseline);
-                        if (!pll_bleed_active && abs_base > PLL_BLEED_ENGAGE_S) {
-                            pll_bleed_active = 1;
-                            av_log(mux, AV_LOG_INFO,
-                                   "[AV-SYNC-PLL] bleed engaged: baseline=%.3fms target=0\n",
-                                   pll_error_baseline * 1000.0);
-                        } else if (pll_bleed_active && abs_base < PLL_BLEED_STOP_S) {
-                            pll_bleed_active = 0;
-                            av_log(mux, AV_LOG_INFO,
-                                   "[AV-SYNC-PLL] bleed disengaged: baseline=%.3fms\n",
-                                   pll_error_baseline * 1000.0);
-                        }
-                        if (pll_bleed_active) {
-                            double step = (pll_error_baseline > 0)
-                                          ? -PLL_BLEED_RATE_S
-                                          :  PLL_BLEED_RATE_S;
-                            pll_error_baseline += step;
-                        }
-                    }
-
                     pll_last_log_wc = now;
                 }
             }
