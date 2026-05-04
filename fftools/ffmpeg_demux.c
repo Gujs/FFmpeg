@@ -1402,29 +1402,37 @@ static int ts_fixup(Demuxer *d, AVPacket *pkt, FrameData *fd)
 }
 
 /**
- * Rebase SCTE-35 splice_time to match rebased packet timestamps.
+ * Rebase SCTE-35 pts_adjustment to track packet timestamp shifts.
  *
- * When packet DTS/PTS are adjusted by an offset (ts_fixup start_time
- * offset or discontinuity buffer applied_offset), the splice_time inside
- * the SCTE-35 section payload is left unchanged. This creates a massive
- * preroll mismatch. Fix by adding the same offset to splice_time and
- * recalculating the CRC.
+ * Per SCTE-35 §9.6, receivers compute
+ *   effective_splice_time = (splice_time + pts_adjustment) mod 2^33
+ * pts_adjustment is the spec-defined re-multiplexer field. When packet
+ * DTS/PTS get shifted by an offset (ts_fixup start_time offset or
+ * discontinuity buffer applied_offset), pts_adjustment needs the same
+ * shift so the on-wire effective splice time tracks the new timeline.
  *
- * Handles splice_insert (0x05) and time_signal (0x06) commands.
- * Skips encrypted sections and commands without splice_time.
+ * Why pts_adjustment and not splice_time:
+ *  - Single fixed-offset field in the section header (byte 4 bit 0 +
+ *    bytes 5-8); no per-command parsing needed.
+ *  - Works uniformly for every command type, including those where
+ *    splice_time is absent (splice_immediate_flag=1, time_specified_flag=0,
+ *    splice_schedule, segmentation_descriptor).
+ *  - Lives in the unencrypted header per spec, so encrypted sections
+ *    pass through with correct timing.
+ *  - Preserves the source's original splice_time so downstream consumers
+ *    correlating cues across multiple emissions see consistent IDs.
  */
-static void scte35_rebase_splice_time(Demuxer *d, AVPacket *pkt,
-                                      int64_t offset_us)
+static void scte35_rebase_pts_adjustment(Demuxer *d, AVPacket *pkt,
+                                         int64_t offset_us)
 {
     const uint8_t *buf;
     uint8_t *wbuf;
-    int len, section_length, splice_command_type, off, ret;
-    int64_t old_splice_time, new_splice_time, offset_90k;
-    int splice_time_offset = -1;
+    int len, section_length, ret;
+    int64_t old_pts_adjustment, new_pts_adjustment, offset_90k;
     uint32_t crc;
 
-    if (!offset_us || !pkt->data || pkt->size < 15)
-        return;
+    if (!offset_us || !pkt->data || pkt->size < 17)
+        return; /* Need at least header + 4-byte CRC */
 
     buf = pkt->data;
     len = pkt->size;
@@ -1433,65 +1441,20 @@ static void scte35_rebase_splice_time(Demuxer *d, AVPacket *pkt,
     if (buf[0] != 0xFC)
         return;
 
-    /* Skip encrypted sections */
-    if (buf[4] & 0x80)
-        return;
-
     section_length = ((buf[1] & 0x0F) << 8) | buf[2];
     if (section_length + 3 > len)
         return;
 
-    splice_command_type = buf[13];
+    /* Read 33-bit pts_adjustment from byte 4 (bit 0) + bytes 5-8 (BE32). */
+    old_pts_adjustment = ((int64_t)(buf[4] & 0x01) << 32) |
+                         ((int64_t)buf[5] << 24) |
+                         ((int64_t)buf[6] << 16) |
+                         ((int64_t)buf[7] << 8)  |
+                         buf[8];
 
-    if (splice_command_type == 0x06) {
-        /* time_signal: splice_time() at offset 14 */
-        off = 14;
-        if (off + 5 > len)
-            return;
-        if (!(buf[off] & 0x80)) /* time_specified_flag */
-            return;
-        splice_time_offset = off;
-    } else if (splice_command_type == 0x05) {
-        /* splice_insert: parse variable-length fields */
-        off = 14;
-        if (off + 5 > len)
-            return;
-        off += 4; /* skip splice_event_id */
-        if (off >= len)
-            return;
-        if (buf[off] & 0x80) /* splice_event_cancel_indicator */
-            return;
-        off++;
-        if (off >= len)
-            return;
-        int program_splice_flag = (buf[off] >> 6) & 1;
-        int splice_immediate_flag = (buf[off] >> 4) & 1;
-        if (!program_splice_flag || splice_immediate_flag)
-            return;
-        off++;
-        if (off + 5 > len)
-            return;
-        if (!(buf[off] & 0x80)) /* time_specified_flag */
-            return;
-        splice_time_offset = off;
-    } else {
-        return; /* unsupported command type */
-    }
-
-    if (splice_time_offset < 0 || splice_time_offset + 5 > len)
-        return;
-
-    /* Read 33-bit splice_time */
-    old_splice_time = ((int64_t)(buf[splice_time_offset] & 0x01) << 32) |
-                      ((int64_t)buf[splice_time_offset + 1] << 24) |
-                      ((int64_t)buf[splice_time_offset + 2] << 16) |
-                      ((int64_t)buf[splice_time_offset + 3] << 8) |
-                      buf[splice_time_offset + 4];
-
-    /* Convert offset from AV_TIME_BASE (us) to 90kHz ticks */
+    /* Convert offset from AV_TIME_BASE (us) to 90kHz ticks, mask to 33 bits. */
     offset_90k = av_rescale(offset_us, 90000, AV_TIME_BASE);
-
-    new_splice_time = (old_splice_time + offset_90k) & 0x1FFFFFFFFLL;
+    new_pts_adjustment = (old_pts_adjustment + offset_90k) & 0x1FFFFFFFFLL;
 
     /* Make packet writable before modifying */
     ret = av_packet_make_writable(pkt);
@@ -1500,17 +1463,13 @@ static void scte35_rebase_splice_time(Demuxer *d, AVPacket *pkt,
 
     wbuf = pkt->data;
 
-    /* Write 33-bit splice_time */
-    wbuf[splice_time_offset] = (wbuf[splice_time_offset] & 0xFE) |
-                               ((new_splice_time >> 32) & 0x01);
-    wbuf[splice_time_offset + 1] = (new_splice_time >> 24) & 0xFF;
-    wbuf[splice_time_offset + 2] = (new_splice_time >> 16) & 0xFF;
-    wbuf[splice_time_offset + 3] = (new_splice_time >> 8) & 0xFF;
-    wbuf[splice_time_offset + 4] = new_splice_time & 0xFF;
-
-    /* Zero pts_adjustment (bytes 4-8), preserve encrypted/algorithm bits */
-    wbuf[4] &= 0xFE;
-    wbuf[5] = wbuf[6] = wbuf[7] = wbuf[8] = 0;
+    /* Write 33-bit pts_adjustment back. Preserve top 7 bits of byte 4
+     * (encrypted_packet flag and encryption_algorithm field). */
+    wbuf[4] = (wbuf[4] & 0xFE) | ((new_pts_adjustment >> 32) & 0x01);
+    wbuf[5] = (new_pts_adjustment >> 24) & 0xFF;
+    wbuf[6] = (new_pts_adjustment >> 16) & 0xFF;
+    wbuf[7] = (new_pts_adjustment >>  8) & 0xFF;
+    wbuf[8] =  new_pts_adjustment        & 0xFF;
 
     /* Recalculate CRC32 (last 4 bytes) */
     crc = av_bswap32(av_crc(av_crc_get_table(AV_CRC_32_IEEE), -1,
@@ -1520,11 +1479,10 @@ static void scte35_rebase_splice_time(Demuxer *d, AVPacket *pkt,
     wbuf[len - 2] = (crc >>  8) & 0xFF;
     wbuf[len - 1] =  crc        & 0xFF;
 
-    av_log(d, AV_LOG_INFO,
-           "SCTE-35 splice_time rebased: %.3fs -> %.3fs "
-           "(preroll preserved, offset %.3fs)\n",
-           (double)old_splice_time / 90000.0,
-           (double)new_splice_time / 90000.0,
+    av_log(d, AV_LOG_DEBUG,
+           "SCTE-35 pts_adjustment rebased: %"PRId64" -> %"PRId64
+           " (offset %.3fs)\n",
+           old_pts_adjustment, new_pts_adjustment,
            (double)offset_90k / 90000.0);
 }
 
@@ -1545,10 +1503,10 @@ static int input_packet_process(Demuxer *d, AVPacket *pkt, unsigned *send_flags)
         return ret;
 
     /* ts_fixup applies f->ts_offset to DTS/PTS (subtracts source start_time).
-     * For SCTE-35 packets, also rebase the section-internal splice_time so
-     * downstream ad inserters see the correct preroll relative to output PTS. */
+     * For SCTE-35 packets, also shift pts_adjustment by the same offset so
+     * receivers compute the same effective_splice_time relative to output PTS. */
     if (ist->par->codec_id == AV_CODEC_ID_SCTE_35 && pkt->size > 0)
-        scte35_rebase_splice_time(d, pkt, f->ts_offset);
+        scte35_rebase_pts_adjustment(d, pkt, f->ts_offset);
 
     if (d->recording_time != INT64_MAX) {
         int64_t start_time = 0;
@@ -2030,37 +1988,12 @@ static int input_thread(void *arg)
                                                ist->st->time_base, AV_TIME_BASE_Q,
                                                AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
 
-                    /* Propagate the wrap correction from VIDEO to DATA and
-                     * SUBTITLE streams. discont_detect_jump() only runs wrap
-                     * detection on video/audio (sparse DATA/SUBTITLE packets
-                     * are unreliable for it), so without this, DATA streams
-                     * stay in raw 33-bit space while video extends past it.
-                     * The resulting domain mismatch broke SCTE-35 splice_time
-                     * after every source PCR wrap (~26.5h), causing the
-                     * mpegtsenc fallback to emit splice_times in the wrong
-                     * 33-bit cycle (downstream saw ~56000s preroll).
-                     *
-                     * Use video as the reference because SCTE-35 splice_time
-                     * is keyed to source PCR, which on MPEG-TS lives on the
-                     * video PID. Audio's wrap is detected separately within
-                     * ~1s of video's; not propagating from audio avoids
-                     * double-application. */
-                    if (ist->par->codec_type == AVMEDIA_TYPE_VIDEO) {
-                        for (int s = 0; s < f->nb_streams; s++) {
-                            InputStream *ist_other = f->streams[s];
-                            DemuxStream  *ds_other = ds_from_ist(ist_other);
-                            if (ist_other->par->codec_type != AVMEDIA_TYPE_DATA &&
-                                ist_other->par->codec_type != AVMEDIA_TYPE_SUBTITLE)
-                                continue;
-                            ds_other->pts_wrap_correction += new_delta;
-                            av_log(d, AV_LOG_INFO,
-                                   "[DISCONT-BUF] Propagating video wrap to %s stream %d, "
-                                   "correction now %.3fs\n",
-                                   av_get_media_type_string(ist_other->par->codec_type),
-                                   s,
-                                   (double)ds_other->pts_wrap_correction / AV_TIME_BASE);
-                        }
-                    }
+                    /* Note: pts_wrap_correction is intentionally NOT propagated
+                     * to DATA/SUBTITLE streams. They stay in the source's
+                     * 33-bit modular space (matching the wire format), and the
+                     * staleness clamp below uses modular comparison so it
+                     * survives source PCR wraps without false-firing. SCTE-35
+                     * pts_adjustment is similarly modular by spec (§9.6). */
                 } else if (jump_ret == 1) {
                     d->discont_buf.active = 1;
                     d->discont_buf.buffer_start_time = av_gettime_relative();
@@ -2223,24 +2156,35 @@ static int input_thread(void *arg)
              * while giving the muxer a valid DTS. Ad splicers use section-internal
              * pts_time, not PES DTS, so clamping is transparent to them.
              *
-             * Note: discont_buffer_flush() adjusts DATA last_sent_dts to the video
-             * reference when the offset changes, so this comparison is always in
-             * the correct (rebased) timeline domain. */
+             * DATA streams stay in 33-bit modular space (no pts_wrap_correction
+             * propagation), so this comparison uses modular distance. A wrap
+             * (~95443s raw delta) normalizes to a small positive — accept; a
+             * genuine stale packet (small negative) — clamp. last_sent_dts may
+             * be in extended-time (set from the video reference at flush) or
+             * in modular (updated by an earlier clamp); modular reduction
+             * handles either correctly. */
             if (ist_pkt->par->codec_type == AVMEDIA_TYPE_DATA) {
                 int sidx = dt.pkt_demux->stream_index;
                 if (sidx < d->discont_buf.nb_streams) {
                     DiscontinuityStreamState *ss = &d->discont_buf.stream_state[sidx];
                     if (ss->last_sent_dts != AV_NOPTS_VALUE) {
+                        /* 33-bit cycle in microseconds: 2^33 ticks / 90 kHz */
+                        const int64_t MOD_CYCLE_US = (int64_t)((1LL << 33) * 1000000LL / 90000);
                         int64_t dts_us = av_rescale_q(dt.pkt_demux->dts, time_base,
                                                       AV_TIME_BASE_Q);
-                        if (dts_us <= ss->last_sent_dts) {
+                        int64_t delta_us = (dts_us - ss->last_sent_dts) % MOD_CYCLE_US;
+                        if (delta_us >  MOD_CYCLE_US / 2) delta_us -= MOD_CYCLE_US;
+                        if (delta_us < -MOD_CYCLE_US / 2) delta_us += MOD_CYCLE_US;
+
+                        if (delta_us <= 0) {
                             int64_t clamped = ss->last_sent_dts + 1;
                             av_log(ist_pkt, AV_LOG_INFO,
                                    "[DISCONT-BUF] Clamping stale DATA DTS: %.3fs -> %.3fs "
-                                   "(last_sent=%.3fs)\n",
+                                   "(last_sent=%.3fs, modular_delta=%.3fs)\n",
                                    (double)dts_us / AV_TIME_BASE,
                                    (double)clamped / AV_TIME_BASE,
-                                   (double)ss->last_sent_dts / AV_TIME_BASE);
+                                   (double)ss->last_sent_dts / AV_TIME_BASE,
+                                   (double)delta_us / AV_TIME_BASE);
                             dt.pkt_demux->dts = av_rescale_q(clamped, AV_TIME_BASE_Q,
                                                               time_base);
                             if (dt.pkt_demux->pts != AV_NOPTS_VALUE &&
@@ -2254,13 +2198,13 @@ static int input_thread(void *arg)
                 }
             }
 
-            /* Rebase SCTE-35 splice_time inside the section payload.
-             * DTS/PTS were already adjusted above; now fix the section-internal
-             * splice_time so downstream ad inserters see the original preroll. */
+            /* Shift SCTE-35 pts_adjustment by the same applied_offset.
+             * DTS/PTS were already adjusted above; this keeps the section's
+             * effective_splice_time aligned with the rebased timeline. */
             if (ist_pkt->par->codec_id == AV_CODEC_ID_SCTE_35 &&
                 dt.pkt_demux->size > 0) {
-                scte35_rebase_splice_time(d, dt.pkt_demux,
-                                          d->discont_buf.applied_offset);
+                scte35_rebase_pts_adjustment(d, dt.pkt_demux,
+                                             d->discont_buf.applied_offset);
             }
 
             /* Mark packet as having discontinuity correction applied so
