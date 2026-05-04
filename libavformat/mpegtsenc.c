@@ -368,99 +368,94 @@ static int64_t scte35_get_splice_time(const uint8_t *buf, int len, int *splice_t
     return pts_time;
 }
 
-/* Safety-net adjustment for SCTE-35 splice_time timeline mismatches.
+/* Safety-net adjustment for SCTE-35 timeline mismatches.
  *
- * Normally the demuxer rebases splice_time when it applies ts_offset or
- * discontinuity offsets to packet DTS/PTS. This function catches any
- * residual mismatch (preroll outside ±60s in 33-bit modular space) and
- * replaces splice_time with pkt_pts + 8s as a last resort.
+ * SCTE-35 §9.6: effective_splice_time = (splice_time + pts_adjustment) mod 2^33.
+ * The demuxer rebases pts_adjustment in lockstep with packet DTS/PTS, so the
+ * effective splice time on the wire stays correct after the muxer's 33-bit
+ * mask. This function only fires when the demuxer-side rebase failed to
+ * produce a sane result (effective splice time outside ±60s of pkt_pts in
+ * 33-bit modular space), and rewrites pts_adjustment to land at a safe
+ * default preroll.
  *
- * Modular comparison: splice_time is a 33-bit field by construction.
- * pkt_pts is int64 in extended time and may be many 2^33 cycles past
- * splice_time after multiple source PCR wraps (DemuxStream.pts_wrap_correction
- * accumulates with each wrap). We map pkt_pts into [0, 2^33) before
- * comparing so the preroll check works for any number of wraps.
+ * Why pts_adjustment and not splice_time:
+ *  - Spec-defined re-multiplexer mechanism (§9.6).
+ *  - Single fixed-offset field (bytes 4-8); no per-command parsing needed.
+ *  - Works for command types where splice_time is absent (splice_immediate,
+ *    time_specified_flag=0) or encrypted.
+ *  - Preserves source's original splice_time so downstream consumers
+ *    correlating cues across multiple emissions see consistent IDs.
  *
  * Returns 0 on success, negative on error.
  */
 static int scte35_adjust_pts(AVFormatContext *s, uint8_t *buf, int len,
                              int64_t pkt_pts)
 {
-    int64_t splice_time, new_splice_time, preroll, pkt_pts_mod;
-    int splice_time_offset;
+    int64_t splice_time, pts_adjustment, effective_old, effective_new;
+    int64_t new_pts_adjustment, preroll, pkt_pts_mod;
     uint32_t crc;
 
-    /* Maximum reasonable preroll is 60 seconds (typical is 5-30 seconds) */
-    const int64_t MAX_PREROLL = 60 * 90000;
-    /* Default preroll when we can't determine the original (8 seconds is common) */
+    const int64_t MAX_PREROLL    = 60 * 90000;
     const int64_t DEFAULT_PREROLL = 8 * 90000;
-    /* 33-bit PTS max value */
-    const int64_t PTS_33BIT_MAX = 0x1FFFFFFFFLL;
-    /* 33-bit PTS cycle = 2^33 */
-    const int64_t CYCLE = PTS_33BIT_MAX + 1;
+    const int64_t PTS_33BIT_MAX  = 0x1FFFFFFFFLL;
+    const int64_t CYCLE          = PTS_33BIT_MAX + 1;
 
     if (len < 17) /* Minimum section with splice_time and CRC */
         return 0;
 
     if (pkt_pts == AV_NOPTS_VALUE)
-        return 0; /* Need packet PTS to calculate correct timing */
+        return 0; /* Need packet PTS to compare against */
 
-    /* Get splice_time and its offset in the section */
-    splice_time = scte35_get_splice_time(buf, len, &splice_time_offset);
-    if (splice_time == AV_NOPTS_VALUE || splice_time_offset < 0)
-        return 0; /* No splice_time to adjust */
+    /* The safety check requires extracting splice_time. Sections without one
+     * (splice_immediate, time_specified_flag=0, splice_schedule, etc.) flow
+     * through unchanged — the demuxer-side pts_adjustment rebase already
+     * keeps them aligned. */
+    splice_time = scte35_get_splice_time(buf, len, NULL);
+    if (splice_time == AV_NOPTS_VALUE)
+        return 0;
 
-    /* Verify we can safely write back to the buffer */
-    if (splice_time_offset + 5 > len)
-        return -1;
+    /* Read 33-bit pts_adjustment from byte 4 (bit 0) + bytes 5-8 (BE32). */
+    pts_adjustment = ((int64_t)(buf[4] & 0x01) << 32) |
+                     ((int64_t)buf[5] << 24) |
+                     ((int64_t)buf[6] << 16) |
+                     ((int64_t)buf[7] << 8)  |
+                     buf[8];
+
+    effective_old = (splice_time + pts_adjustment) & PTS_33BIT_MAX;
 
     /* Map pkt_pts into [0, 2^33) so the comparison is in the same modular
-     * space as splice_time, regardless of how many wraps the demuxer's
-     * pts_wrap_correction has accumulated. The double-mod handles negative
-     * inputs defensively (pkt_pts is non-negative in practice, but C99 % can
-     * return negative for negative dividends). */
+     * space as the on-wire effective splice time. */
     pkt_pts_mod = ((pkt_pts % CYCLE) + CYCLE) % CYCLE;
 
-    /* Compute preroll as the smallest-absolute-value 33-bit-modular distance
-     * from pkt_pts to splice_time. Result is in (-2^32, +2^32]. */
-    preroll = splice_time - pkt_pts_mod;
+    /* Smallest-absolute-value 33-bit-modular distance, in (-2^32, +2^32]. */
+    preroll = effective_old - pkt_pts_mod;
     if (preroll >  CYCLE / 2) preroll -= CYCLE;
     if (preroll < -CYCLE / 2) preroll += CYCLE;
 
-    /* Check if preroll is reasonable (-60 to +60 seconds in modular space) */
-    if (preroll >= -MAX_PREROLL && preroll <= MAX_PREROLL) {
-        /* Timeline matches, no adjustment needed */
-        return 0;
-    }
+    if (preroll >= -MAX_PREROLL && preroll <= MAX_PREROLL)
+        return 0; /* Timeline matches, no adjustment needed (hot path) */
 
-    /* Timeline mismatch: splice_time not rebased by demuxer.
-     * Fall back to default preroll (8s). This should rarely trigger
-     * since the demuxer now rebases splice_time alongside DTS/PTS. */
-    new_splice_time = pkt_pts + DEFAULT_PREROLL;
-    new_splice_time &= 0x1FFFFFFFFULL;
+    /* Timeline mismatch — demuxer rebase failed for some reason. Rewrite
+     * pts_adjustment so effective_splice_time lands at pkt_pts + 8s. */
+    new_pts_adjustment = (pkt_pts_mod + DEFAULT_PREROLL - splice_time) & PTS_33BIT_MAX;
+    effective_new = (splice_time + new_pts_adjustment) & PTS_33BIT_MAX;
 
     av_log(s, AV_LOG_WARNING, "SCTE-35: Timeline mismatch (preroll %.3fs). "
-           "Falling back to %.1fs preroll: splice_time %"PRId64" (%.3fs) -> "
-           "%"PRId64" (%.3fs)\n",
+           "Falling back to %.1fs preroll: pts_adjustment %"PRId64" -> %"PRId64
+           " (effective_splice_time %.3fs -> %.3fs)\n",
            preroll / 90000.0, DEFAULT_PREROLL / 90000.0,
-           splice_time, splice_time / 90000.0,
-           new_splice_time, new_splice_time / 90000.0);
+           pts_adjustment, new_pts_adjustment,
+           effective_old / 90000.0, effective_new / 90000.0);
 
-    /* Write new splice_time back (33 bits at splice_time_offset) */
-    buf[splice_time_offset] = (buf[splice_time_offset] & 0xFE) | ((new_splice_time >> 32) & 0x01);
-    buf[splice_time_offset + 1] = (new_splice_time >> 24) & 0xFF;
-    buf[splice_time_offset + 2] = (new_splice_time >> 16) & 0xFF;
-    buf[splice_time_offset + 3] = (new_splice_time >> 8) & 0xFF;
-    buf[splice_time_offset + 4] = new_splice_time & 0xFF;
+    /* Write pts_adjustment back. Preserve top 7 bits of byte 4
+     * (encrypted_packet, encryption_algorithm). */
+    buf[4] = (buf[4] & 0xFE) | ((new_pts_adjustment >> 32) & 0x01);
+    buf[5] = (new_pts_adjustment >> 24) & 0xFF;
+    buf[6] = (new_pts_adjustment >> 16) & 0xFF;
+    buf[7] = (new_pts_adjustment >>  8) & 0xFF;
+    buf[8] = (new_pts_adjustment      ) & 0xFF;
 
-    /* Zero pts_adjustment (bytes 4-8) so downstream consumers compute
-     * splice_time + 0 = correct splice time.  Preserve encrypted_packet
-     * and encryption_algorithm bits in byte 4 (top 7 bits). */
-    buf[4] &= 0xFE;           /* clear bit 0 of pts_adjustment (33-bit field) */
-    buf[5] = buf[6] = buf[7] = buf[8] = 0;  /* clear remaining 32 bits */
-
-    /* Recalculate CRC32 (last 4 bytes of section)
-     * Use the same CRC calculation as mpegts_write_section1() */
+    /* Recalculate CRC32 over modified section. */
     crc = av_bswap32(av_crc(av_crc_get_table(AV_CRC_32_IEEE), -1, buf, len - 4));
     buf[len - 4] = (crc >> 24) & 0xff;
     buf[len - 3] = (crc >> 16) & 0xff;
@@ -1099,6 +1094,11 @@ static int mpegts_write_pmt(AVFormatContext *s, MpegTSService *service)
                 *q++ = 0xF;          /* metadata_locator_record_flag|MPEG_carriage_flags|reserved */
             } else if (codec_id == AV_CODEC_ID_SCTE_35) {
                 put_registration_descriptor(&q, MKTAG('C', 'U', 'E', 'I'));
+                /* Cue Identifier Descriptor (SCTE 35 §8.2) lets receivers
+                 * discover the SCTE-35 PID without scanning all PIDs. */
+                *q++ = 0x8a; /* descriptor_tag */
+                *q++ = 0x01; /* descriptor_length */
+                *q++ = 0x01; /* cue_stream_type: splice_insert / time_signal */
             }
             break;
         }
