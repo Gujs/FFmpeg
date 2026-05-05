@@ -52,6 +52,12 @@
 #define DISCONT_TIMEOUT_US            (500 * 1000)         /* 500ms */
 #define DISCONT_TIMELINE_TOLERANCE_US (100 * 1000)         /* 100ms */
 
+/* MPEG-TS 33-bit modular cycle in microseconds: 2^33 ticks / 90 kHz.
+ * DATA/SUBTITLE streams stay in the source's 33-bit modular space (G design,
+ * Session 97); their last_sent_dts and per-packet dts_us are kept within one
+ * cycle. Used by the discont_buf flush adjustment and the staleness clamp. */
+#define DEMUX_MOD_CYCLE_US ((int64_t)((1LL << 33) * 1000000LL / 90000))
+
 typedef struct DiscontinuityPacket {
     AVPacket *pkt;
     int stream_idx;
@@ -830,12 +836,21 @@ static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
             for (int s = 0; s < buf->nb_streams && s < f->nb_streams; s++) {
                 if (f->streams[s]->par->codec_type == AVMEDIA_TYPE_DATA &&
                     ref_dts != AV_NOPTS_VALUE) {
+                    /* DATA streams stay in 33-bit modular space (G design); the
+                     * video/audio reference is in extended-time after a wrap.
+                     * Mask to modular cycle so the staleness clamp's modular
+                     * comparison stays consistent with incoming DATA dts_us. */
+                    int64_t masked = ref_dts % DEMUX_MOD_CYCLE_US;
+                    if (masked < 0)
+                        masked += DEMUX_MOD_CYCLE_US;
                     av_log(d, AV_LOG_DEBUG,
-                           "[DISCONT-BUF] Adjusting DATA s%d last_sent_dts: %.3fs -> %.3fs (ref)\n",
+                           "[DISCONT-BUF] Adjusting DATA s%d last_sent_dts: %.3fs -> %.3fs "
+                           "(ref=%.3fs, masked to modular cycle)\n",
                            s,
                            (double)buf->stream_state[s].last_sent_dts / AV_TIME_BASE,
+                           (double)masked / AV_TIME_BASE,
                            (double)ref_dts / AV_TIME_BASE);
-                    buf->stream_state[s].last_sent_dts = ref_dts;
+                    buf->stream_state[s].last_sent_dts = masked;
                 }
             }
         }
@@ -2089,16 +2104,18 @@ static int input_thread(void *arg)
                 if (sidx < d->discont_buf.nb_streams) {
                     DiscontinuityStreamState *ss = &d->discont_buf.stream_state[sidx];
                     if (ss->last_sent_dts != AV_NOPTS_VALUE) {
-                        /* 33-bit cycle in microseconds: 2^33 ticks / 90 kHz */
-                        const int64_t MOD_CYCLE_US = (int64_t)((1LL << 33) * 1000000LL / 90000);
                         int64_t dts_us = av_rescale_q(dt.pkt_demux->dts, time_base,
                                                       AV_TIME_BASE_Q);
-                        int64_t delta_us = (dts_us - ss->last_sent_dts) % MOD_CYCLE_US;
-                        if (delta_us >  MOD_CYCLE_US / 2) delta_us -= MOD_CYCLE_US;
-                        if (delta_us < -MOD_CYCLE_US / 2) delta_us += MOD_CYCLE_US;
+                        int64_t delta_us = (dts_us - ss->last_sent_dts) % DEMUX_MOD_CYCLE_US;
+                        if (delta_us >  DEMUX_MOD_CYCLE_US / 2) delta_us -= DEMUX_MOD_CYCLE_US;
+                        if (delta_us < -DEMUX_MOD_CYCLE_US / 2) delta_us += DEMUX_MOD_CYCLE_US;
 
                         if (delta_us <= 0) {
-                            int64_t clamped = ss->last_sent_dts + 1;
+                            /* Mask clamped to modular cycle so last_sent_dts stays
+                             * within one cycle even after thousands of clamps. */
+                            int64_t clamped = (ss->last_sent_dts + 1) % DEMUX_MOD_CYCLE_US;
+                            if (clamped < 0)
+                                clamped += DEMUX_MOD_CYCLE_US;
                             av_log(ist_pkt, AV_LOG_INFO,
                                    "[DISCONT-BUF] Clamping stale DATA DTS: %.3fs -> %.3fs "
                                    "(last_sent=%.3fs, modular_delta=%.3fs)\n",
