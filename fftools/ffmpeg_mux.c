@@ -174,7 +174,18 @@ static int mux_fixup_ts(Muxer *mux, MuxStream *ms, AVPacket *pkt)
                      - FFMIN3(pkt->pts, pkt->dts, ms->last_mux_dts + 1)
                      - FFMAX3(pkt->pts, pkt->dts, ms->last_mux_dts + 1);
         }
-        if ((ost->type == AVMEDIA_TYPE_AUDIO || ost->type == AVMEDIA_TYPE_VIDEO || ost->type == AVMEDIA_TYPE_SUBTITLE) &&
+        /* MPEG-TS DATA and SUBTITLE streams live in 33-bit modular space —
+         * source PCR wraps every ~26.5h are routine, not bugs. Skip the
+         * monotonic-DTS check for these on mpegts output; the demuxer-side
+         * modular comparison in fftools/ffmpeg_demux.c is responsible. Other
+         * containers (MOV, Matroska, etc.) keep their strict check. */
+        int is_mpegts_modular_stream =
+            (mux->fc->oformat && !strcmp(mux->fc->oformat->name, "mpegts") &&
+             (ost->type == AVMEDIA_TYPE_DATA ||
+              ost->type == AVMEDIA_TYPE_SUBTITLE));
+
+        if (!is_mpegts_modular_stream &&
+            (ost->type == AVMEDIA_TYPE_AUDIO || ost->type == AVMEDIA_TYPE_VIDEO || ost->type == AVMEDIA_TYPE_SUBTITLE) &&
             pkt->dts != AV_NOPTS_VALUE &&
             ms->last_mux_dts != AV_NOPTS_VALUE) {
             int64_t max = ms->last_mux_dts + !(mux->fc->oformat->flags & AVFMT_TS_NONSTRICT);
