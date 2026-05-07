@@ -840,6 +840,15 @@ int fg_create_simple(FilterGraph **pfg,
 int fg_finalise_bindings(void);
 
 /**
+ * Fix F: derive the muxer PLL's per-packet jump-detection threshold from
+ * the largest jump_comp value declared on any aresample filter in the
+ * active filter graphs. Returns threshold in seconds (default 35 ms,
+ * scales with operator-configured jump_comp). See implementation in
+ * fftools/ffmpeg_filter.c for the exact formula.
+ */
+double of_compute_pll_jump_threshold(void);
+
+/**
  * Get our axiliary frame data attached to the frame, allocating it
  * if needed.
  */
