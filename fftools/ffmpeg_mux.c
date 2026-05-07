@@ -450,6 +450,7 @@ int muxer_thread(void *arg)
 #define PLL_HARD_CEILING_US  (60 * 60 * 1000000LL)  /* 60 min — force capture even if disturbance window stays open */
 #define PLL_STUCK_THRESHOLD  2.0     /* seconds — |baseline| above this = suspect stuck capture */
 #define PLL_STUCK_DRIFT_LIMIT 0.050  /* seconds — |drift| below this = converged (stuck condition) */
+#define PLL_JUMP_DEFAULT_S   0.035   /* Fix F: default packet-jump threshold (used if of_compute_pll_jump_threshold returns nothing) */
 
     double     pll_error_ema = 0.0;         /* Smoothed error: (corrected_output - input) */
     double     pll_error_baseline = 0.0;    /* Initial error (constant pipeline delay) */
@@ -463,6 +464,11 @@ int muxer_thread(void *arg)
     int64_t    pll_warmup_complete_wc = 0;  /* Wall-clock when warmup first completed (for hard ceiling) */
     int64_t    pll_last_defer_log_wc = 0;   /* Throttle the "deferred" log to once/min */
     int        pll_stuck_minutes = 0;       /* Consecutive minutes meeting stuck condition (Fix C) */
+
+    /* Fix F: per-packet error-spike detection for jump_comp / corruption events */
+    double     pll_packet_jump_threshold = PLL_JUMP_DEFAULT_S;
+    double     pll_prev_error = 0.0;
+    int        pll_prev_error_set = 0;
 
     /* Rate monitoring (10-second windows) */
     int64_t    rate_monitor_start = 0;
@@ -481,6 +487,15 @@ int muxer_thread(void *arg)
     last_write_wc_audio = last_write_wc_video;
     rate_monitor_start  = last_write_wc_video;
     session_start_wc    = last_write_wc_video;
+
+    /* Fix F: derive per-packet jump-detection threshold from operator's
+     * configured aresample jump_comp value. Auto-adapts when operator
+     * changes jump_comp on the command line. Stays at PLL_JUMP_DEFAULT_S
+     * (35 ms) if no aresample is in the filter graphs. */
+    pll_packet_jump_threshold = of_compute_pll_jump_threshold();
+    av_log(mux, AV_LOG_INFO,
+           "[AV-SYNC-PLL] packet-jump detection threshold = %.3fms\n",
+           pll_packet_jump_threshold * 1000.0);
 
     while (1) {
         OutputStream *ost;
@@ -623,6 +638,50 @@ int muxer_thread(void *arg)
              * we need to correct (both sides share source clock). */
             double error = output_offset;
 
+            /* Fix F: detect per-packet error spike (jump_comp / packet-corruption signature).
+             *
+             * jump_comp firing in libswresample injects silence INSTANTLY when the
+             * input PTS jumps by ≥min_hard_comp (default 30 ms). The next audio
+             * packet at the muxer carries a raw error that differs from the previous
+             * packet's by that magnitude. Without this detector, the EMA picks up
+             * the spike and the PLL accumulates pll_cumulative_offset over the
+             * 3-5 minute decay window — locking in hundreds of ms of audio shift
+             * that's visible to the viewer (GBN 2026-05-05 incident: cumul +680 ms).
+             *
+             * On detection, do the same re-warmup as the existing 5 s PLL_RESET
+             * (preserve cumul via bumpless transfer) and arm Fix B's disturbance
+             * window for 5 minutes. The window will defer the next baseline
+             * capture until the EMA has decayed past the spike. Multiple
+             * jump_comps in the same burst (4 in 1 s on GBN) collapse into one
+             * re-warmup because subsequent firings hit pll_baseline_set=0 and
+             * skip; the disturbance helper's max-of semantics extend the same
+             * window rather than restart it.
+             *
+             * Threshold pll_packet_jump_threshold is derived at thread start from
+             * the operator's actual aresample jump_comp setting (1.2× margin,
+             * 35 ms floor). Adapts when operator changes jump_comp. */
+            if (pll_prev_error_set && pll_baseline_set &&
+                fabs(error - pll_prev_error) > pll_packet_jump_threshold) {
+                av_log(mux, AV_LOG_INFO,
+                       "[AV-SYNC-PLL] packet jump detected: prev=%.3fms curr=%.3fms "
+                       "diff=%.3fms threshold=%.3fms — re-warmup, arm disturbance\n",
+                       pll_prev_error * 1000.0, error * 1000.0,
+                       (error - pll_prev_error) * 1000.0,
+                       pll_packet_jump_threshold * 1000.0);
+                pll_sample_count = 0;
+                pll_baseline_set = 0;
+                pll_error_ema = error;
+                pll_warmup_complete_wc = 0;
+                pll_last_defer_log_wc  = 0;
+                pll_stuck_minutes      = 0;
+                pll_prev_error_set     = 0;
+                if (pll_input_file_idx >= 0 && pll_input_file_idx < nb_input_files)
+                    ifile_arm_pll_disturbance(input_files[pll_input_file_idx],
+                                              5 * 60 * 1000000LL);
+            }
+            pll_prev_error = error;
+            pll_prev_error_set = 1;
+
             /* EMA smooth the error (τ=60s at ~47 audio packets/sec) */
             double alpha = 1.0 - exp(-1.0 / (PLL_AUDIO_PKT_RATE * PLL_GAIN_PERIOD));
             if (pll_sample_count == 0) {
@@ -699,6 +758,7 @@ int muxer_thread(void *arg)
                 pll_warmup_complete_wc = 0;
                 pll_last_defer_log_wc  = 0;
                 pll_stuck_minutes      = 0;
+                pll_prev_error_set     = 0;  /* Fix F: clear prev_error tracking too */
             }
 
             /* Step 4: Integrate correction into cumulative offset */
