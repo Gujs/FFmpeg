@@ -2316,6 +2316,51 @@ int filtergraph_is_simple(const FilterGraph *fg)
     return fgp->is_simple;
 }
 
+/*
+ * Fix F: derive the muxer PLL's per-packet jump-detection threshold from
+ * the actual jump_comp value declared on aresample filters in any active
+ * filter graph. Returns threshold in seconds.
+ *
+ * jump_comp (libswresample's min_hard_compensation) defines the smallest
+ * delta that triggers hard silence injection. When that fires, audio
+ * output PTS jumps by ≥jump_comp instantly, which the muxer PLL would
+ * otherwise chase via cumulative_offset and leave permanently shifted.
+ *
+ * The PLL's detection threshold = max(jump_comp_max * 1.2, 0.035 s):
+ *  - 1.2× margin gives clean separation from the firing threshold
+ *  - 35 ms floor catches the swresample default (0.030) even if no
+ *    aresample filter is found (e.g., copy-only audio pipelines)
+ *
+ * graph_desc is parsed as a string ("aresample=async=1:jump_comp=0.05,...")
+ * to avoid dependency on per-thread AVFilterGraph internals. Multiple
+ * aresample instances across filtergraphs return the max value.
+ */
+double of_compute_pll_jump_threshold(void)
+{
+    const double swr_default = 0.030;
+    const double margin      = 1.2;
+    const double floor_s     = 0.035;
+    double max_jc = swr_default;
+
+    for (int i = 0; i < nb_filtergraphs; i++) {
+        const FilterGraph *fg = filtergraphs[i];
+        if (!fg || !fg->graph_desc)
+            continue;
+        const char *p = fg->graph_desc;
+        while ((p = strstr(p, "jump_comp=")) != NULL) {
+            p += strlen("jump_comp=");
+            char *endp = NULL;
+            double v = strtod(p, &endp);
+            if (endp != p && v > 0.0 && v > max_jc)
+                max_jc = v;
+            p = endp ? endp : p + 1;
+        }
+    }
+
+    double t = max_jc * margin;
+    return (t < floor_s) ? floor_s : t;
+}
+
 static void send_command(FilterGraph *fg, AVFilterGraph *graph,
                          double time, const char *target,
                          const char *command, const char *arg, int all_filters)
