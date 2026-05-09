@@ -556,7 +556,21 @@ static int compute_muxer_pkt_fields(AVFormatContext *s, AVStream *st, AVPacket *
         pkt->dts = sti->pts_buffer[0];
     }
 
+    /* MPEG-TS DATA/SUBTITLE streams use 33-bit modular timestamps that
+     * wrap every 26.5h. The internal extended-time pkt->dts can briefly
+     * regress at re-sync boundaries (e.g. SCTE-35 sections rebased
+     * through ts_offset and applied_offset). For these streams in mpegts
+     * output, accept non-monotonic DTS — the muxer masks to 33-bit at
+     * wire emission, so receivers see correct modular wraps. Strict
+     * monotonic checks remain in force for video/audio and for other
+     * containers (MOV, Matroska) that genuinely require it. */
+    int is_mpegts_modular_stream =
+        s->oformat && s->oformat->name && !strcmp(s->oformat->name, "mpegts") &&
+        (st->codecpar->codec_type == AVMEDIA_TYPE_DATA ||
+         st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE);
+
     if (sti->cur_dts && sti->cur_dts != AV_NOPTS_VALUE &&
+        !is_mpegts_modular_stream &&
         ((!(s->oformat->flags & AVFMT_TS_NONSTRICT) &&
           st->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE &&
           st->codecpar->codec_type != AVMEDIA_TYPE_DATA &&
