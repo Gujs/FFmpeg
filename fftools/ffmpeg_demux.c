@@ -52,12 +52,6 @@
 #define DISCONT_TIMEOUT_US            (500 * 1000)         /* 500ms */
 #define DISCONT_TIMELINE_TOLERANCE_US (100 * 1000)         /* 100ms */
 
-/* MPEG-TS 33-bit modular cycle in microseconds: 2^33 ticks / 90 kHz.
- * DATA/SUBTITLE streams stay in the source's 33-bit modular space (G design,
- * Session 97); their last_sent_dts and per-packet dts_us are kept within one
- * cycle. Used by the discont_buf flush adjustment and the staleness clamp. */
-#define DEMUX_MOD_CYCLE_US ((int64_t)((1LL << 33) * 1000000LL / 90000))
-
 typedef struct DiscontinuityPacket {
     AVPacket *pkt;
     int stream_idx;
@@ -843,21 +837,16 @@ static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
             for (int s = 0; s < buf->nb_streams && s < f->nb_streams; s++) {
                 if (f->streams[s]->par->codec_type == AVMEDIA_TYPE_DATA &&
                     ref_dts != AV_NOPTS_VALUE) {
-                    /* DATA streams stay in 33-bit modular space (G design); the
-                     * video/audio reference is in extended-time after a wrap.
-                     * Mask to modular cycle so the staleness clamp's modular
-                     * comparison stays consistent with incoming DATA dts_us. */
-                    int64_t masked = ref_dts % DEMUX_MOD_CYCLE_US;
-                    if (masked < 0)
-                        masked += DEMUX_MOD_CYCLE_US;
+                    /* DATA streams now extend to extended-time monotonically
+                     * (G propagation restored), same domain as video/audio
+                     * reference. Use the reference directly — no modular
+                     * reduction needed. */
                     av_log(d, AV_LOG_DEBUG,
-                           "[DISCONT-BUF] Adjusting DATA s%d last_sent_dts: %.3fs -> %.3fs "
-                           "(ref=%.3fs, masked to modular cycle)\n",
+                           "[DISCONT-BUF] Adjusting DATA s%d last_sent_dts: %.3fs -> %.3fs (extended)\n",
                            s,
                            (double)buf->stream_state[s].last_sent_dts / AV_TIME_BASE,
-                           (double)masked / AV_TIME_BASE,
                            (double)ref_dts / AV_TIME_BASE);
-                    buf->stream_state[s].last_sent_dts = masked;
+                    buf->stream_state[s].last_sent_dts = ref_dts;
                 }
             }
         }
@@ -2003,12 +1992,47 @@ static int input_thread(void *arg)
                                                ist->st->time_base, AV_TIME_BASE_Q,
                                                AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
 
-                    /* Note: pts_wrap_correction is intentionally NOT propagated
-                     * to DATA/SUBTITLE streams. They stay in the source's
-                     * 33-bit modular space (matching the wire format), and the
-                     * staleness clamp below uses modular comparison so it
-                     * survives source PCR wraps without false-firing. SCTE-35
-                     * pts_adjustment is similarly modular by spec (§9.6). */
+                    /* Propagate the wrap correction from VIDEO to DATA and
+                     * SUBTITLE streams. discont_detect_jump() only runs wrap
+                     * detection on video/audio (sparse DATA/SUBTITLE packets
+                     * are unreliable for it), so without this, DATA streams
+                     * stay in raw 33-bit space while video/audio extend past
+                     * it. After ts_fixup applies a (typically negative) start-
+                     * time offset, the post-wrap raw modular DATA dts becomes
+                     * negative, which libavformat's mux.c monotonic check
+                     * rejects with EINVAL — observed deterministically at
+                     * 26h30m on Game&Fish/GBN.
+                     *
+                     * Keeping DATA in extended-time int64 fixes this. The
+                     * mpegts muxer masks DTS to 33-bit at wire emission, so
+                     * wire output remains correct modular MPEG-TS. SCTE-35
+                     * effective_splice_time = (splice_time + pts_adjustment)
+                     * mod 2^33 stays correct because scte35_rebase_pts_adjust-
+                     * ment shifts pts_adjustment by ts_offset_90k +
+                     * applied_offset_90k modularly, independent of pkt_pts
+                     * extension.
+                     *
+                     * Use video as the reference (not audio) because SCTE-35
+                     * splice_time is keyed to source PCR, which on MPEG-TS
+                     * lives on the video PID. Audio's wrap is detected
+                     * separately within ~1s of video's; not propagating from
+                     * audio avoids double-application. */
+                    if (ist->par->codec_type == AVMEDIA_TYPE_VIDEO) {
+                        for (int s = 0; s < f->nb_streams; s++) {
+                            InputStream *ist_other = f->streams[s];
+                            DemuxStream  *ds_other = ds_from_ist(ist_other);
+                            if (ist_other->par->codec_type != AVMEDIA_TYPE_DATA &&
+                                ist_other->par->codec_type != AVMEDIA_TYPE_SUBTITLE)
+                                continue;
+                            ds_other->pts_wrap_correction += new_delta;
+                            av_log(d, AV_LOG_INFO,
+                                   "[DISCONT-BUF] Propagating video wrap to %s stream %d, "
+                                   "correction now %.3fs\n",
+                                   av_get_media_type_string(ist_other->par->codec_type),
+                                   s,
+                                   (double)ds_other->pts_wrap_correction / AV_TIME_BASE);
+                        }
+                    }
                 } else if (jump_ret == 1) {
                     d->discont_buf.active = 1;
                     d->discont_buf.buffer_start_time = av_gettime_relative();
@@ -2166,18 +2190,16 @@ static int input_thread(void *arg)
                 dt.pkt_demux->pts += pkt_offset;
 
             /* DATA streams (SCTE-35): clamp rebased DTS to ensure monotonicity.
-             * Stale old-timeline packets get hugely negative DTS after offset.
-             * Clamp to last_sent_dts + 1 — preserves the packet (ad announcement)
-             * while giving the muxer a valid DTS. Ad splicers use section-internal
-             * pts_time, not PES DTS, so clamping is transparent to them.
+             * Stale old-timeline packets (e.g. splice_insert announcing an ad
+             * break, sent ~6-8s before the boundary, carrying old-timeline
+             * DTS) get a large negative DTS after offset. Clamp to
+             * last_sent_dts + 1 — preserves the packet (ad announcement)
+             * while giving the muxer a valid DTS. Ad splicers use section-
+             * internal pts_time, not PES DTS, so clamping is transparent.
              *
-             * DATA streams stay in 33-bit modular space (no pts_wrap_correction
-             * propagation), so this comparison uses modular distance. A wrap
-             * (~95443s raw delta) normalizes to a small positive — accept; a
-             * genuine stale packet (small negative) — clamp. last_sent_dts may
-             * be in extended-time (set from the video reference at flush) or
-             * in modular (updated by an earlier clamp); modular reduction
-             * handles either correctly. */
+             * DATA streams now extend to extended-time (G propagation
+             * restored), same domain as last_sent_dts. Simple subtraction
+             * gives the correct delta — no modular reduction needed. */
             if (ist_pkt->par->codec_type == AVMEDIA_TYPE_DATA) {
                 int sidx = dt.pkt_demux->stream_index;
                 if (sidx < d->discont_buf.nb_streams) {
@@ -2185,23 +2207,14 @@ static int input_thread(void *arg)
                     if (ss->last_sent_dts != AV_NOPTS_VALUE) {
                         int64_t dts_us = av_rescale_q(dt.pkt_demux->dts, time_base,
                                                       AV_TIME_BASE_Q);
-                        int64_t delta_us = (dts_us - ss->last_sent_dts) % DEMUX_MOD_CYCLE_US;
-                        if (delta_us >  DEMUX_MOD_CYCLE_US / 2) delta_us -= DEMUX_MOD_CYCLE_US;
-                        if (delta_us < -DEMUX_MOD_CYCLE_US / 2) delta_us += DEMUX_MOD_CYCLE_US;
-
-                        if (delta_us <= 0) {
-                            /* Mask clamped to modular cycle so last_sent_dts stays
-                             * within one cycle even after thousands of clamps. */
-                            int64_t clamped = (ss->last_sent_dts + 1) % DEMUX_MOD_CYCLE_US;
-                            if (clamped < 0)
-                                clamped += DEMUX_MOD_CYCLE_US;
+                        if (dts_us <= ss->last_sent_dts) {
+                            int64_t clamped = ss->last_sent_dts + 1;
                             av_log(ist_pkt, AV_LOG_INFO,
                                    "[DISCONT-BUF] Clamping stale DATA DTS: %.3fs -> %.3fs "
-                                   "(last_sent=%.3fs, modular_delta=%.3fs)\n",
+                                   "(last_sent=%.3fs)\n",
                                    (double)dts_us / AV_TIME_BASE,
                                    (double)clamped / AV_TIME_BASE,
-                                   (double)ss->last_sent_dts / AV_TIME_BASE,
-                                   (double)delta_us / AV_TIME_BASE);
+                                   (double)ss->last_sent_dts / AV_TIME_BASE);
                             dt.pkt_demux->dts = av_rescale_q(clamped, AV_TIME_BASE_Q,
                                                               time_base);
                             if (dt.pkt_demux->pts != AV_NOPTS_VALUE &&
