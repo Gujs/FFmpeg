@@ -489,6 +489,26 @@ int64_t swr_get_delay(struct SwrContext *s, int64_t base);
 int swr_get_out_samples(struct SwrContext *s, int in_samples);
 
 /**
+ * Get the cumulative count of jump_comp silence-injection / sample-drop events.
+ *
+ * This counter increments once per successful hard correction performed by
+ * the jump_comp safety net inside swr_next_pts(), i.e. each time the absolute
+ * delta between expected and actual outpts exceeds min_hard_compensation and
+ * the resulting silence injection / output drop completes successfully.
+ *
+ * Filter-rebuild "outpts reset" events do NOT increment this counter — they
+ * are benign re-anchorings, not stream-clock shifts.
+ *
+ * The counter is updated with relaxed atomic semantics, so it is safe to read
+ * from any thread without additional synchronisation. Reading is sufficient
+ * for "did the count advance since I last looked?" detection.
+ *
+ * @param s   Swr context (may be NULL — returns 0)
+ * @return    cumulative event count, or 0 if @p s is NULL
+ */
+uint64_t swr_get_jump_comp_event_count(struct SwrContext *s);
+
+/**
  * @}
  *
  * @name Configuration accessors

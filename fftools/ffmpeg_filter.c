@@ -41,6 +41,12 @@
 #include "libavutil/time.h"
 #include "libavutil/timestamp.h"
 
+#include "libswresample/swresample.h"
+
+/* Forward declarations for jump_comp event detection helpers; the
+ * definitions live at the bottom of this file. */
+static void fg_register_aresample_swr(FilterGraph *fg, AVFilterGraph *graph);
+
 typedef struct FilterGraphPriv {
     FilterGraph      fg;
 
@@ -2135,6 +2141,14 @@ static int configure_filtergraph(FilterGraph *fg, FilterGraphThread *fgt)
 
     fgp->is_meta = graph_is_meta(fgt->graph);
 
+    /* Cache aresample filters' SwrContext pointers on the parent
+     * InputFile. The muxer thread polls these to detect libswresample
+     * jump_comp silence-injection events and arm the PLL disturbance
+     * window. Safe across reconfig: the helper drops stale entries
+     * for this graph before registering fresh ones. Helper defined
+     * at the bottom of this file. */
+    fg_register_aresample_swr(fg, fgt->graph);
+
     /* limit the lists of allowed formats to the ones selected, to
      * make sure they stay the same if the filtergraph is reconfigured later */
     for (int i = 0; i < fg->nb_outputs; i++) {
@@ -3444,4 +3458,138 @@ void fg_send_command(FilterGraph *fg, double time, const char *target,
     fgp->frame->opaque = (void*)(intptr_t)FRAME_OPAQUE_SEND_COMMAND;
 
     sch_filter_command(fgp->sch, fgp->sch_idx, fgp->frame);
+}
+
+/* =====================================================================
+ *  libswresample jump_comp event detection
+ * =====================================================================
+ *
+ * After a filter graph is configured, walk it for aresample filters and
+ * cache pointers to their underlying SwrContext on the parent InputFile.
+ * The muxer thread polls input_file_jump_comp_total() once per audio
+ * packet — when the cumulative event count advances, libswresample has
+ * just hard-corrected an audio timestamp delta (silence injection or
+ * sample drop), and the muxer arms the PLL disturbance window.
+ *
+ * Detection is structurally false-positive-free: it only fires when
+ * libswresample actually injected silence. The muxer-side cadence-noise
+ * problem that broke Fix F (Session 99) does not apply here. */
+
+/* Find the InputFile that owns a given InputFilter by walking input
+ * streams' filter lists. Returns NULL if not found (e.g., InputFilter
+ * bound to a complex filtergraph output). */
+static InputFile *fg_input_file_from_ifilter(const InputFilter *ifilter)
+{
+    for (int fi = 0; fi < nb_input_files; fi++) {
+        InputFile *f = input_files[fi];
+        for (int si = 0; si < f->nb_streams; si++) {
+            InputStream *ist = f->streams[si];
+            for (int fil = 0; fil < ist->nb_filters; fil++) {
+                if (ist->filters[fil] == ifilter)
+                    return f;
+            }
+        }
+    }
+    return NULL;
+}
+
+/* Append swr to f->swr_jump_comp_ctxs[] if not already present. */
+static int input_file_add_swr(InputFile *f, void *swr)
+{
+    if (!f || !swr)
+        return 0;
+    for (int i = 0; i < f->nb_swr_jump_comp_ctxs; i++)
+        if (f->swr_jump_comp_ctxs[i] == swr)
+            return 0;
+    return av_dynarray_add_nofree(&f->swr_jump_comp_ctxs,
+                                  &f->nb_swr_jump_comp_ctxs, swr);
+}
+
+/* Remove all SwrContext pointers from f->swr_jump_comp_ctxs[] that are
+ * present in the given AVFilterGraph (used before re-configuring a graph
+ * to drop now-stale pointers). */
+static void input_file_drop_swr_from_graph(InputFile *f, AVFilterGraph *graph)
+{
+    if (!f || !graph)
+        return;
+    for (unsigned i = 0; i < graph->nb_filters; i++) {
+        AVFilterContext *fctx = graph->filters[i];
+        if (!fctx || !fctx->filter || !fctx->filter->name ||
+            strcmp(fctx->filter->name, "aresample") != 0)
+            continue;
+        void *swr = av_opt_child_next(fctx->priv, NULL);
+        if (!swr)
+            continue;
+        for (int k = 0; k < f->nb_swr_jump_comp_ctxs; k++) {
+            if (f->swr_jump_comp_ctxs[k] == swr) {
+                /* shift remaining entries down */
+                for (int j = k + 1; j < f->nb_swr_jump_comp_ctxs; j++)
+                    f->swr_jump_comp_ctxs[j - 1] = f->swr_jump_comp_ctxs[j];
+                f->nb_swr_jump_comp_ctxs--;
+                break;
+            }
+        }
+    }
+}
+
+/* Walk the configured AVFilterGraph for aresample filters; for each,
+ * obtain its SwrContext via the AResampleContext child_next mechanism
+ * (af_aresample.c registers swr_get_class() as a child class) and
+ * register the SwrContext on the parent InputFile's cache.
+ *
+ * Called once per successful configure_filtergraph() invocation. Safe
+ * across reconfigurations: stale pointers are dropped first. */
+static void fg_register_aresample_swr(FilterGraph *fg, AVFilterGraph *graph)
+{
+    InputFile *f = NULL;
+
+    /* Find the InputFile via the first audio input bound to this fg. */
+    for (int i = 0; i < fg->nb_inputs; i++) {
+        if (fg->inputs[i]->type == AVMEDIA_TYPE_AUDIO) {
+            f = fg_input_file_from_ifilter(fg->inputs[i]);
+            if (f)
+                break;
+        }
+    }
+    if (!f || !graph)
+        return;
+
+    /* Drop any now-stale entries this graph may have contributed in a
+     * previous configuration pass. */
+    input_file_drop_swr_from_graph(f, graph);
+
+    /* Register fresh pointers. */
+    for (unsigned i = 0; i < graph->nb_filters; i++) {
+        AVFilterContext *fctx = graph->filters[i];
+        if (!fctx || !fctx->filter || !fctx->filter->name ||
+            strcmp(fctx->filter->name, "aresample") != 0)
+            continue;
+        void *swr = av_opt_child_next(fctx->priv, NULL);
+        if (!swr)
+            continue;
+        if (input_file_add_swr(f, swr) < 0) {
+            av_log(NULL, AV_LOG_WARNING,
+                   "[AV-SYNC-PLL] failed to cache aresample SwrContext for "
+                   "input file #%d (jump_comp detection disabled for this "
+                   "filter)\n", f->index);
+        }
+    }
+}
+
+uint64_t input_file_jump_comp_total(const InputFile *f)
+{
+    uint64_t total = 0;
+    if (!f)
+        return 0;
+    for (int i = 0; i < f->nb_swr_jump_comp_ctxs; i++)
+        total += swr_get_jump_comp_event_count(f->swr_jump_comp_ctxs[i]);
+    return total;
+}
+
+void input_file_clear_swr_cache(InputFile *f)
+{
+    if (!f)
+        return;
+    av_freep(&f->swr_jump_comp_ctxs);
+    f->nb_swr_jump_comp_ctxs = 0;
 }

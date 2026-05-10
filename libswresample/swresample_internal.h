@@ -21,6 +21,8 @@
 #ifndef SWRESAMPLE_SWRESAMPLE_INTERNAL_H
 #define SWRESAMPLE_SWRESAMPLE_INTERNAL_H
 
+#include <stdatomic.h>
+
 #include "swresample.h"
 #include "libavutil/channel_layout.h"
 #include "config.h"
@@ -138,6 +140,7 @@ struct SwrContext {
     float max_soft_compensation;                    ///< swr maximum soft compensation in seconds over soft_compensation_duration
     float async;                                    ///< swr simple 1 parameter async, similar to ffmpegs -async
     float jump_comp;                                ///< jump compensation: enables safety-net hard correction (0=disabled)
+    atomic_uint_least64_t jump_comp_event_count;    ///< cumulative count of successful jump_comp hard corrections (silence-injected/sample-dropped). Atomic so the muxer thread can poll from any context.
     int64_t firstpts_in_samples;                    ///< swr first pts in samples
 
     int resample_first;                             ///< 1 if resampling must come first, 0 if rematrixing

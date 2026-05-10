@@ -551,6 +551,21 @@ typedef struct InputFile {
     /* stream groups that ffmpeg is aware of; */
     InputStreamGroup **stream_groups;
     int           nb_stream_groups;
+
+    /* Cached pointers to libswresample SwrContext instances belonging to
+     * any aresample filter in this input file's filter graphs. Populated
+     * once at filter-graph finalisation by fg_register_aresample_swr() in
+     * ffmpeg_filter.c. The muxer thread polls
+     * input_file_jump_comp_total() (also in ffmpeg_filter.c) to detect
+     * libswresample silence-injection events so it can arm the PLL
+     * disturbance window. NULL when no aresample is present (e.g.
+     * audio copy-only configurations).
+     *
+     * NOTE: void* because <swresample.h> is not included by ffmpeg.h —
+     * keeping ffmpeg.h independent of libswresample types. The
+     * stored values are SwrContext*; cast at the use site. */
+    void           **swr_jump_comp_ctxs;
+    int              nb_swr_jump_comp_ctxs;
 } InputFile;
 
 enum forced_keyframes_const {
@@ -824,6 +839,25 @@ int fg_create_simple(FilterGraph **pfg,
                      Scheduler *sch, unsigned sched_idx_enc,
                      const OutputFilterOptions *opts);
 int fg_finalise_bindings(void);
+
+/**
+ * Sum the libswresample jump_comp event counts across all aresample
+ * filters cached on this input file. The muxer thread polls this once
+ * per audio packet — when the cumulative total advances since the
+ * previous poll, libswresample has just hard-corrected an audio
+ * timestamp delta (silence injection or sample drop). The muxer arms
+ * the PLL disturbance window in response.
+ *
+ * Returns 0 if @p f is NULL or has no aresample filters cached
+ * (e.g., audio copy-only configurations).
+ */
+uint64_t input_file_jump_comp_total(const InputFile *f);
+
+/**
+ * Free the cached aresample SwrContext pointer array on @p f. Called
+ * from ifile_close() during shutdown. Safe to call repeatedly.
+ */
+void input_file_clear_swr_cache(InputFile *f);
 
 /**
  * Get our axiliary frame data attached to the frame, allocating it

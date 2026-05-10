@@ -928,6 +928,9 @@ void ifile_close(InputFile **pf)
         istg_free(&f->stream_groups[i]);
     av_freep(&f->stream_groups);
 
+    /* free cached aresample SwrContext pointer array (jump_comp polling). */
+    input_file_clear_swr_cache(f);
+
     avformat_close_input(&f->ctx);
 
     av_packet_free(&d->pkt_heartbeat);
