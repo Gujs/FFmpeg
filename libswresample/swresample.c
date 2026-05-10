@@ -896,6 +896,14 @@ int64_t swr_get_delay(struct SwrContext *s, int64_t base){
     }
 }
 
+uint64_t swr_get_jump_comp_event_count(struct SwrContext *s)
+{
+    if (!s)
+        return 0;
+    return atomic_load_explicit(&s->jump_comp_event_count,
+                                memory_order_relaxed);
+}
+
 int swr_get_out_samples(struct SwrContext *s, int in_samples)
 {
     int64_t out_samples;
@@ -974,6 +982,14 @@ int64_t swr_next_pts(struct SwrContext *s, int64_t pts){
                                      - s->outpts + s->drop_output*(int64_t)s->in_sample_rate;
                 double fpost = post_delta / (double)(s->in_sample_rate * (int64_t)s->out_sample_rate);
                 av_log(s, AV_LOG_INFO, "jump_comp: corrected %.3fs -> residual=%.6fs\n", fdelta, fpost);
+                /* Bump the externally-observable counter so the muxer-side PLL
+                 * can detect the silence-injection event and arm its
+                 * disturbance window. NOT incremented on the filter-rebuild
+                 * branch above (line ~948) — those events do not advance
+                 * audio_dts spuriously and are already covered by Fix B's
+                 * INPUT-GAP / DISCONT-BUF disturbance arming. */
+                atomic_fetch_add_explicit(&s->jump_comp_event_count, 1,
+                                          memory_order_relaxed);
             }
         }
 

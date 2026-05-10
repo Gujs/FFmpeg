@@ -153,6 +153,7 @@ av_cold struct SwrContext *swr_alloc(void){
         s->av_class= &av_class;
         av_opt_set_defaults(s);
         s->firstpts = AV_NOPTS_VALUE;
+        atomic_init(&s->jump_comp_event_count, 0);
     }
     return s;
 }
