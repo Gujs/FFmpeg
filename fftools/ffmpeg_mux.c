@@ -471,6 +471,12 @@ int muxer_thread(void *arg)
     int64_t    pll_warmup_complete_wc = 0;  /* Wall-clock when warmup first completed (for hard ceiling) */
     int64_t    pll_last_defer_log_wc = 0;   /* Throttle the "deferred" log to once/min */
     int        pll_stuck_minutes = 0;       /* Consecutive minutes meeting stuck condition (Fix C) */
+    /* Last-seen total of jump_comp events across this input file's
+     * aresample filters; used to detect libswresample silence-injection
+     * events that would otherwise pollute the EMA. Updated by the
+     * per-audio-packet poll below; declared here so each output's
+     * muxer thread tracks its own seen-watermark independently. */
+    uint64_t   pll_swr_jump_comp_seen = 0;
 
     /* Rate monitoring (10-second windows) */
     int64_t    rate_monitor_start = 0;
@@ -630,6 +636,53 @@ int muxer_thread(void *arg)
              * No input subtraction — input-referenced design cancelled the drift
              * we need to correct (both sides share source clock). */
             double error = output_offset;
+
+            /* Step 2a: detect libswresample jump_comp silence-injection events.
+             *
+             * libswresample increments an atomic counter (in patch 0008) on
+             * every successful hard correction inside swr_next_pts() — i.e.
+             * whenever |delta| > min_hard_compensation triggers silence
+             * injection or sample drop. The counter is summed across all
+             * aresample filters belonging to this input file by
+             * input_file_jump_comp_total() (also patch 0008).
+             *
+             * When the count advances since our last poll, libswresample has
+             * just permanently shifted audio_dts by the injected/dropped
+             * duration. We arm the existing PLL disturbance window (5 min)
+             * and re-warmup the local PLL state so the EMA does not lock
+             * onto the polluted post-injection error. cumul is preserved
+             * (bumpless transfer) so output PTS does not jump.
+             *
+             * This is the cleaner replacement for the reverted Fix F (Session
+             * 99/102) per-packet error-diff detector, which false-positived
+             * on natural cadence noise (58.667ms / 98.667ms peaks). The
+             * jump_comp counter is structurally false-positive-free: it only
+             * advances when libswresample actually injected silence. */
+            if (pll_input_file_idx >= 0 && pll_input_file_idx < nb_input_files) {
+                uint64_t total = input_file_jump_comp_total(input_files[pll_input_file_idx]);
+                if (total > pll_swr_jump_comp_seen) {
+                    uint64_t advanced = total - pll_swr_jump_comp_seen;
+                    pll_swr_jump_comp_seen = total;
+                    if (pll_baseline_set) {
+                        av_log(mux, AV_LOG_INFO,
+                               "[AV-SYNC-PLL] swr jump_comp event observed "
+                               "(total=%"PRIu64", +%"PRIu64") — re-warmup, arm disturbance\n",
+                               total, advanced);
+                        pll_sample_count       = 0;
+                        pll_baseline_set       = 0;
+                        pll_error_ema          = error;
+                        pll_warmup_complete_wc = 0;
+                        pll_last_defer_log_wc  = 0;
+                        pll_stuck_minutes      = 0;
+                        /* pll_cumulative_offset preserved — bumpless. */
+                    }
+                    /* Always arm/extend the disturbance window. Pre-baseline
+                     * captures stay deferred; post-baseline captures (above)
+                     * just re-warmed and need the window for their next pass. */
+                    ifile_arm_pll_disturbance(input_files[pll_input_file_idx],
+                                              5 * 60 * 1000000LL);
+                }
+            }
 
             /* EMA smooth the error (τ=60s at ~47 audio packets/sec) */
             double alpha = 1.0 - exp(-1.0 / (PLL_AUDIO_PKT_RATE * PLL_GAIN_PERIOD));
