@@ -1134,6 +1134,25 @@ static void ts_discontinuity_detect(Demuxer *d, InputStream *ist,
     int64_t pkt_dts = av_rescale_q_rnd(pkt->dts, pkt->time_base, AV_TIME_BASE_Q,
                                        AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
 
+    /* DISCONT-BUF owns timestamp-discontinuity detection via its per-stream
+     * cumulative_ts_offset and pts_wrap_correction. The legacy mechanism here
+     * maintains a per-Demuxer shared d->ts_offset_discont that gets updated
+     * by each per-stream firing — when DISCONT-BUF is also active on an
+     * mpegts input with both audio and video streams, the two layers
+     * compete: each audio packet (delta negative relative to its next_dts
+     * after DISCONT-BUF applies wrap correction) and each video packet
+     * (delta positive in the opposite direction) drives d->ts_offset_discont
+     * back and forth, locking into a multi-second feedback loop (we measured
+     * ±14.64 s steady-state on production multi-stream inputs, with the
+     * resulting output audio/video skew showing up directly in the muxer
+     * AV-SYNC log). Bypass entirely when DISCONT-BUF is enabled for this
+     * input — DISCONT-BUF handles all real source discontinuities and PTS
+     * wraps via its own per-stream tracking. The AV_PKT_FLAG_DISCONTINUITY
+     * shortcut below is preserved as a defensive belt-and-braces for the
+     * legacy code path. */
+    if (d->discont_buf.capacity > 0)
+        return;
+
     /* Skip standard discontinuity correction for packets that have already been
      * processed by the discontinuity buffer. The buffer has already rebased
      * timestamps to maintain continuity. */
@@ -3569,6 +3588,22 @@ int ifile_open(const OptionsContext *o, const char *filename, Scheduler *sch)
         return err;
     }
     f->ctx = ic;
+
+    /* DISCONT-BUF owns 33-bit PTS-wrap handling on mpegts inputs via per-stream
+     * pts_wrap_correction (see discont_detect_jump). libavformat's mpegts demuxer
+     * has its own silent overflow correction (the "correct_ts_overflow" AVOption,
+     * default 1) which adjusts timestamps around the wrap boundary; with our
+     * DISCONT-BUF active, this double-adjusts and causes spurious timestamp
+     * discontinuities downstream. Force it off here so the user no longer needs
+     * to pass `-correct_ts_overflow 0` per input on the CLI. Only mpegts exposes
+     * this option, so the av_opt_set is a no-op on other demuxers. The setting
+     * must happen before avformat_find_stream_info() below, which pulls packets
+     * through libavformat's overflow-correction code path. */
+    if (ic->iformat && ic->iformat->name &&
+        !strcmp(ic->iformat->name, "mpegts")) {
+        av_opt_set_int(ic, "correct_ts_overflow", 0,
+                       AV_OPT_SEARCH_CHILDREN);
+    }
 
     av_strlcat(d->log_name, "/",               sizeof(d->log_name));
     av_strlcat(d->log_name, ic->iformat->name, sizeof(d->log_name));
