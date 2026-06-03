@@ -324,9 +324,16 @@ static int init_muxer(AVFormatContext *s, AVDictionary **options)
                 par->codec_tag = av_codec_get_tag(of->p.codec_tag, par->codec_id);
         }
 
+        /* Count subtitles as interleaved so their packets stay DTS-ordered
+         * with audio/video (patch 0001 fix for displaced/out-of-order DVB
+         * subs). 0001->0004 COUPLING: this is wrap-safe only because patch
+         * 0004 keeps SUBTITLE timestamps in extended-time (commit 01de453bcc,
+         * coherent with A/V); if subtitle DTS ever reverts to modular 33-bit,
+         * subtitles would be misordered across PTS wraps here. DATA and
+         * SMPTE-2038 stay excluded: they are modular-DTS sparse metadata
+         * (e.g. SCTE-35) that must never gate A/V interleaving. */
         if (par->codec_type != AVMEDIA_TYPE_ATTACHMENT &&
             par->codec_type != AVMEDIA_TYPE_DATA &&
-            par->codec_type != AVMEDIA_TYPE_SUBTITLE &&
             par->codec_id != AV_CODEC_ID_SMPTE_2038)
             fci->nb_interleaved_streams++;
     }
@@ -958,7 +965,9 @@ int ff_interleave_packet_per_dts(AVFormatContext *s, AVPacket *pkt,
     FormatContextInternal *const fci = ff_fc_internal(s);
     FFFormatContext *const si = &fci->fc;
     int stream_count = 0;
-    int noninterleaved_count = 0;
+    int missing_sparse = 0;
+    int missing_nonsparse = 0;
+    int64_t limit;
     int ret;
 
     if (has_packet) {
@@ -974,22 +983,37 @@ int ff_interleave_packet_per_dts(AVFormatContext *s, AVPacket *pkt,
             ++stream_count;
         } else if (par->codec_type != AVMEDIA_TYPE_ATTACHMENT &&
                    par->codec_type != AVMEDIA_TYPE_DATA &&
-                   par->codec_type != AVMEDIA_TYPE_SUBTITLE &&
-                   par->codec_id != AV_CODEC_ID_VP8 &&
-                   par->codec_id != AV_CODEC_ID_VP9 &&
                    par->codec_id != AV_CODEC_ID_SMPTE_2038) {
-            ++noninterleaved_count;
+            /* Split missing interleaved streams: a missing subtitle (sparse)
+             * holds the head only for the short max_sparse_interleave_delta,
+             * a missing audio/video stream for the full max_interleave_delta. */
+            if (par->codec_type == AVMEDIA_TYPE_SUBTITLE)
+                ++missing_sparse;
+            else if (par->codec_id != AV_CODEC_ID_VP8 &&
+                     par->codec_id != AV_CODEC_ID_VP9)
+                ++missing_nonsparse;
         }
     }
 
     if (fci->nb_interleaved_streams == stream_count)
         flush = 1;
 
-    if (s->max_interleave_delta > 0 &&
+    /* Dual-timeout valve. If a non-sparse (audio/video) stream is the one
+     * missing, wait the full max_interleave_delta. If ONLY sparse (subtitle)
+     * streams are missing, wait the shorter max_sparse_interleave_delta so a
+     * subtitle PID with multi-second gaps cannot stall A/V on live output
+     * (rcombs, ffmpeg-devel #512). A max_sparse_interleave_delta of 0 falls
+     * back to max_interleave_delta; with both 0 the valve is disabled and
+     * interleaving is pure-DTS. */
+    limit = missing_nonsparse ? s->max_interleave_delta
+          : s->max_sparse_interleave_delta ? s->max_sparse_interleave_delta
+                                           : s->max_interleave_delta;
+
+    if (limit > 0 &&
         si->packet_buffer.head &&
         si->packet_buffer.head->pkt.dts != AV_NOPTS_VALUE &&
         !flush &&
-        fci->nb_interleaved_streams == stream_count+noninterleaved_count
+        fci->nb_interleaved_streams == stream_count + missing_sparse + missing_nonsparse
     ) {
         AVPacket *const top_pkt = &si->packet_buffer.head->pkt;
         int64_t delta_dts = INT64_MIN;
@@ -1003,7 +1027,14 @@ int ff_interleave_packet_per_dts(AVFormatContext *s, AVPacket *pkt,
             const PacketListEntry *const last = sti->last_in_packet_buffer;
             int64_t last_dts;
 
-            if (!last || st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE)
+            /* Exclude sparse/modular-DTS streams from the delay metric:
+             * subtitles (upstream) plus DATA and SMPTE-2038, whose modular
+             * 33-bit DTS must not perturb the extended-time delta (this
+             * protects SCTE-35 splice timing). */
+            if (!last ||
+                st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE ||
+                st->codecpar->codec_type == AVMEDIA_TYPE_DATA ||
+                st->codecpar->codec_id   == AV_CODEC_ID_SMPTE_2038)
                 continue;
 
             last_dts = av_rescale_q(last->pkt.dts,
@@ -1012,11 +1043,11 @@ int ff_interleave_packet_per_dts(AVFormatContext *s, AVPacket *pkt,
             delta_dts = FFMAX(delta_dts, last_dts - top_dts);
         }
 
-        if (delta_dts > s->max_interleave_delta) {
+        if (delta_dts > limit) {
             av_log(s, AV_LOG_DEBUG,
                    "Delay between the first packet and last packet in the "
                    "muxing queue is %"PRId64" > %"PRId64": forcing output\n",
-                   delta_dts, s->max_interleave_delta);
+                   delta_dts, limit);
             flush = 1;
         }
     }
