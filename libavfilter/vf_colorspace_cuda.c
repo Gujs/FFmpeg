@@ -92,6 +92,7 @@ static av_cold void cudacolorspace_uninit(AVFilterContext* ctx)
         CUcontext dummy;
 
         CHECK_CU(cu->cuCtxPushCurrent(s->hwctx->cuda_ctx));
+        CHECK_CU(cu->cuCtxSynchronize());
         CHECK_CU(cu->cuModuleUnload(s->cu_module));
         s->cu_module = NULL;
         CHECK_CU(cu->cuCtxPopCurrent(&dummy));
