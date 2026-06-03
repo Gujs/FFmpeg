@@ -553,6 +553,18 @@ typedef struct InputFile {
     /* stream groups that ffmpeg is aware of; */
     InputStreamGroup **stream_groups;
     int           nb_stream_groups;
+
+    /* Input A/V DTS offset measured in demuxer thread (microseconds).
+     * Continuously updated via atomic store; muxer reads via atomic load.
+     * Positive = video DTS ahead of audio DTS. */
+    atomic_int_least64_t input_av_offset_us;
+
+    /* Disturbance window deadline (av_gettime_relative units, microseconds).
+     * While the wall clock < this value, the muxer's PLL defers baseline
+     * capture to avoid locking onto a polluted EMA. Set forward (max-of)
+     * by demuxer events that make the EMA unreliable: large vid_error in
+     * DISCONT-BUF, INPUT-GAP close, and at process startup. */
+    atomic_int_least64_t pll_disturbance_until_us;
 } InputFile;
 
 enum forced_keyframes_const {
