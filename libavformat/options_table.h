@@ -84,6 +84,7 @@ static const AVOption avformat_options[] = {
 {"metadata_header_padding", "set number of bytes to be written as padding in a metadata header", OFFSET(metadata_header_padding), AV_OPT_TYPE_INT, {.i64 = -1}, -1, INT_MAX, E},
 {"output_ts_offset", "set output timestamp offset", OFFSET(output_ts_offset), AV_OPT_TYPE_DURATION, {.i64 = 0}, INT64_MIN, (double)INT64_MAX, E},
 {"max_interleave_delta", "maximum buffering duration for interleaving", OFFSET(max_interleave_delta), AV_OPT_TYPE_INT64, { .i64 = 10000000 }, 0, (double)INT64_MAX, E },
+{"max_sparse_interleave_delta", "maximum buffering duration for interleaving of sparse streams (e.g. subtitles); 0 = use max_interleave_delta", OFFSET(max_sparse_interleave_delta), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, (double)INT64_MAX, E },
 {"f_strict", "how strictly to follow the standards (deprecated; use strict, save via avconv)", OFFSET(strict_std_compliance), AV_OPT_TYPE_INT, {.i64 = DEFAULT }, INT_MIN, INT_MAX, D|E, .unit = "strict"},
 {"strict", "how strictly to follow the standards", OFFSET(strict_std_compliance), AV_OPT_TYPE_INT, {.i64 = DEFAULT }, INT_MIN, INT_MAX, D|E, .unit = "strict"},
 {"very", "strictly conform to a older more strict version of the spec or reference software", 0, AV_OPT_TYPE_CONST, {.i64 = FF_COMPLIANCE_VERY_STRICT }, INT_MIN, INT_MAX, D|E, .unit = "strict"},

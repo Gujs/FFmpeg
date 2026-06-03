@@ -1584,6 +1584,18 @@ typedef struct AVFormatContext {
     int64_t max_interleave_delta;
 
     /**
+     * Maximum buffering duration (in microseconds) for interleaving of sparse
+     * streams (e.g. subtitles), applied only when no audio/video stream is the
+     * one missing from the muxing queue. This bounds how long a sparse stream
+     * with large inter-packet gaps may hold back audio/video without forcing
+     * the full max_interleave_delta. A value of 0 means "use
+     * max_interleave_delta" (i.e. no separate sparse window).
+     *
+     * Muxing only, set by the caller before avformat_write_header().
+     */
+    int64_t max_sparse_interleave_delta;
+
+    /**
      * Maximum number of packets to read while waiting for the first timestamp.
      * Decoding only.
      */
