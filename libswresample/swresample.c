@@ -275,6 +275,18 @@ av_cold int swr_init(struct SwrContext *s){
     } else
         s->firstpts = AV_NOPTS_VALUE;
 
+    if (s->jump_comp > 0) {
+        if (!s->async) {
+            av_log(s, AV_LOG_WARNING, "jump_comp requires async, enabling async=1\n");
+            s->async = 1;
+        }
+        /* Use jump_comp value as the hard compensation threshold.
+         * This makes jump_comp=0.03 correct any delta > 30ms,
+         * catching discontinuity residuals while ignoring jitter. */
+        if (s->min_hard_compensation > s->jump_comp)
+            s->min_hard_compensation = s->jump_comp;
+    }
+
     if (s->async) {
         if (s->min_compensation >= FLT_MAX/2)
             s->min_compensation = 0.001;
@@ -884,6 +896,14 @@ int64_t swr_get_delay(struct SwrContext *s, int64_t base){
     }
 }
 
+uint64_t swr_get_jump_comp_event_count(struct SwrContext *s)
+{
+    if (!s)
+        return 0;
+    return atomic_load_explicit(&s->jump_comp_event_count,
+                                memory_order_relaxed);
+}
+
 int swr_get_out_samples(struct SwrContext *s, int in_samples)
 {
     int64_t out_samples;
@@ -930,11 +950,50 @@ int64_t swr_next_pts(struct SwrContext *s, int64_t pts){
     if(pts == INT64_MIN)
         return s->outpts;
 
-    if (s->firstpts == AV_NOPTS_VALUE)
+    if (s->firstpts == AV_NOPTS_VALUE) {
         s->outpts = s->firstpts = pts;
+        if (s->jump_comp > 0)
+            av_log(s, AV_LOG_INFO, "jump_comp: outpts reset to %.3fs (filter rebuild)\n",
+                   pts / (double)(s->in_sample_rate * (int64_t)s->out_sample_rate));
+    }
 
     if(s->min_compensation >= FLT_MAX) {
         return (s->outpts = pts - swr_get_delay(s, s->in_sample_rate * (int64_t)s->out_sample_rate));
+    } else if (s->jump_comp > 0) {
+        /* Safety-net only: correct when accumulated delta exceeds
+         * min_hard_compensation (default 0.1s). Per-stream discontinuity
+         * offsets in the demuxer now handle splice boundaries, so SWR
+         * sees near-zero delta at those events. This safety net catches
+         * residual drift on channels without discontinuities (19ppm source
+         * clock drift reaches 100ms after ~87 min). */
+        int64_t delta = pts - swr_get_delay(s, s->in_sample_rate * (int64_t)s->out_sample_rate) - s->outpts + s->drop_output*(int64_t)s->in_sample_rate;
+        double fdelta = delta / (double)(s->in_sample_rate * (int64_t)s->out_sample_rate);
+
+        if (fabs(fdelta) > s->min_hard_compensation) {
+            int ret;
+            av_log(s, AV_LOG_INFO, "jump_comp: delta %.3fs exceeds hard threshold (%.3fs), correcting\n",
+                   fdelta, s->min_hard_compensation);
+            if (delta > 0) ret = swr_inject_silence(s,  delta / s->out_sample_rate);
+            else           ret = swr_drop_output   (s, -delta / s->in_sample_rate);
+            if (ret < 0) {
+                av_log(s, AV_LOG_ERROR, "jump_comp: failed to correct delta of %.3fs\n", fdelta);
+            } else {
+                int64_t post_delta = pts - swr_get_delay(s, s->in_sample_rate * (int64_t)s->out_sample_rate)
+                                     - s->outpts + s->drop_output*(int64_t)s->in_sample_rate;
+                double fpost = post_delta / (double)(s->in_sample_rate * (int64_t)s->out_sample_rate);
+                av_log(s, AV_LOG_INFO, "jump_comp: corrected %.3fs -> residual=%.6fs\n", fdelta, fpost);
+                /* Bump the externally-observable counter so the muxer-side PLL
+                 * can detect the silence-injection event and arm its
+                 * disturbance window. NOT incremented on the filter-rebuild
+                 * branch above (line ~948) — those events do not advance
+                 * audio_dts spuriously and are already covered by Fix B's
+                 * INPUT-GAP / DISCONT-BUF disturbance arming. */
+                atomic_fetch_add_explicit(&s->jump_comp_event_count, 1,
+                                          memory_order_relaxed);
+            }
+        }
+
+        return s->outpts;
     } else {
         int64_t delta = pts - swr_get_delay(s, s->in_sample_rate * (int64_t)s->out_sample_rate) - s->outpts + s->drop_output*(int64_t)s->in_sample_rate;
         double fdelta = delta /(double)(s->in_sample_rate * (int64_t)s->out_sample_rate);
