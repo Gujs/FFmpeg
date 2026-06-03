@@ -977,6 +977,17 @@ void ifile_open_io_result_cleanup(IfileOpenIOResult *result);
  */
 const char *ifile_open_io_result_error(const IfileOpenIOResult *result);
 
+/**
+ * Arm the muxer PLL disturbance window forward by `duration_us` microseconds
+ * from now. While the wall clock is below the deadline, the muxer's PLL
+ * defers baseline capture to avoid locking onto a polluted EMA. Only takes
+ * effect if the resulting deadline is later than the current one (max-of).
+ *
+ * Called from sites that introduce a transient EMA disturbance: large
+ * vid_error in the discontinuity buffer, INPUT-GAP close, process startup.
+ */
+void ifile_arm_pll_disturbance(InputFile *f, int64_t duration_us);
+
 int ist_use(InputStream *ist, int decoding_needed,
             const ViewSpecifier *vs, SchedulerNode *src);
 int ist_filter_add(InputStream *ist, InputFilter *ifilter, int is_simple,
