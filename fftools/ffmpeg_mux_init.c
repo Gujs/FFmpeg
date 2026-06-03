@@ -1229,6 +1229,11 @@ static int ost_add(Muxer *mux, const OptionsContext *o, enum AVMediaType type,
         av_assert0(ret == mux->nb_sch_stream_idx - 1);
         mux->sch_stream_idx[ret] = ms->ost.index;
         ms->sch_idx              = ret;
+
+        // mark data and subtitle streams as sparse - they have infrequent
+        // packets and should not block timing calculations
+        if (type == AVMEDIA_TYPE_DATA || type == AVMEDIA_TYPE_SUBTITLE)
+            sch_mux_stream_set_sparse(mux->sch, mux->sch_idx, ret, 1);
     }
 
     ost = &ms->ost;
@@ -3340,6 +3345,33 @@ static Muxer *mux_alloc(void)
     return mux;
 }
 
+/* Bounded sparse-interleave window (microseconds) for live (non-seekable)
+ * outputs. Subtitle PIDs are sparse (multi-second gaps); since patch 0001
+ * counts them in the interleaver for correct DVB-sub ordering, cap how long a
+ * missing subtitle may hold back audio/video on a live wire. File outputs keep
+ * 0 (fall back to max_interleave_delta -> exact ordering, identical to
+ * upstream). 150 ms is negligible vs the multi-second SRT/UDP path latency;
+ * tune at runtime via -max_sparse_interleave_delta. */
+#define LIVE_SPARSE_INTERLEAVE_DELTA_US 150000
+
+static void mux_set_sparse_interleave_delta(Muxer *mux, AVFormatContext *oc)
+{
+    int is_live;
+
+    /* An explicit user -max_sparse_interleave_delta wins (it is still in
+     * mux->opts here and gets applied later by avformat_write_header());
+     * only auto-tune when the user did not set it. */
+    if (av_dict_get(mux->opts, "max_sparse_interleave_delta", NULL, 0))
+        return;
+
+    is_live = !oc->pb || !(oc->pb->seekable & AVIO_SEEKABLE_NORMAL);
+    if (is_live)
+        oc->max_sparse_interleave_delta = LIVE_SPARSE_INTERLEAVE_DELTA_US;
+
+    av_log(mux, AV_LOG_VERBOSE, "sparse-interleave delay: %s output -> %"PRId64" us\n",
+           is_live ? "live" : "file", oc->max_sparse_interleave_delta);
+}
+
 int of_open(const OptionsContext *o, const char *filename, Scheduler *sch)
 {
     Muxer *mux;
@@ -3456,6 +3488,10 @@ int of_open(const OptionsContext *o, const char *filename, Scheduler *sch)
         av_dict_set_int(&mux->opts, "preload", o->mux_preload*AV_TIME_BASE, 0);
     }
     oc->max_delay = (int)(o->mux_max_delay * AV_TIME_BASE);
+
+    /* Auto-tune the sparse-stream (subtitle) interleave window by output type
+     * now that oc->pb is open; respects an explicit user override. */
+    mux_set_sparse_interleave_delta(mux, oc);
 
     /* copy metadata and chapters from input files */
     err = copy_meta(mux, o);

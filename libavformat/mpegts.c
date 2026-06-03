@@ -1856,7 +1856,7 @@ static void scte_data_cb(MpegTSFilter *filter, const uint8_t *section,
     if (prg && prg->pcr_pid != -1 && prg->discard != AVDISCARD_ALL) {
         MpegTSFilter *f = ts->pids[prg->pcr_pid];
         if (f && f->last_pcr != -1)
-            ts->pkt->pts = ts->pkt->dts = f->last_pcr/SYSTEM_CLOCK_FREQUENCY_DIVISOR;
+            ts->pkt->pts = ts->pkt->dts = f->last_pcr / SYSTEM_CLOCK_FREQUENCY_DIVISOR;
     }
     ts->stop_parse = 1;
 
@@ -2886,10 +2886,16 @@ static void pmt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
                     goto out;
                 st->id = pid;
                 st->codecpar->codec_type = AVMEDIA_TYPE_DATA;
-                if (stream_type == STREAM_TYPE_SCTE_DATA_SCTE_35 && prog_reg_desc == AV_RL32("CUEI")) {
-                    mpegts_find_stream_type(st, stream_type, SCTE_types);
+            }
+            /* SCTE-35 section filter must be opened even if stream already exists,
+             * e.g. from a previous PMT parse or format probing. Close any existing
+             * non-section filter first. */
+            if (stream_type == STREAM_TYPE_SCTE_DATA_SCTE_35 && prog_reg_desc == AV_RL32("CUEI")) {
+                mpegts_find_stream_type(st, stream_type, SCTE_types);
+                if (ts->pids[pid] && ts->pids[pid]->type != MPEGTS_SECTION)
+                    mpegts_close_filter(ts, ts->pids[pid]);
+                if (!ts->pids[pid])
                     mpegts_open_section_filter(ts, pid, scte_data_cb, ts, 1);
-                }
             }
         }
 
