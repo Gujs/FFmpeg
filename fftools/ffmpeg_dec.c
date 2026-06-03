@@ -22,6 +22,7 @@
 #include "libavutil/avstring.h"
 #include "libavutil/dict.h"
 #include "libavutil/error.h"
+#include "libavutil/frame.h"
 #include "libavutil/log.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
@@ -33,6 +34,8 @@
 
 #include "libavcodec/avcodec.h"
 #include "libavcodec/codec.h"
+
+#include "ffmpeg_sched.h"
 
 #include "ffmpeg.h"
 
@@ -71,6 +74,21 @@ typedef struct DecoderPriv {
     /* previous decoded subtitles */
     AVFrame            *sub_prev[2];
     AVFrame            *sub_heartbeat;
+
+    /* closed caption extraction */
+    int                 cc_extract;       /* 1 if CC extraction enabled */
+    /* CC debounce: buffer subtitle text and only emit after it stops
+     * changing for CC_DEBOUNCE_US microseconds. This eliminates the
+     * rapid incremental fragments from cc_dec real_time=1 mode. */
+    AVSubtitle          cc_pending_sub;   /* buffered subtitle waiting for debounce */
+    int                 cc_pending_valid; /* 1 if cc_pending_sub has data */
+    int64_t             cc_pending_pts;   /* PTS when pending text last changed */
+    int64_t             cc_pending_first_pts; /* PTS when current pending cycle started */
+    char               *cc_pending_text;  /* text of pending subtitle (for comparison) */
+    unsigned            cc_out_idx;       /* scheduler decoder output index for CC */
+    AVCodecContext     *cc_dec_ctx;       /* EIA-608 decoder (cc_dec) context */
+    AVFrame            *cc_frame;         /* reusable frame for CC subtitle output */
+    int64_t             cc_last_sub_pts;  /* PTS of last sent subtitle (for keepalive throttle) */
 
     Scheduler          *sch;
     unsigned            sch_idx;
@@ -135,6 +153,12 @@ void dec_free(Decoder **pdec)
     for (int i = 0; i < FF_ARRAY_ELEMS(dp->sub_prev); i++)
         av_frame_free(&dp->sub_prev[i]);
     av_frame_free(&dp->sub_heartbeat);
+
+    avcodec_free_context(&dp->cc_dec_ctx);
+    av_frame_free(&dp->cc_frame);
+    if (dp->cc_pending_valid)
+        avsubtitle_free(&dp->cc_pending_sub);
+    av_freep(&dp->cc_pending_text);
 
     av_freep(&dp->parent_name);
 
@@ -694,6 +718,224 @@ static int transcode_subtitles(DecoderPriv *dp, const AVPacket *pkt,
     return process_subtitle(dp, frame);
 }
 
+/* Debounce intervals for CC subtitle emission.
+ *
+ * cc_dec real_time=1 fires a new subtitle on every CC buffer change.
+ * Roll-up mode (live news): character-by-character, every ~200ms.
+ * Pop-on mode (scripted): complete blocks with 2-10s natural pauses.
+ *
+ * Two timers control emission:
+ * - CC_DEBOUNCE_US (silence): emit after text unchanged for 500ms (pop-on)
+ * - CC_DEBOUNCE_MAX_US (deadline): emit after 300ms pending regardless
+ *   of ongoing changes (roll-up) */
+#define CC_DEBOUNCE_US      500000  /* 500 ms — silence-based (pop-on) */
+#define CC_DEBOUNCE_MAX_US  300000  /* 300 ms — max pending age (roll-up) */
+
+/**
+ * Send a subtitle (content or empty keepalive) to the CC encoder.
+ * Returns 0 on success. On AVERROR_EOF the CC output is disabled.
+ */
+static int cc_send_subtitle(DecoderPriv *dp, AVSubtitle *sub, AVFrame *frame)
+{
+    AVFrame *cc_frame = dp->cc_frame;
+    int ret;
+
+    av_frame_unref(cc_frame);
+
+    /* subtitle_wrap_frame with copy=0 moves ownership: it memdup's the
+     * AVSubtitle and zeroes the caller's copy. On failure the data may be
+     * lost (OOM), but there is nothing useful to do in that case. */
+    ret = subtitle_wrap_frame(cc_frame, sub, 0);
+    if (ret < 0)
+        return ret;
+
+    cc_frame->pts       = frame->pts;
+    cc_frame->time_base = frame->time_base;
+
+    /* Enforce monotonic subtitle PTS — discontinuity rebasing can produce
+     * out-of-order PTS that crashes the muxer with EINVAL */
+    if (dp->cc_last_sub_pts != AV_NOPTS_VALUE) {
+        int64_t min_pts = dp->cc_last_sub_pts + 1;  /* strictly increasing */
+        int64_t frame_pts_us = av_rescale_q(frame->pts, frame->time_base,
+                                            AV_TIME_BASE_Q);
+        if (frame_pts_us < min_pts) {
+            av_log(dp, AV_LOG_DEBUG,
+                   "[CC] Clamping subtitle PTS from %.3fs to %.3fs (monotonicity)\n",
+                   (double)frame_pts_us / AV_TIME_BASE,
+                   (double)min_pts / AV_TIME_BASE);
+            cc_frame->pts = av_rescale_q(min_pts, AV_TIME_BASE_Q,
+                                         frame->time_base);
+            /* Also fix the subtitle.pts inside the frame buffer */
+            AVSubtitle *wrapped = (AVSubtitle *)cc_frame->buf[0]->data;
+            wrapped->pts = min_pts;
+        }
+    }
+
+    ret = sch_dec_send(dp->sch, dp->sch_idx, dp->cc_out_idx, cc_frame);
+    if (ret < 0) {
+        av_frame_unref(cc_frame);
+        if (ret == AVERROR_EOF) {
+            dp->cc_extract = 0;
+            ret = 0;
+        }
+        return ret;
+    }
+
+    /* Use cc_frame->pts (potentially clamped for monotonicity) so that
+     * the next call's monotonicity check compares against the sent value */
+    dp->cc_last_sub_pts = av_rescale_q(cc_frame->pts, cc_frame->time_base,
+                                       AV_TIME_BASE_Q);
+    return 0;
+}
+
+/**
+ * Extract closed captions from decoded video frame and send as subtitle.
+ *
+ * Extracts AV_FRAME_DATA_A53_CC side data from the video frame, decodes
+ * EIA-608 captions to ASS subtitles using cc_dec, and debounces the output
+ * so that only complete phrases are emitted (not character-by-character
+ * incremental fragments from real_time=1 mode).
+ *
+ * Also strips CC from the video frame so the video encoder does not
+ * re-inject it into SEI.
+ */
+static int extract_cc_subtitle(DecoderPriv *dp, AVFrame *frame)
+{
+    AVFrameSideData *sd;
+    AVPacket *cc_pkt = NULL;
+    AVSubtitle subtitle = { 0 };
+    int got_sub = 0;
+    int ret = 0;
+    int64_t cur_pts;
+
+    if (!dp->cc_extract || !dp->cc_dec_ctx)
+        return 0;
+
+    if (frame->pts == AV_NOPTS_VALUE)
+        goto strip;
+
+    cur_pts = av_rescale_q(frame->pts, frame->time_base, AV_TIME_BASE_Q);
+
+    /* Reset CC state if PTS jumped backward (discontinuity rebased timeline) */
+    if (dp->cc_last_sub_pts != AV_NOPTS_VALUE &&
+        cur_pts < dp->cc_last_sub_pts - 500000) {  /* 500ms tolerance */
+        av_log(dp, AV_LOG_INFO,
+               "[CC] PTS jumped backward (%.3fs -> %.3fs), resetting CC state\n",
+               (double)dp->cc_last_sub_pts / AV_TIME_BASE,
+               (double)cur_pts / AV_TIME_BASE);
+        dp->cc_last_sub_pts = AV_NOPTS_VALUE;
+        if (dp->cc_pending_valid) {
+            avsubtitle_free(&dp->cc_pending_sub);
+            dp->cc_pending_valid = 0;
+        }
+    }
+
+    /* If PTS jumped forward significantly (discontinuity / ad boundary),
+     * flush any pending subtitle immediately rather than losing it. */
+    if (dp->cc_pending_valid &&
+        cur_pts - dp->cc_pending_pts > 2 * CC_DEBOUNCE_US) {
+        ret = cc_send_subtitle(dp, &dp->cc_pending_sub, frame);
+        dp->cc_pending_valid = 0;
+        if (ret < 0)
+            goto strip;
+    }
+
+    /* --- Decode CC side data from this video frame --- */
+    sd = av_frame_get_side_data(frame, AV_FRAME_DATA_A53_CC);
+    if (!sd || sd->size < 3)
+        goto check_pending;
+
+    cc_pkt = av_packet_alloc();
+    if (!cc_pkt)
+        return AVERROR(ENOMEM);
+
+    ret = av_new_packet(cc_pkt, sd->size);
+    if (ret < 0) {
+        av_packet_free(&cc_pkt);
+        return ret;
+    }
+    memcpy(cc_pkt->data, sd->data, sd->size);
+    cc_pkt->pts = cur_pts;
+
+    subtitle.pts = cur_pts;
+
+    ret = avcodec_decode_subtitle2(dp->cc_dec_ctx, &subtitle, &got_sub, cc_pkt);
+    av_packet_free(&cc_pkt);
+
+    if (ret < 0) {
+        av_log(dp, AV_LOG_WARNING, "CC decode error: %s\n", av_err2str(ret));
+        ret = 0;
+        goto check_pending;
+    }
+
+    /* --- Debounce: buffer new text, emit only after it stabilises --- */
+    if (got_sub && subtitle.num_rects > 0) {
+        const char *new_text = subtitle.rects[0]->ass ? subtitle.rects[0]->ass : "";
+
+        if (!dp->cc_pending_text || strcmp(new_text, dp->cc_pending_text)) {
+            /* Text changed — replace pending buffer and reset debounce timer */
+            int was_pending = dp->cc_pending_valid;
+            if (dp->cc_pending_valid)
+                avsubtitle_free(&dp->cc_pending_sub);
+
+            /* Clamp end_display_time (cc_dec real_time sets UINT32_MAX) */
+            if (subtitle.end_display_time == UINT32_MAX ||
+                subtitle.end_display_time > 10000)
+                subtitle.end_display_time = 10000;
+
+            subtitle.pts = cur_pts;
+            dp->cc_pending_sub   = subtitle;
+            dp->cc_pending_valid = 1;
+            dp->cc_pending_pts   = cur_pts;  /* silence timer: resets on each change */
+
+            /* Deadline timer: set only when first entering pending state */
+            if (!was_pending)
+                dp->cc_pending_first_pts = cur_pts;
+
+            av_freep(&dp->cc_pending_text);
+            dp->cc_pending_text = av_strdup(new_text);
+
+            /* Ownership transferred to pending — do NOT free subtitle */
+            goto strip;
+        }
+        /* Same text as pending — leave timer unchanged, free duplicate */
+        avsubtitle_free(&subtitle);
+    } else {
+        avsubtitle_free(&subtitle);
+    }
+
+check_pending:
+    /* Emit pending subtitle once text has been stable for CC_DEBOUNCE_US
+     * (silence timer) or pending for CC_DEBOUNCE_MAX_US (deadline timer) */
+    if (dp->cc_pending_valid &&
+        (cur_pts - dp->cc_pending_pts >= CC_DEBOUNCE_US ||
+         cur_pts - dp->cc_pending_first_pts >= CC_DEBOUNCE_MAX_US)) {
+
+        ret = cc_send_subtitle(dp, &dp->cc_pending_sub, frame);
+        dp->cc_pending_valid = 0;  /* subtitle_wrap_frame zeroed the struct */
+        if (ret < 0)
+            goto strip;
+    }
+    /* Keepalive: send empty subtitle at ~1 Hz to prevent MPEG-TS interleaver
+     * from stalling on the sparse subtitle stream. */
+    else if (!dp->cc_pending_valid &&
+             dp->cc_last_sub_pts != AV_NOPTS_VALUE &&
+             cur_pts - dp->cc_last_sub_pts >= 1000000) {
+
+        AVSubtitle empty = { 0 };
+        empty.pts = cur_pts;
+
+        ret = cc_send_subtitle(dp, &empty, frame);
+        if (ret < 0)
+            goto strip;
+    }
+
+strip:
+    /* Remove CC side data so the video encoder does not re-inject it */
+    av_frame_remove_side_data(frame, AV_FRAME_DATA_A53_CC);
+    return ret;
+}
+
 static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
 {
     AVCodecContext *dec = dp->dec_ctx;
@@ -800,6 +1042,13 @@ static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
                 av_log(dp, AV_LOG_FATAL,
                        "Error while processing the decoded data\n");
                 return ret;
+            }
+
+            /* extract closed captions before sending video to outputs */
+            if (dp->cc_extract) {
+                ret = extract_cc_subtitle(dp, frame);
+                if (ret < 0)
+                    return ret;
             }
         }
 
@@ -1086,6 +1335,83 @@ int dec_request_view(Decoder *d, const ViewSpecifier *vs,
     *src = SCH_DEC_OUT(dp->sch_idx,
                        dp->views_requested[dp->nb_views_requested - 1].out_idx);
 
+    return 0;
+}
+
+int dec_setup_cc_extract(Decoder *d, SchedulerNode *src)
+{
+    DecoderPriv *dp = dp_from_dec(d);
+    const AVCodec *cc_codec;
+    int ret;
+
+    if (dp->cc_extract) {
+        *src = SCH_DEC_OUT(dp->sch_idx, dp->cc_out_idx);
+        return 0;
+    }
+
+    /* find the EIA-608 closed caption decoder */
+    cc_codec = avcodec_find_decoder(AV_CODEC_ID_EIA_608);
+    if (!cc_codec) {
+        av_log(dp, AV_LOG_ERROR,
+               "CC extraction requested but EIA-608 decoder (cc_dec) not found\n");
+        return AVERROR_DECODER_NOT_FOUND;
+    }
+
+    /* add a secondary output to this decoder for CC subtitle data */
+    ret = sch_add_dec_output(dp->sch, dp->sch_idx);
+    if (ret < 0)
+        return ret;
+    dp->cc_out_idx = ret;
+
+    /* initialize the EIA-608 decoder context */
+    dp->cc_dec_ctx = avcodec_alloc_context3(cc_codec);
+    if (!dp->cc_dec_ctx)
+        return AVERROR(ENOMEM);
+
+    dp->cc_dec_ctx->pkt_timebase = AV_TIME_BASE_Q;
+
+    /* Enable real-time mode for live streaming: emit subtitles immediately
+     * on each buffer change rather than waiting for mode switches */
+    av_opt_set_int(dp->cc_dec_ctx, "real_time", 1, AV_OPT_SEARCH_CHILDREN);
+
+    ret = avcodec_open2(dp->cc_dec_ctx, cc_codec, NULL);
+    if (ret < 0) {
+        av_log(dp, AV_LOG_ERROR, "Failed to open EIA-608 decoder: %s\n",
+               av_err2str(ret));
+        avcodec_free_context(&dp->cc_dec_ctx);
+        return ret;
+    }
+
+    /* allocate reusable frame for CC output */
+    dp->cc_frame = av_frame_alloc();
+    if (!dp->cc_frame) {
+        avcodec_free_context(&dp->cc_dec_ctx);
+        return AVERROR(ENOMEM);
+    }
+
+    dp->cc_extract       = 1;
+    dp->cc_last_sub_pts  = AV_NOPTS_VALUE;
+
+    av_log(dp, AV_LOG_INFO,
+           "CC extraction enabled: EIA-608 → subtitle output %u\n",
+           dp->cc_out_idx);
+
+    *src = SCH_DEC_OUT(dp->sch_idx, dp->cc_out_idx);
+    return 0;
+}
+
+int dec_get_cc_subtitle_header(Decoder *d, const uint8_t **header, int *header_size)
+{
+    DecoderPriv *dp = dp_from_dec(d);
+
+    if (!dp->cc_dec_ctx) {
+        *header = NULL;
+        *header_size = 0;
+        return AVERROR(EINVAL);
+    }
+
+    *header      = dp->cc_dec_ctx->subtitle_header;
+    *header_size = dp->cc_dec_ctx->subtitle_header_size;
     return 0;
 }
 
