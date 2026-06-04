@@ -2570,20 +2570,35 @@ static void nvenc_fill_time_code(AVCodecContext *avctx, const AVFrame *frame, NV
         uint32_t *tc = (uint32_t*)sd->data;
         int cnt = FFMIN(tc[0], FF_ARRAY_ELEMS(time_code->clockTimestamp));
 
-        switch (cnt) {
-            case 0:
-                time_code->displayPicStruct = NV_ENC_PIC_STRUCT_DISPLAY_FRAME;
-                time_code->skipClockTimestampInsertion = 1;
-                break;
+        /* Choose displayPicStruct from the frame's repeat semantics
+         * (repeat_pict), not the SMPTE timecode count: an interlaced source
+         * carries one timecode per field (count 2/3), and after deinterlacing to
+         * a single progressive frame that count is stale -- keying off it
+         * mislabels the frame as FRAME_DOUBLING/TRIPLING (pic_struct 7/8), which
+         * stalls some hardware decoders. repeat_pict is the real repetition
+         * signal and survives av_frame_copy_props (the interlaced flag does not).
+         * Emit exactly NumClockTS(pic_struct) timestamps so the SEI stays
+         * well-formed. */
+        if (cnt == 0) {
+            time_code->displayPicStruct = NV_ENC_PIC_STRUCT_DISPLAY_FRAME;
+            time_code->skipClockTimestampInsertion = 1;
+        } else {
+            int num_ts;
+            switch (frame->repeat_pict) {
             case 2:
                 time_code->displayPicStruct = NV_ENC_PIC_STRUCT_DISPLAY_FRAME_DOUBLING;
+                num_ts = 2;
                 break;
-            case 3:
+            case 4:
                 time_code->displayPicStruct = NV_ENC_PIC_STRUCT_DISPLAY_FRAME_TRIPLING;
+                num_ts = 3;
                 break;
             default:
                 time_code->displayPicStruct = NV_ENC_PIC_STRUCT_DISPLAY_FRAME;
+                num_ts = 1;
                 break;
+            }
+            cnt = FFMIN(cnt, num_ts);
         }
 
         for (int i = 0; i < cnt; i++) {
