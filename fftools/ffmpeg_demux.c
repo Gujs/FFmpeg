@@ -51,6 +51,7 @@
 #define DISCONT_THRESHOLD_US          (1 * AV_TIME_BASE)   /* 1 second */
 #define DISCONT_TIMEOUT_US            (500 * 1000)         /* 500ms */
 #define DISCONT_TIMELINE_TOLERANCE_US (100 * 1000)         /* 100ms */
+#define DISCONT_DROP_KF_TIMEOUT_US    (5 * AV_TIME_BASE)   /* 5 seconds */
 
 typedef struct DiscontinuityPacket {
     AVPacket *pkt;
@@ -169,6 +170,13 @@ typedef struct DemuxStream {
      * instead of outputting 10s of visual corruption. */
     int                      discont_drop_until_keyframe;
 
+    /* Wallclock (av_gettime_relative) when drop-until-keyframe was first
+     * armed for the current episode. Stamped only on the 0->1 transition:
+     * re-arm storms (a new jump every 1-3s during sustained corruption)
+     * must not slide the timeout window forward, or the gate never escapes.
+     * Read only while the flag is set, so it needs no initialization. */
+    int64_t                  discont_drop_armed_wc;
+
     /* Per-stream PTS wrap correction (AV_TIME_BASE units).
      * MPEG-TS uses a 33-bit counter that wraps every ~26.5 hours. Different
      * streams may wrap at slightly different times. This tracks the cumulative
@@ -239,6 +247,7 @@ typedef struct Demuxer {
         int     pkts_buffered;     /* Packets held in discont buffer */
         int     pkts_buf_flushed;  /* Packets released from buffer flush */
         int     pkts_dropped_kf;   /* Packets dropped by drop-until-keyframe */
+        int     drop_kf_timeouts;  /* Drop-until-keyframe gates opened by timeout */
         int     pkts_dropped_corrupt; /* Packets with AV_PKT_FLAG_CORRUPT */
         int     pkts_sent;         /* Packets sent to decoder (normal path) */
         int     vid_pkts_sent;     /* Video packets sent to decoder */
@@ -860,6 +869,8 @@ static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
                 InputStream *ist_s = f->streams[s];
                 if (ist_s->par->codec_type == AVMEDIA_TYPE_VIDEO) {
                     DemuxStream *ds_vid = ds_from_ist(ist_s);
+                    if (!ds_vid->discont_drop_until_keyframe)
+                        ds_vid->discont_drop_armed_wc = av_gettime_relative();
                     ds_vid->discont_drop_until_keyframe = 1;
                     av_log(d, AV_LOG_INFO,
                            "[DISCONT-BUF] Will drop non-keyframe video on stream %d until IDR\n", s);
@@ -1020,17 +1031,19 @@ static void discont_diag_log(Demuxer *d)
     if (d->diag.vid_pkts_sent == 0 ||
         d->diag.pkts_buffered > 0 ||
         d->diag.pkts_dropped_kf > 0 ||
+        d->diag.drop_kf_timeouts > 0 ||
         d->diag.eagain_count > 10) {
 
         av_log(d, AV_LOG_INFO,
                "[DISCONT-DIAG] 1s: read=%d discard=%d buffered=%d "
-               "flushed=%d drop_kf=%d corrupt=%d sent=%d "
+               "flushed=%d drop_kf=%d kf_timeout=%d corrupt=%d sent=%d "
                "(vid=%d aud=%d) eagain=%d\n",
                d->diag.pkts_read,
                d->diag.pkts_discarded,
                d->diag.pkts_buffered,
                d->diag.pkts_buf_flushed,
                d->diag.pkts_dropped_kf,
+               d->diag.drop_kf_timeouts,
                d->diag.pkts_dropped_corrupt,
                d->diag.pkts_sent,
                d->diag.vid_pkts_sent,
@@ -2273,6 +2286,23 @@ static int input_thread(void *arg)
                 av_log(&ds->ist, AV_LOG_INFO,
                        "[DISCONT-BUF] Keyframe arrived on stream %d, resuming video decode\n",
                        dt.pkt_demux->stream_index);
+            } else if (av_gettime_relative() - ds->discont_drop_armed_wc >
+                       DISCONT_DROP_KF_TIMEOUT_US) {
+                /* Escape hatch: without it, a corruption storm that holes
+                 * every IDR (UDP fifo tail-drop) keeps the gate armed
+                 * indefinitely and video stays suppressed — on a framesync
+                 * grid that freezes the whole output. Passing mid-GOP
+                 * packets costs brief decode corruption; an unbounded
+                 * freeze costs the channel. */
+                ds->discont_drop_until_keyframe = 0;
+                d->diag.drop_kf_timeouts++;
+                av_log(&ds->ist, AV_LOG_WARNING,
+                       "[DISCONT-BUF] No keyframe within %ds after discontinuity on "
+                       "stream %d; resuming video decode with non-keyframe "
+                       "(expect corruption until next IDR)\n",
+                       (int)(DISCONT_DROP_KF_TIMEOUT_US / AV_TIME_BASE),
+                       dt.pkt_demux->stream_index);
+                /* fall through: packet continues to input_packet_process() */
             } else {
                 d->diag.pkts_dropped_kf++;
                 av_log(&ds->ist, AV_LOG_DEBUG,
