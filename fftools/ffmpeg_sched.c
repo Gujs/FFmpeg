@@ -1517,6 +1517,26 @@ static void schedule_update_locked(Scheduler *sch)
     RESET_WAITER(filters);
     RESET_WAITER(dec);
 
+    // Is there any active (non-finished) non-sparse output stream? If so, sparse
+    // (subtitle/data) streams must NOT drive the source-unchoke decision below:
+    // a copied sparse stream sharing a demuxer with A/V is perpetually behind
+    // trailing_dts and would otherwise unconditionally unchoke that shared
+    // demuxer every cycle, defeating A/V pacing (Grid_2x2 latency bug). But in an
+    // ALL-SPARSE pipeline (e.g. a subtitle-only webvtt->webvtt conversion) the
+    // sparse stream is the only thing that can unchoke its own source/decoder, so
+    // it MUST still drive the unchoke or the pipeline hangs at EOF.
+    int have_non_sparse = 0;
+    for (unsigned i = 0; i < sch->nb_mux && !have_non_sparse; i++) {
+        SchMux *mux = &sch->mux[i];
+        for (unsigned j = 0; j < mux->nb_streams; j++) {
+            SchMuxStream *ms = &mux->streams[j];
+            if (!ms->sparse && !ms->source_finished) {
+                have_non_sparse = 1;
+                break;
+            }
+        }
+    }
+
     // figure out the sources that are allowed to proceed
     for (unsigned i = 0; i < sch->nb_mux; i++) {
         SchMux *mux = &sch->mux[i];
@@ -1531,6 +1551,12 @@ static void schedule_update_locked(Scheduler *sch)
                 unchoke_for_stream(sch, ms->src, UNCHOKE_DECODE);
                 continue;
             }
+            // sparse (subtitle/data) streams don't drive the unchoke when an
+            // active non-sparse sibling is present to pace the shared source
+            // (see have_non_sparse above); skipping them unconditionally would
+            // hang an all-sparse pipeline (subtitle-only conversion) at EOF.
+            if (ms->sparse && have_non_sparse)
+                continue;
             if (dts == AV_NOPTS_VALUE && ms->last_dts != AV_NOPTS_VALUE)
                 continue;
             if (dts != AV_NOPTS_VALUE && ms->last_dts - dts >= SCHEDULE_TOLERANCE)
