@@ -37,6 +37,7 @@
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/pixfmt.h"
+#include "libavutil/hwcontext.h"
 #include "libavutil/samplefmt.h"
 #include "libavutil/time.h"
 #include "libavutil/timestamp.h"
@@ -144,6 +145,14 @@ typedef struct InputFilterPriv {
 
     int                 downmixinfo_present;
     AVDownmixInfo       downmixinfo;
+
+    // Audio parameter change hysteresis to filter transient changes at splice boundaries
+    // Discontinuities can cause decoder to briefly output different channel layout/format
+    int                 pending_audio_sample_rate;
+    enum AVSampleFormat pending_audio_format;
+    AVChannelLayout     pending_audio_ch_layout;
+    int                 audio_stable_count;
+#define AUDIO_HYSTERESIS_FRAMES 5  // Require 5 consecutive frames (~100ms at 48kHz/1024)
 
     struct {
         AVFrame *frame;
@@ -1038,6 +1047,7 @@ void fg_free(FilterGraph **pfg)
 
         av_buffer_unref(&ifp->hw_frames_ctx);
         av_channel_layout_uninit(&ifp->ch_layout);
+        av_channel_layout_uninit(&ifp->pending_audio_ch_layout);
         av_freep(&ifilter->linklabel);
         av_freep(&ifp->opts.name);
         av_frame_side_data_free(&ifp->side_data, &ifp->nb_side_data);
@@ -1580,6 +1590,113 @@ static int insert_trim(void *logctx, int64_t start_time, int64_t duration,
     return 0;
 }
 
+/**
+ * Detect hardware acceleration type by examining filter names in the chain.
+ * Returns the hardware pixel format if a hardware filter is found,
+ * AV_PIX_FMT_NONE otherwise.
+ *
+ * This works at filter creation time before format negotiation,
+ * by looking at the filter names rather than negotiated formats.
+ */
+static enum AVPixelFormat detect_hw_accel_from_filter_chain(AVFilterContext *ctx)
+{
+    AVFilterContext *cur;
+    int visited = 0;
+    const int max_depth = 32;  /* Prevent infinite loops */
+
+    av_log(ctx, AV_LOG_DEBUG, "[HW-PATCH] detect_hw_accel: starting from filter '%s'\n",
+           ctx ? ctx->filter->name : "NULL");
+
+    /* Walk back through the filter chain looking for hardware filter names */
+    for (cur = ctx; cur && visited < max_depth; visited++) {
+        const char *name = cur->filter->name;
+
+        av_log(cur, AV_LOG_DEBUG, "[HW-PATCH] detect_hw_accel: examining filter[%d] '%s'\n",
+               visited, name);
+
+        /* Check for CUDA filters */
+        if (strstr(name, "_cuda") || strstr(name, "hwupload_cuda") ||
+            strstr(name, "hwdownload_cuda")) {
+            av_log(cur, AV_LOG_DEBUG, "[HW-PATCH] detect_hw_accel: found CUDA filter '%s'\n", name);
+            return AV_PIX_FMT_CUDA;
+        }
+
+        /* Check for VideoToolbox filters */
+        if (strstr(name, "_vt") || strstr(name, "_videotoolbox") ||
+            strstr(name, "hwupload_videotoolbox"))
+            return AV_PIX_FMT_VIDEOTOOLBOX;
+
+        /* Check for QSV filters */
+        if (strstr(name, "_qsv") || strstr(name, "hwupload_qsv"))
+            return AV_PIX_FMT_QSV;
+
+        /* Check for VAAPI filters */
+        if (strstr(name, "_vaapi") || strstr(name, "hwupload_vaapi"))
+            return AV_PIX_FMT_VAAPI;
+
+        /* Check for D3D11 filters */
+        if (strstr(name, "_d3d11"))
+            return AV_PIX_FMT_D3D11;
+
+        /* Check for Vulkan filters */
+        if (strstr(name, "_vulkan") || strstr(name, "hwupload_vulkan"))
+            return AV_PIX_FMT_VULKAN;
+
+        /* Move to the first input filter if available */
+        if (cur->nb_inputs > 0 && cur->inputs[0])
+            cur = cur->inputs[0]->src;
+        else {
+            av_log(ctx, AV_LOG_DEBUG, "[HW-PATCH] detect_hw_accel: reached end of chain (no more inputs)\n");
+            break;
+        }
+    }
+
+    av_log(ctx, AV_LOG_DEBUG, "[HW-PATCH] detect_hw_accel: no hardware filter found, returning NONE\n");
+    return AV_PIX_FMT_NONE;
+}
+
+/**
+ * Get the appropriate scale filter for a given pixel format.
+ * Returns hardware-specific scale filter for hardware formats,
+ * or "scale" for software formats.
+ */
+static const char *get_scale_filter_for_format(enum AVPixelFormat fmt)
+{
+    if (fmt == AV_PIX_FMT_NONE)
+        return "scale";
+
+    switch (fmt) {
+    case AV_PIX_FMT_CUDA:
+        if (avfilter_get_by_name("scale_cuda"))
+            return "scale_cuda";
+        break;
+    case AV_PIX_FMT_VIDEOTOOLBOX:
+        if (avfilter_get_by_name("scale_vt"))
+            return "scale_vt";
+        break;
+    case AV_PIX_FMT_QSV:
+        if (avfilter_get_by_name("scale_qsv"))
+            return "scale_qsv";
+        break;
+    case AV_PIX_FMT_VAAPI:
+        if (avfilter_get_by_name("scale_vaapi"))
+            return "scale_vaapi";
+        break;
+    case AV_PIX_FMT_D3D11:
+        if (avfilter_get_by_name("scale_d3d11"))
+            return "scale_d3d11";
+        break;
+    case AV_PIX_FMT_VULKAN:
+        if (avfilter_get_by_name("scale_vulkan"))
+            return "scale_vulkan";
+        break;
+    default:
+        break;
+    }
+
+    return "scale";
+}
+
 static int insert_filter(AVFilterContext **last_filter, int *pad_idx,
                          const char *filter_name, const char *args)
 {
@@ -1615,6 +1732,12 @@ static int configure_output_video_filter(FilterGraphPriv *fgp, AVFilterGraph *gr
     int pad_idx = out->pad_idx;
     int ret;
     char name[255];
+
+    av_log(ofilter, AV_LOG_DEBUG,
+           "[HW-PATCH] configure_output_video_filter called for output '%s' "
+           "(last_filter=%s, width=%d, height=%d, autoscale=%d)\n",
+           ofilter->output_name, last_filter ? last_filter->filter->name : "NULL",
+           ofp->width, ofp->height, !!(ofp->flags & OFILTER_FLAG_AUTOSCALE));
 
     snprintf(name, sizeof(name), "out_%s", ofilter->output_name);
     ret = avfilter_graph_create_filter(&ofilter->filter,
@@ -1679,6 +1802,10 @@ static int configure_output_video_filter(FilterGraphPriv *fgp, AVFilterGraph *gr
         AVFilterContext *filter;
         const AVDictionaryEntry *e = NULL;
 
+        av_log(ofilter, AV_LOG_DEBUG,
+               "[HW-PATCH] Phase2: Creating scaler_out (width=%d, height=%d, autoscale=1)\n",
+               ofp->width, ofp->height);
+
         snprintf(args, sizeof(args), "%d:%d",
                  ofp->width, ofp->height);
 
@@ -1687,9 +1814,46 @@ static int configure_output_video_filter(FilterGraphPriv *fgp, AVFilterGraph *gr
         }
 
         snprintf(name, sizeof(name), "scaler_out_%s", ofilter->output_name);
-        if ((ret = avfilter_graph_create_filter(&filter, avfilter_get_by_name("scale"),
-                                                name, args, NULL, graph)) < 0)
-            return ret;
+
+        /* Select appropriate scale filter based on input pipeline type.
+         * For hardware pipelines (CUDA, VideoToolbox, etc.), use the
+         * corresponding hardware scale filter to avoid format conversion issues.
+         * We detect hardware usage by examining filter names since format
+         * negotiation hasn't happened yet at this point. */
+        {
+            enum AVPixelFormat hw_fmt = detect_hw_accel_from_filter_chain(last_filter);
+            const char *scale_filter_name = get_scale_filter_for_format(hw_fmt);
+            const AVFilter *scale_filter = avfilter_get_by_name(scale_filter_name);
+
+            av_log(ofilter, AV_LOG_DEBUG,
+                   "[HW-PATCH] Phase2: detect_hw_accel returned %s, selected filter: %s\n",
+                   hw_fmt != AV_PIX_FMT_NONE ? av_get_pix_fmt_name(hw_fmt) : "none",
+                   scale_filter_name);
+
+            if (!scale_filter) {
+                av_log(ofilter, AV_LOG_DEBUG,
+                       "[HW-PATCH] Phase2: Scale filter '%s' not found, falling back to 'scale'\n",
+                       scale_filter_name);
+                scale_filter = avfilter_get_by_name("scale");
+                if (!scale_filter)
+                    return AVERROR_FILTER_NOT_FOUND;
+            }
+
+            if (hw_fmt != AV_PIX_FMT_NONE) {
+                av_log(ofilter, AV_LOG_DEBUG,
+                       "[HW-PATCH] Phase2: Using hardware scale filter '%s' for scaler_out_%s "
+                       "(detected hw format: %s)\n",
+                       scale_filter_name, ofilter->output_name, av_get_pix_fmt_name(hw_fmt));
+            } else {
+                av_log(ofilter, AV_LOG_DEBUG,
+                       "[HW-PATCH] Phase2: Using software 'scale' for scaler_out_%s (no hw detected)\n",
+                       ofilter->output_name);
+            }
+
+            if ((ret = avfilter_graph_create_filter(&filter, scale_filter,
+                                                    name, args, NULL, graph)) < 0)
+                return ret;
+        }
         if ((ret = avfilter_link(last_filter, pad_idx, filter, 0)) < 0)
             return ret;
 
@@ -2062,6 +2226,29 @@ static int configure_filtergraph(FilterGraph *fg, FilterGraphThread *fgt)
     const char *graph_desc = fg->graph_desc;
 
     cleanup_filtergraph(fg, fgt);
+
+    /* Reset colorspace/range constraints before reconfiguration.
+     * This allows the filter graph to accept new input parameters
+     * without trying to convert back to the old colorspace.
+     * The values will be re-locked after successful configuration.
+     *
+     * Note: We reset both the single value (color_space) and the list
+     * (color_spaces) to ensure choose_color_spaces() returns early
+     * without adding any constraint to the format filter. */
+    for (int i = 0; i < fg->nb_outputs; i++) {
+        OutputFilterPriv *ofp = ofp_from_ofilter(fg->outputs[i]);
+        if (ofp->color_space != AVCOL_SPC_UNSPECIFIED) {
+            av_log(fg, AV_LOG_DEBUG,
+                   "[HW-PATCH] Resetting output %d colorspace constraint "
+                   "(was %s) for reconfiguration\n",
+                   i, av_color_space_name(ofp->color_space));
+        }
+        ofp->color_space = AVCOL_SPC_UNSPECIFIED;
+        ofp->color_spaces = NULL;  /* Clear list to avoid any constraint */
+        ofp->color_range = AVCOL_RANGE_UNSPECIFIED;
+        ofp->color_ranges = NULL;  /* Clear list to avoid any constraint */
+    }
+
     fgt->graph = avfilter_graph_alloc();
     if (!fgt->graph)
         return AVERROR(ENOMEM);
@@ -3080,19 +3267,120 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
     /* determine if the parameters for this input changed */
     switch (ifilter->type) {
     case AVMEDIA_TYPE_AUDIO:
+        /* Audio parameter changes use hysteresis to filter transient changes
+         * at splice/discontinuity boundaries. The decoder may briefly output
+         * different channel layout or sample format during transitions.
+         * Require AUDIO_HYSTERESIS_FRAMES consecutive frames at new parameters
+         * before triggering reconfiguration (which rebuilds the ENTIRE filter
+         * graph including video CUDA filters). */
         if (ifp->format      != frame->format ||
             ifp->sample_rate != frame->sample_rate ||
-            av_channel_layout_compare(&ifp->ch_layout, &frame->ch_layout))
-            need_reinit |= AUDIO_CHANGED;
+            av_channel_layout_compare(&ifp->ch_layout, &frame->ch_layout)) {
+
+            int same_as_pending = (ifp->pending_audio_format == frame->format &&
+                                   ifp->pending_audio_sample_rate == frame->sample_rate &&
+                                   !av_channel_layout_compare(&ifp->pending_audio_ch_layout, &frame->ch_layout));
+
+            if (same_as_pending) {
+                ifp->audio_stable_count++;
+                if (ifp->audio_stable_count >= AUDIO_HYSTERESIS_FRAMES) {
+                    av_log(fg, AV_LOG_INFO,
+                           "[HW-PATCH] Audio change confirmed after %d frames: %dHz %s -> %dHz %s\n",
+                           ifp->audio_stable_count,
+                           ifp->sample_rate,
+                           av_get_sample_fmt_name(ifp->format),
+                           frame->sample_rate,
+                           av_get_sample_fmt_name(frame->format));
+                    need_reinit |= AUDIO_CHANGED;
+                    ifp->audio_stable_count = 0;
+                    av_channel_layout_uninit(&ifp->pending_audio_ch_layout);
+                } else {
+                    /* Hysteresis in progress - drop frame because downstream
+                     * filters (anull, aresample) cannot handle channel layout
+                     * changes mid-stream and return AVERROR_PATCHWELCOME. */
+                    av_log(fg, AV_LOG_DEBUG,
+                           "[HW-PATCH] Audio change pending (%d/%d) - dropping frame\n",
+                           ifp->audio_stable_count, AUDIO_HYSTERESIS_FRAMES);
+                    av_frame_unref(frame);
+                    return 0;
+                }
+            } else {
+                /* New pending audio params - reset counter and drop frame */
+                ifp->pending_audio_format = frame->format;
+                ifp->pending_audio_sample_rate = frame->sample_rate;
+                av_channel_layout_uninit(&ifp->pending_audio_ch_layout);
+                av_channel_layout_copy(&ifp->pending_audio_ch_layout, &frame->ch_layout);
+                ifp->audio_stable_count = 1;
+                av_log(fg, AV_LOG_DEBUG,
+                       "[HW-PATCH] Audio change detected, starting hysteresis: "
+                       "%dHz %s -> %dHz %s (dropping frame)\n",
+                       ifp->sample_rate,
+                       av_get_sample_fmt_name(ifp->format),
+                       frame->sample_rate,
+                       av_get_sample_fmt_name(frame->format));
+                av_frame_unref(frame);
+                return 0;
+            }
+        } else {
+            /* Parameters match current - reset any pending change */
+            if (ifp->audio_stable_count) {
+                av_log(fg, AV_LOG_VERBOSE,
+                       "[HW-PATCH] Transient audio change filtered out after %d frames\n",
+                       ifp->audio_stable_count);
+                ifp->audio_stable_count = 0;
+                av_channel_layout_uninit(&ifp->pending_audio_ch_layout);
+            }
+        }
         break;
     case AVMEDIA_TYPE_VIDEO:
+        /* Format and alpha mode changes trigger immediately */
         if (ifp->format != frame->format ||
-            ifp->width  != frame->width ||
-            ifp->height != frame->height ||
-            ifp->color_space != frame->colorspace ||
-            ifp->color_range != frame->color_range ||
             ifp->alpha_mode != frame->alpha_mode)
             need_reinit |= VIDEO_CHANGED;
+
+        /* Colorspace/range changes: DON'T trigger reconfiguration for HW pipelines.
+         * CUDA/VideoToolbox filters don't do colorspace conversion anyway.
+         * Reconfiguring destroys hw_frames_ctx causing B-frame reference issues.
+         * Just update tracked values and continue - output uses source colorspace. */
+        if (ifp->color_space != frame->colorspace ||
+            ifp->color_range != frame->color_range) {
+            av_log(fg, AV_LOG_VERBOSE,
+                   "[HW-PATCH] Colorspace change detected: %s/%s -> %s/%s (no reconfig)\n",
+                   av_color_space_name(ifp->color_space),
+                   av_color_range_name(ifp->color_range),
+                   av_color_space_name(frame->colorspace),
+                   av_color_range_name(frame->color_range));
+            /* Update tracked values without triggering reconfiguration */
+            ifp->color_space = frame->colorspace;
+            ifp->color_range = frame->color_range;
+        }
+
+        /* Resolution changes: HW pipelines reconfigure immediately (CUDA pools
+         * have fixed dimensions — delayed reconfig lets mismatched frames crash
+         * hwupload_cuda with CUDA_ERROR_INVALID_VALUE). SW pipelines use
+         * hysteresis to filter out spurious changes from corrupted SPS data.
+         *
+         * Corrupt frames are excluded from both paths because their resolution
+         * metadata is unreliable (may come from corrupted SPS/PPS data). */
+        int frame_is_corrupt = (frame->flags & AV_FRAME_FLAG_CORRUPT) != 0;
+
+        if (frame_is_corrupt && (ifp->width != frame->width || ifp->height != frame->height)) {
+            /* Corrupt frame with different resolution — don't trust it.
+             * Corrupt SPS/PPS can report wrong dimensions. */
+            av_log(fg, AV_LOG_DEBUG,
+                   "[HW-PATCH] Ignoring resolution %dx%d from corrupt frame (current %dx%d)\n",
+                   frame->width, frame->height, ifp->width, ifp->height);
+        } else if (ifp->width != frame->width || ifp->height != frame->height) {
+            /* Reconfigure immediately on any resolution change.
+             * Corrupt frames are excluded above — their SPS is unreliable.
+             * A spurious reconfig from a brief resolution glitch is harmless
+             * (brief interruption); delaying reconfig lets mismatched frames
+             * into CUDA pools with fixed dimensions → CUDA_ERROR_INVALID_VALUE. */
+            av_log(fg, AV_LOG_INFO,
+                   "[HW-PATCH] Resolution change: %dx%d -> %dx%d (immediate reconfig)\n",
+                   ifp->width, ifp->height, frame->width, frame->height);
+            need_reinit |= VIDEO_CHANGED;
+        }
         break;
     }
 
@@ -3103,12 +3391,26 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
     } else if (ifp->displaymatrix_present)
         need_reinit |= MATRIX_CHANGED;
 
+    /* Downmix metadata changes: DON'T trigger full filter graph reconfiguration.
+     * Downmix info is advisory metadata from the audio decoder and can flutter
+     * at splice/discontinuity boundaries (e.g., AC3 decode errors).
+     * Rebuilding the entire filter graph (including CUDA video filters) just
+     * because downmix metadata changed is catastrophic — it creates new
+     * hw_frames_ctx pools that displace NVENC output frames for ~10-45 seconds.
+     * Just update the tracked values so they propagate correctly. */
     if (sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DOWNMIX_INFO)) {
         if (!ifp->downmixinfo_present ||
-            memcmp(sd->data, &ifp->downmixinfo, sizeof(ifp->downmixinfo)))
-            need_reinit |= DOWNMIX_CHANGED;
-    } else if (ifp->downmixinfo_present)
-        need_reinit |= DOWNMIX_CHANGED;
+            memcmp(sd->data, &ifp->downmixinfo, sizeof(ifp->downmixinfo))) {
+            av_log(fg, AV_LOG_VERBOSE,
+                   "[HW-PATCH] Downmix metadata changed (no reconfig)\n");
+            memcpy(&ifp->downmixinfo, sd->data, sizeof(ifp->downmixinfo));
+            ifp->downmixinfo_present = 1;
+        }
+    } else if (ifp->downmixinfo_present) {
+        av_log(fg, AV_LOG_VERBOSE,
+               "[HW-PATCH] Downmix metadata removed (no reconfig)\n");
+        ifp->downmixinfo_present = 0;
+    }
 
     if (need_reinit && fgt->graph && (ifp->opts.flags & IFILTER_FLAG_DROPCHANGED)) {
             ifp->nb_dropped++;
@@ -3120,9 +3422,47 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
     if (!(ifp->opts.flags & IFILTER_FLAG_REINIT) && fgt->graph)
         need_reinit = 0;
 
-    if (!!ifp->hw_frames_ctx != !!frame->hw_frames_ctx ||
-        (ifp->hw_frames_ctx && ifp->hw_frames_ctx->data != frame->hw_frames_ctx->data))
+    if (!!ifp->hw_frames_ctx != !!frame->hw_frames_ctx) {
+        /* HW <-> SW transition - must reconfigure */
         need_reinit |= HWACCEL_CHANGED;
+        av_log(fg, AV_LOG_INFO,
+               "[HW-PATCH] HW<->SW transition detected (had_hw=%d frame_hw=%d) - "
+               "triggering HWACCEL_CHANGED reconfig\n",
+               !!ifp->hw_frames_ctx, !!frame->hw_frames_ctx);
+    } else if (ifp->hw_frames_ctx && ifp->hw_frames_ctx->data != frame->hw_frames_ctx->data) {
+        /* hw_frames_ctx pointer changed. Decoder may recreate hw_frames_ctx
+         * on metadata-only SPS changes (e.g., colorspace). Only reconfigure
+         * if the actual frame format changed - suppress if parameters match
+         * to avoid unnecessary NVENC pool changes that cause displaced frames. */
+        AVHWFramesContext *old_hwfc = (AVHWFramesContext *)ifp->hw_frames_ctx->data;
+        AVHWFramesContext *new_hwfc = (AVHWFramesContext *)frame->hw_frames_ctx->data;
+        /* Compare video surface parameters only — NOT the device pointer.
+         * hwupload_cuda creates a new AVHWDeviceContext allocation on each
+         * filter graph rebuild, even for the same physical GPU. */
+        if (old_hwfc->sw_format  != new_hwfc->sw_format  ||
+            old_hwfc->width      != new_hwfc->width      ||
+            old_hwfc->height     != new_hwfc->height) {
+            need_reinit |= HWACCEL_CHANGED;
+            av_log(fg, AV_LOG_INFO,
+                   "[HW-PATCH] hw_frames_ctx changed with DIFFERENT parameters "
+                   "(%p %s %dx%d -> %p %s %dx%d) - "
+                   "triggering HWACCEL_CHANGED reconfig\n",
+                   (void *)old_hwfc, av_get_pix_fmt_name(old_hwfc->sw_format),
+                   old_hwfc->width, old_hwfc->height,
+                   (void *)new_hwfc, av_get_pix_fmt_name(new_hwfc->sw_format),
+                   new_hwfc->width, new_hwfc->height);
+        } else {
+            av_log(fg, AV_LOG_VERBOSE,
+                   "[HW-PATCH] hw_frames_ctx changed (%p -> %p) but parameters "
+                   "identical (%s %dx%d) - suppressing reconfig\n",
+                   (void *)ifp->hw_frames_ctx->data,
+                   (void *)frame->hw_frames_ctx->data,
+                   av_get_pix_fmt_name(new_hwfc->sw_format),
+                   new_hwfc->width, new_hwfc->height);
+            /* Update stored reference so subsequent frames don't re-trigger */
+            av_buffer_replace(&ifp->hw_frames_ctx, frame->hw_frames_ctx);
+        }
+    }
 
     if (need_reinit) {
         ret = ifilter_parameters_from_frame(ifilter, frame);
