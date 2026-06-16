@@ -41,6 +41,56 @@
 
 #include "libavformat/avformat.h"
 
+#include "libavutil/bswap.h"
+#include "libavutil/crc.h"
+
+/* Discontinuity buffer structures for handling interleaved packets
+ * at discontinuity boundaries (e.g., ad splices without discontinuity_indicator) */
+
+#define DISCONT_BUFFER_DEFAULT_SIZE   256
+#define DISCONT_THRESHOLD_US          (1 * AV_TIME_BASE)   /* 1 second */
+#define DISCONT_TIMEOUT_US            (500 * 1000)         /* 500ms */
+#define DISCONT_TIMELINE_TOLERANCE_US (100 * 1000)         /* 100ms */
+#define DISCONT_DROP_KF_TIMEOUT_US    (5 * AV_TIME_BASE)   /* 5 seconds */
+
+typedef struct DiscontinuityPacket {
+    AVPacket *pkt;
+    int stream_idx;
+    int64_t raw_dts;         /* Original DTS before adjustment (AV_TIME_BASE units) */
+    int timeline;            /* 0=old, 1=new, -1=unknown */
+} DiscontinuityPacket;
+
+typedef struct DiscontinuityStreamState {
+    int64_t cumulative_ts_offset;  /* Per-stream offset (AV_TIME_BASE), persists across cycles */
+    int64_t last_sent_dts;         /* End of last packet sent for THIS stream (AV_TIME_BASE) */
+    int64_t old_timeline_base;     /* This stream's last DTS before jump (per-cycle) */
+    int64_t new_timeline_base;     /* This stream's first DTS in new timeline (per-cycle) */
+    int     has_old_base;          /* Set when old_timeline_base recorded this cycle */
+    int     has_new_base;          /* Set when new_timeline_base recorded this cycle */
+} DiscontinuityStreamState;
+
+typedef struct DiscontinuityBuffer {
+    DiscontinuityPacket **packets;
+    int nb_packets;
+    int capacity;
+
+    int active;                  /* 1 if currently buffering packets */
+    int flushing;                /* 1 if currently flushing (skip detection) */
+    int64_t buffer_start_time;   /* Wall clock time when buffering started (us) */
+    int jump_detected;           /* 1 if any stream detected a jump this cycle */
+
+    uint8_t *stream_transitioned; /* Per-stream flag: 1 if stream has transitioned to new timeline */
+    int nb_streams;
+
+    /* Per-stream offset tracking for multiple discontinuities */
+    DiscontinuityStreamState *stream_state;
+
+    /* Single offset applied to ALL streams (preserves A/V sync).
+     * Derived from the video stream's per-stream offset. Per-stream offsets
+     * are still computed for diagnostics but only this value is applied. */
+    int64_t applied_offset;
+} DiscontinuityBuffer;
+
 typedef struct DemuxStream {
     InputStream              ist;
 
@@ -105,6 +155,34 @@ typedef struct DemuxStream {
     int64_t                  resume_pts;
     // measure of how far behind packet reading is against spceified readrate
     int64_t                  lag;
+
+    /* Per-stream discontinuity handling */
+    int64_t                  ts_offset_discont;      /* Per-stream timestamp offset */
+    int                      discontinuity_pending;  /* Flag when discontinuity just detected */
+    int64_t                  last_raw_dts;           /* Last DTS before any adjustment (AV_TIME_BASE) */
+
+    /* Drop non-keyframe video packets after a discontinuity boundary.
+     * The source sends corrupt packets at splice points that poison the
+     * decoder's reference frames. All subsequent P/B frames decode as
+     * garbage until the next IDR keyframe resets the decoder. By dropping
+     * non-keyframe packets, the decoder produces no output during this
+     * period and cfr mode duplicates the last good frame (clean freeze)
+     * instead of outputting 10s of visual corruption. */
+    int                      discont_drop_until_keyframe;
+
+    /* Wallclock (av_gettime_relative) when drop-until-keyframe was first
+     * armed for the current episode. Stamped only on the 0->1 transition:
+     * re-arm storms (a new jump every 1-3s during sustained corruption)
+     * must not slide the timeout window forward, or the gate never escapes.
+     * Read only while the flag is set, so it needs no initialization. */
+    int64_t                  discont_drop_armed_wc;
+
+    /* Per-stream PTS wrap correction (AV_TIME_BASE units).
+     * MPEG-TS uses a 33-bit counter that wraps every ~26.5 hours. Different
+     * streams may wrap at slightly different times. This tracks the cumulative
+     * wrap correction for each stream independently so that a video wrap
+     * doesn't corrupt audio timestamps (and vice versa). */
+    int64_t                  pts_wrap_correction;
 } DemuxStream;
 
 typedef struct DemuxStreamGroup {
@@ -154,6 +232,28 @@ typedef struct Demuxer {
     int                   read_started;
     int                   nb_streams_used;
     int                   nb_streams_finished;
+
+    /* Discontinuity packet buffer for handling interleaved packets */
+    DiscontinuityBuffer   discont_buf;
+    int64_t               discont_threshold;     /* Jump threshold (default: 1 second) */
+    int                   discont_buffer_size;   /* Max packets to buffer (default: 256) */
+    int64_t               discont_timeout_us;    /* Timeout before forced flush (default: 500ms) */
+
+    /* Diagnostic packet flow counters (per-second summary) */
+    struct {
+        int64_t interval_start;    /* Wall clock start of current 1s interval */
+        int     pkts_read;         /* Packets read from av_read_frame */
+        int     pkts_discarded;    /* Packets on wrong/finished streams */
+        int     pkts_buffered;     /* Packets held in discont buffer */
+        int     pkts_buf_flushed;  /* Packets released from buffer flush */
+        int     pkts_dropped_kf;   /* Packets dropped by drop-until-keyframe */
+        int     drop_kf_timeouts;  /* Drop-until-keyframe gates opened by timeout */
+        int     pkts_dropped_corrupt; /* Packets with AV_PKT_FLAG_CORRUPT */
+        int     pkts_sent;         /* Packets sent to decoder (normal path) */
+        int     vid_pkts_sent;     /* Video packets sent to decoder */
+        int     aud_pkts_sent;     /* Audio packets sent to decoder */
+        int     eagain_count;      /* EAGAIN returns from av_read_frame */
+    } diag;
 } Demuxer;
 
 typedef struct DemuxThreadContext {
@@ -224,6 +324,819 @@ static int seek_to_start(Demuxer *d, Timestamp end_pts)
     return ret;
 }
 
+/* ========== Discontinuity Buffer Functions ========== */
+
+/**
+ * Estimate packet duration in AV_TIME_BASE units from codec parameters.
+ * Used for tracking last sent position (end of packet) for cumulative
+ * offset calculation across discontinuities.
+ */
+static int64_t discont_estimate_pkt_duration(InputStream *ist, AVPacket *pkt)
+{
+    int64_t pkt_duration = 0;
+
+    if (ist->par->codec_type == AVMEDIA_TYPE_AUDIO && ist->par->sample_rate) {
+        pkt_duration = ((int64_t)AV_TIME_BASE * ist->par->frame_size) / ist->par->sample_rate;
+    } else if (ist->par->codec_type == AVMEDIA_TYPE_VIDEO) {
+        if (ist->framerate.num)
+            pkt_duration = av_rescale_q(1, av_inv_q(ist->framerate), AV_TIME_BASE_Q);
+        else if (ist->par->framerate.num)
+            pkt_duration = av_rescale_q(1, av_inv_q(ist->par->framerate), AV_TIME_BASE_Q);
+    }
+    if (pkt_duration == 0 && pkt->duration > 0)
+        pkt_duration = av_rescale_q(pkt->duration, ist->st->time_base, AV_TIME_BASE_Q);
+
+    return pkt_duration;
+}
+
+/**
+ * Initialize the discontinuity buffer for the given number of streams.
+ * @param buf     The buffer to initialize
+ * @param capacity Maximum number of packets to buffer
+ * @param nb_streams Number of streams in the demuxer
+ * @return 0 on success, negative AVERROR on failure
+ */
+static int discont_buffer_init(DiscontinuityBuffer *buf, int capacity, int nb_streams)
+{
+    memset(buf, 0, sizeof(*buf));
+
+    buf->packets = av_calloc(capacity, sizeof(*buf->packets));
+    if (!buf->packets)
+        return AVERROR(ENOMEM);
+
+    buf->stream_transitioned = av_calloc(nb_streams, sizeof(*buf->stream_transitioned));
+    if (!buf->stream_transitioned) {
+        av_freep(&buf->packets);
+        return AVERROR(ENOMEM);
+    }
+
+    buf->stream_state = av_calloc(nb_streams, sizeof(*buf->stream_state));
+    if (!buf->stream_state) {
+        av_freep(&buf->stream_transitioned);
+        av_freep(&buf->packets);
+        return AVERROR(ENOMEM);
+    }
+
+    buf->capacity = capacity;
+    buf->nb_streams = nb_streams;
+    buf->nb_packets = 0;
+    buf->active = 0;
+    buf->buffer_start_time = 0;
+    buf->jump_detected = 0;
+
+    for (int i = 0; i < nb_streams; i++) {
+        buf->stream_state[i].cumulative_ts_offset = 0;
+        buf->stream_state[i].last_sent_dts = AV_NOPTS_VALUE;
+        buf->stream_state[i].old_timeline_base = AV_NOPTS_VALUE;
+        buf->stream_state[i].new_timeline_base = AV_NOPTS_VALUE;
+        buf->stream_state[i].has_old_base = 0;
+        buf->stream_state[i].has_new_base = 0;
+    }
+
+    return 0;
+}
+
+/**
+ * Reset the discontinuity buffer state without freeing memory.
+ * Called after a successful flush.
+ */
+static void discont_buffer_reset(DiscontinuityBuffer *buf)
+{
+    /* Free any remaining packets */
+    for (int i = 0; i < buf->nb_packets; i++) {
+        if (buf->packets[i]) {
+            av_packet_free(&buf->packets[i]->pkt);
+            av_freep(&buf->packets[i]);
+        }
+    }
+    buf->nb_packets = 0;
+
+    /* Reset per-stream transition flags */
+    if (buf->stream_transitioned)
+        memset(buf->stream_transitioned, 0, buf->nb_streams * sizeof(*buf->stream_transitioned));
+
+    /* Reset per-cycle fields (NOT cumulative_ts_offset or last_sent_dts) */
+    for (int i = 0; i < buf->nb_streams; i++) {
+        buf->stream_state[i].old_timeline_base = AV_NOPTS_VALUE;
+        buf->stream_state[i].new_timeline_base = AV_NOPTS_VALUE;
+        buf->stream_state[i].has_old_base = 0;
+        buf->stream_state[i].has_new_base = 0;
+    }
+
+    buf->active = 0;
+    buf->jump_detected = 0;
+    buf->buffer_start_time = 0;
+}
+
+/**
+ * Free all resources associated with the discontinuity buffer.
+ */
+static void discont_buffer_free(DiscontinuityBuffer *buf)
+{
+    if (!buf)
+        return;
+
+    discont_buffer_reset(buf);
+    av_freep(&buf->packets);
+    av_freep(&buf->stream_transitioned);
+    av_freep(&buf->stream_state);
+    buf->capacity = 0;
+    buf->nb_streams = 0;
+}
+
+/**
+ * Add a packet to the discontinuity buffer.
+ * @param buf         The discontinuity buffer
+ * @param pkt         The packet to add (will be cloned)
+ * @param stream_idx  Stream index of the packet
+ * @param raw_dts     Original DTS in AV_TIME_BASE units before any adjustment
+ * @return 0 on success, negative AVERROR on failure
+ */
+static int discont_buffer_add(DiscontinuityBuffer *buf, AVPacket *pkt,
+                              int stream_idx, int64_t raw_dts)
+{
+    DiscontinuityPacket *dp;
+
+    if (buf->nb_packets >= buf->capacity)
+        return AVERROR(ENOSPC);
+
+    dp = av_mallocz(sizeof(*dp));
+    if (!dp)
+        return AVERROR(ENOMEM);
+
+    dp->pkt = av_packet_clone(pkt);
+    if (!dp->pkt) {
+        av_freep(&dp);
+        return AVERROR(ENOMEM);
+    }
+
+    dp->stream_idx = stream_idx;
+    dp->raw_dts = raw_dts;
+    dp->timeline = -1;  /* Unknown until classified */
+
+    buf->packets[buf->nb_packets++] = dp;
+
+    return 0;
+}
+
+/**
+ * Classify a packet to OLD (0) or NEW (1) timeline.
+ * Uses per-stream timeline bases when available, falls back to any stream
+ * that has bases (for classifying packets from streams that haven't jumped yet).
+ * @param buf        The discontinuity buffer
+ * @param stream_idx Stream index of the packet
+ * @param raw_dts    The packet's raw DTS in AV_TIME_BASE units
+ * @return 0 for old timeline, 1 for new timeline, -1 if unknown
+ */
+static int discont_classify_timeline(DiscontinuityBuffer *buf, int stream_idx,
+                                     int64_t raw_dts)
+{
+    int64_t old_base = AV_NOPTS_VALUE, new_base = AV_NOPTS_VALUE;
+    int64_t dist_to_old, dist_to_new;
+
+    if (!buf->jump_detected)
+        return -1;  /* Can't classify yet */
+
+    /* Prefer this stream's own bases */
+    if (stream_idx >= 0 && stream_idx < buf->nb_streams) {
+        DiscontinuityStreamState *ss = &buf->stream_state[stream_idx];
+        if (ss->has_old_base && ss->has_new_base) {
+            old_base = ss->old_timeline_base;
+            new_base = ss->new_timeline_base;
+        }
+    }
+
+    /* Fall back to any stream with bases */
+    if (old_base == AV_NOPTS_VALUE || new_base == AV_NOPTS_VALUE) {
+        for (int i = 0; i < buf->nb_streams; i++) {
+            DiscontinuityStreamState *ss = &buf->stream_state[i];
+            if (ss->has_old_base && ss->has_new_base) {
+                old_base = ss->old_timeline_base;
+                new_base = ss->new_timeline_base;
+                break;
+            }
+        }
+    }
+
+    if (old_base == AV_NOPTS_VALUE || new_base == AV_NOPTS_VALUE)
+        return -1;
+
+    dist_to_old = llabs(raw_dts - old_base);
+    dist_to_new = llabs(raw_dts - new_base);
+
+    /* Use tolerance for classification */
+    if (dist_to_old < dist_to_new && dist_to_old < DISCONT_TIMELINE_TOLERANCE_US)
+        return 0;  /* OLD timeline */
+    else if (dist_to_new < DISCONT_TIMELINE_TOLERANCE_US)
+        return 1;  /* NEW timeline */
+    else if (dist_to_old < dist_to_new)
+        return 0;  /* Closer to old */
+    else
+        return 1;  /* Closer to new */
+}
+
+/**
+ * Check if all streams have transitioned to the new timeline.
+ * @param buf        The discontinuity buffer
+ * @param f          The input file (to check which streams are active)
+ * @return 1 if all active streams have transitioned, 0 otherwise
+ */
+static int discont_all_streams_transitioned(DiscontinuityBuffer *buf, InputFile *f)
+{
+    for (int i = 0; i < f->nb_streams && i < buf->nb_streams; i++) {
+        InputStream *ist = f->streams[i];
+        DemuxStream *ds = ds_from_ist(ist);
+
+        /* Skip discarded/finished streams */
+        if (ds->discard || ds->finished)
+            continue;
+
+        /* Only check video and audio streams (not data/subtitle) */
+        if (ist->par->codec_type != AVMEDIA_TYPE_VIDEO &&
+            ist->par->codec_type != AVMEDIA_TYPE_AUDIO)
+            continue;
+
+        if (!buf->stream_transitioned[i])
+            return 0;
+    }
+    return 1;
+}
+
+/**
+ * Check if the discontinuity buffer has timed out.
+ * @param buf  The discontinuity buffer
+ * @return 1 if timeout exceeded, 0 otherwise
+ */
+static int discont_buffer_timeout(DiscontinuityBuffer *buf, int64_t timeout_us)
+{
+    int64_t now = av_gettime_relative();
+
+    if (buf->buffer_start_time == 0)
+        return 0;
+
+    return (now - buf->buffer_start_time) > timeout_us;
+}
+
+/**
+ * Compare function for sorting packets by adjusted DTS.
+ */
+static int discont_packet_compare(const void *a, const void *b)
+{
+    const DiscontinuityPacket *pa = *(const DiscontinuityPacket **)a;
+    const DiscontinuityPacket *pb = *(const DiscontinuityPacket **)b;
+    int64_t dts_a, dts_b;
+
+    /* Use adjusted DTS for comparison */
+    dts_a = pa->raw_dts;
+    dts_b = pb->raw_dts;
+
+    /* OLD timeline packets need adjustment */
+    /* (Note: timeline_delta is applied during flush, not here) */
+
+    if (dts_a < dts_b)
+        return -1;
+    else if (dts_a > dts_b)
+        return 1;
+    else
+        return pa->stream_idx - pb->stream_idx;  /* Stable sort by stream */
+}
+
+/* Forward declarations */
+static int demux_send(Demuxer *d, DemuxThreadContext *dt, DemuxStream *ds,
+                      AVPacket *pkt, unsigned flags);
+static int input_packet_process(Demuxer *d, AVPacket *pkt, unsigned *send_flags);
+
+/**
+ * Flush the discontinuity buffer, applying timestamp corrections and
+ * reordering packets by adjusted DTS.
+ * @param d   The demuxer
+ * @param dt  The demux thread context
+ * @return 0 on success, negative AVERROR on failure
+ */
+static int discont_buffer_flush(Demuxer *d, DemuxThreadContext *dt)
+{
+    DiscontinuityBuffer *buf = &d->discont_buf;
+    InputFile *f = &d->f;
+    int ret = 0;
+
+    if (buf->nb_packets == 0) {
+        discont_buffer_reset(buf);
+        return 0;
+    }
+
+    /* Set flushing flag to prevent re-detection during processing */
+    buf->flushing = 1;
+
+    /* Classify all packets */
+    {
+        int old_count = 0, new_count = 0;
+        int old_vid = 0, old_aud = 0, new_vid = 0, new_aud = 0;
+        for (int i = 0; i < buf->nb_packets; i++) {
+            DiscontinuityPacket *dp = buf->packets[i];
+            if (dp->timeline < 0)
+                dp->timeline = discont_classify_timeline(buf, dp->stream_idx, dp->raw_dts);
+            if (dp->timeline == 0) {
+                old_count++;
+                if (dp->stream_idx < f->nb_streams) {
+                    if (f->streams[dp->stream_idx]->par->codec_type == AVMEDIA_TYPE_VIDEO) old_vid++;
+                    else if (f->streams[dp->stream_idx]->par->codec_type == AVMEDIA_TYPE_AUDIO) old_aud++;
+                }
+            } else if (dp->timeline == 1) {
+                new_count++;
+                if (dp->stream_idx < f->nb_streams) {
+                    if (f->streams[dp->stream_idx]->par->codec_type == AVMEDIA_TYPE_VIDEO) new_vid++;
+                    else if (f->streams[dp->stream_idx]->par->codec_type == AVMEDIA_TYPE_AUDIO) new_aud++;
+                }
+            }
+        }
+        av_log(d, AV_LOG_INFO,
+               "[DISCONT-BUF] Flushing %d packets: old=%d (v:%d a:%d) new=%d (v:%d a:%d)\n",
+               buf->nb_packets, old_count, old_vid, old_aud, new_count, new_vid, new_aud);
+    }
+
+    /* Sort new-timeline packets by DTS for proper ordering */
+    qsort(buf->packets, buf->nb_packets, sizeof(DiscontinuityPacket *),
+          discont_packet_compare);
+
+    /* Determine which timeline to keep:
+     * 1. If only one timeline has packets, keep those
+     * 2. If both timelines have packets, always keep NEW (the continued content)
+     */
+    {
+        int sent_count = 0, discarded_count = 0;
+        int old_count = 0, new_count = 0;
+        int keep_timeline;
+        int any_stream_started = 0;
+
+        /* Count packets in each timeline */
+        for (int i = 0; i < buf->nb_packets; i++) {
+            if (buf->packets[i]->timeline == 0) old_count++;
+            else if (buf->packets[i]->timeline == 1) new_count++;
+        }
+
+        /* Check if any stream has sent data before (not stream start) */
+        for (int s = 0; s < buf->nb_streams; s++) {
+            if (buf->stream_state[s].last_sent_dts != AV_NOPTS_VALUE) {
+                any_stream_started = 1;
+                break;
+            }
+        }
+
+        /* Decide which timeline to keep */
+        if (old_count == 0 && new_count > 0) {
+            keep_timeline = 1;  /* No old packets buffered, keep new */
+
+            if (!any_stream_started) {
+                /* True stream start - no rebasing needed */
+                av_log(d, AV_LOG_INFO, "[DISCONT-BUF] Stream start, keeping all new (%d), no rebase\n", new_count);
+            } else {
+                /* Mid-stream jump - compute per-stream offsets */
+                for (int s = 0; s < buf->nb_streams; s++) {
+                    DiscontinuityStreamState *ss = &buf->stream_state[s];
+                    if (!ss->has_new_base)
+                        continue;
+                    if (ss->last_sent_dts != AV_NOPTS_VALUE)
+                        ss->cumulative_ts_offset = ss->last_sent_dts - ss->new_timeline_base;
+                    else if (ss->has_old_base)
+                        ss->cumulative_ts_offset = ss->old_timeline_base - ss->new_timeline_base;
+                }
+
+                /* Log per-stream offsets */
+                for (int s = 0; s < buf->nb_streams && s < f->nb_streams; s++) {
+                    DiscontinuityStreamState *ss = &buf->stream_state[s];
+                    if (ss->has_new_base) {
+                        av_log(d, AV_LOG_INFO,
+                               "[DISCONT-BUF] s%d(%s) offset=%.3fs (last_sent=%.3fs new_base=%.3fs)\n",
+                               s, f->streams[s]->par->codec_type == AVMEDIA_TYPE_VIDEO ? "vid" : "aud",
+                               (double)ss->cumulative_ts_offset / AV_TIME_BASE,
+                               (double)ss->last_sent_dts / AV_TIME_BASE,
+                               (double)ss->new_timeline_base / AV_TIME_BASE);
+                    }
+                }
+            }
+        } else if (new_count == 0 && old_count > 0) {
+            keep_timeline = 0;  /* No new packets, keep old */
+            av_log(d, AV_LOG_INFO, "[DISCONT-BUF] No new-timeline packets, keeping all OLD (%d)\n", old_count);
+        } else {
+            /* Both timelines have packets - always keep NEW.
+             *
+             * The NEW timeline represents where the source is going next,
+             * regardless of whether the jump is forward or backward.
+             * The OLD side typically has just 1 packet (the last before the
+             * jump was detected), while NEW has the continued content.
+             */
+            keep_timeline = 1;
+
+            /* Compute per-stream offsets */
+            for (int s = 0; s < buf->nb_streams; s++) {
+                DiscontinuityStreamState *ss = &buf->stream_state[s];
+                if (!ss->has_new_base)
+                    continue;
+                if (ss->last_sent_dts != AV_NOPTS_VALUE)
+                    ss->cumulative_ts_offset = ss->last_sent_dts - ss->new_timeline_base;
+                else if (ss->has_old_base)
+                    ss->cumulative_ts_offset = ss->old_timeline_base - ss->new_timeline_base;
+            }
+
+            /* Log per-stream offsets */
+            av_log(d, AV_LOG_INFO, "[DISCONT-BUF] Keeping NEW (old=%d, new=%d), per-stream offsets:\n",
+                   old_count, new_count);
+            for (int s = 0; s < buf->nb_streams && s < f->nb_streams; s++) {
+                DiscontinuityStreamState *ss = &buf->stream_state[s];
+                if (ss->has_new_base) {
+                    av_log(d, AV_LOG_INFO,
+                           "[DISCONT-BUF]   s%d(%s) offset=%.3fs (last_sent=%.3fs new_base=%.3fs)\n",
+                           s, f->streams[s]->par->codec_type == AVMEDIA_TYPE_VIDEO ? "vid" : "aud",
+                           (double)ss->cumulative_ts_offset / AV_TIME_BASE,
+                           (double)ss->last_sent_dts / AV_TIME_BASE,
+                           (double)ss->new_timeline_base / AV_TIME_BASE);
+                }
+            }
+        }
+
+        /* Set applied_offset from video stream (preserves A/V sync).
+         * Per-stream offsets are tracked for diagnostics but a single offset
+         * is applied to all streams so video and audio stay synchronized. */
+        {
+            int64_t vid_offset = 0, aud_offset = 0;
+            int has_vid = 0, has_aud = 0;
+            for (int s = 0; s < buf->nb_streams && s < f->nb_streams; s++) {
+                if (!buf->stream_state[s].has_new_base)
+                    continue;
+                if (f->streams[s]->par->codec_type == AVMEDIA_TYPE_VIDEO) {
+                    vid_offset = buf->stream_state[s].cumulative_ts_offset;
+                    has_vid = 1;
+                } else if (f->streams[s]->par->codec_type == AVMEDIA_TYPE_AUDIO) {
+                    aud_offset = buf->stream_state[s].cumulative_ts_offset;
+                    has_aud = 1;
+                }
+            }
+
+            /* Use audio offset for all streams to eliminate A/V divergence.
+             * Audio gets seamless timestamps; video absorbs the small DTS
+             * error (20-170ms) via CFR dup/drop during the discontinuity
+             * freeze, which is imperceptible. Fall back to video if no audio. */
+            if (has_aud)
+                buf->applied_offset = aud_offset;
+            else if (has_vid)
+                buf->applied_offset = vid_offset;
+
+            if (has_vid && has_aud) {
+                av_log(d, AV_LOG_INFO,
+                       "[DISCONT-BUF] Applied offset=%.3fs (from audio). "
+                       "Per-stream: vid=%.3fs aud=%.3fs vid_error=%.3fs\n",
+                       (double)buf->applied_offset / AV_TIME_BASE,
+                       (double)vid_offset / AV_TIME_BASE,
+                       (double)aud_offset / AV_TIME_BASE,
+                       (double)(vid_offset - aud_offset) / AV_TIME_BASE);
+
+                /* Arm the muxer PLL disturbance window when vid_error is large.
+                 * After the rebase, output video DTS is offset from where the
+                 * audio offset places it by exactly vid_error. The pipeline
+                 * (cfr duplicating, swr injecting silence) absorbs this over
+                 * minutes, polluting the muxer PLL's EMA. Defer baseline
+                 * capture until the EMA settles.
+                 *
+                 * Threshold 1s catches catastrophic events (PATRIOT-TVI's
+                 * 13.4s / 26.3s / 51.6s vid_errors) without arming on routine
+                 * boundary noise (Daystar 2ch/6ch audio change ~50 ms,
+                 * AWE/Euronews SCTE-35 splices ~0 ms). */
+                int64_t vid_err_us = vid_offset - aud_offset;
+                if (vid_err_us < 0)
+                    vid_err_us = -vid_err_us;
+                if (vid_err_us > AV_TIME_BASE) {
+                    ifile_arm_pll_disturbance(f, 5 * 60 * 1000000LL);
+                    av_log(d, AV_LOG_INFO,
+                           "[DISCONT-BUF] arming PLL disturbance window for 5min (vid_error=%.3fs > 1s)\n",
+                           (double)(vid_offset - aud_offset) / AV_TIME_BASE);
+                }
+            }
+        }
+
+        /* Adjust DATA streams' last_sent_dts to the rebased timeline.
+         * DATA (e.g. SCTE-35) bypasses the discontinuity buffer, so its
+         * last_sent_dts reflects the pre-offset output domain. Set it to
+         * the video (or audio) stream's last_sent_dts so that the offset-apply
+         * path can correctly clamp stale DATA packets to monotonic DTS. */
+        {
+            int64_t ref_dts = AV_NOPTS_VALUE;
+            for (int s = 0; s < buf->nb_streams && s < f->nb_streams; s++) {
+                if (f->streams[s]->par->codec_type == AVMEDIA_TYPE_VIDEO &&
+                    buf->stream_state[s].last_sent_dts != AV_NOPTS_VALUE) {
+                    ref_dts = buf->stream_state[s].last_sent_dts;
+                    break;
+                }
+            }
+            if (ref_dts == AV_NOPTS_VALUE) {
+                for (int s = 0; s < buf->nb_streams && s < f->nb_streams; s++) {
+                    if (f->streams[s]->par->codec_type == AVMEDIA_TYPE_AUDIO &&
+                        buf->stream_state[s].last_sent_dts != AV_NOPTS_VALUE) {
+                        ref_dts = buf->stream_state[s].last_sent_dts;
+                        break;
+                    }
+                }
+            }
+            for (int s = 0; s < buf->nb_streams && s < f->nb_streams; s++) {
+                if (f->streams[s]->par->codec_type == AVMEDIA_TYPE_DATA &&
+                    ref_dts != AV_NOPTS_VALUE) {
+                    /* DATA streams now extend to extended-time monotonically
+                     * (G propagation restored), same domain as video/audio
+                     * reference. Use the reference directly — no modular
+                     * reduction needed. */
+                    av_log(d, AV_LOG_DEBUG,
+                           "[DISCONT-BUF] Adjusting DATA s%d last_sent_dts: %.3fs -> %.3fs (extended)\n",
+                           s,
+                           (double)buf->stream_state[s].last_sent_dts / AV_TIME_BASE,
+                           (double)ref_dts / AV_TIME_BASE);
+                    buf->stream_state[s].last_sent_dts = ref_dts;
+                }
+            }
+        }
+
+        /* Set drop-until-keyframe for video streams when keeping NEW timeline.
+         * This prevents corrupt splice boundary packets from poisoning the
+         * decoder's reference frames, which would cause ~10s of garbage output
+         * until the next IDR keyframe arrives. */
+        if (keep_timeline == 1 && (old_count > 0 || any_stream_started)) {
+            for (int s = 0; s < f->nb_streams; s++) {
+                InputStream *ist_s = f->streams[s];
+                if (ist_s->par->codec_type == AVMEDIA_TYPE_VIDEO) {
+                    DemuxStream *ds_vid = ds_from_ist(ist_s);
+                    if (!ds_vid->discont_drop_until_keyframe)
+                        ds_vid->discont_drop_armed_wc = av_gettime_relative();
+                    ds_vid->discont_drop_until_keyframe = 1;
+                    av_log(d, AV_LOG_INFO,
+                           "[DISCONT-BUF] Will drop non-keyframe video on stream %d until IDR\n", s);
+                }
+            }
+        }
+
+        for (int i = 0; i < buf->nb_packets; i++) {
+            DiscontinuityPacket *dp = buf->packets[i];
+            DemuxStream *ds;
+            unsigned send_flags = 0;
+
+            /* Discard packets from the timeline we don't want */
+            if (dp->timeline != keep_timeline && dp->timeline >= 0) {
+                av_log(d, AV_LOG_DEBUG, "[DISCONT-BUF] Discarding %s-timeline packet %d stream=%d dts=%"PRId64"\n",
+                       dp->timeline == 0 ? "old" : "new", i + 1, dp->stream_idx, dp->raw_dts);
+                discarded_count++;
+                av_packet_free(&dp->pkt);
+                av_freep(&buf->packets[i]);
+                continue;
+            }
+
+            av_log(d, AV_LOG_DEBUG, "[DISCONT-BUF] Processing %s-timeline packet %d/%d stream=%d dts=%"PRId64"\n",
+                   dp->timeline == 0 ? "old" : "new", i + 1, buf->nb_packets, dp->stream_idx, dp->raw_dts);
+
+            /* Drop non-keyframe video packets after discontinuity to prevent
+             * corrupt splice boundary data from reaching the decoder */
+            if (dp->stream_idx < f->nb_streams) {
+                InputStream *ist_chk = f->streams[dp->stream_idx];
+                DemuxStream *ds_chk = ds_from_ist(ist_chk);
+                if (ds_chk->discont_drop_until_keyframe &&
+                    ist_chk->par->codec_type == AVMEDIA_TYPE_VIDEO) {
+                    if (dp->pkt->flags & AV_PKT_FLAG_KEY) {
+                        ds_chk->discont_drop_until_keyframe = 0;
+                        av_log(d, AV_LOG_INFO,
+                               "[DISCONT-BUF] Keyframe found in buffer for stream %d, resuming video\n",
+                               dp->stream_idx);
+                    } else {
+                        av_log(d, AV_LOG_DEBUG,
+                               "[DISCONT-BUF] Dropping non-keyframe video packet from buffer: stream=%d dts=%"PRId64"\n",
+                               dp->stream_idx, dp->raw_dts);
+                        discarded_count++;
+                        av_packet_free(&dp->pkt);
+                        av_freep(&buf->packets[i]);
+                        continue;
+                    }
+                }
+            }
+
+            if (dp->stream_idx >= f->nb_streams) {
+                av_log(d, AV_LOG_WARNING, "[DISCONT-BUF] Invalid stream index %d\n",
+                       dp->stream_idx);
+                av_packet_free(&dp->pkt);
+                av_freep(&buf->packets[i]);
+                continue;
+            }
+
+            ds = ds_from_ist(f->streams[dp->stream_idx]);
+
+            /* Apply single offset (from video) to ALL streams for A/V sync.
+             * Per-stream offsets are tracked for diagnostics only. */
+            if (buf->applied_offset != 0) {
+                InputStream *ist_pkt = f->streams[dp->stream_idx];
+                AVRational time_base = ist_pkt->st->time_base;
+                int64_t pkt_offset = av_rescale_q(buf->applied_offset, AV_TIME_BASE_Q, time_base);
+                av_log(d, AV_LOG_DEBUG, "[DISCONT-BUF] Rebasing: stream=%d offset=%"PRId64" pkt_offset=%"PRId64" orig_dts=%"PRId64"\n",
+                       dp->stream_idx, buf->applied_offset, pkt_offset, dp->pkt->dts);
+                if (dp->pkt->dts != AV_NOPTS_VALUE)
+                    dp->pkt->dts += pkt_offset;
+                if (dp->pkt->pts != AV_NOPTS_VALUE)
+                    dp->pkt->pts += pkt_offset;
+                dp->pkt->flags |= AV_PKT_FLAG_DISCONTINUITY;
+            }
+
+            /* Process through normal timestamp fixup path */
+            ret = input_packet_process(d, dp->pkt, &send_flags);
+            if (ret < 0) {
+                av_log(d, AV_LOG_ERROR, "[DISCONT-BUF] Failed to process packet: %s\n",
+                       av_err2str(ret));
+                av_packet_free(&dp->pkt);
+                av_freep(&buf->packets[i]);
+                break;
+            }
+
+            ret = demux_send(d, dt, ds, dp->pkt, send_flags);
+            if (ret < 0) {
+                av_log(d, AV_LOG_ERROR, "[DISCONT-BUF] Failed to send packet: %s\n",
+                       av_err2str(ret));
+                av_packet_free(&dp->pkt);
+                av_freep(&buf->packets[i]);
+                break;
+            }
+
+            /* Update ds->last_raw_dts so subsequent packets don't trigger new
+             * discontinuity detection. Use the RAW (unrebased) DTS so the next
+             * packet from the demuxer has a small delta, not a huge one. */
+            if (dp->raw_dts != AV_NOPTS_VALUE) {
+                ds->last_raw_dts = dp->raw_dts;
+            }
+
+            /* Track per-stream last sent position (END of packet, not start) for
+             * cumulative offset calculation in future flushes. Using end time ensures
+             * new content starts AFTER old content ends (no audio overlap).
+             * Use applied_offset (not per-stream) since that's what was applied to packets. */
+            if (dp->raw_dts != AV_NOPTS_VALUE && dp->stream_idx < buf->nb_streams) {
+                DiscontinuityStreamState *ss = &buf->stream_state[dp->stream_idx];
+                InputStream *ist_pkt = f->streams[dp->stream_idx];
+                int64_t pkt_duration = discont_estimate_pkt_duration(ist_pkt, dp->pkt);
+                int64_t output_dts = dp->raw_dts + buf->applied_offset;
+                int64_t output_end = output_dts + pkt_duration;
+                if (output_end > ss->last_sent_dts || ss->last_sent_dts == AV_NOPTS_VALUE) {
+                    ss->last_sent_dts = output_end;
+                    av_log(d, AV_LOG_DEBUG, "[DISCONT-BUF] s%d last_sent_dts=%.3fs (end, start=%.3fs dur=%.3fs)\n",
+                           dp->stream_idx,
+                           (double)ss->last_sent_dts / AV_TIME_BASE,
+                           (double)output_dts / AV_TIME_BASE,
+                           (double)pkt_duration / AV_TIME_BASE);
+                }
+            }
+
+            sent_count++;
+            d->diag.pkts_buf_flushed++;
+
+            /* Clean up this packet entry */
+            av_packet_free(&dp->pkt);
+            av_freep(&buf->packets[i]);
+        }
+
+        av_log(d, AV_LOG_INFO, "[DISCONT-BUF] Flush complete: %d sent, %d discarded\n",
+               sent_count, discarded_count);
+    }
+
+    /* Clear flushing flag and reset buffer */
+    buf->flushing = 0;
+    discont_buffer_reset(buf);
+
+    return ret;
+}
+
+/**
+ * Log diagnostic packet flow counters once per second.
+ * Only logs when something looks abnormal (no video sent, buffer active,
+ * packets dropped, or excessive EAGAIN). Zero overhead during normal operation.
+ */
+static void discont_diag_log(Demuxer *d)
+{
+    int64_t now = av_gettime_relative();
+    int64_t elapsed_us = now - d->diag.interval_start;
+
+    if (elapsed_us < 1000000)  /* Not yet 1 second */
+        return;
+
+    /* Only log when something looks wrong:
+     * - Zero video packets sent to decoder
+     * - Buffer was active (packets held)
+     * - Packets were dropped
+     * - av_read_frame returned EAGAIN many times */
+    if (d->diag.vid_pkts_sent == 0 ||
+        d->diag.pkts_buffered > 0 ||
+        d->diag.pkts_dropped_kf > 0 ||
+        d->diag.drop_kf_timeouts > 0 ||
+        d->diag.eagain_count > 10) {
+
+        av_log(d, AV_LOG_INFO,
+               "[DISCONT-DIAG] 1s: read=%d discard=%d buffered=%d "
+               "flushed=%d drop_kf=%d kf_timeout=%d corrupt=%d sent=%d "
+               "(vid=%d aud=%d) eagain=%d\n",
+               d->diag.pkts_read,
+               d->diag.pkts_discarded,
+               d->diag.pkts_buffered,
+               d->diag.pkts_buf_flushed,
+               d->diag.pkts_dropped_kf,
+               d->diag.drop_kf_timeouts,
+               d->diag.pkts_dropped_corrupt,
+               d->diag.pkts_sent,
+               d->diag.vid_pkts_sent,
+               d->diag.aud_pkts_sent,
+               d->diag.eagain_count);
+    }
+
+    /* Reset for next interval */
+    memset(&d->diag, 0, sizeof(d->diag));
+    d->diag.interval_start = now;
+}
+
+/**
+ * Detect if a packet triggers a discontinuity and should start buffering.
+ * @param d    The demuxer
+ * @param ist  The input stream
+ * @param pkt  The packet being processed
+ * @param raw_dts  The packet's raw DTS in AV_TIME_BASE units
+ * @return 1 if discontinuity detected and buffering should start, 0 otherwise
+ */
+static int discont_detect_jump(Demuxer *d, InputStream *ist, AVPacket *pkt,
+                               int64_t raw_dts)
+{
+    DemuxStream *ds = ds_from_ist(ist);
+    DiscontinuityBuffer *buf = &d->discont_buf;
+    int64_t delta;
+
+    /* Skip detection if we're currently flushing the buffer */
+    if (buf->flushing)
+        return 0;
+
+    /* Only detect on video/audio streams */
+    if (ist->par->codec_type != AVMEDIA_TYPE_VIDEO &&
+        ist->par->codec_type != AVMEDIA_TYPE_AUDIO)
+        return 0;
+
+    /* Need previous DTS to compare */
+    if (ds->last_raw_dts == AV_NOPTS_VALUE)
+        return 0;
+
+    /* Calculate delta */
+    delta = raw_dts - ds->last_raw_dts;
+
+    /* Check for PTS wrap (33-bit counter wraps every ~26.5 hours).
+     * A wrap looks like a huge jump whose magnitude is close to the
+     * wrap value (2^pts_wrap_bits in stream timebase, rescaled).
+     * We detect this BEFORE treating it as a real discontinuity. */
+    if (ist->st->pts_wrap_bits > 0 && ist->st->pts_wrap_bits < 64) {
+        int64_t wrap_value = av_rescale_q(1LL << ist->st->pts_wrap_bits,
+                                          ist->st->time_base, AV_TIME_BASE_Q);
+        if (llabs(delta) > d->discont_threshold &&
+            llabs(llabs(delta) - wrap_value) < 2 * AV_TIME_BASE) {
+            /* This is a counter wrap, not a real discontinuity.
+             * Record per-stream correction so the caller can adjust
+             * this packet and all future packets on this stream. */
+            ds->pts_wrap_correction -= delta;
+            av_log(ist, AV_LOG_WARNING,
+                   "[DISCONT-BUF] Timestamp jump %.3fs on stream %d is a PTS wrap "
+                   "(wrap=%.3fs), per-stream correction now %.3fs\n",
+                   (double)delta / AV_TIME_BASE, ist->index,
+                   (double)wrap_value / AV_TIME_BASE,
+                   (double)ds->pts_wrap_correction / AV_TIME_BASE);
+            return 2;  /* wrap detected, caller applies correction */
+        }
+    }
+
+    /* Check for significant jump (forward or backward) */
+    if (llabs(delta) > d->discont_threshold) {
+        av_log(ist, AV_LOG_WARNING,
+               "[DISCONT-BUF] Detected timestamp jump on stream %d: "
+               "delta=%.3fs (threshold=%.3fs)\n",
+               ist->index, (double)delta / AV_TIME_BASE,
+               (double)d->discont_threshold / AV_TIME_BASE);
+
+        /* Set per-stream timeline bases */
+        {
+            int sidx = ist->index;
+            if (sidx >= 0 && sidx < buf->nb_streams) {
+                DiscontinuityStreamState *ss = &buf->stream_state[sidx];
+                ss->old_timeline_base = ds->last_raw_dts;
+                ss->new_timeline_base = raw_dts;
+                ss->has_old_base = 1;
+                ss->has_new_base = 1;
+            }
+            buf->jump_detected = 1;
+
+            av_log(d, AV_LOG_INFO,
+                   "[DISCONT-BUF] Stream %d timelines: old=%.3fs, new=%.3fs, delta=%.3fs\n",
+                   ist->index,
+                   (double)ds->last_raw_dts / AV_TIME_BASE,
+                   (double)raw_dts / AV_TIME_BASE,
+                   (double)delta / AV_TIME_BASE);
+        }
+
+        return 1;
+    }
+
+    return 0;
+}
+
 static void ts_discontinuity_detect(Demuxer *d, InputStream *ist,
                                     AVPacket *pkt)
 {
@@ -233,6 +1146,39 @@ static void ts_discontinuity_detect(Demuxer *d, InputStream *ist,
     int disable_discontinuity_correction = copy_ts;
     int64_t pkt_dts = av_rescale_q_rnd(pkt->dts, pkt->time_base, AV_TIME_BASE_Q,
                                        AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+
+    /* DISCONT-BUF owns timestamp-discontinuity detection via its per-stream
+     * cumulative_ts_offset and pts_wrap_correction. The legacy mechanism here
+     * maintains a per-Demuxer shared d->ts_offset_discont that gets updated
+     * by each per-stream firing — when DISCONT-BUF is also active on an
+     * mpegts input with both audio and video streams, the two layers
+     * compete: each audio packet (delta negative relative to its next_dts
+     * after DISCONT-BUF applies wrap correction) and each video packet
+     * (delta positive in the opposite direction) drives d->ts_offset_discont
+     * back and forth, locking into a multi-second feedback loop (we measured
+     * ±14.64 s steady-state on production multi-stream inputs, with the
+     * resulting output audio/video skew showing up directly in the muxer
+     * AV-SYNC log). Bypass entirely when DISCONT-BUF is enabled for this
+     * input — DISCONT-BUF handles all real source discontinuities and PTS
+     * wraps via its own per-stream tracking. The AV_PKT_FLAG_DISCONTINUITY
+     * shortcut below is preserved as a defensive belt-and-braces for the
+     * legacy code path. */
+    if (d->discont_buf.capacity > 0)
+        return;
+
+    /* Skip standard discontinuity correction for packets that have already been
+     * processed by the discontinuity buffer. The buffer has already rebased
+     * timestamps to maintain continuity. */
+    if (pkt->flags & AV_PKT_FLAG_DISCONTINUITY) {
+        av_log(ist, AV_LOG_DEBUG,
+               "[DISCONT-BUF] Skipping standard discontinuity correction (already handled)\n");
+        /* Update tracking to avoid triggering on subsequent packets.
+         * Set next_dts to AV_NOPTS_VALUE so it gets reinitialized from this packet.
+         * Update last_ts so inter-stream detection doesn't trigger. */
+        ds->next_dts = AV_NOPTS_VALUE;
+        d->last_ts = pkt_dts;
+        return;
+    }
 
     if (copy_ts && ds->next_dts != AV_NOPTS_VALUE &&
         fmt_is_discont && ist->st->pts_wrap_bits < 60) {
@@ -297,6 +1243,27 @@ static void ts_discontinuity_process(Demuxer *d, InputStream *ist,
 {
     int64_t offset = av_rescale_q(d->ts_offset_discont, AV_TIME_BASE_Q,
                                   pkt->time_base);
+
+    /* For packets that have been rebased by the discontinuity buffer
+     * (marked with AV_PKT_FLAG_DISCONTINUITY), we still apply the existing
+     * d->ts_offset_discont (which includes start_time offset), but skip
+     * the discontinuity detection that might add additional corrections. */
+    if (pkt->flags & AV_PKT_FLAG_DISCONTINUITY) {
+        av_log(ist, AV_LOG_DEBUG,
+               "[DISCONT-BUF] Applying existing offset (%.3fs) to rebased packet, skipping detection\n",
+               (double)d->ts_offset_discont / AV_TIME_BASE);
+
+        // apply the existing offset
+        if (pkt->dts != AV_NOPTS_VALUE)
+            pkt->dts += offset;
+        if (pkt->pts != AV_NOPTS_VALUE)
+            pkt->pts += offset;
+
+        /* Update d->last_ts so inter-stream detection doesn't trigger
+         * on subsequent non-rebased packets */
+        d->last_ts = av_rescale_q(pkt->dts, pkt->time_base, AV_TIME_BASE_Q);
+        return;
+    }
 
     // apply previously-detected timestamp-discontinuity offset
     // (to all streams, not just audio/video)
@@ -463,6 +1430,91 @@ static int ts_fixup(Demuxer *d, AVPacket *pkt, FrameData *fd)
     return 0;
 }
 
+/**
+ * Rebase SCTE-35 pts_adjustment to track packet timestamp shifts.
+ *
+ * Per SCTE-35 §9.6, receivers compute
+ *   effective_splice_time = (splice_time + pts_adjustment) mod 2^33
+ * pts_adjustment is the spec-defined re-multiplexer field. When packet
+ * DTS/PTS get shifted by an offset (ts_fixup start_time offset or
+ * discontinuity buffer applied_offset), pts_adjustment needs the same
+ * shift so the on-wire effective splice time tracks the new timeline.
+ *
+ * Why pts_adjustment and not splice_time:
+ *  - Single fixed-offset field in the section header (byte 4 bit 0 +
+ *    bytes 5-8); no per-command parsing needed.
+ *  - Works uniformly for every command type, including those where
+ *    splice_time is absent (splice_immediate_flag=1, time_specified_flag=0,
+ *    splice_schedule, segmentation_descriptor).
+ *  - Lives in the unencrypted header per spec, so encrypted sections
+ *    pass through with correct timing.
+ *  - Preserves the source's original splice_time so downstream consumers
+ *    correlating cues across multiple emissions see consistent IDs.
+ */
+static void scte35_rebase_pts_adjustment(Demuxer *d, AVPacket *pkt,
+                                         int64_t offset_us)
+{
+    const uint8_t *buf;
+    uint8_t *wbuf;
+    int len, section_length, ret;
+    int64_t old_pts_adjustment, new_pts_adjustment, offset_90k;
+    uint32_t crc;
+
+    if (!offset_us || !pkt->data || pkt->size < 17)
+        return; /* Need at least header + 4-byte CRC */
+
+    buf = pkt->data;
+    len = pkt->size;
+
+    /* table_id must be 0xFC (splice_info_section) */
+    if (buf[0] != 0xFC)
+        return;
+
+    section_length = ((buf[1] & 0x0F) << 8) | buf[2];
+    if (section_length + 3 > len)
+        return;
+
+    /* Read 33-bit pts_adjustment from byte 4 (bit 0) + bytes 5-8 (BE32). */
+    old_pts_adjustment = ((int64_t)(buf[4] & 0x01) << 32) |
+                         ((int64_t)buf[5] << 24) |
+                         ((int64_t)buf[6] << 16) |
+                         ((int64_t)buf[7] << 8)  |
+                         buf[8];
+
+    /* Convert offset from AV_TIME_BASE (us) to 90kHz ticks, mask to 33 bits. */
+    offset_90k = av_rescale(offset_us, 90000, AV_TIME_BASE);
+    new_pts_adjustment = (old_pts_adjustment + offset_90k) & 0x1FFFFFFFFLL;
+
+    /* Make packet writable before modifying */
+    ret = av_packet_make_writable(pkt);
+    if (ret < 0)
+        return;
+
+    wbuf = pkt->data;
+
+    /* Write 33-bit pts_adjustment back. Preserve top 7 bits of byte 4
+     * (encrypted_packet flag and encryption_algorithm field). */
+    wbuf[4] = (wbuf[4] & 0xFE) | ((new_pts_adjustment >> 32) & 0x01);
+    wbuf[5] = (new_pts_adjustment >> 24) & 0xFF;
+    wbuf[6] = (new_pts_adjustment >> 16) & 0xFF;
+    wbuf[7] = (new_pts_adjustment >>  8) & 0xFF;
+    wbuf[8] =  new_pts_adjustment        & 0xFF;
+
+    /* Recalculate CRC32 (last 4 bytes) */
+    crc = av_bswap32(av_crc(av_crc_get_table(AV_CRC_32_IEEE), -1,
+                            wbuf, len - 4));
+    wbuf[len - 4] = (crc >> 24) & 0xFF;
+    wbuf[len - 3] = (crc >> 16) & 0xFF;
+    wbuf[len - 2] = (crc >>  8) & 0xFF;
+    wbuf[len - 1] =  crc        & 0xFF;
+
+    av_log(d, AV_LOG_DEBUG,
+           "SCTE-35 pts_adjustment rebased: %"PRId64" -> %"PRId64
+           " (offset %.3fs)\n",
+           old_pts_adjustment, new_pts_adjustment,
+           (double)offset_90k / 90000.0);
+}
+
 static int input_packet_process(Demuxer *d, AVPacket *pkt, unsigned *send_flags)
 {
     InputFile     *f = &d->f;
@@ -478,6 +1530,12 @@ static int input_packet_process(Demuxer *d, AVPacket *pkt, unsigned *send_flags)
     ret = ts_fixup(d, pkt, fd);
     if (ret < 0)
         return ret;
+
+    /* ts_fixup applies f->ts_offset to DTS/PTS (subtracts source start_time).
+     * For SCTE-35 packets, also shift pts_adjustment by the same offset so
+     * receivers compute the same effective_splice_time relative to output PTS. */
+    if (ist->par->codec_id == AV_CODEC_ID_SCTE_35 && pkt->size > 0)
+        scte35_rebase_pts_adjustment(d, pkt, f->ts_offset);
 
     if (d->recording_time != INT64_MAX) {
         int64_t start_time = 0;
@@ -746,14 +1804,41 @@ static int input_thread(void *arg)
 
     d->read_started    = 1;
     d->wallclock_start = av_gettime_relative();
+    d->diag.interval_start = av_gettime_relative();
+
+    /* Lazy init: if discontinuity buffer wasn't initialized in ifile_open
+     * (e.g., when using parallel input opening via ifile_open_from_io),
+     * initialize it now before the demux loop starts. */
+    if (d->discont_threshold == 0) {
+        d->discont_threshold = DISCONT_THRESHOLD_US;
+        d->discont_buffer_size = DISCONT_BUFFER_DEFAULT_SIZE;
+        d->discont_timeout_us = DISCONT_TIMEOUT_US;
+        ret = discont_buffer_init(&d->discont_buf, d->discont_buffer_size, f->nb_streams);
+        if (ret < 0)
+            goto finish;
+    }
 
     while (1) {
         DemuxStream *ds;
         unsigned send_flags = 0;
+        int64_t read_start, read_elapsed;
 
+        /* Flush diagnostics before potentially blocking in av_read_frame */
+        discont_diag_log(d);
+
+        read_start = av_gettime_relative();
         ret = av_read_frame(f->ctx, dt.pkt_demux);
+        read_elapsed = av_gettime_relative() - read_start;
+
+        if (read_elapsed > 1000000) {
+            av_log(d, AV_LOG_WARNING,
+                   "[DISCONT-DIAG] av_read_frame blocked for %.3fs (ret=%s)\n",
+                   (double)read_elapsed / AV_TIME_BASE,
+                   av_err2str(ret));
+        }
 
         if (ret == AVERROR(EAGAIN)) {
+            d->diag.eagain_count++;
             av_usleep(10000);
             continue;
         }
@@ -787,6 +1872,8 @@ static int input_thread(void *arg)
             break;
         }
 
+        d->diag.pkts_read++;
+
         if (do_pkt_dump) {
             av_pkt_dump_log2(NULL, AV_LOG_INFO, dt.pkt_demux, do_hex_dump,
                              f->ctx->streams[dt.pkt_demux->stream_index]);
@@ -797,12 +1884,14 @@ static int input_thread(void *arg)
         ds = dt.pkt_demux->stream_index < f->nb_streams ?
              ds_from_ist(f->streams[dt.pkt_demux->stream_index]) : NULL;
         if (!ds || ds->discard || ds->finished) {
+            d->diag.pkts_discarded++;
             report_new_stream(d, dt.pkt_demux);
             av_packet_unref(dt.pkt_demux);
             continue;
         }
 
         if (dt.pkt_demux->flags & AV_PKT_FLAG_CORRUPT) {
+            d->diag.pkts_dropped_corrupt++;
             av_log(d, exit_on_error ? AV_LOG_FATAL : AV_LOG_WARNING,
                    "corrupt input packet in stream %d\n",
                    dt.pkt_demux->stream_index);
@@ -810,6 +1899,338 @@ static int input_thread(void *arg)
                 av_packet_unref(dt.pkt_demux);
                 ret = AVERROR_INVALIDDATA;
                 break;
+            }
+        }
+
+        /* Capture raw DTS before ts_fixup for discontinuity detection */
+        {
+            InputStream *ist = f->streams[dt.pkt_demux->stream_index];
+            DemuxStream *ds_wrap = ds_from_ist(ist);
+            int64_t raw_dts = AV_NOPTS_VALUE;
+
+            /* Apply per-stream PTS wrap correction BEFORE computing raw_dts.
+             * This corrects all future packets after a wrap has been detected
+             * on this stream. */
+            if (ds_wrap->pts_wrap_correction != 0 &&
+                dt.pkt_demux->dts != AV_NOPTS_VALUE) {
+                int64_t corr_tb = av_rescale_q(ds_wrap->pts_wrap_correction,
+                                               AV_TIME_BASE_Q, ist->st->time_base);
+                dt.pkt_demux->dts += corr_tb;
+                if (dt.pkt_demux->pts != AV_NOPTS_VALUE)
+                    dt.pkt_demux->pts += corr_tb;
+            }
+
+            if (dt.pkt_demux->dts != AV_NOPTS_VALUE) {
+                raw_dts = av_rescale_q_rnd(dt.pkt_demux->dts,
+                                           ist->st->time_base, AV_TIME_BASE_Q,
+                                           AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+            }
+
+            /* Check if this packet triggers discontinuity buffering */
+            if (!d->discont_buf.active && raw_dts != AV_NOPTS_VALUE) {
+                int64_t old_wrap_corr = ds_wrap->pts_wrap_correction;
+                int jump_ret = discont_detect_jump(d, ist, dt.pkt_demux, raw_dts);
+                if (jump_ret == 2) {
+                    /* PTS wrap detected - apply only the NEWLY ADDED correction
+                     * to this packet. The previous correction was already applied
+                     * at line 1614 above; applying the full accumulated value
+                     * would double-count the old portion. */
+                    int64_t new_delta = ds_wrap->pts_wrap_correction - old_wrap_corr;
+                    int64_t corr_tb = av_rescale_q(new_delta,
+                                                   AV_TIME_BASE_Q, ist->st->time_base);
+                    dt.pkt_demux->dts += corr_tb;
+                    if (dt.pkt_demux->pts != AV_NOPTS_VALUE)
+                        dt.pkt_demux->pts += corr_tb;
+                    raw_dts = av_rescale_q_rnd(dt.pkt_demux->dts,
+                                               ist->st->time_base, AV_TIME_BASE_Q,
+                                               AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+
+                    /* Propagate the wrap correction from VIDEO to DATA and
+                     * SUBTITLE streams. discont_detect_jump() only runs wrap
+                     * detection on video/audio (sparse DATA/SUBTITLE packets
+                     * are unreliable for it), so without this, DATA streams
+                     * stay in raw 33-bit space while video/audio extend past
+                     * it. After ts_fixup applies a (typically negative) start-
+                     * time offset, the post-wrap raw modular DATA dts becomes
+                     * negative, which libavformat's mux.c monotonic check
+                     * rejects with EINVAL — observed deterministically at
+                     * 26h30m on Game&Fish/GBN.
+                     *
+                     * Keeping DATA in extended-time int64 fixes this. The
+                     * mpegts muxer masks DTS to 33-bit at wire emission, so
+                     * wire output remains correct modular MPEG-TS. SCTE-35
+                     * effective_splice_time = (splice_time + pts_adjustment)
+                     * mod 2^33 stays correct because scte35_rebase_pts_adjust-
+                     * ment shifts pts_adjustment by ts_offset_90k +
+                     * applied_offset_90k modularly, independent of pkt_pts
+                     * extension.
+                     *
+                     * Use video as the reference (not audio) because SCTE-35
+                     * splice_time is keyed to source PCR, which on MPEG-TS
+                     * lives on the video PID. Audio's wrap is detected
+                     * separately within ~1s of video's; not propagating from
+                     * audio avoids double-application. */
+                    if (ist->par->codec_type == AVMEDIA_TYPE_VIDEO) {
+                        for (int s = 0; s < f->nb_streams; s++) {
+                            InputStream *ist_other = f->streams[s];
+                            DemuxStream  *ds_other = ds_from_ist(ist_other);
+                            if (ist_other->par->codec_type != AVMEDIA_TYPE_DATA &&
+                                ist_other->par->codec_type != AVMEDIA_TYPE_SUBTITLE)
+                                continue;
+                            ds_other->pts_wrap_correction += new_delta;
+                            av_log(d, AV_LOG_INFO,
+                                   "[DISCONT-BUF] Propagating video wrap to %s stream %d, "
+                                   "correction now %.3fs\n",
+                                   av_get_media_type_string(ist_other->par->codec_type),
+                                   s,
+                                   (double)ds_other->pts_wrap_correction / AV_TIME_BASE);
+                        }
+                    }
+                } else if (jump_ret == 1) {
+                    d->discont_buf.active = 1;
+                    d->discont_buf.buffer_start_time = av_gettime_relative();
+                    av_log(d, AV_LOG_INFO,
+                           "[DISCONT-BUF] Started buffering on stream %d jump (%.3fs → %.3fs, delta=%.3fs)\n",
+                           ist->index,
+                           (double)ds_wrap->last_raw_dts / AV_TIME_BASE,
+                           (double)raw_dts / AV_TIME_BASE,
+                           (double)(raw_dts - ds_wrap->last_raw_dts) / AV_TIME_BASE);
+                }
+            }
+
+            /* If buffering is active, add packet to buffer.
+             * Exempt DATA packets (e.g. SCTE-35): they have no meaningful DTS
+             * for timeline classification, and buffering them risks silent drops
+             * or DTS corruption during flush.  The offset-apply path below
+             * handles DATA DTS clamping for muxer monotonicity. */
+            if (d->discont_buf.active &&
+                ist->par->codec_type != AVMEDIA_TYPE_DATA) {
+                int timeline;
+
+                d->diag.pkts_buffered++;
+                ret = discont_buffer_add(&d->discont_buf, dt.pkt_demux,
+                                         dt.pkt_demux->stream_index, raw_dts);
+                if (ret == AVERROR(ENOSPC)) {
+                    /* Buffer full, force flush */
+                    av_log(d, AV_LOG_WARNING,
+                           "[DISCONT-BUF] Buffer full (%d packets), forcing flush\n",
+                           d->discont_buf.nb_packets);
+                    ret = discont_buffer_flush(d, &dt);
+                    if (ret < 0)
+                        break;
+
+                    /* Re-add this packet now that buffer is cleared */
+                    ret = discont_buffer_add(&d->discont_buf, dt.pkt_demux,
+                                             dt.pkt_demux->stream_index, raw_dts);
+                }
+                if (ret < 0) {
+                    av_log(d, AV_LOG_ERROR,
+                           "[DISCONT-BUF] Failed to add packet to buffer: %s\n",
+                           av_err2str(ret));
+                    break;
+                }
+
+                /* Mark this stream as transitioned if packet is on new timeline */
+                timeline = discont_classify_timeline(&d->discont_buf,
+                                                     dt.pkt_demux->stream_index, raw_dts);
+                if (timeline == 1 && dt.pkt_demux->stream_index < d->discont_buf.nb_streams) {
+                    int sidx = dt.pkt_demux->stream_index;
+                    d->discont_buf.stream_transitioned[sidx] = 1;
+
+                    /* Record per-stream timeline bases for streams that didn't
+                     * trigger the initial jump detection themselves */
+                    {
+                        DiscontinuityStreamState *ss = &d->discont_buf.stream_state[sidx];
+                        if (!ss->has_new_base) {
+                            ss->new_timeline_base = raw_dts;
+                            ss->has_new_base = 1;
+                            if (!ss->has_old_base && ds->last_raw_dts != AV_NOPTS_VALUE) {
+                                ss->old_timeline_base = ds->last_raw_dts;
+                                ss->has_old_base = 1;
+                            }
+                        }
+                    }
+                }
+
+                /* Check if we should flush */
+                if (discont_all_streams_transitioned(&d->discont_buf, f) ||
+                    discont_buffer_timeout(&d->discont_buf, d->discont_timeout_us)) {
+
+                    if (discont_buffer_timeout(&d->discont_buf, d->discont_timeout_us)) {
+                        /* Log which streams did NOT transition */
+                        char not_transitioned[256] = "";
+                        int pos = 0;
+                        for (int s = 0; s < f->nb_streams && s < d->discont_buf.nb_streams; s++) {
+                            InputStream *ist_s = f->streams[s];
+                            DemuxStream *ds_s = ds_from_ist(ist_s);
+                            if (ds_s->discard || ds_s->finished) continue;
+                            if (ist_s->par->codec_type != AVMEDIA_TYPE_VIDEO &&
+                                ist_s->par->codec_type != AVMEDIA_TYPE_AUDIO) continue;
+                            if (!d->discont_buf.stream_transitioned[s]) {
+                                pos += snprintf(not_transitioned + pos, sizeof(not_transitioned) - pos,
+                                                " s%d(%s)", s,
+                                                ist_s->par->codec_type == AVMEDIA_TYPE_VIDEO ? "vid" : "aud");
+                            }
+                        }
+                        av_log(d, AV_LOG_WARNING,
+                               "[DISCONT-BUF] Timeout after %dms, flushing %d pkts (not transitioned:%s)\n",
+                               (int)((av_gettime_relative() - d->discont_buf.buffer_start_time) / 1000),
+                               d->discont_buf.nb_packets, not_transitioned);
+                    } else {
+                        av_log(d, AV_LOG_INFO,
+                               "[DISCONT-BUF] All streams transitioned after %dms, flushing %d pkts\n",
+                               (int)((av_gettime_relative() - d->discont_buf.buffer_start_time) / 1000),
+                               d->discont_buf.nb_packets);
+                    }
+
+                    ret = discont_buffer_flush(d, &dt);
+                    if (ret < 0)
+                        break;
+                }
+
+                /* Update last_raw_dts for this stream */
+                ds->last_raw_dts = raw_dts;
+
+                av_packet_unref(dt.pkt_demux);
+                continue;  /* Don't process this packet through normal path */
+            }
+
+            /* Detect "poisoned" packets at splice boundaries where DTS
+             * continues monotonically from the old timeline but PTS has
+             * already jumped to the new timeline. discont_detect_jump only
+             * checks DTS, so these slip through with a catastrophically
+             * wrong PTS that causes massive frame drops in the CFR filter.
+             * Clamp PTS to DTS when the gap exceeds a reasonable B-frame
+             * reordering delay. */
+            if (raw_dts != AV_NOPTS_VALUE &&
+                dt.pkt_demux->pts != AV_NOPTS_VALUE) {
+                int64_t raw_pts = av_rescale_q_rnd(dt.pkt_demux->pts,
+                                                    ist->st->time_base,
+                                                    AV_TIME_BASE_Q,
+                                                    AV_ROUND_NEAR_INF |
+                                                    AV_ROUND_PASS_MINMAX);
+                int64_t pts_dts_diff = llabs(raw_pts - raw_dts);
+                if (pts_dts_diff > d->discont_threshold) {
+                    av_log(ist, AV_LOG_WARNING,
+                           "[DISCONT-BUF] Poisoned packet detected on stream %d: "
+                           "PTS=%.3fs DTS=%.3fs diff=%.3fs - clamping PTS to DTS\n",
+                           ist->index,
+                           (double)raw_pts / AV_TIME_BASE,
+                           (double)raw_dts / AV_TIME_BASE,
+                           (double)pts_dts_diff / AV_TIME_BASE);
+                    dt.pkt_demux->pts = dt.pkt_demux->dts;
+                }
+            }
+
+            /* Update last_raw_dts for discontinuity detection */
+            ds->last_raw_dts = raw_dts;
+        }
+
+        /* Apply single offset (from video) to ALL streams for muxer DTS consistency.
+         * DATA streams (SCTE-35) may arrive with stale old-timeline DTS after a
+         * discontinuity — the splice_insert announcing the ad break is sent ~6-8s
+         * before the boundary, carrying old-timeline DTS. After rebasing, such
+         * packets get a wildly negative DTS. Clamp to last_sent_dts+1 to maintain
+         * monotonicity while preserving the SCTE-35 section content (pts_time). */
+        if (d->discont_buf.applied_offset != 0 && dt.pkt_demux->dts != AV_NOPTS_VALUE) {
+            InputStream *ist_pkt = f->streams[dt.pkt_demux->stream_index];
+            AVRational time_base = ist_pkt->st->time_base;
+            int64_t pkt_offset = av_rescale_q(d->discont_buf.applied_offset,
+                                              AV_TIME_BASE_Q, time_base);
+
+            dt.pkt_demux->dts += pkt_offset;
+            if (dt.pkt_demux->pts != AV_NOPTS_VALUE)
+                dt.pkt_demux->pts += pkt_offset;
+
+            /* DATA streams (SCTE-35): clamp rebased DTS to ensure monotonicity.
+             * Stale old-timeline packets (e.g. splice_insert announcing an ad
+             * break, sent ~6-8s before the boundary, carrying old-timeline
+             * DTS) get a large negative DTS after offset. Clamp to
+             * last_sent_dts + 1 — preserves the packet (ad announcement)
+             * while giving the muxer a valid DTS. Ad splicers use section-
+             * internal pts_time, not PES DTS, so clamping is transparent.
+             *
+             * DATA streams now extend to extended-time (G propagation
+             * restored), same domain as last_sent_dts. Simple subtraction
+             * gives the correct delta — no modular reduction needed. */
+            if (ist_pkt->par->codec_type == AVMEDIA_TYPE_DATA) {
+                int sidx = dt.pkt_demux->stream_index;
+                if (sidx < d->discont_buf.nb_streams) {
+                    DiscontinuityStreamState *ss = &d->discont_buf.stream_state[sidx];
+                    if (ss->last_sent_dts != AV_NOPTS_VALUE) {
+                        int64_t dts_us = av_rescale_q(dt.pkt_demux->dts, time_base,
+                                                      AV_TIME_BASE_Q);
+                        if (dts_us <= ss->last_sent_dts) {
+                            int64_t clamped = ss->last_sent_dts + 1;
+                            av_log(ist_pkt, AV_LOG_INFO,
+                                   "[DISCONT-BUF] Clamping stale DATA DTS: %.3fs -> %.3fs "
+                                   "(last_sent=%.3fs)\n",
+                                   (double)dts_us / AV_TIME_BASE,
+                                   (double)clamped / AV_TIME_BASE,
+                                   (double)ss->last_sent_dts / AV_TIME_BASE);
+                            dt.pkt_demux->dts = av_rescale_q(clamped, AV_TIME_BASE_Q,
+                                                              time_base);
+                            if (dt.pkt_demux->pts != AV_NOPTS_VALUE &&
+                                dt.pkt_demux->pts < dt.pkt_demux->dts)
+                                dt.pkt_demux->pts = dt.pkt_demux->dts;
+                            /* Update last_sent_dts so subsequent stale DATA packets
+                             * get monotonically increasing DTS values */
+                            ss->last_sent_dts = clamped;
+                        }
+                    }
+                }
+            }
+
+            /* Shift SCTE-35 pts_adjustment by the same applied_offset.
+             * DTS/PTS were already adjusted above; this keeps the section's
+             * effective_splice_time aligned with the rebased timeline. */
+            if (ist_pkt->par->codec_id == AV_CODEC_ID_SCTE_35 &&
+                dt.pkt_demux->size > 0) {
+                scte35_rebase_pts_adjustment(d, dt.pkt_demux,
+                                             d->discont_buf.applied_offset);
+            }
+
+            /* Mark packet as having discontinuity correction applied so
+             * ts_discontinuity_process doesn't double-adjust it */
+            dt.pkt_demux->flags |= AV_PKT_FLAG_DISCONTINUITY;
+        }
+
+        /* Drop non-keyframe video packets after discontinuity boundary.
+         * The source's new content stream is joined mid-GOP, so non-IDR
+         * packets reference frames our decoder has never seen. They would
+         * either decode as garbage or fail entirely for ~10s until the next
+         * IDR arrives. Dropping them lets cfr duplicate the last good frame. */
+        if (ds->discont_drop_until_keyframe &&
+            ds->ist.par->codec_type == AVMEDIA_TYPE_VIDEO) {
+            if (dt.pkt_demux->flags & AV_PKT_FLAG_KEY) {
+                ds->discont_drop_until_keyframe = 0;
+                av_log(&ds->ist, AV_LOG_INFO,
+                       "[DISCONT-BUF] Keyframe arrived on stream %d, resuming video decode\n",
+                       dt.pkt_demux->stream_index);
+            } else if (av_gettime_relative() - ds->discont_drop_armed_wc >
+                       DISCONT_DROP_KF_TIMEOUT_US) {
+                /* Escape hatch: without it, a corruption storm that holes
+                 * every IDR (UDP fifo tail-drop) keeps the gate armed
+                 * indefinitely and video stays suppressed — on a framesync
+                 * grid that freezes the whole output. Passing mid-GOP
+                 * packets costs brief decode corruption; an unbounded
+                 * freeze costs the channel. */
+                ds->discont_drop_until_keyframe = 0;
+                d->diag.drop_kf_timeouts++;
+                av_log(&ds->ist, AV_LOG_WARNING,
+                       "[DISCONT-BUF] No keyframe within %ds after discontinuity on "
+                       "stream %d; resuming video decode with non-keyframe "
+                       "(expect corruption until next IDR)\n",
+                       (int)(DISCONT_DROP_KF_TIMEOUT_US / AV_TIME_BASE),
+                       dt.pkt_demux->stream_index);
+                /* fall through: packet continues to input_packet_process() */
+            } else {
+                d->diag.pkts_dropped_kf++;
+                av_log(&ds->ist, AV_LOG_DEBUG,
+                       "[DISCONT-BUF] Dropping non-keyframe video packet: stream=%d dts=%"PRId64"\n",
+                       dt.pkt_demux->stream_index, dt.pkt_demux->dts);
+                av_packet_unref(dt.pkt_demux);
+                continue;
             }
         }
 
@@ -823,6 +2244,32 @@ static int input_thread(void *arg)
         ret = demux_send(d, &dt, ds, dt.pkt_demux, send_flags);
         if (ret < 0)
             break;
+
+        d->diag.pkts_sent++;
+        if (ds->ist.par->codec_type == AVMEDIA_TYPE_VIDEO)
+            d->diag.vid_pkts_sent++;
+        else if (ds->ist.par->codec_type == AVMEDIA_TYPE_AUDIO)
+            d->diag.aud_pkts_sent++;
+
+        /* Track per-stream last sent position (END of packet, not start) for
+         * discontinuity buffer cumulative offset calculation. Using end time
+         * ensures new content starts AFTER old content ends (no audio overlap).
+         *
+         * NOTE: Use ds->ist.index, NOT dt.pkt_demux->stream_index — demux_send()
+         * unrefs the packet which resets stream_index to 0. */
+        if (ds->last_raw_dts != AV_NOPTS_VALUE && d->discont_buf.capacity > 0) {
+            int sidx = ds->ist.index;
+            if (sidx < d->discont_buf.nb_streams) {
+                DiscontinuityStreamState *ss = &d->discont_buf.stream_state[sidx];
+                int64_t pkt_duration = discont_estimate_pkt_duration(&ds->ist, dt.pkt_demux);
+                int64_t output_dts = ds->last_raw_dts + d->discont_buf.applied_offset;
+                int64_t output_end = output_dts + pkt_duration;
+                if (output_end > ss->last_sent_dts || ss->last_sent_dts == AV_NOPTS_VALUE)
+                    ss->last_sent_dts = output_end;
+            }
+        }
+
+        discont_diag_log(d);
     }
 
     // EOF/EXIT is normal termination
@@ -931,6 +2378,9 @@ void ifile_close(InputFile **pf)
     avformat_close_input(&f->ctx);
 
     av_packet_free(&d->pkt_heartbeat);
+
+    /* Free discontinuity buffer */
+    discont_buffer_free(&d->discont_buf);
 
     av_freep(pf);
 }
@@ -1436,6 +2886,7 @@ static int ist_add(const OptionsContext *o, Demuxer *d, AVStream *st, AVDictiona
     st->discard  = AVDISCARD_ALL;
     ds->first_dts   = AV_NOPTS_VALUE;
     ds->next_dts    = AV_NOPTS_VALUE;
+    ds->last_raw_dts = AV_NOPTS_VALUE;
 
     ds->dec_opts.time_base = st->time_base;
 
@@ -2604,6 +4055,22 @@ int ifile_open(const OptionsContext *o, const char *filename, Scheduler *sch)
     }
     f->ctx = ic;
 
+    /* DISCONT-BUF owns 33-bit PTS-wrap handling on mpegts inputs via per-stream
+     * pts_wrap_correction (see discont_detect_jump). libavformat's mpegts demuxer
+     * has its own silent overflow correction (the "correct_ts_overflow" AVOption,
+     * default 1) which adjusts timestamps around the wrap boundary; with our
+     * DISCONT-BUF active, this double-adjusts and causes spurious timestamp
+     * discontinuities downstream. Force it off here so the user no longer needs
+     * to pass `-correct_ts_overflow 0` per input on the CLI. Only mpegts exposes
+     * this option, so the av_opt_set is a no-op on other demuxers. The setting
+     * must happen before avformat_find_stream_info() below, which pulls packets
+     * through libavformat's overflow-correction code path. */
+    if (ic->iformat && ic->iformat->name &&
+        !strcmp(ic->iformat->name, "mpegts")) {
+        av_opt_set_int(ic, "correct_ts_overflow", 0,
+                       AV_OPT_SEARCH_CHILDREN);
+    }
+
     av_strlcat(d->log_name, "/",               sizeof(d->log_name));
     av_strlcat(d->log_name, ic->iformat->name, sizeof(d->log_name));
     av_freep(&ic->name);
@@ -2783,6 +4250,17 @@ int ifile_open(const OptionsContext *o, const char *filename, Scheduler *sch)
                     return ret;
             }
         }
+    }
+
+    /* Initialize discontinuity buffer for handling interleaved packets */
+    d->discont_threshold = DISCONT_THRESHOLD_US;
+    d->discont_buffer_size = DISCONT_BUFFER_DEFAULT_SIZE;
+    d->discont_timeout_us = DISCONT_TIMEOUT_US;
+
+    ret = discont_buffer_init(&d->discont_buf, d->discont_buffer_size, f->nb_streams);
+    if (ret < 0) {
+        av_log(d, AV_LOG_ERROR, "Failed to initialize discontinuity buffer\n");
+        return ret;
     }
 
     return 0;
