@@ -269,6 +269,53 @@ typedef struct MpegTSWriteStream {
     DVBAC3Descriptor *dvb_ac3_desc;
 } MpegTSWriteStream;
 
+/* Write SCTE-35 section data as TS packets. The section passes through
+ * unchanged: the demuxer-side rebase (scte35_rebase_pts_adjustment in
+ * patch 0004) shifts pts_adjustment by f->ts_offset and the discontinuity
+ * buffer's applied_offset, so the wire effective_splice_time =
+ * (splice_time + pts_adjustment) mod 2^33 already lands on the muxer's
+ * output timeline. */
+static void mpegts_write_scte35_section(AVFormatContext *s, AVStream *st,
+                                        const uint8_t *buf, int len)
+{
+    MpegTSWriteStream *ts_st = st->priv_data;
+    MpegTSWrite *ts = s->priv_data;
+    uint8_t packet[TS_PACKET_SIZE];
+    uint8_t *q;
+    int first = 1;
+    int len1, left;
+
+    while (len > 0) {
+        q = packet;
+        *q++ = SYNC_BYTE;
+        *q++ = (ts_st->pid >> 8) | (first ? 0x40 : 0x00);
+        *q++ = ts_st->pid;
+        ts_st->cc = (ts_st->cc + 1) & 0xf;
+        *q++ = 0x10 | ts_st->cc;
+
+        if (first)
+            *q++ = 0; /* pointer_field: section starts immediately */
+
+        len1 = TS_PACKET_SIZE - (q - packet);
+        if (len1 > len)
+            len1 = len;
+        memcpy(q, buf, len1);
+        q += len1;
+
+        /* Pad with stuffing bytes */
+        left = TS_PACKET_SIZE - (q - packet);
+        if (left > 0)
+            memset(q, STUFFING_BYTE, left);
+
+        avio_write(s->pb, packet, TS_PACKET_SIZE);
+        ts->total_size += TS_PACKET_SIZE;
+
+        buf += len1;
+        len -= len1;
+        first = 0;
+    }
+}
+
 static void mpegts_write_pat(AVFormatContext *s)
 {
     MpegTSWrite *ts = s->priv_data;
@@ -444,6 +491,9 @@ static int get_dvb_stream_type(AVFormatContext *s, AVStream *st)
             stream_type = STREAM_TYPE_PRIVATE_DATA;
         }
         break;
+    case AV_CODEC_ID_SCTE_35:
+        stream_type = STREAM_TYPE_SCTE_DATA_SCTE_35;
+        break;
     default:
         av_log_once(s, AV_LOG_WARNING, AV_LOG_DEBUG, &ts_st->data_st_warning,
                     "Stream %d, codec %s, is muxed as a private data stream "
@@ -529,6 +579,15 @@ static int mpegts_write_pmt(AVFormatContext *s, MpegTSService *service)
         put16(&q, 0x0fff);  // CA_System_ID
         *q++ = 0xfc;        // private_data_byte
         *q++ = 0xfc;        // private_data_byte
+    }
+
+    /* Add CUEI registration descriptor if any stream is SCTE-35 */
+    for (i = 0; i < s->nb_streams; i++) {
+        AVStream *st = s->streams[i];
+        if (st->codecpar->codec_id == AV_CODEC_ID_SCTE_35) {
+            put_registration_descriptor(&q, MKTAG('C', 'U', 'E', 'I'));
+            break;
+        }
     }
 
     val = 0xf000 | (q - program_info_length_ptr - 2);
@@ -828,6 +887,13 @@ static int mpegts_write_pmt(AVFormatContext *s, MpegTSService *service)
                 putbuf(&q, tag, strlen(tag));
                 *q++ = 0;            /* metadata service ID */
                 *q++ = 0xF;          /* metadata_locator_record_flag|MPEG_carriage_flags|reserved */
+            } else if (codec_id == AV_CODEC_ID_SCTE_35) {
+                put_registration_descriptor(&q, MKTAG('C', 'U', 'E', 'I'));
+                /* Cue Identifier Descriptor (SCTE 35 §8.2) lets receivers
+                 * discover the SCTE-35 PID without scanning all PIDs. */
+                *q++ = 0x8a; /* descriptor_tag */
+                *q++ = 0x01; /* descriptor_length */
+                *q++ = 0x01; /* cue_stream_type: splice_insert / time_signal */
             }
             break;
         }
@@ -1886,6 +1952,15 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
     if (stream_id_p)
         stream_id = stream_id_p[0];
 
+    /* SCTE-35 must be written as section data, not PES.
+     * The splice_info_section data from the demuxer already has valid CRC
+     * and pts_adjustment rebased to our output timeline. */
+    if (st->codecpar->codec_id == AV_CODEC_ID_SCTE_35) {
+        if (size > 0)
+            mpegts_write_scte35_section(s, st, buf, size);
+        return 0;
+    }
+
     if (!ts->first_dts_checked && dts != AV_NOPTS_VALUE) {
         ts->first_pcr += dts * SYSTEM_CLOCK_FREQUENCY_DIVISOR;
         ts->first_dts_checked = 1;
@@ -2200,6 +2275,31 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
         mpegts_write_pes(s, st, buf, size, pts, dts,
                          pkt->flags & AV_PKT_FLAG_KEY, stream_id);
         return 0;
+    }
+
+    /* Flush aggregated audio if timestamp is irregular (discontinuity recovery).
+     * This prevents PES packets with computed frame timestamps that overlap the next PES. */
+    if (ts_st->payload_size && ts_st->payload_dts != AV_NOPTS_VALUE &&
+        dts != AV_NOPTS_VALUE && st->codecpar->sample_rate > 0 &&
+        st->codecpar->frame_size > 0) {
+        int64_t frame_dur = av_rescale(st->codecpar->frame_size, 90000,
+                                       st->codecpar->sample_rate);
+        int avg_frame_bytes = (st->codecpar->bit_rate > 0)
+            ? (int)av_rescale(st->codecpar->bit_rate, st->codecpar->frame_size,
+                              8LL * st->codecpar->sample_rate)
+            : 0;
+        int frame_count = (avg_frame_bytes > 0)
+            ? ts_st->payload_size / avg_frame_bytes : 1;
+        if (frame_count < 1) frame_count = 1;
+        int64_t expected_next_dts = ts_st->payload_dts + frame_count * frame_dur;
+        int64_t delta = dts - expected_next_dts;
+        if (FFABS(delta) > frame_dur / 4) {
+            mpegts_write_pes(s, st, ts_st->payload, ts_st->payload_size,
+                             ts_st->payload_pts, ts_st->payload_dts,
+                             ts_st->payload_flags & AV_PKT_FLAG_KEY, stream_id);
+            ts_st->payload_size = 0;
+            ts_st->opus_queued_samples = 0;
+        }
     }
 
     if (ts_st->payload_size && (ts_st->payload_size + size > ts->pes_payload_size ||
