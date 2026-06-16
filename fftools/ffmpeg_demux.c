@@ -1818,6 +1818,9 @@ static int input_thread(void *arg)
             goto finish;
     }
 
+    int64_t last_read_wc_video = d->wallclock_start;
+    int64_t last_read_wc_audio = d->wallclock_start;
+
     while (1) {
         DemuxStream *ds;
         unsigned send_flags = 0;
@@ -1841,6 +1844,39 @@ static int input_thread(void *arg)
             d->diag.eagain_count++;
             av_usleep(10000);
             continue;
+        }
+
+        if (ret >= 0) {
+            int stream_idx = dt.pkt_demux->stream_index;
+            enum AVMediaType mtype = f->ctx->streams[stream_idx]->codecpar->codec_type;
+            if (mtype == AVMEDIA_TYPE_VIDEO) {
+                int64_t now = av_gettime_relative();
+                int64_t gap_us = now - last_read_wc_video;
+                if (gap_us > 1000000) { /* >1s */
+                    av_log(d, AV_LOG_WARNING,
+                           "[INPUT-GAP] No video packets for %.3fs (stream %d)\n",
+                           gap_us / 1000000.0, stream_idx);
+                    /* Arm muxer PLL disturbance window for gaps >=5s. cfr fills
+                     * the gap with duplicates while real input is missing,
+                     * leaving the EMA polluted for ~gap_seconds wall clock
+                     * plus EMA settling time. 5s threshold avoids arming on
+                     * routine UDP jitter (1-3s gaps self-recover). */
+                    if (gap_us > 5000000)
+                        ifile_arm_pll_disturbance(f, 5 * 60 * 1000000LL);
+                }
+                last_read_wc_video = now;
+            } else if (mtype == AVMEDIA_TYPE_AUDIO) {
+                int64_t now = av_gettime_relative();
+                int64_t gap_us = now - last_read_wc_audio;
+                if (gap_us > 1000000) { /* >1s */
+                    av_log(d, AV_LOG_WARNING,
+                           "[INPUT-GAP] No audio packets for %.3fs (stream %d)\n",
+                           gap_us / 1000000.0, stream_idx);
+                    if (gap_us > 5000000)
+                        ifile_arm_pll_disturbance(f, 5 * 60 * 1000000LL);
+                }
+                last_read_wc_audio = now;
+            }
         }
         if (ret < 0) {
             int ret_bsf;
