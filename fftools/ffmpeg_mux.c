@@ -16,6 +16,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
@@ -241,7 +242,16 @@ static int write_packet(Muxer *mux, OutputStream *ost, AVPacket *pkt)
     if (ms->stats.io)
         enc_stats_write(ost, &ms->stats, NULL, pkt, frame_num);
 
-    ret = av_interleaved_write_frame(s, pkt);
+    {
+        int64_t before_write = av_gettime_relative();
+        ret = av_interleaved_write_frame(s, pkt);
+        int64_t write_dur = av_gettime_relative() - before_write;
+        if (write_dur > 1000000) { /* >1s */
+            av_log(ost, AV_LOG_WARNING,
+                   "[WRITE-STALL] av_interleaved_write_frame blocked for %.3fs\n",
+                   write_dur / 1000000.0);
+        }
+    }
     if (ret < 0) {
         av_log(ost, AV_LOG_ERROR,
                "Error submitting a packet to the muxer: %s\n",
@@ -420,12 +430,71 @@ int muxer_thread(void *arg)
     MuxThreadContext mt;
 
     int        ret = 0;
+    int64_t    last_write_wc_video = 0;
+    int64_t    last_write_wc_audio = 0;
+
+    /* DTS continuity tracking (first video stream) */
+    int64_t    last_video_dts = AV_NOPTS_VALUE;
+    int        last_video_dts_stream = -1;
+    AVRational last_video_dts_tb = {0, 1};
+
+    /* A/V sync tracking */
+    int64_t    last_audio_dts = AV_NOPTS_VALUE;
+    AVRational last_audio_dts_tb = {0, 1};
+    int64_t    last_avsync_log_wc = 0;
+
+    /* Input-referenced A/V sync PLL — closed-loop integral controller.
+     * Maintains a cumulative position offset that grows over time to counter
+     * drift from aresample async clock (~34ms/hr) and discontinuity vid_error
+     * residuals (~11ms/hr). Measures CORRECTED output for closed-loop feedback.
+     * History: Session 80 had closed-loop but adaptive baseline (absorbed drift).
+     * Session 83 had input-ref baseline but open-loop (corrections invisible).
+     * This combines input-ref baseline + closed-loop + cumulative offset. */
+#define PLL_WARMUP_SAMPLES   14100   /* ~5min at 47 audio pkt/s */
+#define PLL_RESET_THRESHOLD  5.0     /* seconds — genuine source change */
+#define PLL_AUDIO_PKT_RATE   47.0    /* 48kHz AAC @ 1024 samples/frame */
+#define PLL_GAIN_PERIOD      60.0    /* proportional gain: drift/60 per second */
+#define PLL_MAX_RATE         0.001   /* ±1ms/s max correction rate */
+#define PLL_HARD_CEILING_US  (60 * 60 * 1000000LL)  /* 60 min — force capture even if disturbance window stays open */
+#define PLL_STUCK_THRESHOLD  2.0     /* seconds — |baseline| above this = suspect stuck capture */
+#define PLL_STUCK_DRIFT_LIMIT 0.050  /* seconds — |drift| below this = converged (stuck condition) */
+
+    double     pll_error_ema = 0.0;         /* Smoothed error: (corrected_output - input) */
+    double     pll_error_baseline = 0.0;    /* Initial error (constant pipeline delay) */
+    int        pll_baseline_set = 0;        /* Whether baseline has been captured */
+    int64_t    pll_sample_count = 0;        /* Measurement samples collected */
+    double     pll_cumulative_offset = 0.0; /* Integral: total position correction (seconds) */
+    int64_t    pll_total_ticks = 0;         /* Current offset in ticks (diagnostic) */
+    int64_t    pll_last_log_wc = 0;         /* Wall-clock of last PLL log */
+    int        pll_enc_audio_idx = -1;      /* First encoded audio stream index */
+    int        pll_input_file_idx = (nb_input_files > 0) ? 0 : -1;
+    int64_t    pll_warmup_complete_wc = 0;  /* Wall-clock when warmup first completed (for hard ceiling) */
+    int64_t    pll_last_defer_log_wc = 0;   /* Throttle the "deferred" log to once/min */
+    int        pll_stuck_minutes = 0;       /* Consecutive minutes meeting stuck condition (Fix C) */
+    /* Last-seen total of jump_comp events across this input file's
+     * aresample filters; used to detect libswresample silence-injection
+     * events that would otherwise pollute the EMA. Updated by the
+     * per-audio-packet poll below; declared here so each output's
+     * muxer thread tracks its own seen-watermark independently. */
+    uint64_t   pll_swr_jump_comp_seen = 0;
+
+    /* Rate monitoring (10-second windows) */
+    int64_t    rate_monitor_start = 0;
+    int64_t    video_pkts_interval = 0;
+    int64_t    video_pkts_total = 0;
+    int64_t    max_gap_interval_us = 0;
+    int64_t    session_start_wc = 0;
 
     ret = mux_thread_init(&mt);
     if (ret < 0)
         goto finish;
 
     thread_set_name(mux);
+
+    last_write_wc_video = av_gettime_relative();
+    last_write_wc_audio = last_write_wc_video;
+    rate_monitor_start  = last_write_wc_video;
+    session_start_wc    = last_write_wc_video;
 
     while (1) {
         OutputStream *ost;
@@ -442,6 +511,315 @@ int muxer_thread(void *arg)
         ost = of->streams[mux->sch_stream_idx[stream_idx]];
         mt.pkt->stream_index = ost->index;
         mt.pkt->flags       &= ~AV_PKT_FLAG_TRUSTED;
+
+        if (ost->type == AVMEDIA_TYPE_VIDEO) {
+            int64_t now = av_gettime_relative();
+            int64_t gap_us = now - last_write_wc_video;
+
+            /* Wall-clock gap: >1s */
+            if (gap_us > 1000000) {
+                av_log(mux, AV_LOG_WARNING,
+                       "[OUTPUT-GAP] No video packets for %.3fs (stream %d)\n",
+                       gap_us / 1000000.0, ost->index);
+            }
+
+            /* Track max gap in this monitoring interval */
+            if (gap_us > max_gap_interval_us)
+                max_gap_interval_us = gap_us;
+
+            last_write_wc_video = now;
+
+            /* DTS continuity: check for timestamp gaps in output */
+            if (mt.pkt->dts != AV_NOPTS_VALUE) {
+                if (last_video_dts != AV_NOPTS_VALUE &&
+                    last_video_dts_stream == ost->index) {
+                    int64_t dts_gap_us = av_rescale_q(
+                        mt.pkt->dts - last_video_dts,
+                        mt.pkt->time_base, AV_TIME_BASE_Q);
+                    if (dts_gap_us > 1000000) { /* >1s */
+                        av_log(mux, AV_LOG_WARNING,
+                               "[OUTPUT-DTS-GAP] Video DTS gap: %.3fs "
+                               "(stream %d, prev_dts=%"PRId64" cur_dts=%"PRId64")\n",
+                               dts_gap_us / 1000000.0, ost->index,
+                               last_video_dts, mt.pkt->dts);
+                    }
+                }
+                last_video_dts = mt.pkt->dts;
+                last_video_dts_stream = ost->index;
+                last_video_dts_tb = mt.pkt->time_base;
+            }
+
+            video_pkts_interval++;
+            video_pkts_total++;
+        } else if (ost->type == AVMEDIA_TYPE_AUDIO) {
+            int64_t now = av_gettime_relative();
+            int64_t gap_us = now - last_write_wc_audio;
+            if (gap_us > 1000000) { /* >1s */
+                av_log(mux, AV_LOG_WARNING,
+                       "[OUTPUT-GAP] No audio packets for %.3fs (stream %d)\n",
+                       gap_us / 1000000.0, ost->index);
+            }
+            last_write_wc_audio = now;
+            /* DTS tracking: PLL stream updates AFTER correction (closed-loop);
+             * non-PLL audio streams update here immediately. */
+            if (mt.pkt->dts != AV_NOPTS_VALUE &&
+                !(ost->enc && ost->index == pll_enc_audio_idx)) {
+                last_audio_dts = mt.pkt->dts;
+                last_audio_dts_tb = mt.pkt->time_base;
+            }
+            if (pll_enc_audio_idx < 0 && ost->enc)
+                pll_enc_audio_idx = ost->index;
+        }
+
+        /* A/V sync monitor: log offset every 60 seconds */
+        if (last_video_dts != AV_NOPTS_VALUE && last_audio_dts != AV_NOPTS_VALUE) {
+            int64_t now = av_gettime_relative();
+            if (now - last_avsync_log_wc >= 60000000) { /* 60s */
+                double video_sec = last_video_dts * av_q2d(last_video_dts_tb);
+                double audio_sec = last_audio_dts * av_q2d(last_audio_dts_tb);
+                double offset_ms = (video_sec - audio_sec) * 1000.0;
+                double uptime = (now - session_start_wc) / 1000000.0;
+                double input_offset_ms = 0.0;
+                if (pll_input_file_idx >= 0 && pll_input_file_idx < nb_input_files)
+                    input_offset_ms = atomic_load(&input_files[pll_input_file_idx]->input_av_offset_us) / 1000.0;
+                av_log(mux, AV_LOG_INFO,
+                       "[AV-SYNC] video_dts=%.3fs audio_dts=%.3fs offset=%.3fms "
+                       "input_offset=%.3fms uptime=%.0fs\n",
+                       video_sec, audio_sec, offset_ms, input_offset_ms, uptime);
+                last_avsync_log_wc = now;
+            }
+        }
+
+        /* Rate monitor: log stats every 10 seconds, only if anomalous */
+        {
+            int64_t now = av_gettime_relative();
+            int64_t interval_elapsed = now - rate_monitor_start;
+            if (interval_elapsed >= 10000000) { /* 10s */
+                if (max_gap_interval_us > 1000000) { /* only log if max gap >1s */
+                    double elapsed_total = (now - session_start_wc) / 1000000.0;
+                    av_log(mux, AV_LOG_INFO,
+                           "[OUTPUT-RATE] 10s: vid_pkts=%"PRId64" max_gap=%.3fs "
+                           "total_pkts=%"PRId64" uptime=%.0fs\n",
+                           video_pkts_interval,
+                           max_gap_interval_us / 1000000.0,
+                           video_pkts_total, elapsed_total);
+                }
+                video_pkts_interval = 0;
+                max_gap_interval_us = 0;
+                rate_monitor_start = now;
+            }
+        }
+
+        /* A/V sync PLL — closed-loop integral controller.
+         * Measures ABSOLUTE corrected output A/V offset (video_dts - audio_dts).
+         * No input reference: the input-referenced design (Sessions 83-89) cancelled
+         * the 19ppm aresample drift because both input and output share the source
+         * clock — the PLL saw no drift to correct. Absolute measurement detects
+         * the real drift between CFR video and source-clocked audio directly.
+         * Discontinuity vid_error steps are absorbed by the EMA (τ=60s).
+         * Closed-loop: cumulative_offset feeds back into measurement → convergence.
+         * Only primary (first encoded) audio stream is measured and corrected. */
+        if (ost->type == AVMEDIA_TYPE_AUDIO && ost->enc &&
+            ost->index == pll_enc_audio_idx &&
+            mt.pkt->dts != AV_NOPTS_VALUE &&
+            last_video_dts != AV_NOPTS_VALUE) {
+
+            /* Step 1: Measure CORRECTED output A/V offset (closed-loop).
+             * Include pll_cumulative_offset so the PLL sees the effect of
+             * its own corrections. This creates negative feedback → convergence. */
+            double video_sec = last_video_dts * av_q2d(last_video_dts_tb);
+            double raw_audio_sec = mt.pkt->dts * av_q2d(mt.pkt->time_base);
+            double corrected_audio_sec = raw_audio_sec + pll_cumulative_offset;
+            double output_offset = video_sec - corrected_audio_sec;
+
+            /* Step 2: Error = absolute corrected offset.
+             * No input subtraction — input-referenced design cancelled the drift
+             * we need to correct (both sides share source clock). */
+            double error = output_offset;
+
+            /* Step 2a: detect libswresample jump_comp silence-injection events.
+             *
+             * libswresample increments an atomic counter (in patch 0008) on
+             * every successful hard correction inside swr_next_pts() — i.e.
+             * whenever |delta| > min_hard_compensation triggers silence
+             * injection or sample drop. The counter is summed across all
+             * aresample filters belonging to this input file by
+             * input_file_jump_comp_total() (also patch 0008).
+             *
+             * When the count advances since our last poll, libswresample has
+             * just permanently shifted audio_dts by the injected/dropped
+             * duration. We arm the existing PLL disturbance window (5 min)
+             * and re-warmup the local PLL state so the EMA does not lock
+             * onto the polluted post-injection error. cumul is preserved
+             * (bumpless transfer) so output PTS does not jump.
+             *
+             * This is the cleaner replacement for the reverted Fix F (Session
+             * 99/102) per-packet error-diff detector, which false-positived
+             * on natural cadence noise (58.667ms / 98.667ms peaks). The
+             * jump_comp counter is structurally false-positive-free: it only
+             * advances when libswresample actually injected silence. */
+            if (pll_input_file_idx >= 0 && pll_input_file_idx < nb_input_files) {
+                uint64_t total = input_file_jump_comp_total(input_files[pll_input_file_idx]);
+                if (total > pll_swr_jump_comp_seen) {
+                    uint64_t advanced = total - pll_swr_jump_comp_seen;
+                    pll_swr_jump_comp_seen = total;
+                    if (pll_baseline_set) {
+                        av_log(mux, AV_LOG_INFO,
+                               "[AV-SYNC-PLL] swr jump_comp event observed "
+                               "(total=%"PRIu64", +%"PRIu64") — re-warmup, arm disturbance\n",
+                               total, advanced);
+                        pll_sample_count       = 0;
+                        pll_baseline_set       = 0;
+                        pll_error_ema          = error;
+                        pll_warmup_complete_wc = 0;
+                        pll_last_defer_log_wc  = 0;
+                        pll_stuck_minutes      = 0;
+                        /* pll_cumulative_offset preserved — bumpless. */
+                    }
+                    /* Always arm/extend the disturbance window. Pre-baseline
+                     * captures stay deferred; post-baseline captures (above)
+                     * just re-warmed and need the window for their next pass. */
+                    ifile_arm_pll_disturbance(input_files[pll_input_file_idx],
+                                              5 * 60 * 1000000LL);
+                }
+            }
+
+            /* EMA smooth the error (τ=60s at ~47 audio packets/sec) */
+            double alpha = 1.0 - exp(-1.0 / (PLL_AUDIO_PKT_RATE * PLL_GAIN_PERIOD));
+            if (pll_sample_count == 0) {
+                pll_error_ema = error;
+            } else {
+                pll_error_ema += alpha * (error - pll_error_ema);
+            }
+            pll_sample_count++;
+
+            /* Capture baseline after warmup guard, BUT only if we are outside
+             * the disturbance window (set by demuxer DISCONT-BUF, INPUT-GAP,
+             * and process startup). The window protects the EMA from being
+             * captured while it is still polluted by transient swr silence
+             * injection or vid_error fallout. Production data showed that
+             * captures landing inside disturbance windows produced multi-
+             * second stuck baselines (e.g., PATRIOT-TVI -3690ms, -4017ms).
+             *
+             * Hard ceiling: if a source is so continuously disturbed that
+             * the window never expires, capture anyway after PLL_HARD_CEILING_US
+             * (60 min) past warmup completion — better an imperfect baseline
+             * than no PLL at all. The captured value will still likely be
+             * better than today since the EMA has had longer to settle. */
+            if (!pll_baseline_set && pll_sample_count >= PLL_WARMUP_SAMPLES) {
+                int64_t now_wc = av_gettime_relative();
+                if (pll_warmup_complete_wc == 0)
+                    pll_warmup_complete_wc = now_wc;
+
+                int64_t arm_until = (pll_input_file_idx >= 0 && pll_input_file_idx < nb_input_files)
+                    ? atomic_load(&input_files[pll_input_file_idx]->pll_disturbance_until_us)
+                    : 0;
+
+                int forced_by_ceiling =
+                    (now_wc - pll_warmup_complete_wc) > PLL_HARD_CEILING_US;
+                int window_clear = (now_wc > arm_until);
+
+                if (window_clear || forced_by_ceiling) {
+                    pll_error_baseline = pll_error_ema;
+                    pll_baseline_set = 1;
+                    av_log(mux, AV_LOG_INFO,
+                           "[AV-SYNC-PLL] baseline captured: %.3fms "
+                           "(output=%.3fms cumul=%.3fms%s)\n",
+                           pll_error_baseline * 1000.0,
+                           output_offset * 1000.0,
+                           pll_cumulative_offset * 1000.0,
+                           forced_by_ceiling ? " HARD_CEILING" : "");
+                } else if (now_wc - pll_last_defer_log_wc >= 60000000) {
+                    int64_t remaining_s = (arm_until - now_wc) / 1000000;
+                    av_log(mux, AV_LOG_INFO,
+                           "[AV-SYNC-PLL] baseline deferred (%"PRId64"s left in disturbance window)\n",
+                           remaining_s);
+                    pll_last_defer_log_wc = now_wc;
+                }
+            }
+
+            /* Reset on large step — genuine source change.
+             * Do NOT reset pll_cumulative_offset: it represents real corrections
+             * already applied. Resetting would cause a DTS discontinuity.
+             * The new baseline will capture the current corrected state.
+             *
+             * Re-arm the warmup-completion clock and the deferred-log throttle
+             * so the hard-ceiling check applies relative to the NEW warmup,
+             * not the original one — without this, a reset later in the run
+             * leaves pll_warmup_complete_wc stuck at the first warmup time,
+             * which makes (now - pll_warmup_complete_wc) > 60min trivially
+             * true and bypasses the disturbance window on every reset. */
+            if (pll_baseline_set && fabs(error - pll_error_ema) > PLL_RESET_THRESHOLD) {
+                av_log(mux, AV_LOG_INFO,
+                       "[AV-SYNC-PLL] reset: step=%.3fs cumul=%.3fms\n",
+                       error - pll_error_ema,
+                       pll_cumulative_offset * 1000.0);
+                pll_sample_count = 0;
+                pll_baseline_set = 0;
+                pll_error_ema = error;
+                pll_warmup_complete_wc = 0;
+                pll_last_defer_log_wc  = 0;
+                pll_stuck_minutes      = 0;
+            }
+
+            /* Step 4: Integrate correction into cumulative offset */
+            if (pll_baseline_set) {
+                double drift = pll_error_ema - pll_error_baseline;
+
+                /* Proportional gain: correction_rate = drift/60 per second.
+                 * Clamp to ±1ms/s to prevent audible artifacts.
+                 * Integrate: cumulative_offset grows by correction_rate * dt.
+                 * This is the key fix: the offset GROWS over time, creating
+                 * meaningful position correction (unlike the old drain-accumulator
+                 * which created negligible ~0.022ms per-packet shifts). */
+                double correction_rate = drift / PLL_GAIN_PERIOD;
+                if (correction_rate >  PLL_MAX_RATE) correction_rate =  PLL_MAX_RATE;
+                if (correction_rate < -PLL_MAX_RATE) correction_rate = -PLL_MAX_RATE;
+
+                pll_cumulative_offset += correction_rate / PLL_AUDIO_PKT_RATE;
+            }
+
+            /* Step 5: Apply FULL cumulative offset to packet.
+             * Each packet gets the entire accumulated correction because the
+             * encoder produces raw DTS with no memory of prior corrections. */
+            {
+                double tick_size = av_q2d(mt.pkt->time_base);
+                int64_t ticks = llrint(pll_cumulative_offset / tick_size);
+
+                if (ticks != 0) {
+                    mt.pkt->dts += ticks;
+                    if (mt.pkt->pts != AV_NOPTS_VALUE)
+                        mt.pkt->pts += ticks;
+                }
+                pll_total_ticks = ticks;
+            }
+
+            /* Update last_audio_dts with CORRECTED DTS (closed-loop feedback).
+             * The [AV-SYNC] diagnostic log will now show corrected output. */
+            last_audio_dts = mt.pkt->dts;
+            last_audio_dts_tb = mt.pkt->time_base;
+
+            /* PLL log every 60 seconds */
+            {
+                int64_t now = av_gettime_relative();
+                if (now - pll_last_log_wc >= 60000000) {
+                    double drift = pll_baseline_set ?
+                                   (pll_error_ema - pll_error_baseline) : 0.0;
+                    av_log(mux, AV_LOG_INFO,
+                           "[AV-SYNC-PLL] error=%.3fms baseline=%.3fms "
+                           "drift=%.3fms cumul=%.3fms input=%.3fms ticks=%"PRId64"\n",
+                           pll_error_ema * 1000.0,
+                           pll_baseline_set ? pll_error_baseline * 1000.0 : 0.0,
+                           drift * 1000.0,
+                           pll_cumulative_offset * 1000.0,
+                           (pll_input_file_idx >= 0 && pll_input_file_idx < nb_input_files ?
+                            atomic_load(&input_files[pll_input_file_idx]->input_av_offset_us) / 1000.0 :
+                            0.0),
+                           pll_total_ticks);
+                    pll_last_log_wc = now;
+                }
+            }
+        }
 
         ret = mux_packet_filter(mux, &mt, ost, ret < 0 ? NULL : mt.pkt, &stream_eof);
         av_packet_unref(mt.pkt);

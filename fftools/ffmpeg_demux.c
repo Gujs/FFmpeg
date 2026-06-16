@@ -254,6 +254,13 @@ typedef struct Demuxer {
         int     aud_pkts_sent;     /* Audio packets sent to decoder */
         int     eagain_count;      /* EAGAIN returns from av_read_frame */
     } diag;
+
+    /* Input A/V offset tracking (for muxer PLL reference) */
+    int64_t               input_last_video_dts;  /* Last video DTS (AV_TIME_BASE units) */
+    int64_t               input_last_audio_dts;  /* Last audio DTS (AV_TIME_BASE units) */
+    int                   input_audio_stream_idx; /* Locked to first audio stream (-1 = unset) */
+    double                input_av_offset_ema;   /* Smoothed offset (seconds), EMA τ=60s */
+    int64_t               input_av_offset_samples; /* Sample count for EMA init */
 } Demuxer;
 
 typedef struct DemuxThreadContext {
@@ -1560,6 +1567,42 @@ static int input_packet_process(Demuxer *d, AVPacket *pkt, unsigned *send_flags)
                av_ts2str(pkt->dts), av_ts2timestr(pkt->dts, &pkt->time_base),
                av_ts2str(pkt->duration), av_ts2timestr(pkt->duration, &pkt->time_base),
                av_ts2str(f->ts_offset),  av_ts2timestr(f->ts_offset, &AV_TIME_BASE_Q));
+    }
+
+    /* Track input A/V DTS offset for muxer PLL reference.
+     * Measured AFTER ts_fixup (rebased DTS in AV_TIME_BASE units).
+     * Uses ds->dts which is set by ist_dts_update() inside ts_fixup().
+     * Only first audio stream is tracked to avoid DTS bouncing with
+     * multi-audio input (e.g., stereo + AC3 copy). */
+    if (ist->par->codec_type == AVMEDIA_TYPE_VIDEO) {
+        d->input_last_video_dts = ds->dts;
+    } else if (ist->par->codec_type == AVMEDIA_TYPE_AUDIO) {
+        if (d->input_audio_stream_idx < 0)
+            d->input_audio_stream_idx = ist->index;
+        if (ist->index == d->input_audio_stream_idx)
+            d->input_last_audio_dts = ds->dts;
+    }
+
+    if (d->input_last_video_dts != AV_NOPTS_VALUE &&
+        d->input_last_audio_dts != AV_NOPTS_VALUE) {
+        double offset = (d->input_last_video_dts - d->input_last_audio_dts)
+                        / (double)AV_TIME_BASE;
+
+        /* EMA smoothing: τ=60s at ~75 packets/sec (vid+aud combined).
+         * Longer τ reduces MPEG-TS interleaving noise (~6x vs τ=10s).
+         * Post-discontinuity convergence: ~3min (3τ), acceptable since
+         * discontinuities don't reset the muxer PLL baseline. */
+        double alpha = 1.0 / (75.0 * 60.0);
+        if (d->input_av_offset_samples == 0) {
+            d->input_av_offset_ema = offset;
+        } else {
+            d->input_av_offset_ema += alpha * (offset - d->input_av_offset_ema);
+        }
+        d->input_av_offset_samples++;
+
+        /* Publish to InputFile for muxer thread (microseconds) */
+        atomic_store(&f->input_av_offset_us,
+                     (int64_t)(d->input_av_offset_ema * 1000000.0));
     }
 
     return 0;
@@ -3937,7 +3980,30 @@ static Demuxer *demux_alloc(void)
 
     snprintf(d->log_name, sizeof(d->log_name), "in#%d", d->f.index);
 
+    d->input_last_video_dts     = AV_NOPTS_VALUE;
+    d->input_last_audio_dts     = AV_NOPTS_VALUE;
+    d->input_audio_stream_idx   = -1;
+    d->input_av_offset_ema      = 0.0;
+    d->input_av_offset_samples  = 0;
+
+    /* Arm the PLL disturbance window for the first 5 minutes of process
+     * lifetime. Most of the catastrophically-bad baseline captures observed
+     * in production come from initial-startup chaos (PTS wrap, decoder
+     * warmup, codec parameter discovery). The 5-min initial arm covers that
+     * window; subsequent arms come from demuxer-side disturbance signals.
+     * Sub-perceptible cost: ≤6 ms of uncorrected drift on every channel
+     * during the deferred window (19 ppm × 5 min). */
+    ifile_arm_pll_disturbance(&d->f, 5 * 60 * 1000000LL);
+
     return d;
+}
+
+void ifile_arm_pll_disturbance(InputFile *f, int64_t duration_us)
+{
+    int64_t until = av_gettime_relative() + duration_us;
+    int64_t cur   = atomic_load(&f->pll_disturbance_until_us);
+    if (until > cur)
+        atomic_store(&f->pll_disturbance_until_us, until);
 }
 
 int ifile_open(const OptionsContext *o, const char *filename, Scheduler *sch)
