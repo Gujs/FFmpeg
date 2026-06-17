@@ -2253,6 +2253,7 @@ PROGRAM_LIST="
     ffplay
     ffprobe
     ffmpeg
+    ptvencoder
 "
 
 SUBSYSTEM_LIST="
@@ -4399,6 +4400,8 @@ ffplay_select="crop_filter transpose_filter hflip_filter vflip_filter rotate_fil
 ffplay_suggest="shell32 libplacebo vulkan"
 ffprobe_deps="avcodec avformat"
 ffprobe_suggest="shell32"
+ptvencoder_deps="avcodec avfilter avformat swscale swresample threads"
+ptvencoder_select="aformat_filter anull_filter format_filter null_filter scale_filter"
 
 # documentation
 podpages_deps="perl"
