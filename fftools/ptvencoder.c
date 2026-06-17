@@ -50,6 +50,7 @@ void show_help_default(const char *opt, const char *arg)
         "    -i <url>      input (file or udp://...)\n"
         "    -c:v <name>   video encoder (default: h264_videotoolbox, fallback mpeg2video)\n"
         "    -r <rate>     output frame rate / house-clock rate (e.g. 25, 30000/1001); default = source\n"
+        "    -f <mux>      output format (default: guessed from output; mpegts for udp://...)\n"
         "    -an           disable audio\n"
         "    --mode live|offline   live = wall-clock paced; offline = media-clock. default: auto from input\n"
         "    -version, -h\n"
@@ -275,7 +276,7 @@ static int audio_flush(AudioState *a)
     return encode_write(a->ofmt, a->enc, a->ost, NULL, a->pkt);  /* flush encoder */
 }
 
-static int transcode(const char *in_url, const char *out_url,
+static int transcode(const char *in_url, const char *out_url, const char *out_fmt,
                      const char *venc_name, const char *rate_str, int mode, int want_audio)
 {
     AVFormatContext *ifmt = NULL, *ofmt = NULL;
@@ -312,8 +313,13 @@ static int transcode(const char *in_url, const char *out_url,
         av_log(NULL, AV_LOG_ERROR, "open video decoder: %s\n", av_err2str(ret)); goto end;
     }
 
-    if ((ret = avformat_alloc_output_context2(&ofmt, NULL, NULL, out_url)) < 0) {
-        av_log(NULL, AV_LOG_ERROR, "output ctx: %s\n", av_err2str(ret)); goto end;
+    ret = avformat_alloc_output_context2(&ofmt, NULL, out_fmt, out_url);
+    if (ret < 0 && !out_fmt)   /* protocol URLs (udp://, srt://) have no extension to guess from */
+        ret = avformat_alloc_output_context2(&ofmt, NULL, "mpegts", out_url);
+    if (ret < 0) {
+        av_log(NULL, AV_LOG_ERROR, "cannot create output context for '%s': %s (try -f mpegts)\n",
+               out_url, av_err2str(ret));
+        goto end;
     }
 
     /* video encoder */
@@ -481,7 +487,7 @@ end:
 
 int main(int argc, char **argv)
 {
-    const char *in_url = NULL, *out_url = NULL, *rate = NULL;
+    const char *in_url = NULL, *out_url = NULL, *rate = NULL, *out_fmt = NULL;
     const char *venc = "h264_videotoolbox";
     int mode = -1, want_audio = 1, i;
 
@@ -506,6 +512,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "-i") && i + 1 < argc)        in_url = argv[++i];
         else if (!strcmp(argv[i], "-c:v") && i + 1 < argc) venc   = argv[++i];
         else if (!strcmp(argv[i], "-r") && i + 1 < argc)   rate   = argv[++i];
+        else if (!strcmp(argv[i], "-f") && i + 1 < argc)   out_fmt = argv[++i];
         else if (!strcmp(argv[i], "-an"))                  want_audio = 0;
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
             const char *m = argv[++i];
@@ -518,5 +525,5 @@ int main(int argc, char **argv)
     }
 
     if (!in_url || !out_url) { show_help_default(NULL, NULL); return 1; }
-    return transcode(in_url, out_url, venc, rate, mode, want_audio) < 0 ? 1 : 0;
+    return transcode(in_url, out_url, out_fmt, venc, rate, mode, want_audio) < 0 ? 1 : 0;
 }
