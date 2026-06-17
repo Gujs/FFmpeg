@@ -37,6 +37,10 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
+/* 33-bit MPEG-TS PTS cycle in microseconds, and the discontinuity threshold. */
+#define PTV_WRAP_US (((int64_t)1 << 33) * 1000000 / 90000)   /* ~95443.7 s */
+#define PTV_JUMP_US (2 * (int64_t)AV_TIME_BASE)              /* 2 s */
+
 void show_help_default(const char *opt, const char *arg)
 {
     av_log(NULL, AV_LOG_INFO,
@@ -86,7 +90,14 @@ typedef struct ClockState {
     int64_t          tick_dur_us;
     int              live;
     AVPacket        *pkt;
-    int64_t         *h0;           /* shared input anchor (us) */
+    int64_t         *h0;           /* shared input anchor (us), common-mode A/V init */
+
+    /* mapping Mᵢ: house_us = house_base + (src_us - va); re-anchored on wrap/jump/gap */
+    int              anchored;
+    int64_t          va;           /* source time mapped to house_base */
+    int64_t          house_base;   /* house time at va */
+    int64_t          last_src_us;  /* previous frame source time (discontinuity detect) */
+    int64_t          reanchor;
 
     int64_t          wall0_us;
     int64_t          next_tick;
@@ -129,9 +140,25 @@ static int clock_push(ClockState *c, AVFrame *frame)
     if (ts != AV_NOPTS_VALUE) {
         int64_t src_us = av_rescale_q(ts, c->ist_tb, AV_TIME_BASE_Q);
         if (*c->h0 == AV_NOPTS_VALUE)
-            *c->h0 = src_us;
-        house_us = src_us - *c->h0;
-        if (house_us < c->next_tick * c->tick_dur_us)   /* backwards guard (re-anchor = next increment) */
+            *c->h0 = src_us;                 /* shared input anchor (common-mode A/V) */
+        if (!c->anchored) {
+            c->va = *c->h0; c->house_base = 0; c->last_src_us = src_us; c->anchored = 1;
+        } else {
+            int64_t delta = src_us - c->last_src_us;
+            int64_t ad    = FFABS(delta);
+            int wrap = FFABS(ad - PTV_WRAP_US) < 2 * (int64_t)AV_TIME_BASE;  /* 33-bit wrap */
+            int jump = !wrap && ad > PTV_JUMP_US;                            /* discontinuity / gap */
+            if (wrap || jump) {
+                /* re-anchor: this frame continues at the current house position,
+                 * so wrap/jump/gap never reaches the output (M4). */
+                c->house_base = c->next_tick * c->tick_dur_us;
+                c->va = src_us;
+                c->reanchor++;
+            }
+            c->last_src_us = src_us;
+        }
+        house_us = c->house_base + (src_us - c->va);
+        if (house_us < c->next_tick * c->tick_dur_us)   /* small-backwards jitter guard */
             house_us = c->next_tick * c->tick_dur_us;
     } else {
         house_us = c->next_tick * c->tick_dur_us;
@@ -427,8 +454,8 @@ static int transcode(const char *in_url, const char *out_url,
 
     av_write_trailer(ofmt);
     av_log(NULL, AV_LOG_INFO,
-        "ptvencoder: done — video in %"PRId64" out %"PRId64" (dup %"PRId64" drop %"PRId64")%s\n",
-        cs.in_frames, cs.emitted, cs.dup, cs.drop,
+        "ptvencoder: done — video in %"PRId64" out %"PRId64" (dup %"PRId64" drop %"PRId64" re-anchor %"PRId64")%s\n",
+        cs.in_frames, cs.emitted, cs.dup, cs.drop, cs.reanchor,
         have_audio ? "" : "  [no audio]");
     if (have_audio)
         av_log(NULL, AV_LOG_INFO, "ptvencoder: audio in %"PRId64" frames, out %"PRId64" aac frames\n",
