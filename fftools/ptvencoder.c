@@ -5,20 +5,37 @@
  * same patched libav* libraries but runs on its own house-clock timing engine.
  * See analysis/ptvencoder-functional-spec.md.
  *
- * Phase 1, increment 3: video house-clock + audio (A/V common-mode anchor).
- *   demux -> {video: decode -> house-clock frame-sync -> encode}
- *         -> {audio: decode -> resample-to-48k -> AAC} -> mux.
+ * Phase 1, increment 5: pull-based multi-stage pipeline (the professional model).
  *
- * Both video and audio map their source PTS onto one shared input anchor (h0),
- * so the source A/V offset (lip sync) is preserved while the absolute timeline
- * becomes the house clock. Video drives wall-clock pacing in live mode; audio
- * rides the same single-threaded loop.
+ *   demux ─video_q─▶ decode (free-run) ─frame_q─▶ output(master clock, sample
+ *         ─audio_q─▶ audio (decode▶resample▶AAC) ──────────────────┐  & hold)
+ *                                                          mux_q ◀──┴──▶ mux
+ *
+ *  - A free-running output clock is the master: a wall-paced timer in the output
+ *    thread emits at the house rate no matter what upstream does.
+ *  - The frame synchronizer is sample-and-hold: decode runs free in its own
+ *    thread and keeps the latest decoded frame current (frame_q, drop-oldest);
+ *    each output tick samples it — repeat if decode is behind, drop intermediate
+ *    frames if it is ahead. Source PTS is advisory; video output PTS is the tick
+ *    counter, so source wrap/jump/gap is invisible to the output (no re-anchor
+ *    needed — the pull model dissolves it).
+ *  - The encoder is downstream and never allowed to block the clock from
+ *    draining input: if it stalls (e.g. NVENC blocking the caller under GPU
+ *    load — the failure this design exists to survive), decode keeps running,
+ *    the demuxer keeps draining the socket (dropping on a full queue), and a
+ *    watchdog flags the stall. (Auto-reinit of a hung in-process session is a
+ *    follow-up; this build contains + detects.)
+ *  - The mux is clock-locked and keeps emitting (dup-fill) so the TS never stops.
+ *
+ * Video and audio map onto one shared input anchor (h0) for A/V start offset.
  *
  * This file is licensed under the same terms as FFmpeg (GPL, --enable-gpl).
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 #include "libavutil/avutil.h"
 #include "libavutil/log.h"
@@ -28,6 +45,7 @@
 #include "libavutil/samplefmt.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/audio_fifo.h"
+#include "libavutil/threadmessage.h"
 #include "libavformat/avformat.h"
 #include "libavcodec/avcodec.h"
 #include "libswresample/swresample.h"
@@ -37,9 +55,17 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-/* 33-bit MPEG-TS PTS cycle in microseconds, and the discontinuity threshold. */
-#define PTV_WRAP_US (((int64_t)1 << 33) * 1000000 / 90000)   /* ~95443.7 s */
-#define PTV_JUMP_US (2 * (int64_t)AV_TIME_BASE)              /* 2 s */
+#define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
+#define PTV_FRAME_QDEPTH 6     /* decode->output jitter buffer (frames) */
+#define PTV_WD_DEADLINE_US (2 * (int64_t)AV_TIME_BASE)   /* watchdog stall threshold */
+
+/* Diagnostics (env PTV_DIAG=1): per-second stage counters + slow-call
+ * breadcrumbs to localize a stall. Temporary, gated, low-overhead (Rule 0). */
+static int     g_diag;
+static int64_t g_muxed;
+/* PTV_SLOW_US: inject N us of extra per-emitted-frame consumer cost, to model a
+ * slow/blocking encoder on a box that has none. Stress knob, gated. */
+static int     g_slow;
 
 void show_help_default(const char *opt, const char *arg)
 {
@@ -55,140 +81,253 @@ void show_help_default(const char *opt, const char *arg)
         "    --mode live|offline   live = wall-clock paced; offline = media-clock. default: auto from input\n"
         "    -version, -h\n"
         "\n"
-        "  Phase 1 increment 3: video house clock + AAC audio (A/V common-mode anchor).\n");
+        "  Phase 1 increment 5: pull-based pipeline (demux/decode/output/audio/mux).\n");
 }
 
-/* Drain an encoder, writing packets to the muxer. frame=NULL flushes. */
-static int encode_write(AVFormatContext *ofmt, AVCodecContext *enc,
-                        AVStream *ost, AVFrame *frame, AVPacket *pkt)
+/* Free function for AVThreadMessageQueue elements (AVPacket* / AVFrame*; a NULL
+ * element is an end-of-stream marker on mux_q). */
+static void free_pkt_msg(void *msg)   { av_packet_free(msg); }
+static void free_frame_msg(void *msg) { av_frame_free(msg); }
+
+/* Drain an encoder, pushing packets to the mux queue. frame=NULL flushes. */
+static int encode_push(AVThreadMessageQueue *mux_q, AVCodecContext *enc,
+                       AVStream *ost, AVFrame *frame)
 {
     int ret = avcodec_send_frame(enc, frame);
     if (ret < 0)
         return ret;
-    while (ret >= 0) {
+    for (;;) {
+        AVPacket *pkt = av_packet_alloc();
+        if (!pkt)
+            return AVERROR(ENOMEM);
         ret = avcodec_receive_packet(enc, pkt);
-        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+            av_packet_free(&pkt);
             return 0;
-        if (ret < 0)
+        }
+        if (ret < 0) {
+            av_packet_free(&pkt);
             return ret;
+        }
         av_packet_rescale_ts(pkt, enc->time_base, ost->time_base);
         pkt->stream_index = ost->index;
-        ret = av_interleaved_write_frame(ofmt, pkt);
-        av_packet_unref(pkt);
-        if (ret < 0)
-            return ret;
+        ret = av_thread_message_queue_send(mux_q, &pkt, 0);   /* blocking */
+        if (ret < 0) {
+            av_packet_free(&pkt);
+            return ret;                                       /* mux gone */
+        }
     }
-    return 0;
 }
 
-/* ---- video house clock ---- */
+/* ---- video: decode (free-run) + output (master clock, sample-and-hold) ---- */
 
-typedef struct ClockState {
-    AVFormatContext *ofmt;
-    AVCodecContext  *enc;
-    AVStream        *ost;
+typedef struct VideoCtx {
+    /* queues */
+    AVThreadMessageQueue *video_q;   /* demux  -> decode  (AVPacket*) */
+    AVThreadMessageQueue *frame_q;   /* decode -> output  (AVFrame*)  */
+    AVThreadMessageQueue *mux_q;     /* output -> mux     (AVPacket*) */
+    /* decode side */
+    AVCodecContext  *vdec;
     AVRational       ist_tb;
+    int64_t         *h0;             /* shared A/V input anchor (us) */
+    pthread_mutex_t *h0_lock;
+    /* output side */
+    AVCodecContext  *venc;
+    AVStream        *ost;
     int64_t          tick_dur_us;
     int              live;
-    AVPacket        *pkt;
-    int64_t         *h0;           /* shared input anchor (us), common-mode A/V init */
+    /* counters */
+    int64_t          dec_frames, vcorrupt, framedrop, emitted, dup;
+    /* watchdog */
+    int64_t          last_emit_us;
+    volatile int     output_done;
+    int              stalled;
+} VideoCtx;
 
-    /* mapping Mᵢ: house_us = house_base + (src_us - va); re-anchored on wrap/jump/gap */
-    int              anchored;
-    int64_t          va;           /* source time mapped to house_base */
-    int64_t          house_base;   /* house time at va */
-    int64_t          last_src_us;  /* previous frame source time (discontinuity detect) */
-    int64_t          reanchor;
-
-    int64_t          wall0_us;
-    int64_t          next_tick;
-    AVFrame         *held;
-    int              have_held;
-    int              held_emits;
-    int64_t          dup, drop, emitted, in_frames;
-} ClockState;
-
-static int emit_tick(ClockState *c)
+/* decode thread: pull packets, decode, hand the latest frame to the output via
+ * frame_q (drop-oldest in live so a stalled encoder never blocks decode). */
+static void push_frame(VideoCtx *v, AVFrame *out)
 {
-    int ret;
-    if (c->live) {
-        int64_t now, target;
-        if (c->emitted == 0)
-            c->wall0_us = av_gettime_relative();
-        target = c->wall0_us + c->next_tick * c->tick_dur_us;
-        now = av_gettime_relative();
-        if (now < target)
-            av_usleep((unsigned)(target - now));
+    if (!v->live) {                                  /* offline: lossless back-pressure */
+        if (av_thread_message_queue_send(v->frame_q, &out, 0) < 0)
+            av_frame_free(&out);
+        return;
     }
-    c->held->pts      = c->next_tick;
-    c->held->pkt_dts  = AV_NOPTS_VALUE;
-    c->held->duration = 0;
-    ret = encode_write(c->ofmt, c->enc, c->ost, c->held, c->pkt);
-    c->next_tick++;
-    c->emitted++;
-    if (++c->held_emits > 1)
-        c->dup++;
-    return ret;
-}
-
-static int clock_push(ClockState *c, AVFrame *frame)
-{
-    int ret = 0;
-    int64_t ts = frame->best_effort_timestamp;
-    int64_t house_us;
-
-    c->in_frames++;
-    if (ts != AV_NOPTS_VALUE) {
-        int64_t src_us = av_rescale_q(ts, c->ist_tb, AV_TIME_BASE_Q);
-        if (*c->h0 == AV_NOPTS_VALUE)
-            *c->h0 = src_us;                 /* shared input anchor (common-mode A/V) */
-        if (!c->anchored) {
-            c->va = *c->h0; c->house_base = 0; c->last_src_us = src_us; c->anchored = 1;
-        } else {
-            int64_t delta = src_us - c->last_src_us;
-            int64_t ad    = FFABS(delta);
-            int wrap = FFABS(ad - PTV_WRAP_US) < 2 * (int64_t)AV_TIME_BASE;  /* 33-bit wrap */
-            int jump = !wrap && ad > PTV_JUMP_US;                            /* discontinuity / gap */
-            if (wrap || jump) {
-                /* re-anchor: this frame continues at the current house position,
-                 * so wrap/jump/gap never reaches the output (M4). */
-                c->house_base = c->next_tick * c->tick_dur_us;
-                c->va = src_us;
-                c->reanchor++;
-            }
-            c->last_src_us = src_us;
+    int ret = av_thread_message_queue_send(v->frame_q, &out, AV_THREAD_MESSAGE_NONBLOCK);
+    if (ret == AVERROR(EAGAIN)) {                    /* full -> drop oldest, keep newest */
+        AVFrame *old;
+        if (av_thread_message_queue_recv(v->frame_q, &old, AV_THREAD_MESSAGE_NONBLOCK) >= 0)
+            av_frame_free(&old);
+        if (av_thread_message_queue_send(v->frame_q, &out, AV_THREAD_MESSAGE_NONBLOCK) < 0) {
+            av_frame_free(&out);
+            v->framedrop++;
         }
-        house_us = c->house_base + (src_us - c->va);
-        if (house_us < c->next_tick * c->tick_dur_us)   /* small-backwards jitter guard */
-            house_us = c->next_tick * c->tick_dur_us;
-    } else {
-        house_us = c->next_tick * c->tick_dur_us;
+    } else if (ret < 0) {
+        av_frame_free(&out);
     }
-
-    while (c->have_held && c->next_tick * c->tick_dur_us < house_us)
-        if ((ret = emit_tick(c)) < 0)
-            return ret;
-
-    if (c->have_held && c->held_emits == 0)
-        c->drop++;
-    av_frame_unref(c->held);
-    av_frame_move_ref(c->held, frame);
-    c->have_held  = 1;
-    c->held_emits = 0;
-    return 0;
 }
 
-static int clock_flush(ClockState *c)
+static void *decode_thread(void *arg)
 {
-    if (c->have_held && c->held_emits == 0)
-        return emit_tick(c);
-    return 0;
+    VideoCtx *v = arg;
+    AVPacket *pkt;
+    AVFrame  *frame = av_frame_alloc();
+    int ret = 0;
+
+    if (!frame)
+        goto done;
+    for (;;) {
+        ret = av_thread_message_queue_recv(v->video_q, &pkt, 0);
+        if (ret < 0) break;
+        ret = avcodec_send_packet(v->vdec, pkt);
+        av_packet_free(&pkt);
+        while (ret >= 0) {
+            ret = avcodec_receive_frame(v->vdec, frame);
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) { ret = 0; break; }
+            if (ret < 0) goto done;
+            if (frame->flags & AV_FRAME_FLAG_CORRUPT) { v->vcorrupt++; av_frame_unref(frame); continue; }
+            int64_t ts = frame->best_effort_timestamp;
+            if (ts != AV_NOPTS_VALUE) {
+                pthread_mutex_lock(v->h0_lock);
+                if (*v->h0 == AV_NOPTS_VALUE) *v->h0 = av_rescale_q(ts, v->ist_tb, AV_TIME_BASE_Q);
+                pthread_mutex_unlock(v->h0_lock);
+            }
+            v->dec_frames++;
+            {
+                AVFrame *out = av_frame_alloc();
+                if (!out) { av_frame_unref(frame); continue; }
+                av_frame_move_ref(out, frame);
+                push_frame(v, out);
+            }
+        }
+    }
+    /* flush decoder */
+    avcodec_send_packet(v->vdec, NULL);
+    while (avcodec_receive_frame(v->vdec, frame) >= 0) {
+        if (frame->flags & AV_FRAME_FLAG_CORRUPT) { av_frame_unref(frame); continue; }
+        v->dec_frames++;
+        AVFrame *out = av_frame_alloc();
+        if (out) { av_frame_move_ref(out, frame); push_frame(v, out); }
+        else av_frame_unref(frame);
+    }
+done:
+    av_frame_free(&frame);
+    av_thread_message_queue_set_err_recv(v->video_q, AVERROR_EOF);  /* unblock demux */
+    av_thread_message_queue_set_err_send(v->frame_q, AVERROR_EOF);  /* tell output done */
+    return NULL;
+}
+
+static void *output_thread(void *arg)
+{
+    VideoCtx *v = arg;
+    AVFrame *held = av_frame_alloc();
+    AVFrame *f;
+    int have = 0, ret = 0;
+    int64_t tick = 0, wall0 = 0;
+    int64_t diag_t0 = av_gettime_relative(), diag_last = diag_t0;
+
+    if (!held)
+        goto done;
+
+    if (!v->live) {
+        /* offline: media clock — encode every decoded frame 1:1, no pacing/dup */
+        for (;;) {
+            ret = av_thread_message_queue_recv(v->frame_q, &f, 0);
+            if (ret < 0) break;
+            f->pts = tick++; f->pkt_dts = AV_NOPTS_VALUE; f->duration = 0;
+            ret = encode_push(v->mux_q, v->venc, v->ost, f);
+            v->emitted++; v->last_emit_us = av_gettime_relative();
+            av_frame_free(&f);
+            if (ret < 0) break;
+        }
+        encode_push(v->mux_q, v->venc, v->ost, NULL);
+        goto done;
+    }
+
+    /* live: free-running master clock at the house rate. Pop ONE frame per tick;
+     * the frame_q is a jitter buffer that absorbs decoder delivery bursts, so at
+     * matched rates this is a smooth 1:1 (CFR). A genuine source gap -> dup; a
+     * genuine overflow (source faster / output stalled) -> drop-oldest at decode. */
+    for (;;) {
+        int fresh = 0;
+        ret = av_thread_message_queue_recv(v->frame_q, &f, AV_THREAD_MESSAGE_NONBLOCK);
+        if (ret >= 0) {
+            av_frame_unref(held); av_frame_move_ref(held, f); av_frame_free(&f);
+            have = 1; fresh = 1;
+        } else if (ret == AVERROR_EOF) {
+            break;                                  /* decode finished, queue drained */
+        }
+        if (!have) { av_usleep(2000); continue; }   /* await first frame (no startup dups) */
+
+        if (v->emitted == 0) wall0 = av_gettime_relative();
+        {
+            int64_t target = wall0 + tick * v->tick_dur_us;
+            int64_t now = av_gettime_relative();
+            if (now < target) av_usleep((unsigned)(target - now));
+        }
+        held->pts = tick; held->pkt_dts = AV_NOPTS_VALUE; held->duration = 0;
+        ret = encode_push(v->mux_q, v->venc, v->ost, held);
+        v->last_emit_us = av_gettime_relative();
+        tick++; v->emitted++;
+        if (!fresh) v->dup++;
+        if (g_slow) av_usleep(g_slow);
+        if (ret < 0) break;
+
+        if (g_diag) {
+            int64_t nowd = av_gettime_relative();
+            if (nowd - diag_last >= 1000000) {
+                av_log(NULL, AV_LOG_INFO,
+                    "[PTV-DIAG] t=%.1fs dec=%"PRId64" vcorrupt=%"PRId64" emitted=%"PRId64
+                    " muxed=%"PRId64" dup=%"PRId64" framedrop=%"PRId64" vq=%d frameq=%d muxq=%d\n",
+                    (nowd - diag_t0) / 1000000.0, v->dec_frames, v->vcorrupt, v->emitted,
+                    g_muxed, v->dup, v->framedrop,
+                    av_thread_message_queue_nb_elems(v->video_q),
+                    av_thread_message_queue_nb_elems(v->frame_q),
+                    av_thread_message_queue_nb_elems(v->mux_q));
+                diag_last = nowd;
+            }
+        }
+    }
+    encode_push(v->mux_q, v->venc, v->ost, NULL);
+done:
+    av_frame_free(&held);
+    v->output_done = 1;
+    { AVPacket *eof = NULL; av_thread_message_queue_send(v->mux_q, &eof, 0); }
+    return NULL;
+}
+
+/* watchdog: flag (does not yet auto-recover) a stalled output/encoder so a hung
+ * NVENC session is visible. A hung in-process session can't be safely torn down
+ * from another thread, so auto-reinit needs process isolation — a follow-up. */
+static void *watchdog_thread(void *arg)
+{
+    VideoCtx *v = arg;
+    while (!v->output_done) {
+        av_usleep(500000);
+        int64_t le = v->last_emit_us;
+        if (v->emitted > 0 && le > 0) {
+            int64_t age = av_gettime_relative() - le;
+            if (age > PTV_WD_DEADLINE_US) {
+                if (!v->stalled) {
+                    av_log(NULL, AV_LOG_WARNING,
+                        "[PTV-WATCHDOG] output stalled %.1fs — encoder not advancing (input keeps draining)\n",
+                        age / 1000000.0);
+                    v->stalled = 1;
+                }
+            } else {
+                v->stalled = 0;
+            }
+        }
+    }
+    return NULL;
 }
 
 /* ---- audio path (decode -> resample 48k stereo -> AAC -> mux) ---- */
 
 typedef struct AudioState {
-    AVFormatContext *ofmt;
+    AVThreadMessageQueue *audio_q;
+    AVThreadMessageQueue *mux_q;
+    AVCodecContext  *dec;
     AVCodecContext  *enc;
     AVStream        *ost;
     AVRational       ist_tb;
@@ -198,10 +337,10 @@ typedef struct AudioState {
     int              out_rate;
     enum AVSampleFormat out_sfmt;
     AVChannelLayout  out_chl;
-    AVPacket        *pkt;
-    int64_t         *h0;           /* shared input anchor (us) */
+    int64_t         *h0;
+    pthread_mutex_t *h0_lock;
     int              pts_set;
-    int64_t          next_pts;     /* output sample index */
+    int64_t          next_pts;
     int64_t          in_frames, out_frames;
 } AudioState;
 
@@ -219,7 +358,7 @@ static int audio_drain_fifo(AudioState *a)
         av_audio_fifo_read(a->fifo, (void **)f->data, a->frame_size);
         f->pts = a->next_pts;
         a->next_pts += a->frame_size;
-        ret = encode_write(a->ofmt, a->enc, a->ost, f, a->pkt);
+        ret = encode_push(a->mux_q, a->enc, a->ost, f);
         a->out_frames++;
         av_frame_free(&f);
         if (ret < 0) return ret;
@@ -235,8 +374,12 @@ static int audio_push(AudioState *a, AVFrame *frame)
 
     a->in_frames++;
 
-    if (ts != AV_NOPTS_VALUE && *a->h0 == AV_NOPTS_VALUE)
-        *a->h0 = av_rescale_q(ts, a->ist_tb, AV_TIME_BASE_Q);
+    if (ts != AV_NOPTS_VALUE) {
+        pthread_mutex_lock(a->h0_lock);
+        if (*a->h0 == AV_NOPTS_VALUE)
+            *a->h0 = av_rescale_q(ts, a->ist_tb, AV_TIME_BASE_Q);
+        pthread_mutex_unlock(a->h0_lock);
+    }
 
     if (!a->pts_set && ts != AV_NOPTS_VALUE && *a->h0 != AV_NOPTS_VALUE) {
         int64_t house_us = av_rescale_q(ts, a->ist_tb, AV_TIME_BASE_Q) - *a->h0;
@@ -260,20 +403,151 @@ static int audio_push(AudioState *a, AVFrame *frame)
     return audio_drain_fifo(a);
 }
 
-static int audio_flush(AudioState *a)
+static void *audio_thread(void *arg)
 {
-    /* flush the resampler, then any buffered full frames */
-    uint8_t **out = NULL;
-    int got, ret = 0;
-    int out_max = 4096;
-    if (av_samples_alloc_array_and_samples(&out, NULL, a->out_chl.nb_channels,
-                                           out_max, a->out_sfmt, 0) >= 0) {
-        while ((got = swr_convert(a->swr, out, out_max, NULL, 0)) > 0)
-            av_audio_fifo_write(a->fifo, (void **)out, got);
-        av_freep(&out[0]); av_freep(&out);
+    AudioState *a = arg;
+    AVPacket *pkt;
+    AVFrame  *frame = av_frame_alloc();
+    int ret = 0;
+
+    if (!frame)
+        goto done;
+    for (;;) {
+        ret = av_thread_message_queue_recv(a->audio_q, &pkt, 0);
+        if (ret < 0) break;
+        ret = avcodec_send_packet(a->dec, pkt);
+        av_packet_free(&pkt);
+        while (ret >= 0) {
+            ret = avcodec_receive_frame(a->dec, frame);
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) { ret = 0; break; }
+            if (ret < 0) goto done;
+            ret = audio_push(a, frame);
+            av_frame_unref(frame);
+            if (ret < 0) goto done;
+        }
     }
-    if ((ret = audio_drain_fifo(a)) < 0) return ret;
-    return encode_write(a->ofmt, a->enc, a->ost, NULL, a->pkt);  /* flush encoder */
+    /* flush decoder -> resampler -> encoder */
+    avcodec_send_packet(a->dec, NULL);
+    while (avcodec_receive_frame(a->dec, frame) >= 0) { audio_push(a, frame); av_frame_unref(frame); }
+    {
+        uint8_t **out = NULL; int got, out_max = 4096;
+        if (av_samples_alloc_array_and_samples(&out, NULL, a->out_chl.nb_channels,
+                                               out_max, a->out_sfmt, 0) >= 0) {
+            while ((got = swr_convert(a->swr, out, out_max, NULL, 0)) > 0)
+                av_audio_fifo_write(a->fifo, (void **)out, got);
+            av_freep(&out[0]); av_freep(&out);
+        }
+        audio_drain_fifo(a);
+        encode_push(a->mux_q, a->enc, a->ost, NULL);
+    }
+done:
+    av_frame_free(&frame);
+    av_thread_message_queue_set_err_recv(a->audio_q, AVERROR_EOF);
+    { AVPacket *eof = NULL; av_thread_message_queue_send(a->mux_q, &eof, 0); }
+    return NULL;
+}
+
+/* ---- demux + mux ---- */
+
+typedef struct DemuxArgs {
+    AVFormatContext      *ifmt;
+    AVThreadMessageQueue *video_q, *audio_q;
+    int                   vstream, astream;
+    int                   drop;          /* non-blocking + drop on full (network input) */
+    int64_t               vpkt, apkt, vdrop, adrop;
+} DemuxArgs;
+
+typedef struct MuxArgs {
+    AVFormatContext      *ofmt;
+    AVThreadMessageQueue *mux_q;
+    int                   n_producers;
+    int                   err;
+} MuxArgs;
+
+static int demux_send(AVThreadMessageQueue *q, AVPacket *pkt, int drop, int64_t *drops)
+{
+    int ret = av_thread_message_queue_send(q, &pkt, drop ? AV_THREAD_MESSAGE_NONBLOCK : 0);
+    if (drop && ret == AVERROR(EAGAIN)) {   /* full -> drop */
+        av_packet_free(&pkt);
+        (*drops)++;
+        return 0;
+    }
+    if (ret < 0)
+        av_packet_free(&pkt);               /* queue closed */
+    return ret;
+}
+
+static void *demux_thread(void *arg)
+{
+    DemuxArgs *d = arg;
+    AVPacket *pkt = av_packet_alloc();
+    int64_t diag_last = av_gettime_relative();
+    int ret = 0;
+
+    if (!pkt)
+        goto end;
+    while (av_read_frame(d->ifmt, pkt) >= 0) {
+        if (g_diag) {
+            int64_t now = av_gettime_relative();
+            if (now - diag_last >= 1000000) {
+                av_log(NULL, AV_LOG_INFO, "[PTV-DIAG] demux vpkt=%"PRId64" vdrop=%"PRId64
+                       " apkt=%"PRId64" adrop=%"PRId64"\n", d->vpkt, d->vdrop, d->apkt, d->adrop);
+                diag_last = now;
+            }
+        }
+        AVPacket *out = av_packet_alloc();
+        if (!out) { av_packet_unref(pkt); break; }
+        av_packet_move_ref(out, pkt);
+        if (out->stream_index == d->vstream) {
+            d->vpkt++;
+            ret = demux_send(d->video_q, out, d->drop, &d->vdrop);
+        } else if (d->astream >= 0 && out->stream_index == d->astream) {
+            d->apkt++;
+            ret = demux_send(d->audio_q, out, d->drop, &d->adrop);
+        } else {
+            av_packet_free(&out);
+        }
+        if (ret < 0)
+            break;
+    }
+end:
+    av_thread_message_queue_set_err_send(d->video_q, AVERROR_EOF);
+    if (d->astream >= 0)
+        av_thread_message_queue_set_err_send(d->audio_q, AVERROR_EOF);
+    av_packet_free(&pkt);
+    return NULL;
+}
+
+static void *mux_thread(void *arg)
+{
+    MuxArgs *m = arg;
+    AVPacket *pkt;
+    int done = 0, ret;
+
+    for (;;) {
+        ret = av_thread_message_queue_recv(m->mux_q, &pkt, 0);
+        if (ret < 0)
+            break;
+        if (!pkt) {                                  /* end-of-stream marker */
+            if (++done >= m->n_producers)
+                break;
+            continue;
+        }
+        {
+            int64_t wt0 = g_diag ? av_gettime_relative() : 0;
+            ret = av_interleaved_write_frame(m->ofmt, pkt);
+            if (g_diag) {
+                int64_t dlt = av_gettime_relative() - wt0;
+                if (dlt > 800000)
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-DIAG] write blocked %"PRId64" ms\n", dlt / 1000);
+            }
+        }
+        av_packet_free(&pkt);
+        if (ret < 0) { m->err = ret; break; }
+        g_muxed++;
+    }
+    av_thread_message_queue_set_err_recv(m->mux_q, AVERROR_EOF);
+    return NULL;
 }
 
 static int transcode(const char *in_url, const char *out_url, const char *out_fmt,
@@ -283,16 +557,19 @@ static int transcode(const char *in_url, const char *out_url, const char *out_fm
     AVCodecContext  *vdec = NULL, *venc = NULL, *adec = NULL, *aenc = NULL;
     const AVCodec   *vdecoder = NULL, *vencoder = NULL, *adecoder = NULL, *aencoder = NULL;
     AVStream        *vist = NULL, *aist = NULL;
-    AVPacket        *pkt = NULL;
-    AVFrame         *frame = NULL;
-    ClockState       cs;
+    AVThreadMessageQueue *video_q = NULL, *audio_q = NULL, *frame_q = NULL, *mux_q = NULL;
+    VideoCtx         vc;
     AudioState       as;
+    DemuxArgs        da; MuxArgs ma;
+    pthread_t        th_demux, th_decode, th_output, th_audio, th_mux, th_wd;
+    pthread_mutex_t  h0_lock = PTHREAD_MUTEX_INITIALIZER;
     int64_t          input_h0_us = AV_NOPTS_VALUE;
-    int vstream = -1, astream = -1, ret = 0, live, have_audio = 0;
+    int vstream = -1, astream = -1, ret = 0, live, net_input, have_audio = 0;
+    int started_audio = 0, hdr_written = 0;
     AVRational out_fps;
 
-    memset(&cs, 0, sizeof(cs));
-    memset(&as, 0, sizeof(as));
+    memset(&vc, 0, sizeof(vc)); memset(&as, 0, sizeof(as));
+    memset(&da, 0, sizeof(da)); memset(&ma, 0, sizeof(ma));
 
     if ((ret = avformat_open_input(&ifmt, in_url, NULL, NULL)) < 0) {
         av_log(NULL, AV_LOG_ERROR, "cannot open input '%s': %s\n", in_url, av_err2str(ret)); return ret;
@@ -322,7 +599,6 @@ static int transcode(const char *in_url, const char *out_url, const char *out_fm
         goto end;
     }
 
-    /* video encoder */
     vencoder = avcodec_find_encoder_by_name(venc_name);
     if (!vencoder) {
         av_log(NULL, AV_LOG_WARNING, "encoder '%s' not found, using mpeg2video\n", venc_name);
@@ -349,10 +625,10 @@ static int transcode(const char *in_url, const char *out_url, const char *out_fm
     if ((ret = avcodec_open2(venc, vencoder, NULL)) < 0) {
         av_log(NULL, AV_LOG_ERROR, "open video encoder '%s': %s\n", vencoder->name, av_err2str(ret)); goto end;
     }
-    cs.ost = avformat_new_stream(ofmt, NULL);
-    if (!cs.ost) { ret = AVERROR(ENOMEM); goto end; }
-    avcodec_parameters_from_context(cs.ost->codecpar, venc);
-    cs.ost->time_base = venc->time_base;
+    vc.ost = avformat_new_stream(ofmt, NULL);
+    if (!vc.ost) { ret = AVERROR(ENOMEM); goto end; }
+    avcodec_parameters_from_context(vc.ost->codecpar, venc);
+    vc.ost->time_base = venc->time_base;
 
     /* audio (optional) */
     if (want_audio)
@@ -400,82 +676,96 @@ static int transcode(const char *in_url, const char *out_url, const char *out_fm
     if ((ret = avformat_write_header(ofmt, NULL)) < 0) {
         av_log(NULL, AV_LOG_ERROR, "write header: %s\n", av_err2str(ret)); goto end;
     }
+    hdr_written = 1;
 
-    live = mode < 0 ? (!strncmp(in_url, "udp://", 6) || !strncmp(in_url, "rtp://", 6) ||
-                       !strncmp(in_url, "srt://", 6)) : mode;
+    net_input = !strncmp(in_url, "udp://", 6) || !strncmp(in_url, "rtp://", 6) ||
+                !strncmp(in_url, "srt://", 6);
+    live = mode < 0 ? net_input : mode;
 
-    pkt = av_packet_alloc(); frame = av_frame_alloc(); cs.held = av_frame_alloc();
-    if (!pkt || !frame || !cs.held) { ret = AVERROR(ENOMEM); goto end; }
-
-    cs.ofmt = ofmt; cs.enc = venc; cs.ist_tb = vist->time_base;
-    cs.tick_dur_us = av_rescale(1000000, out_fps.den, out_fps.num);
-    cs.live = live; cs.pkt = pkt; cs.h0 = &input_h0_us;
+    if ((ret = av_thread_message_queue_alloc(&video_q, PTV_QDEPTH, sizeof(AVPacket *))) < 0) goto end;
+    av_thread_message_queue_set_free_func(video_q, free_pkt_msg);
+    if ((ret = av_thread_message_queue_alloc(&frame_q, PTV_FRAME_QDEPTH, sizeof(AVFrame *))) < 0) goto end;
+    av_thread_message_queue_set_free_func(frame_q, free_frame_msg);
+    if ((ret = av_thread_message_queue_alloc(&mux_q, PTV_QDEPTH, sizeof(AVPacket *))) < 0) goto end;
+    av_thread_message_queue_set_free_func(mux_q, free_pkt_msg);
     if (have_audio) {
-        as.ofmt = ofmt; as.enc = aenc; as.ist_tb = aist->time_base; as.pkt = pkt; as.h0 = &input_h0_us;
+        if ((ret = av_thread_message_queue_alloc(&audio_q, PTV_QDEPTH, sizeof(AVPacket *))) < 0) goto end;
+        av_thread_message_queue_set_free_func(audio_q, free_pkt_msg);
+    }
+
+    vc.video_q = video_q; vc.frame_q = frame_q; vc.mux_q = mux_q;
+    vc.vdec = vdec; vc.venc = venc; vc.ist_tb = vist->time_base;
+    vc.tick_dur_us = av_rescale(1000000, out_fps.den, out_fps.num);
+    vc.live = live; vc.h0 = &input_h0_us; vc.h0_lock = &h0_lock;
+    if (have_audio) {
+        as.audio_q = audio_q; as.mux_q = mux_q; as.dec = adec; as.enc = aenc;
+        as.ist_tb = aist->time_base; as.h0 = &input_h0_us; as.h0_lock = &h0_lock;
     }
 
     av_log(NULL, AV_LOG_INFO,
-        "ptvencoder: %dx%d  house %d/%d fps (%s)  v:%s->%s  a:%s  [%s]\n",
+        "ptvencoder: %dx%d  house %d/%d fps (%s)  v:%s->%s  a:%s  [%s]  in:%s  pull-pipeline\n",
         venc->width, venc->height, out_fps.num, out_fps.den, live ? "live" : "offline",
-        vdecoder->name, vencoder->name, have_audio ? "aac" : "none", ofmt->oformat->name);
+        vdecoder->name, vencoder->name, have_audio ? "aac" : "none", ofmt->oformat->name,
+        net_input ? "net(drop)" : "file(block)");
 
-    while (av_read_frame(ifmt, pkt) >= 0) {
-        if (pkt->stream_index == vstream) {
-            ret = avcodec_send_packet(vdec, pkt);
-            while (ret >= 0) {
-                ret = avcodec_receive_frame(vdec, frame);
-                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) { ret = 0; break; }
-                if (ret < 0) goto end;
-                if (frame->flags & AV_FRAME_FLAG_CORRUPT) { av_frame_unref(frame); continue; }
-                if ((ret = clock_push(&cs, frame)) < 0) goto end;
-            }
-        } else if (have_audio && pkt->stream_index == astream) {
-            ret = avcodec_send_packet(adec, pkt);
-            while (ret >= 0) {
-                ret = avcodec_receive_frame(adec, frame);
-                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) { ret = 0; break; }
-                if (ret < 0) goto end;
-                if ((ret = audio_push(&as, frame)) < 0) goto end;
-                av_frame_unref(frame);
-            }
-        }
-        av_packet_unref(pkt);
+    da.ifmt = ifmt; da.video_q = video_q; da.audio_q = audio_q;
+    da.vstream = vstream; da.astream = have_audio ? astream : -1; da.drop = net_input;
+    ma.ofmt = ofmt; ma.mux_q = mux_q; ma.n_producers = have_audio ? 2 : 1;
+
+    if ((ret = pthread_create(&th_mux, NULL, mux_thread, &ma))) { ret = AVERROR(ret); goto end; }
+    if ((ret = pthread_create(&th_output, NULL, output_thread, &vc))) {
+        av_thread_message_queue_set_err_recv(mux_q, AVERROR_EOF); pthread_join(th_mux, NULL);
+        ret = AVERROR(ret); goto end;
+    }
+    if ((ret = pthread_create(&th_decode, NULL, decode_thread, &vc))) {
+        av_thread_message_queue_set_err_send(frame_q, AVERROR_EOF);
+        pthread_join(th_output, NULL); pthread_join(th_mux, NULL);
+        ret = AVERROR(ret); goto end;
+    }
+    pthread_create(&th_wd, NULL, watchdog_thread, &vc);
+    if (have_audio && !pthread_create(&th_audio, NULL, audio_thread, &as))
+        started_audio = 1;
+    else if (have_audio)
+        av_log(NULL, AV_LOG_WARNING, "audio thread create failed; video only\n");
+
+    if ((ret = pthread_create(&th_demux, NULL, demux_thread, &da))) {
+        av_thread_message_queue_set_err_send(video_q, AVERROR_EOF);
+        if (have_audio) av_thread_message_queue_set_err_send(audio_q, AVERROR_EOF);
+        ret = AVERROR(ret);
+    } else {
+        pthread_join(th_demux, NULL);
     }
 
-    /* flush video */
-    avcodec_send_packet(vdec, NULL);
-    while (avcodec_receive_frame(vdec, frame) >= 0) {
-        if (!(frame->flags & AV_FRAME_FLAG_CORRUPT)) clock_push(&cs, frame);
-        else av_frame_unref(frame);
-    }
-    clock_flush(&cs);
-    encode_write(ofmt, venc, cs.ost, NULL, pkt);
+    pthread_join(th_decode, NULL);
+    pthread_join(th_output, NULL);
+    if (started_audio) pthread_join(th_audio, NULL);
+    pthread_join(th_wd, NULL);
+    pthread_join(th_mux, NULL);
 
-    /* flush audio */
-    if (have_audio) {
-        avcodec_send_packet(adec, NULL);
-        while (avcodec_receive_frame(adec, frame) >= 0) { audio_push(&as, frame); av_frame_unref(frame); }
-        audio_flush(&as);
-    }
+    if (!ret && ma.err < 0) ret = ma.err;
 
-    av_write_trailer(ofmt);
     av_log(NULL, AV_LOG_INFO,
-        "ptvencoder: done — video in %"PRId64" out %"PRId64" (dup %"PRId64" drop %"PRId64" re-anchor %"PRId64")%s\n",
-        cs.in_frames, cs.emitted, cs.dup, cs.drop, cs.reanchor,
+        "ptvencoder: done — video dec %"PRId64" out %"PRId64" (dup %"PRId64" framedrop %"PRId64") "
+        "demux v:%"PRId64"/drop%"PRId64"%s\n",
+        vc.dec_frames, vc.emitted, vc.dup, vc.framedrop, da.vpkt, da.vdrop,
         have_audio ? "" : "  [no audio]");
     if (have_audio)
-        av_log(NULL, AV_LOG_INFO, "ptvencoder: audio in %"PRId64" frames, out %"PRId64" aac frames\n",
-               as.in_frames, as.out_frames);
-    ret = 0;
+        av_log(NULL, AV_LOG_INFO, "ptvencoder: audio in %"PRId64" frames, out %"PRId64" aac frames (demux a:%"PRId64"/drop%"PRId64")\n",
+               as.in_frames, as.out_frames, da.apkt, da.adrop);
+
+    if (hdr_written)
+        av_write_trailer(ofmt);
+    if (ret > 0) ret = 0;
 
 end:
     if (ofmt && !(ofmt->oformat->flags & AVFMT_NOFILE) && ofmt->pb)
         avio_closep(&ofmt->pb);
+    av_thread_message_queue_free(&video_q);
+    av_thread_message_queue_free(&frame_q);
+    av_thread_message_queue_free(&audio_q);
+    av_thread_message_queue_free(&mux_q);
     if (as.swr)  swr_free(&as.swr);
     if (as.fifo) av_audio_fifo_free(as.fifo);
-    av_frame_free(&cs.held);
-    av_frame_free(&frame);
-    av_packet_free(&pkt);
     avcodec_free_context(&aenc);
     avcodec_free_context(&adec);
     avcodec_free_context(&venc);
@@ -493,6 +783,8 @@ int main(int argc, char **argv)
 
     init_dynload();
     av_log_set_level(AV_LOG_INFO);
+    g_diag = !!getenv("PTV_DIAG");
+    { const char *s = getenv("PTV_SLOW_US"); g_slow = s ? atoi(s) : 0; }
 
     if (argc >= 2 && (!strcmp(argv[1], "-version") || !strcmp(argv[1], "--version"))) {
         printf("ptvencoder (PoC) — FFmpeg %s\n", av_version_info());
