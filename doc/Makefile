@@ -14,11 +14,16 @@ COMPONENTS-$(CONFIG_AVFORMAT)   += ffmpeg-formats ffmpeg-protocols
 COMPONENTS-$(CONFIG_AVDEVICE)   += ffmpeg-devices
 COMPONENTS-$(CONFIG_AVFILTER)   += ffmpeg-filters
 
-MANPAGES1   = $(AVPROGS-yes:%=doc/%.1)    $(AVPROGS-yes:%=doc/%-all.1)    $(COMPONENTS-yes:%=doc/%.1)
+# ptvencoder ships without texi documentation (PoC): keep it in AVPROGS for the
+# binary build/install, but exclude it from the man/pod/html page lists so the
+# doc build doesn't expect a doc/ptvencoder.texi.
+DOCPROGS-yes := $(filter-out ptvencoder,$(AVPROGS-yes))
+
+MANPAGES1   = $(DOCPROGS-yes:%=doc/%.1)    $(DOCPROGS-yes:%=doc/%-all.1)    $(COMPONENTS-yes:%=doc/%.1)
 MANPAGES3   = $(LIBRARIES-yes:%=doc/%.3)
 MANPAGES    = $(MANPAGES1) $(MANPAGES3)
-PODPAGES    = $(AVPROGS-yes:%=doc/%.pod)  $(AVPROGS-yes:%=doc/%-all.pod)  $(COMPONENTS-yes:%=doc/%.pod)  $(LIBRARIES-yes:%=doc/%.pod)
-HTMLPAGES   = $(AVPROGS-yes:%=doc/%.html) $(AVPROGS-yes:%=doc/%-all.html) $(COMPONENTS-yes:%=doc/%.html) $(LIBRARIES-yes:%=doc/%.html) \
+PODPAGES    = $(DOCPROGS-yes:%=doc/%.pod)  $(DOCPROGS-yes:%=doc/%-all.pod)  $(COMPONENTS-yes:%=doc/%.pod)  $(LIBRARIES-yes:%=doc/%.pod)
+HTMLPAGES   = $(DOCPROGS-yes:%=doc/%.html) $(DOCPROGS-yes:%=doc/%-all.html) $(COMPONENTS-yes:%=doc/%.html) $(LIBRARIES-yes:%=doc/%.html) \
               doc/community.html                                        \
               doc/developer.html                                        \
               doc/faq.html                                              \
@@ -141,7 +146,7 @@ uninstall-html:
 	$(RM) -r "$(DOCDIR)"
 
 uninstall-man:
-	$(RM) $(addprefix "$(MANDIR)/man1/",$(AVPROGS-yes:%=%.1) $(AVPROGS-yes:%=%-all.1) $(COMPONENTS-yes:%=%.1))
+	$(RM) $(addprefix "$(MANDIR)/man1/",$(DOCPROGS-yes:%=%.1) $(DOCPROGS-yes:%=%-all.1) $(COMPONENTS-yes:%=%.1))
 	$(RM) $(addprefix "$(MANDIR)/man3/",$(LIBRARIES-yes:%=%.3))
 
 clean:: docclean
