@@ -374,16 +374,22 @@ static int audio_push(AudioState *a, AVFrame *frame)
 
     a->in_frames++;
 
-    if (ts != AV_NOPTS_VALUE) {
+    /* Audio anchors to the FIRST VIDEO frame (h0, set only by the video decode
+     * thread) so A/V share one origin. Audio that arrives before video has
+     * anchored — or that precedes the anchor — is DROPPED, otherwise audio leads
+     * video by the video start-up (IDR-acquire) delay (the ~1-2s A/V offset). */
+    if (!a->pts_set) {
+        int64_t h0, house_us;
+        if (ts == AV_NOPTS_VALUE)
+            return 0;
         pthread_mutex_lock(a->h0_lock);
-        if (*a->h0 == AV_NOPTS_VALUE)
-            *a->h0 = av_rescale_q(ts, a->ist_tb, AV_TIME_BASE_Q);
+        h0 = *a->h0;
         pthread_mutex_unlock(a->h0_lock);
-    }
-
-    if (!a->pts_set && ts != AV_NOPTS_VALUE && *a->h0 != AV_NOPTS_VALUE) {
-        int64_t house_us = av_rescale_q(ts, a->ist_tb, AV_TIME_BASE_Q) - *a->h0;
-        if (house_us < 0) house_us = 0;
+        if (h0 == AV_NOPTS_VALUE)
+            return 0;                          /* video not anchored yet: drop */
+        house_us = av_rescale_q(ts, a->ist_tb, AV_TIME_BASE_Q) - h0;
+        if (house_us < 0)
+            return 0;                          /* audio precedes video anchor: drop */
         a->next_pts = av_rescale(house_us, a->out_rate, 1000000);
         a->pts_set  = 1;
     }
