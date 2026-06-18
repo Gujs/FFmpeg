@@ -975,6 +975,13 @@ static int transcode(const char *in_url, const char *out_url, const char *out_fm
         if ((ret = avio_open(&ofmt->pb, out_url, AVIO_FLAG_WRITE)) < 0) {
             av_log(NULL, AV_LOG_ERROR, "open output '%s': %s\n", out_url, av_err2str(ret)); goto end;
         }
+    /* Sparse passthrough streams (DVB subtitles, data/SCTE) arrive seconds apart.
+     * The default interleaver holds continuous A/V up to max_interleave_delta
+     * (10s) to DTS-order it against them, then releases a burst when a sparse
+     * packet finally lands -> uneven UDP delivery / receiver stutter. Bound the
+     * wait so A/V flush promptly (well above the A/V + B-frame DTS spread, well
+     * below the sparse gap); sparse packets emit when they arrive. */
+    ofmt->max_interleave_delta = 200000;   /* 200 ms */
     if ((ret = avformat_write_header(ofmt, NULL)) < 0) {
         av_log(NULL, AV_LOG_ERROR, "write header: %s\n", av_err2str(ret)); goto end;
     }
