@@ -143,7 +143,14 @@ static void free_frame_msg(void *msg) { av_frame_free(msg); }
 static int encode_push(AVThreadMessageQueue *mux_q, AVCodecContext *enc,
                        AVStream *ost, AVFrame *frame)
 {
-    int ret = avcodec_send_frame(enc, frame);
+    int ret;
+    /* Let the ENCODER choose the GOP: clear the decoder's leftover I/P/B
+     * classification. Otherwise mpeg2video (and any pict_type-honoring encoder)
+     * tries to replicate the source's frame types — h264's long B-runs trip
+     * "too many B-frames in a row" and stall; NVENC's forced-IDR GOP can misalign. */
+    if (frame)
+        frame->pict_type = AV_PICTURE_TYPE_NONE;
+    ret = avcodec_send_frame(enc, frame);
     if (ret < 0)
         return ret;
     for (;;) {
@@ -485,9 +492,9 @@ static void *decode_thread(void *arg)
 done:
     av_frame_free(&filt);
     av_frame_free(&frame);
-    av_thread_message_queue_set_err_recv(d->video_q, AVERROR_EOF);   /* unblock demux */
+    av_thread_message_queue_set_err_send(d->video_q, AVERROR_EOF);   /* unblock demux (a SENDER) */
     for (i = 0; i < d->n_rung; i++)
-        av_thread_message_queue_set_err_send(d->frame_q[i], AVERROR_EOF);  /* tell each output done */
+        av_thread_message_queue_set_err_recv(d->frame_q[i], AVERROR_EOF);  /* EOF to each output (RECEIVER) */
     return NULL;
 }
 
@@ -742,6 +749,36 @@ static int audio_drain_fifo(AudioState *a)
     return 0;
 }
 
+/* -af path: drain the filtergraph's (fixed-size) output frames straight to the
+ * per-rung encoders, stamping each with ITS OWN filter PTS rebased onto the house
+ * anchor h0 (in out_rate sample units). This HONORS aresample=async's correction
+ * — discarding it for a free sample counter is what let audio drift behind video.
+ * Frames whose rebased pts precedes the video anchor (<0) are dropped. */
+static int audio_drain_fg(AudioState *a)
+{
+    AVFrame *filt = av_frame_alloc();
+    AVRational sink_tb;
+    int64_t h0, h0_samp;
+    int ret = 0;
+    if (!filt) return AVERROR(ENOMEM);
+    pthread_mutex_lock(a->h0_lock); h0 = *a->h0; pthread_mutex_unlock(a->h0_lock);
+    h0_samp = (h0 == AV_NOPTS_VALUE) ? 0 : av_rescale(h0, a->out_rate, 1000000);
+    sink_tb = av_buffersink_get_time_base(a->afsink);
+    while ((ret = av_buffersink_get_frame(a->afsink, filt)) >= 0) {
+        if (filt->pts != AV_NOPTS_VALUE) {
+            int64_t opts = av_rescale_q(filt->pts, sink_tb, (AVRational){1, a->out_rate}) - h0_samp;
+            if (opts < 0) { av_frame_unref(filt); continue; }   /* precedes video anchor */
+            filt->pts = opts;
+        }
+        ret = audio_encode_push(a, filt);
+        a->out_frames++;
+        av_frame_unref(filt);
+        if (ret < 0) break;
+    }
+    av_frame_free(&filt);
+    return (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) ? 0 : ret;
+}
+
 static int audio_push(AudioState *a, AVFrame *frame)
 {
     uint8_t **out = NULL;
@@ -771,31 +808,25 @@ static int audio_push(AudioState *a, AVFrame *frame)
     }
 
     if (a->use_fg) {
-        /* -af: push into the filtergraph (aresample async fills gaps / trims, plus
-         * loudness chain), then collect the timeline-corrected samples to the FIFO.
-         * av_buffersrc_add_frame consumes the frame; PTS comes from the FIFO counter. */
-        AVFrame *filt = av_frame_alloc();
-        if (!filt) return AVERROR(ENOMEM);
-        if ((ret = av_buffersrc_add_frame(a->afsrc, frame)) < 0) { av_frame_free(&filt); return ret; }
-        while ((ret = av_buffersink_get_frame(a->afsink, filt)) >= 0) {
-            av_audio_fifo_write(a->fifo, (void **)filt->extended_data, filt->nb_samples);
-            av_frame_unref(filt);
-        }
-        av_frame_free(&filt);
-        if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) return ret;
-    } else {
-        out_max = av_rescale_rnd(swr_get_delay(a->swr, frame->sample_rate) + frame->nb_samples,
-                                 a->out_rate, frame->sample_rate, AV_ROUND_UP);
-        if ((ret = av_samples_alloc_array_and_samples(&out, NULL, a->out_chl.nb_channels,
-                                                      out_max, a->out_sfmt, 0)) < 0)
+        /* -af: feed the graph; aresample async + loudness emit fixed-size frames
+         * whose PTS already carries async's A/V correction — drain them straight
+         * to the encoders (no FIFO, no free counter). */
+        if ((ret = av_buffersrc_add_frame(a->afsrc, frame)) < 0)
             return ret;
-        got = swr_convert(a->swr, out, out_max,
-                          (const uint8_t **)frame->extended_data, frame->nb_samples);
-        if (got > 0)
-            av_audio_fifo_write(a->fifo, (void **)out, got);
-        if (out) { av_freep(&out[0]); av_freep(&out); }
-        if (got < 0) return got;
+        return audio_drain_fg(a);
     }
+
+    out_max = av_rescale_rnd(swr_get_delay(a->swr, frame->sample_rate) + frame->nb_samples,
+                             a->out_rate, frame->sample_rate, AV_ROUND_UP);
+    if ((ret = av_samples_alloc_array_and_samples(&out, NULL, a->out_chl.nb_channels,
+                                                  out_max, a->out_sfmt, 0)) < 0)
+        return ret;
+    got = swr_convert(a->swr, out, out_max,
+                      (const uint8_t **)frame->extended_data, frame->nb_samples);
+    if (got > 0)
+        av_audio_fifo_write(a->fifo, (void **)out, got);
+    if (out) { av_freep(&out[0]); av_freep(&out); }
+    if (got < 0) return got;
 
     return audio_drain_fifo(a);
 }
@@ -827,17 +858,9 @@ static void *audio_thread(void *arg)
     avcodec_send_packet(a->dec, NULL);
     while (avcodec_receive_frame(a->dec, frame) >= 0) { audio_push(a, frame); av_frame_unref(frame); }
     if (a->use_fg) {
-        AVFrame *filt = av_frame_alloc();
-        if (filt) {
-            if (av_buffersrc_add_frame(a->afsrc, NULL) >= 0)          /* signal EOF to the graph */
-                while (av_buffersink_get_frame(a->afsink, filt) >= 0) {
-                    av_audio_fifo_write(a->fifo, (void **)filt->extended_data, filt->nb_samples);
-                    av_frame_unref(filt);
-                }
-            av_frame_free(&filt);
-        }
-        audio_drain_fifo(a);
-        audio_encode_push(a, NULL);
+        if (av_buffersrc_add_frame(a->afsrc, NULL) >= 0)   /* signal EOF to the graph */
+            audio_drain_fg(a);
+        audio_encode_push(a, NULL);                        /* flush encoders */
     } else {
         uint8_t **out = NULL; int got, out_max = 4096;
         if (av_samples_alloc_array_and_samples(&out, NULL, a->out_chl.nb_channels,
@@ -851,7 +874,7 @@ static void *audio_thread(void *arg)
     }
 done:
     av_frame_free(&frame);
-    av_thread_message_queue_set_err_recv(a->audio_q, AVERROR_EOF);
+    av_thread_message_queue_set_err_send(a->audio_q, AVERROR_EOF);   /* unblock demux (a SENDER) */
     { int i; for (i = 0; i < a->n_out; i++) {        /* EOF marker to each muxer */
         AVPacket *eof = NULL; av_thread_message_queue_send(a->mux_q[i], &eof, 0); } }
     return NULL;
@@ -891,6 +914,11 @@ static int build_audio_filter(AudioState *a, AVCodecContext *adec, AVRational tb
     ins->name  = av_strdup("out"); ins->filter_ctx  = a->afsink; ins->pad_idx  = 0; ins->next  = NULL;
     if ((ret = avfilter_graph_parse_ptr(a->afg, chain, &ins, &outs, NULL)) < 0) goto end;
     if ((ret = avfilter_graph_config(a->afg, NULL)) < 0) goto end;
+
+    /* deliver encoder-sized frames so we can feed them straight to the AAC
+     * encoders carrying their own (async-corrected) PTS — no FIFO repackaging. */
+    if (a->frame_size > 0)
+        av_buffersink_set_frame_size(a->afsink, a->frame_size);
 
     av_log(NULL, AV_LOG_INFO, "ptvencoder: audio filter [%s]\n", chain);
     a->use_fg = 1;
@@ -1012,9 +1040,12 @@ static void *demux_thread(void *arg)
             break;
     }
 end:
-    av_thread_message_queue_set_err_send(d->video_q, AVERROR_EOF);
+    /* producer done → signal CONSUMERS to drain then get EOF. recv() returns
+     * err_recv (set_err_send is invisible to receivers), so this MUST be
+     * set_err_recv or decode/audio block forever (the offline-EOF deadlock). */
+    av_thread_message_queue_set_err_recv(d->video_q, AVERROR_EOF);
     if (d->astream >= 0)
-        av_thread_message_queue_set_err_send(d->audio_q, AVERROR_EOF);
+        av_thread_message_queue_set_err_recv(d->audio_q, AVERROR_EOF);
     if (d->n_pass > 0) {                     /* copy-passthrough producer EOF, per muxer */
         int i;
         for (i = 0; i < d->n_out; i++) {
@@ -1055,7 +1086,7 @@ static void *mux_thread(void *arg)
         if (ret < 0) { m->err = ret; break; }
         g_muxed++;
     }
-    av_thread_message_queue_set_err_recv(m->mux_q, AVERROR_EOF);
+    av_thread_message_queue_set_err_send(m->mux_q, AVERROR_EOF);   /* unblock producers (SENDERS) */
     return NULL;
 }
 
@@ -1153,6 +1184,10 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
     if (!vdec) { ret = AVERROR(ENOMEM); goto end; }
     avcodec_parameters_to_context(vdec, vist->codecpar);
     vdec->pkt_timebase = vist->time_base;
+    /* NOTE: do NOT enable frame-threaded decode (thread_count=0/auto) yet — it
+     * hangs offline at EOF (the decode flush doesn't drain frame-threading workers
+     * cleanly through this pipeline). Live input never hits EOF so it's moot there,
+     * but keep single-threaded until the EOF drain is handled. (perf TODO) */
     if ((ret = avcodec_open2(vdec, vdecoder, NULL)) < 0) {
         av_log(NULL, AV_LOG_ERROR, "open video decoder: %s\n", av_err2str(ret)); goto end;
     }
@@ -1473,8 +1508,8 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
     {
         int pe = pthread_create(&th_demux, NULL, demux_thread, &da);
         if (pe) {                                   /* couldn't start demux: drain the pipeline */
-            av_thread_message_queue_set_err_send(video_q, AVERROR_EOF);
-            if (have_audio) av_thread_message_queue_set_err_send(audio_q, AVERROR_EOF);
+            av_thread_message_queue_set_err_recv(video_q, AVERROR_EOF);   /* EOF to consumers */
+            if (have_audio) av_thread_message_queue_set_err_recv(audio_q, AVERROR_EOF);
             for (r = 0; n_pass > 0 && r < n_rung; r++) { AVPacket *eof = NULL; av_thread_message_queue_send(rung[r].mux_q, &eof, 0); }
             ret = AVERROR(pe);
         } else {
@@ -1483,13 +1518,24 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
     }
 
 shutdown:
-    if (aborted) {                                  /* force the pipeline to unwind */
+    if (aborted) {                                  /* force the pipeline to unwind: release ANY
+                                                     * thread blocked in send OR recv on any queue */
         av_thread_message_queue_set_err_send(video_q, AVERROR_EOF);
-        if (audio_q) av_thread_message_queue_set_err_send(audio_q, AVERROR_EOF);
+        av_thread_message_queue_set_err_recv(video_q, AVERROR_EOF);
+        if (audio_q) {
+            av_thread_message_queue_set_err_send(audio_q, AVERROR_EOF);
+            av_thread_message_queue_set_err_recv(audio_q, AVERROR_EOF);
+        }
         for (r = 0; r < n_rung; r++) {
             rung[r].vc.output_done = 1;             /* stop the watchdog */
-            if (rung[r].frame_q) av_thread_message_queue_set_err_send(rung[r].frame_q, AVERROR_EOF);
-            if (rung[r].mux_q)   av_thread_message_queue_set_err_recv(rung[r].mux_q, AVERROR_EOF);
+            if (rung[r].frame_q) {
+                av_thread_message_queue_set_err_send(rung[r].frame_q, AVERROR_EOF);
+                av_thread_message_queue_set_err_recv(rung[r].frame_q, AVERROR_EOF);
+            }
+            if (rung[r].mux_q) {
+                av_thread_message_queue_set_err_send(rung[r].mux_q, AVERROR_EOF);
+                av_thread_message_queue_set_err_recv(rung[r].mux_q, AVERROR_EOF);
+            }
         }
     }
     if (started_decode) pthread_join(th_decode, NULL);
