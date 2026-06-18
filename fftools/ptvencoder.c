@@ -292,20 +292,41 @@ static int build_filter_complex(const char *graph_str, AVCodecContext *vdec,
                                 AVFilterContext **sinks)
 {
     char args[256];
-    AVFilterGraph   *fg    = avfilter_graph_alloc();
-    const AVFilter  *bsrc  = avfilter_get_by_name("buffer");
-    const AVFilter  *bsink = avfilter_get_by_name("buffersink");
-    AVFilterInOut   *gin = NULL, *gout = NULL, *io;
-    AVFilterContext *src = NULL;
+    AVFilterGraph        *fg    = avfilter_graph_alloc();
+    AVFilterGraphSegment *seg   = NULL;
+    const AVFilter       *bsrc  = avfilter_get_by_name("buffer");
+    const AVFilter       *bsink = avfilter_get_by_name("buffersink");
+    AVFilterInOut        *gin = NULL, *gout = NULL, *io;
+    AVFilterContext      *src = NULL;
     AVRational sar = vdec->sample_aspect_ratio.num ? vdec->sample_aspect_ratio : (AVRational){1, 1};
     int ret, i;
 
     if (!fg || !bsrc || !bsink) { ret = AVERROR(ENOMEM); goto fail; }
 
-    /* gin  = the graph's unconnected INPUT(s)  — fed by our buffersrc ([0:v])
-     * gout = the graph's unconnected OUTPUT(s) — each labelled, fed to a sink */
-    if ((ret = avfilter_graph_parse2(fg, graph_str, &gin, &gout)) < 0) {
+    /* Build via the segment API so the hw device is assigned to every filter
+     * BEFORE it is initialised. Plain `hwupload` (unlike `hwupload_cuda`)
+     * hard-requires avctx->hw_device_ctx in its init(); a one-shot
+     * avfilter_graph_parse2() inits filters during the parse, too early to set
+     * it. Sequence: parse -> create_filters -> SET DEVICE -> apply_opts -> init
+     * -> link. After link, gin = the unconnected input ([0:v]) and gout = the
+     * unconnected outputs (each rung label), wired to our buffersrc / sinks. */
+    if ((ret = avfilter_graph_segment_parse(fg, graph_str, 0, &seg)) < 0) {
         av_log(NULL, AV_LOG_ERROR, "filter_complex parse: %s\n", av_err2str(ret)); goto fail;
+    }
+    if ((ret = avfilter_graph_segment_create_filters(seg, 0)) < 0) {
+        av_log(NULL, AV_LOG_ERROR, "filter_complex create: %s\n", av_err2str(ret)); goto fail;
+    }
+    if (hw_device)                                   /* must precede init() (hwupload) */
+        for (unsigned k = 0; k < fg->nb_filters; k++)
+            fg->filters[k]->hw_device_ctx = av_buffer_ref(hw_device);
+    if ((ret = avfilter_graph_segment_apply_opts(seg, 0)) < 0) {
+        av_log(NULL, AV_LOG_ERROR, "filter_complex opts: %s\n", av_err2str(ret)); goto fail;
+    }
+    if ((ret = avfilter_graph_segment_init(seg, 0)) < 0) {
+        av_log(NULL, AV_LOG_ERROR, "filter_complex init: %s\n", av_err2str(ret)); goto fail;
+    }
+    if ((ret = avfilter_graph_segment_link(seg, 0, &gin, &gout)) < 0) {
+        av_log(NULL, AV_LOG_ERROR, "filter_complex link: %s\n", av_err2str(ret)); goto fail;
     }
 
     snprintf(args, sizeof args,
@@ -331,17 +352,15 @@ static int build_filter_complex(const char *graph_str, AVCodecContext *vdec,
         sinks[i] = sink;
     }
 
-    if (hw_device)
-        for (unsigned k = 0; k < fg->nb_filters; k++)
-            fg->filters[k]->hw_device_ctx = av_buffer_ref(hw_device);
-
     if ((ret = avfilter_graph_config(fg, NULL)) < 0) {
         av_log(NULL, AV_LOG_ERROR, "filter_complex config: %s\n", av_err2str(ret)); goto fail;
     }
     *out_fg = fg; *out_src = src;
+    avfilter_graph_segment_free(&seg);
     avfilter_inout_free(&gin); avfilter_inout_free(&gout);
     return 0;
 fail:
+    avfilter_graph_segment_free(&seg);
     avfilter_inout_free(&gin); avfilter_inout_free(&gout);
     avfilter_graph_free(&fg);
     return ret;
