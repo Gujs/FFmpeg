@@ -36,6 +36,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <time.h>
 
 #include "libavutil/avutil.h"
 #include "libavutil/log.h"
@@ -70,9 +71,47 @@ static int64_t g_muxed;
 /* ffmpeg-style progress line (frame=/fps=/bitrate=/speed=); on unless -nostats. */
 static int     g_stats = 1;
 static int64_t g_muxed_bytes;
+/* -stats_period: interval (us) between progress lines. Default 1s; raise for
+ * production (e.g. -stats_period 10 -> every 10s) to keep logs quiet. */
+static int64_t g_stats_period_us = 1000000;
 /* PTV_SLOW_US: inject N us of extra per-emitted-frame consumer cost, to model a
  * slow/blocking encoder on a box that has none. Stress knob, gated. */
 static int     g_slow;
+
+/* PTV_LOG_TS=1: prefix every log line with a local wall-clock timestamp
+ * [YYYY-MM-DD HH:MM:SS.mmm], so production logs are self-dated natively
+ * (replaces piping through `ts`). Wraps libav's line formatter; serialized so
+ * lines from the demux/decode/encode/mux threads don't interleave. */
+static pthread_mutex_t g_log_mtx = PTHREAD_MUTEX_INITIALIZER;
+static void ptv_log_ts_callback(void *avcl, int level, const char *fmt, va_list vl)
+{
+    static int print_prefix = 1, at_line_start = 1;
+    char buf[2048];
+    int n, start;
+
+    if (level > av_log_get_level())
+        return;
+    pthread_mutex_lock(&g_log_mtx);
+    av_log_format_line2(avcl, level, fmt, vl, buf, sizeof buf, &print_prefix);
+    n = (int)strlen(buf);
+    for (start = 0; start < n; ) {
+        const char *nl = memchr(buf + start, '\n', n - start);
+        int end = nl ? (int)(nl - buf) + 1 : n;
+        if (at_line_start) {
+            int64_t now = av_gettime();
+            time_t s = (time_t)(now / 1000000);
+            struct tm tm; char d[24];
+            localtime_r(&s, &tm);
+            strftime(d, sizeof d, "%Y-%m-%d %H:%M:%S", &tm);
+            fprintf(stderr, "[%s.%03d] ", d, (int)((now % 1000000) / 1000));
+            at_line_start = 0;
+        }
+        fwrite(buf + start, 1, (size_t)(end - start), stderr);
+        if (nl) at_line_start = 1;
+        start = end;
+    }
+    pthread_mutex_unlock(&g_log_mtx);
+}
 
 void show_help_default(const char *opt, const char *arg)
 {
@@ -575,7 +614,7 @@ static void *output_thread(void *arg)
 
         if (g_stats && v->is_master) {          /* ffmpeg-style progress line */
             int64_t nows = av_gettime_relative();
-            if (nows - stat_last >= 1000000) {
+            if (nows - stat_last >= g_stats_period_us) {
                 double dt    = (nows - stat_last) / 1000000.0;
                 double fps   = (v->emitted - stat_prev) / (dt > 0 ? dt : 1);
                 double secs  = v->emitted * v->tick_dur_us / 1000000.0;   /* CFR output time */
@@ -1686,6 +1725,8 @@ int main(int argc, char **argv)
     av_log_set_level(AV_LOG_INFO);
     g_diag = !!getenv("PTV_DIAG");
     { const char *s = getenv("PTV_SLOW_US"); g_slow = s ? atoi(s) : 0; }
+    if (getenv("PTV_LOG_TS") && atoi(getenv("PTV_LOG_TS")))   /* native [timestamp] log prefix */
+        av_log_set_callback(ptv_log_ts_callback);
 
     if (argc >= 2 && (!strcmp(argv[1], "-version") || !strcmp(argv[1], "--version"))) {
         printf("ptvencoder (PoC) — FFmpeg %s\n", av_version_info());
@@ -1716,6 +1757,9 @@ int main(int argc, char **argv)
             fcomplex = octx.global_opts.opts[gi].val;
         if (!strcmp(octx.global_opts.opts[gi].key, "init_hw_device"))              /* cuda=cuda:N -> GPU N */
             hwdev = octx.global_opts.opts[gi].val;
+        if (!strcmp(octx.global_opts.opts[gi].key, "stats_period")) {              /* progress-line interval */
+            int64_t p; if (av_parse_time(&p, octx.global_opts.opts[gi].val, 1) >= 0 && p > 0) g_stats_period_us = p;
+        }
     }
     if (octx.groups[1].nb_groups < 1 || octx.groups[0].nb_groups < 1) {
         av_log(NULL, AV_LOG_ERROR,
