@@ -223,7 +223,7 @@ static void *output_thread(void *arg)
     AVFrame *held = av_frame_alloc();
     AVFrame *f;
     int have = 0, ret = 0;
-    int64_t tick = 0, wall0 = 0;
+    int64_t tick = 0, wall0 = 0, last_vpts = -1;
     int64_t diag_t0 = av_gettime_relative(), diag_last = diag_t0;
 
     if (!held)
@@ -265,7 +265,24 @@ static void *output_thread(void *arg)
             int64_t now = av_gettime_relative();
             if (now < target) av_usleep((unsigned)(target - now));
         }
-        held->pts = tick; held->pkt_dts = AV_NOPTS_VALUE; held->duration = 0;
+        /* Stamp output PTS from the frame's SOURCE time on the shared house
+         * anchor (h0) — the SAME mapping audio uses — so dropped/duped frames
+         * never skew the timeline and A/V stays locked. (A pure tick counter
+         * drifts by the number of startup/stall-dropped frames -> A/V skew.)
+         * Pacing still rides the wall clock via `tick`; PTS rides content. */
+        {
+            int64_t vpts;
+            if (held->best_effort_timestamp != AV_NOPTS_VALUE && *v->h0 != AV_NOPTS_VALUE) {
+                int64_t house_us = av_rescale_q(held->best_effort_timestamp, v->ist_tb, AV_TIME_BASE_Q) - *v->h0;
+                if (house_us < 0) house_us = 0;
+                vpts = (house_us + v->tick_dur_us / 2) / v->tick_dur_us;
+            } else {
+                vpts = last_vpts + 1;
+            }
+            if (vpts <= last_vpts) vpts = last_vpts + 1;   /* monotonic CFR; dup -> next slot */
+            held->pts = vpts; held->pkt_dts = AV_NOPTS_VALUE; held->duration = 0;
+            last_vpts = vpts;
+        }
         ret = encode_push(v->mux_q, v->venc, v->ost, held);
         v->last_emit_us = av_gettime_relative();
         tick++; v->emitted++;
