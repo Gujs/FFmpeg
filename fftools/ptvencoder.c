@@ -790,10 +790,34 @@ static void *mux_thread(void *arg)
     return NULL;
 }
 
-static int transcode(const char *in_url, const char *out_url, const char *out_fmt,
-                     const char *venc_name, const char *rate_str, int mode, int want_audio,
-                     const char *vf, int do_deint, int scale_w, int scale_h, int hw_cuda)
+/* resolved per-output selection from an ffmpeg-style command (see resolve_plan) */
+typedef struct Sel {
+    int            have;                  /* 1 if -map present (explicit plan) */
+    int            vstream;               /* input video stream to transcode (-1 none) */
+    const AVCodec *vdec;
+    const char    *venc;                  /* -c:v encoder name (NULL = default) */
+    const char    *vf;                    /* -filter:v / -vf */
+    const char    *vbr;                   /* -b:v */
+    int            astream;               /* input audio stream to transcode (-1 none) */
+    const AVCodec *adec;
+    const char    *aenc;                  /* -c:a:N encoder name (NULL = aac) */
+    const char    *abr;                   /* -b:a:N */
+    int            copy[PTV_MAX_PASS];    /* input stream indices to passthrough (-c copy) */
+    int            n_copy;
+} Sel;
+static const char *og_get(OptionGroup *g, const char *key);
+static int resolve_plan(AVFormatContext *ifmt, OptionGroup *outg, Sel *s);
+
+/* transcode one output: ing/outg are the parsed ffmpeg-style input/output option
+ * groups; selection (transcode vs copy) comes from their -map/-c (resolve_plan). */
+static int transcode(OptionGroup *ing, OptionGroup *outg, int mode)
 {
+    const char *in_url   = ing->arg;
+    const char *out_url  = outg->arg;
+    const char *out_fmt  = og_get(outg, "f");
+    const char *rate_str = og_get(outg, "r");
+    int   hw_cuda = 0;
+    Sel   sel;
     AVFormatContext *ifmt = NULL, *ofmt = NULL;
     AVCodecContext  *vdec = NULL, *venc = NULL, *adec = NULL, *aenc = NULL;
     const AVCodec   *vdecoder = NULL, *vencoder = NULL, *adecoder = NULL, *aencoder = NULL;
@@ -815,7 +839,7 @@ static int transcode(const char *in_url, const char *out_url, const char *out_fm
     memset(&vc, 0, sizeof(vc)); memset(&as, 0, sizeof(as));
     memset(&da, 0, sizeof(da)); memset(&ma, 0, sizeof(ma));
 
-    if ((ret = avformat_open_input(&ifmt, in_url, NULL, NULL)) < 0) {
+    if ((ret = avformat_open_input(&ifmt, in_url, NULL, &ing->format_opts)) < 0) {
         av_log(NULL, AV_LOG_ERROR, "cannot open input '%s': %s\n", in_url, av_err2str(ret)); return ret;
     }
     if ((ret = avformat_find_stream_info(ifmt, NULL)) < 0) {
@@ -823,9 +847,14 @@ static int transcode(const char *in_url, const char *out_url, const char *out_fm
     }
     av_dump_format(ifmt, 0, in_url, 0);   /* ffmpeg-style "Input #0 ... Stream ..." */
 
-    vstream = av_find_best_stream(ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, &vdecoder, 0);
-    if (vstream < 0) { av_log(NULL, AV_LOG_ERROR, "no video stream\n"); ret = vstream; goto end; }
+    /* resolve -map/-c into the transcode/copy selection (or auto, if no -map) */
+    if ((ret = resolve_plan(ifmt, outg, &sel)) < 0) goto end;
+    vstream   = sel.vstream;
+    vdecoder  = sel.vdec;
+    if (vstream < 0 || !vdecoder) { av_log(NULL, AV_LOG_ERROR, "no video stream selected\n"); ret = AVERROR(EINVAL); goto end; }
     vist = ifmt->streams[vstream];
+    /* CUDA backend when the video filter targets it */
+    hw_cuda = sel.vf && (strstr(sel.vf, "_cuda") || strstr(sel.vf, "hwupload_cuda")) ? 1 : 0;
 
     vdec = avcodec_alloc_context3(vdecoder);
     if (!vdec) { ret = AVERROR(ENOMEM); goto end; }
@@ -844,10 +873,13 @@ static int transcode(const char *in_url, const char *out_url, const char *out_fm
         goto end;
     }
 
-    vencoder = avcodec_find_encoder_by_name(venc_name);
-    if (!vencoder) {
-        av_log(NULL, AV_LOG_WARNING, "encoder '%s' not found, using mpeg2video\n", venc_name);
-        vencoder = avcodec_find_encoder_by_name("mpeg2video");
+    {
+        const char *venc_name = sel.venc ? sel.venc : "h264_videotoolbox";
+        vencoder = avcodec_find_encoder_by_name(venc_name);
+        if (!vencoder) {
+            av_log(NULL, AV_LOG_WARNING, "encoder '%s' not found, using mpeg2video\n", venc_name);
+            vencoder = avcodec_find_encoder_by_name("mpeg2video");
+        }
     }
     if (!vencoder) { ret = AVERROR_ENCODER_NOT_FOUND; goto end; }
 
@@ -860,13 +892,13 @@ static int transcode(const char *in_url, const char *out_url, const char *out_fm
                 : vist->avg_frame_rate.num ? vist->avg_frame_rate : (AVRational){25, 1};
     }
 
-    /* optional video filter: raw -vf chain, or convenience deinterlace/scale (CPU or CUDA) */
-    if (vf || do_deint || scale_w > 0) {
+    /* video filter: the -filter:v / -vf chain (raw libavfilter), CPU or CUDA */
+    if (sel.vf) {
         if (hw_cuda &&
             (ret = av_hwdevice_ctx_create(&hw_device, AV_HWDEVICE_TYPE_CUDA, NULL, NULL, 0)) < 0) {
-            av_log(NULL, AV_LOG_ERROR, "cannot create CUDA device (--hw cuda): %s\n", av_err2str(ret)); goto end;
+            av_log(NULL, AV_LOG_ERROR, "cannot create CUDA device: %s\n", av_err2str(ret)); goto end;
         }
-        if ((ret = build_video_filter(&vc, vdec, vist->time_base, vf, do_deint, scale_w, scale_h,
+        if ((ret = build_video_filter(&vc, vdec, vist->time_base, sel.vf, 0, 0, 0,
                                       hw_cuda, hw_device, &fw, &fh, &fpix, &fhwfr)) < 0) {
             av_log(NULL, AV_LOG_ERROR, "build video filter: %s\n", av_err2str(ret)); goto end;
         }
@@ -884,33 +916,28 @@ static int transcode(const char *in_url, const char *out_url, const char *out_fm
     venc->time_base = av_inv_q(out_fps); venc->framerate = out_fps;
     venc->bit_rate = 3000000; venc->gop_size = 2 * (out_fps.num / FFMAX(out_fps.den, 1));
     if (ofmt->oformat->flags & AVFMT_GLOBALHEADER) venc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-    if ((ret = avcodec_open2(venc, vencoder, NULL)) < 0) {
-        av_log(NULL, AV_LOG_ERROR, "open video encoder '%s': %s\n", vencoder->name, av_err2str(ret)); goto end;
+    {   /* -b:v + forwarded encoder options (-preset/-rc/-maxrate/-g/-s12m_tc/...) */
+        AVDictionary *vopts = NULL;
+        av_dict_copy(&vopts, outg->codec_opts, 0);
+        if (sel.vbr) av_dict_set(&vopts, "b", sel.vbr, 0);
+        ret = avcodec_open2(venc, vencoder, &vopts);
+        av_dict_free(&vopts);
+        if (ret < 0) { av_log(NULL, AV_LOG_ERROR, "open video encoder '%s': %s\n", vencoder->name, av_err2str(ret)); goto end; }
     }
     vc.ost = avformat_new_stream(ofmt, NULL);
     if (!vc.ost) { ret = AVERROR(ENOMEM); goto end; }
     avcodec_parameters_from_context(vc.ost->codecpar, venc);
     vc.ost->time_base = venc->time_base;
 
-    /* audio (optional). Prefer a <=2ch (stereo) source for the AAC transcode; any
-     * multichannel stream (e.g. AC-3 5.1) is preserved untouched via passthrough,
-     * matching the broadcast ladder convention. */
-    if (want_audio) {
-        astream = av_find_best_stream(ifmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
-        for (si = 0; si < (int)ifmt->nb_streams; si++) {
-            AVCodecParameters *cp = ifmt->streams[si]->codecpar;
-            if (cp->codec_type == AVMEDIA_TYPE_AUDIO &&
-                cp->ch_layout.nb_channels > 0 && cp->ch_layout.nb_channels <= 2) {
-                astream = si; break;
-            }
-        }
-        if (astream >= 0)
-            adecoder = avcodec_find_decoder(ifmt->streams[astream]->codecpar->codec_id);
-    }
+    /* audio: the -map'd audio stream whose -c:a is an encoder (resolve_plan).
+     * Multichannel (AC-3 5.1) etc. are preserved via the passthrough list below. */
+    astream  = sel.astream;
+    adecoder = sel.adec;
     if (astream >= 0) {
         aist = ifmt->streams[astream];
         adec = avcodec_alloc_context3(adecoder);
-        aencoder = avcodec_find_encoder_by_name("aac");
+        aencoder = avcodec_find_encoder_by_name(sel.aenc ? sel.aenc : "aac");
+        if (!aencoder) aencoder = avcodec_find_encoder_by_name("aac");
         if (adec && aencoder) {
             avcodec_parameters_to_context(adec, aist->codecpar);
             adec->pkt_timebase = aist->time_base;
@@ -923,8 +950,11 @@ static int transcode(const char *in_url, const char *out_url, const char *out_fm
                 aenc->bit_rate    = 160000;
                 aenc->time_base   = (AVRational){1, 48000};
                 if (ofmt->oformat->flags & AVFMT_GLOBALHEADER) aenc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-                if (avcodec_open2(aenc, aencoder, NULL) < 0) { av_log(NULL, AV_LOG_WARNING, "audio encoder failed; video only\n"); }
-                else {
+                { AVDictionary *aopts = NULL; int ar2;
+                  if (sel.abr) av_dict_set(&aopts, "b", sel.abr, 0);
+                  ar2 = avcodec_open2(aenc, aencoder, &aopts); av_dict_free(&aopts);
+                  if (ar2 < 0) av_log(NULL, AV_LOG_WARNING, "audio encoder failed; video only\n");
+                  else {
                     as.ost = avformat_new_stream(ofmt, NULL);
                     avcodec_parameters_from_context(as.ost->codecpar, aenc);
                     as.ost->time_base = aenc->time_base;
@@ -938,6 +968,7 @@ static int transcode(const char *in_url, const char *out_url, const char *out_fm
                         as.out_rate = 48000; as.out_sfmt = aenc->sample_fmt;
                         have_audio = 1;
                     }
+                  }
                 }
             }
         }
@@ -946,15 +977,11 @@ static int transcode(const char *in_url, const char *out_url, const char *out_fm
     /* passthrough (copy): every input stream we don't transcode — extra audio
      * (e.g. AC-3 5.1), DVB subtitles, data/SCTE-35 — mapped 1:1 to the output.
      * Must be created before the header is written. */
-    for (si = 0; si < (int)ifmt->nb_streams && n_pass < PTV_MAX_PASS; si++) {
-        AVStream *ist = ifmt->streams[si];
-        enum AVMediaType mt = ist->codecpar->codec_type;
+    for (si = 0; si < sel.n_copy && n_pass < PTV_MAX_PASS; si++) {
+        int sidx = sel.copy[si];
+        AVStream *ist = ifmt->streams[sidx];
         AVStream *os;
         AVDictionaryEntry *lang;
-        if (si == vstream || (have_audio && si == astream))
-            continue;
-        if (mt != AVMEDIA_TYPE_AUDIO && mt != AVMEDIA_TYPE_SUBTITLE && mt != AVMEDIA_TYPE_DATA)
-            continue;
         os = avformat_new_stream(ofmt, NULL);
         if (!os) { ret = AVERROR(ENOMEM); goto end; }
         if ((ret = avcodec_parameters_copy(os->codecpar, ist->codecpar)) < 0) goto end;
@@ -963,7 +990,7 @@ static int transcode(const char *in_url, const char *out_url, const char *out_fm
         os->disposition = ist->disposition;
         lang = av_dict_get(ist->metadata, "language", NULL, 0);
         if (lang) av_dict_set(&os->metadata, "language", lang->value, 0);
-        pass[n_pass].in_index = si;
+        pass[n_pass].in_index = sidx;
         pass[n_pass].ost      = os;
         pass[n_pass].in_tb    = ist->time_base;
         n_pass++;
@@ -982,7 +1009,19 @@ static int transcode(const char *in_url, const char *out_url, const char *out_fm
      * wait so A/V flush promptly (well above the A/V + B-frame DTS spread, well
      * below the sparse gap); sparse packets emit when they arrive. */
     ofmt->max_interleave_delta = 200000;   /* 200 ms */
-    if ((ret = avformat_write_header(ofmt, NULL)) < 0) {
+    {   /* forwarded muxer options (-mpegts_flags/-pat_period/-pcr_period/...) + file -metadata */
+        AVDictionary *mopts = NULL; int mi;
+        av_dict_copy(&mopts, outg->format_opts, 0);
+        for (mi = 0; mi < outg->nb_opts; mi++) {
+            char kv[256], *eq;            /* -metadata service_name=CineStar (file-level) */
+            if (strcmp(outg->opts[mi].key, "metadata")) continue;
+            snprintf(kv, sizeof kv, "%s", outg->opts[mi].val);
+            if ((eq = strchr(kv, '='))) { *eq = 0; av_dict_set(&ofmt->metadata, kv, eq + 1, 0); }
+        }
+        ret = avformat_write_header(ofmt, &mopts);
+        av_dict_free(&mopts);
+    }
+    if (ret < 0) {
         av_log(NULL, AV_LOG_ERROR, "write header: %s\n", av_err2str(ret)); goto end;
     }
     hdr_written = 1;
@@ -1105,6 +1144,7 @@ static const OptionDef ptv_options[] = {
     { "v",                OPT_TYPE_STRING, 0,                        { .off = 0 }, "log level", "level" },
     { "loglevel",         OPT_TYPE_STRING, 0,                        { .off = 0 }, "log level", "level" },
     { "stats",            OPT_TYPE_BOOL,   0,                        { .off = 0 }, "print stats" },
+    { "nostats",          OPT_TYPE_BOOL,   0,                        { .off = 0 }, "disable stats" },
     { "stats_period",     OPT_TYPE_STRING, 0,                        { .off = 0 }, "stats period", "t" },
     { "y",                OPT_TYPE_BOOL,   0,                        { .off = 0 }, "overwrite output" },
     { "n",                OPT_TYPE_BOOL,   0,                        { .off = 0 }, "never overwrite" },
@@ -1217,6 +1257,68 @@ static const char *map_spec(const char *v, char *buf, size_t bufsz, int *optiona
 
 /* PTV_PLAN_DEBUG=1: parse an ffmpeg-style command, open the input, resolve each
  * -map to an input stream + its copy/encode decision (and applied opts), print. */
+/* Resolve an output group's -map/-c into a Sel (transcode vs copy decision).
+ * No -map -> auto (best video + first <=2ch audio + copy the rest), back-compat. */
+static int resolve_plan(AVFormatContext *ifmt, OptionGroup *outg, Sel *s)
+{
+    int o, si, tcnt[5] = {0}, nmap = 0;
+    memset(s, 0, sizeof *s);
+    s->vstream = s->astream = -1;
+    s->vf = og_get(outg, "filter:v"); if (!s->vf) s->vf = og_get(outg, "vf");
+    for (o = 0; o < outg->nb_opts; o++) if (!strcmp(outg->opts[o].key, "map")) nmap++;
+    s->have = nmap > 0;
+
+    if (!nmap) {                       /* no -map: auto-select (back-compat) */
+        s->vstream = av_find_best_stream(ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, &s->vdec, 0);
+        for (si = 0; si < (int)ifmt->nb_streams; si++) {
+            AVCodecParameters *cp = ifmt->streams[si]->codecpar;
+            if (cp->codec_type == AVMEDIA_TYPE_AUDIO &&
+                cp->ch_layout.nb_channels > 0 && cp->ch_layout.nb_channels <= 2) { s->astream = si; break; }
+        }
+        if (s->astream < 0) s->astream = av_find_best_stream(ifmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
+        if (s->astream >= 0) s->adec = avcodec_find_decoder(ifmt->streams[s->astream]->codecpar->codec_id);
+        for (si = 0; si < (int)ifmt->nb_streams; si++) {
+            enum AVMediaType mt = ifmt->streams[si]->codecpar->codec_type;
+            if (si == s->vstream || si == s->astream) continue;
+            if ((mt == AVMEDIA_TYPE_AUDIO || mt == AVMEDIA_TYPE_SUBTITLE || mt == AVMEDIA_TYPE_DATA)
+                && s->n_copy < PTV_MAX_PASS) s->copy[s->n_copy++] = si;
+        }
+        s->venc = og_get(outg, "c:v"); if (!s->venc) s->venc = og_get(outg, "c");
+        s->vbr  = og_get(outg, "b:v"); if (!s->vbr)  s->vbr  = og_get(outg, "b");
+        return 0;
+    }
+
+    for (o = 0; o < outg->nb_opts; o++) {              /* explicit -map plan */
+        char buf[64]; int optional; const char *spec, *mv = outg->opts[o].val;
+        if (strcmp(outg->opts[o].key, "map")) continue;
+        if (mv[0] == '[') continue;                    /* filter-output label: ladder phase */
+        spec = map_spec(mv, buf, sizeof buf, &optional);
+        for (si = 0; si < (int)ifmt->nb_streams; si++) {
+            enum AVMediaType mt; char t; int ti, idx; const char *codec;
+            if (avformat_match_stream_specifier(ifmt, ifmt->streams[si], spec) <= 0) continue;
+            mt  = ifmt->streams[si]->codecpar->codec_type;
+            t   = mt==AVMEDIA_TYPE_VIDEO?'v':mt==AVMEDIA_TYPE_AUDIO?'a':
+                  mt==AVMEDIA_TYPE_SUBTITLE?'s':mt==AVMEDIA_TYPE_DATA?'d':'?';
+            ti  = mt==AVMEDIA_TYPE_VIDEO?0:mt==AVMEDIA_TYPE_AUDIO?1:
+                  mt==AVMEDIA_TYPE_SUBTITLE?2:mt==AVMEDIA_TYPE_DATA?3:4;
+            idx = tcnt[ti]++;
+            codec = og_spec(outg, "c", t, idx);
+            if (codec && !strcmp(codec, "copy")) {
+                if (s->n_copy < PTV_MAX_PASS) s->copy[s->n_copy++] = si;
+            } else if (mt == AVMEDIA_TYPE_VIDEO && s->vstream < 0) {
+                s->vstream = si; s->venc = codec; s->vbr = og_spec(outg, "b", t, idx);
+                s->vdec = avcodec_find_decoder(ifmt->streams[si]->codecpar->codec_id);
+            } else if (mt == AVMEDIA_TYPE_AUDIO && s->astream < 0) {
+                s->astream = si; s->aenc = codec; s->abr = og_spec(outg, "b", t, idx);
+                s->adec = avcodec_find_decoder(ifmt->streams[si]->codecpar->codec_id);
+            } else if (s->n_copy < PTV_MAX_PASS) {
+                s->copy[s->n_copy++] = si;             /* extra encode streams unsupported -> copy */
+            }
+        }
+    }
+    return 0;
+}
+
 static int plan_resolve_and_print(int argc, char **argv)
 {
     OptionParseContext octx;
@@ -1289,11 +1391,9 @@ static int plan_resolve_and_print(int argc, char **argv)
 
 int main(int argc, char **argv)
 {
-    const char *in_url = NULL, *out_url = NULL, *rate = NULL, *out_fmt = NULL;
-    const char *venc = "h264_videotoolbox";
-    const char *vfilter = NULL;
-    int mode = -1, want_audio = 1, i;
-    int do_deint = 0, scale_w = 0, scale_h = 0, hw_cuda = 0;
+    OptionParseContext octx;
+    OptionGroup *ing, *outg;
+    int mode = -1, ret, gi;
 
     init_dynload();
     av_log_set_level(AV_LOG_INFO);
@@ -1318,38 +1418,21 @@ int main(int argc, char **argv)
     if (getenv("PTV_PLAN_DEBUG"))    /* resolve -map/-c against the input, print plan, exit */
         return plan_resolve_and_print(argc, argv) < 0 ? 1 : 0;
 
-    for (i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "-i") && i + 1 < argc)        in_url = argv[++i];
-        else if (!strcmp(argv[i], "-c:v") && i + 1 < argc) venc   = argv[++i];
-        else if (!strcmp(argv[i], "-r") && i + 1 < argc)   rate   = argv[++i];
-        else if (!strcmp(argv[i], "-f") && i + 1 < argc)   out_fmt = argv[++i];
-        else if (!strcmp(argv[i], "-an"))                  want_audio = 0;
-        else if (!strcmp(argv[i], "-nostats"))             g_stats = 0;
-        else if (!strcmp(argv[i], "-stats"))               g_stats = 1;
-        else if ((!strcmp(argv[i], "-vf") || !strcmp(argv[i], "-filter:v")) && i + 1 < argc) vfilter = argv[++i];
-        else if (!strcmp(argv[i], "--deint"))              do_deint = 1;
-        else if (!strcmp(argv[i], "-s") && i + 1 < argc) {
-            if (sscanf(argv[++i], "%dx%d", &scale_w, &scale_h) != 2 || scale_w <= 0 || scale_h <= 0) {
-                av_log(NULL, AV_LOG_ERROR, "-s expects WxH (e.g. 1280x720)\n"); return 1;
-            }
-        }
-        else if (!strcmp(argv[i], "--hw") && i + 1 < argc) {
-            const char *h = argv[++i];
-            if (!strcmp(h, "cuda")) hw_cuda = 1;
-            else if (!strcmp(h, "none") || !strcmp(h, "cpu")) hw_cuda = 0;
-            else { av_log(NULL, AV_LOG_ERROR, "--hw must be cuda|cpu\n"); return 1; }
-        }
-        else if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
-            const char *m = argv[++i];
-            if (!strcmp(m, "live")) mode = 1;
-            else if (!strcmp(m, "offline")) mode = 0;
-            else { av_log(NULL, AV_LOG_ERROR, "--mode must be live|offline\n"); return 1; }
-        }
-        else if (argv[i][0] != '-') out_url = argv[i];
-        else { av_log(NULL, AV_LOG_ERROR, "unknown option '%s'\n", argv[i]); return 1; }
+    /* ffmpeg-style: split argv into the input (-i) group + output (url) group(s) */
+    if (split_commandline(&octx, argc, argv, ptv_options, ptv_groups,
+                           sizeof(ptv_groups)/sizeof(ptv_groups[0])) < 0) {
+        av_log(NULL, AV_LOG_ERROR, "command parse failed\n"); return 1;
     }
-
-    if (!in_url || !out_url) { show_help_default(NULL, NULL); return 1; }
-    return transcode(in_url, out_url, out_fmt, venc, rate, mode, want_audio,
-                     vfilter, do_deint, scale_w, scale_h, hw_cuda) < 0 ? 1 : 0;
+    for (gi = 0; gi < octx.global_opts.nb_opts; gi++)   /* honor -stats/-nostats */
+        if (!strcmp(octx.global_opts.opts[gi].key, "nostats")) g_stats = 0;
+    if (octx.groups[1].nb_groups < 1 || octx.groups[0].nb_groups < 1) {
+        av_log(NULL, AV_LOG_ERROR,
+               "usage: ptvencoder [opts] -i <input> [-map .. -c:TYPE .. -b:TYPE .. -filter:v ..] <output>\n");
+        uninit_parse_context(&octx); return 1;
+    }
+    ing  = &octx.groups[1].groups[0];   /* first input */
+    outg = &octx.groups[0].groups[0];   /* first output (multiple = ladder, future) */
+    ret  = transcode(ing, outg, mode);
+    uninit_parse_context(&octx);
+    return ret < 0 ? 1 : 0;
 }
