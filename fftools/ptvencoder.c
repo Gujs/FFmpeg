@@ -46,8 +46,12 @@
 #include "libavutil/channel_layout.h"
 #include "libavutil/audio_fifo.h"
 #include "libavutil/threadmessage.h"
+#include "libavutil/hwcontext.h"
 #include "libavformat/avformat.h"
 #include "libavcodec/avcodec.h"
+#include "libavfilter/avfilter.h"
+#include "libavfilter/buffersrc.h"
+#include "libavfilter/buffersink.h"
 #include "libswresample/swresample.h"
 
 #include "cmdutils.h"
@@ -78,10 +82,13 @@ void show_help_default(const char *opt, const char *arg)
         "    -r <rate>     output frame rate / house-clock rate (e.g. 25, 30000/1001); default = source\n"
         "    -f <mux>      output format (default: guessed from output; mpegts for udp://...)\n"
         "    -an           disable audio\n"
+        "    -s <WxH>      scale to WxH (e.g. 1280x720)\n"
+        "    --deint       deinterlace (bwdif)\n"
+        "    --hw cuda|cpu filter backend: cuda = bwdif_cuda/scale_cuda (-> NVENC); cpu (default)\n"
         "    --mode live|offline   live = wall-clock paced; offline = media-clock. default: auto from input\n"
         "    -version, -h\n"
         "\n"
-        "  Phase 1 increment 5: pull-based pipeline (demux/decode/output/audio/mux).\n");
+        "  Phase 1 increment 6: video filters (deinterlace + scale, CPU or CUDA).\n");
 }
 
 /* Free function for AVThreadMessageQueue elements (AVPacket* / AVFrame*; a NULL
@@ -131,6 +138,10 @@ typedef struct VideoCtx {
     AVRational       ist_tb;
     int64_t         *h0;             /* shared A/V input anchor (us) */
     pthread_mutex_t *h0_lock;
+    /* optional video filter (deinterlace / scale), decode-thread local */
+    int              filtering;
+    AVFilterGraph   *fg;
+    AVFilterContext *fsrc, *fsink;
     /* output side */
     AVCodecContext  *venc;
     AVStream        *ost;
@@ -167,14 +178,105 @@ static void push_frame(VideoCtx *v, AVFrame *out)
     }
 }
 
+/* Build the optional video filter graph: buffer -> [deint][,scale] -> buffersink.
+ * CPU backend: bwdif + scale + format=yuv420p. CUDA backend: hwupload_cuda +
+ * bwdif_cuda + scale_cuda (output stays on GPU, fed straight to NVENC).
+ * On success sets v->filtering and returns the output w/h/pixfmt (+ hw_frames_ctx
+ * for the CUDA path) so the encoder can be configured to match. */
+static int build_video_filter(VideoCtx *v, AVCodecContext *vdec, AVRational tb,
+                              int do_deint, int sw, int sh, int hw_cuda,
+                              AVBufferRef *hw_device,
+                              int *out_w, int *out_h, int *out_pixfmt,
+                              AVBufferRef **out_hwfr)
+{
+    char args[256], desc[256];
+    const AVFilter *bsrc  = avfilter_get_by_name("buffer");
+    const AVFilter *bsink = avfilter_get_by_name("buffersink");
+    AVFilterInOut *ins = avfilter_inout_alloc(), *outs = avfilter_inout_alloc();
+    AVRational sar = vdec->sample_aspect_ratio.num ? vdec->sample_aspect_ratio : (AVRational){1, 1};
+    char *p = desc; int rem = sizeof(desc), n = 0, ret;
+
+    if (!bsrc || !bsink || !ins || !outs) { ret = AVERROR(ENOMEM); goto end; }
+    v->fg = avfilter_graph_alloc();
+    if (!v->fg) { ret = AVERROR(ENOMEM); goto end; }
+
+    snprintf(args, sizeof(args),
+             "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
+             vdec->width, vdec->height, vdec->pix_fmt, tb.num, tb.den, sar.num, sar.den);
+    if ((ret = avfilter_graph_create_filter(&v->fsrc, bsrc, "in", args, NULL, v->fg)) < 0) goto end;
+    if ((ret = avfilter_graph_create_filter(&v->fsink, bsink, "out", NULL, NULL, v->fg)) < 0) goto end;
+
+#define APPEND(...) do { int k = snprintf(p, rem, "%s", n++ ? "," : ""); p += k; rem -= k; \
+                         k = snprintf(p, rem, __VA_ARGS__); p += k; rem -= k; } while (0)
+    if (hw_cuda) {
+        APPEND("hwupload_cuda");
+        if (do_deint) APPEND("bwdif_cuda");
+        if (sw > 0)   APPEND("scale_cuda=%d:%d", sw, sh);
+    } else {
+        if (do_deint) APPEND("bwdif=mode=send_frame:deint=all");
+        if (sw > 0)   APPEND("scale=%d:%d:flags=bicubic", sw, sh);
+        APPEND("format=yuv420p");
+    }
+#undef APPEND
+
+    /* outputs = the buffer src feeding the parsed chain; inputs = the sink it feeds */
+    outs->name = av_strdup("in");  outs->filter_ctx = v->fsrc;  outs->pad_idx = 0; outs->next = NULL;
+    ins->name  = av_strdup("out"); ins->filter_ctx  = v->fsink; ins->pad_idx  = 0; ins->next  = NULL;
+    if ((ret = avfilter_graph_parse_ptr(v->fg, desc, &ins, &outs, NULL)) < 0) goto end;
+
+    if (hw_cuda && hw_device)
+        for (unsigned i = 0; i < v->fg->nb_filters; i++)
+            v->fg->filters[i]->hw_device_ctx = av_buffer_ref(hw_device);
+
+    if ((ret = avfilter_graph_config(v->fg, NULL)) < 0) goto end;
+
+    *out_w      = av_buffersink_get_w(v->fsink);
+    *out_h      = av_buffersink_get_h(v->fsink);
+    *out_pixfmt = av_buffersink_get_format(v->fsink);
+    if (out_hwfr) {
+        AVBufferRef *hf = av_buffersink_get_hw_frames_ctx(v->fsink);
+        *out_hwfr = hf ? av_buffer_ref(hf) : NULL;
+    }
+    av_log(NULL, AV_LOG_INFO, "ptvencoder: filter [%s] -> %dx%d\n", desc, *out_w, *out_h);
+    v->filtering = 1;
+    ret = 0;
+end:
+    avfilter_inout_free(&ins);
+    avfilter_inout_free(&outs);
+    return ret;
+}
+
+/* Hand a decoded frame downstream: straight to the jitter buffer, or through the
+ * filter graph first. Source PTS is preserved (frame->pts) so the output thread's
+ * content-PTS A/V anchoring still holds across the filter. */
+static void emit_video(VideoCtx *v, AVFrame *frame, AVFrame *filt)
+{
+    if (!v->filtering) {
+        AVFrame *out = av_frame_alloc();
+        if (!out) { av_frame_unref(frame); return; }
+        av_frame_move_ref(out, frame);
+        push_frame(v, out);
+        return;
+    }
+    frame->pts = frame->best_effort_timestamp;   /* carry source time through the graph */
+    if (av_buffersrc_add_frame(v->fsrc, frame) < 0)   /* consumes frame */
+        return;
+    while (av_buffersink_get_frame(v->fsink, filt) >= 0) {
+        AVFrame *out = av_frame_alloc();
+        if (out) { av_frame_move_ref(out, filt); push_frame(v, out); }
+        else     { av_frame_unref(filt); }
+    }
+}
+
 static void *decode_thread(void *arg)
 {
     VideoCtx *v = arg;
     AVPacket *pkt;
     AVFrame  *frame = av_frame_alloc();
+    AVFrame  *filt  = av_frame_alloc();
     int ret = 0;
 
-    if (!frame)
+    if (!frame || !filt)
         goto done;
     for (;;) {
         ret = av_thread_message_queue_recv(v->video_q, &pkt, 0);
@@ -193,12 +295,7 @@ static void *decode_thread(void *arg)
                 pthread_mutex_unlock(v->h0_lock);
             }
             v->dec_frames++;
-            {
-                AVFrame *out = av_frame_alloc();
-                if (!out) { av_frame_unref(frame); continue; }
-                av_frame_move_ref(out, frame);
-                push_frame(v, out);
-            }
+            emit_video(v, frame, filt);
         }
     }
     /* flush decoder */
@@ -206,11 +303,19 @@ static void *decode_thread(void *arg)
     while (avcodec_receive_frame(v->vdec, frame) >= 0) {
         if (frame->flags & AV_FRAME_FLAG_CORRUPT) { av_frame_unref(frame); continue; }
         v->dec_frames++;
-        AVFrame *out = av_frame_alloc();
-        if (out) { av_frame_move_ref(out, frame); push_frame(v, out); }
-        else av_frame_unref(frame);
+        emit_video(v, frame, filt);
+    }
+    /* flush filter graph */
+    if (v->filtering) {
+        int fr = av_buffersrc_add_frame(v->fsrc, NULL); (void)fr;
+        while (av_buffersink_get_frame(v->fsink, filt) >= 0) {
+            AVFrame *out = av_frame_alloc();
+            if (out) { av_frame_move_ref(out, filt); push_frame(v, out); }
+            else     { av_frame_unref(filt); }
+        }
     }
 done:
+    av_frame_free(&filt);
     av_frame_free(&frame);
     av_thread_message_queue_set_err_recv(v->video_q, AVERROR_EOF);  /* unblock demux */
     av_thread_message_queue_set_err_send(v->frame_q, AVERROR_EOF);  /* tell output done */
@@ -272,8 +377,10 @@ static void *output_thread(void *arg)
          * Pacing still rides the wall clock via `tick`; PTS rides content. */
         {
             int64_t vpts;
-            if (held->best_effort_timestamp != AV_NOPTS_VALUE && *v->h0 != AV_NOPTS_VALUE) {
-                int64_t house_us = av_rescale_q(held->best_effort_timestamp, v->ist_tb, AV_TIME_BASE_Q) - *v->h0;
+            int64_t src_ts = held->best_effort_timestamp != AV_NOPTS_VALUE
+                           ? held->best_effort_timestamp : held->pts;   /* filtered frames carry pts */
+            if (src_ts != AV_NOPTS_VALUE && *v->h0 != AV_NOPTS_VALUE) {
+                int64_t house_us = av_rescale_q(src_ts, v->ist_tb, AV_TIME_BASE_Q) - *v->h0;
                 if (house_us < 0) house_us = 0;
                 vpts = (house_us + v->tick_dur_us / 2) / v->tick_dur_us;
             } else {
@@ -574,13 +681,16 @@ static void *mux_thread(void *arg)
 }
 
 static int transcode(const char *in_url, const char *out_url, const char *out_fmt,
-                     const char *venc_name, const char *rate_str, int mode, int want_audio)
+                     const char *venc_name, const char *rate_str, int mode, int want_audio,
+                     int do_deint, int scale_w, int scale_h, int hw_cuda)
 {
     AVFormatContext *ifmt = NULL, *ofmt = NULL;
     AVCodecContext  *vdec = NULL, *venc = NULL, *adec = NULL, *aenc = NULL;
     const AVCodec   *vdecoder = NULL, *vencoder = NULL, *adecoder = NULL, *aencoder = NULL;
     AVStream        *vist = NULL, *aist = NULL;
     AVThreadMessageQueue *video_q = NULL, *audio_q = NULL, *frame_q = NULL, *mux_q = NULL;
+    AVBufferRef     *hw_device = NULL, *fhwfr = NULL;
+    int              fw = 0, fh = 0, fpix = AV_PIX_FMT_NONE;
     VideoCtx         vc;
     AudioState       as;
     DemuxArgs        da; MuxArgs ma;
@@ -638,10 +748,27 @@ static int transcode(const char *in_url, const char *out_url, const char *out_fm
                 : vist->avg_frame_rate.num ? vist->avg_frame_rate : (AVRational){25, 1};
     }
 
+    /* optional video filter: deinterlace and/or scale (CPU or CUDA backend) */
+    if (do_deint || scale_w > 0) {
+        if (hw_cuda &&
+            (ret = av_hwdevice_ctx_create(&hw_device, AV_HWDEVICE_TYPE_CUDA, NULL, NULL, 0)) < 0) {
+            av_log(NULL, AV_LOG_ERROR, "cannot create CUDA device (--hw cuda): %s\n", av_err2str(ret)); goto end;
+        }
+        if ((ret = build_video_filter(&vc, vdec, vist->time_base, do_deint, scale_w, scale_h,
+                                      hw_cuda, hw_device, &fw, &fh, &fpix, &fhwfr)) < 0) {
+            av_log(NULL, AV_LOG_ERROR, "build video filter: %s\n", av_err2str(ret)); goto end;
+        }
+    }
+
     venc = avcodec_alloc_context3(vencoder);
     if (!venc) { ret = AVERROR(ENOMEM); goto end; }
-    venc->width = vdec->width; venc->height = vdec->height;
-    venc->pix_fmt = vdec->pix_fmt != AV_PIX_FMT_NONE ? vdec->pix_fmt : AV_PIX_FMT_YUV420P;
+    if (vc.filtering) {
+        venc->width = fw; venc->height = fh; venc->pix_fmt = fpix;
+        if (fhwfr) venc->hw_frames_ctx = av_buffer_ref(fhwfr);   /* CUDA frames -> NVENC */
+    } else {
+        venc->width = vdec->width; venc->height = vdec->height;
+        venc->pix_fmt = vdec->pix_fmt != AV_PIX_FMT_NONE ? vdec->pix_fmt : AV_PIX_FMT_YUV420P;
+    }
     venc->time_base = av_inv_q(out_fps); venc->framerate = out_fps;
     venc->bit_rate = 3000000; venc->gop_size = 2 * (out_fps.num / FFMAX(out_fps.den, 1));
     if (ofmt->oformat->flags & AVFMT_GLOBALHEADER) venc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
@@ -793,6 +920,9 @@ end:
     avcodec_free_context(&adec);
     avcodec_free_context(&venc);
     avcodec_free_context(&vdec);
+    avfilter_graph_free(&vc.fg);
+    av_buffer_unref(&fhwfr);
+    av_buffer_unref(&hw_device);
     if (ofmt) avformat_free_context(ofmt);
     avformat_close_input(&ifmt);
     return ret;
@@ -803,6 +933,7 @@ int main(int argc, char **argv)
     const char *in_url = NULL, *out_url = NULL, *rate = NULL, *out_fmt = NULL;
     const char *venc = "h264_videotoolbox";
     int mode = -1, want_audio = 1, i;
+    int do_deint = 0, scale_w = 0, scale_h = 0, hw_cuda = 0;
 
     init_dynload();
     av_log_set_level(AV_LOG_INFO);
@@ -829,6 +960,18 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-r") && i + 1 < argc)   rate   = argv[++i];
         else if (!strcmp(argv[i], "-f") && i + 1 < argc)   out_fmt = argv[++i];
         else if (!strcmp(argv[i], "-an"))                  want_audio = 0;
+        else if (!strcmp(argv[i], "--deint"))              do_deint = 1;
+        else if (!strcmp(argv[i], "-s") && i + 1 < argc) {
+            if (sscanf(argv[++i], "%dx%d", &scale_w, &scale_h) != 2 || scale_w <= 0 || scale_h <= 0) {
+                av_log(NULL, AV_LOG_ERROR, "-s expects WxH (e.g. 1280x720)\n"); return 1;
+            }
+        }
+        else if (!strcmp(argv[i], "--hw") && i + 1 < argc) {
+            const char *h = argv[++i];
+            if (!strcmp(h, "cuda")) hw_cuda = 1;
+            else if (!strcmp(h, "none") || !strcmp(h, "cpu")) hw_cuda = 0;
+            else { av_log(NULL, AV_LOG_ERROR, "--hw must be cuda|cpu\n"); return 1; }
+        }
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
             const char *m = argv[++i];
             if (!strcmp(m, "live")) mode = 1;
@@ -840,5 +983,6 @@ int main(int argc, char **argv)
     }
 
     if (!in_url || !out_url) { show_help_default(NULL, NULL); return 1; }
-    return transcode(in_url, out_url, out_fmt, venc, rate, mode, want_audio) < 0 ? 1 : 0;
+    return transcode(in_url, out_url, out_fmt, venc, rate, mode, want_audio,
+                     do_deint, scale_w, scale_h, hw_cuda) < 0 ? 1 : 0;
 }
