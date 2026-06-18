@@ -4401,7 +4401,7 @@ ffplay_suggest="shell32 libplacebo vulkan"
 ffprobe_deps="avcodec avformat"
 ffprobe_suggest="shell32"
 ptvencoder_deps="avcodec avfilter avformat swscale swresample threads"
-ptvencoder_select="aformat_filter anull_filter format_filter null_filter scale_filter"
+ptvencoder_select="aformat_filter anull_filter format_filter null_filter scale_filter buffer_filter buffersink_filter bwdif_filter"
 
 # documentation
 podpages_deps="perl"
