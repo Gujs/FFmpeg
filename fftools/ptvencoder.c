@@ -675,9 +675,12 @@ typedef struct AudioState {
     AVStream             *ost[PTV_MAX_RUNG];     /* audio out stream in each muxer */
     int              n_out;
     AVCodecContext  *dec;
-    AVCodecContext  *enc;
+    AVCodecContext  *enc[PTV_MAX_RUNG];          /* one AAC encoder per rung (per-rung -b:a) */
     AVRational       ist_tb;
-    SwrContext      *swr;
+    SwrContext      *swr;                         /* no -af: plain resample to 48k stereo */
+    AVFilterGraph   *afg;                         /* -af present: abuffer -> chain -> abuffersink */
+    AVFilterContext *afsrc, *afsink;
+    int              use_fg;
     AVAudioFifo     *fifo;
     int              frame_size;
     int              out_rate;
@@ -690,30 +693,31 @@ typedef struct AudioState {
     int64_t          in_frames, out_frames;
 } AudioState;
 
-/* encode one AAC frame once, then fan the packet out (ref-clone) to every output
- * muxer — all rungs carry the same audio. frame=NULL flushes the encoder. */
+/* encode the SAME loudness-processed frame into each rung's own AAC encoder (so
+ * per-rung -b:a is honored), routing each rung's packets to its muxer. The frame
+ * is only ref'd by avcodec_send_frame, so the one frame feeds all N encoders.
+ * frame=NULL flushes every encoder. (ffmpeg's filter -> asplit -> N encoders.) */
 static int audio_encode_push(AudioState *a, AVFrame *frame)
 {
-    int ret = avcodec_send_frame(a->enc, frame), i;
-    if (ret < 0)
-        return ret;
-    for (;;) {
-        AVPacket *pkt = av_packet_alloc();
-        if (!pkt)
-            return AVERROR(ENOMEM);
-        ret = avcodec_receive_packet(a->enc, pkt);
-        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) { av_packet_free(&pkt); return 0; }
-        if (ret < 0) { av_packet_free(&pkt); return ret; }
-        for (i = 0; i < a->n_out; i++) {
-            AVPacket *c = av_packet_clone(pkt);
-            if (!c) continue;
-            av_packet_rescale_ts(c, a->enc->time_base, a->ost[i]->time_base);
-            c->stream_index = a->ost[i]->index;
-            if (av_thread_message_queue_send(a->mux_q[i], &c, 0) < 0)   /* blocking */
-                av_packet_free(&c);
+    int i, ret;
+    for (i = 0; i < a->n_out; i++) {
+        ret = avcodec_send_frame(a->enc[i], frame);
+        if (ret < 0)
+            return ret;
+        for (;;) {
+            AVPacket *pkt = av_packet_alloc();
+            if (!pkt)
+                return AVERROR(ENOMEM);
+            ret = avcodec_receive_packet(a->enc[i], pkt);
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) { av_packet_free(&pkt); break; }
+            if (ret < 0) { av_packet_free(&pkt); return ret; }
+            av_packet_rescale_ts(pkt, a->enc[i]->time_base, a->ost[i]->time_base);
+            pkt->stream_index = a->ost[i]->index;
+            if (av_thread_message_queue_send(a->mux_q[i], &pkt, 0) < 0)   /* blocking */
+                av_packet_free(&pkt);
         }
-        av_packet_free(&pkt);
     }
+    return 0;
 }
 
 static int audio_drain_fifo(AudioState *a)
@@ -766,17 +770,32 @@ static int audio_push(AudioState *a, AVFrame *frame)
         a->pts_set  = 1;
     }
 
-    out_max = av_rescale_rnd(swr_get_delay(a->swr, frame->sample_rate) + frame->nb_samples,
-                             a->out_rate, frame->sample_rate, AV_ROUND_UP);
-    if ((ret = av_samples_alloc_array_and_samples(&out, NULL, a->out_chl.nb_channels,
-                                                  out_max, a->out_sfmt, 0)) < 0)
-        return ret;
-    got = swr_convert(a->swr, out, out_max,
-                      (const uint8_t **)frame->extended_data, frame->nb_samples);
-    if (got > 0)
-        av_audio_fifo_write(a->fifo, (void **)out, got);
-    if (out) { av_freep(&out[0]); av_freep(&out); }
-    if (got < 0) return got;
+    if (a->use_fg) {
+        /* -af: push into the filtergraph (aresample async fills gaps / trims, plus
+         * loudness chain), then collect the timeline-corrected samples to the FIFO.
+         * av_buffersrc_add_frame consumes the frame; PTS comes from the FIFO counter. */
+        AVFrame *filt = av_frame_alloc();
+        if (!filt) return AVERROR(ENOMEM);
+        if ((ret = av_buffersrc_add_frame(a->afsrc, frame)) < 0) { av_frame_free(&filt); return ret; }
+        while ((ret = av_buffersink_get_frame(a->afsink, filt)) >= 0) {
+            av_audio_fifo_write(a->fifo, (void **)filt->extended_data, filt->nb_samples);
+            av_frame_unref(filt);
+        }
+        av_frame_free(&filt);
+        if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) return ret;
+    } else {
+        out_max = av_rescale_rnd(swr_get_delay(a->swr, frame->sample_rate) + frame->nb_samples,
+                                 a->out_rate, frame->sample_rate, AV_ROUND_UP);
+        if ((ret = av_samples_alloc_array_and_samples(&out, NULL, a->out_chl.nb_channels,
+                                                      out_max, a->out_sfmt, 0)) < 0)
+            return ret;
+        got = swr_convert(a->swr, out, out_max,
+                          (const uint8_t **)frame->extended_data, frame->nb_samples);
+        if (got > 0)
+            av_audio_fifo_write(a->fifo, (void **)out, got);
+        if (out) { av_freep(&out[0]); av_freep(&out); }
+        if (got < 0) return got;
+    }
 
     return audio_drain_fifo(a);
 }
@@ -804,10 +823,22 @@ static void *audio_thread(void *arg)
             if (ret < 0) goto done;
         }
     }
-    /* flush decoder -> resampler -> encoder */
+    /* flush decoder -> resampler/filtergraph -> encoder */
     avcodec_send_packet(a->dec, NULL);
     while (avcodec_receive_frame(a->dec, frame) >= 0) { audio_push(a, frame); av_frame_unref(frame); }
-    {
+    if (a->use_fg) {
+        AVFrame *filt = av_frame_alloc();
+        if (filt) {
+            if (av_buffersrc_add_frame(a->afsrc, NULL) >= 0)          /* signal EOF to the graph */
+                while (av_buffersink_get_frame(a->afsink, filt) >= 0) {
+                    av_audio_fifo_write(a->fifo, (void **)filt->extended_data, filt->nb_samples);
+                    av_frame_unref(filt);
+                }
+            av_frame_free(&filt);
+        }
+        audio_drain_fifo(a);
+        audio_encode_push(a, NULL);
+    } else {
         uint8_t **out = NULL; int got, out_max = 4096;
         if (av_samples_alloc_array_and_samples(&out, NULL, a->out_chl.nb_channels,
                                                out_max, a->out_sfmt, 0) >= 0) {
@@ -824,6 +855,50 @@ done:
     { int i; for (i = 0; i < a->n_out; i++) {        /* EOF marker to each muxer */
         AVPacket *eof = NULL; av_thread_message_queue_send(a->mux_q[i], &eof, 0); } }
     return NULL;
+}
+
+/* Build the audio filtergraph: abuffer -> [user -af chain] -> aformat -> abuffersink.
+ * Mirrors build_video_filter for audio. The trailing aformat pins the sink to the
+ * encoder's format (48k stereo + enc sample_fmt) so the graph auto-inserts any
+ * needed aresample even when -af omits one; the -af chain (aresample=async,
+ * acompressor, alimiter, ...) runs first. Sets a->use_fg on success. */
+static int build_audio_filter(AudioState *a, AVCodecContext *adec, AVRational tb,
+                              const char *af, enum AVSampleFormat out_fmt)
+{
+    char args[256], chain[512], chl[64];
+    const AVFilter *bsrc  = avfilter_get_by_name("abuffer");
+    const AVFilter *bsink = avfilter_get_by_name("abuffersink");
+    AVFilterInOut *ins = avfilter_inout_alloc(), *outs = avfilter_inout_alloc();
+    int ret;
+
+    if (!bsrc || !bsink || !ins || !outs) { ret = AVERROR(ENOMEM); goto end; }
+    a->afg = avfilter_graph_alloc();
+    if (!a->afg) { ret = AVERROR(ENOMEM); goto end; }
+
+    av_channel_layout_describe(&adec->ch_layout, chl, sizeof chl);
+    snprintf(args, sizeof args,
+             "time_base=%d/%d:sample_rate=%d:sample_fmt=%s:channel_layout=%s",
+             tb.num, tb.den, adec->sample_rate,
+             av_get_sample_fmt_name(adec->sample_fmt), chl);
+    if ((ret = avfilter_graph_create_filter(&a->afsrc, bsrc, "in", args, NULL, a->afg)) < 0) goto end;
+    if ((ret = avfilter_graph_create_filter(&a->afsink, bsink, "out", NULL, NULL, a->afg)) < 0) goto end;
+
+    snprintf(chain, sizeof chain,
+             "%s%saformat=sample_fmts=%s:sample_rates=48000:channel_layouts=stereo",
+             af ? af : "", af ? "," : "", av_get_sample_fmt_name(out_fmt));
+
+    outs->name = av_strdup("in");  outs->filter_ctx = a->afsrc;  outs->pad_idx = 0; outs->next = NULL;
+    ins->name  = av_strdup("out"); ins->filter_ctx  = a->afsink; ins->pad_idx  = 0; ins->next  = NULL;
+    if ((ret = avfilter_graph_parse_ptr(a->afg, chain, &ins, &outs, NULL)) < 0) goto end;
+    if ((ret = avfilter_graph_config(a->afg, NULL)) < 0) goto end;
+
+    av_log(NULL, AV_LOG_INFO, "ptvencoder: audio filter [%s]\n", chain);
+    a->use_fg = 1;
+    ret = 0;
+end:
+    avfilter_inout_free(&ins);
+    avfilter_inout_free(&outs);
+    return ret;
 }
 
 /* ---- demux + mux ---- */
@@ -1028,7 +1103,7 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
     const char *in_url = ing->arg;
     int n_rung = outs->nb_groups;
     AVFormatContext *ifmt = NULL;
-    AVCodecContext  *vdec = NULL, *adec = NULL, *aenc = NULL;
+    AVCodecContext  *vdec = NULL, *adec = NULL;
     const AVCodec   *vdecoder = NULL, *adecoder = NULL, *aencoder = NULL;
     AVStream        *vist = NULL, *aist = NULL;
     AVThreadMessageQueue *video_q = NULL, *audio_q = NULL;
@@ -1201,51 +1276,65 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
         rung[r].vc.ost->time_base = rung[r].venc->time_base;
     }
 
-    /* shared audio: decode + AAC-encode ONCE (from the first rung's -map/-c:a),
-     * with an output audio stream in EACH muxer; the AAC packets fan out.
+    /* shared audio: decode + loudness-filter ONCE, then encode PER RUNG (so each
+     * rung's -b:a is honored) into an output audio stream in EACH muxer. The shared
+     * input stream/decoder come from the first rung; per-rung -c:a/-b:a from each.
      * Multichannel (AC-3 5.1) etc. ride the passthrough list below. */
     if (sel[0].astream >= 0) {
-        int astream = sel[0].astream;
-        aist = ifmt->streams[astream];
+        aist = ifmt->streams[sel[0].astream];
         adecoder = sel[0].adec;
-        aencoder = avcodec_find_encoder_by_name(sel[0].aenc ? sel[0].aenc : "aac");
-        if (!aencoder) aencoder = avcodec_find_encoder_by_name("aac");
         adec = avcodec_alloc_context3(adecoder);
-        if (adec && aencoder) {
+        if (adec) {
             avcodec_parameters_to_context(adec, aist->codecpar);
             adec->pkt_timebase = aist->time_base;
             if (avcodec_open2(adec, adecoder, NULL) < 0) { av_log(NULL, AV_LOG_WARNING, "audio decoder failed; video only\n"); }
             else {
-                aenc = avcodec_alloc_context3(aencoder);
-                aenc->sample_rate = 48000;
-                aenc->ch_layout   = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
-                aenc->sample_fmt  = aencoder->sample_fmts ? aencoder->sample_fmts[0] : AV_SAMPLE_FMT_FLTP;
-                aenc->bit_rate    = 160000;
-                aenc->time_base   = (AVRational){1, 48000};
-                if (rung[0].ofmt->oformat->flags & AVFMT_GLOBALHEADER) aenc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-                { AVDictionary *aopts = NULL; int ar2;
-                  if (sel[0].abr) av_dict_set(&aopts, "b", sel[0].abr, 0);
-                  ar2 = avcodec_open2(aenc, aencoder, &aopts); av_dict_free(&aopts);
-                  if (ar2 < 0) av_log(NULL, AV_LOG_WARNING, "audio encoder failed; video only\n");
-                  else {
-                    for (r = 0; r < n_rung; r++) {           /* an audio stream in each muxer */
-                        AVStream *aos = avformat_new_stream(rung[r].ofmt, NULL);
-                        if (!aos) { ret = AVERROR(ENOMEM); goto end; }
-                        avcodec_parameters_from_context(aos->codecpar, aenc);
-                        aos->time_base = aenc->time_base;
-                        as.ost[r] = aos;
+                int aok = 1;
+                for (r = 0; r < n_rung; r++) {           /* one AAC encoder + stream per rung */
+                    AVCodecContext *e; AVStream *aos; AVDictionary *aopts = NULL;
+                    aencoder = avcodec_find_encoder_by_name(sel[r].aenc ? sel[r].aenc : "aac");
+                    if (!aencoder) aencoder = avcodec_find_encoder_by_name("aac");
+                    e = avcodec_alloc_context3(aencoder);
+                    if (!e) { ret = AVERROR(ENOMEM); goto end; }
+                    e->sample_rate = 48000;
+                    e->ch_layout   = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
+                    e->sample_fmt  = aencoder->sample_fmts ? aencoder->sample_fmts[0] : AV_SAMPLE_FMT_FLTP;
+                    e->bit_rate    = 160000;
+                    e->time_base   = (AVRational){1, 48000};
+                    if (rung[r].ofmt->oformat->flags & AVFMT_GLOBALHEADER) e->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+                    if (sel[r].abr) av_dict_set(&aopts, "b", sel[r].abr, 0);
+                    if (avcodec_open2(e, aencoder, &aopts) < 0) {
+                        av_log(NULL, AV_LOG_WARNING, "audio encoder (rung %d) failed; video only\n", r);
+                        avcodec_free_context(&e); av_dict_free(&aopts); aok = 0; break;
                     }
-                    as.out_chl = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
-                    swr_alloc_set_opts2(&as.swr, &as.out_chl, aenc->sample_fmt, 48000,
-                                        &adec->ch_layout, adec->sample_fmt, adec->sample_rate, 0, NULL);
-                    if (!as.swr || swr_init(as.swr) < 0) { av_log(NULL, AV_LOG_WARNING, "swr init failed; video only\n"); }
-                    else {
-                        as.fifo = av_audio_fifo_alloc(aenc->sample_fmt, 2, aenc->frame_size > 0 ? aenc->frame_size : 1024);
-                        as.frame_size = aenc->frame_size > 0 ? aenc->frame_size : 1024;
-                        as.out_rate = 48000; as.out_sfmt = aenc->sample_fmt; as.n_out = n_rung;
-                        have_audio = 1;
+                    av_dict_free(&aopts);
+                    as.enc[r] = e;
+                    aos = avformat_new_stream(rung[r].ofmt, NULL);
+                    if (!aos) { ret = AVERROR(ENOMEM); goto end; }
+                    avcodec_parameters_from_context(aos->codecpar, e);
+                    aos->time_base = e->time_base;
+                    as.ost[r] = aos;
+                }
+                if (aok) {
+                    enum AVSampleFormat sfmt = as.enc[0]->sample_fmt;
+                    const char *af = og_get(&outs->groups[0], "af");
+                    if (!af) af = og_get(&outs->groups[0], "filter:a");
+                    as.out_chl    = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
+                    as.out_rate   = 48000;
+                    as.out_sfmt   = sfmt;
+                    as.n_out      = n_rung;
+                    as.frame_size = as.enc[0]->frame_size > 0 ? as.enc[0]->frame_size : 1024;
+                    as.fifo       = av_audio_fifo_alloc(sfmt, 2, as.frame_size);
+                    if (af && build_audio_filter(&as, adec, aist->time_base, af, sfmt) < 0) {
+                        av_log(NULL, AV_LOG_WARNING, "audio filtergraph failed; plain resample\n");
+                        avfilter_graph_free(&as.afg); as.use_fg = 0;
                     }
-                  }
+                    if (!as.use_fg) {              /* no -af (or graph failed): plain resample */
+                        swr_alloc_set_opts2(&as.swr, &as.out_chl, sfmt, 48000,
+                                            &adec->ch_layout, adec->sample_fmt, adec->sample_rate, 0, NULL);
+                        if (!as.swr || swr_init(as.swr) < 0) { av_log(NULL, AV_LOG_WARNING, "swr init failed; video only\n"); aok = 0; }
+                    }
+                    if (aok && as.fifo) have_audio = 1;
                 }
             }
         }
@@ -1339,7 +1428,7 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
         rung[r].ma.n_producers = 1 + (have_audio ? 1 : 0) + (n_pass > 0 ? 1 : 0);
     }
     if (have_audio) {
-        as.audio_q = audio_q; as.dec = adec; as.enc = aenc;
+        as.audio_q = audio_q; as.dec = adec;     /* as.enc[r]/as.ost[r] set during setup */
         as.ist_tb = aist->time_base; as.h0 = &input_h0_us; as.h0_lock = &h0_lock;
         for (r = 0; r < n_rung; r++) as.mux_q[r] = rung[r].mux_q;
     }
@@ -1439,7 +1528,8 @@ end:
     }
     if (as.swr)  swr_free(&as.swr);
     if (as.fifo) av_audio_fifo_free(as.fifo);
-    avcodec_free_context(&aenc);
+    avfilter_graph_free(&as.afg);
+    for (r = 0; r < n_rung; r++) avcodec_free_context(&as.enc[r]);
     avcodec_free_context(&adec);
     avcodec_free_context(&vdec);
     avfilter_graph_free(&dc.fg);
