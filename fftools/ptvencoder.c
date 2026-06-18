@@ -136,7 +136,8 @@ typedef struct VideoCtx {
     AVThreadMessageQueue *mux_q;     /* output -> mux     (AVPacket*) */
     /* decode side */
     AVCodecContext  *vdec;
-    AVRational       ist_tb;
+    AVRational       ist_tb;         /* decoder pkt time_base (unfiltered frames) */
+    AVRational       out_tb;         /* time_base of frames reaching the output (filter sink, or ist_tb) */
     int64_t         *h0;             /* shared A/V input anchor (us) */
     pthread_mutex_t *h0_lock;
     /* optional video filter (deinterlace / scale), decode-thread local */
@@ -263,6 +264,8 @@ static void emit_video(VideoCtx *v, AVFrame *frame, AVFrame *filt)
         AVFrame *out = av_frame_alloc();
         if (!out) { av_frame_unref(frame); return; }
         av_frame_move_ref(out, frame);
+        if (out->best_effort_timestamp != AV_NOPTS_VALUE)   /* source time in ist_tb (== out_tb) */
+            out->pts = out->best_effort_timestamp;
         push_frame(v, out);
         return;
     }
@@ -385,10 +388,9 @@ static void *output_thread(void *arg)
          * Pacing still rides the wall clock via `tick`; PTS rides content. */
         {
             int64_t vpts;
-            int64_t src_ts = held->best_effort_timestamp != AV_NOPTS_VALUE
-                           ? held->best_effort_timestamp : held->pts;   /* filtered frames carry pts */
+            int64_t src_ts = held->pts;   /* in out_tb: decoder pkt-tb (unfiltered) or sink tb (filtered) */
             if (src_ts != AV_NOPTS_VALUE && *v->h0 != AV_NOPTS_VALUE) {
-                int64_t house_us = av_rescale_q(src_ts, v->ist_tb, AV_TIME_BASE_Q) - *v->h0;
+                int64_t house_us = av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q) - *v->h0;
                 if (house_us < 0) house_us = 0;
                 vpts = (house_us + v->tick_dur_us / 2) / v->tick_dur_us;
             } else {
@@ -853,6 +855,7 @@ static int transcode(const char *in_url, const char *out_url, const char *out_fm
 
     vc.video_q = video_q; vc.frame_q = frame_q; vc.mux_q = mux_q;
     vc.vdec = vdec; vc.venc = venc; vc.ist_tb = vist->time_base;
+    vc.out_tb = vc.filtering ? av_buffersink_get_time_base(vc.fsink) : vist->time_base;
     vc.tick_dur_us = av_rescale(1000000, out_fps.den, out_fps.num);
     vc.live = live; vc.h0 = &input_h0_us; vc.h0_lock = &h0_lock;
     if (have_audio) {
