@@ -67,6 +67,12 @@ const int  program_birth_year = 2026;
 /* Diagnostics (env PTV_DIAG=1): per-second stage counters + slow-call
  * breadcrumbs to localize a stall. Temporary, gated, low-overhead (Rule 0). */
 static int     g_diag;
+/* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
+ * clock run ahead of source content; that skew is published by the master output
+ * thread and added to the audio resampler's target so audio rides the SAME house
+ * clock as video (else audio stays source-locked and drifts ~40ms per video dup).
+ * On by default; PTV_NO_AVLOCK=1 reverts to the old source-locked audio. */
+static int     g_avlock = 1;
 static int64_t g_muxed;
 /* ffmpeg-style progress line (frame=/fps=/bitrate=/speed=); on unless -nostats. */
 static int     g_stats = 1;
@@ -211,6 +217,7 @@ typedef struct VideoCtx {
     AVRational       out_tb;         /* time_base of frames at this rung's sink (or ist_tb) */
     int64_t         *h0;             /* shared A/V input anchor (us) */
     pthread_mutex_t *h0_lock;
+    int64_t         *house_skew;     /* master publishes house-vs-content skew (us) here */
     AVCodecContext  *venc;
     AVStream        *ost;
     int64_t          tick_dur_us;
@@ -505,6 +512,8 @@ static void *output_thread(void *arg)
     AVFrame *f;
     int have = 0, ret = 0;
     int64_t tick = 0, wall0 = 0, last_vpts = -1;
+    int64_t held_src_pts = AV_NOPTS_VALUE;   /* ORIGINAL source pts of held frame (held->pts gets
+                                                overwritten to vpts on emit; dups must not re-read it) */
     int64_t diag_t0 = av_gettime_relative(), diag_last = diag_t0;
     int64_t stat_last = diag_t0, stat_prev = 0;
 
@@ -554,7 +563,7 @@ static void *output_thread(void *arg)
         ret = av_thread_message_queue_recv(v->frame_q, &f, AV_THREAD_MESSAGE_NONBLOCK);
         if (ret >= 0) {
             av_frame_unref(held); av_frame_move_ref(held, f); av_frame_free(&f);
-            have = 1; fresh = 1;
+            have = 1; fresh = 1; held_src_pts = held->pts;   /* capture before emit overwrites it */
         } else if (ret == AVERROR_EOF) {
             break;                                  /* decode finished, queue drained */
         }
@@ -584,18 +593,26 @@ static void *output_thread(void *arg)
          * drifts by the number of startup/stall-dropped frames -> A/V skew.)
          * Pacing still rides the wall clock via `tick`; PTS rides content. */
         {
-            int64_t vpts;
-            int64_t src_ts = held->pts;   /* in out_tb: decoder pkt-tb (unfiltered) or sink tb (filtered) */
+            int64_t vpts, content_vpts = -1;
+            int64_t src_ts = held_src_pts;   /* ORIGINAL source pts (out_tb); survives dups */
             if (src_ts != AV_NOPTS_VALUE && *v->h0 != AV_NOPTS_VALUE) {
                 int64_t house_us = av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q) - *v->h0;
                 if (house_us < 0) house_us = 0;
-                vpts = (house_us + v->tick_dur_us / 2) / v->tick_dur_us;
+                content_vpts = (house_us + v->tick_dur_us / 2) / v->tick_dur_us;
+                vpts = content_vpts;
             } else {
                 vpts = last_vpts + 1;
             }
             if (vpts <= last_vpts) vpts = last_vpts + 1;   /* monotonic CFR; dup -> next slot */
             held->pts = vpts; held->pkt_dts = AV_NOPTS_VALUE; held->duration = 0;
             last_vpts = vpts;
+            /* Publish how far the house clock now runs AHEAD of source content
+             * (vpts - content_vpts, in ticks). Each dup bumps vpts past content via
+             * the monotonic guard, so this grows by one tick per dup and persists.
+             * The audio path adds it so audio rides the same house clock instead of
+             * staying source-locked (which is what drifts ~40ms per dup). */
+            if (v->is_master && v->house_skew && content_vpts >= 0)
+                *v->house_skew = (vpts - content_vpts) * v->tick_dur_us;
         }
         ret = encode_push(v->mux_q, v->venc, v->ost, held);
         v->last_emit_us = av_gettime_relative();
@@ -695,6 +712,7 @@ typedef struct AudioState {
     AVChannelLayout  out_chl;
     int64_t         *h0;
     pthread_mutex_t *h0_lock;
+    int64_t         *house_skew;    /* video's house-vs-content skew (us); -af audio rides it */
     int              pts_set;
     int64_t          next_pts;
     int64_t          in_frames, out_frames;
@@ -810,7 +828,17 @@ static int audio_push(AudioState *a, AVFrame *frame)
     if (a->use_fg) {
         /* -af: feed the graph; aresample async + loudness emit fixed-size frames
          * whose PTS already carries async's A/V correction — drain them straight
-         * to the encoders (no FIFO, no free counter). */
+         * to the encoders (no FIFO, no free counter).
+         *
+         * Common-mode A/V lock: add the video's house-vs-content skew to this
+         * frame's PTS before it enters the graph, so aresample=async targets the
+         * HOUSE clock (where video lives) instead of the source clock. When video
+         * dups (house outpaces source), the skew grows and async smoothly fills
+         * the matching audio, so audio rides the dup with video — no drift. */
+        if (g_avlock && a->house_skew && frame->pts != AV_NOPTS_VALUE) {
+            int64_t sk = *a->house_skew;
+            if (sk) frame->pts += av_rescale_q(sk, AV_TIME_BASE_Q, a->ist_tb);
+        }
         if ((ret = av_buffersrc_add_frame(a->afsrc, frame)) < 0)
             return ret;
         return audio_drain_fg(a);
@@ -1147,6 +1175,7 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
     pthread_t        th_demux, th_decode, th_audio;
     pthread_mutex_t  h0_lock = PTHREAD_MUTEX_INITIALIZER;
     int64_t          input_h0_us = AV_NOPTS_VALUE;
+    int64_t          house_skew_us = 0;   /* master video thread -> audio (common-mode A/V lock) */
     int vstream = -1, ret = 0, live, net_input, have_audio = 0, hw_cuda = 0;
     int started_audio = 0, started_decode = 0, aborted = 0, r, si;
     AVRational out_fps;
@@ -1457,6 +1486,7 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
         vc->out_tb = dc.filtering ? av_buffersink_get_time_base(dc.fsink[r]) : vist->time_base;
         vc->tick_dur_us = av_rescale(1000000, out_fps.den, out_fps.num);
         vc->live = live; vc->h0 = &input_h0_us; vc->h0_lock = &h0_lock;
+        vc->house_skew = &house_skew_us;
         vc->is_master = (r == 0);
         vc->dbg_video_q = video_q; vc->dbg_dec_frames = &dc.dec_frames; vc->dbg_vcorrupt = &dc.vcorrupt;
         rung[r].ma.ofmt = rung[r].ofmt; rung[r].ma.mux_q = rung[r].mux_q;
@@ -1465,6 +1495,7 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
     if (have_audio) {
         as.audio_q = audio_q; as.dec = adec;     /* as.enc[r]/as.ost[r] set during setup */
         as.ist_tb = aist->time_base; as.h0 = &input_h0_us; as.h0_lock = &h0_lock;
+        as.house_skew = &house_skew_us;
         for (r = 0; r < n_rung; r++) as.mux_q[r] = rung[r].mux_q;
     }
     da.ifmt = ifmt; da.video_q = video_q; da.audio_q = audio_q;
@@ -1879,6 +1910,7 @@ int main(int argc, char **argv)
     init_dynload();
     av_log_set_level(AV_LOG_INFO);
     g_diag = !!getenv("PTV_DIAG");
+    if (getenv("PTV_NO_AVLOCK")) g_avlock = 0;   /* revert to source-locked audio (drifts on dup) */
     { const char *s = getenv("PTV_SLOW_US"); g_slow = s ? atoi(s) : 0; }
     if (getenv("PTV_LOG_TS") && atoi(getenv("PTV_LOG_TS")))   /* native [timestamp] log prefix */
         av_log_set_callback(ptv_log_ts_callback);
