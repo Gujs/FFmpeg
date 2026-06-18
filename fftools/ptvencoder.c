@@ -82,8 +82,9 @@ void show_help_default(const char *opt, const char *arg)
         "    -r <rate>     output frame rate / house-clock rate (e.g. 25, 30000/1001); default = source\n"
         "    -f <mux>      output format (default: guessed from output; mpegts for udp://...)\n"
         "    -an           disable audio\n"
-        "    -s <WxH>      scale to WxH (e.g. 1280x720)\n"
-        "    --deint       deinterlace (bwdif)\n"
+        "    -vf <chain>   raw libavfilter chain (any filters in the build, e.g. \"bwdif,scale=1280:720\")\n"
+        "    -s <WxH>      scale to WxH (e.g. 1280x720)         [convenience; ignored if -vf given]\n"
+        "    --deint       deinterlace (bwdif)                  [convenience; ignored if -vf given]\n"
         "    --hw cuda|cpu filter backend: cuda = bwdif_cuda/scale_cuda (-> NVENC); cpu (default)\n"
         "    --mode live|offline   live = wall-clock paced; offline = media-clock. default: auto from input\n"
         "    -version, -h\n"
@@ -184,17 +185,18 @@ static void push_frame(VideoCtx *v, AVFrame *out)
  * On success sets v->filtering and returns the output w/h/pixfmt (+ hw_frames_ctx
  * for the CUDA path) so the encoder can be configured to match. */
 static int build_video_filter(VideoCtx *v, AVCodecContext *vdec, AVRational tb,
-                              int do_deint, int sw, int sh, int hw_cuda,
+                              const char *vf, int do_deint, int sw, int sh, int hw_cuda,
                               AVBufferRef *hw_device,
                               int *out_w, int *out_h, int *out_pixfmt,
                               AVBufferRef **out_hwfr)
 {
     char args[256], desc[256];
+    const char *chain;
     const AVFilter *bsrc  = avfilter_get_by_name("buffer");
     const AVFilter *bsink = avfilter_get_by_name("buffersink");
     AVFilterInOut *ins = avfilter_inout_alloc(), *outs = avfilter_inout_alloc();
     AVRational sar = vdec->sample_aspect_ratio.num ? vdec->sample_aspect_ratio : (AVRational){1, 1};
-    char *p = desc; int rem = sizeof(desc), n = 0, ret;
+    int ret;
 
     if (!bsrc || !bsink || !ins || !outs) { ret = AVERROR(ENOMEM); goto end; }
     v->fg = avfilter_graph_alloc();
@@ -206,23 +208,29 @@ static int build_video_filter(VideoCtx *v, AVCodecContext *vdec, AVRational tb,
     if ((ret = avfilter_graph_create_filter(&v->fsrc, bsrc, "in", args, NULL, v->fg)) < 0) goto end;
     if ((ret = avfilter_graph_create_filter(&v->fsink, bsink, "out", NULL, NULL, v->fg)) < 0) goto end;
 
+    if (vf) {
+        chain = vf;                                  /* raw ffmpeg-dialect chain */
+    } else {                                         /* convenience flags -> chain */
+        char *p = desc; int rem = sizeof(desc), n = 0;
 #define APPEND(...) do { int k = snprintf(p, rem, "%s", n++ ? "," : ""); p += k; rem -= k; \
                          k = snprintf(p, rem, __VA_ARGS__); p += k; rem -= k; } while (0)
-    if (hw_cuda) {
-        APPEND("hwupload_cuda");
-        if (do_deint) APPEND("bwdif_cuda");
-        if (sw > 0)   APPEND("scale_cuda=%d:%d", sw, sh);
-    } else {
-        if (do_deint) APPEND("bwdif=mode=send_frame:deint=all");
-        if (sw > 0)   APPEND("scale=%d:%d:flags=bicubic", sw, sh);
-        APPEND("format=yuv420p");
-    }
+        if (hw_cuda) {
+            APPEND("hwupload_cuda");
+            if (do_deint) APPEND("bwdif_cuda");
+            if (sw > 0)   APPEND("scale_cuda=%d:%d", sw, sh);
+        } else {
+            if (do_deint) APPEND("bwdif=mode=send_frame:deint=all");
+            if (sw > 0)   APPEND("scale=%d:%d:flags=bicubic", sw, sh);
+            APPEND("format=yuv420p");
+        }
 #undef APPEND
+        chain = desc;
+    }
 
     /* outputs = the buffer src feeding the parsed chain; inputs = the sink it feeds */
     outs->name = av_strdup("in");  outs->filter_ctx = v->fsrc;  outs->pad_idx = 0; outs->next = NULL;
     ins->name  = av_strdup("out"); ins->filter_ctx  = v->fsink; ins->pad_idx  = 0; ins->next  = NULL;
-    if ((ret = avfilter_graph_parse_ptr(v->fg, desc, &ins, &outs, NULL)) < 0) goto end;
+    if ((ret = avfilter_graph_parse_ptr(v->fg, chain, &ins, &outs, NULL)) < 0) goto end;
 
     if (hw_cuda && hw_device)
         for (unsigned i = 0; i < v->fg->nb_filters; i++)
@@ -237,7 +245,7 @@ static int build_video_filter(VideoCtx *v, AVCodecContext *vdec, AVRational tb,
         AVBufferRef *hf = av_buffersink_get_hw_frames_ctx(v->fsink);
         *out_hwfr = hf ? av_buffer_ref(hf) : NULL;
     }
-    av_log(NULL, AV_LOG_INFO, "ptvencoder: filter [%s] -> %dx%d\n", desc, *out_w, *out_h);
+    av_log(NULL, AV_LOG_INFO, "ptvencoder: filter [%s] -> %dx%d\n", chain, *out_w, *out_h);
     v->filtering = 1;
     ret = 0;
 end:
@@ -682,7 +690,7 @@ static void *mux_thread(void *arg)
 
 static int transcode(const char *in_url, const char *out_url, const char *out_fmt,
                      const char *venc_name, const char *rate_str, int mode, int want_audio,
-                     int do_deint, int scale_w, int scale_h, int hw_cuda)
+                     const char *vf, int do_deint, int scale_w, int scale_h, int hw_cuda)
 {
     AVFormatContext *ifmt = NULL, *ofmt = NULL;
     AVCodecContext  *vdec = NULL, *venc = NULL, *adec = NULL, *aenc = NULL;
@@ -748,13 +756,13 @@ static int transcode(const char *in_url, const char *out_url, const char *out_fm
                 : vist->avg_frame_rate.num ? vist->avg_frame_rate : (AVRational){25, 1};
     }
 
-    /* optional video filter: deinterlace and/or scale (CPU or CUDA backend) */
-    if (do_deint || scale_w > 0) {
+    /* optional video filter: raw -vf chain, or convenience deinterlace/scale (CPU or CUDA) */
+    if (vf || do_deint || scale_w > 0) {
         if (hw_cuda &&
             (ret = av_hwdevice_ctx_create(&hw_device, AV_HWDEVICE_TYPE_CUDA, NULL, NULL, 0)) < 0) {
             av_log(NULL, AV_LOG_ERROR, "cannot create CUDA device (--hw cuda): %s\n", av_err2str(ret)); goto end;
         }
-        if ((ret = build_video_filter(&vc, vdec, vist->time_base, do_deint, scale_w, scale_h,
+        if ((ret = build_video_filter(&vc, vdec, vist->time_base, vf, do_deint, scale_w, scale_h,
                                       hw_cuda, hw_device, &fw, &fh, &fpix, &fhwfr)) < 0) {
             av_log(NULL, AV_LOG_ERROR, "build video filter: %s\n", av_err2str(ret)); goto end;
         }
@@ -932,6 +940,7 @@ int main(int argc, char **argv)
 {
     const char *in_url = NULL, *out_url = NULL, *rate = NULL, *out_fmt = NULL;
     const char *venc = "h264_videotoolbox";
+    const char *vfilter = NULL;
     int mode = -1, want_audio = 1, i;
     int do_deint = 0, scale_w = 0, scale_h = 0, hw_cuda = 0;
 
@@ -960,6 +969,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-r") && i + 1 < argc)   rate   = argv[++i];
         else if (!strcmp(argv[i], "-f") && i + 1 < argc)   out_fmt = argv[++i];
         else if (!strcmp(argv[i], "-an"))                  want_audio = 0;
+        else if ((!strcmp(argv[i], "-vf") || !strcmp(argv[i], "-filter:v")) && i + 1 < argc) vfilter = argv[++i];
         else if (!strcmp(argv[i], "--deint"))              do_deint = 1;
         else if (!strcmp(argv[i], "-s") && i + 1 < argc) {
             if (sscanf(argv[++i], "%dx%d", &scale_w, &scale_h) != 2 || scale_w <= 0 || scale_h <= 0) {
@@ -984,5 +994,5 @@ int main(int argc, char **argv)
 
     if (!in_url || !out_url) { show_help_default(NULL, NULL); return 1; }
     return transcode(in_url, out_url, out_fmt, venc, rate, mode, want_audio,
-                     do_deint, scale_w, scale_h, hw_cuda) < 0 ? 1 : 0;
+                     vfilter, do_deint, scale_w, scale_h, hw_cuda) < 0 ? 1 : 0;
 }
