@@ -1170,6 +1170,123 @@ static int ptv_parse_and_print(int argc, char **argv)
     return 0;
 }
 
+/* ---- ffmpeg-style plan resolution (stage 1: resolve -map/-c, dry-run print) ---- */
+
+/* last value of an exact-key option in a group (e.g. "f", "filter:v", "r") */
+static const char *og_get(OptionGroup *g, const char *key)
+{
+    const char *v = NULL; int i;
+    for (i = 0; i < g->nb_opts; i++)
+        if (!strcmp(g->opts[i].key, key)) v = g->opts[i].val;
+    return v;
+}
+
+/* most-specific per-stream string option: <p>:<t>:<idx>  >  <p>:<t>  >  <p>.
+ * p = "c"/"b"/... , t = 'v'/'a'/'s'/'d', idx = output type-index. */
+static const char *og_spec(OptionGroup *g, const char *p, char t, int idx)
+{
+    char k0[8], k1[12], k2[20]; const char *best = NULL; int i, rank = -1;
+    snprintf(k0, sizeof k0, "%s", p);
+    snprintf(k1, sizeof k1, "%s:%c", p, t);
+    snprintf(k2, sizeof k2, "%s:%c:%d", p, t, idx);
+    for (i = 0; i < g->nb_opts; i++) {
+        const char *k = g->opts[i].key; int r = -1;
+        if (!strcmp(k, k0) || (!strcmp(p, "c") && !strcmp(k, "codec"))) r = 0;
+        if (!strcmp(k, k1)) r = 1;
+        if (!strcmp(k, k2)) r = 2;
+        if (r > rank) { rank = r; best = g->opts[i].val; }
+    }
+    return best;
+}
+
+/* strip a leading "<digits>:" file index and a trailing '?' from a -map value */
+static const char *map_spec(const char *v, char *buf, size_t bufsz, int *optional)
+{
+    const char *colon = strchr(v, ':'), *s = v; size_t L;
+    if (colon && colon > v) {
+        const char *p; int alldig = 1;
+        for (p = v; p < colon; p++) if (*p < '0' || *p > '9') { alldig = 0; break; }
+        if (alldig) s = colon + 1;
+    }
+    snprintf(buf, bufsz, "%s", s);
+    L = strlen(buf);
+    *optional = (L && buf[L-1] == '?');
+    if (*optional) buf[L-1] = 0;
+    return buf;
+}
+
+/* PTV_PLAN_DEBUG=1: parse an ffmpeg-style command, open the input, resolve each
+ * -map to an input stream + its copy/encode decision (and applied opts), print. */
+static int plan_resolve_and_print(int argc, char **argv)
+{
+    OptionParseContext octx;
+    AVFormatContext *ifmt = NULL;
+    OptionGroupList *outs, *ins;
+    OptionGroup *outg, *ing;
+    const AVDictionaryEntry *e;
+    int ret, o, si, tcnt[5] = {0};
+
+    if ((ret = split_commandline(&octx, argc, argv, ptv_options, ptv_groups,
+                                 sizeof(ptv_groups)/sizeof(ptv_groups[0]))) < 0)
+        return ret;
+    ins = &octx.groups[1]; outs = &octx.groups[0];
+    if (ins->nb_groups < 1 || outs->nb_groups < 1) {
+        av_log(NULL, AV_LOG_ERROR, "need -i <input> and an output url\n");
+        uninit_parse_context(&octx); return AVERROR(EINVAL);
+    }
+    ing = &ins->groups[0]; outg = &outs->groups[0];
+    if ((ret = avformat_open_input(&ifmt, ing->arg, NULL, &ing->format_opts)) < 0) {
+        av_log(NULL, AV_LOG_ERROR, "open input '%s': %s\n", ing->arg, av_err2str(ret));
+        uninit_parse_context(&octx); return ret;
+    }
+    avformat_find_stream_info(ifmt, NULL);
+    av_log(NULL, AV_LOG_INFO, "PLAN  in=%s  out=%s  fmt=%s\n",
+           ing->arg, outg->arg, og_get(outg, "f") ? og_get(outg, "f") : "(guess)");
+    for (o = 0; o < outg->nb_opts; o++) {
+        char buf[64]; int optional, matched = 0; const char *spec;
+        if (strcmp(outg->opts[o].key, "map")) continue;
+        if (outg->opts[o].val[0] == '[') {
+            av_log(NULL, AV_LOG_INFO, "  map %-9s -> filter output (ladder phase, not yet wired)\n",
+                   outg->opts[o].val);
+            continue;
+        }
+        spec = map_spec(outg->opts[o].val, buf, sizeof buf, &optional);
+        for (si = 0; si < (int)ifmt->nb_streams; si++) {
+            enum AVMediaType mt; char t; int ti, idx; const char *codec, *br;
+            if (avformat_match_stream_specifier(ifmt, ifmt->streams[si], spec) <= 0) continue;
+            matched++;
+            mt = ifmt->streams[si]->codecpar->codec_type;
+            t  = mt==AVMEDIA_TYPE_VIDEO?'v':mt==AVMEDIA_TYPE_AUDIO?'a':
+                 mt==AVMEDIA_TYPE_SUBTITLE?'s':mt==AVMEDIA_TYPE_DATA?'d':'?';
+            ti = mt==AVMEDIA_TYPE_VIDEO?0:mt==AVMEDIA_TYPE_AUDIO?1:
+                 mt==AVMEDIA_TYPE_SUBTITLE?2:mt==AVMEDIA_TYPE_DATA?3:4;
+            idx = tcnt[ti]++;
+            codec = og_spec(outg, "c", t, idx);
+            br    = og_spec(outg, "b", t, idx);
+            if (codec && !strcmp(codec, "copy"))
+                av_log(NULL, AV_LOG_INFO, "  map %-9s -> in#%d %-9s : COPY (passthrough)\n",
+                       outg->opts[o].val, si, av_get_media_type_string(mt));
+            else
+                av_log(NULL, AV_LOG_INFO, "  map %-9s -> in#%d %-9s : ENCODE %s%s%s\n",
+                       outg->opts[o].val, si, av_get_media_type_string(mt),
+                       codec ? codec : "(default)", br ? " @" : "", br ? br : "");
+        }
+        if (!matched)
+            av_log(NULL, optional ? AV_LOG_INFO : AV_LOG_WARNING,
+                   "  map %-9s -> no match%s\n", outg->opts[o].val, optional ? " (optional)" : " (REQUIRED!)");
+    }
+    av_log(NULL, AV_LOG_INFO, "  video filter: %s\n",
+           og_get(outg,"filter:v") ? og_get(outg,"filter:v") :
+           og_get(outg,"vf") ? og_get(outg,"vf") : "(none)");
+    e = NULL; while ((e = av_dict_iterate(outg->codec_opts, e)))
+        av_log(NULL, AV_LOG_INFO, "  enc-opt  %s=%s\n", e->key, e->value);
+    e = NULL; while ((e = av_dict_iterate(outg->format_opts, e)))
+        av_log(NULL, AV_LOG_INFO, "  mux-opt  %s=%s\n", e->key, e->value);
+    avformat_close_input(&ifmt);
+    uninit_parse_context(&octx);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *in_url = NULL, *out_url = NULL, *rate = NULL, *out_fmt = NULL;
@@ -1198,6 +1315,8 @@ int main(int argc, char **argv)
     }
     if (getenv("PTV_PARSE_DEBUG"))   /* validate the ffmpeg-style parser, then exit */
         return ptv_parse_and_print(argc, argv) < 0 ? 1 : 0;
+    if (getenv("PTV_PLAN_DEBUG"))    /* resolve -map/-c against the input, print plan, exit */
+        return plan_resolve_and_print(argc, argv) < 0 ? 1 : 0;
 
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-i") && i + 1 < argc)        in_url = argv[++i];
