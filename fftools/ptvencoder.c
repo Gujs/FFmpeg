@@ -60,7 +60,7 @@ const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
-#define PTV_FRAME_QDEPTH 6     /* decode->output jitter buffer (frames) */
+#define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 #define PTV_WD_DEADLINE_US (2 * (int64_t)AV_TIME_BASE)   /* watchdog stall threshold */
 
 /* Diagnostics (env PTV_DIAG=1): per-second stage counters + slow-call
@@ -363,7 +363,26 @@ static void *output_thread(void *arg)
     /* live: free-running master clock at the house rate. Pop ONE frame per tick;
      * the frame_q is a jitter buffer that absorbs decoder delivery bursts, so at
      * matched rates this is a smooth 1:1 (CFR). A genuine source gap -> dup; a
-     * genuine overflow (source faster / output stalled) -> drop-oldest at decode. */
+     * genuine overflow (source faster / output stalled) -> drop-oldest at decode.
+     *
+     * Pre-roll: decode delivery is bursty (OS scheduling, network read batching)
+     * even when the source cadence is perfectly steady, while the master clock
+     * consumes at a matched average rate. With no cushion the buffer sits near
+     * empty, so any momentary decode gap starves a tick -> a repeated frame (dup)
+     * -> visible micro-stutter. Priming frame_q to ~PTV_PREROLL_MS worth before
+     * starting the clock gives the gaps something to draw down instead. The video
+     * PTS stays content-anchored to h0, so the cushion only shifts WHEN frames
+     * emit, never their timestamps -> A/V sync is unchanged. */
+    {
+        const char *pe = getenv("PTV_PREROLL_MS");
+        int preroll_ms = pe ? atoi(pe) : 350;
+        int n_prime = (preroll_ms > 0 && v->tick_dur_us > 0)
+                          ? (int)((int64_t)preroll_ms * 1000 / v->tick_dur_us) : 0;
+        int primed;
+        if (n_prime > PTV_FRAME_QDEPTH - 8) n_prime = PTV_FRAME_QDEPTH - 8;
+        if (n_prime < 0) n_prime = 0;
+        primed = (n_prime == 0);
+
     for (;;) {
         int fresh = 0;
         ret = av_thread_message_queue_recv(v->frame_q, &f, AV_THREAD_MESSAGE_NONBLOCK);
@@ -374,6 +393,18 @@ static void *output_thread(void *arg)
             break;                                  /* decode finished, queue drained */
         }
         if (!have) { av_usleep(2000); continue; }   /* await first frame (no startup dups) */
+
+        if (!primed) {                              /* one-time jitter-buffer pre-roll */
+            int64_t pt0 = av_gettime_relative();
+            while (av_thread_message_queue_nb_elems(v->frame_q) < n_prime &&
+                   av_gettime_relative() - pt0 < (int64_t)preroll_ms * 3000)
+                av_usleep(2000);
+            primed = 1;
+            if (g_diag)
+                av_log(NULL, AV_LOG_INFO,
+                       "[PTV-DIAG] preroll: primed frame_q to %d frames (~%dms target)\n",
+                       av_thread_message_queue_nb_elems(v->frame_q), preroll_ms);
+        }
 
         if (v->emitted == 0) wall0 = av_gettime_relative();
         {
@@ -423,6 +454,7 @@ static void *output_thread(void *arg)
         }
     }
     encode_push(v->mux_q, v->venc, v->ost, NULL);
+    }
 done:
     av_frame_free(&held);
     v->output_done = 1;
