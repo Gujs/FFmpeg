@@ -1056,6 +1056,86 @@ end:
     return ret;
 }
 
+/* ---- ffmpeg-style command parsing (reuses cmdutils split_commandline) ----
+ * We only name the STRUCTURAL options; unknown encoder/mux options (-preset,
+ * -rc, -mpegts_flags, -pat_period, ...) fall through to opt_default and land in
+ * each group's codec_opts/format_opts dicts, forwarded verbatim to libav. A few
+ * ffmpeg-CLI-only opts are listed as recognized/no-op so real commands parse. */
+static const OptionGroupDef ptv_groups[] = {
+    { "output url", NULL, OPT_OUTPUT },   /* no separator: ended by a bare URL; must be first */
+    { "input url",  "i",  OPT_INPUT  },
+};
+
+static const OptionDef ptv_options[] = {
+    /* recognized-but-passive ffmpeg-CLI globals (so production commands parse) */
+    { "v",                OPT_TYPE_STRING, 0,                        { .off = 0 }, "log level", "level" },
+    { "loglevel",         OPT_TYPE_STRING, 0,                        { .off = 0 }, "log level", "level" },
+    { "stats",            OPT_TYPE_BOOL,   0,                        { .off = 0 }, "print stats" },
+    { "stats_period",     OPT_TYPE_STRING, 0,                        { .off = 0 }, "stats period", "t" },
+    { "y",                OPT_TYPE_BOOL,   0,                        { .off = 0 }, "overwrite output" },
+    { "n",                OPT_TYPE_BOOL,   0,                        { .off = 0 }, "never overwrite" },
+    { "init_hw_device",   OPT_TYPE_STRING, 0,                        { .off = 0 }, "init hw device", "args" },
+    { "filter_hw_device", OPT_TYPE_STRING, 0,                        { .off = 0 }, "filter hw device", "name" },
+    { "filter_complex",   OPT_TYPE_STRING, 0,                        { .off = 0 }, "filtergraph", "graph" },
+    { "abort_on",         OPT_TYPE_STRING, 0,                        { .off = 0 }, "abort conditions", "flags" },
+    /* per-output structural options (walked from g->opts[]) */
+    { "map",              OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "stream map", "spec" },
+    { "c",                OPT_TYPE_STRING, OPT_SPEC | OPT_OUTPUT,    { .off = 0 }, "codec", "codec" },
+    { "codec",            OPT_TYPE_STRING, OPT_SPEC | OPT_OUTPUT,    { .off = 0 }, "codec", "codec" },
+    { "b",                OPT_TYPE_STRING, OPT_SPEC | OPT_OUTPUT,    { .off = 0 }, "bitrate", "rate" },
+    { "metadata",         OPT_TYPE_STRING, OPT_SPEC | OPT_OUTPUT,    { .off = 0 }, "metadata", "key=val" },
+    { "disposition",      OPT_TYPE_STRING, OPT_SPEC | OPT_OUTPUT,    { .off = 0 }, "disposition", "flags" },
+    { "filter",           OPT_TYPE_STRING, OPT_SPEC | OPT_OUTPUT,    { .off = 0 }, "stream filtergraph", "graph" },
+    { "vf",               OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "video filtergraph", "graph" },
+    { "af",               OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "audio filtergraph", "graph" },
+    { "r",                OPT_TYPE_STRING, OPT_SPEC | OPT_OUTPUT,    { .off = 0 }, "frame rate", "fps" },
+    { "ar",               OPT_TYPE_STRING, OPT_SPEC | OPT_OUTPUT,    { .off = 0 }, "audio rate", "hz" },
+    { "ac",               OPT_TYPE_STRING, OPT_SPEC | OPT_OUTPUT,    { .off = 0 }, "audio channels", "n" },
+    { "fps_mode",         OPT_TYPE_STRING, OPT_SPEC | OPT_OUTPUT,    { .off = 0 }, "fps mode", "mode" },
+    { "avoid_negative_ts",OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "avoid negative ts", "mode" },
+    { "max_muxing_queue_size", OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "max muxing queue", "n" },
+    { "t",                OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "duration", "sec" },
+    { "an",               OPT_TYPE_BOOL,   OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "no audio" },
+    { "f",                OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "force format", "fmt" },
+    { NULL },
+};
+
+static void ptv_dump_group(const char *kind, OptionGroup *grp)
+{
+    const AVDictionaryEntry *e = NULL;
+    int o;
+    av_log(NULL, AV_LOG_INFO, "=== %s: %s ===\n", kind, grp->arg && *grp->arg ? grp->arg : "(global)");
+    for (o = 0; o < grp->nb_opts; o++)
+        av_log(NULL, AV_LOG_INFO, "    opt        %-12s = %s\n", grp->opts[o].key, grp->opts[o].val);
+    while ((e = av_dict_iterate(grp->codec_opts, e)))
+        av_log(NULL, AV_LOG_INFO, "    codec_opt  %-12s = %s\n", e->key, e->value);
+    e = NULL;
+    while ((e = av_dict_iterate(grp->format_opts, e)))
+        av_log(NULL, AV_LOG_INFO, "    fmt_opt    %-12s = %s\n", e->key, e->value);
+}
+
+/* PTV_PARSE_DEBUG=1: parse an ffmpeg-style command and print the resolved plan,
+ * then exit. Validates the cmdutils reuse before the pipeline is rewired. */
+static int ptv_parse_and_print(int argc, char **argv)
+{
+    OptionParseContext octx;
+    int g, gi, ret;
+    ret = split_commandline(&octx, argc, argv, ptv_options, ptv_groups,
+                            sizeof(ptv_groups) / sizeof(ptv_groups[0]));
+    if (ret < 0) {
+        av_log(NULL, AV_LOG_ERROR, "split_commandline failed: %s\n", av_err2str(ret));
+        return ret;
+    }
+    ptv_dump_group("global", &octx.global_opts);
+    for (g = 0; g < octx.nb_groups; g++) {
+        OptionGroupList *l = &octx.groups[g];
+        for (gi = 0; gi < l->nb_groups; gi++)
+            ptv_dump_group(l->group_def->name, &l->groups[gi]);
+    }
+    uninit_parse_context(&octx);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *in_url = NULL, *out_url = NULL, *rate = NULL, *out_fmt = NULL;
@@ -1082,6 +1162,8 @@ int main(int argc, char **argv)
     if (argc >= 2 && (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help"))) {
         show_help_default(NULL, NULL); return 0;
     }
+    if (getenv("PTV_PARSE_DEBUG"))   /* validate the ffmpeg-style parser, then exit */
+        return ptv_parse_and_print(argc, argv) < 0 ? 1 : 0;
 
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-i") && i + 1 < argc)        in_url = argv[++i];
