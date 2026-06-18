@@ -67,6 +67,9 @@ const int  program_birth_year = 2026;
  * breadcrumbs to localize a stall. Temporary, gated, low-overhead (Rule 0). */
 static int     g_diag;
 static int64_t g_muxed;
+/* ffmpeg-style progress line (frame=/fps=/bitrate=/speed=); on unless -nostats. */
+static int     g_stats = 1;
+static int64_t g_muxed_bytes;
 /* PTV_SLOW_US: inject N us of extra per-emitted-frame consumer cost, to model a
  * slow/blocking encoder on a box that has none. Stress knob, gated. */
 static int     g_slow;
@@ -341,6 +344,7 @@ static void *output_thread(void *arg)
     int have = 0, ret = 0;
     int64_t tick = 0, wall0 = 0, last_vpts = -1;
     int64_t diag_t0 = av_gettime_relative(), diag_last = diag_t0;
+    int64_t stat_last = diag_t0, stat_prev = 0;
 
     if (!held)
         goto done;
@@ -450,6 +454,26 @@ static void *output_thread(void *arg)
                     av_thread_message_queue_nb_elems(v->frame_q),
                     av_thread_message_queue_nb_elems(v->mux_q));
                 diag_last = nowd;
+            }
+        }
+
+        if (g_stats) {                          /* ffmpeg-style progress line */
+            int64_t nows = av_gettime_relative();
+            if (nows - stat_last >= 1000000) {
+                double dt    = (nows - stat_last) / 1000000.0;
+                double fps   = (v->emitted - stat_prev) / (dt > 0 ? dt : 1);
+                double secs  = v->emitted * v->tick_dur_us / 1000000.0;   /* CFR output time */
+                double wall  = (nows - wall0) / 1000000.0;
+                double speed = wall > 0 ? secs / wall : 0;
+                double kbps  = secs > 0 ? g_muxed_bytes * 8.0 / secs / 1000.0 : 0;
+                int hh = (int)(secs / 3600), mm = ((int)secs % 3600) / 60;
+                double ss = secs - hh * 3600 - mm * 60;
+                av_log(NULL, AV_LOG_INFO,
+                    "frame=%6"PRId64" fps=%3.0f size=%8"PRId64"KiB time=%02d:%02d:%05.2f "
+                    "bitrate=%7.1fkbits/s dup=%"PRId64" drop=%"PRId64" speed=%4.2fx\n",
+                    v->emitted, fps, g_muxed_bytes / 1024, hh, mm, ss, kbps,
+                    v->dup, v->framedrop, speed);
+                stat_last = nows; stat_prev = v->emitted;
             }
         }
     }
@@ -750,6 +774,7 @@ static void *mux_thread(void *arg)
         }
         {
             int64_t wt0 = g_diag ? av_gettime_relative() : 0;
+            g_muxed_bytes += pkt->size;
             ret = av_interleaved_write_frame(m->ofmt, pkt);
             if (g_diag) {
                 int64_t dlt = av_gettime_relative() - wt0;
@@ -796,6 +821,7 @@ static int transcode(const char *in_url, const char *out_url, const char *out_fm
     if ((ret = avformat_find_stream_info(ifmt, NULL)) < 0) {
         av_log(NULL, AV_LOG_ERROR, "stream info: %s\n", av_err2str(ret)); goto end;
     }
+    av_dump_format(ifmt, 0, in_url, 0);   /* ffmpeg-style "Input #0 ... Stream ..." */
 
     vstream = av_find_best_stream(ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, &vdecoder, 0);
     if (vstream < 0) { av_log(NULL, AV_LOG_ERROR, "no video stream\n"); ret = vstream; goto end; }
@@ -953,6 +979,7 @@ static int transcode(const char *in_url, const char *out_url, const char *out_fm
         av_log(NULL, AV_LOG_ERROR, "write header: %s\n", av_err2str(ret)); goto end;
     }
     hdr_written = 1;
+    av_dump_format(ofmt, 0, out_url, 1);  /* ffmpeg-style "Output #0 ... Stream ..." */
 
     net_input = !strncmp(in_url, "udp://", 6) || !strncmp(in_url, "rtp://", 6) ||
                 !strncmp(in_url, "srt://", 6);
@@ -1171,6 +1198,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-r") && i + 1 < argc)   rate   = argv[++i];
         else if (!strcmp(argv[i], "-f") && i + 1 < argc)   out_fmt = argv[++i];
         else if (!strcmp(argv[i], "-an"))                  want_audio = 0;
+        else if (!strcmp(argv[i], "-nostats"))             g_stats = 0;
+        else if (!strcmp(argv[i], "-stats"))               g_stats = 1;
         else if ((!strcmp(argv[i], "-vf") || !strcmp(argv[i], "-filter:v")) && i + 1 < argc) vfilter = argv[++i];
         else if (!strcmp(argv[i], "--deint"))              do_deint = 1;
         else if (!strcmp(argv[i], "-s") && i + 1 < argc) {
