@@ -964,7 +964,8 @@ typedef struct Rung {
  * — decode once, one filter graph splits to N branches, each output group is an
  * independent muxer/encoder; audio + subs/data decoded/copied once and fanned
  * out. Selection (transcode vs copy) per group comes from its -map/-c. */
-static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcomplex, int mode)
+static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcomplex,
+                     const char *hwdev, int mode)
 {
     const char *in_url = ing->arg;
     int n_rung = outs->nb_groups;
@@ -1036,11 +1037,31 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
         }
     }
 
-    /* CUDA backend when the filter graph targets it (filter_complex or single -vf) */
+    /* CUDA backend when the filter graph targets it (filter_complex or single -vf).
+     * ONE device is created and set on every hw filter (hwupload/bwdif/scale_cuda);
+     * NVENC inherits it via the filtered frames' hw_frames_ctx — so a single GPU
+     * ordinal drives the whole chain. Selected ffmpeg-style with
+     * `-init_hw_device cuda=cuda:N` (the device part after the last ':'); default 0. */
     hw_cuda = (fcomplex && (strstr(fcomplex, "_cuda") || strstr(fcomplex, "hwupload_cuda"))) ||
               (sel[0].vf && (strstr(sel[0].vf, "_cuda") || strstr(sel[0].vf, "hwupload_cuda")));
-    if (hw_cuda && (ret = av_hwdevice_ctx_create(&hw_device, AV_HWDEVICE_TYPE_CUDA, NULL, NULL, 0)) < 0) {
-        av_log(NULL, AV_LOG_ERROR, "cannot create CUDA device: %s\n", av_err2str(ret)); goto end;
+    if (hw_cuda) {
+        const char *cuda_ord = NULL; char ordbuf[64];
+        if (hwdev) {
+            const char *c = strrchr(hwdev, ':');         /* cuda=cuda:N / cuda:N -> "N" */
+            if (c && c[1]) {
+                char *comma;
+                snprintf(ordbuf, sizeof ordbuf, "%s", c + 1);
+                if ((comma = strchr(ordbuf, ','))) *comma = 0;   /* drop trailing ,opts */
+                if (ordbuf[0]) cuda_ord = ordbuf;
+            }
+        }
+        if ((ret = av_hwdevice_ctx_create(&hw_device, AV_HWDEVICE_TYPE_CUDA, cuda_ord, NULL, 0)) < 0) {
+            av_log(NULL, AV_LOG_ERROR, "cannot create CUDA device '%s': %s\n",
+                   cuda_ord ? cuda_ord : "0", av_err2str(ret)); goto end;
+        }
+        av_log(NULL, AV_LOG_INFO,
+               "ptvencoder: CUDA device %s (hwupload + deint + scale + nvenc all share it)\n",
+               cuda_ord ? cuda_ord : "0");
     }
 
     /* shared filter graph: -filter_complex (split -> N sinks), a single -filter:v
@@ -1639,7 +1660,7 @@ int main(int argc, char **argv)
     OptionParseContext octx;
     OptionGroup *ing;
     OptionGroupList *outs;
-    const char *fcomplex = NULL;
+    const char *fcomplex = NULL, *hwdev = NULL;
     int mode = -1, ret, gi;
 
     init_dynload();
@@ -1674,6 +1695,8 @@ int main(int argc, char **argv)
         if (!strcmp(octx.global_opts.opts[gi].key, "nostats")) g_stats = 0;        /* honor -nostats */
         if (!strcmp(octx.global_opts.opts[gi].key, "filter_complex"))              /* shared split graph */
             fcomplex = octx.global_opts.opts[gi].val;
+        if (!strcmp(octx.global_opts.opts[gi].key, "init_hw_device"))              /* cuda=cuda:N -> GPU N */
+            hwdev = octx.global_opts.opts[gi].val;
     }
     if (octx.groups[1].nb_groups < 1 || octx.groups[0].nb_groups < 1) {
         av_log(NULL, AV_LOG_ERROR,
@@ -1683,7 +1706,7 @@ int main(int argc, char **argv)
     }
     ing  = &octx.groups[1].groups[0];   /* first input */
     outs = &octx.groups[0];             /* all output groups (one per ABR rung) */
-    ret  = transcode(ing, outs, fcomplex, mode);
+    ret  = transcode(ing, outs, fcomplex, hwdev, mode);
     uninit_parse_context(&octx);
     return ret < 0 ? 1 : 0;
 }
