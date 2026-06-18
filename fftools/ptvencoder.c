@@ -1557,6 +1557,7 @@ static const OptionDef ptv_options[] = {
     { "stats_period",     OPT_TYPE_STRING, 0,                        { .off = 0 }, "stats period", "t" },
     { "y",                OPT_TYPE_BOOL,   0,                        { .off = 0 }, "overwrite output" },
     { "n",                OPT_TYPE_BOOL,   0,                        { .off = 0 }, "never overwrite" },
+    { "hide_banner",      OPT_TYPE_BOOL,   0,                        { .off = 0 }, "suppress startup banner" },
     { "init_hw_device",   OPT_TYPE_STRING, 0,                        { .off = 0 }, "init hw device", "args" },
     { "filter_hw_device", OPT_TYPE_STRING, 0,                        { .off = 0 }, "filter hw device", "name" },
     { "filter_complex",   OPT_TYPE_STRING, 0,                        { .off = 0 }, "filtergraph", "graph" },
@@ -1803,13 +1804,31 @@ static int plan_resolve_and_print(int argc, char **argv)
     return 0;
 }
 
+/* ffmpeg-style startup banner: product name + FFmpeg build id + lib versions.
+ * Emitted via av_log (so the [timestamp] prefix and -loglevel gating apply, like
+ * the rest of the output); suppressed by -hide_banner. */
+static void ptv_show_banner(void)
+{
+    av_log(NULL, AV_LOG_INFO, "Perception TV Encoder (ptvencoder)  FFmpeg %s\n", av_version_info());
+    av_log(NULL, AV_LOG_INFO, "  libavutil      %u.%u.%u\n",
+           AV_VERSION_MAJOR(avutil_version()), AV_VERSION_MINOR(avutil_version()), AV_VERSION_MICRO(avutil_version()));
+    av_log(NULL, AV_LOG_INFO, "  libavcodec     %u.%u.%u\n",
+           AV_VERSION_MAJOR(avcodec_version()), AV_VERSION_MINOR(avcodec_version()), AV_VERSION_MICRO(avcodec_version()));
+    av_log(NULL, AV_LOG_INFO, "  libavformat    %u.%u.%u\n",
+           AV_VERSION_MAJOR(avformat_version()), AV_VERSION_MINOR(avformat_version()), AV_VERSION_MICRO(avformat_version()));
+    av_log(NULL, AV_LOG_INFO, "  libavfilter    %u.%u.%u\n",
+           AV_VERSION_MAJOR(avfilter_version()), AV_VERSION_MINOR(avfilter_version()), AV_VERSION_MICRO(avfilter_version()));
+    av_log(NULL, AV_LOG_INFO, "  libswresample  %u.%u.%u\n",
+           AV_VERSION_MAJOR(swresample_version()), AV_VERSION_MINOR(swresample_version()), AV_VERSION_MICRO(swresample_version()));
+}
+
 int main(int argc, char **argv)
 {
     OptionParseContext octx;
     OptionGroup *ing;
     OptionGroupList *outs;
     const char *fcomplex = NULL, *hwdev = NULL;
-    int mode = -1, ret, gi;
+    int mode = -1, ret, gi, hide_banner = 0;
 
     init_dynload();
     av_log_set_level(AV_LOG_INFO);
@@ -1819,13 +1838,17 @@ int main(int argc, char **argv)
         av_log_set_callback(ptv_log_ts_callback);
 
     if (argc >= 2 && (!strcmp(argv[1], "-version") || !strcmp(argv[1], "--version"))) {
-        printf("ptvencoder (PoC) — FFmpeg %s\n", av_version_info());
-        printf("  libavformat   %u.%u.%u\n", AV_VERSION_MAJOR(avformat_version()),
-               AV_VERSION_MINOR(avformat_version()), AV_VERSION_MICRO(avformat_version()));
-        printf("  libavcodec    %u.%u.%u\n", AV_VERSION_MAJOR(avcodec_version()),
-               AV_VERSION_MINOR(avcodec_version()), AV_VERSION_MICRO(avcodec_version()));
-        printf("  libavutil     %u.%u.%u\n", AV_VERSION_MAJOR(avutil_version()),
+        printf("Perception TV Encoder (ptvencoder)  FFmpeg %s\n", av_version_info());
+        printf("  libavutil      %u.%u.%u\n", AV_VERSION_MAJOR(avutil_version()),
                AV_VERSION_MINOR(avutil_version()), AV_VERSION_MICRO(avutil_version()));
+        printf("  libavcodec     %u.%u.%u\n", AV_VERSION_MAJOR(avcodec_version()),
+               AV_VERSION_MINOR(avcodec_version()), AV_VERSION_MICRO(avcodec_version()));
+        printf("  libavformat    %u.%u.%u\n", AV_VERSION_MAJOR(avformat_version()),
+               AV_VERSION_MINOR(avformat_version()), AV_VERSION_MICRO(avformat_version()));
+        printf("  libavfilter    %u.%u.%u\n", AV_VERSION_MAJOR(avfilter_version()),
+               AV_VERSION_MINOR(avfilter_version()), AV_VERSION_MICRO(avfilter_version()));
+        printf("  libswresample  %u.%u.%u\n", AV_VERSION_MAJOR(swresample_version()),
+               AV_VERSION_MINOR(swresample_version()), AV_VERSION_MICRO(swresample_version()));
         return 0;
     }
     if (argc >= 2 && (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help"))) {
@@ -1850,7 +1873,10 @@ int main(int argc, char **argv)
         if (!strcmp(octx.global_opts.opts[gi].key, "stats_period")) {              /* progress-line interval */
             int64_t p; if (av_parse_time(&p, octx.global_opts.opts[gi].val, 1) >= 0 && p > 0) g_stats_period_us = p;
         }
+        if (!strcmp(octx.global_opts.opts[gi].key, "hide_banner")) hide_banner = 1; /* suppress startup banner */
     }
+    if (!hide_banner)
+        ptv_show_banner();
     if (octx.groups[1].nb_groups < 1 || octx.groups[0].nb_groups < 1) {
         av_log(NULL, AV_LOG_ERROR,
                "usage: ptvencoder [opts] -i <input> [-filter_complex ..] "
