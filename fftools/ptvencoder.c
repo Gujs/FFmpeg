@@ -621,12 +621,23 @@ done:
 
 /* ---- demux + mux ---- */
 
+#define PTV_MAX_PASS 16
+typedef struct PassStream {
+    int        in_index;    /* input stream index being copied 1:1 */
+    AVStream  *ost;         /* output stream */
+    AVRational in_tb;       /* input/output time_base (copy: identical) */
+} PassStream;
+
 typedef struct DemuxArgs {
     AVFormatContext      *ifmt;
-    AVThreadMessageQueue *video_q, *audio_q;
+    AVThreadMessageQueue *video_q, *audio_q, *mux_q;
     int                   vstream, astream;
     int                   drop;          /* non-blocking + drop on full (network input) */
-    int64_t               vpkt, apkt, vdrop, adrop;
+    PassStream           *pass;          /* copy-passthrough: extra audio, subs, data */
+    int                   n_pass;
+    int64_t              *h0;             /* house origin (us); copy ts rebased onto it */
+    pthread_mutex_t      *h0_lock;
+    int64_t               vpkt, apkt, ppkt, vdrop, adrop, pdrop;
 } DemuxArgs;
 
 typedef struct MuxArgs {
@@ -649,6 +660,33 @@ static int demux_send(AVThreadMessageQueue *q, AVPacket *pkt, int drop, int64_t 
     return ret;
 }
 
+/* Copy-passthrough: route an input packet we don't transcode (extra audio, DVB
+ * subtitle, data/SCTE-35) straight to the muxer, rebased onto the same h0 house
+ * timeline the encoded streams use so everything stays in sync. Packets that
+ * precede the anchor are dropped (exactly like audio_push). */
+static int demux_pass(DemuxArgs *d, AVPacket *out)
+{
+    int pi;
+    for (pi = 0; pi < d->n_pass; pi++) {
+        int64_t h0, h0_tb, ref;
+        if (out->stream_index != d->pass[pi].in_index)
+            continue;
+        pthread_mutex_lock(d->h0_lock); h0 = *d->h0; pthread_mutex_unlock(d->h0_lock);
+        if (h0 == AV_NOPTS_VALUE) { av_packet_free(&out); return 0; }  /* video not anchored yet */
+        h0_tb = av_rescale_q(h0, AV_TIME_BASE_Q, d->pass[pi].in_tb);
+        if (out->pts != AV_NOPTS_VALUE) out->pts -= h0_tb;
+        if (out->dts != AV_NOPTS_VALUE) out->dts -= h0_tb;
+        ref = out->dts != AV_NOPTS_VALUE ? out->dts : out->pts;
+        if (ref != AV_NOPTS_VALUE && ref < 0) { av_packet_free(&out); return 0; }  /* precedes anchor */
+        out->stream_index = d->pass[pi].ost->index;
+        out->pos = -1;
+        d->ppkt++;
+        return demux_send(d->mux_q, out, d->drop, &d->pdrop);
+    }
+    av_packet_free(&out);
+    return 0;
+}
+
 static void *demux_thread(void *arg)
 {
     DemuxArgs *d = arg;
@@ -663,7 +701,8 @@ static void *demux_thread(void *arg)
             int64_t now = av_gettime_relative();
             if (now - diag_last >= 1000000) {
                 av_log(NULL, AV_LOG_INFO, "[PTV-DIAG] demux vpkt=%"PRId64" vdrop=%"PRId64
-                       " apkt=%"PRId64" adrop=%"PRId64"\n", d->vpkt, d->vdrop, d->apkt, d->adrop);
+                       " apkt=%"PRId64" adrop=%"PRId64" ppkt=%"PRId64" pdrop=%"PRId64"\n",
+                       d->vpkt, d->vdrop, d->apkt, d->adrop, d->ppkt, d->pdrop);
                 diag_last = now;
             }
         }
@@ -677,7 +716,7 @@ static void *demux_thread(void *arg)
             d->apkt++;
             ret = demux_send(d->audio_q, out, d->drop, &d->adrop);
         } else {
-            av_packet_free(&out);
+            ret = demux_pass(d, out);       /* copy-passthrough, or free if unmapped */
         }
         if (ret < 0)
             break;
@@ -686,6 +725,10 @@ end:
     av_thread_message_queue_set_err_send(d->video_q, AVERROR_EOF);
     if (d->astream >= 0)
         av_thread_message_queue_set_err_send(d->audio_q, AVERROR_EOF);
+    if (d->n_pass > 0) {                     /* copy-passthrough producer EOF */
+        AVPacket *eof = NULL;
+        av_thread_message_queue_send(d->mux_q, &eof, 0);
+    }
     av_packet_free(&pkt);
     return NULL;
 }
@@ -742,6 +785,7 @@ static int transcode(const char *in_url, const char *out_url, const char *out_fm
     int vstream = -1, astream = -1, ret = 0, live, net_input, have_audio = 0;
     int started_audio = 0, hdr_written = 0;
     AVRational out_fps;
+    PassStream pass[PTV_MAX_PASS]; int n_pass = 0, si;
 
     memset(&vc, 0, sizeof(vc)); memset(&as, 0, sizeof(as));
     memset(&da, 0, sizeof(da)); memset(&ma, 0, sizeof(ma));
@@ -822,9 +866,21 @@ static int transcode(const char *in_url, const char *out_url, const char *out_fm
     avcodec_parameters_from_context(vc.ost->codecpar, venc);
     vc.ost->time_base = venc->time_base;
 
-    /* audio (optional) */
-    if (want_audio)
-        astream = av_find_best_stream(ifmt, AVMEDIA_TYPE_AUDIO, -1, -1, &adecoder, 0);
+    /* audio (optional). Prefer a <=2ch (stereo) source for the AAC transcode; any
+     * multichannel stream (e.g. AC-3 5.1) is preserved untouched via passthrough,
+     * matching the broadcast ladder convention. */
+    if (want_audio) {
+        astream = av_find_best_stream(ifmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
+        for (si = 0; si < (int)ifmt->nb_streams; si++) {
+            AVCodecParameters *cp = ifmt->streams[si]->codecpar;
+            if (cp->codec_type == AVMEDIA_TYPE_AUDIO &&
+                cp->ch_layout.nb_channels > 0 && cp->ch_layout.nb_channels <= 2) {
+                astream = si; break;
+            }
+        }
+        if (astream >= 0)
+            adecoder = avcodec_find_decoder(ifmt->streams[astream]->codecpar->codec_id);
+    }
     if (astream >= 0) {
         aist = ifmt->streams[astream];
         adec = avcodec_alloc_context3(adecoder);
@@ -860,6 +916,34 @@ static int transcode(const char *in_url, const char *out_url, const char *out_fm
             }
         }
     }
+
+    /* passthrough (copy): every input stream we don't transcode — extra audio
+     * (e.g. AC-3 5.1), DVB subtitles, data/SCTE-35 — mapped 1:1 to the output.
+     * Must be created before the header is written. */
+    for (si = 0; si < (int)ifmt->nb_streams && n_pass < PTV_MAX_PASS; si++) {
+        AVStream *ist = ifmt->streams[si];
+        enum AVMediaType mt = ist->codecpar->codec_type;
+        AVStream *os;
+        AVDictionaryEntry *lang;
+        if (si == vstream || (have_audio && si == astream))
+            continue;
+        if (mt != AVMEDIA_TYPE_AUDIO && mt != AVMEDIA_TYPE_SUBTITLE && mt != AVMEDIA_TYPE_DATA)
+            continue;
+        os = avformat_new_stream(ofmt, NULL);
+        if (!os) { ret = AVERROR(ENOMEM); goto end; }
+        if ((ret = avcodec_parameters_copy(os->codecpar, ist->codecpar)) < 0) goto end;
+        os->codecpar->codec_tag = 0;
+        os->time_base   = ist->time_base;
+        os->disposition = ist->disposition;
+        lang = av_dict_get(ist->metadata, "language", NULL, 0);
+        if (lang) av_dict_set(&os->metadata, "language", lang->value, 0);
+        pass[n_pass].in_index = si;
+        pass[n_pass].ost      = os;
+        pass[n_pass].in_tb    = ist->time_base;
+        n_pass++;
+    }
+    if (n_pass)
+        av_log(NULL, AV_LOG_INFO, "ptvencoder: passthrough %d stream(s) (copy)\n", n_pass);
 
     if (!(ofmt->oformat->flags & AVFMT_NOFILE))
         if ((ret = avio_open(&ofmt->pb, out_url, AVIO_FLAG_WRITE)) < 0) {
@@ -901,9 +985,10 @@ static int transcode(const char *in_url, const char *out_url, const char *out_fm
         vdecoder->name, vencoder->name, have_audio ? "aac" : "none", ofmt->oformat->name,
         net_input ? "net(drop)" : "file(block)");
 
-    da.ifmt = ifmt; da.video_q = video_q; da.audio_q = audio_q;
+    da.ifmt = ifmt; da.video_q = video_q; da.audio_q = audio_q; da.mux_q = mux_q;
     da.vstream = vstream; da.astream = have_audio ? astream : -1; da.drop = net_input;
-    ma.ofmt = ofmt; ma.mux_q = mux_q; ma.n_producers = have_audio ? 2 : 1;
+    da.pass = pass; da.n_pass = n_pass; da.h0 = &input_h0_us; da.h0_lock = &h0_lock;
+    ma.ofmt = ofmt; ma.mux_q = mux_q; ma.n_producers = (have_audio ? 2 : 1) + (n_pass > 0 ? 1 : 0);
 
     if ((ret = pthread_create(&th_mux, NULL, mux_thread, &ma))) { ret = AVERROR(ret); goto end; }
     if ((ret = pthread_create(&th_output, NULL, output_thread, &vc))) {
