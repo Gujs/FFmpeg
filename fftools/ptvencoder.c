@@ -217,7 +217,7 @@ static int build_video_filter(VideoCtx *v, AVCodecContext *vdec, AVRational tb,
                          k = snprintf(p, rem, __VA_ARGS__); p += k; rem -= k; } while (0)
         if (hw_cuda) {
             APPEND("hwupload_cuda");
-            if (do_deint) APPEND("bwdif_cuda");
+            if (do_deint) APPEND("bwdif_cuda=mode=send_frame");   /* non-doubling, match -r (like CPU --deint) */
             if (sw > 0)   APPEND("scale_cuda=%d:%d", sw, sh);
         } else {
             if (do_deint) APPEND("bwdif=mode=send_frame:deint=all");
