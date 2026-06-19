@@ -43,6 +43,8 @@
 #include "libavutil/time.h"
 #include "libavutil/parseutils.h"
 #include "libavutil/mathematics.h"
+#include "libavutil/crc.h"
+#include "libavutil/bswap.h"
 #include "libavutil/samplefmt.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/audio_fifo.h"
@@ -1001,6 +1003,68 @@ static int demux_send(AVThreadMessageQueue *q, AVPacket *pkt, int drop, int64_t 
     return ret;
 }
 
+/* Shift a SCTE-35 splice_info_section's pts_adjustment by offset_us (the same
+ * offset demux_pass applies to the packet timestamps), so the wire
+ * effective_splice_time = (splice_time + pts_adjustment) mod 2^33 rides the
+ * house clock and a downstream splicer matches it against our output video PTS.
+ * The muxer (mpegtsenc) writes the section verbatim, assuming this rebase ran. */
+static void scte35_rebase_pts_adjustment(AVPacket *pkt, int64_t offset_us)
+{
+    const uint8_t *buf;
+    uint8_t *wbuf;
+    int len, section_length, ret;
+    int64_t old_pts_adjustment, new_pts_adjustment, offset_90k;
+    uint32_t crc;
+
+    if (!offset_us || !pkt->data || pkt->size < 17)
+        return; /* need at least header + 4-byte CRC */
+
+    buf = pkt->data;
+    len = pkt->size;
+
+    if (buf[0] != 0xFC)         /* table_id must be splice_info_section */
+        return;
+
+    section_length = ((buf[1] & 0x0F) << 8) | buf[2];
+    if (section_length + 3 > len)
+        return;
+
+    /* Read 33-bit pts_adjustment: byte 4 bit 0 (MSB) + bytes 5-8 (BE32). */
+    old_pts_adjustment = ((int64_t)(buf[4] & 0x01) << 32) |
+                         ((int64_t)buf[5] << 24) |
+                         ((int64_t)buf[6] << 16) |
+                         ((int64_t)buf[7] << 8)  |
+                         buf[8];
+
+    offset_90k = av_rescale(offset_us, 90000, AV_TIME_BASE);
+    new_pts_adjustment = (old_pts_adjustment + offset_90k) & 0x1FFFFFFFFLL;
+
+    ret = av_packet_make_writable(pkt);
+    if (ret < 0)
+        return;
+    wbuf = pkt->data;
+
+    /* Write 33-bit pts_adjustment back; preserve byte 4's top 7 bits
+     * (encrypted_packet flag + encryption_algorithm). */
+    wbuf[4] = (wbuf[4] & 0xFE) | ((new_pts_adjustment >> 32) & 0x01);
+    wbuf[5] = (new_pts_adjustment >> 24) & 0xFF;
+    wbuf[6] = (new_pts_adjustment >> 16) & 0xFF;
+    wbuf[7] = (new_pts_adjustment >>  8) & 0xFF;
+    wbuf[8] =  new_pts_adjustment        & 0xFF;
+
+    /* Recompute the trailing CRC32 over the whole section. */
+    crc = av_bswap32(av_crc(av_crc_get_table(AV_CRC_32_IEEE), -1,
+                            wbuf, len - 4));
+    wbuf[len - 4] = (crc >> 24) & 0xFF;
+    wbuf[len - 3] = (crc >> 16) & 0xFF;
+    wbuf[len - 2] = (crc >>  8) & 0xFF;
+    wbuf[len - 1] =  crc        & 0xFF;
+
+    av_log(NULL, AV_LOG_DEBUG,
+           "ptvencoder: SCTE-35 pts_adjustment %"PRId64" -> %"PRId64" (%+.3fs)\n",
+           old_pts_adjustment, new_pts_adjustment, (double)offset_90k / 90000.0);
+}
+
 /* Copy-passthrough: route an input packet we don't transcode (extra audio, DVB
  * subtitle, data/SCTE-35) straight to the muxer, rebased onto the same h0 house
  * timeline the encoded streams use so everything stays in sync. Packets that
@@ -1027,6 +1091,11 @@ static int demux_pass(DemuxArgs *d, AVPacket *out)
         if (out->dts != AV_NOPTS_VALUE) out->dts -= h0_tb;
         ref = out->dts != AV_NOPTS_VALUE ? out->dts : out->pts;
         if (ref != AV_NOPTS_VALUE && ref < 0) { av_packet_free(&out); return 0; }  /* precedes anchor */
+        /* SCTE-35: rebase the in-section pts_adjustment by the SAME offset just
+         * applied to pts/dts (-h0_tb), so effective_splice_time rides the house
+         * clock and a downstream splicer matches it to the output video PTS. */
+        if (d->ifmt->streams[d->pass[pi].in_index]->codecpar->codec_id == AV_CODEC_ID_SCTE_35)
+            scte35_rebase_pts_adjustment(out, -av_rescale_q(h0_tb, d->pass[pi].in_tb, AV_TIME_BASE_Q));
         out->pos = -1;
         d->ppkt++;
         for (i = 0; i < d->n_out; i++) {            /* fan the copy out to every muxer */
