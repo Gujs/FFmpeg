@@ -977,6 +977,7 @@ typedef struct DemuxArgs {
     int                   n_pass;
     int64_t              *h0;             /* house origin (us); copy ts rebased onto it */
     pthread_mutex_t      *h0_lock;
+    int64_t              *house_skew;     /* video's house-vs-content skew (us); copy rides it */
     int64_t               vpkt, apkt, ppkt, vdrop, adrop, pdrop;
 } DemuxArgs;
 
@@ -1014,6 +1015,14 @@ static int demux_pass(DemuxArgs *d, AVPacket *out)
         pthread_mutex_lock(d->h0_lock); h0 = *d->h0; pthread_mutex_unlock(d->h0_lock);
         if (h0 == AV_NOPTS_VALUE) { av_packet_free(&out); return 0; }  /* video not anchored yet */
         h0_tb = av_rescale_q(h0, AV_TIME_BASE_Q, d->pass[pi].in_tb);
+        /* Ride the house clock: subtract h0, then ADD the video's house-vs-content
+         * skew so copied streams (AC-3, subs, data) stay aligned with the dup-shifted
+         * video instead of source-locked. Copied audio can't be resampled, so this is
+         * a step (the skew grows in ~40ms tick increments) -> a small periodic A/V hop
+         * on dense audio; sparse subs/data ride it invisibly. (Smooth would need rate-
+         * discipline so dups -> 0; see option 2.) */
+        if (g_avlock && d->house_skew)
+            h0_tb -= av_rescale_q(*d->house_skew, AV_TIME_BASE_Q, d->pass[pi].in_tb);
         if (out->pts != AV_NOPTS_VALUE) out->pts -= h0_tb;
         if (out->dts != AV_NOPTS_VALUE) out->dts -= h0_tb;
         ref = out->dts != AV_NOPTS_VALUE ? out->dts : out->pts;
@@ -1383,6 +1392,11 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
                     enum AVSampleFormat sfmt = as.enc[0]->sample_fmt;
                     const char *af = og_get(&outs->groups[0], "af");
                     if (!af) af = og_get(&outs->groups[0], "filter:a");
+                    /* No -af: still route through aresample=async so the audio rides the
+                     * HOUSE clock (the raw swr path is identity 48k->48k with no resampler
+                     * engaged, so it can't stretch to follow video dups -> drifts). The
+                     * common-mode house-skew in audio_push then keeps A/V locked. */
+                    if (!af) af = "aresample=async=1000";
                     as.out_chl    = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
                     as.out_rate   = 48000;
                     as.out_sfmt   = sfmt;
@@ -1501,6 +1515,7 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
     da.ifmt = ifmt; da.video_q = video_q; da.audio_q = audio_q;
     da.vstream = vstream; da.astream = have_audio ? sel[0].astream : -1; da.drop = net_input;
     da.pass = pass; da.n_pass = n_pass; da.h0 = &input_h0_us; da.h0_lock = &h0_lock; da.n_out = n_rung;
+    da.house_skew = &house_skew_us;
     for (r = 0; r < n_rung; r++) da.mux_q[r] = rung[r].mux_q;
 
     av_log(NULL, AV_LOG_INFO,
