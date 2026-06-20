@@ -64,7 +64,7 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.2.2"   /* 0.2.2: no -r preserves source FRAME rate (avg, not field); 0.2.1: 33-bit PTS-wrap on copy-passthrough */
+#define PTVENCODER_VERSION "0.2.3"   /* 0.2.3: monotonic-DTS clamp on copy path; 0.2.2: no -r preserves source FRAME rate (avg); 0.2.1: 33-bit PTS-wrap on copy-passthrough */
 
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
@@ -970,6 +970,7 @@ typedef struct PassStream {
     int        in_index;              /* input stream index being copied 1:1 */
     AVStream  *ost[PTV_MAX_RUNG];     /* output stream in each muxer (fan-out) */
     AVRational in_tb;                 /* input/output time_base (copy: identical) */
+    int64_t    last_dts;              /* last emitted dts (monotonic guard; NOPTS until first) */
 } PassStream;
 
 typedef struct DemuxArgs {
@@ -1035,6 +1036,22 @@ static int demux_pass(DemuxArgs *d, AVPacket *out)
         if (out->dts != AV_NOPTS_VALUE) out->dts -= h0_tb;
         ref = out->dts != AV_NOPTS_VALUE ? out->dts : out->pts;
         if (ref != AV_NOPTS_VALUE && ref < 0) { av_packet_free(&out); return 0; }  /* precedes anchor */
+        /* Monotonic-DTS guard for the copy path. The house-skew rebase above (and
+         * source quirks / wrap edges) can nudge a copied stream's dts backward
+         * between packets; the mpegts muxer rejects a backward dts with EINVAL and
+         * the rung dies — this froze channels under the 50fps field-rate dup-storm,
+         * and a rare dup-induced skew dip could trip it even at the right rate.
+         * Clamp strictly increasing per copied stream, shifting pts by the same
+         * amount so pts>=dts still holds. (On-wire SCTE-35 splice timing rides
+         * pts_adjustment, not container dts, so a sub-ms nudge is invisible there.) */
+        if (out->dts != AV_NOPTS_VALUE) {
+            if (d->pass[pi].last_dts != AV_NOPTS_VALUE && out->dts <= d->pass[pi].last_dts) {
+                int64_t bump = d->pass[pi].last_dts + 1 - out->dts;
+                out->dts += bump;
+                if (out->pts != AV_NOPTS_VALUE) out->pts += bump;
+            }
+            d->pass[pi].last_dts = out->dts;
+        }
         out->pos = -1;
         d->ppkt++;
         for (i = 0; i < d->n_out; i++) {            /* fan the copy out to every muxer */
@@ -1484,6 +1501,7 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
         AVDictionaryEntry *lang = av_dict_get(ist->metadata, "language", NULL, 0);
         pass[n_pass].in_index = sidx;
         pass[n_pass].in_tb    = ist->time_base;
+        pass[n_pass].last_dts = AV_NOPTS_VALUE;
         for (r = 0; r < n_rung; r++) {
             AVStream *os = avformat_new_stream(rung[r].ofmt, NULL);
             if (!os) { ret = AVERROR(ENOMEM); goto end; }
