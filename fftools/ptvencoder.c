@@ -65,7 +65,7 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.4.0"   /* 0.4.0: MULTIVIEW (1/2/4-input mosaic — house-clock compositor, per-input jitter buffer + clock, per-slot audio/sub, parallel open); 0.3.0: multiple transcoded audio tracks + per-track -ac/-filter:a/-metadata + source fan-out; 0.2.3: monotonic-DTS clamp on copy path; 0.2.2: no -r preserves source FRAME rate (avg); 0.2.1: 33-bit PTS-wrap on copy-passthrough */
+#define PTVENCODER_VERSION "0.4.1"   /* 0.4.1: multiview per-slot audio skew = dup-event counter (was arithmetic+non-decreasing, which locked startup jitter -> later-priming slots' audio over-delayed); per-slot skew in PTV_DIAG. 0.4.0: MULTIVIEW (1/2/4-input mosaic — house-clock compositor, per-input jitter buffer + clock, per-slot audio/sub, parallel open); 0.3.0: multiple transcoded audio tracks + per-track -ac/-filter:a/-metadata + source fan-out; 0.2.3: monotonic-DTS clamp on copy path; 0.2.2: no -r preserves source FRAME rate (avg); 0.2.1: 33-bit PTS-wrap on copy-passthrough */
 
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
@@ -1424,6 +1424,7 @@ static void *compositor_thread(void *arg)
     AVFrame *blackf[PTV_MAX_INPUT] = {0};
     AVFrame *last[PTV_MAX_INPUT] = {0};       /* last frame popped per input (dup source) */
     int64_t last_fresh_us[PTV_MAX_INPUT] = {0};
+    int64_t skew_us[PTV_MAX_INPUT] = {0};     /* per-slot audio skew = accumulated dup-hold ticks */
     int      done_in[PTV_MAX_INPUT] = {0};
     int64_t rung_pts[PTV_MAX_RUNG] = {0};
     AVFrame *filt = av_frame_alloc();
@@ -1475,39 +1476,29 @@ static void *compositor_thread(void *arg)
                                                       * buffer (FIFO) -> feed buffersrc k; dup-hold
                                                       * its last frame on underrun, black when stale */
             VideoHold *h = &c->inputs[k].hold;
-            AVFrame *f = NULL, *st; int64_t sp = AV_NOPTS_VALUE; int stale;
+            AVFrame *f = NULL, *st; int stale, fresh;
             int rr = av_thread_message_queue_recv(h->q, &f, AV_THREAD_MESSAGE_NONBLOCK);
-            if (rr >= 0) { if (last[k]) av_frame_free(&last[k]); last[k] = f; any_fresh = 1; last_fresh_us[k] = now_us; }
+            fresh = (rr >= 0);
+            if (fresh) { if (last[k]) av_frame_free(&last[k]); last[k] = f; any_fresh = 1; last_fresh_us[k] = now_us; }
             else if (rr == AVERROR_EOF) done_in[k] = 1;
             if (!done_in[k]) all_eof = 0;
             stale = (c->slate_after_us > 0 && last_fresh_us[k] > 0 && now_us - last_fresh_us[k] > c->slate_after_us);
-            if (last[k] && !stale) { st = av_frame_clone(last[k]); sp = last[k]->pts; }
-            else                   { st = blackf[k] ? av_frame_clone(blackf[k]) : NULL; }
+            /* Per-slot audio skew = accumulated GENUINE dup-holds (queue underran, a real
+             * frame is re-shown): the house ran one tick ahead of this cell, so its audio
+             * must lag by the same tick to stay in lip-sync with the (held) cell — exactly
+             * the single-input dup->skew rule, but event-counted per slot. Event-counting
+             * (not the arithmetic rung_pts-content_tks) avoids locking startup/rounding
+             * jitter into a permanent over-delay, which de-synced the later-priming slots.
+             * Only count while a real frame is held (not black-slated, not EOF). Monotonic
+             * by construction (keeps the audio input PTS forward); capped defensively. */
+            if (!fresh && !done_in[k] && last[k] && !stale && c->tick_dur_us > 0) {
+                if (skew_us[k] < PTV_MV_SKEW_CAP_US) skew_us[k] += c->tick_dur_us;
+                c->inputs[k].house_skew = skew_us[k];
+            }
+            if (last[k] && !stale) st = av_frame_clone(last[k]);
+            else                   st = blackf[k] ? av_frame_clone(blackf[k]) : NULL;
             if (!st) continue;
             st->pts = tick; st->pkt_dts = AV_NOPTS_VALUE;
-            if (sp != AV_NOPTS_VALUE) {              /* publish this slot's house-vs-content skew */
-                int64_t h0;
-                pthread_mutex_lock(&c->inputs[k].h0_lock); h0 = c->inputs[k].h0; pthread_mutex_unlock(&c->inputs[k].h0_lock);
-                if (h0 != AV_NOPTS_VALUE && c->tick_dur_us > 0) {
-                    /* Round content to whole TICKS (like single-input: raw-us sub-tick
-                     * jitter would step the audio PTS backward -> aac/muxer EINVAL), and
-                     * keep it non-decreasing (the house-faster direction grows it as the
-                     * cell dup-holds; a momentary catch-up must not push audio backward). */
-                    int64_t content_us  = av_rescale_q(sp, c->inputs[k].ist_tb, AV_TIME_BASE_Q) - h0;
-                    int64_t content_tks = (content_us + c->tick_dur_us / 2) / c->tick_dur_us;
-                    int64_t skew = (rung_pts[0] - content_tks) * c->tick_dur_us;
-                    /* Cap at the async compensation budget. Small drift (house a hair
-                     * faster than source) grows skew slowly and the resampler rides it;
-                     * a genuine multi-second cell FREEZE must NOT translate into a huge
-                     * forward audio jump (async can't bridge it -> reset -> backward DTS).
-                     * Beyond the cap the input is frozen, not drifting — its audio has
-                     * stopped too, so leaving skew pinned is correct. Non-decreasing keeps
-                     * the audio input PTS monotonic (any backward trips the aac encoder). */
-                    if (skew < 0) skew = 0;
-                    if (skew > PTV_MV_SKEW_CAP_US) skew = PTV_MV_SKEW_CAP_US;
-                    if (skew > c->inputs[k].house_skew) c->inputs[k].house_skew = skew;
-                }
-            }
             if (av_buffersrc_add_frame(c->fsrc[k], st) < 0) av_frame_free(&st);
         }
 
@@ -1528,9 +1519,10 @@ static void *compositor_thread(void *arg)
         if (g_diag) {
             int64_t nowd = av_gettime_relative();
             if (nowd - diag_last >= 1000000) {
-                char db[128]; int dp = 0;
-                for (k = 0; k < n && dp < (int)sizeof db - 16; k++)
-                    dp += snprintf(db + dp, sizeof db - dp, " in%d:dec=%"PRId64, k, c->inputs[k].dc.dec_frames);
+                char db[256]; int dp = 0;
+                for (k = 0; k < n && dp < (int)sizeof db - 32; k++)
+                    dp += snprintf(db + dp, sizeof db - dp, " in%d:dec=%"PRId64"/skew=%dms",
+                                   k, c->inputs[k].dc.dec_frames, (int)(skew_us[k] / 1000));
                 av_log(NULL, AV_LOG_INFO,
                     "[PTV-DIAG] mv t=%.1fs emitted=%"PRId64" dup=%"PRId64" muxed=%"PRId64" frameq0=%d%s\n",
                     (nowd - diag_t0) / 1000000.0, c->emitted, c->dup, g_muxed,
