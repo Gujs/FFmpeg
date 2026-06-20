@@ -36,6 +36,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <time.h>
 
 #include "libavutil/avutil.h"
@@ -65,7 +66,7 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.5.2"   /* 0.5.2: Option F COARSE half — re-anchor on return-from-outage: clear a slot's accumulated dup skew when it comes back after a black-slate, so a continuous-PTS feed re-syncs A/V on return (the source's advanced PTS lands at current output once stale skew is gone). Safe (outage>=slate exceeds cleared skew -> async input still forward). PTV_NO_REANCHOR=1 for A/B. 0.5.1: Option F skew made NON-DECREASING+capped (async input requires monotonic; a decreasing skew stalled the mux — 20fps-into-25fps repro). Fine-half only: rising dup drift rides async; the DECREASING re-anchor-on-return (full A/V re-sync after outage) needs a separate direct output-offset path (coarse half, TODO). 0.5.0: multiview A/V sync = software frame-synchronizer (Option F). Compositor publishes the MEASURED per-slot output-vs-content skew = out_time-(displayed_src-h0) of the frame each cell actually shows; the slot's audio rides it (existing async path), so A/V stays locked through jitter/drop/dup/interruption and RE-SYNCS on input return (shows current content). Reduces to ~0 on healthy 1:1 inputs (no regression). Replaces the dup-event counter (0.4.1), which missed drops/returns. Copy path protected by its monotonic-DTS clamp. 0.4.1: multiview per-slot audio skew = dup-event counter (was arithmetic+non-decreasing, which locked startup jitter -> later-priming slots' audio over-delayed); per-slot skew in PTV_DIAG. 0.4.0: MULTIVIEW (1/2/4-input mosaic — house-clock compositor, per-input jitter buffer + clock, per-slot audio/sub, parallel open); 0.3.0: multiple transcoded audio tracks + per-track -ac/-filter:a/-metadata + source fan-out; 0.2.3: monotonic-DTS clamp on copy path; 0.2.2: no -r preserves source FRAME rate (avg); 0.2.1: 33-bit PTS-wrap on copy-passthrough */
+#define PTVENCODER_VERSION "0.5.3"   /* 0.5.3: code-review fixes — og_spec buffers sized for "disposition" (was silently truncating -disposition/-disposition:a); -an now honored (suppresses auto-selected audio + audio copy in the no-map path); accurate -h (dropped never-wired -s/--deint/--hw/--mode); fifo alloc NULL-checked; g_muxed/g_muxed_bytes atomic (stats data race). 0.5.2: Option F COARSE half — re-anchor on return-from-outage: clear a slot's accumulated dup skew when it comes back after a black-slate, so a continuous-PTS feed re-syncs A/V on return (the source's advanced PTS lands at current output once stale skew is gone). Safe (outage>=slate exceeds cleared skew -> async input still forward). PTV_NO_REANCHOR=1 for A/B. 0.5.1: Option F skew made NON-DECREASING+capped (async input requires monotonic; a decreasing skew stalled the mux — 20fps-into-25fps repro). Fine-half only: rising dup drift rides async; the DECREASING re-anchor-on-return (full A/V re-sync after outage) needs a separate direct output-offset path (coarse half, TODO). 0.5.0: multiview A/V sync = software frame-synchronizer (Option F). Compositor publishes the MEASURED per-slot output-vs-content skew = out_time-(displayed_src-h0) of the frame each cell actually shows; the slot's audio rides it (existing async path), so A/V stays locked through jitter/drop/dup/interruption and RE-SYNCS on input return (shows current content). Reduces to ~0 on healthy 1:1 inputs (no regression). Replaces the dup-event counter (0.4.1), which missed drops/returns. Copy path protected by its monotonic-DTS clamp. 0.4.1: multiview per-slot audio skew = dup-event counter (was arithmetic+non-decreasing, which locked startup jitter -> later-priming slots' audio over-delayed); per-slot skew in PTV_DIAG. 0.4.0: MULTIVIEW (1/2/4-input mosaic — house-clock compositor, per-input jitter buffer + clock, per-slot audio/sub, parallel open); 0.3.0: multiple transcoded audio tracks + per-track -ac/-filter:a/-metadata + source fan-out; 0.2.3: monotonic-DTS clamp on copy path; 0.2.2: no -r preserves source FRAME rate (avg); 0.2.1: 33-bit PTS-wrap on copy-passthrough */
 
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
@@ -84,10 +85,12 @@ static int     g_avlock = 1;
  * black-slate outage, so its audio re-syncs (not delayed by the stale dup total). On by
  * default; PTV_NO_REANCHOR=1 keeps the stale skew across outages (for A/B comparison). */
 static int     g_reanchor = 1;
-static int64_t g_muxed;
+/* Muxed-packet stats counters. Written by N mux threads (6-rung ABR) -> atomic to avoid a
+ * data race / lost updates in the bitrate=/size= stat line. Stats-only; not on any hot path. */
+static _Atomic int64_t g_muxed;
 /* ffmpeg-style progress line (frame=/fps=/bitrate=/speed=); on unless -nostats. */
 static int     g_stats = 1;
-static int64_t g_muxed_bytes;
+static _Atomic int64_t g_muxed_bytes;
 /* -stats_period: interval (us) between progress lines. Default 1s; raise for
  * production (e.g. -stats_period 10 -> every 10s) to keep logs quiet. */
 static int64_t g_stats_period_us = 1000000;
@@ -133,22 +136,30 @@ static void ptv_log_ts_callback(void *avcl, int level, const char *fmt, va_list 
 void show_help_default(const char *opt, const char *arg)
 {
     av_log(NULL, AV_LOG_INFO,
-        "usage: ptvencoder [options] -i <input> <output>\n"
+        "usage: ptvencoder [options] -i <input> [-i <input> ...] [out-opts] <output> [[out-opts] <output> ...]\n"
         "\n"
-        "  options:\n"
-        "    -i <url>      input (file or udp://...)\n"
-        "    -c:v <name>   video encoder (default: h264_videotoolbox, fallback mpeg2video)\n"
-        "    -r <rate>     output frame rate / house-clock rate (e.g. 25, 30000/1001); default = source\n"
-        "    -f <mux>      output format (default: guessed from output; mpegts for udp://...)\n"
-        "    -an           disable audio\n"
-        "    -vf <chain>   raw libavfilter chain (any filters in the build, e.g. \"bwdif,scale=1280:720\")\n"
-        "    -s <WxH>      scale to WxH (e.g. 1280x720)         [convenience; ignored if -vf given]\n"
-        "    --deint       deinterlace (bwdif)                  [convenience; ignored if -vf given]\n"
-        "    --hw cuda|cpu filter backend: cuda = bwdif_cuda/scale_cuda (-> NVENC); cpu (default)\n"
-        "    --mode live|offline   live = wall-clock paced; offline = media-clock. default: auto from input\n"
+        "  inputs:\n"
+        "    -i <url>            input (file or udp://...). 1 input = single transcode;\n"
+        "                        2 or 4 inputs = multiview mosaic (requires -filter_complex).\n"
+        "  video:\n"
+        "    -vf <chain>         libavfilter chain for the (single) input, e.g. \"bwdif,scale=1280:720\"\n"
+        "    -filter_complex <g> mosaic graph for multiview ([0:v][1:v]hstack...[vN]) and/or ABR split\n"
+        "    -map [vN]|K:v       select this output's video (filter label or input stream)\n"
+        "    -c:v <name>         video encoder (default: h264_videotoolbox, fallback mpeg2video)\n"
+        "    -b:v / -r           video bitrate / output (house-clock) frame rate; default rate = source\n"
+        "  audio (per output stream N):\n"
+        "    -map K:a:n          add a transcoded audio track from input K\n"
+        "    -af / -filter:a:N   audio filtergraph (default aresample=async=1000)\n"
+        "    -c:a:N -b:a:N -ac:a:N   encoder / bitrate / channels per track\n"
+        "    -an                 no audio (suppresses auto-selected audio when no -map is given)\n"
+        "  passthrough / output:\n"
+        "    -map K:s|K:d -c copy   copy subtitle / data (incl. SCTE-35) streams through\n"
+        "    -metadata:s:<t>:N k=v   -disposition:<t>:N flags   per-stream metadata/disposition\n"
+        "    -f <mux>            output format (default: guessed; mpegts for udp://...)\n"
+        "    -stats_period <s>   progress-line interval (default 1)\n"
         "    -version, -h\n"
         "\n"
-        "  Phase 1 increment 6: video filters (deinterlace + scale, CPU or CUDA).\n");
+        "  Pacing is automatic: live (wall-clock) for net inputs, media-clock for files.\n");
 }
 
 /* Free function for AVThreadMessageQueue elements (AVPacket* / AVFrame*; a NULL
@@ -1964,6 +1975,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         a->n_out      = n_rung;
         a->frame_size = a->enc[0]->frame_size > 0 ? a->enc[0]->frame_size : 1024;
         a->fifo       = av_audio_fifo_alloc(sfmt, 2, a->frame_size);
+        if (!a->fifo) { ret = AVERROR(ENOMEM); goto end; }   /* used by the swr fallback path */
         a->ist_tb     = kist->time_base;
         if (af && build_audio_filter(a, a->dec, kist->time_base, af, sfmt) < 0) {
             av_log(NULL, AV_LOG_WARNING, "audio track %d filtergraph failed; plain resample\n", k);
@@ -2353,7 +2365,10 @@ static const char *og_get(OptionGroup *g, const char *key)
  * p = "c"/"b"/... , t = 'v'/'a'/'s'/'d', idx = output type-index. */
 static const char *og_spec(OptionGroup *g, const char *p, char t, int idx)
 {
-    char k0[8], k1[12], k2[20]; const char *best = NULL; int i, rank = -1;
+    /* Buffers must hold the longest option name ("disposition", 11) plus the ":t" and
+     * ":t:idx" suffixes; undersized buffers silently truncated -disposition / -disposition:a
+     * so only the fully-indexed form matched. Sized with headroom for any future option. */
+    char k0[24], k1[28], k2[32]; const char *best = NULL; int i, rank = -1;
     snprintf(k0, sizeof k0, "%s", p);
     snprintf(k1, sizeof k1, "%s:%c", p, t);
     snprintf(k2, sizeof k2, "%s:%c:%d", p, t, idx);
@@ -2422,6 +2437,7 @@ static int resolve_plan(Input *inputs, int n_input, OptionGroup *outg, Sel *s)
 {
     AVFormatContext *ifmt = inputs[0].ifmt;
     int o, si, tcnt[5] = {0}, nmap = 0, astream = -1;
+    int no_audio = og_get(outg, "an") != NULL;   /* -an: suppress auto-selected audio */
     memset(s, 0, sizeof *s);
     s->vstream = -1;
     s->vf = og_get(outg, "filter:v"); if (!s->vf) s->vf = og_get(outg, "vf");
@@ -2435,7 +2451,8 @@ static int resolve_plan(Input *inputs, int n_input, OptionGroup *outg, Sel *s)
             if (cp->codec_type == AVMEDIA_TYPE_AUDIO &&
                 cp->ch_layout.nb_channels > 0 && cp->ch_layout.nb_channels <= 2) { astream = si; break; }
         }
-        if (astream < 0) astream = av_find_best_stream(ifmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
+        if (no_audio) astream = -1;    /* -an: no transcoded audio and no audio copy */
+        else if (astream < 0) astream = av_find_best_stream(ifmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
         if (astream >= 0) {            /* one transcoded audio track (back-compat) */
             s->aout[0].input  = 0;
             s->aout[0].stream = astream;
@@ -2445,6 +2462,7 @@ static int resolve_plan(Input *inputs, int n_input, OptionGroup *outg, Sel *s)
         for (si = 0; si < (int)ifmt->nb_streams; si++) {
             enum AVMediaType mt = ifmt->streams[si]->codecpar->codec_type;
             if (si == s->vstream || si == astream) continue;
+            if (mt == AVMEDIA_TYPE_AUDIO && no_audio) continue;   /* -an: drop audio copy too */
             if ((mt == AVMEDIA_TYPE_AUDIO || mt == AVMEDIA_TYPE_SUBTITLE || mt == AVMEDIA_TYPE_DATA)
                 && s->n_copy < PTV_MAX_PASS) { s->copy_input[s->n_copy] = 0; s->copy[s->n_copy++] = si; }
         }
