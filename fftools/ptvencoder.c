@@ -1498,7 +1498,15 @@ static void *compositor_thread(void *arg)
                  * always exceeds the cleared skew, so the returning audio's input pts is
                  * still forward of the last pre-outage one. Only fires after a real slate,
                  * never on routine dup jitter (which the non-decreasing fine skew handles). */
-                if (slated[k]) { if (g_reanchor) { skew_us[k] = 0; c->inputs[k].house_skew = 0; } slated[k] = 0; }
+                if (slated[k]) {
+                    if (g_diag) {
+                        int64_t h0d; pthread_mutex_lock(&c->inputs[k].h0_lock); h0d = c->inputs[k].h0; pthread_mutex_unlock(&c->inputs[k].h0_lock);
+                        int64_t dd = (f && f->pts != AV_NOPTS_VALUE) ? av_rescale_q(f->pts, c->inputs[k].ist_tb, AV_TIME_BASE_Q) : -1;
+                        av_log(NULL, AV_LOG_INFO, "[PTV-REANCHOR] slot %d return tick=%"PRId64": prev_skew=%"PRId64"ms disp=%"PRId64"ms h0=%"PRId64"ms out=%"PRId64"ms reanchor=%d\n",
+                               k, tick, skew_us[k]/1000, dd/1000, h0d/1000, (tick*c->tick_dur_us)/1000, g_reanchor);
+                    }
+                    if (g_reanchor) { skew_us[k] = 0; c->inputs[k].house_skew = 0; } slated[k] = 0;
+                }
             }
             else if (rr == AVERROR_EOF) done_in[k] = 1;
             if (!done_in[k]) all_eof = 0;
