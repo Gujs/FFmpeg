@@ -923,7 +923,7 @@ done:
 static int build_audio_filter(AudioState *a, AVCodecContext *adec, AVRational tb,
                               const char *af, enum AVSampleFormat out_fmt)
 {
-    char args[256], chain[512], chl[64];
+    char args[256], chain[512], chl[64], outchl[64];
     const AVFilter *bsrc  = avfilter_get_by_name("abuffer");
     const AVFilter *bsink = avfilter_get_by_name("abuffersink");
     AVFilterInOut *ins = avfilter_inout_alloc(), *outs = avfilter_inout_alloc();
@@ -941,9 +941,10 @@ static int build_audio_filter(AudioState *a, AVCodecContext *adec, AVRational tb
     if ((ret = avfilter_graph_create_filter(&a->afsrc, bsrc, "in", args, NULL, a->afg)) < 0) goto end;
     if ((ret = avfilter_graph_create_filter(&a->afsink, bsink, "out", NULL, NULL, a->afg)) < 0) goto end;
 
+    av_channel_layout_describe(&a->out_chl, outchl, sizeof outchl);   /* -ac:a:N target layout */
     snprintf(chain, sizeof chain,
-             "%s%saformat=sample_fmts=%s:sample_rates=48000:channel_layouts=stereo",
-             af ? af : "", af ? "," : "", av_get_sample_fmt_name(out_fmt));
+             "%s%saformat=sample_fmts=%s:sample_rates=48000:channel_layouts=%s",
+             af ? af : "", af ? "," : "", av_get_sample_fmt_name(out_fmt), outchl);
 
     outs->name = av_strdup("in");  outs->filter_ctx = a->afsrc;  outs->pad_idx = 0; outs->next = NULL;
     ins->name  = av_strdup("out"); ins->filter_ctx  = a->afsink; ins->pad_idx  = 0; ins->next  = NULL;
@@ -1464,9 +1465,12 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
         AudioState    *a;
         enum AVSampleFormat sfmt;
         const char    *af;
+        AVChannelLayout ochl;
+        int            nch = spec->ac > 0 ? spec->ac : 2;   /* -ac:a:N output channels (default stereo) */
         int            eok = 1;
 
         if (!kdecoder) { av_log(NULL, AV_LOG_WARNING, "audio track %d (stream %d): no decoder; skipped\n", k, spec->stream); continue; }
+        av_channel_layout_default(&ochl, nch);              /* 2->stereo, 6->5.1, 1->mono */
         kdec = avcodec_alloc_context3(kdecoder);
         if (!kdec) { ret = AVERROR(ENOMEM); goto end; }
         avcodec_parameters_to_context(kdec, kist->codecpar);
@@ -1485,7 +1489,7 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
             e = avcodec_alloc_context3(aenc);
             if (!e) { ret = AVERROR(ENOMEM); avcodec_free_context(&kdec); for (si = 0; si < r; si++) avcodec_free_context(&encs[si]); goto end; }
             e->sample_rate = 48000;
-            e->ch_layout   = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
+            e->ch_layout   = ochl;                          /* from -ac:a:N (stereo / 5.1 / …) */
             e->sample_fmt  = aenc->sample_fmts ? aenc->sample_fmts[0] : AV_SAMPLE_FMT_FLTP;
             e->bit_rate    = 160000;
             e->time_base   = (AVRational){1, 48000};
@@ -1521,7 +1525,7 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
          * clock (raw swr is identity 48k->48k with no resampler to stretch -> drifts).
          * The common-mode house-skew in audio_push then keeps A/V locked. */
         if (!af) af = "aresample=async=1000";
-        a->out_chl    = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
+        a->out_chl    = ochl;                             /* from -ac:a:N (stereo / 5.1 / …) */
         a->out_rate   = 48000;
         a->out_sfmt   = sfmt;
         a->n_out      = n_rung;
@@ -1958,7 +1962,10 @@ static int resolve_plan(AVFormatContext *ifmt, OptionGroup *outg, Sel *s)
                 s->vdec = avcodec_find_decoder(ifmt->streams[si]->codecpar->codec_id);
             } else if (mt == AVMEDIA_TYPE_AUDIO && s->n_aout < PTV_MAX_AUDIO) {
                 AOutSpec *a = &s->aout[s->n_aout++];    /* one transcoded audio track per -map */
+                const char *acs = og_spec(outg, "ac", t, idx);   /* -ac:a:N output channels */
                 a->stream = si; a->aenc = codec; a->abr = og_spec(outg, "b", t, idx);
+                a->filter = og_spec(outg, "filter", t, idx);     /* -filter:a:N (else global -af) */
+                a->ac = acs ? atoi(acs) : 0;                      /* 0 = default stereo */
                 a->adec = avcodec_find_decoder(ifmt->streams[si]->codecpar->codec_id);
             } else if (s->n_copy < PTV_MAX_PASS) {
                 s->copy[s->n_copy++] = si;             /* extra streams over the cap -> copy */
