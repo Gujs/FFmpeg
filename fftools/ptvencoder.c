@@ -66,7 +66,7 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.5.3"   /* 0.5.3: code-review fixes — og_spec buffers sized for "disposition" (was silently truncating -disposition/-disposition:a); -an now honored (suppresses auto-selected audio + audio copy in the no-map path); accurate -h (dropped never-wired -s/--deint/--hw/--mode); fifo alloc NULL-checked; g_muxed/g_muxed_bytes atomic (stats data race). 0.5.2: Option F COARSE half — re-anchor on return-from-outage: clear a slot's accumulated dup skew when it comes back after a black-slate, so a continuous-PTS feed re-syncs A/V on return (the source's advanced PTS lands at current output once stale skew is gone). Safe (outage>=slate exceeds cleared skew -> async input still forward). PTV_NO_REANCHOR=1 for A/B. 0.5.1: Option F skew made NON-DECREASING+capped (async input requires monotonic; a decreasing skew stalled the mux — 20fps-into-25fps repro). Fine-half only: rising dup drift rides async; the DECREASING re-anchor-on-return (full A/V re-sync after outage) needs a separate direct output-offset path (coarse half, TODO). 0.5.0: multiview A/V sync = software frame-synchronizer (Option F). Compositor publishes the MEASURED per-slot output-vs-content skew = out_time-(displayed_src-h0) of the frame each cell actually shows; the slot's audio rides it (existing async path), so A/V stays locked through jitter/drop/dup/interruption and RE-SYNCS on input return (shows current content). Reduces to ~0 on healthy 1:1 inputs (no regression). Replaces the dup-event counter (0.4.1), which missed drops/returns. Copy path protected by its monotonic-DTS clamp. 0.4.1: multiview per-slot audio skew = dup-event counter (was arithmetic+non-decreasing, which locked startup jitter -> later-priming slots' audio over-delayed); per-slot skew in PTV_DIAG. 0.4.0: MULTIVIEW (1/2/4-input mosaic — house-clock compositor, per-input jitter buffer + clock, per-slot audio/sub, parallel open); 0.3.0: multiple transcoded audio tracks + per-track -ac/-filter:a/-metadata + source fan-out; 0.2.3: monotonic-DTS clamp on copy path; 0.2.2: no -r preserves source FRAME rate (avg); 0.2.1: 33-bit PTS-wrap on copy-passthrough */
+#define PTVENCODER_VERSION "0.5.4-adiag"   /* 0.5.4 (diag, temporary): PTV-ADIAG per-track audio-vs-video offset (av_off) + g_vout_us — MP2 tracks land ~1s audio-late from aresample=async startup over-production (first_out~16ms aligned; av_off ~+1s for high source-V-A MP2 inputs). Gated PTV_DIAG; remove after fix. 0.5.3: code-review fixes — og_spec buffers sized for "disposition" (was silently truncating -disposition/-disposition:a); -an now honored (suppresses auto-selected audio + audio copy in the no-map path); accurate -h (dropped never-wired -s/--deint/--hw/--mode); fifo alloc NULL-checked; g_muxed/g_muxed_bytes atomic (stats data race). 0.5.2: Option F COARSE half — re-anchor on return-from-outage: clear a slot's accumulated dup skew when it comes back after a black-slate, so a continuous-PTS feed re-syncs A/V on return (the source's advanced PTS lands at current output once stale skew is gone). Safe (outage>=slate exceeds cleared skew -> async input still forward). PTV_NO_REANCHOR=1 for A/B. 0.5.1: Option F skew made NON-DECREASING+capped (async input requires monotonic; a decreasing skew stalled the mux — 20fps-into-25fps repro). Fine-half only: rising dup drift rides async; the DECREASING re-anchor-on-return (full A/V re-sync after outage) needs a separate direct output-offset path (coarse half, TODO). 0.5.0: multiview A/V sync = software frame-synchronizer (Option F). Compositor publishes the MEASURED per-slot output-vs-content skew = out_time-(displayed_src-h0) of the frame each cell actually shows; the slot's audio rides it (existing async path), so A/V stays locked through jitter/drop/dup/interruption and RE-SYNCS on input return (shows current content). Reduces to ~0 on healthy 1:1 inputs (no regression). Replaces the dup-event counter (0.4.1), which missed drops/returns. Copy path protected by its monotonic-DTS clamp. 0.4.1: multiview per-slot audio skew = dup-event counter (was arithmetic+non-decreasing, which locked startup jitter -> later-priming slots' audio over-delayed); per-slot skew in PTV_DIAG. 0.4.0: MULTIVIEW (1/2/4-input mosaic — house-clock compositor, per-input jitter buffer + clock, per-slot audio/sub, parallel open); 0.3.0: multiple transcoded audio tracks + per-track -ac/-filter:a/-metadata + source fan-out; 0.2.3: monotonic-DTS clamp on copy path; 0.2.2: no -r preserves source FRAME rate (avg); 0.2.1: 33-bit PTS-wrap on copy-passthrough */
 
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
@@ -91,6 +91,9 @@ static _Atomic int64_t g_muxed;
 /* ffmpeg-style progress line (frame=/fps=/bitrate=/speed=); on unless -nostats. */
 static int     g_stats = 1;
 static _Atomic int64_t g_muxed_bytes;
+/* PTV_DIAG: compositor publishes its current VIDEO output time (us) so the audio probe can
+ * log a synchronized per-track audio-minus-video offset. Temporary diagnostic. */
+static _Atomic int64_t g_vout_us;
 /* -stats_period: interval (us) between progress lines. Default 1s; raise for
  * production (e.g. -stats_period 10 -> every 10s) to keep logs quiet. */
 static int64_t g_stats_period_us = 1000000;
@@ -819,6 +822,9 @@ typedef struct AudioState {
     int              pts_set;
     int64_t          next_pts;
     int64_t          in_frames, out_frames;
+    /* PTV_DIAG audio-side probe (temporary): identify per-track A/V offset on real feeds */
+    int              dbg_k, dbg_in;
+    int64_t          dbg_first_out, dbg_diag_last;
 } AudioState;
 
 /* encode the SAME loudness-processed frame into each rung's own AAC encoder (so
@@ -890,6 +896,24 @@ static int audio_drain_fg(AudioState *a)
             int64_t opts = av_rescale_q(filt->pts, sink_tb, (AVRational){1, a->out_rate}) - h0_samp;
             if (opts < 0) { av_frame_unref(filt); continue; }   /* precedes video anchor */
             filt->pts = opts;
+            /* PTV_DIAG audio-side probe (temporary): per-track audio output timeline.
+             * out_pts = where this track's audio sits on the output clock; produced =
+             * total audio seconds emitted (out_frames*frame_size). Compare out_pts/produced
+             * to the compositor's video output time to find the per-slot A/V offset. */
+            if (g_diag) {
+                int64_t now = av_gettime_relative();
+                if (a->dbg_first_out == AV_NOPTS_VALUE) a->dbg_first_out = opts;
+                if (now - a->dbg_diag_last >= 1000000) {
+                    int64_t aout_us = opts * 1000000 / a->out_rate;
+                    int64_t vout_us = g_vout_us;
+                    a->dbg_diag_last = now;
+                    av_log(NULL, AV_LOG_INFO,
+                        "[PTV-ADIAG] a%d(in%d) av_off=%+"PRId64"ms (aout=%.3fs vout=%.3fs) first_out=%"PRId64"ms in=%"PRId64" out=%"PRId64"\n",
+                        a->dbg_k, a->dbg_in, (aout_us - vout_us) / 1000,
+                        aout_us / 1000000.0, vout_us / 1000000.0,
+                        a->dbg_first_out * 1000 / a->out_rate, a->in_frames, a->out_frames);
+                }
+            }
         }
         ret = audio_encode_push(a, filt);
         a->out_frames++;
@@ -1570,6 +1594,7 @@ static void *compositor_thread(void *arg)
             }
         }
         tick++;
+        g_vout_us = c->emitted * c->tick_dur_us;   /* PTV_DIAG: video output time for the audio probe */
 
         if (g_diag) {
             int64_t nowd = av_gettime_relative();
@@ -2114,6 +2139,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         as[k].audio_q = audio_q[k];
         as[k].h0 = &inputs[asrc_in[k]].h0; as[k].h0_lock = &inputs[asrc_in[k]].h0_lock;
         as[k].house_skew = &inputs[asrc_in[k]].house_skew;
+        as[k].dbg_k = k; as[k].dbg_in = asrc_in[k]; as[k].dbg_first_out = AV_NOPTS_VALUE;
         for (r = 0; r < n_rung; r++) as[k].mux_q[r] = rung[r].mux_q;
     }
     for (kk = 0; kk < n_input; kk++) {           /* per-input demux args (pass/n_pass set in copy loop) */
