@@ -978,6 +978,8 @@ typedef struct DemuxArgs {
     int64_t              *h0;             /* house origin (us); copy ts rebased onto it */
     pthread_mutex_t      *h0_lock;
     int64_t              *house_skew;     /* video's house-vs-content skew (us); copy rides it */
+    int64_t              *wrap_off;       /* per input stream: cumulative 33-bit wrap offset (stream tb) */
+    int64_t              *wrap_last;      /* per input stream: last RAW ts seen (wrap detection) */
     int64_t               vpkt, apkt, ppkt, vdrop, adrop, pdrop;
 } DemuxArgs;
 
@@ -1042,6 +1044,45 @@ static int demux_pass(DemuxArgs *d, AVPacket *out)
     return 0;
 }
 
+/* Unwrap a packet's MPEG-TS PTS/DTS into a monotonic, extended timeline.
+ * The source counter rolls every 2^pts_wrap_bits ticks (33 bits = ~26.5h at
+ * 90kHz). The house clock makes that roll invisible to the re-encoded video, but
+ * the copy-passthrough streams carry the source timestamps through: at the roll a
+ * copied stream's DTS leaps backward a full cycle, which the muxer rejects as
+ * non-monotonic — fatal for audio (mux.c exempts only SUBTITLE/DATA), so every
+ * rung dies and the pipeline wedges. The roll also collapses the video
+ * house-vs-content skew. We run the input with correct_ts_overflow=0 (raw 33-bit
+ * in, predictable — libav's own extension is inconsistent across the B-frame
+ * reorder boundary, which is what produced the leap) and add a per-stream
+ * multiple-of-2^bits offset so every downstream consumer sees one continuous
+ * timeline. Keyed on DTS (decode order, monotonic); the SAME offset is added to
+ * PTS so A/V copy stays aligned. mpegtsenc masks back to 33 bits on the wire. */
+static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
+{
+    AVStream *st = d->ifmt->streams[pkt->stream_index];
+    int bits = st->pts_wrap_bits;
+    int64_t mask, half, raw, off;
+
+    if (bits <= 0 || bits >= 63)              /* only meaningful for a real TS wrap */
+        return;
+    mask = 1LL << bits;
+    half = mask >> 1;
+    raw  = pkt->dts != AV_NOPTS_VALUE ? pkt->dts : pkt->pts;
+    if (raw != AV_NOPTS_VALUE) {
+        int64_t last = d->wrap_last[pkt->stream_index];
+        if (last != AV_NOPTS_VALUE) {
+            if (raw - last < -half)      d->wrap_off[pkt->stream_index] += mask;  /* rolled forward */
+            else if (raw - last >  half) d->wrap_off[pkt->stream_index] -= mask;  /* late pre-roll pkt */
+        }
+        d->wrap_last[pkt->stream_index] = raw;
+    }
+    off = d->wrap_off[pkt->stream_index];
+    if (off) {
+        if (pkt->pts != AV_NOPTS_VALUE) pkt->pts += off;
+        if (pkt->dts != AV_NOPTS_VALUE) pkt->dts += off;
+    }
+}
+
 static void *demux_thread(void *arg)
 {
     DemuxArgs *d = arg;
@@ -1064,6 +1105,7 @@ static void *demux_thread(void *arg)
         AVPacket *out = av_packet_alloc();
         if (!out) { av_packet_unref(pkt); break; }
         av_packet_move_ref(out, pkt);
+        demux_unwrap(d, out);               /* 33-bit source wrap -> monotonic extended ts */
         if (out->stream_index == d->vstream) {
             d->vpkt++;
             ret = demux_send(d->video_q, out, d->drop, &d->vdrop);
@@ -1197,6 +1239,9 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
     memset(&dc, 0, sizeof dc); memset(&as, 0, sizeof as);
     memset(&da, 0, sizeof da); memset(rung, 0, sizeof rung);
 
+    /* Take raw 33-bit timestamps; we extend them ourselves in demux_unwrap (libav's
+     * correct_ts_overflow extends inconsistently across the B-frame reorder boundary). */
+    av_dict_set(&ing->format_opts, "correct_ts_overflow", "0", AV_DICT_DONT_OVERWRITE);
     if ((ret = avformat_open_input(&ifmt, in_url, NULL, &ing->format_opts)) < 0) {
         av_log(NULL, AV_LOG_ERROR, "cannot open input '%s': %s\n", in_url, av_err2str(ret)); return ret;
     }
@@ -1516,6 +1561,10 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
     da.vstream = vstream; da.astream = have_audio ? sel[0].astream : -1; da.drop = net_input;
     da.pass = pass; da.n_pass = n_pass; da.h0 = &input_h0_us; da.h0_lock = &h0_lock; da.n_out = n_rung;
     da.house_skew = &house_skew_us;
+    da.wrap_off  = av_calloc(ifmt->nb_streams, sizeof(*da.wrap_off));
+    da.wrap_last = av_malloc_array(ifmt->nb_streams, sizeof(*da.wrap_last));
+    if (!da.wrap_off || !da.wrap_last) { ret = AVERROR(ENOMEM); goto end; }
+    for (si = 0; si < (int)ifmt->nb_streams; si++) da.wrap_last[si] = AV_NOPTS_VALUE;
     for (r = 0; r < n_rung; r++) da.mux_q[r] = rung[r].mux_q;
 
     av_log(NULL, AV_LOG_INFO,
@@ -1626,6 +1675,8 @@ end:
     avcodec_free_context(&vdec);
     avfilter_graph_free(&dc.fg);
     av_buffer_unref(&hw_device);
+    av_freep(&da.wrap_off);
+    av_freep(&da.wrap_last);
     avformat_close_input(&ifmt);
     return ret;
 }
