@@ -65,7 +65,7 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.4.1"   /* 0.4.1: multiview per-slot audio skew = dup-event counter (was arithmetic+non-decreasing, which locked startup jitter -> later-priming slots' audio over-delayed); per-slot skew in PTV_DIAG. 0.4.0: MULTIVIEW (1/2/4-input mosaic — house-clock compositor, per-input jitter buffer + clock, per-slot audio/sub, parallel open); 0.3.0: multiple transcoded audio tracks + per-track -ac/-filter:a/-metadata + source fan-out; 0.2.3: monotonic-DTS clamp on copy path; 0.2.2: no -r preserves source FRAME rate (avg); 0.2.1: 33-bit PTS-wrap on copy-passthrough */
+#define PTVENCODER_VERSION "0.5.2"   /* 0.5.2: Option F COARSE half — re-anchor on return-from-outage: clear a slot's accumulated dup skew when it comes back after a black-slate, so a continuous-PTS feed re-syncs A/V on return (the source's advanced PTS lands at current output once stale skew is gone). Safe (outage>=slate exceeds cleared skew -> async input still forward). PTV_NO_REANCHOR=1 for A/B. 0.5.1: Option F skew made NON-DECREASING+capped (async input requires monotonic; a decreasing skew stalled the mux — 20fps-into-25fps repro). Fine-half only: rising dup drift rides async; the DECREASING re-anchor-on-return (full A/V re-sync after outage) needs a separate direct output-offset path (coarse half, TODO). 0.5.0: multiview A/V sync = software frame-synchronizer (Option F). Compositor publishes the MEASURED per-slot output-vs-content skew = out_time-(displayed_src-h0) of the frame each cell actually shows; the slot's audio rides it (existing async path), so A/V stays locked through jitter/drop/dup/interruption and RE-SYNCS on input return (shows current content). Reduces to ~0 on healthy 1:1 inputs (no regression). Replaces the dup-event counter (0.4.1), which missed drops/returns. Copy path protected by its monotonic-DTS clamp. 0.4.1: multiview per-slot audio skew = dup-event counter (was arithmetic+non-decreasing, which locked startup jitter -> later-priming slots' audio over-delayed); per-slot skew in PTV_DIAG. 0.4.0: MULTIVIEW (1/2/4-input mosaic — house-clock compositor, per-input jitter buffer + clock, per-slot audio/sub, parallel open); 0.3.0: multiple transcoded audio tracks + per-track -ac/-filter:a/-metadata + source fan-out; 0.2.3: monotonic-DTS clamp on copy path; 0.2.2: no -r preserves source FRAME rate (avg); 0.2.1: 33-bit PTS-wrap on copy-passthrough */
 
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
@@ -80,6 +80,10 @@ static int     g_diag;
  * clock as video (else audio stays source-locked and drifts ~40ms per video dup).
  * On by default; PTV_NO_AVLOCK=1 reverts to the old source-locked audio. */
 static int     g_avlock = 1;
+/* multiview coarse re-anchor: clear a slot's accumulated dup skew when it returns from a
+ * black-slate outage, so its audio re-syncs (not delayed by the stale dup total). On by
+ * default; PTV_NO_REANCHOR=1 keeps the stale skew across outages (for A/B comparison). */
+static int     g_reanchor = 1;
 static int64_t g_muxed;
 /* ffmpeg-style progress line (frame=/fps=/bitrate=/speed=); on unless -nostats. */
 static int     g_stats = 1;
@@ -1425,6 +1429,7 @@ static void *compositor_thread(void *arg)
     AVFrame *last[PTV_MAX_INPUT] = {0};       /* last frame popped per input (dup source) */
     int64_t last_fresh_us[PTV_MAX_INPUT] = {0};
     int64_t skew_us[PTV_MAX_INPUT] = {0};     /* per-slot audio skew = accumulated dup-hold ticks */
+    int      slated[PTV_MAX_INPUT] = {0};     /* slot is/was black-slated (outage) since last fresh frame */
     int      done_in[PTV_MAX_INPUT] = {0};
     int64_t rung_pts[PTV_MAX_RUNG] = {0};
     AVFrame *filt = av_frame_alloc();
@@ -1479,21 +1484,52 @@ static void *compositor_thread(void *arg)
             AVFrame *f = NULL, *st; int stale, fresh;
             int rr = av_thread_message_queue_recv(h->q, &f, AV_THREAD_MESSAGE_NONBLOCK);
             fresh = (rr >= 0);
-            if (fresh) { if (last[k]) av_frame_free(&last[k]); last[k] = f; any_fresh = 1; last_fresh_us[k] = now_us; }
+            if (fresh) {
+                if (last[k]) av_frame_free(&last[k]);
+                last[k] = f; any_fresh = 1; last_fresh_us[k] = now_us;
+                /* Option F (coarse half) — RE-ANCHOR on return from an outage. When a slot
+                 * comes back after having been black-slated, clear its accumulated dup skew
+                 * so the returning audio is NOT delayed by the stale dup-hold total. For a
+                 * continuous-PTS source (the common network-blip case) the source's own PTS
+                 * already advanced across the gap, so once the stale skew is gone the audio
+                 * lands at the current output time = its returning video -> back IN SYNC,
+                 * exactly what a hardware frame-synchronizer does on re-acquire. This reset
+                 * is a DECREASE but it cannot stall async: the outage (>= slate timeout)
+                 * always exceeds the cleared skew, so the returning audio's input pts is
+                 * still forward of the last pre-outage one. Only fires after a real slate,
+                 * never on routine dup jitter (which the non-decreasing fine skew handles). */
+                if (slated[k]) { if (g_reanchor) { skew_us[k] = 0; c->inputs[k].house_skew = 0; } slated[k] = 0; }
+            }
             else if (rr == AVERROR_EOF) done_in[k] = 1;
             if (!done_in[k]) all_eof = 0;
             stale = (c->slate_after_us > 0 && last_fresh_us[k] > 0 && now_us - last_fresh_us[k] > c->slate_after_us);
-            /* Per-slot audio skew = accumulated GENUINE dup-holds (queue underran, a real
-             * frame is re-shown): the house ran one tick ahead of this cell, so its audio
-             * must lag by the same tick to stay in lip-sync with the (held) cell — exactly
-             * the single-input dup->skew rule, but event-counted per slot. Event-counting
-             * (not the arithmetic rung_pts-content_tks) avoids locking startup/rounding
-             * jitter into a permanent over-delay, which de-synced the later-priming slots.
-             * Only count while a real frame is held (not black-slated, not EOF). Monotonic
-             * by construction (keeps the audio input PTS forward); capped defensively. */
-            if (!fresh && !done_in[k] && last[k] && !stale && c->tick_dur_us > 0) {
-                if (skew_us[k] < PTV_MV_SKEW_CAP_US) skew_us[k] += c->tick_dur_us;
-                c->inputs[k].house_skew = skew_us[k];
+            if (stale) slated[k] = 1;                 /* mark the outage so the next fresh frame re-anchors */
+            /* Option F (fine half) — per-slot audio skew = the MEASURED output-vs-content
+             * offset of the frame this cell actually displays: skew = out_time -
+             * (displayed_src - h0). = single-input's house_skew (output - content) but
+             * measured per slot at the mosaic join, so the slot's audio rides exactly the
+             * retiming the compositor applied to its video (dup-hold -> skew grows). Reduces
+             * to ~0 on a clean 1:1 FIFO (no regression on healthy inputs).
+             *
+             * NON-DECREASING + capped: this value is added to the audio's INPUT pts and fed
+             * through aresample=async, which REQUIRES a monotonic input — a decreasing skew
+             * steps the input pts backward, async stalls, the mux waits and the output
+             * freezes (proven: a 20fps-into-25fps input oscillates skew negative and stalled
+             * F-v1). So the async path carries only the rising dup drift; the one legitimate
+             * decrease (return-from-outage) is the re-anchor reset above, which is safe
+             * because the outage gap exceeds the cleared skew. Updated only while a real
+             * frame is shown; frozen during black-slate (no audio then anyway). */
+            if (last[k] && !stale && c->tick_dur_us > 0) {
+                int64_t h0k;
+                pthread_mutex_lock(&c->inputs[k].h0_lock); h0k = c->inputs[k].h0; pthread_mutex_unlock(&c->inputs[k].h0_lock);
+                if (h0k != AV_NOPTS_VALUE && last[k]->pts != AV_NOPTS_VALUE) {
+                    int64_t disp_src = av_rescale_q(last[k]->pts, c->inputs[k].ist_tb, AV_TIME_BASE_Q);
+                    int64_t sk = tick * c->tick_dur_us - (disp_src - h0k);
+                    if (sk < skew_us[k]) sk = skew_us[k];                 /* non-decreasing: async-safe */
+                    if (sk > PTV_MV_SKEW_CAP_US) sk = PTV_MV_SKEW_CAP_US; /* bound to the async budget */
+                    skew_us[k] = sk;
+                    c->inputs[k].house_skew = sk;
+                }
             }
             if (last[k] && !stale) st = av_frame_clone(last[k]);
             else                   st = blackf[k] ? av_frame_clone(blackf[k]) : NULL;
@@ -2555,6 +2591,7 @@ int main(int argc, char **argv)
     av_log_set_level(AV_LOG_INFO);
     g_diag = !!getenv("PTV_DIAG");
     if (getenv("PTV_NO_AVLOCK")) g_avlock = 0;   /* revert to source-locked audio (drifts on dup) */
+    if (getenv("PTV_NO_REANCHOR")) g_reanchor = 0;   /* keep stale dup skew across outages (A/B) */
     { const char *s = getenv("PTV_SLOW_US"); g_slow = s ? atoi(s) : 0; }
     if (getenv("PTV_LOG_TS") && atoi(getenv("PTV_LOG_TS")))   /* native [timestamp] log prefix */
         av_log_set_callback(ptv_log_ts_callback);
