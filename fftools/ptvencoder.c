@@ -60,6 +60,12 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
+/* ptvencoder's OWN version, independent of the FFmpeg git-describe string (which,
+ * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
+ * encode which patch revision is applied). Bump by hand on each meaningful fix/
+ * feature so a deployed binary self-identifies via the banner / -version. */
+#define PTVENCODER_VERSION "0.2.1"   /* 0.2.1: 33-bit source PTS-wrap handling on copy-passthrough */
+
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 #define PTV_WD_DEADLINE_US (2 * (int64_t)AV_TIME_BASE)   /* watchdog stall threshold */
@@ -1952,7 +1958,7 @@ static int plan_resolve_and_print(int argc, char **argv)
  * the rest of the output); suppressed by -hide_banner. */
 static void ptv_show_banner(void)
 {
-    av_log(NULL, AV_LOG_INFO, "Perception TV Encoder (ptvencoder)  FFmpeg %s\n", av_version_info());
+    av_log(NULL, AV_LOG_INFO, "Perception TV Encoder (ptvencoder) %s  FFmpeg %s\n", PTVENCODER_VERSION, av_version_info());
     av_log(NULL, AV_LOG_INFO, "  libavutil      %u.%u.%u\n",
            AV_VERSION_MAJOR(avutil_version()), AV_VERSION_MINOR(avutil_version()), AV_VERSION_MICRO(avutil_version()));
     av_log(NULL, AV_LOG_INFO, "  libavcodec     %u.%u.%u\n",
@@ -1982,7 +1988,7 @@ int main(int argc, char **argv)
         av_log_set_callback(ptv_log_ts_callback);
 
     if (argc >= 2 && (!strcmp(argv[1], "-version") || !strcmp(argv[1], "--version"))) {
-        printf("Perception TV Encoder (ptvencoder)  FFmpeg %s\n", av_version_info());
+        printf("Perception TV Encoder (ptvencoder) %s  FFmpeg %s\n", PTVENCODER_VERSION, av_version_info());
         printf("  libavutil      %u.%u.%u\n", AV_VERSION_MAJOR(avutil_version()),
                AV_VERSION_MINOR(avutil_version()), AV_VERSION_MICRO(avutil_version()));
         printf("  libavcodec     %u.%u.%u\n", AV_VERSION_MAJOR(avcodec_version()),
