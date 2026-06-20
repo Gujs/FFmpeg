@@ -44,6 +44,7 @@
 #include "libavutil/parseutils.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/samplefmt.h"
+#include "libavutil/pixdesc.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/audio_fifo.h"
 #include "libavutil/threadmessage.h"
@@ -64,7 +65,7 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.3.0"   /* 0.3.0: multiple transcoded audio tracks + per-track -ac/-filter:a/-metadata + source fan-out; 0.2.3: monotonic-DTS clamp on copy path; 0.2.2: no -r preserves source FRAME rate (avg); 0.2.1: 33-bit PTS-wrap on copy-passthrough */
+#define PTVENCODER_VERSION "0.4.0"   /* 0.4.0: MULTIVIEW (1/2/4-input mosaic — house-clock compositor, per-input jitter buffer + clock, per-slot audio/sub, parallel open); 0.3.0: multiple transcoded audio tracks + per-track -ac/-filter:a/-metadata + source fan-out; 0.2.3: monotonic-DTS clamp on copy path; 0.2.2: no -r preserves source FRAME rate (avg); 0.2.1: 33-bit PTS-wrap on copy-passthrough */
 
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
@@ -192,11 +193,30 @@ static int encode_push(AVThreadMessageQueue *mux_q, AVCodecContext *enc,
 
 #define PTV_MAX_RUNG 8
 #define PTV_MAX_AUDIO 8    /* max transcoded audio output tracks (multi-language, multiview slots) */
+#define PTV_MAX_INPUT 4    /* max composited inputs (multiview): 1 / 2 / 4 */
+#define PTV_MV_SKEW_CAP_US 250000   /* multiview per-slot audio skew cap (async budget) */
+
+/* Multiview per-input jitter buffer: decode pushes each frame onto `q`; the
+ * compositor pops ONE per house tick (absorbing bursty decode delivery, exactly
+ * like the single-input frame_q) and dup-holds its last frame when `q` underruns,
+ * so a late/dead slot never stalls the mosaic. A depth-1 "latest only" hold
+ * instead would discard intra-burst frames -> massive dup/judder. */
+typedef struct VideoHold {
+    AVThreadMessageQueue *q;   /* decode -> compositor (AVFrame*) */
+    int64_t         framedrop; /* drop-oldest count when q overflows (live) */
+    pthread_mutex_t lock;      /* guards wall_us + eof */
+    int64_t         wall_us;   /* when a frame was last pushed (staleness -> slate) */
+    int             eof;       /* decode terminated for this input (terminal) */
+} VideoHold;
 
 /* Shared decode side of the ABR ladder (the ffmpeg model: decode the source
  * ONCE, run it through one filter graph — a -filter_complex `split`, a single
  * -filter:v chain, or none — and hand each rung its own frames via that rung's
- * frame_q). One decoder + one graph feeding N independent outputs. */
+ * frame_q). One decoder + one graph feeding N independent outputs.
+ *
+ * Multiview: `hold` is set and `filtering` is 0 — the decode thread stages each
+ * frame into the per-input hold instead of running the graph; the compositor
+ * owns the (N-input) graph and the frame_q fan. */
 typedef struct DecodeCtx {
     AVThreadMessageQueue *video_q;            /* demux -> decode (AVPacket*) */
     AVCodecContext  *vdec;
@@ -204,6 +224,7 @@ typedef struct DecodeCtx {
     int64_t         *h0;                      /* shared A/V input anchor (us) */
     pthread_mutex_t *h0_lock;
     int              live;
+    VideoHold       *hold;                    /* multiview: stage frames here (NULL = filter inline) */
     /* filter graph: filtering -> N buffersinks (one per rung); else clone decode */
     int              filtering;
     AVFilterGraph   *fg;
@@ -229,6 +250,7 @@ typedef struct VideoCtx {
     AVStream        *ost;
     int64_t          tick_dur_us;
     int              live;
+    int              passthrough;    /* multiview: compositor already paced+stamped; encode 1:1 */
     int              is_master;      /* only the master rung prints stats/diag */
     /* shared decode counters + queue, for the master's diag line */
     AVThreadMessageQueue *dbg_video_q;
@@ -339,27 +361,29 @@ end:
     return ret;
 }
 
-/* Build a SHARED filter_complex graph for the ABR ladder: one buffersrc fed by
- * the decoder, N buffersinks bound to the output labels the rungs map. Mirrors
- * ffmpeg's -filter_complex (decode once, split once, scale per rung) instead of
- * deinterlacing/scaling per output. labels[i] is the bare label (no brackets)
- * that rung i's `-map [label]` selects; sinks[i] receives that branch. Each sink
- * may carry a different resolution / hw_frames_ctx (read per rung afterwards). */
-static int build_filter_complex(const char *graph_str, AVCodecContext *vdec,
-                                AVRational tb, AVBufferRef *hw_device,
+/* Build a SHARED filter_complex graph: N video buffersrcs (one per input, bound
+ * to the graph's `[k:v]` labels) -> the user graph (single-input ABR split, or a
+ * multiview xstack/hstack/overlay mosaic + split) -> N buffersinks (one per rung
+ * label). Mirrors ffmpeg's -filter_complex. n_inputs==1 is the single-input
+ * ladder (unchanged); n_inputs>1 is multiview, fed by the compositor.
+ *
+ * vdecs[k] supplies input k's width/height/pix_fmt/sar; src_tb is the time_base
+ * stamped on every buffersrc (single-input: the source stream tb, frames carry
+ * source pts; multiview: 1/out_fps, the compositor stamps pts = house tick).
+ * labels[i] is rung i's bare output label; sinks[i] receives that branch. */
+static int build_filter_complex(const char *graph_str, AVCodecContext **vdecs,
+                                int n_inputs, AVRational src_tb, AVBufferRef *hw_device,
                                 const char *const *labels, int n_labels,
-                                AVFilterGraph **out_fg, AVFilterContext **out_src,
+                                AVFilterGraph **out_fg, AVFilterContext **srcs,
                                 AVFilterContext **sinks)
 {
-    char args[256];
+    char args[256], name[16];
     AVFilterGraph        *fg    = avfilter_graph_alloc();
     AVFilterGraphSegment *seg   = NULL;
     const AVFilter       *bsrc  = avfilter_get_by_name("buffer");
     const AVFilter       *bsink = avfilter_get_by_name("buffersink");
     AVFilterInOut        *gin = NULL, *gout = NULL, *io;
-    AVFilterContext      *src = NULL;
-    AVRational sar = vdec->sample_aspect_ratio.num ? vdec->sample_aspect_ratio : (AVRational){1, 1};
-    int ret, i;
+    int ret, i, k, linked = 0;
 
     if (!fg || !bsrc || !bsink) { ret = AVERROR(ENOMEM); goto fail; }
 
@@ -368,8 +392,8 @@ static int build_filter_complex(const char *graph_str, AVCodecContext *vdec,
      * hard-requires avctx->hw_device_ctx in its init(); a one-shot
      * avfilter_graph_parse2() inits filters during the parse, too early to set
      * it. Sequence: parse -> create_filters -> SET DEVICE -> apply_opts -> init
-     * -> link. After link, gin = the unconnected input ([0:v]) and gout = the
-     * unconnected outputs (each rung label), wired to our buffersrc / sinks. */
+     * -> link. After link, gin = the unconnected inputs ([k:v]) and gout = the
+     * unconnected outputs (each rung label), wired to our buffersrcs / sinks. */
     if ((ret = avfilter_graph_segment_parse(fg, graph_str, 0, &seg)) < 0) {
         av_log(NULL, AV_LOG_ERROR, "filter_complex parse: %s\n", av_err2str(ret)); goto fail;
     }
@@ -377,8 +401,8 @@ static int build_filter_complex(const char *graph_str, AVCodecContext *vdec,
         av_log(NULL, AV_LOG_ERROR, "filter_complex create: %s\n", av_err2str(ret)); goto fail;
     }
     if (hw_device)                                   /* must precede init() (hwupload) */
-        for (unsigned k = 0; k < fg->nb_filters; k++)
-            fg->filters[k]->hw_device_ctx = av_buffer_ref(hw_device);
+        for (unsigned f = 0; f < fg->nb_filters; f++)
+            fg->filters[f]->hw_device_ctx = av_buffer_ref(hw_device);
     if ((ret = avfilter_graph_segment_apply_opts(seg, 0)) < 0) {
         av_log(NULL, AV_LOG_ERROR, "filter_complex opts: %s\n", av_err2str(ret)); goto fail;
     }
@@ -389,15 +413,32 @@ static int build_filter_complex(const char *graph_str, AVCodecContext *vdec,
         av_log(NULL, AV_LOG_ERROR, "filter_complex link: %s\n", av_err2str(ret)); goto fail;
     }
 
-    snprintf(args, sizeof args,
-             "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
-             vdec->width, vdec->height, vdec->pix_fmt, tb.num, tb.den, sar.num, sar.den);
-    if ((ret = avfilter_graph_create_filter(&src, bsrc, "in", args, NULL, fg)) < 0) goto fail;
-    if (!gin || gin->next) {
-        av_log(NULL, AV_LOG_ERROR, "filter_complex needs exactly one video input ([0:v])\n");
+    /* one buffersrc per input, params from that input's decoder */
+    for (k = 0; k < n_inputs; k++) {
+        AVRational sar = vdecs[k]->sample_aspect_ratio.num ? vdecs[k]->sample_aspect_ratio : (AVRational){1, 1};
+        snprintf(name, sizeof name, "in%d", k);
+        snprintf(args, sizeof args,
+                 "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
+                 vdecs[k]->width, vdecs[k]->height, vdecs[k]->pix_fmt, src_tb.num, src_tb.den, sar.num, sar.den);
+        if ((ret = avfilter_graph_create_filter(&srcs[k], bsrc, name, args, NULL, fg)) < 0) goto fail;
+    }
+    /* link each unconnected graph input [K:v] to buffersrc K (single input: [0:v]->src0) */
+    for (io = gin; io; io = io->next) {
+        int idx = 0;
+        if (io->name) { const char *c = io->name; if (*c >= '0' && *c <= '9') idx = atoi(c); }
+        if (idx < 0 || idx >= n_inputs) {
+            av_log(NULL, AV_LOG_ERROR, "filter_complex input [%s] out of range (n_inputs=%d)\n",
+                   io->name ? io->name : "?", n_inputs);
+            ret = AVERROR(EINVAL); goto fail;
+        }
+        if ((ret = avfilter_link(srcs[idx], 0, io->filter_ctx, io->pad_idx)) < 0) goto fail;
+        linked++;
+    }
+    if (linked != n_inputs) {
+        av_log(NULL, AV_LOG_ERROR, "filter_complex: %d input(s) linked, expected %d ([0:v]..[%d:v])\n",
+               linked, n_inputs, n_inputs - 1);
         ret = AVERROR(EINVAL); goto fail;
     }
-    if ((ret = avfilter_link(src, 0, gin->filter_ctx, gin->pad_idx)) < 0) goto fail;
 
     for (i = 0; i < n_labels; i++) {                 /* one buffersink per rung label */
         AVFilterContext *sink = NULL;
@@ -415,7 +456,7 @@ static int build_filter_complex(const char *graph_str, AVCodecContext *vdec,
     if ((ret = avfilter_graph_config(fg, NULL)) < 0) {
         av_log(NULL, AV_LOG_ERROR, "filter_complex config: %s\n", av_err2str(ret)); goto fail;
     }
-    *out_fg = fg; *out_src = src;
+    *out_fg = fg;
     avfilter_graph_segment_free(&seg);
     avfilter_inout_free(&gin); avfilter_inout_free(&gout);
     return 0;
@@ -456,6 +497,21 @@ static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
     }
 }
 
+/* Multiview: push a decoded frame onto this input's jitter buffer for the
+ * compositor (FIFO, one per tick). Carries source pts on frame->pts so the
+ * compositor can compute this slot's house skew. Takes ownership of the frame. */
+static void stage_hold(VideoHold *h, int live, AVFrame *frame)
+{
+    AVFrame *nf = av_frame_alloc();
+    if (!nf) { av_frame_unref(frame); return; }
+    av_frame_move_ref(nf, frame);
+    if (nf->best_effort_timestamp != AV_NOPTS_VALUE) nf->pts = nf->best_effort_timestamp;
+    push_frame_q(h->q, live, &h->framedrop, nf);    /* drop-oldest in live; consumes nf */
+    pthread_mutex_lock(&h->lock);
+    h->wall_us = av_gettime_relative();
+    pthread_mutex_unlock(&h->lock);
+}
+
 static void *decode_thread(void *arg)
 {
     DecodeCtx *d = arg;
@@ -483,7 +539,8 @@ static void *decode_thread(void *arg)
                 pthread_mutex_unlock(d->h0_lock);
             }
             d->dec_frames++;
-            emit_video(d, frame, filt);
+            if (d->hold) stage_hold(d->hold, d->live, frame);   /* multiview: compositor samples this */
+            else         emit_video(d, frame, filt);
         }
     }
     /* flush decoder */
@@ -491,7 +548,8 @@ static void *decode_thread(void *arg)
     while (avcodec_receive_frame(d->vdec, frame) >= 0) {
         if (frame->flags & AV_FRAME_FLAG_CORRUPT) { av_frame_unref(frame); continue; }
         d->dec_frames++;
-        emit_video(d, frame, filt);
+        if (d->hold) stage_hold(d->hold, d->live, frame);
+        else         emit_video(d, frame, filt);
     }
     /* flush filter graph: push EOF into the src, drain every rung's sink */
     if (d->filtering) {
@@ -506,6 +564,12 @@ static void *decode_thread(void *arg)
 done:
     av_frame_free(&filt);
     av_frame_free(&frame);
+    if (d->hold) {                          /* multiview: signal terminal EOF to the compositor */
+        pthread_mutex_lock(&d->hold->lock);
+        d->hold->eof = 1;
+        pthread_mutex_unlock(&d->hold->lock);
+        av_thread_message_queue_set_err_recv(d->hold->q, AVERROR_EOF);   /* drain then EOF the jitter buffer */
+    }
     av_thread_message_queue_set_err_send(d->video_q, AVERROR_EOF);   /* unblock demux (a SENDER) */
     for (i = 0; i < d->n_rung; i++)
         av_thread_message_queue_set_err_recv(d->frame_q[i], AVERROR_EOF);  /* EOF to each output (RECEIVER) */
@@ -533,6 +597,23 @@ static void *output_thread(void *arg)
             ret = av_thread_message_queue_recv(v->frame_q, &f, 0);
             if (ret < 0) break;
             f->pts = tick++; f->pkt_dts = AV_NOPTS_VALUE; f->duration = 0;
+            ret = encode_push(v->mux_q, v->venc, v->ost, f);
+            v->emitted++; v->last_emit_us = av_gettime_relative();
+            av_frame_free(&f);
+            if (ret < 0) break;
+        }
+        encode_push(v->mux_q, v->venc, v->ost, NULL);
+        goto done;
+    }
+
+    if (v->passthrough) {
+        /* multiview: the compositor IS the house clock — it paced this frame and
+         * already stamped pts (in venc tb). Encode 1:1, no re-pace / dup / skew
+         * (the compositor owns all of that, and the stats/diag line). */
+        for (;;) {
+            ret = av_thread_message_queue_recv(v->frame_q, &f, 0);
+            if (ret < 0) break;
+            f->pkt_dts = AV_NOPTS_VALUE; f->duration = 0;
             ret = encode_push(v->mux_q, v->venc, v->ost, f);
             v->emitted++; v->last_emit_us = av_gettime_relative();
             av_frame_free(&f);
@@ -969,7 +1050,8 @@ end:
 
 #define PTV_MAX_PASS 16
 typedef struct PassStream {
-    int        in_index;              /* input stream index being copied 1:1 */
+    int        input;                 /* source input index (multiview); 0 single-input */
+    int        in_index;              /* input stream index being copied 1:1 (within that input) */
     AVStream  *ost[PTV_MAX_RUNG];     /* output stream in each muxer (fan-out) */
     AVRational in_tb;                 /* input/output time_base (copy: identical) */
     int64_t    last_dts;              /* last emitted dts (monotonic guard; NOPTS until first) */
@@ -1211,7 +1293,8 @@ static void *mux_thread(void *arg)
 /* One TRANSCODED audio output track (copy audio rides the copy[] passthrough list,
  * NOT this, so it keeps demux_pass's wrap unwrap + monotonic-DTS clamp + SCTE rebase). */
 typedef struct AOutSpec {
-    int            stream;                /* input audio stream index (input 0 for now) */
+    int            input;                 /* source input index (multiview -map K:a:N); 0 single-input */
+    int            stream;                /* input audio stream index within that input */
     const AVCodec *adec;
     const char    *aenc;                  /* -c:a:N encoder name (NULL = aac) */
     const char    *abr;                   /* -b:a:N */
@@ -1230,11 +1313,13 @@ typedef struct Sel {
     AOutSpec       aout[PTV_MAX_AUDIO];   /* transcoded audio output tracks */
     int            n_aout;
     int            copy[PTV_MAX_PASS];    /* ALL copy: audio (5.1/2ch) + sub + data + scte */
+    int            copy_input[PTV_MAX_PASS]; /* source input index per copy stream (multiview) */
     int            n_copy;
 } Sel;
 static const char *og_get(OptionGroup *g, const char *key);
 static void apply_stream_meta(OptionGroup *g, char t, int idx, AVStream *ost);
-static int resolve_plan(AVFormatContext *ifmt, OptionGroup *outg, Sel *s);
+struct Input;
+static int resolve_plan(struct Input *inputs, int n_input, OptionGroup *outg, Sel *s);
 
 /* One ABR ladder rung = one output: its own muxer, video encoder, queues and
  * threads. Audio + passthrough are shared (decoded/copied once, fanned out). */
@@ -1251,82 +1336,383 @@ typedef struct Rung {
     int              started_output, started_mux, started_wd, hdr_written;
 } Rung;
 
-/* transcode: ing = parsed input group; outs = the list of output groups (one
- * per ABR rung); fcomplex = the shared -filter_complex (split). The ffmpeg model
- * — decode once, one filter graph splits to N branches, each output group is an
- * independent muxer/encoder; audio + subs/data decoded/copied once and fanned
- * out. Selection (transcode vs copy) per group comes from its -map/-c. */
-static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcomplex,
+/* One source input. Single-input uses inputs[0]; multiview uses 1/2/4. Each has
+ * its own demuxer + video decoder + clock anchor (h0) + wrap state; multiview
+ * decode stages into `hold` for the compositor instead of filtering inline. */
+typedef struct Input {
+    const char           *url;
+    AVFormatContext      *ifmt;
+    int                   vstream;
+    const AVCodec        *vdecoder;
+    AVCodecContext       *vdec;
+    AVStream             *vist;
+    AVRational            ist_tb;
+    AVThreadMessageQueue *video_q;           /* demux -> decode */
+    int64_t               h0;                /* this input's A/V anchor (us); decode sets it */
+    pthread_mutex_t       h0_lock;
+    int64_t               house_skew;        /* compositor publishes; this input's audio/copy ride it */
+    VideoHold             hold;              /* multiview: latest decoded frame for the compositor */
+    int64_t              *wrap_off;          /* per stream: 33-bit wrap offset (stream tb) */
+    int64_t              *wrap_last;         /* per stream: last RAW ts (wrap detection) */
+    DecodeCtx             dc;
+    DemuxArgs             da;
+    pthread_t             th_demux, th_decode;
+    int                   started_demux, started_decode;
+    int                   open_ret;          /* parallel-open result */
+} Input;
+
+/* Multiview compositor = the video house clock. Samples each input's hold at
+ * each tick, feeds the N buffersrcs, pulls each rung's composited frame, and
+ * publishes per-input house_skew. (Single-input never uses this — decode feeds
+ * the graph inline and the per-rung output_thread is the house clock.) */
+typedef struct CompositorCtx {
+    Input                *inputs;
+    int                   n_input;
+    AVFilterGraph        *fg;
+    AVFilterContext      *fsrc[PTV_MAX_INPUT];
+    int                   n_rung;
+    AVFilterContext      *fsink[PTV_MAX_RUNG];
+    AVThreadMessageQueue *frame_q[PTV_MAX_RUNG];
+    int64_t               framedrop[PTV_MAX_RUNG];
+    int64_t               tick_dur_us;       /* 1/out_fps in us */
+    int                   live;
+    int64_t               slate_after_us;    /* stale hold -> black cell (0 = never) */
+    /* stats (compositor is the cadence owner in multiview) */
+    int64_t               emitted, dup;
+    int64_t              *dbg_dec_sum;        /* optional: sum of per-input dec_frames */
+} CompositorCtx;
+
+/* fill a planar-YUV / RGB frame with black (held cell for a not-yet-arrived or
+ * stale multiview slot): luma 16, chroma 128, RGB 0. */
+static void ptv_fill_black(AVFrame *f)
+{
+    const AVPixFmtDescriptor *d = av_pix_fmt_desc_get(f->format);
+    int p;
+    if (!d) return;
+    for (p = 0; p < AV_NUM_DATA_POINTERS && f->data[p]; p++) {
+        int rgb = !!(d->flags & AV_PIX_FMT_FLAG_RGB);
+        int chroma = !rgb && (p == 1 || p == 2);
+        int val = rgb ? 0 : (chroma ? 128 : 16);
+        int h = (chroma) ? AV_CEIL_RSHIFT(f->height, d->log2_chroma_h) : f->height;
+        memset(f->data[p], val, (size_t)f->linesize[p] * h);
+    }
+}
+
+static AVFrame *make_black_frame(AVCodecContext *vdec)
+{
+    AVFrame *f = av_frame_alloc();
+    if (!f) return NULL;
+    f->format = vdec->pix_fmt != AV_PIX_FMT_NONE ? vdec->pix_fmt : AV_PIX_FMT_YUV420P;
+    f->width  = vdec->width;
+    f->height = vdec->height;
+    if (av_frame_get_buffer(f, 0) < 0) { av_frame_free(&f); return NULL; }
+    ptv_fill_black(f);
+    return f;
+}
+
+/* Multiview compositor thread — the video house clock. Each wall-paced tick:
+ * sample-and-hold each input's latest decoded frame (dup-hold a stale one;
+ * black-slate a missing/long-stale one), feed all N buffersrcs with pts = tick
+ * (so the mosaic's xstack/overlay framesync pairs them and never waits), pull
+ * each rung's composited+scaled frame, stamp it consecutive-CFR, and hand it to
+ * that rung's frame_q. Publishes per-input house_skew for the slot's audio lock.
+ * A late/dead/frozen slot NEVER stalls the mosaic (R-MV-6). */
+static void *compositor_thread(void *arg)
+{
+    CompositorCtx *c = arg;
+    int n = c->n_input, R = c->n_rung, k, r;
+    AVFrame *blackf[PTV_MAX_INPUT] = {0};
+    AVFrame *last[PTV_MAX_INPUT] = {0};       /* last frame popped per input (dup source) */
+    int64_t last_fresh_us[PTV_MAX_INPUT] = {0};
+    int      done_in[PTV_MAX_INPUT] = {0};
+    int64_t rung_pts[PTV_MAX_RUNG] = {0};
+    AVFrame *filt = av_frame_alloc();
+    int64_t tick = 0, wall0 = 0;
+    const char *pe = getenv("PTV_PREROLL_MS");
+    int preroll_ms = pe ? atoi(pe) : 350;
+    int n_prime = (preroll_ms > 0 && c->tick_dur_us > 0) ? (int)((int64_t)preroll_ms * 1000 / c->tick_dur_us) : 0;
+    int64_t diag_t0 = av_gettime_relative(), diag_last = diag_t0;
+    int64_t stat_last = diag_t0, stat_prev = 0;
+
+    if (!filt) goto done;
+    if (n_prime > PTV_FRAME_QDEPTH - 8) n_prime = PTV_FRAME_QDEPTH - 8;
+    if (n_prime < 0) n_prime = 0;
+    for (k = 0; k < n; k++) blackf[k] = make_black_frame(c->inputs[k].vdec);
+
+    /* preroll: prime every input's jitter buffer to ~PTV_PREROLL_MS so bursty
+     * decode delivery has a cushion (no startup dup storm) and the mosaic starts
+     * with every cell live. A never-arriving input is left to its black cell. */
+    {
+        int64_t t0 = av_gettime_relative();
+        for (;;) {
+            int ready = 0, eofall = 1;
+            for (k = 0; k < n; k++) {
+                pthread_mutex_lock(&c->inputs[k].hold.lock);
+                if (!c->inputs[k].hold.eof) eofall = 0;
+                pthread_mutex_unlock(&c->inputs[k].hold.lock);
+                if (av_thread_message_queue_nb_elems(c->inputs[k].hold.q) >= (n_prime > 0 ? n_prime : 1)) ready++;
+            }
+            if (ready == n || eofall) break;
+            if (av_gettime_relative() - t0 > 3000000) break;   /* 3s: start with what's there */
+            av_usleep(5000);
+        }
+        wall0 = av_gettime_relative();
+    }
+
+    for (;;) {
+        int all_eof = 1, any_fresh = 0;
+        int64_t now_us;
+        {                                            /* wall-pace the house tick (also offline:
+                                                      * inputs have independent clocks, so the
+                                                      * mosaic cadence is the house rate, not media) */
+            int64_t target = wall0 + tick * c->tick_dur_us;
+            int64_t now = av_gettime_relative();
+            if (now < target) av_usleep((unsigned)(target - now));
+        }
+        now_us = av_gettime_relative();
+
+        for (k = 0; k < n; k++) {                    /* pop ONE frame from this input's jitter
+                                                      * buffer (FIFO) -> feed buffersrc k; dup-hold
+                                                      * its last frame on underrun, black when stale */
+            VideoHold *h = &c->inputs[k].hold;
+            AVFrame *f = NULL, *st; int64_t sp = AV_NOPTS_VALUE; int stale;
+            int rr = av_thread_message_queue_recv(h->q, &f, AV_THREAD_MESSAGE_NONBLOCK);
+            if (rr >= 0) { if (last[k]) av_frame_free(&last[k]); last[k] = f; any_fresh = 1; last_fresh_us[k] = now_us; }
+            else if (rr == AVERROR_EOF) done_in[k] = 1;
+            if (!done_in[k]) all_eof = 0;
+            stale = (c->slate_after_us > 0 && last_fresh_us[k] > 0 && now_us - last_fresh_us[k] > c->slate_after_us);
+            if (last[k] && !stale) { st = av_frame_clone(last[k]); sp = last[k]->pts; }
+            else                   { st = blackf[k] ? av_frame_clone(blackf[k]) : NULL; }
+            if (!st) continue;
+            st->pts = tick; st->pkt_dts = AV_NOPTS_VALUE;
+            if (sp != AV_NOPTS_VALUE) {              /* publish this slot's house-vs-content skew */
+                int64_t h0;
+                pthread_mutex_lock(&c->inputs[k].h0_lock); h0 = c->inputs[k].h0; pthread_mutex_unlock(&c->inputs[k].h0_lock);
+                if (h0 != AV_NOPTS_VALUE && c->tick_dur_us > 0) {
+                    /* Round content to whole TICKS (like single-input: raw-us sub-tick
+                     * jitter would step the audio PTS backward -> aac/muxer EINVAL), and
+                     * keep it non-decreasing (the house-faster direction grows it as the
+                     * cell dup-holds; a momentary catch-up must not push audio backward). */
+                    int64_t content_us  = av_rescale_q(sp, c->inputs[k].ist_tb, AV_TIME_BASE_Q) - h0;
+                    int64_t content_tks = (content_us + c->tick_dur_us / 2) / c->tick_dur_us;
+                    int64_t skew = (rung_pts[0] - content_tks) * c->tick_dur_us;
+                    /* Cap at the async compensation budget. Small drift (house a hair
+                     * faster than source) grows skew slowly and the resampler rides it;
+                     * a genuine multi-second cell FREEZE must NOT translate into a huge
+                     * forward audio jump (async can't bridge it -> reset -> backward DTS).
+                     * Beyond the cap the input is frozen, not drifting — its audio has
+                     * stopped too, so leaving skew pinned is correct. Non-decreasing keeps
+                     * the audio input PTS monotonic (any backward trips the aac encoder). */
+                    if (skew < 0) skew = 0;
+                    if (skew > PTV_MV_SKEW_CAP_US) skew = PTV_MV_SKEW_CAP_US;
+                    if (skew > c->inputs[k].house_skew) c->inputs[k].house_skew = skew;
+                }
+            }
+            if (av_buffersrc_add_frame(c->fsrc[k], st) < 0) av_frame_free(&st);
+        }
+
+        for (r = 0; r < R; r++) {                    /* pull each rung's composited frame */
+            while (av_buffersink_get_frame(c->fsink[r], filt) >= 0) {
+                AVFrame *out = av_frame_alloc();
+                if (out) {
+                    av_frame_move_ref(out, filt);
+                    out->pts = rung_pts[r]++;        /* per-rung consecutive CFR */
+                    out->pkt_dts = AV_NOPTS_VALUE; out->duration = 0;
+                    push_frame_q(c->frame_q[r], c->live, &c->framedrop[r], out);
+                    if (r == 0) { c->emitted++; if (!any_fresh) c->dup++; }
+                } else av_frame_unref(filt);
+            }
+        }
+        tick++;
+
+        if (g_diag) {
+            int64_t nowd = av_gettime_relative();
+            if (nowd - diag_last >= 1000000) {
+                char db[128]; int dp = 0;
+                for (k = 0; k < n && dp < (int)sizeof db - 16; k++)
+                    dp += snprintf(db + dp, sizeof db - dp, " in%d:dec=%"PRId64, k, c->inputs[k].dc.dec_frames);
+                av_log(NULL, AV_LOG_INFO,
+                    "[PTV-DIAG] mv t=%.1fs emitted=%"PRId64" dup=%"PRId64" muxed=%"PRId64" frameq0=%d%s\n",
+                    (nowd - diag_t0) / 1000000.0, c->emitted, c->dup, g_muxed,
+                    av_thread_message_queue_nb_elems(c->frame_q[0]), db);
+                diag_last = nowd;
+            }
+        }
+        if (g_stats) {
+            int64_t nows = av_gettime_relative();
+            if (nows - stat_last >= g_stats_period_us) {
+                double dt    = (nows - stat_last) / 1000000.0;
+                double fps   = (c->emitted - stat_prev) / (dt > 0 ? dt : 1);
+                double secs  = c->emitted * c->tick_dur_us / 1000000.0;
+                double wall  = (nows - wall0) / 1000000.0;
+                double speed = wall > 0 ? secs / wall : 0;
+                double kbps  = secs > 0 ? g_muxed_bytes * 8.0 / secs / 1000.0 : 0;
+                int hh = (int)(secs / 3600), mm = ((int)secs % 3600) / 60;
+                double ss = secs - hh * 3600 - mm * 60;
+                av_log(NULL, AV_LOG_INFO,
+                    "frame=%6"PRId64" fps=%3.0f size=%8"PRId64"KiB time=%02d:%02d:%05.2f "
+                    "bitrate=%7.1fkbits/s dup=%"PRId64" drop=%"PRId64" speed=%4.2fx\n",
+                    c->emitted, fps, g_muxed_bytes / 1024, hh, mm, ss, kbps,
+                    c->dup, c->framedrop[0], speed);
+                stat_last = nows; stat_prev = c->emitted;
+            }
+        }
+        if (g_slow) av_usleep(g_slow);
+        if (all_eof) break;                          /* every input terminated -> tear down */
+    }
+
+    for (k = 0; k < n; k++) { int fr = av_buffersrc_add_frame(c->fsrc[k], NULL); (void)fr; }   /* flush graph */
+    for (r = 0; r < R; r++)
+        while (av_buffersink_get_frame(c->fsink[r], filt) >= 0) {
+            AVFrame *out = av_frame_alloc();
+            if (out) { av_frame_move_ref(out, filt); out->pts = rung_pts[r]++; out->pkt_dts = AV_NOPTS_VALUE; out->duration = 0;
+                       push_frame_q(c->frame_q[r], c->live, &c->framedrop[r], out); }
+            else     { av_frame_unref(filt); }
+        }
+done:
+    av_frame_free(&filt);
+    for (k = 0; k < n; k++) { if (blackf[k]) av_frame_free(&blackf[k]); if (last[k]) av_frame_free(&last[k]); }
+    for (r = 0; r < R; r++) av_thread_message_queue_set_err_recv(c->frame_q[r], AVERROR_EOF);
+    return NULL;
+}
+
+/* open one input on its own thread (parallel open: a dead/slow slot must not
+ * delay the others, and serial open would block on its long rw_timeout). */
+typedef struct OpenArg { Input *in; AVDictionary **opts; } OpenArg;
+static void *open_input_thread(void *arg)
+{
+    OpenArg *o = arg; Input *in = o->in;
+    in->open_ret = avformat_open_input(&in->ifmt, in->url, NULL, o->opts);
+    if (in->open_ret >= 0) in->open_ret = avformat_find_stream_info(in->ifmt, NULL);
+    return NULL;
+}
+
+static int is_net_url(const char *u)
+{
+    return u && (!strncmp(u, "udp://", 6) || !strncmp(u, "rtp://", 6) || !strncmp(u, "srt://", 6));
+}
+
+/* transcode: ins = parsed input group list (1/2/4 inputs; >1 = multiview);
+ * outs = the list of output groups (one per ABR rung); fcomplex = the shared
+ * -filter_complex. The ffmpeg model — decode each input once, one filter graph
+ * (single-input split, or N-input mosaic+split) feeds each rung's independent
+ * muxer/encoder; audio + subs/data decoded/copied once and fanned out.
+ * Selection (transcode vs copy) per group comes from its -map/-c. */
+static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fcomplex,
                      const char *hwdev, int mode)
 {
-    const char *in_url = ing->arg;
+    int n_input = ins->nb_groups;
     int n_rung = outs->nb_groups;
-    AVFormatContext *ifmt = NULL;
-    AVCodecContext  *vdec = NULL;
-    const AVCodec   *vdecoder = NULL;
-    AVStream        *vist = NULL;
-    AVThreadMessageQueue *video_q = NULL;
+    int multiview;
+    Input            inputs[PTV_MAX_INPUT];
+    AVCodecContext  *vdecs[PTV_MAX_INPUT];
+    AVFilterContext *fsrc[PTV_MAX_INPUT] = {0};
     AVThreadMessageQueue *audio_q[PTV_MAX_AUDIO] = {0};
+    AVFilterGraph   *fg = NULL;                 /* the shared graph (single or multiview) */
+    AVFilterContext **vsink = NULL;            /* per-rung buffersinks (single dc / multi comp) */
+    int              filtering = 0;
     AVBufferRef     *hw_device = NULL;
-    DecodeCtx        dc;
     AudioState       as[PTV_MAX_AUDIO];        /* one per transcoded audio track */
-    int              asrc[PTV_MAX_AUDIO];      /* input stream feeding each as[] (demux routing) */
+    int              asrc[PTV_MAX_AUDIO];      /* input-local stream feeding each as[] */
+    int              asrc_in[PTV_MAX_AUDIO];   /* source input index feeding each as[] */
     int              n_audio = 0;
-    DemuxArgs        da;
     Rung             rung[PTV_MAX_RUNG];
     Sel              sel[PTV_MAX_RUNG];
-    pthread_t        th_demux, th_decode, th_audio[PTV_MAX_AUDIO];
+    CompositorCtx    comp;
+    pthread_t        th_compositor, th_audio[PTV_MAX_AUDIO];
+    int              started_compositor = 0;
     int              started_audio[PTV_MAX_AUDIO] = {0};
-    pthread_mutex_t  h0_lock = PTHREAD_MUTEX_INITIALIZER;
-    int64_t          input_h0_us = AV_NOPTS_VALUE;
-    int64_t          house_skew_us = 0;   /* master video thread -> audio (common-mode A/V lock) */
-    int vstream = -1, ret = 0, live, net_input, have_audio = 0, hw_cuda = 0;
-    int started_decode = 0, aborted = 0, r, si, k;
+    int ret = 0, live, net_input, have_audio = 0, hw_cuda = 0;
+    int aborted = 0, r, si, k, kk, n_copy_inputs = 0;
     AVRational out_fps;
     PassStream pass[PTV_MAX_PASS]; int n_pass = 0;
+    /* aliases to input 0 (the shared single-input setup code works on it) */
+    AVCodecContext *vdec; AVStream *vist; int vstream; const AVCodec *vdecoder;
 
+    if (n_input < 1) { av_log(NULL, AV_LOG_ERROR, "no input\n"); return AVERROR(EINVAL); }
+    if (n_input > PTV_MAX_INPUT || n_input == 3) {
+        av_log(NULL, AV_LOG_ERROR, "multiview supports 1, 2 or 4 inputs (got %d)\n", n_input);
+        return AVERROR(EINVAL);
+    }
+    multiview = n_input > 1;
+    if (multiview && !fcomplex) {
+        av_log(NULL, AV_LOG_ERROR, "multiview (%d inputs) requires -filter_complex (mosaic graph)\n", n_input);
+        return AVERROR(EINVAL);
+    }
     if (n_rung > PTV_MAX_RUNG) {
         av_log(NULL, AV_LOG_WARNING, "%d outputs > max %d; using the first %d\n", n_rung, PTV_MAX_RUNG, PTV_MAX_RUNG);
         n_rung = PTV_MAX_RUNG;
     }
-    memset(&dc, 0, sizeof dc); memset(as, 0, sizeof as);
-    memset(&da, 0, sizeof da); memset(rung, 0, sizeof rung);
+    memset(inputs, 0, sizeof inputs); memset(as, 0, sizeof as); memset(rung, 0, sizeof rung);
+    memset(&comp, 0, sizeof comp);
+    for (k = 0; k < n_input; k++) {
+        inputs[k].url = ins->groups[k].arg;
+        inputs[k].h0  = AV_NOPTS_VALUE;
+        pthread_mutex_init(&inputs[k].h0_lock, NULL);
+        pthread_mutex_init(&inputs[k].hold.lock, NULL);
+        if (multiview) {                         /* per-input jitter buffer for the compositor */
+            if ((ret = av_thread_message_queue_alloc(&inputs[k].hold.q, PTV_FRAME_QDEPTH, sizeof(AVFrame *))) < 0) goto end;
+            av_thread_message_queue_set_free_func(inputs[k].hold.q, free_frame_msg);
+        }
+        /* Take raw 33-bit timestamps; demux_unwrap extends them (libav's
+         * correct_ts_overflow extends inconsistently across the B-frame reorder). */
+        av_dict_set(&ins->groups[k].format_opts, "correct_ts_overflow", "0", AV_DICT_DONT_OVERWRITE);
+    }
 
-    /* Take raw 33-bit timestamps; we extend them ourselves in demux_unwrap (libav's
-     * correct_ts_overflow extends inconsistently across the B-frame reorder boundary). */
-    av_dict_set(&ing->format_opts, "correct_ts_overflow", "0", AV_DICT_DONT_OVERWRITE);
-    if ((ret = avformat_open_input(&ifmt, in_url, NULL, &ing->format_opts)) < 0) {
-        av_log(NULL, AV_LOG_ERROR, "cannot open input '%s': %s\n", in_url, av_err2str(ret)); return ret;
+    /* open ALL inputs in parallel: a dead/slow slot must not delay the others,
+     * and a serial open would block on its (long, multiview) rw_timeout. */
+    {
+        OpenArg oa[PTV_MAX_INPUT];
+        pthread_t th[PTV_MAX_INPUT];
+        int started[PTV_MAX_INPUT] = {0};
+        for (k = 0; k < n_input; k++) {
+            oa[k].in = &inputs[k]; oa[k].opts = &ins->groups[k].format_opts;
+            if (pthread_create(&th[k], NULL, open_input_thread, &oa[k]) == 0) started[k] = 1;
+            else { inputs[k].open_ret = AVERROR(errno); }
+        }
+        for (k = 0; k < n_input; k++) if (started[k]) pthread_join(th[k], NULL);
+        for (k = 0; k < n_input; k++) {
+            if (inputs[k].open_ret < 0) {
+                av_log(NULL, AV_LOG_ERROR, "cannot open input %d '%s': %s\n",
+                       k, inputs[k].url, av_err2str(inputs[k].open_ret));
+                ret = inputs[k].open_ret; goto end;
+            }
+            av_dump_format(inputs[k].ifmt, k, inputs[k].url, 0);
+        }
     }
-    if ((ret = avformat_find_stream_info(ifmt, NULL)) < 0) {
-        av_log(NULL, AV_LOG_ERROR, "stream info: %s\n", av_err2str(ret)); goto end;
-    }
-    av_dump_format(ifmt, 0, in_url, 0);   /* ffmpeg-style "Input #0 ... Stream ..." */
 
     /* resolve each output group's -map/-c into its transcode/copy selection */
     for (r = 0; r < n_rung; r++)
-        if ((ret = resolve_plan(ifmt, &outs->groups[r], &sel[r])) < 0) goto end;
+        if ((ret = resolve_plan(inputs, n_input, &outs->groups[r], &sel[r])) < 0) goto end;
 
-    /* shared video decoder. Ladder rungs map filter labels [vN]; the source
-     * video comes from filter_complex's [0:v] — use the best video stream (or
-     * the input video the single non-ladder output maps directly). */
-    vstream = sel[0].vstream;
-    if (vstream >= 0) vdecoder = sel[0].vdec;
-    else              vstream  = av_find_best_stream(ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, &vdecoder, 0);
-    if (vstream < 0 || !vdecoder) { av_log(NULL, AV_LOG_ERROR, "no video stream\n"); ret = AVERROR(EINVAL); goto end; }
-    vist = ifmt->streams[vstream];
-
-    vdec = avcodec_alloc_context3(vdecoder);
-    if (!vdec) { ret = AVERROR(ENOMEM); goto end; }
-    avcodec_parameters_to_context(vdec, vist->codecpar);
-    vdec->pkt_timebase = vist->time_base;
-    /* NOTE: do NOT enable frame-threaded decode (thread_count=0/auto) yet — it
-     * hangs offline at EOF (the decode flush doesn't drain frame-threading workers
-     * cleanly through this pipeline). Live input never hits EOF so it's moot there,
-     * but keep single-threaded until the EOF drain is handled. (perf TODO) */
-    if ((ret = avcodec_open2(vdec, vdecoder, NULL)) < 0) {
-        av_log(NULL, AV_LOG_ERROR, "open video decoder: %s\n", av_err2str(ret)); goto end;
+    /* per-input video decoder. Ladder/mosaic rungs map filter labels [vN]; each
+     * input's source video is the best video stream (single-input may also map an
+     * input video directly via -map). */
+    for (k = 0; k < n_input; k++) {
+        int vs; const AVCodec *vd = NULL;
+        if (k == 0 && sel[0].vstream >= 0) { vs = sel[0].vstream; vd = sel[0].vdec; }
+        else vs = av_find_best_stream(inputs[k].ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, &vd, 0);
+        if (vs < 0 || !vd) { av_log(NULL, AV_LOG_ERROR, "no video stream in input %d\n", k); ret = AVERROR(EINVAL); goto end; }
+        inputs[k].vstream  = vs;
+        inputs[k].vdecoder = vd;
+        inputs[k].vist     = inputs[k].ifmt->streams[vs];
+        inputs[k].ist_tb   = inputs[k].vist->time_base;
+        inputs[k].vdec = avcodec_alloc_context3(vd);
+        if (!inputs[k].vdec) { ret = AVERROR(ENOMEM); goto end; }
+        avcodec_parameters_to_context(inputs[k].vdec, inputs[k].vist->codecpar);
+        inputs[k].vdec->pkt_timebase = inputs[k].ist_tb;
+        /* NOTE: keep single-threaded decode — frame-threaded hangs offline at EOF. */
+        if ((ret = avcodec_open2(inputs[k].vdec, vd, NULL)) < 0) {
+            av_log(NULL, AV_LOG_ERROR, "open video decoder (input %d): %s\n", k, av_err2str(ret)); goto end;
+        }
+        vdecs[k] = inputs[k].vdec;
+        inputs[k].wrap_off  = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].wrap_off));
+        inputs[k].wrap_last = av_malloc_array(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].wrap_last));
+        if (!inputs[k].wrap_off || !inputs[k].wrap_last) { ret = AVERROR(ENOMEM); goto end; }
+        for (si = 0; si < (int)inputs[k].ifmt->nb_streams; si++) inputs[k].wrap_last[si] = AV_NOPTS_VALUE;
     }
+    vdec = inputs[0].vdec; vist = inputs[0].vist;
+    vstream = inputs[0].vstream; vdecoder = inputs[0].vdecoder; (void)vstream;
 
     /* house rate: -r on the first output, else preserve the source's actual FRAME
      * rate. Prefer avg_frame_rate over r_frame_rate: for an interlaced source
@@ -1373,11 +1759,17 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
                cuda_ord ? cuda_ord : "0");
     }
 
-    /* shared filter graph: -filter_complex (split -> N sinks), a single -filter:v
-     * chain (N==1), or none (clone the decoded frame to each rung). */
-    dc.n_rung = n_rung;
+    /* shared filter graph: -filter_complex (N video inputs -> split/mosaic ->
+     * N sinks), a single -filter:v chain (single-input N==1), or none (clone the
+     * decoded frame to each rung). For multiview the compositor owns the graph
+     * and feeds N buffersrcs at pts = house tick (src_tb = 1/out_fps); for
+     * single-input the decode thread feeds the one buffersrc with source pts. */
+    inputs[0].dc.n_rung = n_rung;
     if (fcomplex) {
         const char *labels[PTV_MAX_RUNG];
+        AVRational src_tb = multiview ? av_inv_q(out_fps) : inputs[0].ist_tb;
+        AVFilterGraph **pfg = multiview ? &fg : &inputs[0].dc.fg;
+        AVFilterContext **psinks = multiview ? comp.fsink : inputs[0].dc.fsink;
         for (r = 0; r < n_rung; r++) {
             OptionGroup *g = &outs->groups[r];
             const char *lab = NULL; int o; size_t L;
@@ -1390,17 +1782,20 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
             if (L && rung[r].vlabel[L-1] == ']') rung[r].vlabel[L-1] = 0;      /* drop ']' */
             labels[r] = rung[r].vlabel;
         }
-        if ((ret = build_filter_complex(fcomplex, vdec, vist->time_base, hw_device,
-                                        labels, n_rung, &dc.fg, &dc.fsrc, dc.fsink)) < 0) goto end;
-        dc.filtering = 1;
+        if ((ret = build_filter_complex(fcomplex, vdecs, n_input, src_tb, hw_device,
+                                        labels, n_rung, pfg, fsrc, psinks)) < 0) goto end;
+        filtering = 1;
+        if (multiview) { vsink = comp.fsink; }
+        else { inputs[0].dc.fsrc = fsrc[0]; inputs[0].dc.filtering = 1; vsink = inputs[0].dc.fsink; }
     } else if (n_rung == 1 && sel[0].vf) {
         int fw = 0, fh = 0, fpix = AV_PIX_FMT_NONE; AVBufferRef *hf = NULL;
-        if ((ret = build_video_filter(&dc, vdec, vist->time_base, sel[0].vf, 0, 0, 0,
+        if ((ret = build_video_filter(&inputs[0].dc, vdec, inputs[0].ist_tb, sel[0].vf, 0, 0, 0,
                                       hw_cuda, hw_device, &fw, &fh, &fpix, &hf)) < 0) {
             av_log(NULL, AV_LOG_ERROR, "build video filter: %s\n", av_err2str(ret)); goto end;
         }
-        rung[0].fw = fw; rung[0].fh = fh; rung[0].fpix = fpix; rung[0].fhwfr = hf;
-    }   /* else: dc.filtering stays 0 -> clone the decoded frame to each rung */
+        av_buffer_unref(&hf);
+        filtering = inputs[0].dc.filtering; vsink = inputs[0].dc.fsink;
+    }   /* else: filtering stays 0 -> clone the decoded frame to each rung */
 
     /* per-rung video encoder, sized from this rung's sink (or the decoder) */
     for (r = 0; r < n_rung; r++) {
@@ -1409,16 +1804,16 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
         const char *venc_name = sel[r].venc ? sel[r].venc : "h264_videotoolbox";
         const AVCodec *vencoder;
 
-        if (fcomplex) {
-            rung[r].fw   = av_buffersink_get_w(dc.fsink[r]);
-            rung[r].fh   = av_buffersink_get_h(dc.fsink[r]);
-            rung[r].fpix = av_buffersink_get_format(dc.fsink[r]);
-            { AVBufferRef *hf = av_buffersink_get_hw_frames_ctx(dc.fsink[r]);
+        if (filtering) {
+            rung[r].fw   = av_buffersink_get_w(vsink[r]);
+            rung[r].fh   = av_buffersink_get_h(vsink[r]);
+            rung[r].fpix = av_buffersink_get_format(vsink[r]);
+            { AVBufferRef *hf = av_buffersink_get_hw_frames_ctx(vsink[r]);
               rung[r].fhwfr = hf ? av_buffer_ref(hf) : NULL; }
-        } else if (!dc.filtering) {
+        } else {
             rung[r].fw = vdec->width; rung[r].fh = vdec->height;
             rung[r].fpix = vdec->pix_fmt != AV_PIX_FMT_NONE ? vdec->pix_fmt : AV_PIX_FMT_YUV420P;
-        }   /* else single -vf: rung[0].fw/fh/fpix/fhwfr already set above */
+        }
 
         ret = avformat_alloc_output_context2(&rung[r].ofmt, NULL, out_fmt, out_url);
         if (ret < 0 && !out_fmt)   /* udp://, srt://: no extension to guess from */
@@ -1459,7 +1854,7 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
      * the passthrough list below (keeping demux_pass's wrap unwrap + DTS clamp). */
     for (k = 0; k < sel[0].n_aout && n_audio < PTV_MAX_AUDIO; k++) {
         AOutSpec      *spec = &sel[0].aout[k];
-        AVStream      *kist = ifmt->streams[spec->stream];
+        AVStream      *kist = inputs[spec->input].ifmt->streams[spec->stream];
         const AVCodec *kdecoder = spec->adec ? spec->adec
                                 : avcodec_find_decoder(kist->codecpar->codec_id);
         AVCodecContext *kdec, *encs[PTV_MAX_RUNG] = {0};
@@ -1543,36 +1938,49 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
                                 &a->dec->ch_layout, a->dec->sample_fmt, a->dec->sample_rate, 0, NULL);
             if (!a->swr || swr_init(a->swr) < 0) { av_log(NULL, AV_LOG_WARNING, "audio track %d swr init failed; skipped\n", k); }
         }
-        asrc[n_audio] = spec->stream;
+        asrc[n_audio]    = spec->stream;
+        asrc_in[n_audio] = spec->input;
         n_audio++;
     }
     have_audio = n_audio > 0;
 
     /* shared passthrough (copy): each non-transcoded input stream — extra audio
      * (AC-3 5.1), DVB subtitles, data/SCTE-35 — gets an output stream in EVERY
-     * muxer; the copied packets fan out. From the first rung's plan; created
-     * before the headers are written. */
-    for (si = 0; si < sel[0].n_copy && n_pass < PTV_MAX_PASS; si++) {
-        int sidx = sel[0].copy[si];
-        AVStream *ist = ifmt->streams[sidx];
-        AVDictionaryEntry *lang = av_dict_get(ist->metadata, "language", NULL, 0);
-        pass[n_pass].in_index = sidx;
-        pass[n_pass].in_tb    = ist->time_base;
-        pass[n_pass].last_dts = AV_NOPTS_VALUE;
-        for (r = 0; r < n_rung; r++) {
-            AVStream *os = avformat_new_stream(rung[r].ofmt, NULL);
-            if (!os) { ret = AVERROR(ENOMEM); goto end; }
-            if ((ret = avcodec_parameters_copy(os->codecpar, ist->codecpar)) < 0) goto end;
-            os->codecpar->codec_tag = 0;
-            os->time_base   = ist->time_base;
-            os->disposition = ist->disposition;
-            if (lang) av_dict_set(&os->metadata, "language", lang->value, 0);
-            pass[n_pass].ost[r] = os;
+     * muxer; the copied packets fan out. Built GROUPED BY INPUT so each input's
+     * demux gets a contiguous pass[] slice (inputs[kk].da.pass). Created before
+     * the headers are written. */
+    for (kk = 0; kk < n_input; kk++) {
+        inputs[kk].da.pass = &pass[n_pass];          /* this input's contiguous slice */
+        inputs[kk].da.n_pass = 0;
+        for (si = 0; si < sel[0].n_copy && n_pass < PTV_MAX_PASS; si++) {
+            int sidx;
+            AVStream *ist; AVDictionaryEntry *lang;
+            if (sel[0].copy_input[si] != kk) continue;
+            sidx = sel[0].copy[si];
+            ist  = inputs[kk].ifmt->streams[sidx];
+            lang = av_dict_get(ist->metadata, "language", NULL, 0);
+            pass[n_pass].input    = kk;
+            pass[n_pass].in_index = sidx;
+            pass[n_pass].in_tb    = ist->time_base;
+            pass[n_pass].last_dts = AV_NOPTS_VALUE;
+            for (r = 0; r < n_rung; r++) {
+                AVStream *os = avformat_new_stream(rung[r].ofmt, NULL);
+                if (!os) { ret = AVERROR(ENOMEM); goto end; }
+                if ((ret = avcodec_parameters_copy(os->codecpar, ist->codecpar)) < 0) goto end;
+                os->codecpar->codec_tag = 0;
+                os->time_base   = ist->time_base;
+                os->disposition = ist->disposition;
+                if (lang) av_dict_set(&os->metadata, "language", lang->value, 0);
+                pass[n_pass].ost[r] = os;
+            }
+            n_pass++;
+            inputs[kk].da.n_pass++;
         }
-        n_pass++;
+        if (inputs[kk].da.n_pass > 0) n_copy_inputs++;
     }
     if (n_pass)
-        av_log(NULL, AV_LOG_INFO, "ptvencoder: passthrough %d stream(s) per output (copy)\n", n_pass);
+        av_log(NULL, AV_LOG_INFO, "ptvencoder: passthrough %d stream(s) per output (copy), %d input(s)\n",
+               n_pass, n_copy_inputs);
 
     /* per-rung: open the output, bound the interleave (sparse-sub smoothing),
      * apply file -metadata, write the header. */
@@ -1601,13 +2009,14 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
         av_dump_format(rung[r].ofmt, r, out_url, 1);   /* ffmpeg-style "Output #r ..." */
     }
 
-    net_input = !strncmp(in_url, "udp://", 6) || !strncmp(in_url, "rtp://", 6) ||
-                !strncmp(in_url, "srt://", 6);
+    net_input = is_net_url(inputs[0].url);
     live = mode < 0 ? net_input : mode;
 
-    /* queues: one shared video_q + one audio_q per transcoded track, per-rung frame_q + mux_q */
-    if ((ret = av_thread_message_queue_alloc(&video_q, PTV_QDEPTH, sizeof(AVPacket *))) < 0) goto end;
-    av_thread_message_queue_set_free_func(video_q, free_pkt_msg);
+    /* queues: per-input video_q, one audio_q per transcoded track, per-rung frame_q + mux_q */
+    for (k = 0; k < n_input; k++) {
+        if ((ret = av_thread_message_queue_alloc(&inputs[k].video_q, PTV_QDEPTH, sizeof(AVPacket *))) < 0) goto end;
+        av_thread_message_queue_set_free_func(inputs[k].video_q, free_pkt_msg);
+    }
     for (k = 0; k < n_audio; k++) {
         if ((ret = av_thread_message_queue_alloc(&audio_q[k], PTV_QDEPTH, sizeof(AVPacket *))) < 0) goto end;
         av_thread_message_queue_set_free_func(audio_q[k], free_pkt_msg);
@@ -1619,50 +2028,69 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
         av_thread_message_queue_set_free_func(rung[r].mux_q, free_pkt_msg);
     }
 
-    /* shared decode side */
-    dc.video_q = video_q; dc.vdec = vdec; dc.ist_tb = vist->time_base;
-    dc.h0 = &input_h0_us; dc.h0_lock = &h0_lock; dc.live = live;
-    for (r = 0; r < n_rung; r++) dc.frame_q[r] = rung[r].frame_q;
+    /* per-input decode side. single-input: inputs[0].dc already holds the graph
+     * (fg/fsrc/fsink/filtering) + feeds the rung frame_q inline. multiview: each
+     * decode stages into hold; the compositor owns the graph + frame_q fan. */
+    for (k = 0; k < n_input; k++) {
+        DecodeCtx *d = &inputs[k].dc;
+        d->video_q = inputs[k].video_q; d->vdec = inputs[k].vdec; d->ist_tb = inputs[k].ist_tb;
+        d->h0 = &inputs[k].h0; d->h0_lock = &inputs[k].h0_lock; d->live = live;
+        if (multiview) { d->hold = &inputs[k].hold; d->filtering = 0; d->n_rung = 0; }
+        else { d->n_rung = n_rung; for (r = 0; r < n_rung; r++) d->frame_q[r] = rung[r].frame_q; }
+    }
+
+    if (multiview) {                                 /* compositor = the video house clock */
+        comp.inputs = inputs; comp.n_input = n_input; comp.fg = fg; comp.n_rung = n_rung;
+        comp.tick_dur_us = av_rescale(1000000, out_fps.den, out_fps.num);
+        comp.live = live;
+        comp.slate_after_us = live ? 5 * (int64_t)AV_TIME_BASE : 0;   /* stale cell -> black after 5s */
+        for (k = 0; k < n_input; k++) comp.fsrc[k] = fsrc[k];
+        for (r = 0; r < n_rung; r++) { comp.fsink[r] = vsink[r]; comp.frame_q[r] = rung[r].frame_q; }
+    }
 
     /* per-rung output side */
     for (r = 0; r < n_rung; r++) {
         VideoCtx *vc = &rung[r].vc;
         vc->frame_q = rung[r].frame_q; vc->mux_q = rung[r].mux_q; vc->venc = rung[r].venc;
-        vc->out_tb = dc.filtering ? av_buffersink_get_time_base(dc.fsink[r]) : vist->time_base;
+        vc->out_tb = filtering ? av_buffersink_get_time_base(vsink[r]) : inputs[0].ist_tb;
         vc->tick_dur_us = av_rescale(1000000, out_fps.den, out_fps.num);
-        vc->live = live; vc->h0 = &input_h0_us; vc->h0_lock = &h0_lock;
-        vc->house_skew = &house_skew_us;
+        vc->live = live; vc->passthrough = multiview;
+        vc->h0 = &inputs[0].h0; vc->h0_lock = &inputs[0].h0_lock;
+        vc->house_skew = &inputs[0].house_skew;
         vc->is_master = (r == 0);
-        vc->dbg_video_q = video_q; vc->dbg_dec_frames = &dc.dec_frames; vc->dbg_vcorrupt = &dc.vcorrupt;
+        vc->dbg_video_q = inputs[0].video_q; vc->dbg_dec_frames = &inputs[0].dc.dec_frames; vc->dbg_vcorrupt = &inputs[0].dc.vcorrupt;
         rung[r].ma.ofmt = rung[r].ofmt; rung[r].ma.mux_q = rung[r].mux_q;
-        rung[r].ma.n_producers = 1 + n_audio + (n_pass > 0 ? 1 : 0);   /* video + N audio + copy fan */
+        rung[r].ma.n_producers = 1 + n_audio + n_copy_inputs;   /* video out + N audio + per-input copy fan */
     }
-    for (k = 0; k < n_audio; k++) {              /* per-track audio wiring (dec/enc/ost/fifo set above) */
+    for (k = 0; k < n_audio; k++) {              /* per-track audio: source from its input's clock */
         as[k].audio_q = audio_q[k];
-        as[k].h0 = &input_h0_us; as[k].h0_lock = &h0_lock;
-        as[k].house_skew = &house_skew_us;
+        as[k].h0 = &inputs[asrc_in[k]].h0; as[k].h0_lock = &inputs[asrc_in[k]].h0_lock;
+        as[k].house_skew = &inputs[asrc_in[k]].house_skew;
         for (r = 0; r < n_rung; r++) as[k].mux_q[r] = rung[r].mux_q;
     }
-    da.ifmt = ifmt; da.video_q = video_q;
-    da.vstream = vstream; da.n_audio = n_audio; da.drop = net_input;
-    for (k = 0; k < n_audio; k++) { da.audio_q[k] = audio_q[k]; da.astream[k] = asrc[k]; }
-    da.pass = pass; da.n_pass = n_pass; da.h0 = &input_h0_us; da.h0_lock = &h0_lock; da.n_out = n_rung;
-    da.house_skew = &house_skew_us;
-    da.wrap_off  = av_calloc(ifmt->nb_streams, sizeof(*da.wrap_off));
-    da.wrap_last = av_malloc_array(ifmt->nb_streams, sizeof(*da.wrap_last));
-    if (!da.wrap_off || !da.wrap_last) { ret = AVERROR(ENOMEM); goto end; }
-    for (si = 0; si < (int)ifmt->nb_streams; si++) da.wrap_last[si] = AV_NOPTS_VALUE;
-    for (r = 0; r < n_rung; r++) da.mux_q[r] = rung[r].mux_q;
+    for (kk = 0; kk < n_input; kk++) {           /* per-input demux args (pass/n_pass set in copy loop) */
+        DemuxArgs *d = &inputs[kk].da;
+        d->ifmt = inputs[kk].ifmt; d->video_q = inputs[kk].video_q;
+        d->vstream = inputs[kk].vstream; d->drop = is_net_url(inputs[kk].url); d->n_out = n_rung;
+        d->h0 = &inputs[kk].h0; d->h0_lock = &inputs[kk].h0_lock; d->house_skew = &inputs[kk].house_skew;
+        d->wrap_off = inputs[kk].wrap_off; d->wrap_last = inputs[kk].wrap_last;
+        for (r = 0; r < n_rung; r++) d->mux_q[r] = rung[r].mux_q;
+        d->n_audio = 0;
+        for (k = 0; k < n_audio; k++)
+            if (asrc_in[k] == kk) { d->audio_q[d->n_audio] = audio_q[k]; d->astream[d->n_audio] = asrc[k]; d->n_audio++; }
+    }
 
     av_log(NULL, AV_LOG_INFO,
-        "ptvencoder: ladder %d rung(s)  house %d/%d fps (%s)  v:%s->enc  a:%s  in:%s  pull-pipeline\n",
-        n_rung, out_fps.num, out_fps.den, live ? "live" : "offline", vdecoder->name,
+        "ptvencoder: %s %d input(s) %d rung(s)  house %d/%d fps (%s)  v:%s->enc  a:%s  in:%s  pull-pipeline\n",
+        multiview ? "MULTIVIEW" : "single", n_input, n_rung, out_fps.num, out_fps.den,
+        live ? "live" : "offline", vdecoder->name,
         have_audio ? "aac" : "none", net_input ? "net(drop)" : "file(block)");
     for (r = 0; r < n_rung; r++)
         av_log(NULL, AV_LOG_INFO, "  rung%d: %dx%d -> %s [%s]\n",
                r, rung[r].fw, rung[r].fh, outs->groups[r].arg, rung[r].ofmt->oformat->name);
 
-    /* spawn: N mux + N output + N watchdog + 1 decode + 1 audio + 1 demux */
+    /* spawn: N mux + N output + N watchdog + (per input) decode + demux + 1 audio
+     * per track + (multiview) 1 compositor. */
     for (r = 0; r < n_rung; r++) {
         int pe = pthread_create(&rung[r].th_mux, NULL, mux_thread, &rung[r].ma);
         if (pe) { ret = AVERROR(pe); aborted = 1; goto shutdown; }
@@ -1675,10 +2103,15 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
     }
     for (r = 0; r < n_rung; r++)
         if (!pthread_create(&rung[r].th_wd, NULL, watchdog_thread, &rung[r].vc)) rung[r].started_wd = 1;
-    {
-        int pe = pthread_create(&th_decode, NULL, decode_thread, &dc);
+    if (multiview) {
+        int pe = pthread_create(&th_compositor, NULL, compositor_thread, &comp);
         if (pe) { ret = AVERROR(pe); aborted = 1; goto shutdown; }
-        started_decode = 1;
+        started_compositor = 1;
+    }
+    for (k = 0; k < n_input; k++) {
+        int pe = pthread_create(&inputs[k].th_decode, NULL, decode_thread, &inputs[k].dc);
+        if (pe) { ret = AVERROR(pe); aborted = 1; goto shutdown; }
+        inputs[k].started_decode = 1;
     }
     for (k = 0; k < n_audio; k++) {
         if (!pthread_create(&th_audio[k], NULL, audio_thread, &as[k])) started_audio[k] = 1;
@@ -1687,23 +2120,24 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
             for (r = 0; r < n_rung; r++) { AVPacket *eof = NULL; av_thread_message_queue_send(rung[r].mux_q, &eof, 0); }
         }
     }
-    {
-        int pe = pthread_create(&th_demux, NULL, demux_thread, &da);
-        if (pe) {                                   /* couldn't start demux: drain the pipeline */
-            av_thread_message_queue_set_err_recv(video_q, AVERROR_EOF);   /* EOF to consumers */
-            for (k = 0; k < n_audio; k++) av_thread_message_queue_set_err_recv(audio_q[k], AVERROR_EOF);
-            for (r = 0; n_pass > 0 && r < n_rung; r++) { AVPacket *eof = NULL; av_thread_message_queue_send(rung[r].mux_q, &eof, 0); }
+    for (k = 0; k < n_input; k++) {
+        int pe = pthread_create(&inputs[k].th_demux, NULL, demux_thread, &inputs[k].da);
+        if (pe) {                                   /* couldn't start this demux: EOF its consumers */
+            av_thread_message_queue_set_err_recv(inputs[k].video_q, AVERROR_EOF);
+            { int t; for (t = 0; t < inputs[k].da.n_audio; t++) av_thread_message_queue_set_err_recv(inputs[k].da.audio_q[t], AVERROR_EOF); }
+            for (r = 0; inputs[k].da.n_pass > 0 && r < n_rung; r++) { AVPacket *eof = NULL; av_thread_message_queue_send(rung[r].mux_q, &eof, 0); }
             ret = AVERROR(pe);
-        } else {
-            pthread_join(th_demux, NULL);
-        }
+        } else inputs[k].started_demux = 1;
     }
+    for (k = 0; k < n_input; k++) if (inputs[k].started_demux) pthread_join(inputs[k].th_demux, NULL);
 
 shutdown:
     if (aborted) {                                  /* force the pipeline to unwind: release ANY
                                                      * thread blocked in send OR recv on any queue */
-        av_thread_message_queue_set_err_send(video_q, AVERROR_EOF);
-        av_thread_message_queue_set_err_recv(video_q, AVERROR_EOF);
+        for (k = 0; k < n_input; k++) if (inputs[k].video_q) {
+            av_thread_message_queue_set_err_send(inputs[k].video_q, AVERROR_EOF);
+            av_thread_message_queue_set_err_recv(inputs[k].video_q, AVERROR_EOF);
+        }
         for (k = 0; k < n_audio; k++) if (audio_q[k]) {
             av_thread_message_queue_set_err_send(audio_q[k], AVERROR_EOF);
             av_thread_message_queue_set_err_recv(audio_q[k], AVERROR_EOF);
@@ -1720,7 +2154,8 @@ shutdown:
             }
         }
     }
-    if (started_decode) pthread_join(th_decode, NULL);
+    for (k = 0; k < n_input; k++) if (inputs[k].started_decode) pthread_join(inputs[k].th_decode, NULL);
+    if (started_compositor) pthread_join(th_compositor, NULL);
     for (r = 0; r < n_rung; r++) if (rung[r].started_output) pthread_join(rung[r].th_output, NULL);
     for (k = 0; k < n_audio; k++) if (started_audio[k]) pthread_join(th_audio[k], NULL);
     for (r = 0; r < n_rung; r++) if (rung[r].started_wd) pthread_join(rung[r].th_wd, NULL);
@@ -1729,16 +2164,22 @@ shutdown:
         pthread_join(rung[r].th_mux, NULL);
     }
 
-    av_log(NULL, AV_LOG_INFO,
-        "ptvencoder: done — %d rung(s); video dec %"PRId64" master out %"PRId64
-        " (dup %"PRId64" framedrop %"PRId64")  demux v:%"PRId64"/drop%"PRId64" p:%"PRId64"/drop%"PRId64"%s\n",
-        n_rung, dc.dec_frames, rung[0].vc.emitted, rung[0].vc.dup, rung[0].vc.framedrop,
-        da.vpkt, da.vdrop, da.ppkt, da.pdrop, have_audio ? "" : "  [no audio]");
+    {
+        int64_t dec_sum = 0, vpkt = 0, ppkt = 0;
+        int64_t m_emit = multiview ? comp.emitted : rung[0].vc.emitted;
+        int64_t m_dup  = multiview ? comp.dup     : rung[0].vc.dup;
+        for (k = 0; k < n_input; k++) { dec_sum += inputs[k].dc.dec_frames; vpkt += inputs[k].da.vpkt; ppkt += inputs[k].da.ppkt; }
+        av_log(NULL, AV_LOG_INFO,
+            "ptvencoder: done — %d input(s) %d rung(s); video dec %"PRId64" out %"PRId64
+            " (dup %"PRId64")  demux v:%"PRId64" p:%"PRId64"%s\n",
+            n_input, n_rung, dec_sum, m_emit, m_dup, vpkt, ppkt, have_audio ? "" : "  [no audio]");
+    }
     if (have_audio) {
-        int64_t ain = 0, aout = 0;
+        int64_t ain = 0, aout = 0, apkt = 0;
         for (k = 0; k < n_audio; k++) { ain += as[k].in_frames; aout += as[k].out_frames; }
-        av_log(NULL, AV_LOG_INFO, "ptvencoder: audio %d track(s), in %"PRId64" frames, out %"PRId64" aac (demux a:%"PRId64"/drop%"PRId64")\n",
-               n_audio, ain, aout, da.apkt, da.adrop);
+        for (k = 0; k < n_input; k++) apkt += inputs[k].da.apkt;
+        av_log(NULL, AV_LOG_INFO, "ptvencoder: audio %d track(s), in %"PRId64" frames, out %"PRId64" aac (demux a:%"PRId64")\n",
+               n_audio, ain, aout, apkt);
     }
     if (ret > 0) ret = 0;
 
@@ -1748,7 +2189,6 @@ end:
         if (rung[r].ofmt && !(rung[r].ofmt->oformat->flags & AVFMT_NOFILE) && rung[r].ofmt->pb)
             avio_closep(&rung[r].ofmt->pb);
     }
-    av_thread_message_queue_free(&video_q);
     for (k = 0; k < n_audio; k++) av_thread_message_queue_free(&audio_q[k]);
     for (r = 0; r < n_rung; r++) {
         av_thread_message_queue_free(&rung[r].frame_q);
@@ -1764,12 +2204,19 @@ end:
         for (r = 0; r < n_rung; r++) avcodec_free_context(&as[k].enc[r]);
         avcodec_free_context(&as[k].dec);
     }
-    avcodec_free_context(&vdec);
-    avfilter_graph_free(&dc.fg);
+    avfilter_graph_free(&fg);
+    for (k = 0; k < n_input; k++) {
+        avfilter_graph_free(&inputs[k].dc.fg);       /* single-input graph (multiview: NULL) */
+        avcodec_free_context(&inputs[k].vdec);
+        av_thread_message_queue_free(&inputs[k].video_q);
+        av_thread_message_queue_free(&inputs[k].hold.q);
+        av_freep(&inputs[k].wrap_off);
+        av_freep(&inputs[k].wrap_last);
+        if (inputs[k].ifmt) avformat_close_input(&inputs[k].ifmt);
+        pthread_mutex_destroy(&inputs[k].h0_lock);
+        pthread_mutex_destroy(&inputs[k].hold.lock);
+    }
     av_buffer_unref(&hw_device);
-    av_freep(&da.wrap_off);
-    av_freep(&da.wrap_last);
-    avformat_close_input(&ifmt);
     return ret;
 }
 
@@ -1914,13 +2361,14 @@ static void apply_stream_meta(OptionGroup *g, char t, int idx, AVStream *ost)
 }
 
 /* strip a leading "<digits>:" file index and a trailing '?' from a -map value */
-static const char *map_spec(const char *v, char *buf, size_t bufsz, int *optional)
+static const char *map_spec(const char *v, char *buf, size_t bufsz, int *optional, int *file_idx)
 {
     const char *colon = strchr(v, ':'), *s = v; size_t L;
+    if (file_idx) *file_idx = 0;
     if (colon && colon > v) {
         const char *p; int alldig = 1;
         for (p = v; p < colon; p++) if (*p < '0' || *p > '9') { alldig = 0; break; }
-        if (alldig) s = colon + 1;
+        if (alldig) { if (file_idx) *file_idx = atoi(v); s = colon + 1; }
     }
     snprintf(buf, bufsz, "%s", s);
     L = strlen(buf);
@@ -1932,9 +2380,11 @@ static const char *map_spec(const char *v, char *buf, size_t bufsz, int *optiona
 /* PTV_PLAN_DEBUG=1: parse an ffmpeg-style command, open the input, resolve each
  * -map to an input stream + its copy/encode decision (and applied opts), print. */
 /* Resolve an output group's -map/-c into a Sel (transcode vs copy decision).
- * No -map -> auto (best video + first <=2ch audio + copy the rest), back-compat. */
-static int resolve_plan(AVFormatContext *ifmt, OptionGroup *outg, Sel *s)
+ * No -map -> auto (best video + first <=2ch audio + copy the rest), back-compat
+ * (single-input only). Explicit -map K:... selects from input K (multiview). */
+static int resolve_plan(Input *inputs, int n_input, OptionGroup *outg, Sel *s)
 {
+    AVFormatContext *ifmt = inputs[0].ifmt;
     int o, si, tcnt[5] = {0}, nmap = 0, astream = -1;
     memset(s, 0, sizeof *s);
     s->vstream = -1;
@@ -1942,7 +2392,7 @@ static int resolve_plan(AVFormatContext *ifmt, OptionGroup *outg, Sel *s)
     for (o = 0; o < outg->nb_opts; o++) if (!strcmp(outg->opts[o].key, "map")) nmap++;
     s->have = nmap > 0;
 
-    if (!nmap) {                       /* no -map: auto-select (back-compat) */
+    if (!nmap) {                       /* no -map: auto-select on input 0 (back-compat) */
         s->vstream = av_find_best_stream(ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, &s->vdec, 0);
         for (si = 0; si < (int)ifmt->nb_streams; si++) {
             AVCodecParameters *cp = ifmt->streams[si]->codecpar;
@@ -1951,6 +2401,7 @@ static int resolve_plan(AVFormatContext *ifmt, OptionGroup *outg, Sel *s)
         }
         if (astream < 0) astream = av_find_best_stream(ifmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
         if (astream >= 0) {            /* one transcoded audio track (back-compat) */
+            s->aout[0].input  = 0;
             s->aout[0].stream = astream;
             s->aout[0].adec   = avcodec_find_decoder(ifmt->streams[astream]->codecpar->codec_id);
             s->n_aout = 1;
@@ -1959,7 +2410,7 @@ static int resolve_plan(AVFormatContext *ifmt, OptionGroup *outg, Sel *s)
             enum AVMediaType mt = ifmt->streams[si]->codecpar->codec_type;
             if (si == s->vstream || si == astream) continue;
             if ((mt == AVMEDIA_TYPE_AUDIO || mt == AVMEDIA_TYPE_SUBTITLE || mt == AVMEDIA_TYPE_DATA)
-                && s->n_copy < PTV_MAX_PASS) s->copy[s->n_copy++] = si;
+                && s->n_copy < PTV_MAX_PASS) { s->copy_input[s->n_copy] = 0; s->copy[s->n_copy++] = si; }
         }
         s->venc = og_get(outg, "c:v"); if (!s->venc) s->venc = og_get(outg, "c");
         s->vbr  = og_get(outg, "b:v"); if (!s->vbr)  s->vbr  = og_get(outg, "b");
@@ -1967,7 +2418,8 @@ static int resolve_plan(AVFormatContext *ifmt, OptionGroup *outg, Sel *s)
     }
 
     for (o = 0; o < outg->nb_opts; o++) {              /* explicit -map plan */
-        char buf[64]; int optional; const char *spec, *mv = outg->opts[o].val;
+        char buf[64]; int optional, fidx; const char *spec, *mv = outg->opts[o].val;
+        AVFormatContext *kfmt;
         if (strcmp(outg->opts[o].key, "map")) continue;
         if (mv[0] == '[') {                            /* filter-output label = this rung's video */
             int idx = tcnt[0]++;                       /* video output index */
@@ -1975,11 +2427,16 @@ static int resolve_plan(AVFormatContext *ifmt, OptionGroup *outg, Sel *s)
             s->vbr  = og_spec(outg, "b", 'v', idx);    /* -b:v / -b:v:0 */
             continue;                                  /* video comes from the graph, not an input stream */
         }
-        spec = map_spec(mv, buf, sizeof buf, &optional);
-        for (si = 0; si < (int)ifmt->nb_streams; si++) {
+        spec = map_spec(mv, buf, sizeof buf, &optional, &fidx);
+        if (fidx < 0 || fidx >= n_input) {
+            av_log(NULL, AV_LOG_ERROR, "-map %s: input %d out of range (%d input(s))\n", mv, fidx, n_input);
+            return AVERROR(EINVAL);
+        }
+        kfmt = inputs[fidx].ifmt;
+        for (si = 0; si < (int)kfmt->nb_streams; si++) {
             enum AVMediaType mt; char t; int ti, idx; const char *codec;
-            if (avformat_match_stream_specifier(ifmt, ifmt->streams[si], spec) <= 0) continue;
-            mt  = ifmt->streams[si]->codecpar->codec_type;
+            if (avformat_match_stream_specifier(kfmt, kfmt->streams[si], spec) <= 0) continue;
+            mt  = kfmt->streams[si]->codecpar->codec_type;
             t   = mt==AVMEDIA_TYPE_VIDEO?'v':mt==AVMEDIA_TYPE_AUDIO?'a':
                   mt==AVMEDIA_TYPE_SUBTITLE?'s':mt==AVMEDIA_TYPE_DATA?'d':'?';
             ti  = mt==AVMEDIA_TYPE_VIDEO?0:mt==AVMEDIA_TYPE_AUDIO?1:
@@ -1987,19 +2444,19 @@ static int resolve_plan(AVFormatContext *ifmt, OptionGroup *outg, Sel *s)
             idx = tcnt[ti]++;
             codec = og_spec(outg, "c", t, idx);
             if (codec && !strcmp(codec, "copy")) {
-                if (s->n_copy < PTV_MAX_PASS) s->copy[s->n_copy++] = si;
-            } else if (mt == AVMEDIA_TYPE_VIDEO && s->vstream < 0) {
+                if (s->n_copy < PTV_MAX_PASS) { s->copy_input[s->n_copy] = fidx; s->copy[s->n_copy++] = si; }
+            } else if (mt == AVMEDIA_TYPE_VIDEO && s->vstream < 0 && fidx == 0) {
                 s->vstream = si; s->venc = codec; s->vbr = og_spec(outg, "b", t, idx);
-                s->vdec = avcodec_find_decoder(ifmt->streams[si]->codecpar->codec_id);
+                s->vdec = avcodec_find_decoder(kfmt->streams[si]->codecpar->codec_id);
             } else if (mt == AVMEDIA_TYPE_AUDIO && s->n_aout < PTV_MAX_AUDIO) {
                 AOutSpec *a = &s->aout[s->n_aout++];    /* one transcoded audio track per -map */
                 const char *acs = og_spec(outg, "ac", t, idx);   /* -ac:a:N output channels */
-                a->stream = si; a->aenc = codec; a->abr = og_spec(outg, "b", t, idx);
+                a->input = fidx; a->stream = si; a->aenc = codec; a->abr = og_spec(outg, "b", t, idx);
                 a->filter = og_spec(outg, "filter", t, idx);     /* -filter:a:N (else global -af) */
                 a->ac = acs ? atoi(acs) : 0;                      /* 0 = default stereo */
-                a->adec = avcodec_find_decoder(ifmt->streams[si]->codecpar->codec_id);
+                a->adec = avcodec_find_decoder(kfmt->streams[si]->codecpar->codec_id);
             } else if (s->n_copy < PTV_MAX_PASS) {
-                s->copy[s->n_copy++] = si;             /* extra streams over the cap -> copy */
+                s->copy_input[s->n_copy] = fidx; s->copy[s->n_copy++] = si;   /* over the cap -> copy */
             }
         }
     }
@@ -2039,7 +2496,7 @@ static int plan_resolve_and_print(int argc, char **argv)
                    outg->opts[o].val);
             continue;
         }
-        spec = map_spec(outg->opts[o].val, buf, sizeof buf, &optional);
+        spec = map_spec(outg->opts[o].val, buf, sizeof buf, &optional, NULL);
         for (si = 0; si < (int)ifmt->nb_streams; si++) {
             enum AVMediaType mt; char t; int ti, idx; const char *codec, *br;
             if (avformat_match_stream_specifier(ifmt, ifmt->streams[si], spec) <= 0) continue;
@@ -2097,7 +2554,7 @@ static void ptv_show_banner(void)
 int main(int argc, char **argv)
 {
     OptionParseContext octx;
-    OptionGroup *ing;
+    OptionGroupList *ins;
     OptionGroupList *outs;
     const char *fcomplex = NULL, *hwdev = NULL;
     int mode = -1, ret, gi, hide_banner = 0;
@@ -2156,9 +2613,9 @@ int main(int argc, char **argv)
                "[-map .. -c:TYPE .. -b:TYPE ..] <output> [<output> ...]\n");
         uninit_parse_context(&octx); return 1;
     }
-    ing  = &octx.groups[1].groups[0];   /* first input */
+    ins  = &octx.groups[1];             /* all input groups (one per -i; 1/2/4 = multiview) */
     outs = &octx.groups[0];             /* all output groups (one per ABR rung) */
-    ret  = transcode(ing, outs, fcomplex, hwdev, mode);
+    ret  = transcode(ins, outs, fcomplex, hwdev, mode);
     uninit_parse_context(&octx);
     return ret < 0 ? 1 : 0;
 }
