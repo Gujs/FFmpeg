@@ -191,6 +191,7 @@ static int encode_push(AVThreadMessageQueue *mux_q, AVCodecContext *enc,
 /* ---- video: decode (free-run) + output (master clock, sample-and-hold) ---- */
 
 #define PTV_MAX_RUNG 8
+#define PTV_MAX_AUDIO 8    /* max transcoded audio output tracks (multi-language, multiview slots) */
 
 /* Shared decode side of the ABR ladder (the ffmpeg model: decode the source
  * ONCE, run it through one filter graph — a -filter_complex `split`, a single
@@ -975,10 +976,13 @@ typedef struct PassStream {
 
 typedef struct DemuxArgs {
     AVFormatContext      *ifmt;
-    AVThreadMessageQueue *video_q, *audio_q;
+    AVThreadMessageQueue *video_q;
+    AVThreadMessageQueue *audio_q[PTV_MAX_AUDIO]; /* one per transcoded audio track */
     AVThreadMessageQueue *mux_q[PTV_MAX_RUNG];   /* one per output muxer (fan-out) */
     int                   n_out;
-    int                   vstream, astream;
+    int                   vstream;
+    int                   astream[PTV_MAX_AUDIO]; /* input stream feeding each audio_q */
+    int                   n_audio;
     int                   drop;          /* non-blocking + drop on full (network input) */
     PassStream           *pass;          /* copy-passthrough: extra audio, subs, data */
     int                   n_pass;
@@ -1128,15 +1132,25 @@ static void *demux_thread(void *arg)
         AVPacket *out = av_packet_alloc();
         if (!out) { av_packet_unref(pkt); break; }
         av_packet_move_ref(out, pkt);
-        demux_unwrap(d, out);               /* 33-bit source wrap -> monotonic extended ts */
+        demux_unwrap(d, out);               /* 33-bit source wrap -> monotonic extended ts (ONCE) */
         if (out->stream_index == d->vstream) {
             d->vpkt++;
             ret = demux_send(d->video_q, out, d->drop, &d->vdrop);
-        } else if (d->astream >= 0 && out->stream_index == d->astream) {
-            d->apkt++;
-            ret = demux_send(d->audio_q, out, d->drop, &d->adrop);
         } else {
-            ret = demux_pass(d, out);       /* copy-passthrough, or free if unmapped */
+            /* Fan one source PID to every transcoded audio track on it (a clone
+             * each), then hand the original to demux_pass (copy-passthrough; it
+             * frees it, whether or not it's a copy stream). demux_unwrap ran ONCE
+             * above, so every clone carries the same unwrapped ts (load-bearing:
+             * never unwrap per-clone — the per-stream wrap state is stateful). */
+            int k;
+            for (k = 0; k < d->n_audio; k++) {
+                AVPacket *c;
+                if (d->astream[k] != out->stream_index) continue;
+                if (!(c = av_packet_clone(out))) continue;
+                d->apkt++;
+                demux_send(d->audio_q[k], c, d->drop, &d->adrop);
+            }
+            ret = demux_pass(d, out);       /* copy fan + monotonic-DTS clamp; frees out */
         }
         if (ret < 0)
             break;
@@ -1146,8 +1160,8 @@ end:
      * err_recv (set_err_send is invisible to receivers), so this MUST be
      * set_err_recv or decode/audio block forever (the offline-EOF deadlock). */
     av_thread_message_queue_set_err_recv(d->video_q, AVERROR_EOF);
-    if (d->astream >= 0)
-        av_thread_message_queue_set_err_recv(d->audio_q, AVERROR_EOF);
+    { int k; for (k = 0; k < d->n_audio; k++)
+        av_thread_message_queue_set_err_recv(d->audio_q[k], AVERROR_EOF); }
     if (d->n_pass > 0) {                     /* copy-passthrough producer EOF, per muxer */
         int i;
         for (i = 0; i < d->n_out; i++) {
@@ -1193,6 +1207,18 @@ static void *mux_thread(void *arg)
 }
 
 /* resolved per-output selection from an ffmpeg-style command (see resolve_plan) */
+/* One TRANSCODED audio output track (copy audio rides the copy[] passthrough list,
+ * NOT this, so it keeps demux_pass's wrap unwrap + monotonic-DTS clamp + SCTE rebase). */
+typedef struct AOutSpec {
+    int            stream;                /* input audio stream index (input 0 for now) */
+    const AVCodec *adec;
+    const char    *aenc;                  /* -c:a:N encoder name (NULL = aac) */
+    const char    *abr;                   /* -b:a:N */
+    const char    *filter;                /* -filter:a:N (NULL = global -af) */
+    int            ac;                    /* -ac:a:N output channels (0 = default stereo) */
+    const char    *lang;                  /* source language (override -metadata later) */
+} AOutSpec;
+
 typedef struct Sel {
     int            have;                  /* 1 if -map present (explicit plan) */
     int            vstream;               /* input video stream to transcode (-1 none) */
@@ -1200,11 +1226,9 @@ typedef struct Sel {
     const char    *venc;                  /* -c:v encoder name (NULL = default) */
     const char    *vf;                    /* -filter:v / -vf */
     const char    *vbr;                   /* -b:v */
-    int            astream;               /* input audio stream to transcode (-1 none) */
-    const AVCodec *adec;
-    const char    *aenc;                  /* -c:a:N encoder name (NULL = aac) */
-    const char    *abr;                   /* -b:a:N */
-    int            copy[PTV_MAX_PASS];    /* input stream indices to passthrough (-c copy) */
+    AOutSpec       aout[PTV_MAX_AUDIO];   /* transcoded audio output tracks */
+    int            n_aout;
+    int            copy[PTV_MAX_PASS];    /* ALL copy: audio (5.1/2ch) + sub + data + scte */
     int            n_copy;
 } Sel;
 static const char *og_get(OptionGroup *g, const char *key);
@@ -1236,22 +1260,26 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
     const char *in_url = ing->arg;
     int n_rung = outs->nb_groups;
     AVFormatContext *ifmt = NULL;
-    AVCodecContext  *vdec = NULL, *adec = NULL;
-    const AVCodec   *vdecoder = NULL, *adecoder = NULL, *aencoder = NULL;
-    AVStream        *vist = NULL, *aist = NULL;
-    AVThreadMessageQueue *video_q = NULL, *audio_q = NULL;
+    AVCodecContext  *vdec = NULL;
+    const AVCodec   *vdecoder = NULL;
+    AVStream        *vist = NULL;
+    AVThreadMessageQueue *video_q = NULL;
+    AVThreadMessageQueue *audio_q[PTV_MAX_AUDIO] = {0};
     AVBufferRef     *hw_device = NULL;
     DecodeCtx        dc;
-    AudioState       as;
+    AudioState       as[PTV_MAX_AUDIO];        /* one per transcoded audio track */
+    int              asrc[PTV_MAX_AUDIO];      /* input stream feeding each as[] (demux routing) */
+    int              n_audio = 0;
     DemuxArgs        da;
     Rung             rung[PTV_MAX_RUNG];
     Sel              sel[PTV_MAX_RUNG];
-    pthread_t        th_demux, th_decode, th_audio;
+    pthread_t        th_demux, th_decode, th_audio[PTV_MAX_AUDIO];
+    int              started_audio[PTV_MAX_AUDIO] = {0};
     pthread_mutex_t  h0_lock = PTHREAD_MUTEX_INITIALIZER;
     int64_t          input_h0_us = AV_NOPTS_VALUE;
     int64_t          house_skew_us = 0;   /* master video thread -> audio (common-mode A/V lock) */
     int vstream = -1, ret = 0, live, net_input, have_audio = 0, hw_cuda = 0;
-    int started_audio = 0, started_decode = 0, aborted = 0, r, si;
+    int started_decode = 0, aborted = 0, r, si, k;
     AVRational out_fps;
     PassStream pass[PTV_MAX_PASS]; int n_pass = 0;
 
@@ -1259,7 +1287,7 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
         av_log(NULL, AV_LOG_WARNING, "%d outputs > max %d; using the first %d\n", n_rung, PTV_MAX_RUNG, PTV_MAX_RUNG);
         n_rung = PTV_MAX_RUNG;
     }
-    memset(&dc, 0, sizeof dc); memset(&as, 0, sizeof as);
+    memset(&dc, 0, sizeof dc); memset(as, 0, sizeof as);
     memset(&da, 0, sizeof da); memset(rung, 0, sizeof rung);
 
     /* Take raw 33-bit timestamps; we extend them ourselves in demux_unwrap (libav's
@@ -1422,74 +1450,97 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
         rung[r].vc.ost->time_base = rung[r].venc->time_base;
     }
 
-    /* shared audio: decode + loudness-filter ONCE, then encode PER RUNG (so each
-     * rung's -b:a is honored) into an output audio stream in EACH muxer. The shared
-     * input stream/decoder come from the first rung; per-rung -c:a/-b:a from each.
-     * Multichannel (AC-3 5.1) etc. ride the passthrough list below. */
-    if (sel[0].astream >= 0) {
-        aist = ifmt->streams[sel[0].astream];
-        adecoder = sel[0].adec;
-        adec = avcodec_alloc_context3(adecoder);
-        if (adec) {
-            avcodec_parameters_to_context(adec, aist->codecpar);
-            adec->pkt_timebase = aist->time_base;
-            if (avcodec_open2(adec, adecoder, NULL) < 0) { av_log(NULL, AV_LOG_WARNING, "audio decoder failed; video only\n"); }
-            else {
-                int aok = 1;
-                for (r = 0; r < n_rung; r++) {           /* one AAC encoder + stream per rung */
-                    AVCodecContext *e; AVStream *aos; AVDictionary *aopts = NULL;
-                    aencoder = avcodec_find_encoder_by_name(sel[r].aenc ? sel[r].aenc : "aac");
-                    if (!aencoder) aencoder = avcodec_find_encoder_by_name("aac");
-                    e = avcodec_alloc_context3(aencoder);
-                    if (!e) { ret = AVERROR(ENOMEM); goto end; }
-                    e->sample_rate = 48000;
-                    e->ch_layout   = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
-                    e->sample_fmt  = aencoder->sample_fmts ? aencoder->sample_fmts[0] : AV_SAMPLE_FMT_FLTP;
-                    e->bit_rate    = 160000;
-                    e->time_base   = (AVRational){1, 48000};
-                    if (rung[r].ofmt->oformat->flags & AVFMT_GLOBALHEADER) e->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-                    if (sel[r].abr) av_dict_set(&aopts, "b", sel[r].abr, 0);
-                    if (avcodec_open2(e, aencoder, &aopts) < 0) {
-                        av_log(NULL, AV_LOG_WARNING, "audio encoder (rung %d) failed; video only\n", r);
-                        avcodec_free_context(&e); av_dict_free(&aopts); aok = 0; break;
-                    }
-                    av_dict_free(&aopts);
-                    as.enc[r] = e;
-                    aos = avformat_new_stream(rung[r].ofmt, NULL);
-                    if (!aos) { ret = AVERROR(ENOMEM); goto end; }
-                    avcodec_parameters_from_context(aos->codecpar, e);
-                    aos->time_base = e->time_base;
-                    as.ost[r] = aos;
-                }
-                if (aok) {
-                    enum AVSampleFormat sfmt = as.enc[0]->sample_fmt;
-                    const char *af = og_get(&outs->groups[0], "af");
-                    if (!af) af = og_get(&outs->groups[0], "filter:a");
-                    /* No -af: still route through aresample=async so the audio rides the
-                     * HOUSE clock (the raw swr path is identity 48k->48k with no resampler
-                     * engaged, so it can't stretch to follow video dups -> drifts). The
-                     * common-mode house-skew in audio_push then keeps A/V locked. */
-                    if (!af) af = "aresample=async=1000";
-                    as.out_chl    = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
-                    as.out_rate   = 48000;
-                    as.out_sfmt   = sfmt;
-                    as.n_out      = n_rung;
-                    as.frame_size = as.enc[0]->frame_size > 0 ? as.enc[0]->frame_size : 1024;
-                    as.fifo       = av_audio_fifo_alloc(sfmt, 2, as.frame_size);
-                    if (af && build_audio_filter(&as, adec, aist->time_base, af, sfmt) < 0) {
-                        av_log(NULL, AV_LOG_WARNING, "audio filtergraph failed; plain resample\n");
-                        avfilter_graph_free(&as.afg); as.use_fg = 0;
-                    }
-                    if (!as.use_fg) {              /* no -af (or graph failed): plain resample */
-                        swr_alloc_set_opts2(&as.swr, &as.out_chl, sfmt, 48000,
-                                            &adec->ch_layout, adec->sample_fmt, adec->sample_rate, 0, NULL);
-                        if (!as.swr || swr_init(as.swr) < 0) { av_log(NULL, AV_LOG_WARNING, "swr init failed; video only\n"); aok = 0; }
-                    }
-                    if (aok && as.fifo) have_audio = 1;
-                }
-            }
+    /* shared audio: for EACH transcoded audio track (sel[0].aout[]), decode +
+     * loudness-filter ONCE, then encode PER RUNG (per-rung -b:a) into an output
+     * audio stream in EACH muxer. Source stream/decoder/codec from the first
+     * rung's plan; per-rung -b:a from each rung. Audio COPY (AC-3 5.1, 2ch) rides
+     * the passthrough list below (keeping demux_pass's wrap unwrap + DTS clamp). */
+    for (k = 0; k < sel[0].n_aout && n_audio < PTV_MAX_AUDIO; k++) {
+        AOutSpec      *spec = &sel[0].aout[k];
+        AVStream      *kist = ifmt->streams[spec->stream];
+        const AVCodec *kdecoder = spec->adec ? spec->adec
+                                : avcodec_find_decoder(kist->codecpar->codec_id);
+        AVCodecContext *kdec, *encs[PTV_MAX_RUNG] = {0};
+        AudioState    *a;
+        enum AVSampleFormat sfmt;
+        const char    *af;
+        int            eok = 1;
+
+        if (!kdecoder) { av_log(NULL, AV_LOG_WARNING, "audio track %d (stream %d): no decoder; skipped\n", k, spec->stream); continue; }
+        kdec = avcodec_alloc_context3(kdecoder);
+        if (!kdec) { ret = AVERROR(ENOMEM); goto end; }
+        avcodec_parameters_to_context(kdec, kist->codecpar);
+        kdec->pkt_timebase = kist->time_base;
+        if (avcodec_open2(kdec, kdecoder, NULL) < 0) {
+            av_log(NULL, AV_LOG_WARNING, "audio track %d decoder failed; skipped\n", k);
+            avcodec_free_context(&kdec); continue;
         }
+        /* open all rung encoders into a temp array FIRST — so a mid-rung failure
+         * leaves no orphan output streams in the earlier muxers. */
+        for (r = 0; r < n_rung; r++) {
+            const AVCodec *aenc = avcodec_find_encoder_by_name(spec->aenc ? spec->aenc : "aac");
+            const char *abr = (k < sel[r].n_aout) ? sel[r].aout[k].abr : NULL;
+            AVDictionary *aopts = NULL; AVCodecContext *e;
+            if (!aenc) aenc = avcodec_find_encoder_by_name("aac");
+            e = avcodec_alloc_context3(aenc);
+            if (!e) { ret = AVERROR(ENOMEM); avcodec_free_context(&kdec); for (si = 0; si < r; si++) avcodec_free_context(&encs[si]); goto end; }
+            e->sample_rate = 48000;
+            e->ch_layout   = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
+            e->sample_fmt  = aenc->sample_fmts ? aenc->sample_fmts[0] : AV_SAMPLE_FMT_FLTP;
+            e->bit_rate    = 160000;
+            e->time_base   = (AVRational){1, 48000};
+            if (rung[r].ofmt->oformat->flags & AVFMT_GLOBALHEADER) e->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+            if (abr) av_dict_set(&aopts, "b", abr, 0);
+            if (avcodec_open2(e, aenc, &aopts) < 0) {
+                av_log(NULL, AV_LOG_WARNING, "audio track %d encoder (rung %d) failed; track skipped\n", k, r);
+                avcodec_free_context(&e); av_dict_free(&aopts); eok = 0; break;
+            }
+            av_dict_free(&aopts);
+            encs[r] = e;
+        }
+        if (!eok) { for (r = 0; r < n_rung; r++) avcodec_free_context(&encs[r]); avcodec_free_context(&kdec); continue; }
+
+        /* commit: this is audio track n_audio (dense). Add an output stream per rung. */
+        a = &as[n_audio];
+        a->dec = kdec;
+        for (r = 0; r < n_rung; r++) {
+            AVStream *aos; AVDictionaryEntry *klang;
+            a->enc[r] = encs[r];
+            aos = avformat_new_stream(rung[r].ofmt, NULL);
+            if (!aos) { ret = AVERROR(ENOMEM); goto end; }
+            avcodec_parameters_from_context(aos->codecpar, encs[r]);
+            aos->time_base = encs[r]->time_base;
+            if ((klang = av_dict_get(kist->metadata, "language", NULL, 0)))
+                av_dict_set(&aos->metadata, "language", klang->value, 0);
+            a->ost[r] = aos;
+        }
+        sfmt = a->enc[0]->sample_fmt;
+        af   = spec->filter;                              /* -filter:a:N (per-track); else global -af */
+        if (!af) { af = og_get(&outs->groups[0], "af"); if (!af) af = og_get(&outs->groups[0], "filter:a"); }
+        /* No -af: still route through aresample=async so the audio rides the HOUSE
+         * clock (raw swr is identity 48k->48k with no resampler to stretch -> drifts).
+         * The common-mode house-skew in audio_push then keeps A/V locked. */
+        if (!af) af = "aresample=async=1000";
+        a->out_chl    = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
+        a->out_rate   = 48000;
+        a->out_sfmt   = sfmt;
+        a->n_out      = n_rung;
+        a->frame_size = a->enc[0]->frame_size > 0 ? a->enc[0]->frame_size : 1024;
+        a->fifo       = av_audio_fifo_alloc(sfmt, 2, a->frame_size);
+        a->ist_tb     = kist->time_base;
+        if (af && build_audio_filter(a, a->dec, kist->time_base, af, sfmt) < 0) {
+            av_log(NULL, AV_LOG_WARNING, "audio track %d filtergraph failed; plain resample\n", k);
+            avfilter_graph_free(&a->afg); a->use_fg = 0;
+        }
+        if (!a->use_fg) {              /* no -af (or graph failed): plain resample */
+            swr_alloc_set_opts2(&a->swr, &a->out_chl, sfmt, 48000,
+                                &a->dec->ch_layout, a->dec->sample_fmt, a->dec->sample_rate, 0, NULL);
+            if (!a->swr || swr_init(a->swr) < 0) { av_log(NULL, AV_LOG_WARNING, "audio track %d swr init failed; skipped\n", k); }
+        }
+        asrc[n_audio] = spec->stream;
+        n_audio++;
     }
+    have_audio = n_audio > 0;
 
     /* shared passthrough (copy): each non-transcoded input stream — extra audio
      * (AC-3 5.1), DVB subtitles, data/SCTE-35 — gets an output stream in EVERY
@@ -1548,12 +1599,12 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
                 !strncmp(in_url, "srt://", 6);
     live = mode < 0 ? net_input : mode;
 
-    /* queues: one shared video_q (+audio_q), per-rung frame_q + mux_q */
+    /* queues: one shared video_q + one audio_q per transcoded track, per-rung frame_q + mux_q */
     if ((ret = av_thread_message_queue_alloc(&video_q, PTV_QDEPTH, sizeof(AVPacket *))) < 0) goto end;
     av_thread_message_queue_set_free_func(video_q, free_pkt_msg);
-    if (have_audio) {
-        if ((ret = av_thread_message_queue_alloc(&audio_q, PTV_QDEPTH, sizeof(AVPacket *))) < 0) goto end;
-        av_thread_message_queue_set_free_func(audio_q, free_pkt_msg);
+    for (k = 0; k < n_audio; k++) {
+        if ((ret = av_thread_message_queue_alloc(&audio_q[k], PTV_QDEPTH, sizeof(AVPacket *))) < 0) goto end;
+        av_thread_message_queue_set_free_func(audio_q[k], free_pkt_msg);
     }
     for (r = 0; r < n_rung; r++) {
         if ((ret = av_thread_message_queue_alloc(&rung[r].frame_q, PTV_FRAME_QDEPTH, sizeof(AVFrame *))) < 0) goto end;
@@ -1578,16 +1629,17 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
         vc->is_master = (r == 0);
         vc->dbg_video_q = video_q; vc->dbg_dec_frames = &dc.dec_frames; vc->dbg_vcorrupt = &dc.vcorrupt;
         rung[r].ma.ofmt = rung[r].ofmt; rung[r].ma.mux_q = rung[r].mux_q;
-        rung[r].ma.n_producers = 1 + (have_audio ? 1 : 0) + (n_pass > 0 ? 1 : 0);
+        rung[r].ma.n_producers = 1 + n_audio + (n_pass > 0 ? 1 : 0);   /* video + N audio + copy fan */
     }
-    if (have_audio) {
-        as.audio_q = audio_q; as.dec = adec;     /* as.enc[r]/as.ost[r] set during setup */
-        as.ist_tb = aist->time_base; as.h0 = &input_h0_us; as.h0_lock = &h0_lock;
-        as.house_skew = &house_skew_us;
-        for (r = 0; r < n_rung; r++) as.mux_q[r] = rung[r].mux_q;
+    for (k = 0; k < n_audio; k++) {              /* per-track audio wiring (dec/enc/ost/fifo set above) */
+        as[k].audio_q = audio_q[k];
+        as[k].h0 = &input_h0_us; as[k].h0_lock = &h0_lock;
+        as[k].house_skew = &house_skew_us;
+        for (r = 0; r < n_rung; r++) as[k].mux_q[r] = rung[r].mux_q;
     }
-    da.ifmt = ifmt; da.video_q = video_q; da.audio_q = audio_q;
-    da.vstream = vstream; da.astream = have_audio ? sel[0].astream : -1; da.drop = net_input;
+    da.ifmt = ifmt; da.video_q = video_q;
+    da.vstream = vstream; da.n_audio = n_audio; da.drop = net_input;
+    for (k = 0; k < n_audio; k++) { da.audio_q[k] = audio_q[k]; da.astream[k] = asrc[k]; }
     da.pass = pass; da.n_pass = n_pass; da.h0 = &input_h0_us; da.h0_lock = &h0_lock; da.n_out = n_rung;
     da.house_skew = &house_skew_us;
     da.wrap_off  = av_calloc(ifmt->nb_streams, sizeof(*da.wrap_off));
@@ -1622,10 +1674,10 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
         if (pe) { ret = AVERROR(pe); aborted = 1; goto shutdown; }
         started_decode = 1;
     }
-    if (have_audio) {
-        if (!pthread_create(&th_audio, NULL, audio_thread, &as)) started_audio = 1;
-        else {
-            av_log(NULL, AV_LOG_WARNING, "audio thread create failed; video only\n");
+    for (k = 0; k < n_audio; k++) {
+        if (!pthread_create(&th_audio[k], NULL, audio_thread, &as[k])) started_audio[k] = 1;
+        else {                                      /* this track produces nothing: send its mux EOF */
+            av_log(NULL, AV_LOG_WARNING, "audio thread %d create failed\n", k);
             for (r = 0; r < n_rung; r++) { AVPacket *eof = NULL; av_thread_message_queue_send(rung[r].mux_q, &eof, 0); }
         }
     }
@@ -1633,7 +1685,7 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
         int pe = pthread_create(&th_demux, NULL, demux_thread, &da);
         if (pe) {                                   /* couldn't start demux: drain the pipeline */
             av_thread_message_queue_set_err_recv(video_q, AVERROR_EOF);   /* EOF to consumers */
-            if (have_audio) av_thread_message_queue_set_err_recv(audio_q, AVERROR_EOF);
+            for (k = 0; k < n_audio; k++) av_thread_message_queue_set_err_recv(audio_q[k], AVERROR_EOF);
             for (r = 0; n_pass > 0 && r < n_rung; r++) { AVPacket *eof = NULL; av_thread_message_queue_send(rung[r].mux_q, &eof, 0); }
             ret = AVERROR(pe);
         } else {
@@ -1646,9 +1698,9 @@ shutdown:
                                                      * thread blocked in send OR recv on any queue */
         av_thread_message_queue_set_err_send(video_q, AVERROR_EOF);
         av_thread_message_queue_set_err_recv(video_q, AVERROR_EOF);
-        if (audio_q) {
-            av_thread_message_queue_set_err_send(audio_q, AVERROR_EOF);
-            av_thread_message_queue_set_err_recv(audio_q, AVERROR_EOF);
+        for (k = 0; k < n_audio; k++) if (audio_q[k]) {
+            av_thread_message_queue_set_err_send(audio_q[k], AVERROR_EOF);
+            av_thread_message_queue_set_err_recv(audio_q[k], AVERROR_EOF);
         }
         for (r = 0; r < n_rung; r++) {
             rung[r].vc.output_done = 1;             /* stop the watchdog */
@@ -1664,7 +1716,7 @@ shutdown:
     }
     if (started_decode) pthread_join(th_decode, NULL);
     for (r = 0; r < n_rung; r++) if (rung[r].started_output) pthread_join(rung[r].th_output, NULL);
-    if (started_audio) pthread_join(th_audio, NULL);
+    for (k = 0; k < n_audio; k++) if (started_audio[k]) pthread_join(th_audio[k], NULL);
     for (r = 0; r < n_rung; r++) if (rung[r].started_wd) pthread_join(rung[r].th_wd, NULL);
     for (r = 0; r < n_rung; r++) if (rung[r].started_mux) {
         if (!ret && rung[r].ma.err < 0) ret = rung[r].ma.err;
@@ -1676,9 +1728,12 @@ shutdown:
         " (dup %"PRId64" framedrop %"PRId64")  demux v:%"PRId64"/drop%"PRId64" p:%"PRId64"/drop%"PRId64"%s\n",
         n_rung, dc.dec_frames, rung[0].vc.emitted, rung[0].vc.dup, rung[0].vc.framedrop,
         da.vpkt, da.vdrop, da.ppkt, da.pdrop, have_audio ? "" : "  [no audio]");
-    if (have_audio)
-        av_log(NULL, AV_LOG_INFO, "ptvencoder: audio in %"PRId64" frames, out %"PRId64" aac (demux a:%"PRId64"/drop%"PRId64")\n",
-               as.in_frames, as.out_frames, da.apkt, da.adrop);
+    if (have_audio) {
+        int64_t ain = 0, aout = 0;
+        for (k = 0; k < n_audio; k++) { ain += as[k].in_frames; aout += as[k].out_frames; }
+        av_log(NULL, AV_LOG_INFO, "ptvencoder: audio %d track(s), in %"PRId64" frames, out %"PRId64" aac (demux a:%"PRId64"/drop%"PRId64")\n",
+               n_audio, ain, aout, da.apkt, da.adrop);
+    }
     if (ret > 0) ret = 0;
 
 end:
@@ -1688,7 +1743,7 @@ end:
             avio_closep(&rung[r].ofmt->pb);
     }
     av_thread_message_queue_free(&video_q);
-    av_thread_message_queue_free(&audio_q);
+    for (k = 0; k < n_audio; k++) av_thread_message_queue_free(&audio_q[k]);
     for (r = 0; r < n_rung; r++) {
         av_thread_message_queue_free(&rung[r].frame_q);
         av_thread_message_queue_free(&rung[r].mux_q);
@@ -1696,11 +1751,13 @@ end:
         av_buffer_unref(&rung[r].fhwfr);
         if (rung[r].ofmt) avformat_free_context(rung[r].ofmt);
     }
-    if (as.swr)  swr_free(&as.swr);
-    if (as.fifo) av_audio_fifo_free(as.fifo);
-    avfilter_graph_free(&as.afg);
-    for (r = 0; r < n_rung; r++) avcodec_free_context(&as.enc[r]);
-    avcodec_free_context(&adec);
+    for (k = 0; k < n_audio; k++) {
+        if (as[k].swr)  swr_free(&as[k].swr);
+        if (as[k].fifo) av_audio_fifo_free(as[k].fifo);
+        avfilter_graph_free(&as[k].afg);
+        for (r = 0; r < n_rung; r++) avcodec_free_context(&as[k].enc[r]);
+        avcodec_free_context(&as[k].dec);
+    }
     avcodec_free_context(&vdec);
     avfilter_graph_free(&dc.fg);
     av_buffer_unref(&hw_device);
@@ -1843,9 +1900,9 @@ static const char *map_spec(const char *v, char *buf, size_t bufsz, int *optiona
  * No -map -> auto (best video + first <=2ch audio + copy the rest), back-compat. */
 static int resolve_plan(AVFormatContext *ifmt, OptionGroup *outg, Sel *s)
 {
-    int o, si, tcnt[5] = {0}, nmap = 0;
+    int o, si, tcnt[5] = {0}, nmap = 0, astream = -1;
     memset(s, 0, sizeof *s);
-    s->vstream = s->astream = -1;
+    s->vstream = -1;
     s->vf = og_get(outg, "filter:v"); if (!s->vf) s->vf = og_get(outg, "vf");
     for (o = 0; o < outg->nb_opts; o++) if (!strcmp(outg->opts[o].key, "map")) nmap++;
     s->have = nmap > 0;
@@ -1855,13 +1912,17 @@ static int resolve_plan(AVFormatContext *ifmt, OptionGroup *outg, Sel *s)
         for (si = 0; si < (int)ifmt->nb_streams; si++) {
             AVCodecParameters *cp = ifmt->streams[si]->codecpar;
             if (cp->codec_type == AVMEDIA_TYPE_AUDIO &&
-                cp->ch_layout.nb_channels > 0 && cp->ch_layout.nb_channels <= 2) { s->astream = si; break; }
+                cp->ch_layout.nb_channels > 0 && cp->ch_layout.nb_channels <= 2) { astream = si; break; }
         }
-        if (s->astream < 0) s->astream = av_find_best_stream(ifmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
-        if (s->astream >= 0) s->adec = avcodec_find_decoder(ifmt->streams[s->astream]->codecpar->codec_id);
+        if (astream < 0) astream = av_find_best_stream(ifmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
+        if (astream >= 0) {            /* one transcoded audio track (back-compat) */
+            s->aout[0].stream = astream;
+            s->aout[0].adec   = avcodec_find_decoder(ifmt->streams[astream]->codecpar->codec_id);
+            s->n_aout = 1;
+        }
         for (si = 0; si < (int)ifmt->nb_streams; si++) {
             enum AVMediaType mt = ifmt->streams[si]->codecpar->codec_type;
-            if (si == s->vstream || si == s->astream) continue;
+            if (si == s->vstream || si == astream) continue;
             if ((mt == AVMEDIA_TYPE_AUDIO || mt == AVMEDIA_TYPE_SUBTITLE || mt == AVMEDIA_TYPE_DATA)
                 && s->n_copy < PTV_MAX_PASS) s->copy[s->n_copy++] = si;
         }
@@ -1895,11 +1956,12 @@ static int resolve_plan(AVFormatContext *ifmt, OptionGroup *outg, Sel *s)
             } else if (mt == AVMEDIA_TYPE_VIDEO && s->vstream < 0) {
                 s->vstream = si; s->venc = codec; s->vbr = og_spec(outg, "b", t, idx);
                 s->vdec = avcodec_find_decoder(ifmt->streams[si]->codecpar->codec_id);
-            } else if (mt == AVMEDIA_TYPE_AUDIO && s->astream < 0) {
-                s->astream = si; s->aenc = codec; s->abr = og_spec(outg, "b", t, idx);
-                s->adec = avcodec_find_decoder(ifmt->streams[si]->codecpar->codec_id);
+            } else if (mt == AVMEDIA_TYPE_AUDIO && s->n_aout < PTV_MAX_AUDIO) {
+                AOutSpec *a = &s->aout[s->n_aout++];    /* one transcoded audio track per -map */
+                a->stream = si; a->aenc = codec; a->abr = og_spec(outg, "b", t, idx);
+                a->adec = avcodec_find_decoder(ifmt->streams[si]->codecpar->codec_id);
             } else if (s->n_copy < PTV_MAX_PASS) {
-                s->copy[s->n_copy++] = si;             /* extra encode streams unsupported -> copy */
+                s->copy[s->n_copy++] = si;             /* extra streams over the cap -> copy */
             }
         }
     }
