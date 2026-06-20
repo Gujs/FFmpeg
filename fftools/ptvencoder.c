@@ -64,7 +64,7 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.2.1"   /* 0.2.1: 33-bit source PTS-wrap handling on copy-passthrough */
+#define PTVENCODER_VERSION "0.2.2"   /* 0.2.2: no -r preserves source FRAME rate (avg, not field); 0.2.1: 33-bit PTS-wrap on copy-passthrough */
 
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
@@ -1281,7 +1281,12 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
         av_log(NULL, AV_LOG_ERROR, "open video decoder: %s\n", av_err2str(ret)); goto end;
     }
 
-    /* house rate: -r on the first output, else the source rate */
+    /* house rate: -r on the first output, else preserve the source's actual FRAME
+     * rate. Prefer avg_frame_rate over r_frame_rate: for an interlaced source
+     * r_frame_rate is the FIELD rate (e.g. 1080i25 -> 50), but the decoder/
+     * deinterlacer emits one frame per coded frame (25), so a 50-fps house clock
+     * would tick twice per delivered frame -> ~50% duplicates (judder). Force a
+     * specific rate (incl. field-doubling deint) with -r. */
     {
         const char *rate_str = og_get(&outs->groups[0], "r");
         if (rate_str) {
@@ -1289,8 +1294,8 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
                 av_log(NULL, AV_LOG_ERROR, "bad -r '%s'\n", rate_str); ret = AVERROR(EINVAL); goto end;
             }
         } else {
-            out_fps = vist->r_frame_rate.num ? vist->r_frame_rate
-                    : vist->avg_frame_rate.num ? vist->avg_frame_rate : (AVRational){25, 1};
+            out_fps = vist->avg_frame_rate.num ? vist->avg_frame_rate
+                    : vist->r_frame_rate.num ? vist->r_frame_rate : (AVRational){25, 1};
         }
     }
 
