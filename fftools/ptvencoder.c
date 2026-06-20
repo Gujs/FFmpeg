@@ -1233,6 +1233,7 @@ typedef struct Sel {
     int            n_copy;
 } Sel;
 static const char *og_get(OptionGroup *g, const char *key);
+static void apply_stream_meta(OptionGroup *g, char t, int idx, AVStream *ost);
 static int resolve_plan(AVFormatContext *ifmt, OptionGroup *outg, Sel *s);
 
 /* One ABR ladder rung = one output: its own muxer, video encoder, queues and
@@ -1516,6 +1517,7 @@ static int transcode(OptionGroup *ing, OptionGroupList *outs, const char *fcompl
             aos->time_base = encs[r]->time_base;
             if ((klang = av_dict_get(kist->metadata, "language", NULL, 0)))
                 av_dict_set(&aos->metadata, "language", klang->value, 0);
+            apply_stream_meta(&outs->groups[r], 'a', k, aos);   /* CLI -metadata:s:a:N / -disposition:a:N (G5) */
             a->ost[r] = aos;
         }
         sfmt = a->enc[0]->sample_fmt;
@@ -1880,6 +1882,35 @@ static const char *og_spec(OptionGroup *g, const char *p, char t, int idx)
         if (r > rank) { rank = r; best = g->opts[i].val; }
     }
     return best;
+}
+
+/* Apply CLI -metadata:s:<t>:idx (possibly several) and -disposition:<t>:idx onto
+ * an output stream (G5). metadata overrides the source value set earlier;
+ * disposition takes ffmpeg's "flag", "+flag+flag" or "0"/"none" forms. */
+static void apply_stream_meta(OptionGroup *g, char t, int idx, AVStream *ost)
+{
+    char key[24]; int i;
+    const char *disp = og_spec(g, "disposition", t, idx);
+    if (disp) {
+        if (!strcmp(disp, "0") || !strcmp(disp, "none")) {
+            ost->disposition = 0;
+        } else {
+            char buf[128], *tok, *sp = NULL; int d = 0;
+            snprintf(buf, sizeof buf, "%s", disp);
+            for (tok = strtok_r(buf, "+", &sp); tok; tok = strtok_r(NULL, "+", &sp)) {
+                int f = av_disposition_from_string(tok);
+                if (f > 0) d |= f;
+            }
+            ost->disposition = d;
+        }
+    }
+    snprintf(key, sizeof key, "metadata:s:%c:%d", t, idx);     /* -metadata:s:a:N key=val (repeatable) */
+    for (i = 0; i < g->nb_opts; i++) {
+        char kv[256], *eq;
+        if (strcmp(g->opts[i].key, key)) continue;
+        snprintf(kv, sizeof kv, "%s", g->opts[i].val);
+        if ((eq = strchr(kv, '='))) { *eq = 0; av_dict_set(&ost->metadata, kv, eq + 1, 0); }
+    }
 }
 
 /* strip a leading "<digits>:" file index and a trailing '?' from a -map value */
