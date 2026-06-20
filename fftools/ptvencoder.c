@@ -66,7 +66,7 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.5.4-adiag"   /* 0.5.4 (diag, temporary): PTV-ADIAG per-track audio-vs-video offset (av_off) + g_vout_us — MP2 tracks land ~1s audio-late from aresample=async startup over-production (first_out~16ms aligned; av_off ~+1s for high source-V-A MP2 inputs). Gated PTV_DIAG; remove after fix. 0.5.3: code-review fixes — og_spec buffers sized for "disposition" (was silently truncating -disposition/-disposition:a); -an now honored (suppresses auto-selected audio + audio copy in the no-map path); accurate -h (dropped never-wired -s/--deint/--hw/--mode); fifo alloc NULL-checked; g_muxed/g_muxed_bytes atomic (stats data race). 0.5.2: Option F COARSE half — re-anchor on return-from-outage: clear a slot's accumulated dup skew when it comes back after a black-slate, so a continuous-PTS feed re-syncs A/V on return (the source's advanced PTS lands at current output once stale skew is gone). Safe (outage>=slate exceeds cleared skew -> async input still forward). PTV_NO_REANCHOR=1 for A/B. 0.5.1: Option F skew made NON-DECREASING+capped (async input requires monotonic; a decreasing skew stalled the mux — 20fps-into-25fps repro). Fine-half only: rising dup drift rides async; the DECREASING re-anchor-on-return (full A/V re-sync after outage) needs a separate direct output-offset path (coarse half, TODO). 0.5.0: multiview A/V sync = software frame-synchronizer (Option F). Compositor publishes the MEASURED per-slot output-vs-content skew = out_time-(displayed_src-h0) of the frame each cell actually shows; the slot's audio rides it (existing async path), so A/V stays locked through jitter/drop/dup/interruption and RE-SYNCS on input return (shows current content). Reduces to ~0 on healthy 1:1 inputs (no regression). Replaces the dup-event counter (0.4.1), which missed drops/returns. Copy path protected by its monotonic-DTS clamp. 0.4.1: multiview per-slot audio skew = dup-event counter (was arithmetic+non-decreasing, which locked startup jitter -> later-priming slots' audio over-delayed); per-slot skew in PTV_DIAG. 0.4.0: MULTIVIEW (1/2/4-input mosaic — house-clock compositor, per-input jitter buffer + clock, per-slot audio/sub, parallel open); 0.3.0: multiple transcoded audio tracks + per-track -ac/-filter:a/-metadata + source fan-out; 0.2.3: monotonic-DTS clamp on copy path; 0.2.2: no -r preserves source FRAME rate (avg); 0.2.1: 33-bit PTS-wrap on copy-passthrough */
+#define PTVENCODER_VERSION "0.5.5"   /* 0.5.5: FIX per-slot audio-late in multiview — audio arriving before a slot's video sets h0 was DROPPED, so the slot whose video is slowest to acquire its first frame lost the head of its audio (first_out up to ~1s = the per-slot "audio delayed"; box-confirmed on Grid_2x2). Now buffer pre-h0 audio (bounded ring) and replay it once h0 is known, keeping content>=h0 -> first_out~0 all slots. ADIAG probe retained to verify. 0.5.4-adiag (diag, temporary): PTV-ADIAG per-track audio-vs-video offset (av_off) + g_vout_us — MP2 tracks land ~1s audio-late from aresample=async startup over-production (first_out~16ms aligned; av_off ~+1s for high source-V-A MP2 inputs). Gated PTV_DIAG; remove after fix. 0.5.3: code-review fixes — og_spec buffers sized for "disposition" (was silently truncating -disposition/-disposition:a); -an now honored (suppresses auto-selected audio + audio copy in the no-map path); accurate -h (dropped never-wired -s/--deint/--hw/--mode); fifo alloc NULL-checked; g_muxed/g_muxed_bytes atomic (stats data race). 0.5.2: Option F COARSE half — re-anchor on return-from-outage: clear a slot's accumulated dup skew when it comes back after a black-slate, so a continuous-PTS feed re-syncs A/V on return (the source's advanced PTS lands at current output once stale skew is gone). Safe (outage>=slate exceeds cleared skew -> async input still forward). PTV_NO_REANCHOR=1 for A/B. 0.5.1: Option F skew made NON-DECREASING+capped (async input requires monotonic; a decreasing skew stalled the mux — 20fps-into-25fps repro). Fine-half only: rising dup drift rides async; the DECREASING re-anchor-on-return (full A/V re-sync after outage) needs a separate direct output-offset path (coarse half, TODO). 0.5.0: multiview A/V sync = software frame-synchronizer (Option F). Compositor publishes the MEASURED per-slot output-vs-content skew = out_time-(displayed_src-h0) of the frame each cell actually shows; the slot's audio rides it (existing async path), so A/V stays locked through jitter/drop/dup/interruption and RE-SYNCS on input return (shows current content). Reduces to ~0 on healthy 1:1 inputs (no regression). Replaces the dup-event counter (0.4.1), which missed drops/returns. Copy path protected by its monotonic-DTS clamp. 0.4.1: multiview per-slot audio skew = dup-event counter (was arithmetic+non-decreasing, which locked startup jitter -> later-priming slots' audio over-delayed); per-slot skew in PTV_DIAG. 0.4.0: MULTIVIEW (1/2/4-input mosaic — house-clock compositor, per-input jitter buffer + clock, per-slot audio/sub, parallel open); 0.3.0: multiple transcoded audio tracks + per-track -ac/-filter:a/-metadata + source fan-out; 0.2.3: monotonic-DTS clamp on copy path; 0.2.2: no -r preserves source FRAME rate (avg); 0.2.1: 33-bit PTS-wrap on copy-passthrough */
 
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
@@ -211,6 +211,10 @@ static int encode_push(AVThreadMessageQueue *mux_q, AVCodecContext *enc,
 
 #define PTV_MAX_RUNG 8
 #define PTV_MAX_AUDIO 8    /* max transcoded audio output tracks (multi-language, multiview slots) */
+#define PTV_AQ_PREROLL 256 /* per-track pre-h0 audio buffer (frames): preserve a slot's audio head
+                            * while its video decodes its first frame (sets h0), instead of dropping
+                            * it (which made that slot's audio start ~h0-acquire-delay late). Bounded
+                            * ring (drop-oldest) so a never-arriving video can't grow it unboundedly. */
 #define PTV_MAX_INPUT 4    /* max composited inputs (multiview): 1 / 2 / 4 */
 #define PTV_MV_SKEW_CAP_US 250000   /* multiview per-slot audio skew cap (async budget) */
 
@@ -825,6 +829,9 @@ typedef struct AudioState {
     /* PTV_DIAG audio-side probe (temporary): identify per-track A/V offset on real feeds */
     int              dbg_k, dbg_in;
     int64_t          dbg_first_out, dbg_diag_last;
+    int64_t          dbg_first_src, dbg_last_src;   /* source audio content span (us) for async-pad probe */
+    AVFrame         *aq_pending[PTV_AQ_PREROLL];     /* pre-h0 audio buffer (preserve head until video anchors) */
+    int              aq_npending;
 } AudioState;
 
 /* encode the SAME loudness-processed frame into each rung's own AAC encoder (so
@@ -906,12 +913,14 @@ static int audio_drain_fg(AudioState *a)
                 if (now - a->dbg_diag_last >= 1000000) {
                     int64_t aout_us = opts * 1000000 / a->out_rate;
                     int64_t vout_us = g_vout_us;
+                    int64_t content_us = av_rescale_q(a->dbg_last_src - a->dbg_first_src, a->ist_tb, AV_TIME_BASE_Q);
+                    int64_t outspan_us = a->out_frames * (int64_t)a->frame_size * 1000000 / a->out_rate;
                     a->dbg_diag_last = now;
                     av_log(NULL, AV_LOG_INFO,
-                        "[PTV-ADIAG] a%d(in%d) av_off=%+"PRId64"ms (aout=%.3fs vout=%.3fs) first_out=%"PRId64"ms in=%"PRId64" out=%"PRId64"\n",
-                        a->dbg_k, a->dbg_in, (aout_us - vout_us) / 1000,
-                        aout_us / 1000000.0, vout_us / 1000000.0,
-                        a->dbg_first_out * 1000 / a->out_rate, a->in_frames, a->out_frames);
+                        "[PTV-ADIAG] a%d(in%d) av_off=%+"PRId64"ms async_pad=%+"PRId64"ms (out_span=%.2fs content=%.2fs) first_out=%"PRId64"ms\n",
+                        a->dbg_k, a->dbg_in, (aout_us - vout_us) / 1000, (outspan_us - content_us) / 1000,
+                        outspan_us / 1000000.0, content_us / 1000000.0,
+                        a->dbg_first_out * 1000 / a->out_rate);
                 }
             }
         }
@@ -924,44 +933,18 @@ static int audio_drain_fg(AudioState *a)
     return (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) ? 0 : ret;
 }
 
-static int audio_push(AudioState *a, AVFrame *frame)
+/* Feed one h0-anchored decoded audio frame into the -af graph (or swr fallback). */
+static int audio_feed(AudioState *a, AVFrame *frame)
 {
     uint8_t **out = NULL;
     int out_max, got, ret = 0;
-    int64_t ts = frame->best_effort_timestamp;
-
-    a->in_frames++;
-
-    /* Audio anchors to the FIRST VIDEO frame (h0, set only by the video decode
-     * thread) so A/V share one origin. Audio that arrives before video has
-     * anchored — or that precedes the anchor — is DROPPED, otherwise audio leads
-     * video by the video start-up (IDR-acquire) delay (the ~1-2s A/V offset). */
-    if (!a->pts_set) {
-        int64_t h0, house_us;
-        if (ts == AV_NOPTS_VALUE)
-            return 0;
-        pthread_mutex_lock(a->h0_lock);
-        h0 = *a->h0;
-        pthread_mutex_unlock(a->h0_lock);
-        if (h0 == AV_NOPTS_VALUE)
-            return 0;                          /* video not anchored yet: drop */
-        house_us = av_rescale_q(ts, a->ist_tb, AV_TIME_BASE_Q) - h0;
-        if (house_us < 0)
-            return 0;                          /* audio precedes video anchor: drop */
-        a->next_pts = av_rescale(house_us, a->out_rate, 1000000);
-        a->pts_set  = 1;
-    }
-
+    if (frame->best_effort_timestamp != AV_NOPTS_VALUE)
+        a->dbg_last_src = frame->best_effort_timestamp;   /* probe: latest fed source pts */
     if (a->use_fg) {
         /* -af: feed the graph; aresample async + loudness emit fixed-size frames
          * whose PTS already carries async's A/V correction — drain them straight
-         * to the encoders (no FIFO, no free counter).
-         *
-         * Common-mode A/V lock: add the video's house-vs-content skew to this
-         * frame's PTS before it enters the graph, so aresample=async targets the
-         * HOUSE clock (where video lives) instead of the source clock. When video
-         * dups (house outpaces source), the skew grows and async smoothly fills
-         * the matching audio, so audio rides the dup with video — no drift. */
+         * to the encoders. Common-mode A/V lock: add the video's house-vs-content
+         * skew so aresample=async targets the HOUSE clock instead of the source. */
         if (g_avlock && a->house_skew && frame->pts != AV_NOPTS_VALUE) {
             int64_t sk = *a->house_skew;
             if (sk) frame->pts += av_rescale_q(sk, AV_TIME_BASE_Q, a->ist_tb);
@@ -970,7 +953,6 @@ static int audio_push(AudioState *a, AVFrame *frame)
             return ret;
         return audio_drain_fg(a);
     }
-
     out_max = av_rescale_rnd(swr_get_delay(a->swr, frame->sample_rate) + frame->nb_samples,
                              a->out_rate, frame->sample_rate, AV_ROUND_UP);
     if ((ret = av_samples_alloc_array_and_samples(&out, NULL, a->out_chl.nb_channels,
@@ -982,8 +964,67 @@ static int audio_push(AudioState *a, AVFrame *frame)
         av_audio_fifo_write(a->fifo, (void **)out, got);
     if (out) { av_freep(&out[0]); av_freep(&out); }
     if (got < 0) return got;
-
     return audio_drain_fifo(a);
+}
+
+/* Anchor (on the first kept frame) then feed `frame`, given a known h0. Drops frames
+ * whose content precedes h0. Used both for live frames and the replayed pre-h0 buffer. */
+static int audio_anchor_and_feed(AudioState *a, AVFrame *frame, int64_t h0)
+{
+    int64_t ts = frame->best_effort_timestamp;
+    if (ts == AV_NOPTS_VALUE) return 0;
+    if (!a->pts_set) {
+        int64_t house_us = av_rescale_q(ts, a->ist_tb, AV_TIME_BASE_Q) - h0;
+        if (house_us < 0) return 0;                  /* audio precedes video anchor: drop */
+        a->next_pts = av_rescale(house_us, a->out_rate, 1000000);
+        a->pts_set  = 1;
+        a->dbg_first_src = ts;
+    }
+    return audio_feed(a, frame);
+}
+
+static int audio_push(AudioState *a, AVFrame *frame)
+{
+    int64_t ts = frame->best_effort_timestamp;
+    int ret = 0, i;
+
+    a->in_frames++;
+
+    /* Audio anchors to the FIRST VIDEO frame (h0, set by the video decode thread) so
+     * A/V share one origin. While h0 is unset (the slot's video is still acquiring its
+     * first frame) the audio is BUFFERED, not dropped: dropping it made that slot's
+     * audio start late by the whole h0-acquire delay (up to ~1s on the box) — the
+     * per-slot "audio delayed" desync. Once h0 is known we replay the buffer, keeping
+     * content >= h0 and dropping the lead. Bounded ring so a never-arriving video can't
+     * grow it unboundedly. */
+    if (!a->pts_set) {
+        int64_t h0;
+        pthread_mutex_lock(a->h0_lock); h0 = *a->h0; pthread_mutex_unlock(a->h0_lock);
+        if (h0 == AV_NOPTS_VALUE) {
+            if (ts != AV_NOPTS_VALUE) {
+                AVFrame *c = av_frame_clone(frame);
+                if (c) {
+                    if (a->aq_npending >= PTV_AQ_PREROLL) {       /* ring: drop oldest */
+                        av_frame_free(&a->aq_pending[0]);
+                        memmove(a->aq_pending, a->aq_pending + 1,
+                                (PTV_AQ_PREROLL - 1) * sizeof(*a->aq_pending));
+                        a->aq_npending = PTV_AQ_PREROLL - 1;
+                    }
+                    a->aq_pending[a->aq_npending++] = c;
+                }
+            }
+            return 0;
+        }
+        for (i = 0; i < a->aq_npending; i++) {        /* h0 known: replay buffered head */
+            if (ret >= 0) ret = audio_anchor_and_feed(a, a->aq_pending[i], h0);
+            av_frame_free(&a->aq_pending[i]);
+        }
+        a->aq_npending = 0;
+        if (ret < 0) return ret;
+        return audio_anchor_and_feed(a, frame, h0);
+    }
+    if (ts != AV_NOPTS_VALUE) a->dbg_last_src = ts;   /* probe: latest source audio pts */
+    return audio_feed(a, frame);
 }
 
 static void *audio_thread(void *arg)
@@ -1029,6 +1070,7 @@ static void *audio_thread(void *arg)
     }
 done:
     av_frame_free(&frame);
+    { int i; for (i = 0; i < a->aq_npending; i++) av_frame_free(&a->aq_pending[i]); a->aq_npending = 0; }
     av_thread_message_queue_set_err_send(a->audio_q, AVERROR_EOF);   /* unblock demux (a SENDER) */
     { int i; for (i = 0; i < a->n_out; i++) {        /* EOF marker to each muxer */
         AVPacket *eof = NULL; av_thread_message_queue_send(a->mux_q[i], &eof, 0); } }
