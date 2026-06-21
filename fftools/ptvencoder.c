@@ -66,7 +66,7 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.6.4"   /* 0.6.4: multiview audio-follow ACTUATOR upgrade (P1) — glitch-free smooth tracking. The v0.6.2/0.6.3 audio-follow corrected the per-slot lag only with whole-frame drop/pad on a 40ms threshold → it tracked the slow per-slot drift (source-vs-house clock, measured +360ms/35min on a live slot) in discrete ~40ms hops (box symptom: "A/V sometimes off then OK again") and left a ±frame residual ("audio slightly behind" on re-anchored slots). FIX: two-mode per-slot controller in audio_drain_fg — keep the fast discrete drop/pad ONLY to ACQUIRE a large gap (>PTV_AF_ACQUIRE_MS, default 100; startup ramp / big jump the smooth rate can't catch), and otherwise TRACK the residual+drift with a SMOOTH rate-limited (≤PTV_AF_RATE_MS_S, default 2ms/s — imperceptible) sub-sample PTS nudge (af_nudge_us added to the continuous output counter; no silence inserts, no content drops, monotonic since rate≪frame). Reuses the legacy 0007 PLL's rate-limited actuator idea, per slot, driven by the directly-measured lag (NO jump_comp). MULTIVIEW ONLY; PTV_AF_NO_PLL reverts to pure discrete; single-input BYTE-IDENTICAL. Verified local SRT relay (2x1+4-up): zero discrete hops after startup (smooth nudge tracks the drift), transcode↔copy xcorr +48ms→+21ms (q=0.994), 0 clamp, all healthy. Also adds the always-on [PTV-AVSYNC] per-slot status line on the -stats_period cadence (obeys -nostats, NOT gated by PTV_DIAG): lag (cell's measured video-vs-house offset) / applied (audio retiming in effect) / err (lag−applied residual, ~0=tracking) / nudge / cumulative acquire work. 0.6.3: multiview per-slot h0 RE-ANCHOR — floor each slot's lag to ≥0 so a cell is never displayed AHEAD of the house clock, which (a) is physically wrong for a frame-synchronizer and (b) is UNCORRECTABLE on a COPIED audio track (a copy can only be delayed, not advanced — a backward DTS hits the monotonic clamp). ROOT (P0, local SRT relay): a slot's video leaps far ahead (−560ms on a 2x1, up to −2.5s on a 4-up) from an anomalous first decoded frame and/or a deep startup buffer prime (the open-join barrier lets fast decoders over-fill their jitter buffer while waiting for the slowest input). FIX: when a slot's lag drops below −PTV_H0_REANCHOR_MS (default 120), re-anchor its h0 forward (h0 += deficit) so the lag lands at +1 tick (slot reads slightly BEHIND = the normal buffered state): video display unchanged, transcoded audio rides the same h0+house_skew (stays locked), copied audio now only needs to DELAY → correctable. MULTIVIEW ONLY (n>1); PTV_NO_H0_REANCHOR reverts; PTV_H0_REANCHOR_MS tunes. VERIFIED local SRT relay (real POP TV + HD History + the 4 Grid feeds): 4-up lag −2500ms→≥~0; transcode-path(drop/pad) vs copy-path(h0-rebase) of the SAME source agree to +48ms (xcorr q=0.987) ⇒ copy tracks video as well as the box-confirmed transcode; no muxer clamp storm; single-input BYTE-IDENTICAL. (PTV-LIPSYNC err is confounded for the audio-follow path on jumpy sources — the xcorr path-consistency check + box eye-check are the oracles.) 0.6.2: AUDIO-FOLLOW now CONTINUOUSLY RE-TRACKS (was one-shot). ROOT (box+local-SRT-relay confirmed via PTV-LIPSYNC trajectory): a slot's per-slot video lag RAMPS IN over ~30s (in1: 0→+320ms then rock-stable) but the one-time latch fired at t≈1s while lag was still ~0, latched 0, never re-tracked → that slot's audio left permanently ~the steady lag AHEAD of video (~1s on the box; mvb/HD-History symptom). FIX: compositor keeps a slow EMA (~1.3s, smooths ±100ms interlaced-PTS jitter) of each slot's measured lag and publishes it every tick instead of freezing one early value; the drain's existing >40ms-threshold deterministic drop/pad re-tracks it (lag>0 pad/delay, lag<0 drop/advance) through the startup ramp and any later drift, and stays put once settled (no churn). Multiview-only, gated n_input>1 && g_audio_follow; single-input BYTE-IDENTICAL. PTV_NO_AUDIO_FOLLOW reverts. 0.6.1: multiview per-slot A/V FIX = AUDIO-FOLLOW (Option A). ROOT (confirmed: single-input synced on the SAME live feed, multiview not): composite video is POSITION-anchored (rung_pts; one shared frame can't be content-stamped per cell) while audio is CONTENT-anchored (src−h0); at the join they sit on different origins → stable per-slot offset = "audio behind video". Single-input has no split (video=(src−h0)/tick, same h0 as audio) → untouched. FIX (multiview only, n_input>1): compositor latches each slot's STABLE signed offset (avg past the lossy join, re-latch on outage); the slot's audio applies it as a ONE-TIME deterministic correction — DROP content (advance) or PAD silence (delay) on a continuous gapless output counter — landing audio on the video's displayed-content clock. Deterministic because aresample=async is far too slow (~20ms/s) and can't advance. PTV_NO_AUDIO_FOLLOW reverts. 0.6.0 discont-absorber: default ON (helps copy/sparse streams); 0.5.9 clamp: DEFAULT OFF (stuttered; opt-in PTV_MV_CLAMP). 0.6.0: FIX multiview per-slot audio-late = per-input source PTS-DISCONTINUITY ABSORBER. ROOT CAUSE (live-repro confirmed via SRT relay of the real 1080i50 Grid feeds): the source throws a forward PTS jump of a few hundred ms to ~1s at the live join (in1 +480 / in3 +960) while FRAMES stay continuous (one per tick, buffer full, holddrop=0) — a timestamp glitch, NOT lost frames. Raw, it shifts that slot's content→output mapping so the cell video leaps ahead of its (continuous) audio = per-slot "audio behind video", stable for the whole run. FIX: demux_unwrap now also absorbs an arbitrary forward DTS jump (>PTV_DISCONT_MS, default 80) the same way it absorbs the 33-bit wrap — a per-stream offset re-basing to last+nominal, keeping video+audio+copy on one continuous timeline → lag→~0, video stays SMOOTH. The 0.5.9 content CLAMP is now DEFAULT OFF (it stuttered on jittery sources; opt-in via PTV_MV_CLAMP). PTV_NO_DISCONT reverts. 0.5.9: (superseded) house-clock content clamp. ROOT CAUSE (box+local confirmed): a startup/source PTS gap (skipped/corrupt frames during decode startup) makes a cell's video content leap AHEAD of the house clock (lag_true −480..−900ms, audio innocent); the compositor showed the jumped frame immediately → video raced ahead of its (continuous) audio → per-slot "audio behind video". FIX: compositor displays a frame only once the house clock reaches its content-time (disp−h0 <= out+1tick); an ahead-of-clock frame is held one tick at a time → the cell's video freezes across the lost-frame gap (correct for lost video) while audio continues → A/V stays locked, lag→~0. Compositor-only; audio path untouched. Validated locally vs the flash+beep ruler (startup-gap repro: slot +354ms→~baseline). PTV_NO_MV_CLAMP=1 reverts. 0.5.8: [PTV-START] per-tick startup trace (first ~3s, per slot: h0/srcpts/content-age/output/qd) to SEE how the per-slot video-lead onsets — box showed holddrop=0 (NOT jitter-buffer drops) yet video leads the house clock, so the cause is a startup PTS irregularity, not a buffer. 0.5.7: compositor mv line adds per-slot /holddrop= (per-input jitter-buffer drop-oldest count) to confirm the multiview audio-late ROOT CAUSE measured on the box: per-slot VIDEO leads the house clock by a fixed startup offset (lag_true −640/−800/−900ms, mvb 0; audio innocent: house_skew=0 async_pad=0). Hypothesis: early-decoding feeds overflow the 48-frame hold at startup → drop-oldest skips that cell's content ahead → displayed video leads. holddrop>0 on the leading slots at startup confirms it. 0.5.6: PTV-LIPSYNC diag — faithful per-slot pipeline-introduced lip-sync error err=async_pad−house_skew (REPLACES the misleading av_off, which was production-thread buffer lead, not playback sync: +3.5s offline / −0.2s live for identical IN-SYNC content). Compositor mv line adds per-slot /lag= (TRUE uncapped video lag) so 250ms-cap saturation is visible (lag>>skew = audio can't follow). Cross-validated locally vs the flash+beep ruler (grid4-sync.sh): healthy err≈0 == ruler in-sync. Gated PTV_DIAG. 0.5.5: FIX per-slot audio-late in multiview — audio arriving before a slot's video sets h0 was DROPPED, so the slot whose video is slowest to acquire its first frame lost the head of its audio (first_out up to ~1s = the per-slot "audio delayed"; box-confirmed on Grid_2x2). Now buffer pre-h0 audio (bounded ring) and replay it once h0 is known, keeping content>=h0 -> first_out~0 all slots. ADIAG probe retained to verify. 0.5.4-adiag (diag, temporary): PTV-ADIAG per-track audio-vs-video offset (av_off) + g_vout_us — MP2 tracks land ~1s audio-late from aresample=async startup over-production (first_out~16ms aligned; av_off ~+1s for high source-V-A MP2 inputs). Gated PTV_DIAG; remove after fix. 0.5.3: code-review fixes — og_spec buffers sized for "disposition" (was silently truncating -disposition/-disposition:a); -an now honored (suppresses auto-selected audio + audio copy in the no-map path); accurate -h (dropped never-wired -s/--deint/--hw/--mode); fifo alloc NULL-checked; g_muxed/g_muxed_bytes atomic (stats data race). 0.5.2: Option F COARSE half — re-anchor on return-from-outage: clear a slot's accumulated dup skew when it comes back after a black-slate, so a continuous-PTS feed re-syncs A/V on return (the source's advanced PTS lands at current output once stale skew is gone). Safe (outage>=slate exceeds cleared skew -> async input still forward). PTV_NO_REANCHOR=1 for A/B. 0.5.1: Option F skew made NON-DECREASING+capped (async input requires monotonic; a decreasing skew stalled the mux — 20fps-into-25fps repro). Fine-half only: rising dup drift rides async; the DECREASING re-anchor-on-return (full A/V re-sync after outage) needs a separate direct output-offset path (coarse half, TODO). 0.5.0: multiview A/V sync = software frame-synchronizer (Option F). Compositor publishes the MEASURED per-slot output-vs-content skew = out_time-(displayed_src-h0) of the frame each cell actually shows; the slot's audio rides it (existing async path), so A/V stays locked through jitter/drop/dup/interruption and RE-SYNCS on input return (shows current content). Reduces to ~0 on healthy 1:1 inputs (no regression). Replaces the dup-event counter (0.4.1), which missed drops/returns. Copy path protected by its monotonic-DTS clamp. 0.4.1: multiview per-slot audio skew = dup-event counter (was arithmetic+non-decreasing, which locked startup jitter -> later-priming slots' audio over-delayed); per-slot skew in PTV_DIAG. 0.4.0: MULTIVIEW (1/2/4-input mosaic — house-clock compositor, per-input jitter buffer + clock, per-slot audio/sub, parallel open); 0.3.0: multiple transcoded audio tracks + per-track -ac/-filter:a/-metadata + source fan-out; 0.2.3: monotonic-DTS clamp on copy path; 0.2.2: no -r preserves source FRAME rate (avg); 0.2.1: 33-bit PTS-wrap on copy-passthrough */
+#define PTVENCODER_VERSION "0.6.5"   /* 0.6.5: A/V PLL redesign Phase A — READ-ONLY measurement probe [PTV-AVSYNC2] (PTV_AVSYNC_PROBE=1; analysis/ptvencoder-avsync-pll-redesign-plan.md). Measures the REAL per-track lip-sync offset out_v(C)−out_a(C) by pairing each emitted audio frame's source content C against the output time the VIDEO showed that SAME content (a per-input ring of (displayed abs-src → out_v), written by the compositor in multiview / the master output thread in single-input). Reports offset + the video_lag/audio_lag split (§3.2a: which side moved, with slow EMA baselines + deviation) + the content pairing residual (§3.2b). Faithful where the old proxies (async_pad/house_skew/lip-sync err) were confounded for the audio-follow path, because out_a is the ACTUAL emitted pts (af counter+nudge in multiview, opts in single-input). NO actuator — measures only; gated PTV_AVSYNC_PROBE, prints on the -stats_period cadence. Single-input subtracts house_skew from the audio content key (single-input injects it at the graph input). M-b cross-check = "offset ≈ 0 on a clean synced source" (local clean run), not separate code. Purpose: validate the measurement against the box eye (mvb ~1s, Fé drift) BEFORE building the closed-loop controller (Phase B). Zero behavior change when off; BYTE-IDENTICAL output. 0.6.4: multiview audio-follow ACTUATOR upgrade (P1) — glitch-free smooth tracking. The v0.6.2/0.6.3 audio-follow corrected the per-slot lag only with whole-frame drop/pad on a 40ms threshold → it tracked the slow per-slot drift (source-vs-house clock, measured +360ms/35min on a live slot) in discrete ~40ms hops (box symptom: "A/V sometimes off then OK again") and left a ±frame residual ("audio slightly behind" on re-anchored slots). FIX: two-mode per-slot controller in audio_drain_fg — keep the fast discrete drop/pad ONLY to ACQUIRE a large gap (>PTV_AF_ACQUIRE_MS, default 100; startup ramp / big jump the smooth rate can't catch), and otherwise TRACK the residual+drift with a SMOOTH rate-limited (≤PTV_AF_RATE_MS_S, default 2ms/s — imperceptible) sub-sample PTS nudge (af_nudge_us added to the continuous output counter; no silence inserts, no content drops, monotonic since rate≪frame). Reuses the legacy 0007 PLL's rate-limited actuator idea, per slot, driven by the directly-measured lag (NO jump_comp). MULTIVIEW ONLY; PTV_AF_NO_PLL reverts to pure discrete; single-input BYTE-IDENTICAL. Verified local SRT relay (2x1+4-up): zero discrete hops after startup (smooth nudge tracks the drift), transcode↔copy xcorr +48ms→+21ms (q=0.994), 0 clamp, all healthy. Also adds the always-on [PTV-AVSYNC] per-slot status line on the -stats_period cadence (obeys -nostats, NOT gated by PTV_DIAG): lag (cell's measured video-vs-house offset) / applied (audio retiming in effect) / err (lag−applied residual, ~0=tracking) / nudge / cumulative acquire work. 0.6.3: multiview per-slot h0 RE-ANCHOR — floor each slot's lag to ≥0 so a cell is never displayed AHEAD of the house clock, which (a) is physically wrong for a frame-synchronizer and (b) is UNCORRECTABLE on a COPIED audio track (a copy can only be delayed, not advanced — a backward DTS hits the monotonic clamp). ROOT (P0, local SRT relay): a slot's video leaps far ahead (−560ms on a 2x1, up to −2.5s on a 4-up) from an anomalous first decoded frame and/or a deep startup buffer prime (the open-join barrier lets fast decoders over-fill their jitter buffer while waiting for the slowest input). FIX: when a slot's lag drops below −PTV_H0_REANCHOR_MS (default 120), re-anchor its h0 forward (h0 += deficit) so the lag lands at +1 tick (slot reads slightly BEHIND = the normal buffered state): video display unchanged, transcoded audio rides the same h0+house_skew (stays locked), copied audio now only needs to DELAY → correctable. MULTIVIEW ONLY (n>1); PTV_NO_H0_REANCHOR reverts; PTV_H0_REANCHOR_MS tunes. VERIFIED local SRT relay (real POP TV + HD History + the 4 Grid feeds): 4-up lag −2500ms→≥~0; transcode-path(drop/pad) vs copy-path(h0-rebase) of the SAME source agree to +48ms (xcorr q=0.987) ⇒ copy tracks video as well as the box-confirmed transcode; no muxer clamp storm; single-input BYTE-IDENTICAL. (PTV-LIPSYNC err is confounded for the audio-follow path on jumpy sources — the xcorr path-consistency check + box eye-check are the oracles.) 0.6.2: AUDIO-FOLLOW now CONTINUOUSLY RE-TRACKS (was one-shot). ROOT (box+local-SRT-relay confirmed via PTV-LIPSYNC trajectory): a slot's per-slot video lag RAMPS IN over ~30s (in1: 0→+320ms then rock-stable) but the one-time latch fired at t≈1s while lag was still ~0, latched 0, never re-tracked → that slot's audio left permanently ~the steady lag AHEAD of video (~1s on the box; mvb/HD-History symptom). FIX: compositor keeps a slow EMA (~1.3s, smooths ±100ms interlaced-PTS jitter) of each slot's measured lag and publishes it every tick instead of freezing one early value; the drain's existing >40ms-threshold deterministic drop/pad re-tracks it (lag>0 pad/delay, lag<0 drop/advance) through the startup ramp and any later drift, and stays put once settled (no churn). Multiview-only, gated n_input>1 && g_audio_follow; single-input BYTE-IDENTICAL. PTV_NO_AUDIO_FOLLOW reverts. 0.6.1: multiview per-slot A/V FIX = AUDIO-FOLLOW (Option A). ROOT (confirmed: single-input synced on the SAME live feed, multiview not): composite video is POSITION-anchored (rung_pts; one shared frame can't be content-stamped per cell) while audio is CONTENT-anchored (src−h0); at the join they sit on different origins → stable per-slot offset = "audio behind video". Single-input has no split (video=(src−h0)/tick, same h0 as audio) → untouched. FIX (multiview only, n_input>1): compositor latches each slot's STABLE signed offset (avg past the lossy join, re-latch on outage); the slot's audio applies it as a ONE-TIME deterministic correction — DROP content (advance) or PAD silence (delay) on a continuous gapless output counter — landing audio on the video's displayed-content clock. Deterministic because aresample=async is far too slow (~20ms/s) and can't advance. PTV_NO_AUDIO_FOLLOW reverts. 0.6.0 discont-absorber: default ON (helps copy/sparse streams); 0.5.9 clamp: DEFAULT OFF (stuttered; opt-in PTV_MV_CLAMP). 0.6.0: FIX multiview per-slot audio-late = per-input source PTS-DISCONTINUITY ABSORBER. ROOT CAUSE (live-repro confirmed via SRT relay of the real 1080i50 Grid feeds): the source throws a forward PTS jump of a few hundred ms to ~1s at the live join (in1 +480 / in3 +960) while FRAMES stay continuous (one per tick, buffer full, holddrop=0) — a timestamp glitch, NOT lost frames. Raw, it shifts that slot's content→output mapping so the cell video leaps ahead of its (continuous) audio = per-slot "audio behind video", stable for the whole run. FIX: demux_unwrap now also absorbs an arbitrary forward DTS jump (>PTV_DISCONT_MS, default 80) the same way it absorbs the 33-bit wrap — a per-stream offset re-basing to last+nominal, keeping video+audio+copy on one continuous timeline → lag→~0, video stays SMOOTH. The 0.5.9 content CLAMP is now DEFAULT OFF (it stuttered on jittery sources; opt-in via PTV_MV_CLAMP). PTV_NO_DISCONT reverts. 0.5.9: (superseded) house-clock content clamp. ROOT CAUSE (box+local confirmed): a startup/source PTS gap (skipped/corrupt frames during decode startup) makes a cell's video content leap AHEAD of the house clock (lag_true −480..−900ms, audio innocent); the compositor showed the jumped frame immediately → video raced ahead of its (continuous) audio → per-slot "audio behind video". FIX: compositor displays a frame only once the house clock reaches its content-time (disp−h0 <= out+1tick); an ahead-of-clock frame is held one tick at a time → the cell's video freezes across the lost-frame gap (correct for lost video) while audio continues → A/V stays locked, lag→~0. Compositor-only; audio path untouched. Validated locally vs the flash+beep ruler (startup-gap repro: slot +354ms→~baseline). PTV_NO_MV_CLAMP=1 reverts. 0.5.8: [PTV-START] per-tick startup trace (first ~3s, per slot: h0/srcpts/content-age/output/qd) to SEE how the per-slot video-lead onsets — box showed holddrop=0 (NOT jitter-buffer drops) yet video leads the house clock, so the cause is a startup PTS irregularity, not a buffer. 0.5.7: compositor mv line adds per-slot /holddrop= (per-input jitter-buffer drop-oldest count) to confirm the multiview audio-late ROOT CAUSE measured on the box: per-slot VIDEO leads the house clock by a fixed startup offset (lag_true −640/−800/−900ms, mvb 0; audio innocent: house_skew=0 async_pad=0). Hypothesis: early-decoding feeds overflow the 48-frame hold at startup → drop-oldest skips that cell's content ahead → displayed video leads. holddrop>0 on the leading slots at startup confirms it. 0.5.6: PTV-LIPSYNC diag — faithful per-slot pipeline-introduced lip-sync error err=async_pad−house_skew (REPLACES the misleading av_off, which was production-thread buffer lead, not playback sync: +3.5s offline / −0.2s live for identical IN-SYNC content). Compositor mv line adds per-slot /lag= (TRUE uncapped video lag) so 250ms-cap saturation is visible (lag>>skew = audio can't follow). Cross-validated locally vs the flash+beep ruler (grid4-sync.sh): healthy err≈0 == ruler in-sync. Gated PTV_DIAG. 0.5.5: FIX per-slot audio-late in multiview — audio arriving before a slot's video sets h0 was DROPPED, so the slot whose video is slowest to acquire its first frame lost the head of its audio (first_out up to ~1s = the per-slot "audio delayed"; box-confirmed on Grid_2x2). Now buffer pre-h0 audio (bounded ring) and replay it once h0 is known, keeping content>=h0 -> first_out~0 all slots. ADIAG probe retained to verify. 0.5.4-adiag (diag, temporary): PTV-ADIAG per-track audio-vs-video offset (av_off) + g_vout_us — MP2 tracks land ~1s audio-late from aresample=async startup over-production (first_out~16ms aligned; av_off ~+1s for high source-V-A MP2 inputs). Gated PTV_DIAG; remove after fix. 0.5.3: code-review fixes — og_spec buffers sized for "disposition" (was silently truncating -disposition/-disposition:a); -an now honored (suppresses auto-selected audio + audio copy in the no-map path); accurate -h (dropped never-wired -s/--deint/--hw/--mode); fifo alloc NULL-checked; g_muxed/g_muxed_bytes atomic (stats data race). 0.5.2: Option F COARSE half — re-anchor on return-from-outage: clear a slot's accumulated dup skew when it comes back after a black-slate, so a continuous-PTS feed re-syncs A/V on return (the source's advanced PTS lands at current output once stale skew is gone). Safe (outage>=slate exceeds cleared skew -> async input still forward). PTV_NO_REANCHOR=1 for A/B. 0.5.1: Option F skew made NON-DECREASING+capped (async input requires monotonic; a decreasing skew stalled the mux — 20fps-into-25fps repro). Fine-half only: rising dup drift rides async; the DECREASING re-anchor-on-return (full A/V re-sync after outage) needs a separate direct output-offset path (coarse half, TODO). 0.5.0: multiview A/V sync = software frame-synchronizer (Option F). Compositor publishes the MEASURED per-slot output-vs-content skew = out_time-(displayed_src-h0) of the frame each cell actually shows; the slot's audio rides it (existing async path), so A/V stays locked through jitter/drop/dup/interruption and RE-SYNCS on input return (shows current content). Reduces to ~0 on healthy 1:1 inputs (no regression). Replaces the dup-event counter (0.4.1), which missed drops/returns. Copy path protected by its monotonic-DTS clamp. 0.4.1: multiview per-slot audio skew = dup-event counter (was arithmetic+non-decreasing, which locked startup jitter -> later-priming slots' audio over-delayed); per-slot skew in PTV_DIAG. 0.4.0: MULTIVIEW (1/2/4-input mosaic — house-clock compositor, per-input jitter buffer + clock, per-slot audio/sub, parallel open); 0.3.0: multiple transcoded audio tracks + per-track -ac/-filter:a/-metadata + source fan-out; 0.2.3: monotonic-DTS clamp on copy path; 0.2.2: no -r preserves source FRAME rate (avg); 0.2.1: 33-bit PTS-wrap on copy-passthrough */
 
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
@@ -128,6 +128,10 @@ static int     g_audio_follow = 1;
  * PTV_NO_H0_REANCHOR=1 reverts; PTV_H0_REANCHOR_MS sets the trigger (default 120ms). */
 static int     g_h0_reanchor = 1;
 static int     g_h0_reanchor_ms = 120;
+/* A/V PLL redesign — Phase A READ-ONLY measurement probe (analysis/ptvencoder-avsync-pll-redesign-plan.md).
+ * Off by default; PTV_AVSYNC_PROBE=1 enables the [PTV-AVSYNC2] per-track real A/V offset measurement
+ * (out_v(C) − out_a(C), content-paired, video_lag/audio_lag split). Measures only — no actuator. */
+static int     g_avsync_probe = 0;
 /* Multiview audio-follow ACTUATOR (P1) — a per-slot two-mode controller for glitch-free A/V tracking.
  * The v0.6.2/0.6.3 audio-follow corrected the per-slot lag only with whole-frame drop/pad fired on a
  * 40ms threshold: it tracked the slow per-slot drift (source-vs-house-clock, e.g. +360ms over 35min)
@@ -274,6 +278,46 @@ static int encode_push(AVThreadMessageQueue *mux_q, AVCodecContext *enc,
 #define PTV_MAX_INPUT 4    /* max composited inputs (multiview): 1 / 2 / 4 */
 #define PTV_MV_SKEW_CAP_US 250000   /* multiview per-slot audio skew cap (async budget) */
 
+/* A/V PLL redesign Phase A probe (PTV_AVSYNC_PROBE): per-input ring recording, for each DISTINCT
+ * video content the cell displayed, the output time it went out at — (abs source pts → out_v, both
+ * us). The audio drain pairs its emitted frame's source content against this ring to read the output
+ * time the VIDEO showed that SAME content (§3.2b), giving the real lip-sync offset out_v(C)−out_a(C).
+ * Written by the compositor (multiview) and the single-input output thread; read by audio_drain_fg.
+ * Single-producer/single-consumer; the small lock keeps a torn read out of the diagnostic. */
+#define PTV_VRING 512      /* distinct video contents kept (~10s @50fps; spans the V↔A content offset) */
+typedef struct VOutRing {
+    int64_t          src[PTV_VRING];   /* absolute source pts of the displayed content (us) */
+    int64_t          out[PTV_VRING];   /* output time that content was emitted at (us, output-PTS axis) */
+    int64_t          n;                /* total writes (monotonic); newest index = (n-1) % PTV_VRING */
+    pthread_mutex_t  lock;
+} VOutRing;
+
+static void vring_put(VOutRing *r, int64_t src_us, int64_t out_us)
+{
+    pthread_mutex_lock(&r->lock);
+    int i = (int)(r->n % PTV_VRING);
+    r->src[i] = src_us; r->out[i] = out_us; r->n++;
+    pthread_mutex_unlock(&r->lock);
+}
+
+/* nearest-by-content lookup: of all kept entries, return the out_v and matched src of the one whose
+ * src is closest to want_src. 0 = found (ring non-empty), -1 = empty. */
+static int vring_lookup(VOutRing *r, int64_t want_src, int64_t *out_v, int64_t *matched_src)
+{
+    int64_t best = INT64_MAX, bo = 0, bs = 0;
+    int found = 0, cnt, i;
+    pthread_mutex_lock(&r->lock);
+    cnt = r->n < PTV_VRING ? (int)r->n : PTV_VRING;
+    for (i = 0; i < cnt; i++) {
+        int idx = (int)((r->n - 1 - i) % PTV_VRING);
+        int64_t d = r->src[idx] - want_src; if (d < 0) d = -d;
+        if (d < best) { best = d; bo = r->out[idx]; bs = r->src[idx]; found = 1; }
+    }
+    pthread_mutex_unlock(&r->lock);
+    if (found) { *out_v = bo; *matched_src = bs; }
+    return found ? 0 : -1;
+}
+
 /* Multiview per-input jitter buffer: decode pushes each frame onto `q`; the
  * compositor pops ONE per house tick (absorbing bursty decode delivery, exactly
  * like the single-input frame_q) and dup-holds its last frame when `q` underruns,
@@ -324,6 +368,7 @@ typedef struct VideoCtx {
     int64_t         *h0;             /* shared A/V input anchor (us) */
     pthread_mutex_t *h0_lock;
     int64_t         *house_skew;     /* master publishes house-vs-content skew (us) here */
+    VOutRing        *vring;          /* A/V probe: single-input video output ring (PTV_AVSYNC_PROBE) */
     AVCodecContext  *venc;
     AVStream        *ost;
     int64_t          tick_dur_us;
@@ -785,6 +830,10 @@ static void *output_thread(void *arg)
              * staying source-locked (which is what drifts ~40ms per dup). */
             if (v->is_master && v->house_skew && content_vpts >= 0)
                 *v->house_skew = (vpts - content_vpts) * v->tick_dur_us;
+            /* A/V probe (read-only): record this distinct content's first-display output time so the
+             * audio drain can pair against it (single-input master rung only; multiview → compositor). */
+            if (g_avsync_probe && v->vring && fresh && content_vpts >= 0)
+                vring_put(v->vring, av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q), vpts * v->tick_dur_us);
         }
         ret = encode_push(v->mux_q, v->venc, v->ost, held);
         v->last_emit_us = av_gettime_relative();
@@ -907,6 +956,11 @@ typedef struct AudioState {
     int64_t          af_nudge_us;                    /* P1: smooth rate-limited PTS nudge (us), tracks residual+drift glitch-free */
     int64_t          avsync_stat_last;               /* [PTV-AVSYNC] status: last print time (us) */
     int64_t          af_acq_drop_us, af_acq_pad_us;  /* cumulative discrete acquire work (us dropped / padded) */
+    /* A/V PLL redesign Phase A probe (PTV_AVSYNC_PROBE, read-only): real per-track A/V offset. */
+    VOutRing        *vring;                           /* video output ring for this track's source input */
+    int64_t          av_vlag_ema, av_alag_ema;        /* slow baselines of video_lag / audio_lag (us) */
+    int              av_seed;                         /* baselines seeded */
+    int64_t          av_probe_last;                   /* [PTV-AVSYNC2]: last print time (us) */
 } AudioState;
 
 /* encode the SAME loudness-processed frame into each rung's own AAC encoder (so
@@ -975,6 +1029,7 @@ static int audio_drain_fg(AudioState *a)
     sink_tb = av_buffersink_get_time_base(a->afsink);
     while ((ret = av_buffersink_get_frame(a->afsink, filt)) >= 0) {
         if (filt->pts != AV_NOPTS_VALUE) {
+            int64_t src_abs_us = av_rescale_q(filt->pts, sink_tb, AV_TIME_BASE_Q);  /* A/V probe: this frame's (post-async) source content time (us), before pts is rebased */
             int64_t opts = av_rescale_q(filt->pts, sink_tb, (AVRational){1, a->out_rate}) - h0_samp;
             if (opts < 0) { av_frame_unref(filt); continue; }   /* precedes video anchor */
             filt->pts = opts;
@@ -1031,6 +1086,62 @@ static int audio_drain_fg(AudioState *a)
                 }
                 if (a->af_drop >= nb) { a->af_drop -= nb; av_frame_unref(filt); continue; }  /* advance: skip content */
                 filt->pts = a->af_next_pts + ns; a->af_next_pts += nb;        /* continuous + smooth nudge */
+            }
+            /* ====================================================================================
+             * [PTV-AVSYNC2] — A/V PLL redesign Phase A READ-ONLY measurement probe
+             *   (analysis/ptvencoder-avsync-pll-redesign-plan.md §3). Measures the REAL per-track
+             *   lip-sync offset, NOT a proxy: for the source content C this emitted audio frame
+             *   carries, look up the output time the VIDEO showed that SAME content (the per-input
+             *   ring, written by the compositor / single-input output thread) and compare:
+             *       offset = out_v(C) − out_a(C)     (− = picture ahead of audio = video leads)
+             *   with the video_lag / audio_lag split (§3.2a — which side moved) and the content
+             *   pairing residual (§3.2b). out_a is the ACTUAL emitted pts (the af counter+nudge in
+             *   multiview, opts in single-input), so it is faithful where async_pad/house_skew were
+             *   confounded. No actuator — this only reports. M-b cross-check = "offset ≈ 0 on a clean
+             *   synced source" (validated on the local clean run), not a separate metric (adjacent-DTS
+             *   at the mux reads ≈0 regardless = the av_off trap).
+             * ==================================================================================== */
+            if (g_avsync_probe && a->vring) {
+                int64_t out_a_us = av_rescale(filt->pts, 1000000, a->out_rate);   /* emitted output time (us) */
+                int64_t h0_us    = (h0 == AV_NOPTS_VALUE) ? 0 : h0;
+                int64_t content  = src_abs_us;                                    /* abs source content of this audio frame */
+                int64_t out_v, msrc;
+                /* single-input injects house_skew into the graph INPUT → the buffersink pts carries it;
+                 * remove it to recover the true source content for the video pairing. Multiview
+                 * audio-follow feeds content-aligned input (no injection) → use src_abs_us directly. */
+                if (!(a->multiview && g_audio_follow) && a->house_skew)
+                    content -= *a->house_skew;
+                if (vring_lookup(a->vring, content, &out_v, &msrc) == 0) {
+                    int64_t vlag   = out_v    - (msrc    - h0_us);   /* video realized output − content (at msrc) */
+                    int64_t alag   = out_a_us - (content - h0_us);   /* audio realized output − content (at content) */
+                    int64_t paird  = msrc - content;                 /* pairing residual: msrc and content differ when the
+                                                                       * video ring hasn't yet composited the audio's content
+                                                                       * (deep video prime → composition lags the audio drain
+                                                                       * in WALL time; invisible to the player). */
+                    int64_t ring   = out_v - out_a_us;               /* raw direct out_v−out_a — CONTAMINATED by paird */
+                    int64_t offset = vlag - alag;                    /* = ring − paird: the content-referenced (via shared h0),
+                                                                       * pairδ-corrected lip-sync the PLAYER sees. PRIMARY. */
+                    if (!a->av_seed) { a->av_vlag_ema = vlag; a->av_alag_ema = alag; a->av_seed = 1; }
+                    else { a->av_vlag_ema += (vlag - a->av_vlag_ema) >> 8;   /* slow baseline (~5s @47fps) */
+                           a->av_alag_ema += (alag - a->av_alag_ema) >> 8; }
+                    {
+                        int64_t per = g_stats_period_us > 0 ? g_stats_period_us : 5000000;
+                        int64_t nowp = av_gettime_relative();
+                        if (a->av_probe_last == 0) a->av_probe_last = nowp;
+                        else if (nowp - a->av_probe_last >= per) {
+                            av_log(NULL, AV_LOG_INFO,
+                                "[PTV-AVSYNC2] a%d(in%d) offset=%+"PRId64"ms | "
+                                "vlag=%+"PRId64"ms(base%+"PRId64" dev%+"PRId64") "
+                                "alag=%+"PRId64"ms(base%+"PRId64" dev%+"PRId64") | ring=%+"PRId64"ms pairδ=%+"PRId64"ms"
+                                "  [offset<0 = picture ahead of audio; |pairδ| large ⇒ trust offset(=vlag−alag), not ring]\n",
+                                a->dbg_k, a->dbg_in, offset / 1000,
+                                vlag / 1000, a->av_vlag_ema / 1000, (vlag - a->av_vlag_ema) / 1000,
+                                alag / 1000, a->av_alag_ema / 1000, (alag - a->av_alag_ema) / 1000,
+                                ring / 1000, paird / 1000);
+                            a->av_probe_last = nowp;
+                        }
+                    }
+                }
             }
             /* [PTV-AVSYNC] production A/V-sync status — per slot, on the -stats_period cadence (obeys
              * -nostats / -stats_period like the progress line, NOT PTV_DIAG). Reports what the
@@ -1619,6 +1730,7 @@ typedef struct Input {
     int64_t               house_lag_true;     /* PTV_DIAG: compositor publishes the UNCAPPED signed video lag
                                                * (output−content) for the lip-sync probe; = house_skew unless the
                                                * 250ms cap / non-decreasing floor clips it (multiview only) */
+    VOutRing              vring;             /* A/V probe: this input's (displayed content → out_v) ring */
     VideoHold             hold;              /* multiview: latest decoded frame for the compositor */
     int64_t              *wrap_off;          /* per stream: 33-bit wrap offset (stream tb) */
     int64_t              *wrap_last;         /* per stream: last RAW ts (wrap detection) */
@@ -1868,6 +1980,10 @@ static void *compositor_thread(void *arg)
                             last[k]->pts, sk / 1000, fresh, av_thread_message_queue_nb_elems(c->inputs[k].hold.q));
                     lag_true_us[k] = sk;                                  /* PTV_DIAG: capture BEFORE clamp = lip-sync truth */
                     c->inputs[k].house_lag_true = sk;                     /* publish for the per-slot audio lip-sync probe */
+                    /* A/V probe (read-only): record this slot's distinct displayed content → its
+                     * first-display output time, so the slot's audio can pair against it (§3.2b). */
+                    if (g_avsync_probe && fresh)
+                        vring_put(&c->inputs[k].vring, disp_src, tick * c->tick_dur_us);
                     /* Don't ratchet the audio skew during a CONTENT-CLAMP hold: that freeze is
                      * deliberate pacing (a future frame is pending, video waits for the clock),
                      * NOT a dup-underrun the audio should follow. Letting skew grow here would
@@ -2048,6 +2164,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         inputs[k].h0  = AV_NOPTS_VALUE;
         pthread_mutex_init(&inputs[k].h0_lock, NULL);
         pthread_mutex_init(&inputs[k].hold.lock, NULL);
+        pthread_mutex_init(&inputs[k].vring.lock, NULL);
         if (multiview) {                         /* per-input jitter buffer for the compositor */
             if ((ret = av_thread_message_queue_alloc(&inputs[k].hold.q, PTV_FRAME_QDEPTH, sizeof(AVFrame *))) < 0) goto end;
             av_thread_message_queue_set_free_func(inputs[k].hold.q, free_frame_msg);
@@ -2456,6 +2573,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         vc->live = live; vc->passthrough = multiview;
         vc->h0 = &inputs[0].h0; vc->h0_lock = &inputs[0].h0_lock;
         vc->house_skew = &inputs[0].house_skew;
+        vc->vring = (!multiview && r == 0) ? &inputs[0].vring : NULL;  /* single-input: master rung feeds the A/V probe ring (multiview: compositor does) */
         vc->is_master = (r == 0);
         vc->dbg_video_q = inputs[0].video_q; vc->dbg_dec_frames = &inputs[0].dc.dec_frames; vc->dbg_vcorrupt = &inputs[0].dc.vcorrupt;
         rung[r].ma.ofmt = rung[r].ofmt; rung[r].ma.mux_q = rung[r].mux_q;
@@ -2466,6 +2584,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         as[k].h0 = &inputs[asrc_in[k]].h0; as[k].h0_lock = &inputs[asrc_in[k]].h0_lock;
         as[k].house_skew = &inputs[asrc_in[k]].house_skew;
         as[k].house_lag_true = (n_input > 1) ? &inputs[asrc_in[k]].house_lag_true : NULL;  /* multiview: true lag; single: NULL→house_skew */
+        as[k].vring = &inputs[asrc_in[k]].vring;         /* A/V probe: pair this track's audio against its input's video ring */
         as[k].multiview = (n_input > 1);                 /* multiview-only: enable deterministic audio-follow */
         as[k].af_applied_us = 0;
         as[k].dbg_k = k; as[k].dbg_in = asrc_in[k]; as[k].dbg_first_out = AV_NOPTS_VALUE;
@@ -2618,6 +2737,7 @@ end:
         if (inputs[k].ifmt) avformat_close_input(&inputs[k].ifmt);
         pthread_mutex_destroy(&inputs[k].h0_lock);
         pthread_mutex_destroy(&inputs[k].hold.lock);
+        pthread_mutex_destroy(&inputs[k].vring.lock);
     }
     av_buffer_unref(&hw_device);
     return ret;
@@ -2980,6 +3100,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_H0_REANCHOR")) g_h0_reanchor = 0;    /* A/B: don't floor per-slot lag (allow video-ahead) */
     { const char *rm = getenv("PTV_H0_REANCHOR_MS"); if (rm && atoi(rm) > 0) g_h0_reanchor_ms = atoi(rm); }
     if (getenv("PTV_AF_NO_PLL")) g_af_pll = 0;              /* A/B: pure discrete drop/pad (no smooth nudge) */
+    if (getenv("PTV_AVSYNC_PROBE")) g_avsync_probe = 1;    /* Phase A: read-only [PTV-AVSYNC2] real A/V offset */
     { const char *am = getenv("PTV_AF_ACQUIRE_MS"); if (am && atoi(am) > 0) g_af_acquire_us = atoi(am) * 1000; }
     { const char *rr = getenv("PTV_AF_RATE_MS_S");  if (rr && atoi(rr) > 0) g_af_rate_us = atoi(rr) * 1000; }
     { const char *s = getenv("PTV_SLOW_US"); g_slow = s ? atoi(s) : 0; }
