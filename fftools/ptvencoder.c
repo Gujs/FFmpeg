@@ -66,7 +66,18 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.7.1"  /* 0.7.1 (A/V-sync redesign P2, stage 2a — hybrid sparse program-offset): an ad-break
+#define PTVENCODER_VERSION "0.7.2"  /* 0.7.2 (A/V-sync redesign P2, stage 2b part 1 — DROP-UNTIL-KEYFRAME): after a detected
+ * source discontinuity (ad-splice), the new timeline starts mid-GOP, so its pre-IDR P/B frames decode as a corruption
+ * burst (greyed/torn) that the house clock then samples. Now drop video packets until the next IDR (AV_PKT_FLAG_KEY) in
+ * demux_thread → the house clock dup-holds the last good frame across the splice = a CLEAN CUT instead of a burst.
+ * Bounded by a wall-clock ESCAPE (PTV_DUKF_ESCAPE_MS, default 5s) so a no-IDR stream can't freeze the cell (the
+ * session-109 28h-freeze lesson), armed FIRST-ARM-ONLY (never re-stamp the escape while armed — the re-arm slide).
+ * Default ON; PTV_NO_DUKF=1 reverts. Mechanism local-validated (arms on disc / resumes at IDR / never arms on clean);
+ * the real mid-GOP burst-suppression is a box property (the injected-concat boundary is keyframe-aligned). REMAINING
+ * 2b: buffer-classify-keep-NEW (the interleaved-straddle whipsaw fix) — deferred pending box measurement of the
+ * residual straddle glitch after 2a+dukf. Spec: analysis/ptvencoder-p2-discontinuity-normalizer.md §3.5.
+ *
+ * 0.7.1 (A/V-sync redesign P2, stage 2a — hybrid sparse program-offset): an ad-break
  * PTS jump used to ORPHAN the sparse copied streams (DVB-sub/teletext, data, SCTE-35) — they skip the per-stream
  * discontinuity absorber (their multi-second gaps would false-trigger it), so they got NO discontinuity offset →
  * desync by the jump, and on a BACKWARD jump (TruBlu −500s) their rebased ts<h0 → demux_pass dropped them → subs/SCTE
@@ -139,6 +150,16 @@ static int     g_discont_ms = 80;
  * offset can be A/B'd against plain v0.6.23 sparse behaviour without disabling the whole absorber.
  * Default ON; PTV_NO_PROG_OFF=1 reverts (sparse get 33-bit wrap only, = v0.6.23 → orphaned across a jump). */
 static int     g_prog_off = 1;
+/* P2 §7.1 / stage 2b: after a detected source discontinuity, DROP video packets until the next keyframe
+ * (IDR) before they reach the decoder — a splice starts a NEW timeline mid-GOP, so the P/B frames that
+ * reference the missing IDR decode as a corruption burst (greyed/torn frames) that the house clock would
+ * then sample. Dropping them lets the house clock dup-hold the last good frame across the splice = a clean
+ * cut instead of a corruption burst. Bounded by a wall-clock ESCAPE (g_dukf_escape_us) so a stream that
+ * never sends an IDR can't freeze the cell (the session-109 28h-freeze lesson), and armed FIRST-ARM-ONLY
+ * (never re-stamp the escape deadline while already armed — the re-arm slide). Default ON; PTV_NO_DUKF=1
+ * reverts (decode the post-splice burst, = v0.6.23). MULTI/SINGLE both (per-input demux state). */
+static int     g_drop_until_kf = 1;
+static int64_t g_dukf_escape_us = 5000000;   /* PTV_DUKF_ESCAPE_MS: force-resume if no IDR within this */
 /* Multiview per-slot AUDIO-FOLLOW (Option A) — the per-slot A/V-sync fix. A mosaic's composite
  * video is forced onto a house-clock POSITION timeline (rung_pts; one shared frame can't be
  * content-stamped per cell), while the audio is CONTENT-anchored (src-h0). At the join they sit
@@ -1939,6 +1960,8 @@ typedef struct DemuxArgs {
                                            * DENSE video reference) applied to SPARSE copied streams (sub/data/SCTE)
                                            * which don't self-rebase — keeps them aligned to video across an ad-break
                                            * PTS jump instead of orphaned/vanishing. V/A keep per-stream self-rebase. */
+    int                   drop_until_kf;  /* P2 2b: armed on a video discontinuity → drop video until the next IDR */
+    int64_t               kf_arm_us;      /* P2 2b: wall time the drop was armed (first-arm-only escape deadline) */
     int64_t               vpkt, apkt, ppkt, vdrop, adrop, pdrop;
     int64_t               vcorrupt;       /* video packets flagged AV_PKT_FLAG_CORRUPT (discarded if g_discardcorrupt) */
 } DemuxArgs;
@@ -2081,12 +2104,20 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                 if (thresh > 0 && (delta > thresh || delta < -thresh)) {
                     int64_t nominal = pkt->duration > 0 ? pkt->duration : thresh / 4;
                     d->wrap_off[pkt->stream_index] -= (delta - nominal);
-                    if (ct == AVMEDIA_TYPE_VIDEO)
+                    if (ct == AVMEDIA_TYPE_VIDEO) {
                         d->prog_off -= (delta - nominal);   /* P2 §7.1: track the DENSE-reference (video) discontinuity
                                                              * offset program-level → applied to sparse sub/data/SCTE
                                                              * (which don't self-rebase) so they ride the same
                                                              * continuous timeline as video across the splice (mpegts:
                                                              * all streams share 90kHz, so this tick offset is uniform) */
+                        if (g_drop_until_kf && !d->drop_until_kf) {   /* P2 2b: arm drop-until-keyframe (first-arm-only) —
+                                                                       * the new timeline starts mid-GOP; drop its corrupt
+                                                                       * pre-IDR frames so the house clock holds the last
+                                                                       * good frame instead of sampling the burst */
+                            d->drop_until_kf = 1;
+                            d->kf_arm_us = av_gettime_relative();
+                        }
+                    }
                     if (d->disturb_epoch)   /* B3: a real content discontinuity → arm the PLL's mid-run re-acquire */
                         atomic_fetch_add_explicit(d->disturb_epoch, 1, memory_order_relaxed);
                     if (g_diag)
@@ -2145,6 +2176,17 @@ static void *demux_thread(void *arg)
             continue;
         }
         if (out->stream_index == d->vstream) {
+            if (d->drop_until_kf) {   /* P2 2b: post-splice → drop video until the next IDR (bounded by the escape) */
+                if (out->flags & AV_PKT_FLAG_KEY) {
+                    d->drop_until_kf = 0;                                  /* IDR → clean resume; send it */
+                    if (g_diag) av_log(NULL, AV_LOG_INFO, "[PTV-DUKF] resume at keyframe (dropped to IDR)\n");
+                } else if (av_gettime_relative() - d->kf_arm_us > g_dukf_escape_us) {
+                    d->drop_until_kf = 0;                                  /* escape: no IDR in time → don't freeze */
+                    if (g_diag) av_log(NULL, AV_LOG_WARNING, "[PTV-DUKF] escape — no IDR within %"PRId64"ms, resuming\n", g_dukf_escape_us/1000);
+                } else {
+                    d->vdrop++; av_packet_free(&out); continue;           /* drop the mid-GOP new-timeline burst */
+                }
+            }
             d->vpkt++;
             ret = demux_send(d->video_q, out, d->drop, &d->vdrop);
         } else {
@@ -3702,6 +3744,8 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_DISCONT")) g_discont = 0;     /* A/B: don't absorb source PTS discontinuities */
     { const char *dm = getenv("PTV_DISCONT_MS"); if (dm && atoi(dm) > 0) g_discont_ms = atoi(dm); }
     if (getenv("PTV_NO_PROG_OFF")) g_prog_off = 0;   /* P2: A/B — sparse copied streams get 33-bit wrap only (v0.6.23) */
+    if (getenv("PTV_NO_DUKF")) g_drop_until_kf = 0;  /* P2 2b: A/B — decode the post-splice corruption burst (v0.6.23) */
+    { const char *de = getenv("PTV_DUKF_ESCAPE_MS"); if (de && atoi(de) > 0) g_dukf_escape_us = (int64_t)atoi(de) * 1000; }
     if (getenv("PTV_NO_AUDIO_FOLLOW")) g_audio_follow = 0;  /* A/B: multiview audio uses old floored/capped async skew */
     if (getenv("PTV_NO_H0_REANCHOR")) g_h0_reanchor = 0;    /* A/B: don't floor per-slot lag (allow video-ahead) */
     if (getenv("PTV_NO_H0_AT_DISPLAY")) g_h0_at_display = 0; /* A/B: multiview anchors h0 at first DECODE, not first DISPLAY */
