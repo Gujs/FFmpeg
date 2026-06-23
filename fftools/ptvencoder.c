@@ -66,7 +66,22 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.7.0"  /* 0.7.0 (A/V-sync redesign P1): §7.5a POST-ENCODE DELIVERY-ALIGNMENT GATE — the
+#define PTVENCODER_VERSION "0.7.1"  /* 0.7.1 (A/V-sync redesign P2, stage 2a — hybrid sparse program-offset): an ad-break
+ * PTS jump used to ORPHAN the sparse copied streams (DVB-sub/teletext, data, SCTE-35) — they skip the per-stream
+ * discontinuity absorber (their multi-second gaps would false-trigger it), so they got NO discontinuity offset →
+ * desync by the jump, and on a BACKWARD jump (TruBlu −500s) their rebased ts<h0 → demux_pass dropped them → subs/SCTE
+ * VANISHED for minutes. FIX (hybrid): track a program-level offset `prog_off` from the DENSE video reference's
+ * discontinuity (the same −(delta−nominal) the video absorber applies to itself) and add it to the SPARSE streams in
+ * demux_unwrap's apply step — a uniform constant shift (preserves their sparse inter-packet deltas, so NOT the v0.6.14
+ * collapse) that moves them WITH the video across the splice. Dense V/A (incl. copied AC-3) keep their validated
+ * per-stream self-rebase UNTOUCHED (applying prog_off to them too would double-count). SCTE-35 also rides prog_off in
+ * its `pts_adjustment` rebase (0002) so the on-wire splice marker lands at the right content PTS after a jump. STAGE 2a
+ * = clean-splice fix ONLY: prog_off mirrors the video absorber so it whipsaws on an INTERLEAVED straddle (trailing-OLD
+ * after the first NEW pkt), and the copied-AC-3 whipsaw is untouched — both need 2b's buffer-classify (drops trailing-
+ * OLD) + drop-until-keyframe. Default ON; PTV_NO_PROG_OFF=1 reverts sparse to v0.6.23 (A/B vs the whole g_discont
+ * absorber). Spec: analysis/ptvencoder-p2-discontinuity-normalizer.md. Validation (gate B-copy) gated on the P1 soak.
+ *
+ * 0.7.0 (A/V-sync redesign P1): §7.5a POST-ENCODE DELIVERY-ALIGNMENT GATE — the
  * fftools "sync queue" the greenfield mux dropped. NVENC holds video ~0.85–0.9s (B-frames + CBR bufsize + GPU; A0
  * measured fleet-wide, encoder-caused) while transcoded audio + copied AC-3/MP2 are near-zero-latency → audio reaches
  * the muxer ~1s AHEAD of the video for the SAME content → audio-ahead-of-video on the wire → the downstream sync_check
@@ -117,6 +132,13 @@ static int     g_mv_clamp = 0;
  * beyond it = a glitch to absorb). */
 static int     g_discont = 1;
 static int     g_discont_ms = 80;
+/* P2 §7.1 (hybrid): apply the program-level discontinuity offset (tracked from the dense VIDEO reference)
+ * to the SPARSE copied streams (DVB-sub/teletext, data, SCTE-35) that can't self-rebase — so an ad-break
+ * PTS jump shifts them WITH the video instead of orphaning/vanishing them. Dense V/A (incl. copied AC-3)
+ * keep their own per-stream rebase (g_discont) untouched. Separate from g_discont so the sparse-program-
+ * offset can be A/B'd against plain v0.6.23 sparse behaviour without disabling the whole absorber.
+ * Default ON; PTV_NO_PROG_OFF=1 reverts (sparse get 33-bit wrap only, = v0.6.23 → orphaned across a jump). */
+static int     g_prog_off = 1;
 /* Multiview per-slot AUDIO-FOLLOW (Option A) — the per-slot A/V-sync fix. A mosaic's composite
  * video is forced onto a house-clock POSITION timeline (rung_pts; one shared frame can't be
  * content-stamped per cell), while the audio is CONTENT-anchored (src-h0). At the join they sit
@@ -1913,6 +1935,10 @@ typedef struct DemuxArgs {
     _Atomic int_least64_t *disturb_epoch; /* B3: bump this input's disturbance epoch when the discont absorber fires */
     int64_t              *wrap_off;       /* per input stream: cumulative 33-bit wrap offset (stream tb) */
     int64_t              *wrap_last;      /* per input stream: last RAW ts seen (wrap detection) */
+    int64_t               prog_off;       /* P2 (§7.1): program-level discontinuity offset (90kHz, detected on the
+                                           * DENSE video reference) applied to SPARSE copied streams (sub/data/SCTE)
+                                           * which don't self-rebase — keeps them aligned to video across an ad-break
+                                           * PTS jump instead of orphaned/vanishing. V/A keep per-stream self-rebase. */
     int64_t               vpkt, apkt, ppkt, vdrop, adrop, pdrop;
     int64_t               vcorrupt;       /* video packets flagged AV_PKT_FLAG_CORRUPT (discarded if g_discardcorrupt) */
 } DemuxArgs;
@@ -2055,6 +2081,12 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                 if (thresh > 0 && (delta > thresh || delta < -thresh)) {
                     int64_t nominal = pkt->duration > 0 ? pkt->duration : thresh / 4;
                     d->wrap_off[pkt->stream_index] -= (delta - nominal);
+                    if (ct == AVMEDIA_TYPE_VIDEO)
+                        d->prog_off -= (delta - nominal);   /* P2 §7.1: track the DENSE-reference (video) discontinuity
+                                                             * offset program-level → applied to sparse sub/data/SCTE
+                                                             * (which don't self-rebase) so they ride the same
+                                                             * continuous timeline as video across the splice (mpegts:
+                                                             * all streams share 90kHz, so this tick offset is uniform) */
                     if (d->disturb_epoch)   /* B3: a real content discontinuity → arm the PLL's mid-run re-acquire */
                         atomic_fetch_add_explicit(d->disturb_epoch, 1, memory_order_relaxed);
                     if (g_diag)
@@ -2066,6 +2098,14 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
         d->wrap_last[pkt->stream_index] = raw;
     }
     off = d->wrap_off[pkt->stream_index];
+    /* P2 §7.1: sparse copied streams (DVB-sub/teletext, data, SCTE-35) skip the per-stream discontinuity
+     * absorber above (their natural multi-second gaps would false-trigger it). They instead ride the
+     * PROGRAM-level offset accumulated from the dense video reference, so an ad-break PTS jump shifts them
+     * WITH the video instead of orphaning them (today they desync, and on a backward jump their ts<h0 →
+     * demux_pass drops them → subs/SCTE vanish). V/A keep their own per-stream rebase (unchanged). */
+    if (g_discont && g_prog_off && (st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE ||
+                                    st->codecpar->codec_type == AVMEDIA_TYPE_DATA))
+        off += d->prog_off;
     if (off) {
         if (pkt->pts != AV_NOPTS_VALUE) pkt->pts += off;
         if (pkt->dts != AV_NOPTS_VALUE) pkt->dts += off;
@@ -3661,6 +3701,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_MV_CLAMP")) g_mv_clamp = 1;      /* opt-in: re-enable the (stutter-prone) content clamp */
     if (getenv("PTV_NO_DISCONT")) g_discont = 0;     /* A/B: don't absorb source PTS discontinuities */
     { const char *dm = getenv("PTV_DISCONT_MS"); if (dm && atoi(dm) > 0) g_discont_ms = atoi(dm); }
+    if (getenv("PTV_NO_PROG_OFF")) g_prog_off = 0;   /* P2: A/B — sparse copied streams get 33-bit wrap only (v0.6.23) */
     if (getenv("PTV_NO_AUDIO_FOLLOW")) g_audio_follow = 0;  /* A/B: multiview audio uses old floored/capped async skew */
     if (getenv("PTV_NO_H0_REANCHOR")) g_h0_reanchor = 0;    /* A/B: don't floor per-slot lag (allow video-ahead) */
     if (getenv("PTV_NO_H0_AT_DISPLAY")) g_h0_at_display = 0; /* A/B: multiview anchors h0 at first DECODE, not first DISPLAY */
