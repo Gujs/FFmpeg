@@ -3041,7 +3041,15 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
             if (!e) { ret = AVERROR(ENOMEM); avcodec_free_context(&kdec); for (si = 0; si < r; si++) avcodec_free_context(&encs[si]); goto end; }
             e->sample_rate = 48000;
             e->ch_layout   = ochl;                          /* from -ac:a:N (stereo / 5.1 / …) */
-            e->sample_fmt  = aenc->sample_fmts ? aenc->sample_fmts[0] : AV_SAMPLE_FMT_FLTP;
+            {   /* pick the encoder's first supported sample format. Use avcodec_get_supported_config()
+                 * (the AVCodec.sample_fmts field is deprecated and REMOVED on current upstream — the
+                 * build box clones fresh upstream, so the old field breaks the static Linux build). */
+                const enum AVSampleFormat *sfmts = NULL;
+                e->sample_fmt = (avcodec_get_supported_config(NULL, aenc, AV_CODEC_CONFIG_SAMPLE_FORMAT,
+                                                              0, (const void **)&sfmts, NULL) >= 0
+                                 && sfmts && sfmts[0] != AV_SAMPLE_FMT_NONE)
+                              ? sfmts[0] : AV_SAMPLE_FMT_FLTP;
+            }
             e->bit_rate    = 160000;
             e->time_base   = (AVRational){1, 48000};
             if (rung[r].ofmt->oformat->flags & AVFMT_GLOBALHEADER) e->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
