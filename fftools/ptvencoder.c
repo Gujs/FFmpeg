@@ -41,6 +41,7 @@
 
 #include "libavutil/avutil.h"
 #include "libavutil/log.h"
+#include "libavutil/opt.h"
 #include "libavutil/time.h"
 #include "libavutil/parseutils.h"
 #include "libavutil/mathematics.h"
@@ -66,7 +67,8 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.7.3"  /* 0.7.3 (P2 box-tuning from cor-1 A16 real-HW validation): (1) DELIVERY CAP default
+#define PTVENCODER_VERSION "0.7.4"  /* 0.7.4 (diagnostic, logging-only/byte-identical): [PTV-SWRDELAY] logs the -af aresample filter's internal swr_get_delay() on the -stats cadence — the FAITHFUL resampler-slip sensor the PTS-based offset=/house_skew/sync_check-D are structurally blind to; min_hard_comp (set in ptvencoder.sh) should bound it.
+                                    * 0.7.3 (P2 box-tuning from cor-1 A16 real-HW validation): (1) DELIVERY CAP default
  * 2s→3s — the real production-load hold is ~2s (TruBLU cor-1 dlvhold=2055ms; A0's 845ms underestimated), so the 2s
  * default cap-saturated (dlvforced climbing); 3s lets the precise DTS-match win (box-confirmed dlvforced 38033→0,
  * wire D −0.078→−0.057s), harmless on low-hold channels. (2) DROP-UNTIL-KEYFRAME now arms only on a LARGE jump
@@ -1268,6 +1270,8 @@ typedef struct AudioState {
     AVCodecContext  *enc[PTV_MAX_RUNG];          /* one AAC encoder per rung (per-rung -b:a) */
     AVRational       ist_tb;
     SwrContext      *swr;                         /* no -af: plain resample to 48k stereo */
+    SwrContext      *fg_swr;                       /* -af path: the (async) aresample filter's internal SwrContext — swr_get_delay() = faithful resampler-slip sensor (PTS metrics are blind to it) */
+    int64_t          fg_swr_delay_max_ms;          /* running peak of swr_get_delay for observability */
     AVFilterGraph   *afg;                         /* -af present: abuffer -> chain -> abuffersink */
     AVFilterContext *afsrc, *afsink;
     int              use_fg;
@@ -1699,6 +1703,16 @@ static int audio_drain_fg(AudioState *a)
                             "[PTV-AVSYNC] a%d(in%d) lipsync=%+"PRId64"ms | offset=%s (vlag=%+"PRId64"ms alag=%+"PRId64"ms) "
                             "house_skew=%+"PRId64"ms  [lipsync>0 / offset<0 = audio late]\n",
                             a->dbg_k, a->dbg_in, lshead / 1000, m, a->av_vlag_us / 1000, a->av_alag_us / 1000, lag / 1000);
+                    /* FAITHFUL resampler-slip sensor (the one signal offset=/sync_check-D can't see).
+                     * If swr_delay grows unbounded → the hard-comp (min_hard_comp) is NOT firing (AVLOCK
+                     * may be masking delta); if it stays bounded → the slip is being corrected. */
+                    if (a->fg_swr) {
+                        int64_t dms = swr_get_delay(a->fg_swr, 1000);
+                        if (dms > a->fg_swr_delay_max_ms) a->fg_swr_delay_max_ms = dms;
+                        av_log(NULL, AV_LOG_INFO,
+                            "[PTV-SWRDELAY] a%d(in%d) swr_delay=%"PRId64"ms (max %"PRId64"ms)\n",
+                            a->dbg_k, a->dbg_in, dms, a->fg_swr_delay_max_ms);
+                    }
                     a->avsync_stat_last = nowp;
                 }
             }
@@ -1929,6 +1943,26 @@ static int build_audio_filter(AudioState *a, AVCodecContext *adec, AVRational tb
     ins->name  = av_strdup("out"); ins->filter_ctx  = a->afsink; ins->pad_idx  = 0; ins->next  = NULL;
     if ((ret = avfilter_graph_parse_ptr(a->afg, chain, &ins, &outs, NULL)) < 0) goto end;
     if ((ret = avfilter_graph_config(a->afg, NULL)) < 0) goto end;
+
+    /* Grab the async aresample filter's internal SwrContext. swr_get_delay() on it is the
+     * FAITHFUL resampler-slip sensor: the PTS-based metrics (offset=/house_skew/sync_check D)
+     * are structurally blind to a sub-resampler slip, so this is the one number that sees it.
+     * Prefer the aresample whose swr has async set (the explicit -af one), fall back to the first. */
+    a->fg_swr = NULL;
+    for (unsigned i = 0; i < a->afg->nb_filters; i++) {
+        AVFilterContext *fc = a->afg->filters[i];
+        if (fc && fc->filter && !strcmp(fc->filter->name, "aresample") && fc->priv) {
+            SwrContext *cand = av_opt_child_next(fc->priv, NULL);
+            if (cand) {
+                int64_t as = 0;
+                av_opt_get_int(cand, "async", 0, &as);
+                if (!a->fg_swr || as) a->fg_swr = cand;
+                if (as) break;
+            }
+        }
+    }
+    if (a->fg_swr)
+        av_log(NULL, AV_LOG_INFO, "ptvencoder: [PTV-SWRDELAY] sensor armed (aresample SwrContext found)\n");
 
     /* deliver encoder-sized frames so we can feed them straight to the AAC
      * encoders carrying their own (async-corrected) PTS — no FIFO repackaging. */
