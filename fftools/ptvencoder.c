@@ -66,7 +66,16 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.7.2"  /* 0.7.2 (A/V-sync redesign P2, stage 2b part 1 — DROP-UNTIL-KEYFRAME): after a detected
+#define PTVENCODER_VERSION "0.7.3"  /* 0.7.3 (P2 box-tuning from cor-1 A16 real-HW validation): (1) DELIVERY CAP default
+ * 2s→3s — the real production-load hold is ~2s (TruBLU cor-1 dlvhold=2055ms; A0's 845ms underestimated), so the 2s
+ * default cap-saturated (dlvforced climbing); 3s lets the precise DTS-match win (box-confirmed dlvforced 38033→0,
+ * wire D −0.078→−0.057s), harmless on low-hold channels. (2) DROP-UNTIL-KEYFRAME now arms only on a LARGE jump
+ * (PTV_DUKF_MIN_MS=1000) not the 80ms absorber threshold — a +90ms VIDEO-ONLY jitter blip on TruBLU spuriously
+ * dropped a GOP; real splices were ≥120s so ≥1s cleanly separates them. Validated real-HW: TruBLU rode 4 real
+ * ad-break jumps (+630/−120/−1461/−750s) audio-continuous no-stall (app-confirmed); AWE_Plus SCTE ad break
+ * CDN-detected (clean splice). Spec: analysis/ptvencoder-p2-discontinuity-normalizer.md.
+ *
+ * 0.7.2 (A/V-sync redesign P2, stage 2b part 1 — DROP-UNTIL-KEYFRAME): after a detected
  * source discontinuity (ad-splice), the new timeline starts mid-GOP, so its pre-IDR P/B frames decode as a corruption
  * burst (greyed/torn) that the house clock then samples. Now drop video packets until the next IDR (AV_PKT_FLAG_KEY) in
  * demux_thread → the house clock dup-holds the last good frame across the splice = a CLEAN CUT instead of a burst.
@@ -160,6 +169,13 @@ static int     g_prog_off = 1;
  * reverts (decode the post-splice burst, = v0.6.23). MULTI/SINGLE both (per-input demux state). */
 static int     g_drop_until_kf = 1;
 static int64_t g_dukf_escape_us = 5000000;   /* PTV_DUKF_ESCAPE_MS: force-resume if no IDR within this */
+/* P2 2b (v0.7.3): arm drop-until-keyframe only on a LARGE jump (a real ad-splice), not on sub-second
+ * jitter. The absorber/prog_off detection threshold is g_discont_ms (80ms) — fine for the small,
+ * harmless timeline re-base — but DUKF *drops video to the next IDR*, so a sub-second blip (observed:
+ * a +90ms VIDEO-ONLY jitter event on TruBLU, no audio pair → not a real splice) would needlessly drop
+ * up to a GOP. Gate the video-drop on a separate, higher threshold (real splices on the box were
+ * ≥120s; anything ≥~1s is a genuine timeline change). PTV_DUKF_MIN_MS overrides. */
+static int     g_dukf_min_ms = 1000;
 /* Multiview per-slot AUDIO-FOLLOW (Option A) — the per-slot A/V-sync fix. A mosaic's composite
  * video is forced onto a house-clock POSITION timeline (rung_pts; one shared frame can't be
  * content-stamped per cell), while the audio is CONTENT-anchored (src-h0). At the join they sit
@@ -277,7 +293,12 @@ static int     g_discardcorrupt = 1;
  * P1 — the multiview audio path is reworked in P3). Offline (file out) always bypasses. */
 static int     g_delivery = 1;
 static int     g_delivery_mv;                 /* PTV_DELIVERY_MV=1: also gate multiview (default off in P1) */
-static int64_t g_delivery_cap_us = 2000000;   /* PTV_DELIVERY_CAP_MS: force-release ceiling (≥ max encoder latency; A0 ≈1.5–2s) */
+static int64_t g_delivery_cap_us = 3000000;   /* PTV_DELIVERY_CAP_MS: force-release ceiling (≥ max encoder latency).
+                                                * 3s (v0.7.3): the real steady-state hold under production load is ~2s
+                                                * (box: TruBLU on cor-1 dlvhold=2055ms — A0's 845ms underestimated it),
+                                                * so the old 2s default cap-saturated (dlvforced climbing); 3s lets the
+                                                * precise DTS-match win (dlvforced→0) with margin, harmless on low-hold
+                                                * channels (match wins well before 3s), still bounds a stuck encoder to 3s. */
 static int     g_delivery_maxq = 512;         /* PTV_DELIVERY_MAXQ: hold-FIFO size backstop (total-stall back-pressure point) */
 /* Muxed-packet stats counters. Written by N mux threads (6-rung ABR) -> atomic to avoid a
  * data race / lost updates in the bitrate=/size= stat line. Stats-only; not on any hot path. */
@@ -2110,12 +2131,15 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                                                              * (which don't self-rebase) so they ride the same
                                                              * continuous timeline as video across the splice (mpegts:
                                                              * all streams share 90kHz, so this tick offset is uniform) */
-                        if (g_drop_until_kf && !d->drop_until_kf) {   /* P2 2b: arm drop-until-keyframe (first-arm-only) —
-                                                                       * the new timeline starts mid-GOP; drop its corrupt
-                                                                       * pre-IDR frames so the house clock holds the last
-                                                                       * good frame instead of sampling the burst */
-                            d->drop_until_kf = 1;
-                            d->kf_arm_us = av_gettime_relative();
+                        {   /* P2 2b: arm drop-until-keyframe (first-arm-only), but ONLY on a LARGE jump (a real
+                             * splice) — not a sub-second jitter blip (which would drop a GOP for nothing). The
+                             * absorber/prog_off above still fires at g_discont_ms; the video-drop gets g_dukf_min_ms. */
+                            int64_t dukf_thresh = av_rescale(g_dukf_min_ms, st->time_base.den, (int64_t)st->time_base.num * 1000);
+                            if (g_drop_until_kf && !d->drop_until_kf &&
+                                (delta > dukf_thresh || delta < -dukf_thresh)) {
+                                d->drop_until_kf = 1;
+                                d->kf_arm_us = av_gettime_relative();
+                            }
                         }
                     }
                     if (d->disturb_epoch)   /* B3: a real content discontinuity → arm the PLL's mid-run re-acquire */
@@ -3746,6 +3770,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_PROG_OFF")) g_prog_off = 0;   /* P2: A/B — sparse copied streams get 33-bit wrap only (v0.6.23) */
     if (getenv("PTV_NO_DUKF")) g_drop_until_kf = 0;  /* P2 2b: A/B — decode the post-splice corruption burst (v0.6.23) */
     { const char *de = getenv("PTV_DUKF_ESCAPE_MS"); if (de && atoi(de) > 0) g_dukf_escape_us = (int64_t)atoi(de) * 1000; }
+    { const char *dm = getenv("PTV_DUKF_MIN_MS"); if (dm && atoi(dm) > 0) g_dukf_min_ms = atoi(dm); }  /* P2 2b: min jump to arm drop-until-keyframe */
     if (getenv("PTV_NO_AUDIO_FOLLOW")) g_audio_follow = 0;  /* A/B: multiview audio uses old floored/capped async skew */
     if (getenv("PTV_NO_H0_REANCHOR")) g_h0_reanchor = 0;    /* A/B: don't floor per-slot lag (allow video-ahead) */
     if (getenv("PTV_NO_H0_AT_DISPLAY")) g_h0_at_display = 0; /* A/B: multiview anchors h0 at first DECODE, not first DISPLAY */
