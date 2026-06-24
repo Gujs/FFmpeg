@@ -67,7 +67,8 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.7.5"  /* 0.7.5 (diagnostic): [PTV-CHAIN] traces source-content time (us) at the demux + at output emission for video/primary-audio every 10s — srcAV (input) vs outAV (output) localizes WHERE the A/V relationship diverges (source drift vs ptvencoder restamp). Logging-only/byte-identical.
+#define PTVENCODER_VERSION "0.7.6"  /* 0.7.6 (diagnostic, logging-only/byte-identical): [PTV-CHAIN] adds rawA-V (PRE-demux_unwrap source-native A/V) + unwrap_inj (= srcA-V − rawA-V) → separates source-inherent A/V drift (rawA-V grows) from demux_unwrap per-stream rebase divergence (unwrap_inj grows). The number that decides §5.A (program rebase) vs §5.B (genlock).
+                                    * 0.7.5 (diagnostic): [PTV-CHAIN] traces source-content time (us) at the demux + at output emission for video/primary-audio every 10s — srcAV (input) vs outAV (output) localizes WHERE the A/V relationship diverges (source drift vs ptvencoder restamp). Logging-only/byte-identical.
                                     * 0.7.4 (diagnostic, logging-only/byte-identical): [PTV-SWRDELAY] logs the -af aresample filter's internal swr_get_delay() on the -stats cadence — the FAITHFUL resampler-slip sensor the PTS-based offset=/house_skew/sync_check-D are structurally blind to; min_hard_comp (set in ptvencoder.sh) should bound it.
                                     * 0.7.3 (P2 box-tuning from cor-1 A16 real-HW validation): (1) DELIVERY CAP default
  * 2s→3s — the real production-load hold is ~2s (TruBLU cor-1 dlvhold=2055ms; A0's 845ms underestimated), so the 2s
@@ -313,10 +314,12 @@ static _Atomic int64_t g_muxed_bytes;
  * log a synchronized per-track audio-minus-video offset. Temporary diagnostic. */
 static _Atomic int64_t g_vout_us;
 /* [PTV-CHAIN] data-driven A/V trace (diagnostic): latest SOURCE-CONTENT time (us, post-unwrap)
- * at the demux and at output emission, for video + primary audio. srcAV (demux) vs outAV (output)
- * localizes WHERE the A/V content relationship diverges (source drift vs ptvencoder restamp).
- * Coarse 10s sample, relaxed atomics. */
+ * at the demux and at output emission, for video + primary audio. THREE-WAY split:
+ * rawA-V (PRE-demux_unwrap, source-native) vs srcA-V (POST-unwrap) vs outA-V (output) →
+ * separates source-inherent A/V drift (raw grows) from demux_unwrap per-stream rebase
+ * divergence (unwrap_inj grows) from ptvencoder restamp (introduced). Coarse 10s, relaxed atomics. */
 static _Atomic int64_t g_ch_vsrc, g_ch_asrc, g_ch_vout_src, g_ch_aout_src;
+static _Atomic int64_t g_ch_vsrc_raw, g_ch_asrc_raw;   /* [PTV-CHAIN] PRE-unwrap raw source ts (us) */
 /* -stats_period: interval (us) between progress lines. Default 1s; raise for
  * production (e.g. -stats_period 10 -> every 10s) to keep logs quiet. */
 static int64_t g_stats_period_us = 1000000;
@@ -1725,13 +1728,17 @@ static int audio_drain_fg(AudioState *a)
                             a->dbg_k, a->dbg_in, dms, dsamp, a->fg_swr_delay_max_ms);
                     }
                     if (a->dbg_k == 0) {   /* [PTV-CHAIN] data-driven A/V trace, primary track only */
-                        int64_t vs = atomic_load_explicit(&g_ch_vsrc, memory_order_relaxed);
-                        int64_t as = atomic_load_explicit(&g_ch_asrc, memory_order_relaxed);
-                        int64_t vo = atomic_load_explicit(&g_ch_vout_src, memory_order_relaxed);
-                        int64_t ao = atomic_load_explicit(&g_ch_aout_src, memory_order_relaxed);
+                        int64_t vs  = atomic_load_explicit(&g_ch_vsrc, memory_order_relaxed);
+                        int64_t as  = atomic_load_explicit(&g_ch_asrc, memory_order_relaxed);
+                        int64_t vsr = atomic_load_explicit(&g_ch_vsrc_raw, memory_order_relaxed);
+                        int64_t asr = atomic_load_explicit(&g_ch_asrc_raw, memory_order_relaxed);
+                        int64_t vo  = atomic_load_explicit(&g_ch_vout_src, memory_order_relaxed);
+                        int64_t ao  = atomic_load_explicit(&g_ch_aout_src, memory_order_relaxed);
+                        /* rawA-V grows → source-inherent A/V drift (→ §5.B genlock); rawA-V flat but
+                         * unwrap_inj grows → demux_unwrap injects it (→ §5.A program rebase). */
                         av_log(NULL, AV_LOG_INFO,
-                            "[PTV-CHAIN] demux Vsrc=%"PRId64"ms Asrc=%"PRId64"ms (srcA-V=%+"PRId64"ms) | out Vsrc=%"PRId64"ms Asrc=%"PRId64"ms (outA-V=%+"PRId64"ms) | introduced=%+"PRId64"ms\n",
-                            vs/1000, as/1000, (as-vs)/1000, vo/1000, ao/1000, (ao-vo)/1000, ((ao-vo)-(as-vs))/1000);
+                            "[PTV-CHAIN] demux rawA-V=%+"PRId64"ms srcA-V=%+"PRId64"ms (unwrap_inj=%+"PRId64"ms) | outA-V=%+"PRId64"ms | introduced=%+"PRId64"ms\n",
+                            (asr-vsr)/1000, (as-vs)/1000, ((as-vs)-(asr-vsr))/1000, (ao-vo)/1000, ((ao-vo)-(as-vs))/1000);
                     }
                     a->avsync_stat_last = nowp;
                 }
@@ -2243,6 +2250,16 @@ static void *demux_thread(void *arg)
         AVPacket *out = av_packet_alloc();
         if (!out) { av_packet_unref(pkt); break; }
         av_packet_move_ref(out, pkt);
+        /* [PTV-CHAIN] RAW source-content tap — BEFORE demux_unwrap, so rawA-V reflects the
+         * source's native A/V relationship. Compared against the post-unwrap srcA-V below, this
+         * separates source-inherent A/V drift (rawA-V grows) from demux_unwrap per-stream rebase
+         * divergence (rawA-V flat, srcA-V grows = unwrap_inj) — the number that decides §5.A vs §5.B. */
+        if (out->pts != AV_NOPTS_VALUE) {
+            if (out->stream_index == d->vstream)
+                atomic_store_explicit(&g_ch_vsrc_raw, av_rescale_q(out->pts, d->ifmt->streams[d->vstream]->time_base, AV_TIME_BASE_Q), memory_order_relaxed);
+            else if (d->n_audio > 0 && out->stream_index == d->astream[0])
+                atomic_store_explicit(&g_ch_asrc_raw, av_rescale_q(out->pts, d->ifmt->streams[out->stream_index]->time_base, AV_TIME_BASE_Q), memory_order_relaxed);
+        }
         demux_unwrap(d, out);               /* 33-bit source wrap -> monotonic extended ts (ONCE) */
         if ((out->flags & AV_PKT_FLAG_CORRUPT) && g_discardcorrupt) {
             /* = -fflags +discardcorrupt, ALL streams — but COUNTED (video) so frame loss shows in stats
