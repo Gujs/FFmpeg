@@ -67,7 +67,8 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.7.8"  /* 0.7.8 (§5.A.2 A/V-drift fix, OPT-IN): dense V/A share ONE program discontinuity offset (prog_off) instead of each self-rebasing — the per-stream self-rebase diverged (different nominal/packet-position at the interleaved splice) → same-sign per-splice residual accumulating ~+150ms/hr on TruBLU. Now: nobody self-rebases the discontinuity; prog_off is the SOLE accumulator, bumped once per splice by the FIRST dense crosser (wall-clock debounced so the 2nd stream adopts), all dense+sparse apply mask+prog_off → V&A on one timeline → zero divergence (= legacy 0004 audio-derived offset; audio-led splices → audio bumps, video adopts). DEFAULT OFF (staged rollout — §5.A.1 ships/soaks first); PTV_PROGOFF_AV=1 enables, PTV_PROGOFF_DEBOUNCE_MS tunes.
+#define PTVENCODER_VERSION "0.7.9"  /* 0.7.9 (§5.A.2 FIX — v0.7.8 had a live straddle blowup): dense V/A absorb the SHARED first-crosser discontinuity amount, but each still self-rebases its OWN wrap_off AT ITS OWN crossing (proven path) → no premature offset on un-crossed packets → no house_skew/aresample blowup. v0.7.8 applied prog_off to ALL packets immediately → during the V/A straddle the not-yet-crossed stream got the offset → house_skew blew up ~1372s on TruBLU live (audio destroyed). This version touches ONLY the rebase amount (shared vs own); apply path unchanged. Still zeroes V/A divergence. DEFAULT OFF; PTV_PROGOFF_AV=1, PTV_PROGOFF_DEBOUNCE_MS tunes.
+                                    * 0.7.8 (§5.A.2, WITHDRAWN — straddle blowup): dense V/A shared prog_off applied to all packets; broke live. Superseded by 0.7.9.
                                     * 0.7.7 (§5.A.1 A/V-drift fix): DIRECTIONAL discontinuity-absorber threshold — FORWARD jumps default 1000ms (was 80ms), BACKWARD keep 80ms. Box-confirmed (TruBLU): the +90ms forward video-only frame-drops were being absorbed → video timeline compressed ~57ms each → audio behind ~+150ms/hr; at forward-1000 they flow through (player holds last frame, A/V aligned). Backward stays 80ms so a backward jump still absorbs → no aresample stall (v0.6.23). Knobs PTV_DISCONT_MS (forward) / PTV_DISCONT_BACK_MS (backward).
                                     * 0.7.6 (diagnostic, logging-only/byte-identical): [PTV-CHAIN] adds rawA-V (PRE-demux_unwrap source-native A/V) + unwrap_inj (= srcA-V − rawA-V) → separates source-inherent A/V drift (rawA-V grows) from demux_unwrap per-stream rebase divergence (unwrap_inj grows). The number that decides §5.A (program rebase) vs §5.B (genlock).
                                     * 0.7.5 (diagnostic): [PTV-CHAIN] traces source-content time (us) at the demux + at output emission for video/primary-audio every 10s — srcAV (input) vs outAV (output) localizes WHERE the A/V relationship diverges (source drift vs ptvencoder restamp). Logging-only/byte-identical.
@@ -175,17 +176,20 @@ static int     g_discont_back_ms = 80;    /* backward jump threshold (keep small
  * offset can be A/B'd against plain v0.6.23 sparse behaviour without disabling the whole absorber.
  * Default ON; PTV_NO_PROG_OFF=1 reverts (sparse get 33-bit wrap only, = v0.6.23 → orphaned across a jump). */
 static int     g_prog_off = 1;
-/* §5.A.2 (v0.7.7): make DENSE video+audio share ONE program discontinuity offset instead of each
- * self-rebasing. The old per-stream self-rebase diverges (video frame-dur ≠ audio frame-dur, different
- * packet positions across the interleaved splice) → a same-sign per-splice A/V residual that accumulates
- * (~+150ms/hr measured on TruBLU). Fix: nobody self-rebases the discontinuity; prog_off is the SOLE
- * accumulator, bumped once per splice by the FIRST dense stream to cross it (debounced on wall-clock so
- * the 2nd stream crossing the SAME splice adopts rather than re-bumping); ALL dense+sparse apply
- * mask+prog_off → V and A share one timeline → zero divergence (= legacy 0004's single audio-derived
- * offset; for TruBLU's audio-led splices audio bumps first, video adopts). Default OFF (opt-in for staged
- * rollout — §5.A.1 directional threshold ships/soaks first); PTV_PROGOFF_AV=1 enables. wrap_off then holds
- * ONLY the 33-bit mask. ⚠ assumes a threshold-crossing jump is program-wide; a video-only BACKWARD jump
- * 80ms-1s would shift audio spuriously (§5.B-reserved asymmetric case; none on fleet — watch unwrap_inj). */
+/* §5.A.2 (v0.7.8 corrected): make DENSE video+audio absorb the SAME discontinuity amount so they don't
+ * diverge. The old per-stream self-rebase used each stream's OWN adj (video frame-dur ≠ audio frame-dur,
+ * different packet position across the interleaved splice) → a same-sign per-splice A/V residual that
+ * accumulates (~+150ms/hr on TruBLU). Fix: each dense stream STILL self-rebases its own wrap_off at its
+ * OWN crossing (the v0.6.23-proven path — never offsets a not-yet-crossed stream, so the compositor
+ * h0/skew math sees no premature leap), but it uses the SHARED first-crosser adj (splice_adj, debounced
+ * on wall-clock g_progoff_debounce_us so the 2nd stream crossing the SAME splice adopts the amount) →
+ * V and A land on the same offset → zero divergence (= legacy 0004's single audio-derived offset; for
+ * TruBLU's audio-led splices audio sets it, video adopts).
+ *   ⚠ v0.7.7 FIRST TRY (apply prog_off to ALL packets immediately) was WRONG — during the V/A straddle it
+ *   offset the not-yet-crossed stream → house_skew/aresample blew up a full splice (~1372s) live. This
+ *   version touches ONLY the rebase amount; the apply path is the unchanged proven one.
+ * Default OFF (opt-in; PTV_PROGOFF_AV=1). ⚠ assumes a threshold-crossing jump is program-wide; a video-only
+ * BACKWARD jump 80ms-1s would shift audio spuriously (§5.B-reserved asymmetric case; none on fleet). */
 static int     g_progoff_av = 0;
 static int64_t g_progoff_debounce_us = 1000000;   /* PTV_PROGOFF_DEBOUNCE_MS: coalesce a V/A straddle into one bump */
 /* P2 §7.1 / stage 2b: after a detected source discontinuity, DROP video packets until the next keyframe
@@ -2069,8 +2073,9 @@ typedef struct DemuxArgs {
                                            * DENSE video reference) applied to SPARSE copied streams (sub/data/SCTE)
                                            * which don't self-rebase — keeps them aligned to video across an ad-break
                                            * PTS jump instead of orphaned/vanishing. V/A keep per-stream self-rebase.
-                                           * §5.A.2 (g_progoff_av): becomes the SOLE shared accumulator for dense V/A too. */
-    int64_t               prog_off_bump_us; /* §5.A.2: wall-clock of the last prog_off bump (debounce; 0 = never) */
+                                           * §5.A.2 (g_progoff_av): dense V/A self-rebase by the SHARED first-crosser amount. */
+    int64_t               splice_adj;       /* §5.A.2: the first-crosser's discontinuity adj for the current splice */
+    int64_t               splice_adj_us;    /* §5.A.2: wall-clock when splice_adj was set (debounce; 0 = never) */
     int                   drop_until_kf;  /* P2 2b: armed on a video discontinuity → drop video until the next IDR */
     int64_t               kf_arm_us;      /* P2 2b: wall time the drop was armed (first-arm-only escape deadline) */
     int64_t               vpkt, apkt, ppkt, vdrop, adrop, pdrop;
@@ -2221,25 +2226,24 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                     int64_t nominal = pkt->duration > 0 ? pkt->duration : thresh / 4;
                     int64_t adj = delta - nominal;
                     if (g_progoff_av) {
-                        /* §5.A.2: SINGLE shared accumulator. The first dense stream to detect THIS splice
-                         * bumps prog_off; a detection within g_progoff_debounce_us of the last bump = the
-                         * other stream crossing the SAME splice → adopt (don't re-bump, else ~2× offset).
-                         * NO per-stream self-rebase: wrap_off holds only the 33-bit mask; all dense+sparse
-                         * apply mask+prog_off below → V & A share one timeline → zero divergence. */
+                        /* §5.A.2 (adopt-on-crossing, SHARED amount): each dense stream still self-rebases its
+                         * OWN wrap_off at its OWN crossing (the v0.6.23-proven path — a not-yet-crossed stream
+                         * is NEVER given the offset, so the compositor h0/skew math sees no premature leap),
+                         * but it absorbs the SHARED first-crosser delta instead of its own → V and A land on the
+                         * same offset → zero A/V divergence. First dense stream to cross a splice sets the shared
+                         * adj; another stream crossing within g_progoff_debounce_us adopts it.
+                         *   ⚠ v0.7.7's "apply prog_off to ALL packets" was WRONG — it offset un-crossed packets
+                         *   during the V/A straddle → house_skew/aresample blew up ~a full splice (live). This
+                         *   rebases each stream only at its OWN crossing, just by the shared amount. */
                         int64_t nowb = av_gettime_relative();
-                        if (nowb - d->prog_off_bump_us > g_progoff_debounce_us) {
-                            d->prog_off -= adj;
-                            d->prog_off_bump_us = nowb;
-                        }
-                    } else {
-                        /* v0.7.6 and earlier: per-stream self-rebase; video also publishes prog_off (sparse only). */
-                        d->wrap_off[pkt->stream_index] -= adj;
-                        if (ct == AVMEDIA_TYPE_VIDEO)
-                            d->prog_off -= adj;
+                        if (nowb - d->splice_adj_us <= g_progoff_debounce_us)
+                            adj = d->splice_adj;                                   /* same splice → adopt shared amount */
+                        else { d->splice_adj = adj; d->splice_adj_us = nowb; }     /* first crosser sets the shared amount */
                     }
+                    d->wrap_off[pkt->stream_index] -= adj;   /* per-stream rebase AT OWN CROSSING (shared amount when g_progoff_av) */
                     if (ct == AVMEDIA_TYPE_VIDEO) {
-                        /* P2 2b: arm drop-until-keyframe on VIDEO's OWN crossing (first-arm-only), ONLY on a
-                         * LARGE jump (a real splice) — independent of who bumped prog_off (review v6.3). */
+                        d->prog_off -= adj;                  /* P2: sparse sub/data/SCTE ride this */
+                        /* P2 2b: arm drop-until-keyframe on VIDEO's own crossing (first-arm-only), ONLY on a LARGE jump. */
                         int64_t dukf_thresh = av_rescale(g_dukf_min_ms, st->time_base.den, (int64_t)st->time_base.num * 1000);
                         if (g_drop_until_kf && !d->drop_until_kf &&
                             (delta > dukf_thresh || delta < -dukf_thresh)) {
@@ -2257,17 +2261,14 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
         }
         d->wrap_last[pkt->stream_index] = raw;
     }
-    off = d->wrap_off[pkt->stream_index];   /* §5.A.2: when g_progoff_av, this is the 33-bit MASK only */
-    if (g_discont && g_progoff_av) {
-        /* §5.A.2: ALL dense (V/A, incl. copied AC-3) AND sparse (sub/data/SCTE) ride the ONE shared prog_off
-         * → V and A stay on a single program timeline across a splice → zero per-stream divergence. */
+    off = d->wrap_off[pkt->stream_index];   /* 33-bit mask + per-stream discontinuity self-rebase (dense V/A) */
+    /* P2 §7.1: sparse copied streams (DVB-sub/teletext, data, SCTE-35) skip the per-stream absorber (their
+     * multi-second gaps would false-trigger it) and instead ride the program offset. Dense V/A carry their
+     * own per-stream rebase in wrap_off above (§5.A.2 makes that rebase use the SHARED amount, but it's still
+     * applied per-stream at each stream's own crossing — NOT added to prog_off here). */
+    if (g_discont && g_prog_off && (st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE ||
+                                    st->codecpar->codec_type == AVMEDIA_TYPE_DATA))
         off += d->prog_off;
-    } else if (g_discont && g_prog_off && (st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE ||
-                                           st->codecpar->codec_type == AVMEDIA_TYPE_DATA)) {
-        /* P2 §7.1 (legacy path, g_progoff_av off): only SPARSE copied streams ride prog_off (they skip the
-         * per-stream absorber — their multi-second gaps would false-trigger it); dense V/A self-rebase. */
-        off += d->prog_off;
-    }
     if (off) {
         if (pkt->pts != AV_NOPTS_VALUE) pkt->pts += off;
         if (pkt->dts != AV_NOPTS_VALUE) pkt->dts += off;
