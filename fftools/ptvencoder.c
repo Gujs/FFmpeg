@@ -67,7 +67,8 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.8.0"  /* 0.8.0 (§13 DEEP BURSTY-INPUT PRIME, opt-in per-channel): PTV_PREROLL_MS now sizes a deep startup cushion carried by video_q (not the ~1.6s frame_q cap) so HLS-segment bursty delivery (Fintech_247, Unique_TV: ~6s segment as a 1.3s burst + 4.7s gap) no longer starves the house clock into a monotonic house_skew runaway. Mechanism: the realtime-limited decoder delays its start until video_q banks ≥ PTV_PREROLL_MS worth of packets (demux fills it while waiting), and video_q is auto-sized to hold it (bounded). Cost: ~+PTV_PREROLL_MS latency on opted-in channels only. DEFAULT 350ms → 0 deep packets → BYTE-IDENTICAL (no decode delay; only bursty channels set PTV_PREROLL_MS≈segment+margin, e.g. 8000 for 6s segments, 12000 for 10s). Open risk: if a channel still climbs with a deep prime → true rate deficit (needs clock recovery, P3/B4), not a buffer.
+#define PTVENCODER_VERSION "0.8.1"  /* 0.8.1 (§13 hardening, review): startup-blackout budget 3x->2x preroll (worst-case ~16s not ~24s, documented); clamp deep_prime_packets to video_q-32 so the prime-wait is always satisfiable at high fps (>~68fps could exceed the queue cap ->永 time out); pre-h0 audio ring gated by g_aq_cap (256 default = byte-identical, PTV_AQ_PREROLL only when deep) so a slow-h0 NON-bursty channel stays bit-identical; documented the whole-session rung-0 lossless block + its decoder->video_q->demux->input back-pressure chain. No behavior change vs 0.8.0 on a deep-prime channel; default path now strictly byte-identical. ⚠ VALIDATION: the residual-rate-deficit failure mode drains the cushion over HOURS (8s cushion / 0.1% deficit ~= 2.2h) — a short box test FALSELY passes; soak Fintech >=3-4h to tell complete-fix (flat past ~3h) from stopgap (climbs again, envelope ~ cushion size -> needs clock recovery P3/B4).
+                                    * 0.8.0 (§13 DEEP BURSTY-INPUT PRIME, opt-in per-channel): PTV_PREROLL_MS now sizes a deep startup cushion carried by video_q (not the ~1.6s frame_q cap) so HLS-segment bursty delivery (Fintech_247, Unique_TV: ~6s segment as a 1.3s burst + 4.7s gap) no longer starves the house clock into a monotonic house_skew runaway. Mechanism: the realtime-limited decoder delays its start until video_q banks ≥ PTV_PREROLL_MS worth of packets (demux fills it while waiting), and video_q is auto-sized to hold it (bounded). Cost: ~+PTV_PREROLL_MS latency on opted-in channels only. DEFAULT 350ms → 0 deep packets → BYTE-IDENTICAL (no decode delay; only bursty channels set PTV_PREROLL_MS≈segment+margin, e.g. 8000 for 6s segments, 12000 for 10s). Open risk: if a channel still climbs with a deep prime → true rate deficit (needs clock recovery, P3/B4), not a buffer.
                                     * 0.7.10 (§5.A.2 DEFAULT-ON): the shared-adj-at-own-crossing A/V-drift fix is now default ON (g_progoff_av=1) after live validation — TruBLU 13 ad-breaks eye-confirmed lip-synced (unwrap_inj flat, house_skew ≤33ms, no blowup) + Cinestar AC-3 channel 1h51m clean. PTV_NO_PROGOFF_AV=1 disables (A/B/rollback). With §5.A.1 directional threshold = the legacy-0004 single-input A/V-drift restore, complete.
                                     * 0.7.9 (§5.A.2 FIX — v0.7.8 had a live straddle blowup): dense V/A absorb the SHARED first-crosser discontinuity amount, but each still self-rebases its OWN wrap_off AT ITS OWN crossing (proven path) → no premature offset on un-crossed packets → no house_skew/aresample blowup. v0.7.8 applied prog_off to ALL packets immediately → during the V/A straddle the not-yet-crossed stream got the offset → house_skew blew up ~1372s on TruBLU live (audio destroyed). This version touches ONLY the rebase amount (shared vs own); apply path unchanged. Still zeroes V/A divergence. DEFAULT OFF; PTV_PROGOFF_AV=1, PTV_PROGOFF_DEBOUNCE_MS tunes.
                                     * 0.7.8 (§5.A.2, WITHDRAWN — straddle blowup): dense V/A shared prog_off applied to all packets; broke live. Superseded by 0.7.9.
@@ -313,6 +314,7 @@ static int     g_pll_dev_shift = 9;          /* v0.6.22: EMA shift for pll_dev (
  * the backstop for genuine SUSTAINED overload. PTV_VIDEOQ overrides. */
 static int     g_videoq = 256;
 static int     g_preroll_ms = 350;   /* §13: house-clock startup cushion (ms). >~1.6s (frame_q cap) → single-input decode delays its start until video_q banks this much (deep bursty-input prime). Default 350 → 0 deep packets → byte-identical. Bounded [0,30000]; PTV_PREROLL_MS sets it. */
+static int     g_aq_cap = 256;       /* §13: effective pre-h0 audio ring depth (<= PTV_AQ_PREROLL). Default 256 = historical (byte-identical); raised to PTV_AQ_PREROLL only for a deep prime so audio buffers through the long video-decode delay. */
 /* Discard video packets the demuxer flags AV_PKT_FLAG_CORRUPT (= -fflags +discardcorrupt), at the demux
  * before they reach the decoder, and COUNT them (DemuxArgs.vcorrupt) so frame loss is visible in stats.
  * A corrupt frame, like a dropped one, becomes a content GAP that the position-anchored composite video
@@ -970,7 +972,16 @@ fail:
 
 /* Hand a decoded frame downstream: straight to the jitter buffer, or through the
  * filter graph first. Source PTS is preserved (frame->pts) so the output thread's
- * content-PTS A/V anchoring still holds across the filter. */
+ * content-PTS A/V anchoring still holds across the filter.
+ *
+ * §13 deep-prime channels (deep_prime_packets>0): rung 0 (the master/house-clock rung) pushes
+ * LOSSLESS/BLOCKING for the WHOLE run (not just startup), so the decoder back-pressures on
+ * frame_q[0] -> stays paced to the house clock -> the deep cushion stays parked in video_q
+ * (a fast decoder can't race it into the 48-frame frame_q and drop it). Consequences, intended:
+ *   - the drop-newest backstop moves from frame_q[0] to the (deeper) video_q cap on sustained overload;
+ *   - back-pressure chains rung0-output -> decoder -> video_q -> demux -> input, so a rung-0
+ *     output/mux/gate stall becomes INPUT packet loss on these channels (right trade for bursty inputs).
+ * Non-master rungs keep drop-newest (stall-isolated). Default (deep_prime_packets==0) = d->live everywhere. */
 static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
 {
     int i;
@@ -1030,7 +1041,11 @@ static void *decode_thread(void *arg)
      * house_skew runaway. Demux fills video_q while we sleep; bounded by 3x the target time. */
     if (d->deep_prime_packets > 0) {
         int64_t t0 = av_gettime_relative();
-        int64_t budget = (int64_t)g_preroll_ms * 3000;   /* 3x preroll_ms, in us */
+        /* ⚠ STARTUP BLACKOUT: while we bank the cushion the decoder emits no frames, so the output
+         * thread emits nothing — for up to `budget`. Normal (≈realtime source) fill takes ≈preroll_ms;
+         * the 2x budget caps the worst case at ~2x preroll_ms (e.g. ~16s at PTV_PREROLL_MS=8000). This
+         * is the deep buffer's latency, paid once at channel start (and on each crash-loop restart). */
+        int64_t budget = (int64_t)g_preroll_ms * 2000;   /* 2x preroll_ms, in us */
         while (av_thread_message_queue_nb_elems(d->video_q) < d->deep_prime_packets
                && av_gettime_relative() - t0 < budget)
             av_usleep(5000);
@@ -1916,11 +1931,11 @@ static int audio_push(AudioState *a, AVFrame *frame)
             if (ts != AV_NOPTS_VALUE) {
                 AVFrame *c = av_frame_clone(frame);
                 if (c) {
-                    if (a->aq_npending >= PTV_AQ_PREROLL) {       /* ring: drop oldest */
+                    if (a->aq_npending >= g_aq_cap) {       /* ring (g_aq_cap; 256 default = byte-identical, PTV_AQ_PREROLL deep): drop oldest */
                         av_frame_free(&a->aq_pending[0]);
                         memmove(a->aq_pending, a->aq_pending + 1,
-                                (PTV_AQ_PREROLL - 1) * sizeof(*a->aq_pending));
-                        a->aq_npending = PTV_AQ_PREROLL - 1;
+                                (g_aq_cap - 1) * sizeof(*a->aq_pending));
+                        a->aq_npending = g_aq_cap - 1;
                     }
                     a->aq_pending[a->aq_npending++] = c;
                 }
@@ -3373,10 +3388,15 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         else { d->n_rung = n_rung; for (r = 0; r < n_rung; r++) d->frame_q[r] = rung[r].frame_q; }
         /* §13: deep startup cushion target (packets ~= preroll_ms x fps). Single-input only, and
          * only when the cushion exceeds frame_q (~1.6s) -> then decode_thread delays its start
-         * until video_q banks this much. Default 350ms -> 0 -> no delay (byte-identical). */
+         * until video_q banks this much. Default 350ms -> 0 -> no delay (byte-identical).
+         * NOTE: out_fps approximates the INPUT packet rate (exact when in==out fps, i.e. no -r
+         * conversion / not field-rate); bursty single-input channels have in==out so it holds.
+         * CLAMP to g_videoq-32 so the prime-wait is always satisfiable (video_q is the cap the
+         * banked packets sit in; a target above it could never be reached -> always time out). */
         d->deep_prime_packets = 0;
         if (!multiview && out_fps.num > 0) {
             int tgt = (int)((int64_t)g_preroll_ms * out_fps.num / (1000LL * out_fps.den));
+            if (tgt > g_videoq - 32) tgt = g_videoq - 32;
             if (tgt > PTV_FRAME_QDEPTH - 8) d->deep_prime_packets = tgt;
         }
     }
@@ -3951,7 +3971,7 @@ int main(int argc, char **argv)
     { const char *vq = getenv("PTV_VIDEOQ"); if (vq && atoi(vq) > 0) g_videoq = atoi(vq); }   /* video_q depth (startup-burst absorb) */
     /* §13: a cushion deeper than frame_q (~1.6s) is carried by video_q -> size it to hold the
      * backlog (packets ~= preroll_ms x <=60fps + margin), bounded. Default 350ms -> no change. */
-    if (g_preroll_ms > 1600) { int need = (int)((int64_t)g_preroll_ms * 60 / 1000) + 64; if (need > 2048) need = 2048; if (g_videoq < need) g_videoq = need; }
+    if (g_preroll_ms > 1600) { int need = (int)((int64_t)g_preroll_ms * 60 / 1000) + 64; if (need > 2048) need = 2048; if (g_videoq < need) g_videoq = need; g_aq_cap = PTV_AQ_PREROLL; }  /* deep prime: also raise the pre-h0 audio ring (default stays 256 = byte-identical) */
     if (getenv("PTV_KEEP_CORRUPT")) g_discardcorrupt = 0;   /* keep AV_PKT_FLAG_CORRUPT video packets (don't +discardcorrupt) */
     if (getenv("PTV_NO_DELIVERY")) g_delivery = 0;          /* §7.5a: disable the A/V delivery-alignment gate (audio sent direct = v0.6.23) */
     if (getenv("PTV_DELIVERY_MV")) g_delivery_mv = 1;       /* §7.5a: also gate multiview (default OFF in P1) */
