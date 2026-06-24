@@ -67,7 +67,8 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.7.6"  /* 0.7.6 (diagnostic, logging-only/byte-identical): [PTV-CHAIN] adds rawA-V (PRE-demux_unwrap source-native A/V) + unwrap_inj (= srcA-V − rawA-V) → separates source-inherent A/V drift (rawA-V grows) from demux_unwrap per-stream rebase divergence (unwrap_inj grows). The number that decides §5.A (program rebase) vs §5.B (genlock).
+#define PTVENCODER_VERSION "0.7.7"  /* 0.7.7 (§5.A.1 A/V-drift fix): DIRECTIONAL discontinuity-absorber threshold — FORWARD jumps default 1000ms (was 80ms), BACKWARD keep 80ms. Box-confirmed (TruBLU): the +90ms forward video-only frame-drops were being absorbed → video timeline compressed ~57ms each → audio behind ~+150ms/hr; at forward-1000 they flow through (player holds last frame, A/V aligned). Backward stays 80ms so a backward jump still absorbs → no aresample stall (v0.6.23). Knobs PTV_DISCONT_MS (forward) / PTV_DISCONT_BACK_MS (backward). [§5.A.2 first-crosser shared offset = next commit, for the residual big-splice asymmetry.]
+                                    * 0.7.6 (diagnostic, logging-only/byte-identical): [PTV-CHAIN] adds rawA-V (PRE-demux_unwrap source-native A/V) + unwrap_inj (= srcA-V − rawA-V) → separates source-inherent A/V drift (rawA-V grows) from demux_unwrap per-stream rebase divergence (unwrap_inj grows). The number that decides §5.A (program rebase) vs §5.B (genlock).
                                     * 0.7.5 (diagnostic): [PTV-CHAIN] traces source-content time (us) at the demux + at output emission for video/primary-audio every 10s — srcAV (input) vs outAV (output) localizes WHERE the A/V relationship diverges (source drift vs ptvencoder restamp). Logging-only/byte-identical.
                                     * 0.7.4 (diagnostic, logging-only/byte-identical): [PTV-SWRDELAY] logs the -af aresample filter's internal swr_get_delay() on the -stats cadence — the FAITHFUL resampler-slip sensor the PTS-based offset=/house_skew/sync_check-D are structurally blind to; min_hard_comp (set in ptvencoder.sh) should bound it.
                                     * 0.7.3 (P2 box-tuning from cor-1 A16 real-HW validation): (1) DELIVERY CAP default
@@ -155,7 +156,17 @@ static int     g_mv_clamp = 0;
  * default; PTV_NO_DISCONT=1 reverts; PTV_DISCONT_MS sets the detect threshold (forward DTS jump
  * beyond it = a glitch to absorb). */
 static int     g_discont = 1;
-static int     g_discont_ms = 80;
+/* DIRECTIONAL discontinuity-absorber thresholds (v0.7.7, §5.A.1). The absorber re-bases a source
+ * DTS jump to a continuous timeline. FORWARD jumps default to 1000ms (was 80ms): a recurring small
+ * FORWARD video-only frame-drop (observed +90ms on TruBLU, no audio pair) was being absorbed →
+ * compressing video's timeline ~57ms each → audio progressively BEHIND (measured ~+150ms/hr drift).
+ * At 1000ms those flow through unabsorbed (the player holds the last frame across the pts gap, on
+ * the true timeline → A/V stays aligned). BACKWARD jumps keep 80ms: a backward jump unabsorbed would
+ * step aresample=async's input backward → audio STALL (the v0.6.23 / task#23 whole-channel outage) —
+ * so backward MUST still absorb. (Real ad-splices are seconds, far above either threshold, and still
+ * absorb in both directions.) PTV_DISCONT_MS sets forward; PTV_DISCONT_BACK_MS sets backward. */
+static int     g_discont_ms = 1000;       /* forward jump threshold */
+static int     g_discont_back_ms = 80;    /* backward jump threshold (keep small — anti-stall) */
 /* P2 §7.1 (hybrid): apply the program-level discontinuity offset (tracked from the dense VIDEO reference)
  * to the SPARSE copied streams (DVB-sub/teletext, data, SCTE-35) that can't self-rebase — so an ad-break
  * PTS jump shifts them WITH the video instead of orphaning/vanishing them. Dense V/A (incl. copied AC-3)
@@ -174,7 +185,9 @@ static int     g_prog_off = 1;
 static int     g_drop_until_kf = 1;
 static int64_t g_dukf_escape_us = 5000000;   /* PTV_DUKF_ESCAPE_MS: force-resume if no IDR within this */
 /* P2 2b (v0.7.3): arm drop-until-keyframe only on a LARGE jump (a real ad-splice), not on sub-second
- * jitter. The absorber/prog_off detection threshold is g_discont_ms (80ms) — fine for the small,
+ * jitter. (v0.7.7: the forward absorber threshold g_discont_ms is now 1000ms = g_dukf_min_ms, so the
+ * +90ms forward jitter below no longer absorbs OR arms DUKF — it flows through. This comment predates
+ * that; backward jumps still absorb at g_discont_back_ms=80ms.) The absorber re-base is fine for small,
  * harmless timeline re-base — but DUKF *drops video to the next IDR*, so a sub-second blip (observed:
  * a +90ms VIDEO-ONLY jitter event on TruBLU, no audio pair → not a real splice) would needlessly drop
  * up to a GOP. Gate the video-drop on a separate, higher threshold (real splices on the box were
@@ -2182,8 +2195,13 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                  * collapses the sparse timeline (subs drift out of sync / vanish; ad markers shift).
                  * The 33-bit wrap branches above still apply to every stream (copied AC-3/SCTE-35
                  * across the roll). */
-                int64_t thresh = av_rescale(g_discont_ms, st->time_base.den, (int64_t)st->time_base.num * 1000);
-                if (thresh > 0 && (delta > thresh || delta < -thresh)) {
+                int64_t fwd_thresh  = av_rescale(g_discont_ms,      st->time_base.den, (int64_t)st->time_base.num * 1000);
+                int64_t back_thresh = av_rescale(g_discont_back_ms, st->time_base.den, (int64_t)st->time_base.num * 1000);
+                /* DIRECTIONAL (§5.A.1): forward jump must exceed the (large) forward threshold — small
+                 * forward frame-drops flow through unabsorbed; backward jump must exceed the (small)
+                 * backward threshold — backward jumps still absorb to protect aresample from a stall. */
+                if ((fwd_thresh > 0 && delta > fwd_thresh) || (back_thresh > 0 && delta < -back_thresh)) {
+                    int64_t thresh  = delta > 0 ? fwd_thresh : back_thresh;
                     int64_t nominal = pkt->duration > 0 ? pkt->duration : thresh / 4;
                     d->wrap_off[pkt->stream_index] -= (delta - nominal);
                     if (ct == AVMEDIA_TYPE_VIDEO) {
@@ -3849,7 +3867,8 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_REANCHOR")) g_reanchor = 0;   /* keep stale dup skew across outages (A/B) */
     if (getenv("PTV_MV_CLAMP")) g_mv_clamp = 1;      /* opt-in: re-enable the (stutter-prone) content clamp */
     if (getenv("PTV_NO_DISCONT")) g_discont = 0;     /* A/B: don't absorb source PTS discontinuities */
-    { const char *dm = getenv("PTV_DISCONT_MS"); if (dm && atoi(dm) > 0) g_discont_ms = atoi(dm); }
+    { const char *dm = getenv("PTV_DISCONT_MS"); if (dm && atoi(dm) > 0) g_discont_ms = atoi(dm); }            /* forward jump threshold */
+    { const char *dm = getenv("PTV_DISCONT_BACK_MS"); if (dm && atoi(dm) > 0) g_discont_back_ms = atoi(dm); }   /* backward jump threshold (anti-stall) */
     if (getenv("PTV_NO_PROG_OFF")) g_prog_off = 0;   /* P2: A/B — sparse copied streams get 33-bit wrap only (v0.6.23) */
     if (getenv("PTV_NO_DUKF")) g_drop_until_kf = 0;  /* P2 2b: A/B — decode the post-splice corruption burst (v0.6.23) */
     { const char *de = getenv("PTV_DUKF_ESCAPE_MS"); if (de && atoi(de) > 0) g_dukf_escape_us = (int64_t)atoi(de) * 1000; }
