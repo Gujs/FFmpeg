@@ -67,7 +67,8 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.7.4"  /* 0.7.4 (diagnostic, logging-only/byte-identical): [PTV-SWRDELAY] logs the -af aresample filter's internal swr_get_delay() on the -stats cadence — the FAITHFUL resampler-slip sensor the PTS-based offset=/house_skew/sync_check-D are structurally blind to; min_hard_comp (set in ptvencoder.sh) should bound it.
+#define PTVENCODER_VERSION "0.7.5"  /* 0.7.5 (diagnostic): [PTV-CHAIN] traces source-content time (us) at the demux + at output emission for video/primary-audio every 10s — srcAV (input) vs outAV (output) localizes WHERE the A/V relationship diverges (source drift vs ptvencoder restamp). Logging-only/byte-identical.
+                                    * 0.7.4 (diagnostic, logging-only/byte-identical): [PTV-SWRDELAY] logs the -af aresample filter's internal swr_get_delay() on the -stats cadence — the FAITHFUL resampler-slip sensor the PTS-based offset=/house_skew/sync_check-D are structurally blind to; min_hard_comp (set in ptvencoder.sh) should bound it.
                                     * 0.7.3 (P2 box-tuning from cor-1 A16 real-HW validation): (1) DELIVERY CAP default
  * 2s→3s — the real production-load hold is ~2s (TruBLU cor-1 dlvhold=2055ms; A0's 845ms underestimated), so the 2s
  * default cap-saturated (dlvforced climbing); 3s lets the precise DTS-match win (box-confirmed dlvforced 38033→0,
@@ -311,6 +312,11 @@ static _Atomic int64_t g_muxed_bytes;
 /* PTV_DIAG: compositor publishes its current VIDEO output time (us) so the audio probe can
  * log a synchronized per-track audio-minus-video offset. Temporary diagnostic. */
 static _Atomic int64_t g_vout_us;
+/* [PTV-CHAIN] data-driven A/V trace (diagnostic): latest SOURCE-CONTENT time (us, post-unwrap)
+ * at the demux and at output emission, for video + primary audio. srcAV (demux) vs outAV (output)
+ * localizes WHERE the A/V content relationship diverges (source drift vs ptvencoder restamp).
+ * Coarse 10s sample, relaxed atomics. */
+static _Atomic int64_t g_ch_vsrc, g_ch_asrc, g_ch_vout_src, g_ch_aout_src;
 /* -stats_period: interval (us) between progress lines. Default 1s; raise for
  * production (e.g. -stats_period 10 -> every 10s) to keep logs quiet. */
 static int64_t g_stats_period_us = 1000000;
@@ -1165,6 +1171,8 @@ static void *output_thread(void *arg)
              * staying source-locked (which is what drifts ~40ms per dup). */
             if (v->is_master && v->house_skew && content_vpts >= 0)
                 *v->house_skew = (vpts - content_vpts) * v->tick_dur_us;
+            if (src_ts != AV_NOPTS_VALUE)   /* [PTV-CHAIN] video source-content being emitted (us); any rung (same content) */
+                atomic_store_explicit(&g_ch_vout_src, av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q), memory_order_relaxed);
             /* A/V probe (read-only): record this distinct content's first-display output time so the
              * audio drain can pair against it (single-input master rung only; multiview → compositor). */
             if (v->vring && fresh && content_vpts >= 0)
@@ -1401,6 +1409,8 @@ static int audio_drain_fg(AudioState *a)
     while ((ret = av_buffersink_get_frame(a->afsink, filt)) >= 0) {
         if (filt->pts != AV_NOPTS_VALUE) {
             int64_t src_abs_us = av_rescale_q(filt->pts, sink_tb, AV_TIME_BASE_Q);  /* A/V probe: this frame's (post-async) source content time (us), before pts is rebased */
+            if (a->dbg_k == 0)   /* [PTV-CHAIN] primary-audio source-content being emitted (us) */
+                atomic_store_explicit(&g_ch_aout_src, src_abs_us, memory_order_relaxed);
             int64_t opts = av_rescale_q(filt->pts, sink_tb, (AVRational){1, a->out_rate}) - h0_samp;
             if (opts < 0) { av_frame_unref(filt); continue; }   /* precedes video anchor */
             filt->pts = opts;
@@ -1707,11 +1717,21 @@ static int audio_drain_fg(AudioState *a)
                      * If swr_delay grows unbounded → the hard-comp (min_hard_comp) is NOT firing (AVLOCK
                      * may be masking delta); if it stays bounded → the slip is being corrected. */
                     if (a->fg_swr) {
-                        int64_t dms = swr_get_delay(a->fg_swr, 1000);
+                        int64_t dms   = swr_get_delay(a->fg_swr, 1000);
+                        int64_t dsamp = swr_get_delay(a->fg_swr, a->out_rate);  /* output samples — shows sub-ms delay the ms field rounds to 0 */
                         if (dms > a->fg_swr_delay_max_ms) a->fg_swr_delay_max_ms = dms;
                         av_log(NULL, AV_LOG_INFO,
-                            "[PTV-SWRDELAY] a%d(in%d) swr_delay=%"PRId64"ms (max %"PRId64"ms)\n",
-                            a->dbg_k, a->dbg_in, dms, a->fg_swr_delay_max_ms);
+                            "[PTV-SWRDELAY] a%d(in%d) swr_delay=%"PRId64"ms (%"PRId64" samp, max %"PRId64"ms)\n",
+                            a->dbg_k, a->dbg_in, dms, dsamp, a->fg_swr_delay_max_ms);
+                    }
+                    if (a->dbg_k == 0) {   /* [PTV-CHAIN] data-driven A/V trace, primary track only */
+                        int64_t vs = atomic_load_explicit(&g_ch_vsrc, memory_order_relaxed);
+                        int64_t as = atomic_load_explicit(&g_ch_asrc, memory_order_relaxed);
+                        int64_t vo = atomic_load_explicit(&g_ch_vout_src, memory_order_relaxed);
+                        int64_t ao = atomic_load_explicit(&g_ch_aout_src, memory_order_relaxed);
+                        av_log(NULL, AV_LOG_INFO,
+                            "[PTV-CHAIN] demux Vsrc=%"PRId64"ms Asrc=%"PRId64"ms (srcA-V=%+"PRId64"ms) | out Vsrc=%"PRId64"ms Asrc=%"PRId64"ms (outA-V=%+"PRId64"ms) | introduced=%+"PRId64"ms\n",
+                            vs/1000, as/1000, (as-vs)/1000, vo/1000, ao/1000, (ao-vo)/1000, ((ao-vo)-(as-vs))/1000);
                     }
                     a->avsync_stat_last = nowp;
                 }
@@ -2246,6 +2266,8 @@ static void *demux_thread(void *arg)
                 }
             }
             d->vpkt++;
+            if (out->pts != AV_NOPTS_VALUE)   /* [PTV-CHAIN] video source-content at demux (us) */
+                atomic_store_explicit(&g_ch_vsrc, av_rescale_q(out->pts, d->ifmt->streams[d->vstream]->time_base, AV_TIME_BASE_Q), memory_order_relaxed);
             ret = demux_send(d->video_q, out, d->drop, &d->vdrop);
         } else {
             /* Fan one source PID to every transcoded audio track on it (a clone
@@ -2253,6 +2275,8 @@ static void *demux_thread(void *arg)
              * frees it, whether or not it's a copy stream). demux_unwrap ran ONCE
              * above, so every clone carries the same unwrapped ts (load-bearing:
              * never unwrap per-clone — the per-stream wrap state is stateful). */
+            if (d->n_audio > 0 && out->stream_index == d->astream[0] && out->pts != AV_NOPTS_VALUE)  /* [PTV-CHAIN] primary-audio source-content at demux (us) */
+                atomic_store_explicit(&g_ch_asrc, av_rescale_q(out->pts, d->ifmt->streams[out->stream_index]->time_base, AV_TIME_BASE_Q), memory_order_relaxed);
             int k;
             for (k = 0; k < d->n_audio; k++) {
                 AVPacket *c;
