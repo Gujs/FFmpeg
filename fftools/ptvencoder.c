@@ -67,7 +67,19 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.8.1"  /* 0.8.1 (§13 hardening, review): startup-blackout budget 3x->2x preroll (worst-case ~16s not ~24s, documented); clamp deep_prime_packets to video_q-32 so the prime-wait is always satisfiable at high fps (>~68fps could exceed the queue cap ->永 time out); pre-h0 audio ring gated by g_aq_cap (256 default = byte-identical, PTV_AQ_PREROLL only when deep) so a slow-h0 NON-bursty channel stays bit-identical; documented the whole-session rung-0 lossless block + its decoder->video_q->demux->input back-pressure chain. No behavior change vs 0.8.0 on a deep-prime channel; default path now strictly byte-identical. ⚠ VALIDATION: the residual-rate-deficit failure mode drains the cushion over HOURS (8s cushion / 0.1% deficit ~= 2.2h) — a short box test FALSELY passes; soak Fintech >=3-4h to tell complete-fix (flat past ~3h) from stopgap (climbs again, envelope ~ cushion size -> needs clock recovery P3/B4).
+#define PTVENCODER_VERSION "0.8.2"  /* 0.8.2 (gap-vs-splice fix, 2026-06-26): the discontinuity absorber no longer
+                                    * "re-bases to continuous" a FORWARD jump on a dense AUDIO stream when it is an
+                                    * audio-only SOURCE GAP — i.e. the VIDEO stream did NOT also forward-cross recently
+                                    * (content signal: a real ad-splice jumps video too) AND this stream's packets were
+                                    * genuinely wall-absent ~the jump. Such a gap is left un-absorbed so aresample=async
+                                    * hard-pads silence and audio stays aligned with the house-clock-continuous video
+                                    * (copied AC-3 keeps the real forward gap). Whole-program SPLICEs (video crosses) and
+                                    * audio relabels with packets still flowing absorb exactly as before; BACKWARD jumps
+                                    * unchanged (anti-stall). Fixes the AWE audio-dropout → permanent ~2.4s A/V step
+                                    * (audio ahead) that internal PTS-domain metrics (lipsync=/dlvhold) could not see —
+                                    * only the external source-vs-output oracle + [PTV-CHAIN] outA-V caught it.
+                                    * PTV_NO_GAPDISCRIM=1 reverts; PTV_GAP_MIN_MS tunes the gap floor (default 700ms).
+                                    * analysis/ptvencoder-avsync-gap-vs-splice-fix.md. ---- prior 0.8.1 (§13 hardening, review): startup-blackout budget 3x->2x preroll (worst-case ~16s not ~24s, documented); clamp deep_prime_packets to video_q-32 so the prime-wait is always satisfiable at high fps (>~68fps could exceed the queue cap ->永 time out); pre-h0 audio ring gated by g_aq_cap (256 default = byte-identical, PTV_AQ_PREROLL only when deep) so a slow-h0 NON-bursty channel stays bit-identical; documented the whole-session rung-0 lossless block + its decoder->video_q->demux->input back-pressure chain. No behavior change vs 0.8.0 on a deep-prime channel; default path now strictly byte-identical. ⚠ VALIDATION: the residual-rate-deficit failure mode drains the cushion over HOURS (8s cushion / 0.1% deficit ~= 2.2h) — a short box test FALSELY passes; soak Fintech >=3-4h to tell complete-fix (flat past ~3h) from stopgap (climbs again, envelope ~ cushion size -> needs clock recovery P3/B4).
                                     * 0.8.0 (§13 DEEP BURSTY-INPUT PRIME, opt-in per-channel): PTV_PREROLL_MS now sizes a deep startup cushion carried by video_q (not the ~1.6s frame_q cap) so HLS-segment bursty delivery (Fintech_247, Unique_TV: ~6s segment as a 1.3s burst + 4.7s gap) no longer starves the house clock into a monotonic house_skew runaway. Mechanism: the realtime-limited decoder delays its start until video_q banks ≥ PTV_PREROLL_MS worth of packets (demux fills it while waiting), and video_q is auto-sized to hold it (bounded). Cost: ~+PTV_PREROLL_MS latency on opted-in channels only. DEFAULT 350ms → 0 deep packets → BYTE-IDENTICAL (no decode delay; only bursty channels set PTV_PREROLL_MS≈segment+margin, e.g. 8000 for 6s segments, 12000 for 10s). Open risk: if a channel still climbs with a deep prime → true rate deficit (needs clock recovery, P3/B4), not a buffer.
                                     * 0.7.10 (§5.A.2 DEFAULT-ON): the shared-adj-at-own-crossing A/V-drift fix is now default ON (g_progoff_av=1) after live validation — TruBLU 13 ad-breaks eye-confirmed lip-synced (unwrap_inj flat, house_skew ≤33ms, no blowup) + Cinestar AC-3 channel 1h51m clean. PTV_NO_PROGOFF_AV=1 disables (A/B/rollback). With §5.A.1 directional threshold = the legacy-0004 single-input A/V-drift restore, complete.
                                     * 0.7.9 (§5.A.2 FIX — v0.7.8 had a live straddle blowup): dense V/A absorb the SHARED first-crosser discontinuity amount, but each still self-rebases its OWN wrap_off AT ITS OWN crossing (proven path) → no premature offset on un-crossed packets → no house_skew/aresample blowup. v0.7.8 applied prog_off to ALL packets immediately → during the V/A straddle the not-yet-crossed stream got the offset → house_skew blew up ~1372s on TruBLU live (audio destroyed). This version touches ONLY the rebase amount (shared vs own); apply path unchanged. Still zeroes V/A divergence. DEFAULT OFF; PTV_PROGOFF_AV=1, PTV_PROGOFF_DEBOUNCE_MS tunes.
@@ -172,6 +184,12 @@ static int     g_discont = 1;
  * absorb in both directions.) PTV_DISCONT_MS sets forward; PTV_DISCONT_BACK_MS sets backward. */
 static int     g_discont_ms = 1000;       /* forward jump threshold */
 static int     g_discont_back_ms = 80;    /* backward jump threshold (keep small — anti-stall) */
+static int     g_gapdiscrim = 1;          /* gap-fix (2026-06-26): on a FORWARD audio jump, discriminate an audio-only source GAP
+                                           * (video did NOT also cross + this stream was wall-absent ~the jump) from a whole-program
+                                           * SPLICE. A GAP is NOT absorbed → aresample=async hard-pads silence → audio stays aligned
+                                           * with the continuous video (fixes the AWE audio-gap → permanent A/V step). A SPLICE absorbs
+                                           * as before. PTV_NO_GAPDISCRIM=1 reverts to unconditional forward absorb (old behaviour). */
+static int64_t g_gap_min_us = 700000;     /* min wall-absence (us) to call a forward audio jump a real GAP when video did not also cross */
 /* P2 §7.1 (hybrid): apply the program-level discontinuity offset (tracked from the dense VIDEO reference)
  * to the SPARSE copied streams (DVB-sub/teletext, data, SCTE-35) that can't self-rebase — so an ad-break
  * PTS jump shifts them WITH the video instead of orphaning/vanishing them. Dense V/A (incl. copied AC-3)
@@ -2107,6 +2125,8 @@ typedef struct DemuxArgs {
     _Atomic int_least64_t *disturb_epoch; /* B3: bump this input's disturbance epoch when the discont absorber fires */
     int64_t              *wrap_off;       /* per input stream: cumulative 33-bit wrap offset (stream tb) */
     int64_t              *wrap_last;      /* per input stream: last RAW ts seen (wrap detection) */
+    int64_t              *wrap_wall_last; /* per input stream: wall-clock (us) of this stream's last packet — gap-vs-splice discriminator */
+    int64_t               video_fwd_us;   /* wall-clock (us) of the last VIDEO forward-discontinuity crossing (whole-program-splice indicator) */
     int64_t               prog_off;       /* P2 (§7.1): program-level discontinuity offset (90kHz, detected on the
                                            * DENSE video reference) applied to SPARSE copied streams (sub/data/SCTE)
                                            * which don't self-rebase — keeps them aligned to video across an ad-break
@@ -2228,6 +2248,7 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
     half = mask >> 1;
     raw  = pkt->dts != AV_NOPTS_VALUE ? pkt->dts : pkt->pts;   /* DTS = decode order = monotonic (B-frame-safe) */
     if (raw != AV_NOPTS_VALUE) {
+        int64_t wall_now = av_gettime_relative();
         int64_t last = d->wrap_last[pkt->stream_index];
         if (last != AV_NOPTS_VALUE) {
             int64_t delta = raw - last;
@@ -2263,6 +2284,31 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                     int64_t thresh  = delta > 0 ? fwd_thresh : back_thresh;
                     int64_t nominal = pkt->duration > 0 ? pkt->duration : thresh / 4;
                     int64_t adj = delta - nominal;
+                    int is_gap = 0;
+                    /* gap-fix (2026-06-26): a FORWARD jump on a dense AUDIO stream is an audio-only SOURCE GAP
+                     * (not a whole-program splice) when (a) the VIDEO stream did NOT also forward-cross recently
+                     * (content signal — a real splice jumps video too) AND (b) this stream's packets were
+                     * genuinely ABSENT for ~the jump in wall time. Absorbing it would delete the gap from the
+                     * audio timeline → permanent A/V step (audio ahead of the house-clock-continuous video — the
+                     * AWE bug). Instead do NOT absorb: aresample=async hard-pads silence (copied AC-3 keeps the
+                     * real forward gap) → audio stays aligned with video. A whole-program splice (video crosses)
+                     * or an audio relabel with packets still flowing (wall_gap≈0) is absorbed as before. See
+                     * analysis/ptvencoder-avsync-gap-vs-splice-fix.md; PTV_NO_GAPDISCRIM reverts. */
+                    if (g_gapdiscrim && delta > 0 && ct == AVMEDIA_TYPE_AUDIO) {
+                        int64_t jump_us  = av_rescale_q(delta, st->time_base, AV_TIME_BASE_Q);
+                        int64_t wl       = d->wrap_wall_last[pkt->stream_index];
+                        int64_t wall_gap = wl ? wall_now - wl : 0;   /* 0 = no prior packet (sentinel) → treat as flowing */
+                        int vcrossed = d->video_fwd_us && (wall_now - d->video_fwd_us <= g_progoff_debounce_us);
+                        if (!vcrossed && wall_gap >= FFMAX(g_gap_min_us, jump_us / 2)) {
+                            is_gap = 1;
+                            if (d->disturb_epoch)   /* audio dropout is a disturbance (freeze rate-recovery / arm re-acquire) */
+                                atomic_fetch_add_explicit(d->disturb_epoch, 1, memory_order_relaxed);
+                            if (g_diag)
+                                av_log(NULL, AV_LOG_INFO, "[PTV-DISCONT] stream %d: %+"PRId64"ms audio GAP — NOT absorbed (aresample pads; wall_gap=%"PRId64"ms)\n",
+                                       pkt->stream_index, av_rescale_q(delta, st->time_base, (AVRational){1,1000}), wall_gap / 1000);
+                        }
+                    }
+                    if (is_gap) goto absorb_done;
                     if (g_progoff_av) {
                         /* §5.A.2 (adopt-on-crossing, SHARED amount): each dense stream still self-rebases its
                          * OWN wrap_off at its OWN crossing (the v0.6.23-proven path — a not-yet-crossed stream
@@ -2281,6 +2327,7 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                     d->wrap_off[pkt->stream_index] -= adj;   /* per-stream rebase AT OWN CROSSING (shared amount when g_progoff_av) */
                     if (ct == AVMEDIA_TYPE_VIDEO) {
                         d->prog_off -= adj;                  /* P2: sparse sub/data/SCTE ride this */
+                        if (delta > 0) d->video_fwd_us = wall_now;   /* gap-fix: video forward crossing = whole-program-splice signal for the audio gap discriminator */
                         /* P2 2b: arm drop-until-keyframe on VIDEO's own crossing (first-arm-only), ONLY on a LARGE jump. */
                         int64_t dukf_thresh = av_rescale(g_dukf_min_ms, st->time_base.den, (int64_t)st->time_base.num * 1000);
                         if (g_drop_until_kf && !d->drop_until_kf &&
@@ -2294,10 +2341,12 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                     if (g_diag)
                         av_log(NULL, AV_LOG_INFO, "[PTV-DISCONT] stream %d: %+"PRId64"ms PTS jump absorbed (re-based to continuous)\n",
                                pkt->stream_index, av_rescale_q(delta, st->time_base, (AVRational){1,1000}));
+                    absorb_done: ;   /* gap-fix: a non-absorbed audio GAP jumps here — wrap_off left untouched, aresample pads */
                 }
             }
         }
         d->wrap_last[pkt->stream_index] = raw;
+        d->wrap_wall_last[pkt->stream_index] = wall_now;   /* gap-fix: per-stream packet arrival wall-clock */
     }
     off = d->wrap_off[pkt->stream_index];   /* 33-bit mask + per-stream discontinuity self-rebase (dense V/A) */
     /* P2 §7.1: sparse copied streams (DVB-sub/teletext, data, SCTE-35) skip the per-stream absorber (their
@@ -2516,6 +2565,7 @@ typedef struct Input {
     VideoHold             hold;              /* multiview: latest decoded frame for the compositor */
     int64_t              *wrap_off;          /* per stream: 33-bit wrap offset (stream tb) */
     int64_t              *wrap_last;         /* per stream: last RAW ts (wrap detection) */
+    int64_t              *wrap_wall_last;    /* per stream: wall-clock (us) of last packet (gap-vs-splice discriminator) */
     DecodeCtx             dc;
     DemuxArgs             da;
     pthread_t             th_demux, th_decode;
@@ -3023,7 +3073,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         vdecs[k] = inputs[k].vdec;
         inputs[k].wrap_off  = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].wrap_off));
         inputs[k].wrap_last = av_malloc_array(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].wrap_last));
-        if (!inputs[k].wrap_off || !inputs[k].wrap_last) { ret = AVERROR(ENOMEM); goto end; }
+        inputs[k].wrap_wall_last = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].wrap_wall_last)); /* 0 = no prev packet yet */
+        if (!inputs[k].wrap_off || !inputs[k].wrap_last || !inputs[k].wrap_wall_last) { ret = AVERROR(ENOMEM); goto end; }
         for (si = 0; si < (int)inputs[k].ifmt->nb_streams; si++) inputs[k].wrap_last[si] = AV_NOPTS_VALUE;
     }
     vdec = inputs[0].vdec; vist = inputs[0].vist;
@@ -3449,6 +3500,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         d->h0 = &inputs[kk].h0; d->h0_lock = &inputs[kk].h0_lock; d->house_skew = &inputs[kk].house_skew;
         d->disturb_epoch = &inputs[kk].house_disturb;   /* B3: discont absorber arms the PLL mid-run re-acquire */
         d->wrap_off = inputs[kk].wrap_off; d->wrap_last = inputs[kk].wrap_last;
+        d->wrap_wall_last = inputs[kk].wrap_wall_last; d->video_fwd_us = 0;
         for (r = 0; r < n_rung; r++) {
             d->mux_q[r] = rung[r].mux_q;
             d->gate[r]  = delivery_on ? &rung[r].gate : NULL;   /* §7.5a: dense copied audio rides the gate */
@@ -3591,6 +3643,7 @@ end:
         av_thread_message_queue_free(&inputs[k].hold.q);
         av_freep(&inputs[k].wrap_off);
         av_freep(&inputs[k].wrap_last);
+        av_freep(&inputs[k].wrap_wall_last);
         if (inputs[k].ifmt) avformat_close_input(&inputs[k].ifmt);
         pthread_mutex_destroy(&inputs[k].h0_lock);
         pthread_mutex_destroy(&inputs[k].hold.lock);
@@ -3952,6 +4005,8 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_REANCHOR")) g_reanchor = 0;   /* keep stale dup skew across outages (A/B) */
     if (getenv("PTV_MV_CLAMP")) g_mv_clamp = 1;      /* opt-in: re-enable the (stutter-prone) content clamp */
     if (getenv("PTV_NO_DISCONT")) g_discont = 0;     /* A/B: don't absorb source PTS discontinuities */
+    if (getenv("PTV_NO_GAPDISCRIM")) g_gapdiscrim = 0;   /* gap-fix A/B: revert to unconditional forward absorb (old desync-on-audio-gap behaviour) */
+    { const char *gm = getenv("PTV_GAP_MIN_MS"); if (gm && atoi(gm) > 0) g_gap_min_us = (int64_t)atoi(gm) * 1000; }  /* min wall-absence to call a forward audio jump a GAP */
     { const char *dm = getenv("PTV_DISCONT_MS"); if (dm && atoi(dm) > 0) g_discont_ms = atoi(dm); }            /* forward jump threshold */
     { const char *dm = getenv("PTV_DISCONT_BACK_MS"); if (dm && atoi(dm) > 0) g_discont_back_ms = atoi(dm); }   /* backward jump threshold (anti-stall) */
     if (getenv("PTV_NO_PROG_OFF")) g_prog_off = 0;   /* P2: A/B — sparse copied streams get 33-bit wrap only (v0.6.23) */
