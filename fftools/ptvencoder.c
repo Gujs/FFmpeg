@@ -67,7 +67,19 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.8.2"  /* 0.8.2 (gap-vs-splice fix, 2026-06-26): the discontinuity absorber no longer
+#define PTVENCODER_VERSION "0.9.0"  /* 0.9.0 (source-clock genlock, 2026-06-26): the single-input output
+                                    * cadence (ALL rungs) is SLAVED to the recovered SOURCE frame rate. A sliding-window FLL in the
+                                    * demux thread (per-~4s UNBIASED Σdc/Σdw of post-unwrap video DTS vs wall clock → EMA τ≈4-5min,
+                                    * slew-clamped, wild-chunk reject; re-anchored across disturbance epochs but KEEPING the learned
+                                    * rate) publishes a Q20 rate ratio, and each rung's pacer scales its per-tick wall span by it via a
+                                    * phase accumulator (a rate change never teleports the target). This stops the house clock drifting
+                                    * vs the channel (the eye-observed ~1s/30min output-slower drift), so house_skew→0 and aresample is
+                                    * freed for honest A/V trim (the rate slave is single-input only; the multiview compositor clock is
+                                    * unchanged). PTV_NO_GENLOCK reverts to byte-identical free-run. PAIRED with a deeper input buffer:
+                                    * the deep input prime now DEFAULTS to ~1 GOP (2s) for single-input AND multiview inputs (both can be
+                                    * bursty) to smooth decode-rate dips that transiently starve the buffer (the "bursty dups"). PTV_PREROLL_MS
+                                    * overrides; PTV_NO_GENLOCK reverts to 350ms. (~1 GOP, NOT 8s which defeats the §7.5a gate.) See analysis/ptvencoder-avsync-genlock-design.md.
+                                    * ---- prior 0.8.2 (gap-vs-splice fix, 2026-06-26): the discontinuity absorber no longer
                                     * "re-bases to continuous" a FORWARD jump on a dense AUDIO stream when it is an
                                     * audio-only SOURCE GAP — i.e. the VIDEO stream did NOT also forward-cross recently
                                     * (content signal: a real ad-splice jumps video too) AND this stream's packets were
@@ -331,7 +343,8 @@ static int     g_pll_dev_shift = 9;          /* v0.6.22: EMA shift for pll_dev (
  * up — multicast/live is realtime steady-state, so video_q sits near-empty after). drop-newest remains
  * the backstop for genuine SUSTAINED overload. PTV_VIDEOQ overrides. */
 static int     g_videoq = 256;
-static int     g_preroll_ms = 350;   /* §13: house-clock startup cushion (ms). >~1.6s (frame_q cap) → single-input decode delays its start until video_q banks this much (deep bursty-input prime). Default 350 → 0 deep packets → byte-identical. Bounded [0,30000]; PTV_PREROLL_MS sets it. */
+static int     g_preroll_ms = 350;   /* §13: house-clock startup cushion (ms). >~1.6s (frame_q cap) → single-input decode delays its start until video_q banks this much (deep bursty-input prime). Default 350 → 0 deep packets → byte-identical. Bounded [0,30000]; PTV_PREROLL_MS sets it. v0.9.0: genlock defaults this to ~1 GOP (2000) unless set explicitly. */
+static int     g_preroll_set;        /* PTV_PREROLL_MS set explicitly → suppresses the v0.9.0 genlock ~1-GOP default */
 static int     g_aq_cap = 256;       /* §13: effective pre-h0 audio ring depth (<= PTV_AQ_PREROLL). Default 256 = historical (byte-identical); raised to PTV_AQ_PREROLL only for a deep prime so audio buffers through the long video-decode delay. */
 /* Discard video packets the demuxer flags AV_PKT_FLAG_CORRUPT (= -fflags +discardcorrupt), at the demux
  * before they reach the decoder, and COUNT them (DemuxArgs.vcorrupt) so frame loss is visible in stats.
@@ -376,6 +389,16 @@ static _Atomic int64_t g_vout_us;
  * divergence (unwrap_inj grows) from ptvencoder restamp (introduced). Coarse 10s, relaxed atomics. */
 static _Atomic int64_t g_ch_vsrc, g_ch_asrc, g_ch_vout_src, g_ch_aout_src;
 static _Atomic int64_t g_ch_vsrc_raw, g_ch_asrc_raw;   /* [PTV-CHAIN] PRE-unwrap raw source ts (us) */
+/* v0.9.0 source-clock genlock: slave the single-input master output cadence to the recovered source
+ * frame rate so the house clock stops drifting vs the channel (no growing output-slower lag), house_skew
+ * → 0, and aresample is freed for honest A/V trim. The estimator (demux thread, post-unwrap video DTS vs
+ * wall clock) publishes g_src_rate_q20 = content-µs per wall-µs in Q20 (1<<20 == declared nominal); the
+ * master pacer scales its per-tick wall span by it. g_genlock_ok is true only for single-input live (the
+ * multiview compositor is unaffected). PTV_NO_GENLOCK reverts to byte-identical free-run. */
+static int             g_genlock = 1;
+static int             g_genlock_ok;                  /* runtime: single-input live (set at setup) */
+static _Atomic int64_t g_src_rate_q20 = (1 << 20);   /* recovered source rate (content-µs/wall-µs), Q20 */
+static _Atomic int     g_src_rate_locked;            /* 0 until the FLL trusts the estimate */
 /* -stats_period: interval (us) between progress lines. Default 1s; raise for
  * production (e.g. -stats_period 10 -> every 10s) to keep logs quiet. */
 static int64_t g_stats_period_us = 1000000;
@@ -1142,7 +1165,7 @@ static void *output_thread(void *arg)
     AVFrame *held = av_frame_alloc();
     AVFrame *f;
     int have = 0, ret = 0;
-    int64_t tick = 0, wall0 = 0, last_vpts = -1;
+    int64_t tick = 0, wall0 = 0, last_vpts = -1, gl_phase = 0;   /* gl_phase: v0.9.0 genlock-scaled cumulative wall span */
     int64_t held_src_pts = AV_NOPTS_VALUE;   /* ORIGINAL source pts of held frame (held->pts gets
                                                 overwritten to vpts on emit; dups must not re-read it) */
     int64_t diag_t0 = av_gettime_relative(), diag_last = diag_t0;
@@ -1231,9 +1254,19 @@ static void *output_thread(void *arg)
 
         if (v->emitted == 0) wall0 = av_gettime_relative();
         {
-            int64_t target = wall0 + tick * v->tick_dur_us;
+            /* v0.9.0 genlock: pace off a phase accumulator (not tick*tick_dur) so a rate change never
+             * teleports the target. per_tick scales by the recovered source rate (ALL single-input rungs,
+             * once locked); otherwise == tick_dur_us → gl_phase == tick*tick_dur → byte-identical free-run. */
+            int64_t per_tick = v->tick_dur_us;
+            if (g_genlock &&
+                atomic_load_explicit(&g_src_rate_locked, memory_order_relaxed)) {
+                int64_t rate = atomic_load_explicit(&g_src_rate_q20, memory_order_relaxed);
+                if (rate > 0) per_tick = av_rescale(v->tick_dur_us, 1 << 20, rate);  /* source faster (rate>nominal) → shorter span → consume faster */
+            }
+            int64_t target = wall0 + gl_phase;
             int64_t now = av_gettime_relative();
             if (now < target) av_usleep((unsigned)(target - now));
+            gl_phase += per_tick;
         }
         /* Stamp output PTS from the frame's SOURCE time on the shared house
          * anchor (h0) — the SAME mapping audio uses — so dropped/duped frames
@@ -1280,12 +1313,14 @@ static void *output_thread(void *arg)
             if (nowd - diag_last >= 1000000) {
                 av_log(NULL, AV_LOG_INFO,
                     "[PTV-DIAG] t=%.1fs dec=%"PRId64" vcorrupt=%"PRId64" emitted=%"PRId64
-                    " muxed=%"PRId64" dup=%"PRId64" framedrop=%"PRId64" vq=%d frameq=%d muxq=%d\n",
+                    " muxed=%"PRId64" dup=%"PRId64" framedrop=%"PRId64" vq=%d frameq=%d muxq=%d genlock=%d rate=%+.0fppm\n",
                     (nowd - diag_t0) / 1000000.0, *v->dbg_dec_frames, *v->dbg_vcorrupt, v->emitted,
                     g_muxed, v->dup, v->framedrop,
                     av_thread_message_queue_nb_elems(v->dbg_video_q),
                     av_thread_message_queue_nb_elems(v->frame_q),
-                    av_thread_message_queue_nb_elems(v->mux_q));
+                    av_thread_message_queue_nb_elems(v->mux_q),
+                    atomic_load_explicit(&g_src_rate_locked, memory_order_relaxed),
+                    (atomic_load_explicit(&g_src_rate_q20, memory_order_relaxed) - (1 << 20)) * 1e6 / (1 << 20));
                 diag_last = nowd;
             }
         }
@@ -2419,6 +2454,48 @@ static void *demux_thread(void *arg)
             d->vpkt++;
             if (out->pts != AV_NOPTS_VALUE)   /* [PTV-CHAIN] video source-content at demux (us) */
                 atomic_store_explicit(&g_ch_vsrc, av_rescale_q(out->pts, d->ifmt->streams[d->vstream]->time_base, AV_TIME_BASE_Q), memory_order_relaxed);
+            /* v0.9.0 genlock estimator: recover the source frame rate as a SLIDING-window FLL. Each ~4s
+             * sub-window contributes an UNBIASED rate (Σdc/Σdw over the window — averages out the bursty
+             * per-packet delivery jitter that a per-packet Δc/Δw cannot: UDP delivers video in clumps).
+             * Each sub-rate folds into an EMA (τ≈64 chunks×4s≈4-5min) that TRACKS slow drift (NOT a
+             * latch-forever cumulative mean — crystal drift over a day must be followed), with a per-chunk
+             * slew clamp (bounds d(rate)/dt, PCR-friendly) and a wild-chunk reject (±1%, so a glitched
+             * window can't bias the rate). Single-input live only; published (global) to ALL rungs via
+             * g_src_rate_q20; locks after ~15 chunks (~60s). A disturbance epoch bump (splice/wrap/gap)
+             * re-anchors the CURRENT sub-window (discards the partial, can't skew Σdc) but KEEPS the learned
+             * rate+lock (the source's physical clock is continuous across a content splice). */
+            if (g_genlock && g_genlock_ok && out->dts != AV_NOPTS_VALUE) {
+                static int64_t c0 = AV_NOPTS_VALUE, w0 = 0, ema = (1 << 20);
+                static int_least64_t ep_prev = -1;
+                static int      chunks = 0;
+                int64_t c_now = av_rescale_q(out->dts, d->ifmt->streams[d->vstream]->time_base, AV_TIME_BASE_Q);
+                int64_t w_now = av_gettime_relative();
+                int_least64_t ep = d->disturb_epoch ? atomic_load_explicit(d->disturb_epoch, memory_order_relaxed) : 0;
+                if (c0 == AV_NOPTS_VALUE || ep != ep_prev) {     /* (re)anchor the current sub-window; keep ema+lock */
+                    ep_prev = ep; c0 = c_now; w0 = w_now;
+                } else {
+                    int64_t win_w = w_now - w0, win_c = c_now - c0;
+                    if (win_w >= 3 * AV_TIME_BASE) {                        /* close a ~3s sub-window */
+                        if (win_c > 0) {
+                            int64_t r  = av_rescale(win_c, 1 << 20, win_w); /* unbiased sub-window rate, Q20 */
+                            int64_t lo = (1 << 20) - ((1 << 20) / 100);     /* fold only sane chunks (±1%) */
+                            int64_t hi = (1 << 20) + ((1 << 20) / 100);
+                            if (r >= lo && r <= hi) {
+                                int64_t step = (r - ema) >> 6;              /* EMA α≈1/64 → τ≈4-5min */
+                                int64_t dmax = (1 << 20) / 100000;          /* slew clamp ≈10ppm/chunk (≈2.5ppm/s) */
+                                if (step > dmax) step = dmax;
+                                else if (step < -dmax) step = -dmax;
+                                ema += step;
+                                atomic_store_explicit(&g_src_rate_q20, ema, memory_order_relaxed);
+                                if (chunks < 100000) chunks++;
+                                if (chunks >= 8)                            /* ~24s+ of clean chunks → trust + apply */
+                                    atomic_store_explicit(&g_src_rate_locked, 1, memory_order_relaxed);
+                            }
+                        }
+                        c0 = c_now; w0 = w_now;                            /* slide to the next sub-window */
+                    }
+                }
+            }
             ret = demux_send(d->video_q, out, d->drop, &d->vdrop);
         } else {
             /* Fan one source PID to every transcoded audio track on it (a clone
@@ -3437,20 +3514,22 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         d->h0 = &inputs[k].h0; d->h0_lock = &inputs[k].h0_lock; d->live = live;
         if (multiview) { d->hold = &inputs[k].hold; d->filtering = 0; d->n_rung = 0; }
         else { d->n_rung = n_rung; for (r = 0; r < n_rung; r++) d->frame_q[r] = rung[r].frame_q; }
-        /* §13: deep startup cushion target (packets ~= preroll_ms x fps). Single-input only, and
-         * only when the cushion exceeds frame_q (~1.6s) -> then decode_thread delays its start
+        /* §13: deep startup cushion target (packets ~= preroll_ms x fps). Single-input + multiview inputs
+         * (both can be bursty, v0.9.0), and only when the cushion exceeds frame_q (~1.6s) -> then decode_thread delays its start
          * until video_q banks this much. Default 350ms -> 0 -> no delay (byte-identical).
          * NOTE: out_fps approximates the INPUT packet rate (exact when in==out fps, i.e. no -r
          * conversion / not field-rate); bursty single-input channels have in==out so it holds.
          * CLAMP to g_videoq-32 so the prime-wait is always satisfiable (video_q is the cap the
          * banked packets sit in; a target above it could never be reached -> always time out). */
         d->deep_prime_packets = 0;
-        if (!multiview && out_fps.num > 0) {
+        if (out_fps.num > 0) {                       /* v0.9.0: deep prime for single-input AND multiview inputs (both bursty) */
             int tgt = (int)((int64_t)g_preroll_ms * out_fps.num / (1000LL * out_fps.den));
             if (tgt > g_videoq - 32) tgt = g_videoq - 32;
             if (tgt > PTV_FRAME_QDEPTH - 8) d->deep_prime_packets = tgt;
         }
     }
+
+    g_genlock_ok = (live && !multiview);             /* v0.9.0: genlock applies to single-input live only */
 
     if (multiview) {                                 /* compositor = the video house clock */
         comp.inputs = inputs; comp.n_input = n_input; comp.fg = fg; comp.n_rung = n_rung;
@@ -4002,6 +4081,7 @@ int main(int argc, char **argv)
     av_log_set_level(AV_LOG_INFO);
     g_diag = !!getenv("PTV_DIAG");
     if (getenv("PTV_NO_AVLOCK")) g_avlock = 0;   /* revert to source-locked audio (drifts on dup) */
+    if (getenv("PTV_NO_GENLOCK")) g_genlock = 0; /* v0.9.0: revert to free-run nominal pacing (+ old 350ms prime) = byte-identical */
     if (getenv("PTV_NO_REANCHOR")) g_reanchor = 0;   /* keep stale dup skew across outages (A/B) */
     if (getenv("PTV_MV_CLAMP")) g_mv_clamp = 1;      /* opt-in: re-enable the (stutter-prone) content clamp */
     if (getenv("PTV_NO_DISCONT")) g_discont = 0;     /* A/B: don't absorb source PTS discontinuities */
@@ -4022,8 +4102,9 @@ int main(int argc, char **argv)
     { const char *rm = getenv("PTV_H0_REANCHOR_MS"); if (rm && atoi(rm) > 0) g_h0_reanchor_ms = atoi(rm); }
     if (getenv("PTV_AF_NO_PLL")) g_af_pll = 0;              /* A/B: pure discrete drop/pad (no smooth nudge) */
     if (getenv("PTV_AF_NO_ANCHOR")) g_af_anchor = 0;        /* A/B: revert B1 → pre-B1 free-running counter */
-    { const char *pe = getenv("PTV_PREROLL_MS"); if (pe) { int v = atoi(pe); if (v < 0) v = 0; if (v > 30000) v = 30000; g_preroll_ms = v; } }  /* §13: startup cushion target (ms), bounded 0-30s */
+    { const char *pe = getenv("PTV_PREROLL_MS"); if (pe) { int v = atoi(pe); if (v < 0) v = 0; if (v > 30000) v = 30000; g_preroll_ms = v; g_preroll_set = 1; } }  /* §13: startup cushion target (ms), bounded 0-30s */
     { const char *vq = getenv("PTV_VIDEOQ"); if (vq && atoi(vq) > 0) g_videoq = atoi(vq); }   /* video_q depth (startup-burst absorb) */
+    if (g_genlock && !g_preroll_set) g_preroll_ms = 2000;  /* v0.9.0: default the input prime to ~1 GOP (2s) for single-input AND multiview inputs (both can be bursty) → smooth decode-rate dips; PTV_PREROLL_MS overrides, PTV_NO_GENLOCK reverts to 350 */
     /* §13: a cushion deeper than frame_q (~1.6s) is carried by video_q -> size it to hold the
      * backlog (packets ~= preroll_ms x <=60fps + margin), bounded. Default 350ms -> no change. */
     if (g_preroll_ms > 1600) { int need = (int)((int64_t)g_preroll_ms * 60 / 1000) + 64; if (need > 2048) need = 2048; if (g_videoq < need) g_videoq = need; g_aq_cap = PTV_AQ_PREROLL; }  /* deep prime: also raise the pre-h0 audio ring (default stays 256 = byte-identical) */
