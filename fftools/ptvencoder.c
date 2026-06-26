@@ -69,7 +69,7 @@ const int  program_birth_year = 2026;
  * feature so a deployed binary self-identifies via the banner / -version. */
 #define PTVENCODER_VERSION "0.9.0"  /* 0.9.0 (source-clock genlock, 2026-06-26): the single-input output
                                     * cadence (ALL rungs) is SLAVED to the recovered SOURCE frame rate. A sliding-window FLL in the
-                                    * demux thread (per-~4s UNBIASED Σdc/Σdw of post-unwrap video DTS vs wall clock → EMA τ≈4-5min,
+                                    * demux thread (per-~3s UNBIASED Σdc/Σdw of post-unwrap video DTS vs wall clock → EMA τ≈4-5min,
                                     * slew-clamped, wild-chunk reject; re-anchored across disturbance epochs but KEEPING the learned
                                     * rate) publishes a Q20 rate ratio, and each rung's pacer scales its per-tick wall span by it via a
                                     * phase accumulator (a rate change never teleports the target). This stops the house clock drifting
@@ -78,7 +78,10 @@ const int  program_birth_year = 2026;
                                     * unchanged). PTV_NO_GENLOCK reverts to byte-identical free-run. PAIRED with a deeper input buffer:
                                     * the deep input prime now DEFAULTS to ~1 GOP (2s) for single-input AND multiview inputs (both can be
                                     * bursty) to smooth decode-rate dips that transiently starve the buffer (the "bursty dups"). PTV_PREROLL_MS
-                                    * overrides; PTV_NO_GENLOCK reverts to 350ms. (~1 GOP, NOT 8s which defeats the §7.5a gate.) See analysis/ptvencoder-avsync-genlock-design.md.
+                                    * overrides; PTV_NO_GENLOCK reverts to 350ms. The §7.5a gate cap AUTO-SCALES with the prime: the
+                                    * gate holds audio+copy to match the now-deeper video (it is the audio-side of the whole-stream
+                                    * delay), so A/V stays wire-aligned and it stops force-releasing (the TruBLU dlvforced=11614 regression).
+                                    * See analysis/ptvencoder-avsync-genlock-design.md.
                                     * ---- prior 0.8.2 (gap-vs-splice fix, 2026-06-26): the discontinuity absorber no longer
                                     * "re-bases to continuous" a FORWARD jump on a dense AUDIO stream when it is an
                                     * audio-only SOURCE GAP — i.e. the VIDEO stream did NOT also forward-cross recently
@@ -2461,7 +2464,7 @@ static void *demux_thread(void *arg)
              * latch-forever cumulative mean — crystal drift over a day must be followed), with a per-chunk
              * slew clamp (bounds d(rate)/dt, PCR-friendly) and a wild-chunk reject (±1%, so a glitched
              * window can't bias the rate). Single-input live only; published (global) to ALL rungs via
-             * g_src_rate_q20; locks after ~15 chunks (~60s). A disturbance epoch bump (splice/wrap/gap)
+             * g_src_rate_q20; locks after ~8 chunks (~24s). A disturbance epoch bump (splice/wrap/gap)
              * re-anchors the CURRENT sub-window (discards the partial, can't skew Σdc) but KEEPS the learned
              * rate+lock (the source's physical clock is continuous across a content splice). */
             if (g_genlock && g_genlock_ok && out->dts != AV_NOPTS_VALUE) {
@@ -4105,6 +4108,8 @@ int main(int argc, char **argv)
     { const char *pe = getenv("PTV_PREROLL_MS"); if (pe) { int v = atoi(pe); if (v < 0) v = 0; if (v > 30000) v = 30000; g_preroll_ms = v; g_preroll_set = 1; } }  /* §13: startup cushion target (ms), bounded 0-30s */
     { const char *vq = getenv("PTV_VIDEOQ"); if (vq && atoi(vq) > 0) g_videoq = atoi(vq); }   /* video_q depth (startup-burst absorb) */
     if (g_genlock && !g_preroll_set) g_preroll_ms = 2000;  /* v0.9.0: default the input prime to ~1 GOP (2s) for single-input AND multiview inputs (both can be bursty) → smooth decode-rate dips; PTV_PREROLL_MS overrides, PTV_NO_GENLOCK reverts to 350 */
+    if (g_preroll_ms > 1600) g_delivery_cap_us += (int64_t)g_preroll_ms * 1000;  /* v0.9.0: the deep input prime delays VIDEO ~g_preroll_ms; the §7.5a gate holds audio+copy to match (it IS the audio-side of the whole-stream delay), so size its cap to the prime — else it force-releases and audio leaks ahead (TruBLU dlvforced). Explicit PTV_DELIVERY_CAP_MS (below) overrides. */
+    if (g_preroll_ms > 1600) g_delivery_maxq = FFMAX(g_delivery_maxq, (int)(g_delivery_cap_us / 1000000 * 256));  /* v0.9.0: the deeper hold needs more FIFO nodes (≤ cap_s × Σ stream pkt-rates); without this a multi-audio channel (2 transcoded + copied AC-3) hits the maxq backstop and back-pressure-stalls before the cap. Explicit PTV_DELIVERY_MAXQ (below) overrides. */
     /* §13: a cushion deeper than frame_q (~1.6s) is carried by video_q -> size it to hold the
      * backlog (packets ~= preroll_ms x <=60fps + margin), bounded. Default 350ms -> no change. */
     if (g_preroll_ms > 1600) { int need = (int)((int64_t)g_preroll_ms * 60 / 1000) + 64; if (need > 2048) need = 2048; if (g_videoq < need) g_videoq = need; g_aq_cap = PTV_AQ_PREROLL; }  /* deep prime: also raise the pre-h0 audio ring (default stays 256 = byte-identical) */
