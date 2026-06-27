@@ -67,7 +67,25 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.9.3"  /* 0.9.3 (single-input A/V drift-null PTV_AVTRIM — PROBE, 2026-06-27): the slow
+#define PTVENCODER_VERSION "0.9.4"  /* 0.9.4 (genlock STABILITY guard, 2026-06-27): fixes the TruBLU A/V root
+                                    * cause found via the 0.9.3 PROBE + cor-1 16h diag — NOT an audio drift but a
+                                    * genlock RATE-RUNAWAY: jittery/bursty sources alias the 3s FLL window → noisy
+                                    * sub-window rates that the loose ±1% gate folded in → a ±1000ppm slew-limited
+                                    * limit cycle + unbounded house_skew runaway (8.6→28s/16h), which async masks
+                                    * until it frays → visible desync after hours. Every internal A/V metric is BLIND
+                                    * to it (proven: 28s skew under a flat err; the live wire moved +1647→+127ms
+                                    * while wall/dts/span read ~+10ms) → the fix is the CLOCK, not the audio. Guard:
+                                    * (A) hard absolute bound on the applied rate (PTV_GENLOCK_MAX_PPM, default 300)
+                                    * + (B) relative outlier rejection of burst-aliased windows (PTV_GENLOCK_REJECT_PPM,
+                                    * default 700, ≥2×MAX). Default-on, PTV_NO_GENLOCK_GUARD reverts; clean sources
+                                    * (Cinestar ±45, AWE ±271 measured) sit inside both → unaffected. NOTE: this is a
+                                    * SAFETY FLOOR — it caps the runaway SLOPE (~2→~1s/hr) but a biased source pinned at
+                                    * the bound still accumulates house_skew; the full cure (longer-baseline/median rate
+                                    * estimator that removes the burst aliasing) is the planned next iteration. The
+                                    * PTV_AVTRIM audio
+                                    * actuator is RETIRED (all 3 candidate signals proved blind); PROBE kept as the
+                                    * diagnostic that exposed this. Validate via the EXTERNAL oracle on a multi-hour run.
+                                    * ---- 0.9.3 (single-input A/V drift-null PTV_AVTRIM — PROBE, 2026-06-27): the slow
                                     * audio-late drift (root cause of TruBLU "fine at 3:00, broken at 4:30"; genlock
                                     * A/B-proven innocent) is invisible to the legacy patch-0007 closed-loop signal
                                     * here, because that signal needs video+audio on DIFFERENT clocks and ptvencoder's
@@ -434,6 +452,20 @@ static int             g_genlock = 1;
 static int             g_genlock_ok;                  /* runtime: single-input live (set at setup) */
 static _Atomic int64_t g_src_rate_q20 = (1 << 20);   /* recovered source rate (content-µs/wall-µs), Q20 */
 static _Atomic int     g_src_rate_locked;            /* 0 until the FLL trusts the estimate */
+/* v0.9.4 genlock GUARD (PTV_NO_GENLOCK_GUARD reverts to exact v0.9.x behavior). TruBLU-class jittery/
+ * bursty sources alias the 3s FLL window → noisy sub-window rates that the loose ±1% gate folded in,
+ * driving a slew-limited ±1000ppm limit cycle + an UNBOUNDED house_skew runaway (cor-1: 8.6→28s over
+ * 16h; the audio is then padded to chase a clock that's running away → visible desync after hours).
+ * Guard = (A) a hard ABSOLUTE bound on the applied rate (±g_gl_max_q20) so a fooled estimate can never
+ * pace the house clock past a physical envelope, and (B) RELATIVE outlier rejection (skip a sub-window
+ * whose rate deviates from the running estimate by > g_gl_reject_q20 — the burst-alias spikes). Clean
+ * sources (Cinestar ±45ppm, AWE ±300ppm) sit inside both bounds → unaffected. */
+static int             g_genlock_guard = 1;
+static int64_t         g_gl_max_q20    = 314;        /* PTV_GENLOCK_MAX_PPM, default 300ppm (≈314 in Q20) */
+static int64_t         g_gl_reject_q20 = 734;        /* PTV_GENLOCK_REJECT_PPM, default 700ppm (≈734 in Q20). KEEP ≥ 2×MAX:
+                                                      * the reject is RELATIVE to the (bounded) estimate, so the band must span
+                                                      * the full ±MAX envelope twice — else `ema` pinned at one bound could
+                                                      * reject the windows pulling it to the opposite bound (a stuck zone). */
 /* v0.9.2 logging cleanup — HONEST always-on aresample-work metric, latched by the audio drain and
  * read by the master video thread for the progress line (relaxed atomic, like the g_ch_* chain:
  * no lock, no clock read on the hot path).
@@ -2615,14 +2647,30 @@ static void *demux_thread(void *arg)
                     if (win_w >= 3 * AV_TIME_BASE) {                        /* close a ~3s sub-window */
                         if (win_c > 0) {
                             int64_t r  = av_rescale(win_c, 1 << 20, win_w); /* unbiased sub-window rate, Q20 */
-                            int64_t lo = (1 << 20) - ((1 << 20) / 100);     /* fold only sane chunks (±1%) */
+                            int64_t lo = (1 << 20) - ((1 << 20) / 100);     /* coarse sane gate (±1%) */
                             int64_t hi = (1 << 20) + ((1 << 20) / 100);
-                            if (r >= lo && r <= hi) {
+                            /* GUARD-B: relative outlier reject — a burst-aliased window that jumps far from the
+                             * running estimate is jitter, not a real rate change; skip it (slide the window
+                             * anyway). Anchored by GUARD-A's bound so `ema` can't itself wander far. ONLY after
+                             * lock (chunks>=8): pre-lock we must ACQUIRE freely, else a jittery source whose
+                             * sub-window rates straddle the band would never accumulate the 8 chunks to lock
+                             * (genlock would silently disable → revert to the old drift). The runaway is a
+                             * post-lock phenomenon, so post-lock rejection is exactly what's needed. */
+                            int reject = g_genlock_guard && chunks >= 8 &&
+                                         (r - ema > g_gl_reject_q20 || ema - r > g_gl_reject_q20);
+                            if (r >= lo && r <= hi && !reject) {
                                 int64_t step = (r - ema) >> 6;              /* EMA α≈1/64 → τ≈4-5min */
                                 int64_t dmax = (1 << 20) / 100000;          /* slew clamp ≈10ppm/chunk (≈2.5ppm/s) */
                                 if (step > dmax) step = dmax;
                                 else if (step < -dmax) step = -dmax;
                                 ema += step;
+                                /* GUARD-A: hard absolute bound — the applied house-clock rate can never exceed a
+                                 * physical envelope, so a fooled estimate cannot drive the house_skew runaway. */
+                                if (g_genlock_guard) {
+                                    int64_t emin = (1 << 20) - g_gl_max_q20, emax = (1 << 20) + g_gl_max_q20;
+                                    if (ema > emax) ema = emax;
+                                    else if (ema < emin) ema = emin;
+                                }
                                 atomic_store_explicit(&g_src_rate_q20, ema, memory_order_relaxed);
                                 if (chunks < 100000) chunks++;
                                 if (chunks >= 8)                            /* ~24s+ of clean chunks → trust + apply */
@@ -4265,6 +4313,7 @@ static void ptv_print_log_legend(int full)
         "env switches: PTV_AVSYNC_PROBE=1 [PTV-AVSYNC2] decomposition · PTV_ATRACE=1 startup audio trace ·\n"
         "  PTV_AVTRIM_PROBE=1 measure [PTV-AVTRIM] only · PTV_AVTRIM=1 actuate the single-input drift-null ·\n"
         "  PTV_LOG_TS=1 prepend [timestamp] · PTV_NO_GENLOCK=1 disable source-clock slave (free-run) ·\n"
+        "  PTV_NO_GENLOCK_GUARD=1 revert the rate bound+outlier-reject · PTV_GENLOCK_MAX_PPM / _REJECT_PPM tune them ·\n"
         "  PTV_NO_AVLOCK=1 disable audio house-lock\n");
 }
 
@@ -4281,6 +4330,10 @@ int main(int argc, char **argv)
     g_diag = !!getenv("PTV_DIAG");
     if (getenv("PTV_NO_AVLOCK")) g_avlock = 0;   /* revert to source-locked audio (drifts on dup) */
     if (getenv("PTV_NO_GENLOCK")) g_genlock = 0; /* v0.9.0: revert to free-run nominal pacing (+ old 350ms prime) = byte-identical */
+    if (getenv("PTV_NO_GENLOCK_GUARD")) g_genlock_guard = 0;  /* v0.9.4: revert to the unbounded ±1%-gate FLL (A/B the runaway) */
+    { const char *mp = getenv("PTV_GENLOCK_MAX_PPM");    if (mp && atoi(mp) > 0) g_gl_max_q20    = av_rescale(atoi(mp), 1 << 20, 1000000); }  /* abs bound on applied rate (default 300ppm) */
+    { const char *rp = getenv("PTV_GENLOCK_REJECT_PPM"); if (rp && atoi(rp) > 0) g_gl_reject_q20 = av_rescale(atoi(rp), 1 << 20, 1000000); }  /* relative outlier-reject band (default 700ppm) */
+    if (g_gl_reject_q20 < 2 * g_gl_max_q20) g_gl_reject_q20 = 2 * g_gl_max_q20;  /* invariant: reject must span ±MAX twice (no stuck zone) */
     if (getenv("PTV_NO_REANCHOR")) g_reanchor = 0;   /* keep stale dup skew across outages (A/B) */
     if (getenv("PTV_MV_CLAMP")) g_mv_clamp = 1;      /* opt-in: re-enable the (stutter-prone) content clamp */
     if (getenv("PTV_NO_DISCONT")) g_discont = 0;     /* A/B: don't absorb source PTS discontinuities */
