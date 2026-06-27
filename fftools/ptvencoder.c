@@ -67,7 +67,20 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.9.2"  /* 0.9.2 (diagnostics/logging cleanup, 2026-06-27): the always-on -stats
+#define PTVENCODER_VERSION "0.9.3"  /* 0.9.3 (single-input A/V drift-null PTV_AVTRIM — PROBE, 2026-06-27): the slow
+                                    * audio-late drift (root cause of TruBLU "fine at 3:00, broken at 4:30"; genlock
+                                    * A/B-proven innocent) is invisible to the legacy patch-0007 closed-loop signal
+                                    * here, because that signal needs video+audio on DIFFERENT clocks and ptvencoder's
+                                    * house clock + AVLOCK put them on ONE (the Session-83 blindness 0007 escaped) —
+                                    * the drift moved from the timestamp domain into the CONTENT domain. So this step
+                                    * LOGS THREE candidate drift signals via [PTV-AVTRIM] (PTV_AVTRIM_PROBE) and the box
+                                    * picks which tracks the wire oracle (Rule-0, don't assume): wall = wall_a(C)−wall_v(C)
+                                    * production timing (vring now carries the video mux-handoff wall time); dts = the
+                                    * legacy timestamp offset (expected flat = masked); span = async sample-vs-source-content
+                                    * slip (content domain). PTV_AVTRIM reserved for the actuator (NOT built — built on the
+                                    * validated signal at the resampler input, legacy-0007 control law). Single-input only;
+                                    * both default OFF → byte-identical. Multiview (B4) is a separate later change.
+                                    * ---- 0.9.2 (diagnostics/logging cleanup, 2026-06-27): the always-on -stats
                                     * progress line is now an OPERATOR-TRUSTWORTHY line — genlock state +srcppm
                                     * (promoted from PTV_DIAG) and a NEW `async` aresample-work rate (ppm). The
                                     * MISLEADING internal A/V estimates ([PTV-AVSYNC] offset/house_skew,
@@ -300,6 +313,13 @@ static int     g_h0_at_display = 1;
  * Off by default; PTV_AVSYNC_PROBE=1 enables the [PTV-AVSYNC2] per-track real A/V offset measurement
  * (out_v(C) − out_a(C), content-paired, video_lag/audio_lag split). Measures only — no actuator. */
 static int     g_avsync_probe = 0;
+/* PTV_AVTRIM — single-input A/V drift-null (analysis/ptvencoder-avsync-avtrim-plan.md). A closed-loop
+ * integral trim (legacy patch-0007 control law) that nulls the slow audio-late drift aresample=async is
+ * blind to. Driven by a NEW WALL-referenced delivery offset (wall_a(C)−wall_v(C)), the one signal not
+ * cancelled by async's PTS relabeling. g_avtrim_probe = measure+log only (validate the signal vs the wire
+ * oracle, Rule-0); g_avtrim = also actuate. Both default OFF → byte-identical output. Single-input only. */
+static int     g_avtrim = 0;
+static int     g_avtrim_probe = 0;
 static int     g_atrace = 0;       /* PTV_ATRACE: temp per-audio-frame startup trace (opts/applied/guard) to localize the bank */
 /* Multiview audio-follow ACTUATOR (P1) — a per-slot two-mode controller for glitch-free A/V tracking.
  * The v0.6.2/0.6.3 audio-follow corrected the per-slot lag only with whole-frame drop/pad fired on a
@@ -735,33 +755,39 @@ static int encode_push(AVThreadMessageQueue *mux_q, AVCodecContext *enc,
 typedef struct VOutRing {
     int64_t          src[PTV_VRING];   /* absolute source pts of the displayed content (us) */
     int64_t          out[PTV_VRING];   /* output time that content was emitted at (us, output-PTS axis) */
+    int64_t          wall[PTV_VRING];  /* PTV_AVTRIM: WALL time (av_gettime_relative, us) the VIDEO for this
+                                        * content was handed to the mux. Async-independent: async can relabel
+                                        * the output PTS but not the wall clock at which a frame is produced,
+                                        * so wall_a(C)−wall_v(C) sees the audio-side drift the PTS-domain
+                                        * `offset` cancels away. (§ avtrim-plan: the wall-referenced signal.) */
     int64_t          n;                /* total writes (monotonic); newest index = (n-1) % PTV_VRING */
     pthread_mutex_t  lock;
 } VOutRing;
 
-static void vring_put(VOutRing *r, int64_t src_us, int64_t out_us)
+static void vring_put(VOutRing *r, int64_t src_us, int64_t out_us, int64_t wall_us)
 {
     pthread_mutex_lock(&r->lock);
     int i = (int)(r->n % PTV_VRING);
-    r->src[i] = src_us; r->out[i] = out_us; r->n++;
+    r->src[i] = src_us; r->out[i] = out_us; r->wall[i] = wall_us; r->n++;
     pthread_mutex_unlock(&r->lock);
 }
 
-/* nearest-by-content lookup: of all kept entries, return the out_v and matched src of the one whose
- * src is closest to want_src. 0 = found (ring non-empty), -1 = empty. */
-static int vring_lookup(VOutRing *r, int64_t want_src, int64_t *out_v, int64_t *matched_src)
+/* nearest-by-content lookup: of all kept entries, return the out_v, matched src, and (PTV_AVTRIM) the
+ * WALL handoff time of the one whose src is closest to want_src. 0 = found (ring non-empty), -1 = empty.
+ * out_wall may be NULL when the wall column isn't needed. */
+static int vring_lookup(VOutRing *r, int64_t want_src, int64_t *out_v, int64_t *matched_src, int64_t *out_wall)
 {
-    int64_t best = INT64_MAX, bo = 0, bs = 0;
+    int64_t best = INT64_MAX, bo = 0, bs = 0, bw = 0;
     int found = 0, cnt, i;
     pthread_mutex_lock(&r->lock);
     cnt = r->n < PTV_VRING ? (int)r->n : PTV_VRING;
     for (i = 0; i < cnt; i++) {
         int idx = (int)((r->n - 1 - i) % PTV_VRING);
         int64_t d = r->src[idx] - want_src; if (d < 0) d = -d;
-        if (d < best) { best = d; bo = r->out[idx]; bs = r->src[idx]; found = 1; }
+        if (d < best) { best = d; bo = r->out[idx]; bs = r->src[idx]; bw = r->wall[idx]; found = 1; }
     }
     pthread_mutex_unlock(&r->lock);
-    if (found) { *out_v = bo; *matched_src = bs; }
+    if (found) { *out_v = bo; *matched_src = bs; if (out_wall) *out_wall = bw; }
     return found ? 0 : -1;
 }
 
@@ -1327,7 +1353,8 @@ static void *output_thread(void *arg)
             /* A/V probe (read-only): record this distinct content's first-display output time so the
              * audio drain can pair against it (single-input master rung only; multiview → compositor). */
             if (v->vring && fresh && content_vpts >= 0)
-                vring_put(v->vring, av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q), vpts * v->tick_dur_us);
+                vring_put(v->vring, av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q), vpts * v->tick_dur_us,
+                          av_gettime_relative());   /* wall_v: this frame is handed to the mux next (encode_push below) */
         }
         ret = encode_push(v->mux_q, v->venc, v->ost, held, v->gate);   /* §7.5a: publish video front + release caught-up audio/copy */
         v->last_emit_us = av_gettime_relative();
@@ -1486,6 +1513,12 @@ typedef struct AudioState {
     int64_t          av_probe_last;                   /* [PTV-AVSYNC2]: last print time (us) */
     int64_t          av_offset_us, av_vlag_us, av_alag_us;  /* latest MEASURED A/V offset (always computed, for the always-on [PTV-AVSYNC] line) */
     int              av_off_valid;                    /* a measurement has paired (else the status line prints offset=--) */
+    /* PTV_AVTRIM (single-input A/V drift-null) — the WALL-referenced delivery offset (async-immune). */
+    int64_t          avtrim_off_us;                   /* latest wall_a(C) − wall_v(C) (us); + = audio late */
+    int64_t          avtrim_ema;                      /* smoothed offset (control input / log) */
+    int              avtrim_seed;                     /* avtrim_ema seeded at first pairing */
+    int              avtrim_valid;                    /* a wall-paired measurement exists */
+    int64_t          avtrim_probe_last;               /* [PTV-AVTRIM] PROBE: last print time (us) */
     /* A/V PLL redesign Phase B3 — closed-loop two-regime controller on the measured av_offset_us (g_avsync_pll). */
     int64_t          pll_ema;                         /* EMA of the measured offset (us) */
     int64_t          pll_dev;                          /* v0.6.22: slow EMA of |off−ema| = the leg's offset jitter; raises the acquire threshold above the noise floor */
@@ -1783,13 +1816,13 @@ static int audio_drain_fg(AudioState *a)
                 int64_t out_a_us = av_rescale(filt->pts, 1000000, a->out_rate);   /* emitted output time (us) */
                 int64_t h0_us    = (h0 == AV_NOPTS_VALUE) ? 0 : h0;
                 int64_t content  = src_abs_us;                                    /* abs source content of this audio frame */
-                int64_t out_v, msrc;
+                int64_t out_v, msrc, out_wall_v = 0;
                 /* single-input injects house_skew into the graph INPUT → the buffersink pts carries it;
                  * remove it to recover the true source content for the video pairing. Multiview
                  * audio-follow feeds content-aligned input (no injection) → use src_abs_us directly. */
                 if (!(a->multiview && g_audio_follow) && a->house_skew)
                     content -= *a->house_skew;
-                if (vring_lookup(a->vring, content, &out_v, &msrc) == 0) {
+                if (vring_lookup(a->vring, content, &out_v, &msrc, &out_wall_v) == 0) {
                     int64_t vlag   = out_v    - (msrc    - h0_us);   /* video realized output − content (at msrc) */
                     int64_t alag   = out_a_us - (content - h0_us);   /* audio realized output − content (at content) */
                     int64_t paird  = msrc - content;                 /* pairing residual: msrc and content differ when the
@@ -1804,6 +1837,53 @@ static int audio_drain_fg(AudioState *a)
                            a->av_alag_ema += (alag - a->av_alag_ema) >> 8; }
                     /* Latch the latest measurement for the always-on [PTV-AVSYNC] status line (§8). */
                     a->av_offset_us = offset; a->av_vlag_us = vlag; a->av_alag_us = alag; a->av_off_valid = 1;
+                    /* ============================ PTV_AVTRIM signal (single-input) ============================
+                     * The WALL-referenced delivery offset — the one A/V signal aresample=async cannot hide.
+                     * `offset`/ring/emitA-V all compare two PTS quantities that ride the same (async-relabeled)
+                     * clock, so the audio-side slip CANCELS and they read ~0 while the wire drifts 100s of ms.
+                     * Here we compare the real WALL times the SAME source content C was handed to the mux:
+                     *     avtrim_off = wall_a(C) − wall_v(C)   ( + = audio handed off later = audio LATE )
+                     * wall_v came from the video output thread (vring); wall_a is captured now, just before this
+                     * frame's audio_encode_push (symmetric to wall_v, captured just before ITS encode_push, so
+                     * the constant pre-handoff bias cancels in the slope). async controls sample count / PTS, not
+                     * the wall clock at which a frame is produced → a drifting audio path grows this offset.
+                     * Read-only here (PROBE); the actuator (PTV_AVTRIM) trims `opts` downstream. Single-input
+                     * only (multiview audio-follow has its own B-path) and only when measuring/acting, so the
+                     * output is byte-identical when both flags are off. */
+                    if ((g_avtrim || g_avtrim_probe) && !(a->multiview && g_audio_follow) && out_wall_v) {
+                        /* THREE candidate drift signals, logged side-by-side so the box PROBE picks the one
+                         * that actually tracks the wire oracle (Rule-0 — don't ASSUME which is right):
+                         *  (1) wall = wall_a(C) − wall_v(C): PRODUCTION-timing domain. May itself be paced by
+                         *      the house clock (→ also flat) — the box decides, don't bet the deploy on it.
+                         *  (2) dts  = offset (vlag − alag): the legacy-style TIMESTAMP-domain offset. Expected
+                         *      FLAT (AVLOCK locks audio DTS to the house clock = the Session-83 blindness that
+                         *      legacy 0007 escaped) — logging it PROVES the masking on the drifting box.
+                         *  (3) span = (outspan − true_source_content) − house_skew = async_pad − commanded skew:
+                         *      CONTENT domain. Output sample-time vs PRE-async source content consumed, net of the
+                         *      video lag AVLOCK already commanded → async cannot hide a sample slip from a
+                         *      sample-vs-content count. Best a-priori guess for the actuator signal. */
+                        int64_t wall_a    = av_gettime_relative();
+                        int64_t at_off    = wall_a - out_wall_v;          /* (1) + = audio handed off later = audio late */
+                        int64_t hs        = a->house_skew ? *a->house_skew : 0;
+                        int64_t cspan     = av_rescale_q(a->dbg_last_src - a->dbg_first_src, a->ist_tb, AV_TIME_BASE_Q);
+                        int64_t ospan     = a->out_frames * (int64_t)a->frame_size * 1000000 / a->out_rate;
+                        int64_t span_err  = (ospan - cspan) - hs;         /* (3) async_pad − commanded skew; + = audio late */
+                        if (!a->avtrim_seed) { a->avtrim_ema = at_off; a->avtrim_seed = 1; }
+                        else a->avtrim_ema += (at_off - a->avtrim_ema) >> 6;   /* ~1s smoothing @47fps; the slow drift survives */
+                        a->avtrim_off_us = at_off;
+                        a->avtrim_valid  = 1;
+                        if (g_avtrim_probe && a->dbg_k == 0) {           /* PROBE: log primary track on the -stats cadence */
+                            int64_t per  = g_stats_period_us > 0 ? g_stats_period_us : 5000000;
+                            int64_t nowt = av_gettime_relative();
+                            if (a->avtrim_probe_last == 0) a->avtrim_probe_last = nowt;
+                            else if (nowt - a->avtrim_probe_last >= per) {
+                                av_log(NULL, AV_LOG_INFO,
+                                    "[PTV-AVTRIM] a%d wall=%+"PRId64"ms(ema%+"PRId64") dts=%+"PRId64"ms span=%+"PRId64"ms pairδ=%+"PRId64"ms  [+=audio late; whichever SLOPE tracks the oracle is the actuator signal]\n",
+                                    a->dbg_k, at_off / 1000, a->avtrim_ema / 1000, offset / 1000, span_err / 1000, paird / 1000);
+                                a->avtrim_probe_last = nowt;
+                            }
+                        }
+                    }
                     if (g_avsync_probe) {        /* verbose probe (PTV_AVSYNC_PROBE): the full §3.2 decomposition */
                         int64_t per = g_stats_period_us > 0 ? g_stats_period_us : 5000000;
                         int64_t nowp = av_gettime_relative();
@@ -2962,7 +3042,7 @@ static void *compositor_thread(void *arg)
                     /* A/V probe (read-only): record this slot's distinct displayed content → its
                      * first-display output time, so the slot's audio can pair against it (§3.2b). */
                     if (fresh)
-                        vring_put(&c->inputs[k].vring, disp_src, tick * c->tick_dur_us);
+                        vring_put(&c->inputs[k].vring, disp_src, tick * c->tick_dur_us, av_gettime_relative());
                     /* Don't ratchet the audio skew during a CONTENT-CLAMP hold: that freeze is
                      * deliberate pacing (a future frame is pending, video waits for the clock),
                      * NOT a dup-underrun the audio should follow. Letting skew grow here would
@@ -4177,8 +4257,13 @@ static void ptv_print_log_legend(int full)
         "  [PTV-CHAIN]    A/V trace demux→output (rawA-V / srcA-V / unwrap_inj / outA-V) to localize\n"
         "                 where an A/V offset enters\n"
         "  [PTV-LIPSYNC]  per-track err = async_pad − video lag (internal estimate)\n"
+        "  [PTV-AVTRIM]   (PTV_AVTRIM_PROBE/PTV_AVTRIM) single-input A/V drift — 3 candidate signals, the\n"
+        "                 one whose SLOPE tracks the wire oracle is the actuator input (+ = audio late):\n"
+        "                 wall = wall_a(C)−wall_v(C) production timing · dts = the timestamp offset (expect\n"
+        "                 flat = masked by AVLOCK) · span = async sample-vs-source-content slip (content domain)\n"
         "  [PTV-WATCHDOG] (always-on WARNING) the encoder stalled and stopped advancing\n"
         "env switches: PTV_AVSYNC_PROBE=1 [PTV-AVSYNC2] decomposition · PTV_ATRACE=1 startup audio trace ·\n"
+        "  PTV_AVTRIM_PROBE=1 measure [PTV-AVTRIM] only · PTV_AVTRIM=1 actuate the single-input drift-null ·\n"
         "  PTV_LOG_TS=1 prepend [timestamp] · PTV_NO_GENLOCK=1 disable source-clock slave (free-run) ·\n"
         "  PTV_NO_AVLOCK=1 disable audio house-lock\n");
 }
@@ -4230,6 +4315,8 @@ int main(int argc, char **argv)
     { const char *dc = getenv("PTV_DELIVERY_CAP_MS"); if (dc && atoi(dc) > 0) g_delivery_cap_us = (int64_t)atoi(dc) * 1000; }  /* force-release ceiling (A0 ≈1.5–2s) */
     { const char *dq = getenv("PTV_DELIVERY_MAXQ");   if (dq && atoi(dq) > 0) g_delivery_maxq = atoi(dq); }                    /* hold-FIFO size backstop */
     if (getenv("PTV_AVSYNC_PROBE")) g_avsync_probe = 1;    /* Phase A: read-only [PTV-AVSYNC2] real A/V offset */
+    if (getenv("PTV_AVTRIM_PROBE")) g_avtrim_probe = 1;    /* read-only [PTV-AVTRIM] wall-referenced A/V drift signal (validate vs oracle) */
+    if (getenv("PTV_AVTRIM"))       { g_avtrim = 1; g_avtrim_probe = 1; }  /* + actuate the integral drift-null (single-input) */
     if (getenv("PTV_ATRACE")) g_atrace = 1;                /* temp: per-audio-frame startup trace to localize the bank */
     { const char *am = getenv("PTV_AF_ACQUIRE_MS"); if (am && atoi(am) > 0) g_af_acquire_us = atoi(am) * 1000; }
     { const char *rr = getenv("PTV_AF_RATE_MS_S");  if (rr && atoi(rr) > 0) g_af_rate_us = atoi(rr) * 1000; }
