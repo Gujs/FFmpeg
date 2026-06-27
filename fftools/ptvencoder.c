@@ -67,7 +67,18 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.9.4"  /* 0.9.4 (genlock STABILITY guard, 2026-06-27): fixes the TruBLU A/V root
+#define PTVENCODER_VERSION "0.9.5"  /* 0.9.5 (genlock phase-2a — LONG-BASELINE rate, 2026-06-27): the real cure
+                                    * for the runaway the 0.9.4 guard only CAPPED. The 3s FLL window aliases bursty
+                                    * delivery → ±1000ppm noise the EMA walks → house_skew accumulates. A longer
+                                    * measurement window (PTV_GENLOCK_WINDOW_MS) averages the bursts out → the
+                                    * recovered rate ≈ the TRUE source rate → the house clock matches the source →
+                                    * house_skew stays ~0 (accumulation stops at the source, not just capped).
+                                    * Env-tunable WINDOW_MS + EMA_SHIFT, slew scales with the window; DEFAULTS = the
+                                    * old 3s/shift-6 path → byte-identical until raised (sandbox A/B turns it on, then
+                                    * promote). Guard (0.9.4) stays as the backstop. phase-2b (a true phase-lock that
+                                    * drives house_skew→0 via a g_house_skew_us atomic) is the follow-up IF a residual
+                                    * bias survives the long baseline. Validate via the EXTERNAL oracle / house_skew on
+                                    * a multi-hour sandbox run. ---- 0.9.4 (genlock STABILITY guard, 2026-06-27): fixes the TruBLU A/V root
                                     * cause found via the 0.9.3 PROBE + cor-1 16h diag — NOT an audio drift but a
                                     * genlock RATE-RUNAWAY: jittery/bursty sources alias the 3s FLL window → noisy
                                     * sub-window rates that the loose ±1% gate folded in → a ±1000ppm slew-limited
@@ -461,6 +472,15 @@ static _Atomic int     g_src_rate_locked;            /* 0 until the FLL trusts t
  * whose rate deviates from the running estimate by > g_gl_reject_q20 — the burst-alias spikes). Clean
  * sources (Cinestar ±45ppm, AWE ±300ppm) sit inside both bounds → unaffected. */
 static int             g_genlock_guard = 1;
+/* v0.9.5 phase-2a — LONG-BASELINE rate. The guard (below) only CAPS a fooled estimate; the actual cure
+ * is to make the estimate ACCURATE so house_skew never accumulates. The 3s sub-window aliases bursty
+ * delivery (→ ±1000ppm noise the EMA walks). A longer window averages the bursts out → the recovered
+ * rate ≈ the true source rate → the house clock matches the source → house_skew stays ~0. Env-tunable;
+ * DEFAULTS = the old 3s/shift-6 path (byte-identical) so this only engages when PTV_GENLOCK_WINDOW_MS is
+ * raised (the sandbox A/B turns it on; promote the default once validated). The slew clamp scales with
+ * the window so the ppm/s slew rate is preserved. */
+static int64_t         g_gl_window_us  = 3000000;    /* PTV_GENLOCK_WINDOW_MS, default 3000 (3s) */
+static int             g_gl_ema_shift  = 6;          /* PTV_GENLOCK_EMA_SHIFT, default 6 (α≈1/64) */
 static int64_t         g_gl_max_q20    = 314;        /* PTV_GENLOCK_MAX_PPM, default 300ppm (≈314 in Q20) */
 static int64_t         g_gl_reject_q20 = 734;        /* PTV_GENLOCK_REJECT_PPM, default 700ppm (≈734 in Q20). KEEP ≥ 2×MAX:
                                                       * the reject is RELATIVE to the (bounded) estimate, so the band must span
@@ -2644,7 +2664,7 @@ static void *demux_thread(void *arg)
                     ep_prev = ep; c0 = c_now; w0 = w_now;
                 } else {
                     int64_t win_w = w_now - w0, win_c = c_now - c0;
-                    if (win_w >= 3 * AV_TIME_BASE) {                        /* close a ~3s sub-window */
+                    if (win_w >= g_gl_window_us) {                          /* close a sub-window (default 3s; longer = less aliased) */
                         if (win_c > 0) {
                             int64_t r  = av_rescale(win_c, 1 << 20, win_w); /* unbiased sub-window rate, Q20 */
                             int64_t lo = (1 << 20) - ((1 << 20) / 100);     /* coarse sane gate (±1%) */
@@ -2659,8 +2679,8 @@ static void *demux_thread(void *arg)
                             int reject = g_genlock_guard && chunks >= 8 &&
                                          (r - ema > g_gl_reject_q20 || ema - r > g_gl_reject_q20);
                             if (r >= lo && r <= hi && !reject) {
-                                int64_t step = (r - ema) >> 6;              /* EMA α≈1/64 → τ≈4-5min */
-                                int64_t dmax = (1 << 20) / 100000;          /* slew clamp ≈10ppm/chunk (≈2.5ppm/s) */
+                                int64_t step = (r - ema) >> g_gl_ema_shift; /* EMA (default α≈1/64 → τ≈4-5min) */
+                                int64_t dmax = av_rescale((1 << 20) / 100000, g_gl_window_us, 3000000); /* slew ≈10ppm per 3s-window, scaled with the window → constant ppm/s */
                                 if (step > dmax) step = dmax;
                                 else if (step < -dmax) step = -dmax;
                                 ema += step;
@@ -4314,6 +4334,7 @@ static void ptv_print_log_legend(int full)
         "  PTV_AVTRIM_PROBE=1 measure [PTV-AVTRIM] only · PTV_AVTRIM=1 actuate the single-input drift-null ·\n"
         "  PTV_LOG_TS=1 prepend [timestamp] · PTV_NO_GENLOCK=1 disable source-clock slave (free-run) ·\n"
         "  PTV_NO_GENLOCK_GUARD=1 revert the rate bound+outlier-reject · PTV_GENLOCK_MAX_PPM / _REJECT_PPM tune them ·\n"
+        "  PTV_GENLOCK_WINDOW_MS=N long-baseline rate (less burst-alias; default 3000) · PTV_GENLOCK_EMA_SHIFT=N ·\n"
         "  PTV_NO_AVLOCK=1 disable audio house-lock\n");
 }
 
@@ -4334,6 +4355,8 @@ int main(int argc, char **argv)
     { const char *mp = getenv("PTV_GENLOCK_MAX_PPM");    if (mp && atoi(mp) > 0) g_gl_max_q20    = av_rescale(atoi(mp), 1 << 20, 1000000); }  /* abs bound on applied rate (default 300ppm) */
     { const char *rp = getenv("PTV_GENLOCK_REJECT_PPM"); if (rp && atoi(rp) > 0) g_gl_reject_q20 = av_rescale(atoi(rp), 1 << 20, 1000000); }  /* relative outlier-reject band (default 700ppm) */
     if (g_gl_reject_q20 < 2 * g_gl_max_q20) g_gl_reject_q20 = 2 * g_gl_max_q20;  /* invariant: reject must span ±MAX twice (no stuck zone) */
+    { const char *wm = getenv("PTV_GENLOCK_WINDOW_MS"); if (wm && atoi(wm) >= 1000) g_gl_window_us = (int64_t)atoi(wm) * 1000; }  /* phase-2a: longer baseline averages out burst-aliasing (default 3000=3s) */
+    { const char *es = getenv("PTV_GENLOCK_EMA_SHIFT"); if (es && atoi(es) >= 0 && atoi(es) <= 16) g_gl_ema_shift = atoi(es); }   /* faster EMA OK with a cleaner long window (default 6) */
     if (getenv("PTV_NO_REANCHOR")) g_reanchor = 0;   /* keep stale dup skew across outages (A/B) */
     if (getenv("PTV_MV_CLAMP")) g_mv_clamp = 1;      /* opt-in: re-enable the (stutter-prone) content clamp */
     if (getenv("PTV_NO_DISCONT")) g_discont = 0;     /* A/B: don't absorb source PTS discontinuities */
