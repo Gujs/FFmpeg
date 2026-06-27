@@ -67,7 +67,17 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.9.1"  /* 0.9.1 (genlock + shallow input prime, 2026-06-27): the single-input output
+#define PTVENCODER_VERSION "0.9.2"  /* 0.9.2 (diagnostics/logging cleanup, 2026-06-27): the always-on -stats
+                                    * progress line is now an OPERATOR-TRUSTWORTHY line — genlock state +srcppm
+                                    * (promoted from PTV_DIAG) and a NEW `async` aresample-work rate (ppm). The
+                                    * MISLEADING internal A/V estimates ([PTV-AVSYNC] offset/house_skew,
+                                    * [PTV-SWRDELAY], [PTV-CHAIN] outA-V) drop behind PTV_DIAG. A `-log-legend` flag
+                                    * (+ a compact legend at startup) documents every field. An egress emitted-PES
+                                    * lip-sync `emitA-V` was built and REJECTED by wire-oracle validation (a +200ms
+                                    * content shift moved the oracle +200ms but emitA-V 0ms — it tracks encoder
+                                    * reorder, not the content↔PTS offset that is lip-sync), so lip-sync stays an
+                                    * EXTERNAL measurement (drift-continuous.py). Logging-only; no timing path touched.
+                                    * ---- 0.9.1 (genlock + shallow input prime, 2026-06-27): the single-input output
                                     * cadence (ALL rungs) is SLAVED to the recovered SOURCE frame rate. A sliding-window FLL in the
                                     * demux thread (per-~3s UNBIASED Σdc/Σdw of post-unwrap video DTS vs wall clock → EMA τ≈4-5min,
                                     * slew-clamped, wild-chunk reject; re-anchored across disturbance epochs but KEEPING the learned
@@ -404,6 +414,19 @@ static int             g_genlock = 1;
 static int             g_genlock_ok;                  /* runtime: single-input live (set at setup) */
 static _Atomic int64_t g_src_rate_q20 = (1 << 20);   /* recovered source rate (content-µs/wall-µs), Q20 */
 static _Atomic int     g_src_rate_locked;            /* 0 until the FLL trusts the estimate */
+/* v0.9.2 logging cleanup — HONEST always-on aresample-work metric, latched by the audio drain and
+ * read by the master video thread for the progress line (relaxed atomic, like the g_ch_* chain:
+ * no lock, no clock read on the hot path).
+ *   g_async_ppm  : aresample compensation RATE = d(out_span − content_span)/d(wall), ppm. + =
+ *                  stretching/adding samples, − = compressing. ~0 = idle (genlock removed the
+ *                  structural drift); a sustained sign = the resampler is doing net work. A rate,
+ *                  so the slowly-varying house_skew DC term washes out (unlike the confounded
+ *                  async_pad span).
+ * (An egress emitted-PES A/V skew metric `emitA-V` was built here and REJECTED after wire-oracle
+ *  validation: a +200ms injected content shift moved the oracle by +200ms but emitA-V by 0 — it is
+ *  dominated by encoder B-frame reorder and blind to the content↔PTS mapping that IS lip-sync. So
+ *  ptvencoder does NOT self-report lip-sync; it is measured externally by drift-continuous.py.) */
+static _Atomic int64_t g_async_ppm;
 /* -stats_period: interval (us) between progress lines. Default 1s; raise for
  * production (e.g. -stats_period 10 -> every 10s) to keep logs quiet. */
 static int64_t g_stats_period_us = 1000000;
@@ -470,6 +493,7 @@ void show_help_default(const char *opt, const char *arg)
         "    -metadata:s:<t>:N k=v   -disposition:<t>:N flags   per-stream metadata/disposition\n"
         "    -f <mux>            output format (default: guessed; mpegts for udp://...)\n"
         "    -stats_period <s>   progress-line interval (default 1)\n"
+        "    -log-legend         describe every log field/line (also printed once at startup), then exit\n"
         "    -version, -h\n"
         "\n"
         "  Pacing is automatic: live (wall-clock) for net inputs, media-clock for files.\n");
@@ -1347,11 +1371,21 @@ static void *output_thread(void *arg)
                     snprintf(dlv, sizeof dlv, " dlvhold=%"PRId64"ms dlvforced=%"PRId64,
                              atomic_load_explicit(&v->gate->st_hold_us, memory_order_relaxed) / 1000,
                              atomic_load_explicit(&v->gate->st_forced, memory_order_relaxed));
+                char gl[48];                                         /* clock health: genlock lock + recovered source ppm (single-input live only) */
+                if (!(g_genlock && g_genlock_ok))
+                    snprintf(gl, sizeof gl, "genlock=off");
+                else if (atomic_load_explicit(&g_src_rate_locked, memory_order_relaxed))
+                    snprintf(gl, sizeof gl, "genlock=1 srcppm=%+.0f",
+                             (atomic_load_explicit(&g_src_rate_q20, memory_order_relaxed) - (1 << 20)) * 1e6 / (1 << 20));
+                else
+                    snprintf(gl, sizeof gl, "genlock=0");
+                int64_t aw = atomic_load_explicit(&g_async_ppm, memory_order_relaxed);  /* aresample work (ppm) */
                 av_log(NULL, AV_LOG_INFO,
                     "frame=%6"PRId64" fps=%3.0f size=%8"PRId64"KiB time=%02d:%02d:%05.2f "
-                    "bitrate=%7.1fkbits/s dup=%"PRId64" drop=%"PRId64" qdrop=%"PRId64" corrupt=%"PRId64" speed=%4.2fx%s\n",
+                    "bitrate=%7.1fkbits/s dup=%"PRId64" drop=%"PRId64" qdrop=%"PRId64" corrupt=%"PRId64" speed=%4.2fx "
+                    "%s async=%+"PRId64"ppm%s\n",
                     v->emitted, fps, g_muxed_bytes / 1024, hh, mm, ss, kbps,
-                    v->dup, v->framedrop, qd, cr, speed, dlv);
+                    v->dup, v->framedrop, qd, cr, speed, gl, aw, dlv);
                 stat_last = nows; stat_prev = v->emitted;
             }
         }
@@ -1443,6 +1477,7 @@ typedef struct AudioState {
     int64_t          af_last_out;                    /* B1: last emitted output pts (samples) — monotonic guard vs backward opts */
     int              af_out_set;                      /* B1: af_last_out valid */
     int64_t          avsync_stat_last;               /* [PTV-AVSYNC] status: last print time (us) */
+    int64_t          async_stat_last, async_prev_bal; /* v0.9.2: aresample-work rate (g_async_ppm) state (primary track) */
     int64_t          af_acq_drop_us, af_acq_pad_us;  /* cumulative discrete acquire work (us dropped / padded) */
     /* A/V PLL redesign Phase A probe (PTV_AVSYNC_PROBE, read-only): real per-track A/V offset. */
     VOutRing        *vring;                           /* video output ring for this track's source input */
@@ -1788,15 +1823,33 @@ static int audio_drain_fg(AudioState *a)
                     }
                 }
             }
-            /* [PTV-AVSYNC] production A/V-sync status — per slot, on the -stats_period cadence (obeys
-             * -nostats / -stats_period like the progress line, NOT PTV_DIAG). Reports what the
-             * per-slot actuator is correcting (lag = the cell's measured video-vs-house-clock offset),
-             * how much it has applied (applied = the audio retiming in effect: smooth nudge + the
-             * cumulative discrete acquire), the residual it has not yet absorbed (err = lag − applied;
-             * ~0 = tracking, large = catching up after a jump), and total work done (acquire drop/pad).
-             * Multiview audio-follow only. (Absolute lip-sync is the box eye-check; this is the
-             * actuator's own tracking state — the honest, always-available health signal.) */
-            if (g_stats) {
+            /* v0.9.2 — aresample WORK RATE (always-on, primary track only). The honest measure is the
+             * RATE of change of the audio's realized output-vs-content span: d(outspan − content)/d(wall)
+             * in ppm — NOT a raw in/out sample ratio (which reads the nominal 44.1k→48k conversion as a
+             * huge constant). A rate also washes out the slowly-varying house_skew DC term. + = adding
+             * samples (stretch/pad), − = dropping/compressing; ~0 = idle. Latched for the progress line. */
+            if (g_stats && a->dbg_k == 0) {
+                int64_t nowa = av_gettime_relative();
+                int64_t bal  = (a->out_frames * (int64_t)a->frame_size * 1000000 / a->out_rate)
+                             - av_rescale_q(a->dbg_last_src - a->dbg_first_src, a->ist_tb, AV_TIME_BASE_Q);
+                if (a->async_stat_last == 0) { a->async_stat_last = nowa; a->async_prev_bal = bal; }
+                else if (nowa - a->async_stat_last >= g_stats_period_us) {
+                    int64_t dw = nowa - a->async_stat_last;
+                    int64_t r  = dw > 0 ? (bal - a->async_prev_bal) * 1000000 / dw : 0;
+                    int64_t cur = atomic_load_explicit(&g_async_ppm, memory_order_relaxed);
+                    /* EMA (÷8): the per-interval balance is quantized to ~one audio frame (~21ms ⇒
+                     * ~1000ppm noise @10s), so smooth to the NET rate — idle ≈ 0, a sustained sign = real work. */
+                    atomic_store_explicit(&g_async_ppm, cur + ((r - cur) >> 3), memory_order_relaxed);
+                    a->async_stat_last = nowa; a->async_prev_bal = bal;
+                }
+            }
+            /* [PTV-AVSYNC] / [PTV-SWRDELAY] / [PTV-CHAIN] — internal A/V CONTROLLER telemetry. These are
+             * control-domain ESTIMATES (offset / house_skew / outA-V) that diverge from the wire (they
+             * read +11.7s while the wire was ±80ms), so as of v0.9.2 they are DEBUG-only (PTV_DIAG).
+             * Reports what the per-slot actuator is correcting (lag), how much it applied, the residual
+             * (err), and acquire drop/pad. Multiview audio-follow only; absolute lip-sync is NOT self-
+             * reported — it is measured externally by the wire oracle (drift-continuous.py). */
+            if (g_diag) {
                 int64_t nowp = av_gettime_relative();
                 if (a->avsync_stat_last == 0) a->avsync_stat_last = nowp;
                 else if (nowp - a->avsync_stat_last >= g_stats_period_us) {
@@ -2993,9 +3046,9 @@ static void *compositor_thread(void *arg)
                 for (k = 0; k < n && lp < (int)sizeof ls - 48; k++)
                     lp += snprintf(ls + lp, sizeof ls - lp, " in%d:qdrop=%"PRId64"/corrupt=%"PRId64,
                                    k, c->inputs[k].da.vdrop, c->inputs[k].da.vcorrupt + c->inputs[k].dc.vcorrupt);
-                av_log(NULL, AV_LOG_INFO,
+                av_log(NULL, AV_LOG_INFO,        /* genlock=off — multiview compositor clock free-runs (ADR-002) */
                     "frame=%6"PRId64" fps=%3.0f size=%8"PRId64"KiB time=%02d:%02d:%05.2f "
-                    "bitrate=%7.1fkbits/s dup=%"PRId64" drop=%"PRId64" speed=%4.2fx%s\n",
+                    "bitrate=%7.1fkbits/s dup=%"PRId64" drop=%"PRId64" speed=%4.2fx genlock=off%s\n",
                     c->emitted, fps, g_muxed_bytes / 1024, hh, mm, ss, kbps,
                     c->dup, c->framedrop[0], speed, ls);
                 stat_last = nows; stat_prev = c->emitted;
@@ -4073,6 +4126,63 @@ static void ptv_show_banner(void)
            AV_VERSION_MAJOR(swresample_version()), AV_VERSION_MINOR(swresample_version()), AV_VERSION_MICRO(swresample_version()));
 }
 
+/* v0.9.2 self-documenting log legend. full=0 (compact) describes the always-on `-stats` progress
+ * line and is printed once at startup below the banner, so every channel log explains itself;
+ * full=1 (via `-log-legend`, exits after) also documents the PTV_DIAG debug lines + env switches.
+ * Split into <1KiB av_log calls (the default log callback truncates a single line at 1024). */
+static void ptv_print_log_legend(int full)
+{
+    av_log(NULL, AV_LOG_INFO,
+        "log legend — the always-on `-stats` progress line (one per -stats_period, default 1s):\n"
+        "  frame      output frames emitted so far (CFR count)\n"
+        "  fps        output frame rate over the last interval\n"
+        "  size       total bytes written to the output (KiB)\n"
+        "  time       output media time HH:MM:SS.ss\n"
+        "  bitrate    average output bitrate (kbit/s)\n"
+        "  speed      output-vs-wallclock realtime ratio; 1.00x = keeping up, <1 = falling behind\n");
+    av_log(NULL, AV_LOG_INFO,
+        "  dup        frames DUPLICATED to fill the house clock when the source briefly starved the\n"
+        "             buffer; sustained rise = input gaps / decode-rate dips\n"
+        "  drop       frames DROPPED because decode outran the house clock (frame_q overflow)\n"
+        "  qdrop      packets DROPPED before decode — decoder fell behind the demuxer; rising =\n"
+        "             bursty input delivery (HLS-segment / network bursts)\n"
+        "  corrupt    corrupt packets discarded (demux + decode)\n");
+    av_log(NULL, AV_LOG_INFO,
+        "  genlock    source-clock lock: 1 = output cadence SLAVED to the recovered source rate\n"
+        "             (drift-free); 0 = still acquiring (~24s); off = N/A (multiview / offline)\n"
+        "  srcppm     recovered source-clock deviation from nominal (ppm, + = source faster) that\n"
+        "             genlock is compensating; shown only once locked\n"
+        "  async      aresample compensation RATE (ppm, + = stretching/adding samples, − = compressing/\n"
+        "             dropping); ~0 = idle/healthy, large = the resampler is fighting\n");
+    av_log(NULL, AV_LOG_INFO,
+        "  lip-sync   NOT self-reported: a faithful internal ±ms is not achievable — the emitted-PES\n"
+        "             A/V skew is dominated by encoder reorder and is blind to the content↔PTS offset\n"
+        "             that IS lip-sync (validated: a +200ms content shift moved it 0ms). Measure A/V\n"
+        "             sync with the EXTERNAL wire oracle test-scripts/repro/drift-continuous.py.\n"
+        "  dlvhold    (delivery gate active) ms of audio currently HELD waiting for the matching video\n"
+        "             to leave the encoder (≈ encoder latency); normal ~1-2s under NVENC load\n"
+        "  dlvforced  (gate active) cumulative packets FORCE-released at the 3s cap because video never\n"
+        "             caught up — MUST stay ~0; sustained growth = audio leaking ahead of video\n");
+    if (!full)
+        return;
+    av_log(NULL, AV_LOG_INFO,
+        "\ndebug lines — set PTV_DIAG=1 to enable. These are internal CONTROLLER estimates: useful for\n"
+        "debugging the pipeline, but they do NOT track on-wire lip-sync (measure that with the oracle):\n"
+        "  [PTV-DIAG]     per-second engine state: dec/emitted/muxed, dup/framedrop, queue depths\n"
+        "                 vq (demux→decode) frameq (decode→output jitter) muxq (encode→mux), genlock+rate\n"
+        "  [PTV-AVSYNC]   per-track A/V controller telemetry: offset/lipsync estimate, vlag/alag,\n"
+        "                 house_skew, and (multiview) the A/V PLL integrator state\n"
+        "  [PTV-SWRDELAY] aresample internal buffer occupancy (a latency LEVEL; `async` is the RATE)\n");
+    av_log(NULL, AV_LOG_INFO,
+        "  [PTV-CHAIN]    A/V trace demux→output (rawA-V / srcA-V / unwrap_inj / outA-V) to localize\n"
+        "                 where an A/V offset enters\n"
+        "  [PTV-LIPSYNC]  per-track err = async_pad − video lag (internal estimate)\n"
+        "  [PTV-WATCHDOG] (always-on WARNING) the encoder stalled and stopped advancing\n"
+        "env switches: PTV_AVSYNC_PROBE=1 [PTV-AVSYNC2] decomposition · PTV_ATRACE=1 startup audio trace ·\n"
+        "  PTV_LOG_TS=1 prepend [timestamp] · PTV_NO_GENLOCK=1 disable source-clock slave (free-run) ·\n"
+        "  PTV_NO_AVLOCK=1 disable audio house-lock\n");
+}
+
 int main(int argc, char **argv)
 {
     OptionParseContext octx;
@@ -4155,6 +4265,9 @@ int main(int argc, char **argv)
     if (argc >= 2 && (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help"))) {
         show_help_default(NULL, NULL); return 0;
     }
+    if (argc >= 2 && !strcmp(argv[1], "-log-legend")) {   /* full description of every log field/line */
+        ptv_print_log_legend(1); return 0;
+    }
     if (getenv("PTV_PARSE_DEBUG"))   /* validate the ffmpeg-style parser, then exit */
         return ptv_parse_and_print(argc, argv) < 0 ? 1 : 0;
     if (getenv("PTV_PLAN_DEBUG"))    /* resolve -map/-c against the input, print plan, exit */
@@ -4176,8 +4289,10 @@ int main(int argc, char **argv)
         }
         if (!strcmp(octx.global_opts.opts[gi].key, "hide_banner")) hide_banner = 1; /* suppress startup banner */
     }
-    if (!hide_banner)
+    if (!hide_banner) {
         ptv_show_banner();
+        ptv_print_log_legend(0);   /* v0.9.2: compact field legend at the top of every channel log */
+    }
     if (octx.groups[1].nb_groups < 1 || octx.groups[0].nb_groups < 1) {
         av_log(NULL, AV_LOG_ERROR,
                "usage: ptvencoder [opts] -i <input> [-filter_complex ..] "
