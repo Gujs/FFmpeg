@@ -67,7 +67,9 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.9.5"  /* 0.9.5 (genlock phase-2a — LONG-BASELINE rate, 2026-06-27): the real cure
+#define PTVENCODER_VERSION "0.9.7"  /* 0.9.7 (audio filtergraph reconfig, 2026-06-29): rebuild the -af graph/swr when the SOURCE audio changes channel-layout/rate/fmt mid-stream (e.g. stereo→mono at an ad-splice) — fixes permanent audio loss; hysteresis ignores transient splice flips. Ported from legacy 0003. Output stays pinned stereo/48k. */
+                                    /* 0.9.6 (WUCR proportional ρ servo, 2026-06-29): occupancy-locked house rate via a PROPORTIONAL controller (ρ=Kp·err) — kills the integral servo's ±7-13k ppm limit cycle; ρ parks at −(source ppm) so it doubles as a per-source rate readout. PTV_WUCR=1. */
+                                    /* 0.9.5 (genlock phase-2a — LONG-BASELINE rate, 2026-06-27): the real cure
                                     * for the runaway the 0.9.4 guard only CAPPED. The 3s FLL window aliases bursty
                                     * delivery → ±1000ppm noise the EMA walks → house_skew accumulates. A longer
                                     * measurement window (PTV_GENLOCK_WINDOW_MS) averages the bursts out → the
@@ -463,6 +465,26 @@ static int             g_genlock = 1;
 static int             g_genlock_ok;                  /* runtime: single-input live (set at setup) */
 static _Atomic int64_t g_src_rate_q20 = (1 << 20);   /* recovered source rate (content-µs/wall-µs), Q20 */
 static _Atomic int     g_src_rate_locked;            /* 0 until the FLL trusts the estimate */
+/* PTV_RATE_LOCK — VIDEO-SIDE house_skew bound. An occupancy servo holds the master's frame_q depth at
+ * setpoint by integrating depth-error into a shared house-rate correction (ppm) that all rungs apply to
+ * per_tick. Holding the buffer pins the house consume-rate to the source DELIVERY rate, so the house
+ * clock never out-runs content → no dup ratchet → house_skew stays bounded near 0 (the AWE/TruBLU
+ * chronic-drift root: the genlock FLL's residual ratchets house_skew over hours). Default OFF;
+ * PTV_RATE_LOCK=1 enables (A/B vs genlock). Audio path unchanged (async stays on for crystal comp). */
+static int             g_rate_lock = 0;
+static _Atomic int64_t g_rate_corr_ppm;              /* shared house-rate correction (ppm); master updates from occupancy, all rungs apply */
+/* WUCR (W0): PTV_WUCR enables the occupancy-recovered house rate ρ — a type-2 PI loop on frame_q
+ * fill, ±150ppm HARD clamp (physical crystal bound → runaway structurally impossible), burst-freeze
+ * on super-physical fill slope. W0 drives ONLY the video pacer (per_tick) and surfaces buf/rho in
+ * -stats next to srcppm for the go/no-go (ρ flat where the DTS-vs-wall FLL ran away). The FLL still
+ * runs (srcppm computed for comparison) but does not pace. Audio coupling to ρ is W1. Default OFF —
+ * PTV_RATE_LOCK / genlock unchanged as the fallback. g_rho_corr_ppm = the APPLIED correction (I+P),
+ * one producer (master), all rungs apply it identically. */
+static int             g_wucr = 0;
+static _Atomic int64_t g_rho_corr_ppm;               /* WUCR ρ: applied house-rate correction (ppm, corr>0 = house slower); ±6% clamp */
+static int64_t         g_occ_ema_milli;              /* WUCR: EMA-filtered master frame_q occupancy (milli-frames); master-thread only, non-atomic */
+static int             g_occ_ema_seeded;             /* WUCR: seed the EMA to the first occupancy sample so there is no startup-ramp transient */
+static _Atomic int     g_frameq_depth;               /* DIAG: master video frame_q occupancy (frames), published each tick for the discontinuity logs */
 /* v0.9.4 genlock GUARD (PTV_NO_GENLOCK_GUARD reverts to exact v0.9.x behavior). TruBLU-class jittery/
  * bursty sources alias the 3s FLL window → noisy sub-window rates that the loose ±1% gate folded in,
  * driving a slew-limited ±1000ppm limit cycle + an UNBOUNDED house_skew runaway (cor-1: 8.6→28s over
@@ -1363,8 +1385,60 @@ static void *output_thread(void *arg)
             /* v0.9.0 genlock: pace off a phase accumulator (not tick*tick_dur) so a rate change never
              * teleports the target. per_tick scales by the recovered source rate (ALL single-input rungs,
              * once locked); otherwise == tick_dur_us → gl_phase == tick*tick_dur → byte-identical free-run. */
+            if (v->is_master)   /* DIAG: publish frame_q depth so the demux-thread discontinuity logs can show the drain */
+                atomic_store_explicit(&g_frameq_depth, av_thread_message_queue_nb_elems(v->frame_q), memory_order_relaxed);
             int64_t per_tick = v->tick_dur_us;
-            if (g_genlock &&
+            if (g_wucr) {
+                /* WUCR ρ (W0): PROPORTIONAL occupancy controller. corr = Kp·(setpoint − occ_ema).
+                 * occ above setpoint = buffer filling = source faster than house consumes → corr<0 →
+                 * house faster (rate-match). NO integrator → no windup, no pegging: ρ self-settles at the
+                 * source rate with the buffer floating a frame or two off setpoint (steady-state offset =
+                 * rate/Kp, e.g. +15ppm → ~+1.9 frames). A slow EMA smooths jitter AND delivery bursts (a
+                 * burst moves occ_ema gradually, never spikes ρ). ±150ppm hard clamp = physical crystal
+                 * bound → runaway impossible. Zero-steady-offset (PI + anti-windup) is the W1 refinement.
+                 * Master computes; all rungs apply g_rho_corr_ppm identically. */
+                if (v->is_master) {
+                    /* PROPORTIONAL occupancy servo (v0.9.6). The earlier INTEGRAL servo (corr += K·err)
+                     * oscillated: the buffer is itself an integrator (ρ → consume-rate → ∫ → occupancy),
+                     * so an integrating CONTROLLER on top makes a type-2 loop that limit-cycles (the
+                     * ±7-13k ppm ρ wobble), and a series EMA only added phase lag = worse. A PROPORTIONAL
+                     * controller of an integrator plant is unconditionally stable — no windup, no limit
+                     * cycle. ρ = Kp·(setpoint − occ): buffer filling → ρ<0 → house faster → drains it.
+                     * Steady state parks at err = −mismatch/Kp (sub-frame for any real crystal) and
+                     * ρ ≈ −(source rate offset) — i.e. ρ now READS the true per-source rate, smooth and
+                     * non-hunting. Wide ±6% clamp keeps drain authority (the old ±150ppm proportional try
+                     * SATURATED → couldn't drain → crept to 42f → dlvforced; ±6% never saturates on a real
+                     * source). A light EMA gives fractional occ so ρ doesn't step on integer-frame
+                     * quantization; with P-control its lag is harmless. */
+                    int occ = av_thread_message_queue_nb_elems(v->frame_q);
+                    int sp  = n_prime > 2 ? n_prime : 4;                            /* setpoint (frames) */
+                    if (!g_occ_ema_seeded) { g_occ_ema_milli = (int64_t)occ * 1000; g_occ_ema_seeded = 1; }
+                    g_occ_ema_milli += ((int64_t)occ * 1000 - g_occ_ema_milli) / 16;   /* EMA N=16 → smooth fractional occ */
+                    int64_t err_milli = (int64_t)sp * 1000 - g_occ_ema_milli;          /* setpoint − occ (milli-frames) */
+                    int64_t corr = (err_milli * 500) / 1000;                           /* ρ = Kp·err, Kp=500 ppm/frame (PROPORTIONAL, no accumulation) */
+                    if (corr >  60000) corr =  60000;                              /* ±6% */
+                    if (corr < -60000) corr = -60000;
+                    atomic_store_explicit(&g_rho_corr_ppm, corr, memory_order_relaxed);
+                }
+                int64_t corr = atomic_load_explicit(&g_rho_corr_ppm, memory_order_relaxed);
+                per_tick = av_rescale(per_tick, 1000000, 1000000 - corr);
+            } else if (g_rate_lock) {
+                /* PTV_RATE_LOCK occupancy servo: the master integrates frame_q depth-error into the
+                 * shared house-rate correction; all rungs apply it. Holding the buffer at setpoint pins
+                 * the house consume-rate to the source delivery rate → house never out-runs content → no
+                 * dup ratchet → house_skew bounded. Replaces the DTS-vs-wall genlock FLL when enabled. */
+                if (v->is_master) {
+                    int occ = av_thread_message_queue_nb_elems(v->frame_q);
+                    int sp  = n_prime > 2 ? n_prime : 4;                       /* target depth (frames) */
+                    int64_t corr = atomic_load_explicit(&g_rate_corr_ppm, memory_order_relaxed);
+                    corr += (int64_t)(sp - occ) * 6;                           /* integral: occ<sp (draining) → corr↑ → slower house */
+                    if (corr >  60000) corr =  60000;                         /* clamp ±6% */
+                    if (corr < -60000) corr = -60000;
+                    atomic_store_explicit(&g_rate_corr_ppm, corr, memory_order_relaxed);
+                }
+                int64_t corr = atomic_load_explicit(&g_rate_corr_ppm, memory_order_relaxed);
+                per_tick = av_rescale(per_tick, 1000000, 1000000 - corr);     /* corr>0 → longer span → slower house */
+            } else if (g_genlock &&
                 atomic_load_explicit(&g_src_rate_locked, memory_order_relaxed)) {
                 int64_t rate = atomic_load_explicit(&g_src_rate_q20, memory_order_relaxed);
                 if (rate > 0) per_tick = av_rescale(v->tick_dur_us, 1 << 20, rate);  /* source faster (rate>nominal) → shorter span → consume faster */
@@ -1420,14 +1494,15 @@ static void *output_thread(void *arg)
             if (nowd - diag_last >= 1000000) {
                 av_log(NULL, AV_LOG_INFO,
                     "[PTV-DIAG] t=%.1fs dec=%"PRId64" vcorrupt=%"PRId64" emitted=%"PRId64
-                    " muxed=%"PRId64" dup=%"PRId64" framedrop=%"PRId64" vq=%d frameq=%d muxq=%d genlock=%d rate=%+.0fppm\n",
+                    " muxed=%"PRId64" dup=%"PRId64" framedrop=%"PRId64" vq=%d frameq=%d muxq=%d genlock=%d rate=%+.0fppm wucr_rho=%+.0fppm\n",
                     (nowd - diag_t0) / 1000000.0, *v->dbg_dec_frames, *v->dbg_vcorrupt, v->emitted,
                     g_muxed, v->dup, v->framedrop,
                     av_thread_message_queue_nb_elems(v->dbg_video_q),
                     av_thread_message_queue_nb_elems(v->frame_q),
                     av_thread_message_queue_nb_elems(v->mux_q),
                     atomic_load_explicit(&g_src_rate_locked, memory_order_relaxed),
-                    (atomic_load_explicit(&g_src_rate_q20, memory_order_relaxed) - (1 << 20)) * 1e6 / (1 << 20));
+                    (atomic_load_explicit(&g_src_rate_q20, memory_order_relaxed) - (1 << 20)) * 1e6 / (1 << 20),
+                    (double)(-atomic_load_explicit(&g_rho_corr_ppm, memory_order_relaxed)));
                 diag_last = nowd;
             }
         }
@@ -1459,12 +1534,20 @@ static void *output_thread(void *arg)
                 else
                     snprintf(gl, sizeof gl, "genlock=0");
                 int64_t aw = atomic_load_explicit(&g_async_ppm, memory_order_relaxed);  /* aresample work (ppm) */
+                char wu[80] = "";                                    /* WUCR readout: buffer depth + recovered ρ (go/no-go vs srcppm) */
+                if (g_wucr) {
+                    int occ = av_thread_message_queue_nb_elems(v->frame_q);
+                    int64_t corr = atomic_load_explicit(&g_rho_corr_ppm, memory_order_relaxed);
+                    int64_t hs   = v->house_skew ? *v->house_skew : 0;   /* W1 check: must stay ≈0 (ρ genlock → dups→0 → AVLOCK has nothing to inject) */
+                    snprintf(wu, sizeof wu, " wucr_buf=%df/%lldms wucr_rho=%+lldppm hs=%+lldms",
+                             occ, (long long)(occ * v->tick_dur_us / 1000), (long long)(-corr), (long long)(hs / 1000));  /* -corr = recovered source dev (+=faster), comparable to srcppm */
+                }
                 av_log(NULL, AV_LOG_INFO,
                     "frame=%6"PRId64" fps=%3.0f size=%8"PRId64"KiB time=%02d:%02d:%05.2f "
                     "bitrate=%7.1fkbits/s dup=%"PRId64" drop=%"PRId64" qdrop=%"PRId64" corrupt=%"PRId64" speed=%4.2fx "
-                    "%s async=%+"PRId64"ppm%s\n",
+                    "%s async=%+"PRId64"ppm%s%s\n",
                     v->emitted, fps, g_muxed_bytes / 1024, hh, mm, ss, kbps,
-                    v->dup, v->framedrop, qd, cr, speed, gl, aw, dlv);
+                    v->dup, v->framedrop, qd, cr, speed, gl, aw, dlv, wu);
                 stat_last = nows; stat_prev = v->emitted;
             }
         }
@@ -1525,6 +1608,21 @@ typedef struct AudioState {
     AVFilterGraph   *afg;                         /* -af present: abuffer -> chain -> abuffersink */
     AVFilterContext *afsrc, *afsink;
     int              use_fg;
+    /* Audio input-format reconfig (ported from legacy 0003 fftools/ffmpeg_filter.c). The -af graph /
+     * swr is built once for the source's initial params; if the source then changes channel layout /
+     * rate / fmt mid-stream (e.g. stereo→mono at an ad-splice) abuffersrc rejects the frame
+     * ("Changing audio frame properties not supported") and the audio path wedges. We track the
+     * configured input params and rebuild for the new ones (output stays pinned to out_chl/48k →
+     * encoder keeps getting continuous stereo). Hysteresis ignores transient/corrupt single-frame
+     * flips at the splice boundary. */
+    const char      *fg_af;                /* the -af chain string (program-lifetime) for rebuilds */
+    int              fg_in_rate;           /* input params the active path is configured for */
+    enum AVSampleFormat fg_in_fmt;
+    AVChannelLayout  fg_in_chl;
+    int              afmt_pending_rate;    /* hysteresis: candidate new params */
+    enum AVSampleFormat afmt_pending_fmt;
+    AVChannelLayout  afmt_pending_chl;
+    int              afmt_stable;          /* consecutive frames seen at the candidate params */
     AVAudioFifo     *fifo;
     int              frame_size;
     int              out_rate;
@@ -2099,6 +2197,13 @@ static int audio_drain_fg(AudioState *a)
     return (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) ? 0 : ret;
 }
 
+/* Require this many consecutive frames at new audio params before rebuilding, so a transient or
+ * corrupt single-frame flip at a splice boundary doesn't trigger a spurious reconfig (legacy 0003). */
+#define PTV_AFMT_HYSTERESIS 5
+
+static int build_audio_filter(AudioState *a, AVCodecContext *adec, AVRational tb,
+                              const char *af, enum AVSampleFormat out_fmt);   /* fwd: audio_feed rebuilds on a source format change */
+
 /* Feed one h0-anchored decoded audio frame into the -af graph (or swr fallback). */
 static int audio_feed(AudioState *a, AVFrame *frame)
 {
@@ -2106,6 +2211,67 @@ static int audio_feed(AudioState *a, AVFrame *frame)
     int out_max, got, ret = 0;
     if (frame->best_effort_timestamp != AV_NOPTS_VALUE)
         a->dbg_last_src = frame->best_effort_timestamp;   /* probe: latest fed source pts */
+
+    /* Source audio format change (stereo↔mono, sample-rate, fmt) at a splice: the graph/swr was
+     * configured for the prior params and abuffersrc rejects the changed frame → the audio path
+     * wedges permanently (observed on TruBLU 2ch→1ch). Detect it, apply hysteresis to ignore
+     * transient/corrupt flips, then rebuild the path for the new INPUT params. OUTPUT stays pinned
+     * to out_chl/48k (the trailing aformat), so the AAC encoders keep getting continuous stereo —
+     * mono is upmixed. Ported from legacy 0003 (fftools/ffmpeg_filter.c). */
+    if (frame->sample_rate != a->fg_in_rate ||
+        frame->format      != a->fg_in_fmt  ||
+        av_channel_layout_compare(&frame->ch_layout, &a->fg_in_chl)) {
+        int same_pending = (a->afmt_pending_rate == frame->sample_rate &&
+                            a->afmt_pending_fmt  == frame->format &&
+                            !av_channel_layout_compare(&a->afmt_pending_chl, &frame->ch_layout));
+        if (!same_pending) {                       /* new candidate → start hysteresis, drop this frame */
+            a->afmt_pending_rate = frame->sample_rate;
+            a->afmt_pending_fmt  = frame->format;
+            av_channel_layout_uninit(&a->afmt_pending_chl);
+            av_channel_layout_copy(&a->afmt_pending_chl, &frame->ch_layout);
+            a->afmt_stable = 1;
+            return 0;
+        }
+        if (++a->afmt_stable < PTV_AFMT_HYSTERESIS)
+            return 0;                              /* still settling — drop (downstream can't take the change) */
+        {   /* confirmed: rebuild for the new params (a->dec already reflects them) */
+            char ochl[64], nchl[64], tchl[64];
+            int was_fg = a->use_fg;
+            av_channel_layout_describe(&a->fg_in_chl, ochl, sizeof ochl);
+            av_channel_layout_describe(&frame->ch_layout, nchl, sizeof nchl);
+            av_channel_layout_describe(&a->out_chl, tchl, sizeof tchl);
+            av_log(NULL, AV_LOG_WARNING,
+                   "ptvencoder: [PTV-AFMT] audio input changed %dHz %s %s -> %dHz %s %s "
+                   "(confirmed %d frames) — rebuilding audio path; output stays %s/48k\n",
+                   a->fg_in_rate, av_get_sample_fmt_name(a->fg_in_fmt), ochl,
+                   frame->sample_rate, av_get_sample_fmt_name(frame->format), nchl,
+                   a->afmt_stable, tchl);
+            a->afmt_stable = 0;
+            if (a->afg) { avfilter_graph_free(&a->afg); a->afsrc = a->afsink = NULL; a->fg_swr = NULL; }
+            a->use_fg = 0;
+            if (was_fg && a->fg_af &&
+                build_audio_filter(a, a->dec, a->ist_tb, a->fg_af, a->out_sfmt) < 0) {
+                avfilter_graph_free(&a->afg); a->use_fg = 0;
+            }
+            if (!a->use_fg) {                      /* originally swr, or graph rebuild failed → plain swr */
+                swr_free(&a->swr);
+                swr_alloc_set_opts2(&a->swr, &a->out_chl, a->out_sfmt, a->out_rate,
+                                    &a->dec->ch_layout, a->dec->sample_fmt, a->dec->sample_rate, 0, NULL);
+                if (a->swr) swr_init(a->swr);
+            }
+            a->fg_in_rate = a->dec->sample_rate;   /* the path is now configured for these */
+            a->fg_in_fmt  = a->dec->sample_fmt;
+            av_channel_layout_uninit(&a->fg_in_chl);
+            av_channel_layout_copy(&a->fg_in_chl, &a->dec->ch_layout);
+            av_channel_layout_uninit(&a->afmt_pending_chl);
+            a->afmt_pending_rate = 0; a->afmt_pending_fmt = AV_SAMPLE_FMT_NONE;
+        }
+    } else if (a->afmt_stable) {                   /* params returned to normal → transient filtered out */
+        a->afmt_stable = 0;
+        av_channel_layout_uninit(&a->afmt_pending_chl);
+        a->afmt_pending_rate = 0; a->afmt_pending_fmt = AV_SAMPLE_FMT_NONE;
+    }
+
     if (a->use_fg) {
         /* -af: feed the graph; aresample async + loudness emit fixed-size frames
          * whose PTS already carries async's A/V correction — drain them straight
@@ -2114,6 +2280,13 @@ static int audio_feed(AudioState *a, AVFrame *frame)
         /* Single-input (and PTV_NO_AUDIO_FOLLOW): nudge the graph input pts by house_skew so
          * aresample=async targets the house clock. Multiview audio-follow does NOT do this — it
          * feeds content-aligned input and applies the offset deterministically in the drain. */
+        /* WUCR (W1 CORRECTED 2026-06-29): AVLOCK is KEPT ON under WUCR. Tracing the W1 failure showed the
+         * house clock MUST dup-fill on source stall/corruption (never-stop), so video content lags by
+         * house_skew and that lag RATCHETS (the decoder hands back sequential frames, never skipping to
+         * catch up). That lag is a DIFFERENTIAL audio cannot ignore — AVLOCK (audio follows house_skew)
+         * is the necessary coupling that keeps A/V matched through dups. AVLOCK was never the disease;
+         * UNBOUNDED house_skew (free house clock) was — and W0's ρ servo bounds it, making AVLOCK
+         * harmless + correct. Removing AVLOCK (the original W1) caused the −900ms desync on TruBLU. */
         if (g_avlock && a->house_skew && !(a->multiview && g_audio_follow) && frame->pts != AV_NOPTS_VALUE) {
             int64_t sk = *a->house_skew;
             if (sk) frame->pts += av_rescale_q(sk, AV_TIME_BASE_Q, a->ist_tb);
@@ -2360,6 +2533,7 @@ typedef struct DemuxArgs {
     int64_t               splice_adj_us;    /* §5.A.2: wall-clock when splice_adj was set (debounce; 0 = never) */
     int                   drop_until_kf;  /* P2 2b: armed on a video discontinuity → drop video until the next IDR */
     int64_t               kf_arm_us;      /* P2 2b: wall time the drop was armed (first-arm-only escape deadline) */
+    int64_t               kf_arm_vdrop;   /* DIAG: vdrop count when DUKF armed (→ per-event drop count at resume) */
     int64_t               vpkt, apkt, ppkt, vdrop, adrop, pdrop;
     int64_t               vcorrupt;       /* video packets flagged AV_PKT_FLAG_CORRUPT (discarded if g_discardcorrupt) */
 } DemuxArgs;
@@ -2404,7 +2578,7 @@ static int demux_pass(DemuxArgs *d, AVPacket *out)
          * a step (the skew grows in ~40ms tick increments) -> a small periodic A/V hop
          * on dense audio; sparse subs/data ride it invisibly. (Smooth would need rate-
          * discipline so dups -> 0; see option 2.) */
-        if (g_avlock && d->house_skew)
+        if (g_avlock && d->house_skew)   /* WUCR-corrected: AVLOCK kept (copied streams ride house_skew so they stay matched to the dup-lagged video); ρ bounds house_skew so the dup-hop stays small */
             h0_tb -= av_rescale_q(*d->house_skew, AV_TIME_BASE_Q, d->pass[pi].in_tb);
         if (out->pts != AV_NOPTS_VALUE) out->pts -= h0_tb;
         if (out->dts != AV_NOPTS_VALUE) out->dts -= h0_tb;
@@ -2558,13 +2732,16 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                             (delta > dukf_thresh || delta < -dukf_thresh)) {
                             d->drop_until_kf = 1;
                             d->kf_arm_us = av_gettime_relative();
+                            d->kf_arm_vdrop = d->vdrop;   /* DIAG: baseline for the per-event drop count */
                         }
                     }
                     if (d->disturb_epoch)   /* B3: a real content discontinuity → arm the PLL's mid-run re-acquire */
                         atomic_fetch_add_explicit(d->disturb_epoch, 1, memory_order_relaxed);
                     if (g_diag)
-                        av_log(NULL, AV_LOG_INFO, "[PTV-DISCONT] stream %d: %+"PRId64"ms PTS jump absorbed (re-based to continuous)\n",
-                               pkt->stream_index, av_rescale_q(delta, st->time_base, (AVRational){1,1000}));
+                        av_log(NULL, AV_LOG_INFO, "[PTV-DISCONT] stream %d: %+"PRId64"ms PTS jump absorbed (re-based to continuous)%s; frame_q=%d at jump\n",
+                               pkt->stream_index, av_rescale_q(delta, st->time_base, (AVRational){1,1000}),
+                               (ct == AVMEDIA_TYPE_VIDEO && d->drop_until_kf) ? " [DUKF armed → video drops until IDR]" : "",
+                               atomic_load_explicit(&g_frameq_depth, memory_order_relaxed));
                     absorb_done: ;   /* gap-fix: a non-absorbed audio GAP jumps here — wrap_off left untouched, aresample pads */
                 }
             }
@@ -2632,10 +2809,16 @@ static void *demux_thread(void *arg)
             if (d->drop_until_kf) {   /* P2 2b: post-splice → drop video until the next IDR (bounded by the escape) */
                 if (out->flags & AV_PKT_FLAG_KEY) {
                     d->drop_until_kf = 0;                                  /* IDR → clean resume; send it */
-                    if (g_diag) av_log(NULL, AV_LOG_INFO, "[PTV-DUKF] resume at keyframe (dropped to IDR)\n");
+                    if (g_diag) av_log(NULL, AV_LOG_INFO,
+                        "[PTV-DUKF] resume at keyframe — dropped %"PRId64" video frames over %"PRId64"ms; frame_q now %d (it drained while video was paused)\n",
+                        d->vdrop - d->kf_arm_vdrop, (av_gettime_relative() - d->kf_arm_us)/1000,
+                        atomic_load_explicit(&g_frameq_depth, memory_order_relaxed));
                 } else if (av_gettime_relative() - d->kf_arm_us > g_dukf_escape_us) {
                     d->drop_until_kf = 0;                                  /* escape: no IDR in time → don't freeze */
-                    if (g_diag) av_log(NULL, AV_LOG_WARNING, "[PTV-DUKF] escape — no IDR within %"PRId64"ms, resuming\n", g_dukf_escape_us/1000);
+                    if (g_diag) av_log(NULL, AV_LOG_WARNING,
+                        "[PTV-DUKF] escape — no IDR within %"PRId64"ms; dropped %"PRId64" video frames; frame_q now %d\n",
+                        g_dukf_escape_us/1000, d->vdrop - d->kf_arm_vdrop,
+                        atomic_load_explicit(&g_frameq_depth, memory_order_relaxed));
                 } else {
                     d->vdrop++; av_packet_free(&out); continue;           /* drop the mid-GOP new-timeline burst */
                 }
@@ -3595,6 +3778,10 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                                 &a->dec->ch_layout, a->dec->sample_fmt, a->dec->sample_rate, 0, NULL);
             if (!a->swr || swr_init(a->swr) < 0) { av_log(NULL, AV_LOG_WARNING, "audio track %d swr init failed; skipped\n", k); }
         }
+        a->fg_af      = af;            /* remember the chain so audio_feed can rebuild on a source format change */
+        a->fg_in_rate = a->dec->sample_rate;   /* seed the tracked input params (so the first frame doesn't false-trigger) */
+        a->fg_in_fmt  = a->dec->sample_fmt;
+        av_channel_layout_copy(&a->fg_in_chl, &a->dec->ch_layout);
         asrc[n_audio]    = spec->stream;
         asrc_in[n_audio] = spec->input;
         n_audio++;
@@ -4351,6 +4538,12 @@ int main(int argc, char **argv)
     g_diag = !!getenv("PTV_DIAG");
     if (getenv("PTV_NO_AVLOCK")) g_avlock = 0;   /* revert to source-locked audio (drifts on dup) */
     if (getenv("PTV_NO_GENLOCK")) g_genlock = 0; /* v0.9.0: revert to free-run nominal pacing (+ old 350ms prime) = byte-identical */
+    if (getenv("PTV_RATE_LOCK")) g_rate_lock = 1; /* occupancy rate servo (video-side house_skew bound); replaces the DTS-vs-wall FLL */
+    if (getenv("PTV_WUCR")) {                    /* occupancy-ρ video pacing (EMA-filtered + ±1f deadband, gain-6/±6%) + buf/rho readout. AVLOCK KEPT ON: ρ bounds house_skew so AVLOCK's audio-follow is harmless in steady state and keeps A/V matched through unavoidable dups. FLL still computes srcppm for comparison. */
+        g_wucr = 1;
+        av_log(NULL, AV_LOG_INFO, "ptvencoder: [WUCR] active — PROPORTIONAL occupancy-ρ pacing (ρ=500·err, EMA N=16, ±6%% clamp) + AVLOCK ON "
+               "(ρ bounds house_skew; audio follows it so A/V stays matched through dups). Expect: ρ smooth, parks near −(source ppm offset) with no wobble, dlvforced≈0, dup low, speed=1.00x.\n");
+    }
     if (getenv("PTV_NO_GENLOCK_GUARD")) g_genlock_guard = 0;  /* v0.9.4: revert to the unbounded ±1%-gate FLL (A/B the runaway) */
     { const char *mp = getenv("PTV_GENLOCK_MAX_PPM");    if (mp && atoi(mp) > 0) g_gl_max_q20    = av_rescale(atoi(mp), 1 << 20, 1000000); }  /* abs bound on applied rate (default 300ppm) */
     { const char *rp = getenv("PTV_GENLOCK_REJECT_PPM"); if (rp && atoi(rp) > 0) g_gl_reject_q20 = av_rescale(atoi(rp), 1 << 20, 1000000); }  /* relative outlier-reject band (default 700ppm) */
