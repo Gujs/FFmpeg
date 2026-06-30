@@ -224,6 +224,30 @@ static int     g_diag;
  * clock as video (else audio stays source-locked and drifts ~40ms per video dup).
  * On by default; PTV_NO_AVLOCK=1 reverts to the old source-locked audio. */
 static int     g_avlock = 1;
+/* Φ1 (PTV_PHI1) — legacy-rebuild MEASUREMENT GATE. Switches the transcoded-audio output PTS from
+ * ptvencoder's content-anchored `opts=content−h0` to the LEGACY free-running source-clocked sample
+ * counter, turns AVLOCK OFF, and runs NO PLL actuator. The audio is therefore ALLOWED to drift —
+ * that drift is the test signal: we verify the in-process non-blind sensor (out_video_dts −
+ * out_audio_dts, two genuinely-divergent clocks) tracks the external oracle. Proves the rebuild's
+ * measurement premise before any actuator. NOT for production (audio will drift unbounded). */
+static int             g_phi1 = 0;
+static _Atomic int64_t g_phi1_vout_us;               /* Φ1: latest master video OUTPUT time (us, h0-anchored) for the pre-mux (content) sensor */
+static int64_t         g_phi1_mux_vdts_us;           /* Φ1′: latest master-muxer VIDEO packet DTS (us, POST-encode CFR) — master mux thread only */
+static int64_t         g_phi1_mux_last;              /* Φ1′: [PTV-PHI1MUX] wire-sensor log throttle */
+static int             g_phi1_ramp_ppm = 0;          /* Φ1′ slope test (PTV_PHI1_RAMP): inject a KNOWN +ppm ramp into the audio output PTS (stretch by 1+ppm/1e6) → forces a known content drift the oracle AND the wire sensor must both report at the same rate. Implies PTV_PHI1. */
+/* Φ2 (PTV_PHI2) — the legacy-0007 A/V-sync PLL, servoing on the [PTV-PHI1MUX] wire sensor. Implies
+ * PTV_PHI1. In the master mux thread: EMA(τ≈60s) the wire error → capture ONE fixed baseline (the
+ * constant pipeline delay) after warmup → drift = ema−baseline → rate = clamp(drift/60, ±1ms/s) →
+ * integrate into a cumulative offset → shift the audio packet wire DTS by it (drives drift→0, leaves
+ * the constant). Bumpless reset on >5s steps. All state is master-mux-thread-only (non-atomic ok). */
+static int             g_phi2 = 0;
+static double          g_phi2_ema_us;                /* EMA of the wire error (us) */
+static double          g_phi2_baseline_us;           /* captured constant pipeline delay (us) */
+static int             g_phi2_base_set;              /* baseline captured */
+static int64_t         g_phi2_cum_us;                /* integral correction applied to the audio wire DTS (us) */
+static int64_t         g_phi2_n;                     /* audio-packet count (warmup) */
+static int64_t         g_phi2_last_wc;               /* last wallclock for dt integration (us) */
+static int64_t         g_phi2_log_wc;                /* [PTV-PHI2] log throttle */
 /* multiview coarse re-anchor: clear a slot's accumulated dup skew when it returns from a
  * black-slate outage, so its audio re-syncs (not delayed by the stale dup total). On by
  * default; PTV_NO_REANCHOR=1 keeps the stale skew across outages (for A/B comparison). */
@@ -1474,6 +1498,8 @@ static void *output_thread(void *arg)
              * staying source-locked (which is what drifts ~40ms per dup). */
             if (v->is_master && v->house_skew && content_vpts >= 0)
                 *v->house_skew = (vpts - content_vpts) * v->tick_dur_us;
+            if (v->is_master && g_phi1)               /* Φ1: publish video OUTPUT time (us, h0-anchored) for the non-blind sensor */
+                atomic_store_explicit(&g_phi1_vout_us, (int64_t)vpts * v->tick_dur_us, memory_order_relaxed);
             if (src_ts != AV_NOPTS_VALUE)   /* [PTV-CHAIN] video source-content being emitted (us); any rung (same content) */
                 atomic_store_explicit(&g_ch_vout_src, av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q), memory_order_relaxed);
             /* A/V probe (read-only): record this distinct content's first-display output time so the
@@ -1634,6 +1660,8 @@ typedef struct AudioState {
     int64_t         *house_lag_true;/* PTV_DIAG: uncapped true video lag for the lip-sync err (NULL single-input → use house_skew) */
     int              pts_set;
     int64_t          next_pts;
+    int              phi1_seeded;                     /* Φ1: free-running audio counter seeded to h0 */
+    int64_t          phi1_last;                       /* Φ1: last [PTV-PHI1] sensor-log wallclock */
     int64_t          in_frames, out_frames;
     /* PTV_DIAG audio-side probe (temporary): identify per-track A/V offset on real feeds */
     int              dbg_k, dbg_in;
@@ -1758,9 +1786,41 @@ static int audio_drain_fg(AudioState *a)
             int64_t src_abs_us = av_rescale_q(filt->pts, sink_tb, AV_TIME_BASE_Q);  /* A/V probe: this frame's (post-async) source content time (us), before pts is rebased */
             if (a->dbg_k == 0)   /* [PTV-CHAIN] primary-audio source-content being emitted (us) */
                 atomic_store_explicit(&g_ch_aout_src, src_abs_us, memory_order_relaxed);
-            int64_t opts = av_rescale_q(filt->pts, sink_tb, (AVRational){1, a->out_rate}) - h0_samp;
-            if (opts < 0) { av_frame_unref(filt); continue; }   /* precedes video anchor */
+            int64_t opts;
+            if (g_phi1) {
+                /* Φ1: LEGACY free-running source-clocked counter — audio rides aresample's output
+                 * sample count (which, with AVLOCK off, tracks the SOURCE clock), NOT re-anchored to
+                 * content each frame. This is the model ptvencoder replaced with content-anchoring;
+                 * restoring it gives a source-clocked audio output DTS that genuinely diverges from
+                 * the CFR video → the non-blind sensor below has something real to measure. */
+                if (!a->phi1_seeded) {              /* seed to the first at/after-h0 frame's h0-RELATIVE position (matches vout's origin), then free-run */
+                    int64_t first = av_rescale_q(filt->pts, sink_tb, (AVRational){1, a->out_rate}) - h0_samp;
+                    if (first < 0) { av_frame_unref(filt); continue; }   /* wait for the first frame at/after h0 */
+                    a->next_pts = first; a->phi1_seeded = 1;
+                }
+                opts = a->next_pts;
+                a->next_pts += filt->nb_samples;
+                if (g_phi1_ramp_ppm)                  /* Φ1′ slope test: stretch the audio PTS by 1+ppm/1e6 → known content drift */
+                    opts += av_rescale(opts, g_phi1_ramp_ppm, 1000000);
+            } else {
+                opts = av_rescale_q(filt->pts, sink_tb, (AVRational){1, a->out_rate}) - h0_samp;
+                if (opts < 0) { av_frame_unref(filt); continue; }   /* precedes video anchor */
+            }
             filt->pts = opts;
+            if (g_phi1 && a->dbg_k == 0) {                /* Φ1 non-blind sensor: out_video_dts − out_audio_dts (both us, h0-anchored) */
+                int64_t aout_us = av_rescale(opts, 1000000, a->out_rate);
+                int64_t vout_us = atomic_load_explicit(&g_phi1_vout_us, memory_order_relaxed);
+                int64_t nowb    = av_gettime_relative();
+                if (vout_us && nowb - a->phi1_last >= 1000000) {
+                    int64_t sv = atomic_load_explicit(&g_ch_vout_src, memory_order_relaxed);
+                    int64_t sa = atomic_load_explicit(&g_ch_aout_src, memory_order_relaxed);
+                    a->phi1_last = nowb;
+                    av_log(NULL, AV_LOG_INFO,
+                           "ptvencoder: [PTV-PHI1] error=%+lldms (vout=%lldms aout=%lldms)  src_av=%+lldms  [>0 = audio behind video]\n",
+                           (long long)((vout_us - aout_us) / 1000), (long long)(vout_us / 1000), (long long)(aout_us / 1000),
+                           (long long)((sv - sa) / 1000));
+                }
+            }
             /* AUDIO-FOLLOW (Option A, multiview only): apply the compositor's latched per-slot
              * offset as a ONE-TIME deterministic correction — emit on a CONTINUOUS output counter
              * (gapless, monotonic), DROPPING content when the audio is behind the video (advance)
@@ -2287,7 +2347,7 @@ static int audio_feed(AudioState *a, AVFrame *frame)
          * is the necessary coupling that keeps A/V matched through dups. AVLOCK was never the disease;
          * UNBOUNDED house_skew (free house clock) was — and W0's ρ servo bounds it, making AVLOCK
          * harmless + correct. Removing AVLOCK (the original W1) caused the −900ms desync on TruBLU. */
-        if (g_avlock && a->house_skew && !(a->multiview && g_audio_follow) && frame->pts != AV_NOPTS_VALUE) {
+        if (g_avlock && !g_phi1 && a->house_skew && !(a->multiview && g_audio_follow) && frame->pts != AV_NOPTS_VALUE) {
             int64_t sk = *a->house_skew;
             if (sk) frame->pts += av_rescale_q(sk, AV_TIME_BASE_Q, a->ist_tb);
         }
@@ -2543,6 +2603,7 @@ typedef struct MuxArgs {
     AVThreadMessageQueue *mux_q;
     int                   n_producers;
     int                   err;
+    int                   is_master;                  /* Φ1′: rung 0 — compute the wire-DTS sensor here only */
 } MuxArgs;
 
 static int demux_send(AVThreadMessageQueue *q, AVPacket *pkt, int drop, int64_t *drops)
@@ -2938,6 +2999,56 @@ static void *mux_thread(void *arg)
             if (++done >= m->n_producers)
                 break;
             continue;
+        }
+        if (g_phi1 && m->is_master && pkt->dts != AV_NOPTS_VALUE) {
+            /* Φ1′ WIRE sensor (legacy tap point): compare the actually-written video packet DTS
+             * (POST-encode → force-CFR nominal grid) against the audio packet DTS (source-clocked
+             * under PHI1). Unlike the pre-mux [PTV-PHI1] tap (content vs content → blind), the video
+             * here rides the CFR grid, so this should diverge with the real clock drift. */
+            int idx = pkt->stream_index;
+            enum AVMediaType ct = m->ofmt->streams[idx]->codecpar->codec_type;
+            int64_t dts_us = av_rescale_q(pkt->dts, m->ofmt->streams[idx]->time_base, AV_TIME_BASE_Q);
+            if (ct == AVMEDIA_TYPE_VIDEO) {
+                g_phi1_mux_vdts_us = dts_us;
+            } else if (ct == AVMEDIA_TYPE_AUDIO) {
+                int64_t nowb    = av_gettime_relative();
+                int64_t raw_err = g_phi1_mux_vdts_us - dts_us;   /* uncorrected wire error (us) — shows the drift */
+                if (g_phi2 && g_phi1_mux_vdts_us) {
+                    /* Φ2 — legacy 0007 PLL. Closed-loop error includes our own cumulative correction. */
+                    int64_t err = g_phi1_mux_vdts_us - (dts_us + g_phi2_cum_us);
+                    if (g_phi2_base_set && llabs(err - (int64_t)g_phi2_ema_us) > 5000000) {   /* >5s step → bumpless re-warm (preserve cum) */
+                        g_phi2_ema_us = err; g_phi2_base_set = 0; g_phi2_n = 0;
+                    }
+                    if (!g_phi2_n) g_phi2_ema_us = err;                                       /* EMA τ≈60s (~2820 pkts @47/s) */
+                    else           g_phi2_ema_us += (err - g_phi2_ema_us) / 2820.0;
+                    g_phi2_n++;
+                    if (!g_phi2_base_set && g_phi2_n >= 1400) {                               /* capture the constant baseline after ~30s warmup */
+                        g_phi2_baseline_us = g_phi2_ema_us; g_phi2_base_set = 1; g_phi2_last_wc = nowb;
+                    }
+                    if (g_phi2_base_set) {                                                    /* integrate: rate = clamp(drift/60, ±1ms/s) */
+                        double dt = (nowb - g_phi2_last_wc) / 1e6; g_phi2_last_wc = nowb;
+                        if (dt > 0 && dt < 5) {
+                            double rate = (g_phi2_ema_us - g_phi2_baseline_us) / 60.0;        /* us/s, proportional-on-drift */
+                            if (rate >  1000) rate =  1000;
+                            if (rate < -1000) rate = -1000;
+                            g_phi2_cum_us += (int64_t)(rate * dt);
+                        }
+                    }
+                    int64_t off_tb = av_rescale_q(g_phi2_cum_us, AV_TIME_BASE_Q, m->ofmt->streams[idx]->time_base);
+                    if (pkt->pts != AV_NOPTS_VALUE) pkt->pts += off_tb;   /* actuate: shift audio wire DTS by cum → drives drift to baseline */
+                    pkt->dts += off_tb;
+                }
+                if (nowb - g_phi1_mux_last >= 1000000) {
+                    g_phi1_mux_last = nowb;
+                    av_log(NULL, AV_LOG_INFO, "ptvencoder: [PTV-PHI1MUX] error=%+lldms (vdts=%lldms adts=%lldms)\n",
+                           (long long)(raw_err / 1000), (long long)(g_phi1_mux_vdts_us / 1000), (long long)(dts_us / 1000));
+                    if (g_phi2)
+                        av_log(NULL, AV_LOG_INFO, "ptvencoder: [PTV-PHI2] corrected_err=%+lldms (ema=%+lld baseline=%+lld cum=%+lldms)%s\n",
+                               (long long)((g_phi1_mux_vdts_us - (dts_us + g_phi2_cum_us)) / 1000),
+                               (long long)((int64_t)g_phi2_ema_us / 1000), (long long)((int64_t)g_phi2_baseline_us / 1000),
+                               (long long)(g_phi2_cum_us / 1000), g_phi2_base_set ? "" : " (warmup)");
+                }
+            }
         }
         {
             int64_t wt0 = g_diag ? av_gettime_relative() : 0;
@@ -3947,6 +4058,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         vc->dbg_video_q = inputs[0].video_q; vc->dbg_dec_frames = &inputs[0].dc.dec_frames; vc->dbg_vcorrupt = &inputs[0].dc.vcorrupt;
         vc->dbg_vdrop = &inputs[0].da.vdrop; vc->dbg_pcorrupt = &inputs[0].da.vcorrupt;   /* stats: demux video_q drops + corrupt-pkt */
         rung[r].ma.ofmt = rung[r].ofmt; rung[r].ma.mux_q = rung[r].mux_q;
+        rung[r].ma.is_master = (r == 0);                        /* Φ1′: wire-DTS sensor on rung 0 only */
         rung[r].ma.n_producers = 1 + n_audio + n_copy_inputs;   /* video out + N audio + per-input copy fan */
     }
     for (k = 0; k < n_audio; k++) {              /* per-track audio: source from its input's clock */
@@ -4543,6 +4655,20 @@ int main(int argc, char **argv)
         g_wucr = 1;
         av_log(NULL, AV_LOG_INFO, "ptvencoder: [WUCR] active — PROPORTIONAL occupancy-ρ pacing (ρ=500·err, EMA N=16, ±6%% clamp) + AVLOCK ON "
                "(ρ bounds house_skew; audio follows it so A/V stays matched through dups). Expect: ρ smooth, parks near −(source ppm offset) with no wobble, dlvforced≈0, dup low, speed=1.00x.\n");
+    }
+    if (getenv("PTV_PHI1")) {                    /* legacy-rebuild measurement gate (see g_phi1) */
+        g_phi1 = 1;
+        av_log(NULL, AV_LOG_INFO, "ptvencoder: [PTV-PHI1] MEASUREMENT MODE — free-running source-clocked audio + non-blind sensor "
+               "(out_video_dts - out_audio_dts), AVLOCK OFF, NO actuator. Audio WILL drift by design; verify [PTV-PHI1] error tracks the external oracle. NOT for production.\n");
+    }
+    { const char *rp = getenv("PTV_PHI1_RAMP"); if (rp && atoi(rp)) {   /* Φ1′ slope test: inject a KNOWN ppm ramp into the audio output PTS */
+        g_phi1 = 1; g_phi1_ramp_ppm = atoi(rp);
+        av_log(NULL, AV_LOG_INFO, "ptvencoder: [PTV-PHI1RAMP] injecting %+d ppm audio-PTS ramp (= %+.0f ms/hr) — both the oracle and [PTV-PHI1MUX] must report this rate.\n",
+               g_phi1_ramp_ppm, g_phi1_ramp_ppm * 3.6);
+    } }
+    if (getenv("PTV_PHI2")) {                    /* Φ2: the legacy-0007 PLL servoing on the wire sensor (implies PTV_PHI1) */
+        g_phi1 = 1; g_phi2 = 1;
+        av_log(NULL, AV_LOG_INFO, "ptvencoder: [PTV-PHI2] A/V-sync PLL active — EMA(τ60s)→fixed baseline→±1ms/s integral on the [PTV-PHI1MUX] wire error, shifting audio wire DTS. Expect: raw error drifts, corrected_err holds at baseline, cum tracks −(drift). With PTV_PHI1_RAMP set, the PLL should CANCEL the injected ramp.\n");
     }
     if (getenv("PTV_NO_GENLOCK_GUARD")) g_genlock_guard = 0;  /* v0.9.4: revert to the unbounded ±1%-gate FLL (A/B the runaway) */
     { const char *mp = getenv("PTV_GENLOCK_MAX_PPM");    if (mp && atoi(mp) > 0) g_gl_max_q20    = av_rescale(atoi(mp), 1 << 20, 1000000); }  /* abs bound on applied rate (default 300ppm) */
