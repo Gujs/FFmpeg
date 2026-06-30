@@ -234,6 +234,7 @@ static int     g_avlock = 1;
  * measurement premise before any actuator. NOT for production (audio will drift unbounded). */
 static int             g_phi1 = 0;
 static int             g_phiav = 0;                   /* PTV_PHIAV (Stage-1): AVLOCK stays ON + publish the [PTV-PHI1] content sensor (measurement only, NO actuator) — proves the in-process (vout-aout) residual tracks the external oracle before any PLL closes on it */
+static int             g_pll = 0;                     /* PTV_PLL: legacy-0007 wire-PLL (Φ2 integral on the WIRE offset video_dts-audio_dts) but with AVLOCK KEPT ON. Division of labour: AVLOCK absorbs the dup-lag (house_skew steps, which the wire sensor is blind to), the PLL corrects the slow continuous CFR-vs-source-audio rate drift (which AVLOCK can't see). The AVLOCK-off PHI2 ran away precisely because the wire sensor was blind to the dup-lag it was left to handle. */
 static _Atomic int64_t g_phi1_vout_us;               /* Φ1: latest master video OUTPUT time (us, h0-anchored) for the pre-mux (content) sensor */
 static int64_t         g_phi1_mux_vdts_us;           /* Φ1′: latest master-muxer VIDEO packet DTS (us, POST-encode CFR) — master mux thread only */
 static int64_t         g_phi1_mux_last;              /* Φ1′: [PTV-PHI1MUX] wire-sensor log throttle */
@@ -2381,7 +2382,7 @@ static int audio_feed(AudioState *a, AVFrame *frame)
          * is the necessary coupling that keeps A/V matched through dups. AVLOCK was never the disease;
          * UNBOUNDED house_skew (free house clock) was — and W0's ρ servo bounds it, making AVLOCK
          * harmless + correct. Removing AVLOCK (the original W1) caused the −900ms desync on TruBLU. */
-        if (g_avlock && !g_phi1 && a->house_skew && !(a->multiview && g_audio_follow) && frame->pts != AV_NOPTS_VALUE) {
+        if (g_avlock && (!g_phi1 || g_pll) && a->house_skew && !(a->multiview && g_audio_follow) && frame->pts != AV_NOPTS_VALUE) {
             int64_t sk = *a->house_skew;
             if (sk) frame->pts += av_rescale_q(sk, AV_TIME_BASE_Q, a->ist_tb);
         }
@@ -5281,6 +5282,10 @@ int main(int argc, char **argv)
     if (getenv("PTV_PHIAV")) {                   /* Stage-1: AVLOCK-on content sensor (measurement only, no actuator) */
         g_phiav = 1;
         av_log(NULL, AV_LOG_INFO, "ptvencoder: [PTV-PHIAV] AVLOCK-on content-sensor MEASUREMENT mode — [PTV-PHI1] error=(vout-aout) is the post-AVLOCK residual; verify it tracks the external oracle. NO actuator.\n");
+    }
+    if (getenv("PTV_PLL")) {                     /* legacy-0007 wire-PLL WITH AVLOCK kept on (g_pll keeps 2383 AVLOCK active even though g_phi1 is set) */
+        g_phi1 = 1; g_phi2 = 1; g_pll = 1;
+        av_log(NULL, AV_LOG_INFO, "ptvencoder: [PTV-PLL] legacy-0007 wire-PLL ACTIVE with AVLOCK ON — Φ2 integral on the [PTV-PHI1MUX] wire offset (video_dts-audio_dts), ±1ms/s, EMA τ60s; AVLOCK absorbs dup-lag, the PLL nulls the slow CFR-vs-audio rate drift. Watch [PTV-PHI2] cum= track -(drift); verify on the external oracle.\n");
     }
     if (getenv("PTV_PHI1")) {                    /* legacy-rebuild measurement gate (see g_phi1) */
         g_phi1 = 1;
