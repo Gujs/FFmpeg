@@ -3099,6 +3099,22 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
             break;
     }
 
+    /* PERSIST the applied offset so SUBSEQUENT normal-path packets continue on the same
+     * rebased timeline as the flushed NEW packets. demux_unwrap rides wrap_off (dense V/A)
+     * and prog_off (sparse sub/data/SCTE); under g_layera it does `goto absorb_done` and
+     * never updates them, so without this the next packets jump back to the raw new-timeline
+     * ts (e.g. audio +1175s rebased, then the very next packet at the raw 10s) → a huge
+     * BACKWARD jump → aresample chokes → audio dies (sync_check "no audio"). Faithful to
+     * 0004, which applies its per-stream offset to every subsequent packet, not just buffered. */
+    if (b->applied_offset != 0) {
+        int s;
+        for (s = 0; s < b->nb_streams && s < (int)d->ifmt->nb_streams; s++)
+            if (b->stream_state[s].has_new_base)
+                d->wrap_off[s] += av_rescale_q(b->applied_offset, AV_TIME_BASE_Q,
+                                               d->ifmt->streams[s]->time_base);
+        d->prog_off += av_rescale_q(b->applied_offset, AV_TIME_BASE_Q, (AVRational){1, 90000});
+    }
+
     b->flushing = 0;
     ptv_disc_reset(b);
     return ret;
