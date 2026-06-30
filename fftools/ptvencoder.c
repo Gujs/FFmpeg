@@ -45,6 +45,8 @@
 #include "libavutil/time.h"
 #include "libavutil/parseutils.h"
 #include "libavutil/mathematics.h"
+#include "libavutil/crc.h"
+#include "libavutil/bswap.h"
 #include "libavutil/samplefmt.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/channel_layout.h"
@@ -311,6 +313,13 @@ static int     g_prog_off = 1;
  * case; none on fleet — watch unwrap_inj per source). */
 static int     g_progoff_av = 1;
 static int64_t g_progoff_debounce_us = 1000000;   /* PTV_PROGOFF_DEBOUNCE_MS: coalesce a V/A straddle into one bump */
+/* Layer A (proven legacy 0004), PTV_LAYERA=1, default OFF. At a content glue (discontinuity) use ONE
+ * AUDIO-derived offset for ALL dense streams: audio rebases seamlessly, video (and copy) ADOPT the
+ * audio offset so video absorbs the residual via CFR dup/drop. This CORRECTS a source glue A/V
+ * mis-alignment (g_progoff_av merely shares the first-crosser amount → preserves the source A/V,
+ * unwrap_inj≈0 → fast channels that glue mis-muxed content accumulate the error). Supersedes
+ * g_progoff_av when set. Re-aligns video if it crossed before audio within the debounce window. */
+static int     g_layera = 0;
 /* P2 §7.1 / stage 2b: after a detected source discontinuity, DROP video packets until the next keyframe
  * (IDR) before they reach the decoder — a splice starts a NEW timeline mid-GOP, so the P/B frames that
  * reference the missing IDR decode as a corruption burst (greyed/torn frames) that the house clock would
@@ -506,7 +515,10 @@ static _Atomic int64_t g_rate_corr_ppm;              /* shared house-rate correc
  * PTV_RATE_LOCK / genlock unchanged as the fallback. g_rho_corr_ppm = the APPLIED correction (I+P),
  * one producer (master), all rungs apply it identically. */
 static int             g_wucr = 0;
-static _Atomic int64_t g_rho_corr_ppm;               /* WUCR ρ: applied house-rate correction (ppm, corr>0 = house slower); ±6% clamp */
+static int             g_reprime = 0;                /* PTV_REPRIME: when a glue drains frame_q ≤½ setpoint, slow the house HARD (≈0.77x) to refill
+                                                      * fast → dups stop, house_skew stays bounded (the ±6% refill let it run to 7-15s overnight).
+                                                      * Composes with WUCR (occupancy servo) + AVLOCK. Default OFF. */
+static _Atomic int64_t g_rho_corr_ppm;               /* WUCR ρ: applied house-rate correction (ppm, corr>0 = house slower); ±6% clamp (±30% under re-prime) */
 static int64_t         g_occ_ema_milli;              /* WUCR: EMA-filtered master frame_q occupancy (milli-frames); master-thread only, non-atomic */
 static int             g_occ_ema_seeded;             /* WUCR: seed the EMA to the first occupancy sample so there is no startup-ramp transient */
 static _Atomic int     g_frameq_depth;               /* DIAG: master video frame_q occupancy (frames), published each tick for the discontinuity logs */
@@ -1462,8 +1474,15 @@ static void *output_thread(void *arg)
                     g_occ_ema_milli += ((int64_t)occ * 1000 - g_occ_ema_milli) / 16;   /* EMA N=16 → smooth fractional occ */
                     int64_t err_milli = (int64_t)sp * 1000 - g_occ_ema_milli;          /* setpoint − occ (milli-frames) */
                     int64_t corr = (err_milli * 500) / 1000;                           /* ρ = Kp·err, Kp=500 ppm/frame (PROPORTIONAL, no accumulation) */
-                    if (corr >  60000) corr =  60000;                              /* ±6% */
-                    if (corr < -60000) corr = -60000;
+                    int64_t hi = 60000;                                            /* +6% normal positive clamp */
+                    if (g_reprime && occ <= (sp + 1) / 2) {                        /* RE-PRIME: a glue drained frame_q to ≤½ setpoint → the ±6% refill is far
+                                                                                    * too weak (overnight house_skew ran to 7-15s). Slow the house HARD to
+                                                                                    * refill FAST so dups stop and house_skew stays bounded; the normal servo
+                                                                                    * drains the transient latency once occ recovers above ½ setpoint. */
+                        corr = 300000; hi = 300000;                                /* ≈ house 0.77x until refilled */
+                    }
+                    if (corr >  hi)     corr =  hi;
+                    if (corr < -60000)  corr = -60000;
                     atomic_store_explicit(&g_rho_corr_ppm, corr, memory_order_relaxed);
                 }
                 int64_t corr = atomic_load_explicit(&g_rho_corr_ppm, memory_order_relaxed);
@@ -2577,6 +2596,54 @@ typedef struct PassStream {
                                        * is a feature) */
 } PassStream;
 
+/* ---- legacy-0004 TS-discontinuity buffer (g_layera / PTV_LAYERA, default OFF) ----
+ * Faithful port of patches/legacy/0004-ts-discontinuity-buffering. At a content
+ * glue point the source interleaves OLD-timeline and NEW-timeline packets across
+ * the straddle. The default ptvencoder path (g_layera==0) self-rebases each dense
+ * stream's wrap_off at its own crossing and lets mis-glued OLD packets pass through.
+ * When g_layera is on we instead: detect the jump, BUFFER the dense V/A packets while
+ * both timelines are in flight, classify each held packet OLD/NEW, KEEP NEW / DISCARD
+ * OLD, compute one AUDIO-derived offset, apply it to every kept packet, and release
+ * in order. Sparse SUBTITLE/DATA (DVB-sub, SCTE-35) are NEVER buffered — they keep
+ * the existing prog_off path in demux_unwrap. All timestamps here are AV_TIME_BASE
+ * (us); the held packet already has demux_unwrap's 33-bit wrap correction applied. */
+#define PTV_DISC_CAPACITY        256
+#define PTV_DISC_THRESHOLD_US    (1 * AV_TIME_BASE)   /* 1s   jump threshold */
+#define PTV_DISC_TIMEOUT_US      (500 * 1000)         /* 500ms forced-flush timeout */
+#define PTV_DISC_TOL_US          (100 * 1000)         /* 100ms timeline classification tolerance */
+#define PTV_DISC_DROP_KF_TO_US   (5 * AV_TIME_BASE)   /* 5s   drop-until-keyframe escape (unused in port — DUKF stays in demux_thread) */
+
+typedef struct PtvDiscPacket {
+    AVPacket *pkt;
+    int       stream_idx;
+    int64_t   raw_dts;     /* DTS before applied_offset (us); already 33-bit-unwrapped */
+    int       timeline;    /* 0=old, 1=new, -1=unknown */
+} PtvDiscPacket;
+
+typedef struct PtvDiscStreamState {
+    int64_t cumulative_ts_offset;  /* per-stream offset (us), diagnostic; persists across cycles */
+    int64_t last_sent_dts;         /* end of last packet sent for THIS stream (us); NOPTS until first */
+    int64_t last_dts_us;           /* last post-unwrap DTS seen (us) — jump-detection ref; persists */
+    int64_t old_timeline_base;     /* this stream's last DTS before jump (per-cycle) */
+    int64_t new_timeline_base;     /* this stream's first DTS in new timeline (per-cycle) */
+    int     has_old_base;
+    int     has_new_base;
+} PtvDiscStreamState;
+
+typedef struct PtvDiscBuf {
+    PtvDiscPacket     **packets;
+    int                 nb_packets;
+    int                 capacity;
+    int                 active;             /* 1 while buffering across a straddle */
+    int                 flushing;           /* 1 while flushing (suppress re-detection) */
+    int64_t             buffer_start_time;  /* wall clock (us) when buffering started */
+    int                 jump_detected;      /* 1 once any stream recorded bases this cycle */
+    uint8_t            *stream_transitioned;/* per-stream: 1 once it reached the new timeline */
+    int                 nb_streams;
+    PtvDiscStreamState *stream_state;
+    int64_t             applied_offset;     /* single offset (us, audio-derived) applied to ALL kept packets */
+} PtvDiscBuf;
+
 typedef struct DemuxArgs {
     AVFormatContext      *ifmt;
     AVThreadMessageQueue *video_q;
@@ -2597,6 +2664,7 @@ typedef struct DemuxArgs {
     int64_t              *wrap_off;       /* per input stream: cumulative 33-bit wrap offset (stream tb) */
     int64_t              *wrap_last;      /* per input stream: last RAW ts seen (wrap detection) */
     int64_t              *wrap_wall_last; /* per input stream: wall-clock (us) of this stream's last packet — gap-vs-splice discriminator */
+    PtvDiscBuf           *disc;           /* legacy-0004 buffer-classify-discard (g_layera only; NULL otherwise) */
     int64_t               video_fwd_us;   /* wall-clock (us) of the last VIDEO forward-discontinuity crossing (whole-program-splice indicator) */
     int64_t               prog_off;       /* P2 (§7.1): program-level discontinuity offset (90kHz, detected on the
                                            * DENSE video reference) applied to SPARSE copied streams (sub/data/SCTE)
@@ -2605,6 +2673,7 @@ typedef struct DemuxArgs {
                                            * §5.A.2 (g_progoff_av): dense V/A self-rebase by the SHARED first-crosser amount. */
     int64_t               splice_adj;       /* §5.A.2: the first-crosser's discontinuity adj for the current splice */
     int64_t               splice_adj_us;    /* §5.A.2: wall-clock when splice_adj was set (debounce; 0 = never) */
+    int64_t               splice_ref_v;     /* Layer A: video's own adj if it crossed THIS splice before audio (0 = none) → audio re-aligns video to its reference when it crosses */
     int                   drop_until_kf;  /* P2 2b: armed on a video discontinuity → drop video until the next IDR */
     int64_t               kf_arm_us;      /* P2 2b: wall time the drop was armed (first-arm-only escape deadline) */
     int64_t               kf_arm_vdrop;   /* DIAG: vdrop count when DUKF armed (→ per-event drop count at resume) */
@@ -2630,6 +2699,408 @@ static int demux_send(AVThreadMessageQueue *q, AVPacket *pkt, int drop, int64_t 
     }
     if (ret < 0)
         av_packet_free(&pkt);               /* queue closed */
+    return ret;
+}
+
+/* Shift a SCTE-35 splice_info_section's pts_adjustment by offset_us (the same
+ * offset demux_pass applies to the packet timestamps), so the wire
+ * effective_splice_time = (splice_time + pts_adjustment) mod 2^33 rides the
+ * house clock and a downstream splicer matches it against our output video PTS.
+ * The muxer (mpegtsenc) writes the section verbatim, assuming this rebase ran. */
+static void scte35_rebase_pts_adjustment(AVPacket *pkt, int64_t offset_us)
+{
+    const uint8_t *buf;
+    uint8_t *wbuf;
+    int len, section_length, ret;
+    int64_t old_pts_adjustment, new_pts_adjustment, offset_90k;
+    uint32_t crc;
+
+    if (!offset_us || !pkt->data || pkt->size < 17)
+        return; /* need at least header + 4-byte CRC */
+
+    buf = pkt->data;
+    len = pkt->size;
+
+    if (buf[0] != 0xFC)         /* table_id must be splice_info_section */
+        return;
+
+    section_length = ((buf[1] & 0x0F) << 8) | buf[2];
+    if (section_length + 3 > len)
+        return;
+
+    /* Read 33-bit pts_adjustment: byte 4 bit 0 (MSB) + bytes 5-8 (BE32). */
+    old_pts_adjustment = ((int64_t)(buf[4] & 0x01) << 32) |
+                         ((int64_t)buf[5] << 24) |
+                         ((int64_t)buf[6] << 16) |
+                         ((int64_t)buf[7] << 8)  |
+                         buf[8];
+
+    offset_90k = av_rescale(offset_us, 90000, AV_TIME_BASE);
+    new_pts_adjustment = (old_pts_adjustment + offset_90k) & 0x1FFFFFFFFLL;
+
+    ret = av_packet_make_writable(pkt);
+    if (ret < 0)
+        return;
+    wbuf = pkt->data;
+
+    /* Write 33-bit pts_adjustment back; preserve byte 4's top 7 bits
+     * (encrypted_packet flag + encryption_algorithm). */
+    wbuf[4] = (wbuf[4] & 0xFE) | ((new_pts_adjustment >> 32) & 0x01);
+    wbuf[5] = (new_pts_adjustment >> 24) & 0xFF;
+    wbuf[6] = (new_pts_adjustment >> 16) & 0xFF;
+    wbuf[7] = (new_pts_adjustment >>  8) & 0xFF;
+    wbuf[8] =  new_pts_adjustment        & 0xFF;
+
+    /* Recompute the trailing CRC32 over the whole section. */
+    crc = av_bswap32(av_crc(av_crc_get_table(AV_CRC_32_IEEE), -1,
+                            wbuf, len - 4));
+    wbuf[len - 4] = (crc >> 24) & 0xFF;
+    wbuf[len - 3] = (crc >> 16) & 0xFF;
+    wbuf[len - 2] = (crc >>  8) & 0xFF;
+    wbuf[len - 1] =  crc        & 0xFF;
+
+    av_log(NULL, AV_LOG_DEBUG,
+           "ptvencoder: SCTE-35 pts_adjustment %"PRId64" -> %"PRId64" (%+.3fs)\n",
+           old_pts_adjustment, new_pts_adjustment, (double)offset_90k / 90000.0);
+}
+
+/* ========== legacy-0004 TS-discontinuity buffer (g_layera only) ========== */
+
+/* demux_dispatch routes a post-unwrap dense packet (video/audio) to its queue,
+ * exactly as the demux_thread normal path does. The disc-buffer flush re-injects
+ * each kept NEW packet through it, mirroring 0004's flush→demux_send. Forward-
+ * declared because the flush below calls it; defined just before demux_thread. */
+static int demux_dispatch(DemuxArgs *d, AVPacket *out);
+
+/* Estimate a packet's duration in us from codec params, falling back to
+ * pkt->duration. Used to advance last_sent_dts to the END of a packet so NEW
+ * content starts after OLD content ends (faithful to 0004's helper). */
+static int64_t ptv_disc_pkt_duration(AVStream *st, AVPacket *pkt)
+{
+    AVCodecParameters *par = st->codecpar;
+    int64_t dur = 0;
+
+    if (par->codec_type == AVMEDIA_TYPE_AUDIO && par->sample_rate && par->frame_size)
+        dur = ((int64_t)AV_TIME_BASE * par->frame_size) / par->sample_rate;
+    else if (par->codec_type == AVMEDIA_TYPE_VIDEO) {
+        if (st->avg_frame_rate.num)
+            dur = av_rescale_q(1, av_inv_q(st->avg_frame_rate), AV_TIME_BASE_Q);
+        else if (st->r_frame_rate.num)
+            dur = av_rescale_q(1, av_inv_q(st->r_frame_rate), AV_TIME_BASE_Q);
+    }
+    if (dur == 0 && pkt->duration > 0)
+        dur = av_rescale_q(pkt->duration, st->time_base, AV_TIME_BASE_Q);
+    return dur;
+}
+
+static int ptv_disc_init(PtvDiscBuf *b, int capacity, int nb_streams)
+{
+    int i;
+    memset(b, 0, sizeof(*b));
+    b->packets = av_calloc(capacity, sizeof(*b->packets));
+    if (!b->packets)
+        return AVERROR(ENOMEM);
+    b->stream_transitioned = av_calloc(nb_streams, sizeof(*b->stream_transitioned));
+    b->stream_state        = av_calloc(nb_streams, sizeof(*b->stream_state));
+    if (!b->stream_transitioned || !b->stream_state) {
+        av_freep(&b->packets);
+        av_freep(&b->stream_transitioned);
+        av_freep(&b->stream_state);
+        return AVERROR(ENOMEM);
+    }
+    b->capacity   = capacity;
+    b->nb_streams = nb_streams;
+    for (i = 0; i < nb_streams; i++) {
+        b->stream_state[i].cumulative_ts_offset = 0;
+        b->stream_state[i].last_sent_dts        = AV_NOPTS_VALUE;
+        b->stream_state[i].last_dts_us          = AV_NOPTS_VALUE;
+        b->stream_state[i].old_timeline_base    = AV_NOPTS_VALUE;
+        b->stream_state[i].new_timeline_base    = AV_NOPTS_VALUE;
+    }
+    return 0;
+}
+
+/* Reset per-cycle state after a flush WITHOUT clearing cumulative_ts_offset /
+ * last_sent_dts (those persist across discontinuity cycles). */
+static void ptv_disc_reset(PtvDiscBuf *b)
+{
+    int i;
+    for (i = 0; i < b->nb_packets; i++) {
+        if (b->packets[i]) {
+            av_packet_free(&b->packets[i]->pkt);
+            av_freep(&b->packets[i]);
+        }
+    }
+    b->nb_packets = 0;
+    if (b->stream_transitioned)
+        memset(b->stream_transitioned, 0, b->nb_streams * sizeof(*b->stream_transitioned));
+    for (i = 0; i < b->nb_streams; i++) {
+        b->stream_state[i].old_timeline_base = AV_NOPTS_VALUE;
+        b->stream_state[i].new_timeline_base = AV_NOPTS_VALUE;
+        b->stream_state[i].has_old_base      = 0;
+        b->stream_state[i].has_new_base      = 0;
+    }
+    b->active            = 0;
+    b->jump_detected     = 0;
+    b->buffer_start_time = 0;
+    b->applied_offset    = 0;
+}
+
+static void ptv_disc_free(PtvDiscBuf *b)
+{
+    if (!b || !b->packets)
+        return;
+    ptv_disc_reset(b);
+    av_freep(&b->packets);
+    av_freep(&b->stream_transitioned);
+    av_freep(&b->stream_state);
+    b->capacity = b->nb_streams = 0;
+}
+
+/* Clone pkt into the buffer with its raw (post-unwrap) DTS in us. */
+static int ptv_disc_add(PtvDiscBuf *b, AVPacket *pkt, int stream_idx, int64_t raw_dts)
+{
+    PtvDiscPacket *dp;
+    if (b->nb_packets >= b->capacity)
+        return AVERROR(ENOSPC);
+    dp = av_mallocz(sizeof(*dp));
+    if (!dp)
+        return AVERROR(ENOMEM);
+    dp->pkt = av_packet_clone(pkt);
+    if (!dp->pkt) {
+        av_freep(&dp);
+        return AVERROR(ENOMEM);
+    }
+    dp->stream_idx = stream_idx;
+    dp->raw_dts    = raw_dts;
+    dp->timeline   = -1;
+    b->packets[b->nb_packets++] = dp;
+    return 0;
+}
+
+/* Classify raw_dts to OLD(0)/NEW(1) by nearest base within tolerance, preferring
+ * this stream's own bases and BORROWING any stream's bases otherwise. -1 if no
+ * bases recorded yet. Faithful to 0004's discont_classify_timeline. */
+static int ptv_disc_classify(PtvDiscBuf *b, int stream_idx, int64_t raw_dts)
+{
+    int64_t old_base = AV_NOPTS_VALUE, new_base = AV_NOPTS_VALUE;
+    int64_t dist_old, dist_new;
+    int i;
+
+    if (!b->jump_detected)
+        return -1;
+    if (stream_idx >= 0 && stream_idx < b->nb_streams) {
+        PtvDiscStreamState *ss = &b->stream_state[stream_idx];
+        if (ss->has_old_base && ss->has_new_base) {
+            old_base = ss->old_timeline_base;
+            new_base = ss->new_timeline_base;
+        }
+    }
+    if (old_base == AV_NOPTS_VALUE || new_base == AV_NOPTS_VALUE) {
+        for (i = 0; i < b->nb_streams; i++) {
+            PtvDiscStreamState *ss = &b->stream_state[i];
+            if (ss->has_old_base && ss->has_new_base) {
+                old_base = ss->old_timeline_base;
+                new_base = ss->new_timeline_base;
+                break;
+            }
+        }
+    }
+    if (old_base == AV_NOPTS_VALUE || new_base == AV_NOPTS_VALUE)
+        return -1;
+    dist_old = llabs(raw_dts - old_base);
+    dist_new = llabs(raw_dts - new_base);
+    if (dist_old < dist_new && dist_old < PTV_DISC_TOL_US)
+        return 0;
+    else if (dist_new < PTV_DISC_TOL_US)
+        return 1;
+    else if (dist_old < dist_new)
+        return 0;
+    else
+        return 1;
+}
+
+/* All dense (V/A) streams that this input transcodes/copies have transitioned.
+ * ptvencoder has no per-stream discard/finished flags, so check the streams we
+ * actually consume: the video stream and the transcoded audio streams. */
+static int ptv_disc_all_transitioned(DemuxArgs *d, PtvDiscBuf *b)
+{
+    int k;
+    if (d->vstream >= 0 && d->vstream < b->nb_streams && !b->stream_transitioned[d->vstream])
+        return 0;
+    for (k = 0; k < d->n_audio; k++) {
+        int s = d->astream[k];
+        if (s >= 0 && s < b->nb_streams && !b->stream_transitioned[s])
+            return 0;
+    }
+    return 1;
+}
+
+static int ptv_disc_timeout(PtvDiscBuf *b)
+{
+    if (b->buffer_start_time == 0)
+        return 0;
+    return (av_gettime_relative() - b->buffer_start_time) > PTV_DISC_TIMEOUT_US;
+}
+
+static int ptv_disc_compare(const void *a, const void *bb)
+{
+    const PtvDiscPacket *pa = *(const PtvDiscPacket **)a;
+    const PtvDiscPacket *pb = *(const PtvDiscPacket **)bb;
+    if (pa->raw_dts < pb->raw_dts) return -1;
+    if (pa->raw_dts > pb->raw_dts) return  1;
+    return pa->stream_idx - pb->stream_idx;
+}
+
+/* Record this stream's old/new bases on a detected jump and arm jump_detected.
+ * Detection runs against the per-stream wrap_last_us we keep in the disc buffer
+ * (post-unwrap DTS in us), NOT the demux_unwrap wrap_last (stream-tb raw). */
+static int ptv_disc_detect_jump(DemuxArgs *d, PtvDiscBuf *b, int stream_idx,
+                                int64_t raw_dts, int64_t last_dts)
+{
+    int64_t delta;
+    if (b->flushing || last_dts == AV_NOPTS_VALUE)
+        return 0;
+    delta = raw_dts - last_dts;
+    if (llabs(delta) <= PTV_DISC_THRESHOLD_US)
+        return 0;
+    if (stream_idx >= 0 && stream_idx < b->nb_streams) {
+        PtvDiscStreamState *ss = &b->stream_state[stream_idx];
+        ss->old_timeline_base = last_dts;
+        ss->new_timeline_base = raw_dts;
+        ss->has_old_base = 1;
+        ss->has_new_base = 1;
+    }
+    b->jump_detected = 1;
+    if (g_diag)
+        av_log(NULL, AV_LOG_INFO,
+               "[PTV-LAYERA] jump on stream %d: %.3fs -> %.3fs (delta=%.3fs) — buffering\n",
+               stream_idx, (double)last_dts / AV_TIME_BASE,
+               (double)raw_dts / AV_TIME_BASE, (double)delta / AV_TIME_BASE);
+    return 1;
+}
+
+/* Flush: classify each held packet, KEEP NEW / DISCARD OLD, compute one
+ * audio-derived applied_offset, apply it to all kept packets' pts+dts, and
+ * release them in DTS order through demux_dispatch. Faithful to 0004's
+ * discont_buffer_flush (always-keep-NEW, audio-offset preference). */
+static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
+{
+    int i, ret = 0;
+    int old_count = 0, new_count = 0, keep_timeline;
+    int any_started = 0;
+    int64_t vid_off = 0, aud_off = 0;
+    int has_vid = 0, has_aud = 0;
+
+    if (b->nb_packets == 0) {
+        ptv_disc_reset(b);
+        return 0;
+    }
+    b->flushing = 1;
+
+    for (i = 0; i < b->nb_packets; i++) {
+        PtvDiscPacket *dp = b->packets[i];
+        if (dp->timeline < 0)
+            dp->timeline = ptv_disc_classify(b, dp->stream_idx, dp->raw_dts);
+        if (dp->timeline == 0) old_count++;
+        else if (dp->timeline == 1) new_count++;
+    }
+
+    qsort(b->packets, b->nb_packets, sizeof(PtvDiscPacket *), ptv_disc_compare);
+
+    for (i = 0; i < b->nb_streams; i++)
+        if (b->stream_state[i].last_sent_dts != AV_NOPTS_VALUE) { any_started = 1; break; }
+
+    /* Always keep NEW when both timelines have packets (the continued content);
+     * if only one timeline buffered, keep that one. */
+    if (old_count == 0 && new_count > 0)
+        keep_timeline = 1;
+    else if (new_count == 0 && old_count > 0)
+        keep_timeline = 0;
+    else
+        keep_timeline = 1;
+
+    /* Per-stream offset = where this stream left off minus where NEW resumes,
+     * so the kept content butts against the previously-sent timeline. */
+    if (keep_timeline == 1 && any_started) {
+        for (i = 0; i < b->nb_streams; i++) {
+            PtvDiscStreamState *ss = &b->stream_state[i];
+            if (!ss->has_new_base)
+                continue;
+            if (ss->last_sent_dts != AV_NOPTS_VALUE)
+                ss->cumulative_ts_offset = ss->last_sent_dts - ss->new_timeline_base;
+            else if (ss->has_old_base)
+                ss->cumulative_ts_offset = ss->old_timeline_base - ss->new_timeline_base;
+        }
+    }
+
+    /* Pick ONE offset for ALL streams (preserves A/V sync): prefer the audio
+     * stream's offset (audio gets seamless ts; video absorbs the residual via
+     * CFR dup/drop), fall back to video. */
+    for (i = 0; i < b->nb_streams; i++) {
+        AVStream *st;
+        if (!b->stream_state[i].has_new_base)
+            continue;
+        st = d->ifmt->streams[i];
+        if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            vid_off = b->stream_state[i].cumulative_ts_offset; has_vid = 1;
+        } else if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            aud_off = b->stream_state[i].cumulative_ts_offset; has_aud = 1;
+        }
+    }
+    if (has_aud)      b->applied_offset = aud_off;
+    else if (has_vid) b->applied_offset = vid_off;
+
+    if (g_diag)
+        av_log(NULL, AV_LOG_INFO,
+               "[PTV-LAYERA] flush %d pkts: old=%d new=%d keep=%s applied_offset=%.3fs (vid=%.3fs aud=%.3fs vid_err=%.3fs)\n",
+               b->nb_packets, old_count, new_count, keep_timeline ? "NEW" : "OLD",
+               (double)b->applied_offset / AV_TIME_BASE,
+               (double)vid_off / AV_TIME_BASE, (double)aud_off / AV_TIME_BASE,
+               (double)(vid_off - aud_off) / AV_TIME_BASE);
+
+    for (i = 0; i < b->nb_packets; i++) {
+        PtvDiscPacket *dp = b->packets[i];
+        AVStream *st;
+        int64_t pkt_off;
+
+        if (dp->timeline != keep_timeline && dp->timeline >= 0) {
+            av_packet_free(&dp->pkt);
+            av_freep(&b->packets[i]);
+            continue;
+        }
+        if (dp->stream_idx < 0 || dp->stream_idx >= (int)d->ifmt->nb_streams) {
+            av_packet_free(&dp->pkt);
+            av_freep(&b->packets[i]);
+            continue;
+        }
+        st = d->ifmt->streams[dp->stream_idx];
+
+        /* Apply the single (audio-derived) offset to ALL kept packets in stream tb. */
+        if (b->applied_offset != 0) {
+            pkt_off = av_rescale_q(b->applied_offset, AV_TIME_BASE_Q, st->time_base);
+            if (dp->pkt->dts != AV_NOPTS_VALUE) dp->pkt->dts += pkt_off;
+            if (dp->pkt->pts != AV_NOPTS_VALUE) dp->pkt->pts += pkt_off;
+        }
+
+        /* Advance last_sent_dts to the END of this kept packet (output domain) so
+         * the next discontinuity cycle butts new content after it. */
+        if (dp->stream_idx < b->nb_streams) {
+            PtvDiscStreamState *ss = &b->stream_state[dp->stream_idx];
+            int64_t out_end = dp->raw_dts + b->applied_offset + ptv_disc_pkt_duration(st, dp->pkt);
+            if (ss->last_sent_dts == AV_NOPTS_VALUE || out_end > ss->last_sent_dts)
+                ss->last_sent_dts = out_end;
+        }
+
+        ret = demux_dispatch(d, dp->pkt);   /* re-inject through the normal send path; frees pkt */
+        dp->pkt = NULL;
+        av_freep(&b->packets[i]);
+        if (ret < 0)
+            break;
+    }
+
+    b->flushing = 0;
+    ptv_disc_reset(b);
     return ret;
 }
 
@@ -2659,13 +3130,26 @@ static int demux_pass(DemuxArgs *d, AVPacket *out)
         if (out->dts != AV_NOPTS_VALUE) out->dts -= h0_tb;
         ref = out->dts != AV_NOPTS_VALUE ? out->dts : out->pts;
         if (ref != AV_NOPTS_VALUE && ref < 0) { av_packet_free(&out); return 0; }  /* precedes anchor */
-        /* Monotonic-DTS guard for the copy path. The house-skew rebase above (and
-         * source quirks / wrap edges) can nudge a copied stream's dts backward
-         * between packets; the mpegts muxer rejects a backward dts with EINVAL and
-         * the rung dies — this froze channels under the 50fps field-rate dup-storm,
-         * and a rare dup-induced skew dip could trip it even at the right rate.
-         * Clamp strictly increasing per copied stream, shifting pts by the same
-         * amount so pts>=dts still holds. (On-wire SCTE-35 splice timing rides
+        /* SCTE-35: rebase the in-section pts_adjustment by the SAME net offset applied to this packet's
+         * pts/dts so effective_splice_time = (splice_time + pts_adjustment) rides the OUTPUT timeline and a
+         * downstream splicer matches it to the output video PTS. That net offset is (prog_off − h0): −h0_tb
+         * here in demux_pass, PLUS the program-level discontinuity offset prog_off already added to this
+         * DATA packet's container ts in demux_unwrap (P2 §7.1). Without the prog_off term the marker would
+         * arrive at the right container time but point at the WRONG content PTS after an ad-break jump (the
+         * 33-bit wrap is handled by the function's mod-2^33). */
+        if (d->ifmt->streams[d->pass[pi].in_index]->codecpar->codec_id == AV_CODEC_ID_SCTE_35) {
+            int64_t adj_us = -av_rescale_q(h0_tb, d->pass[pi].in_tb, AV_TIME_BASE_Q);
+            if (g_discont && g_prog_off)
+                adj_us += av_rescale_q(d->prog_off, d->pass[pi].in_tb, AV_TIME_BASE_Q);
+            scte35_rebase_pts_adjustment(out, adj_us);
+        }
+        /* Monotonic-DTS guard for the copy path (final, after the SCTE rebase). The
+         * house-skew rebase above (and source quirks / wrap edges) can nudge a copied
+         * stream's dts backward between packets; the mpegts muxer rejects a backward
+         * dts with EINVAL and the rung dies — this froze channels under the 50fps
+         * field-rate dup-storm, and a rare dup-induced skew dip could trip it even at
+         * the right rate. Clamp strictly increasing per copied stream, shifting pts by
+         * the same amount so pts>=dts still holds. (On-wire SCTE-35 splice timing rides
          * pts_adjustment, not container dts, so a sub-ms nudge is invisible there.) */
         if (out->dts != AV_NOPTS_VALUE) {
             if (d->pass[pi].last_dts != AV_NOPTS_VALUE && out->dts <= d->pass[pi].last_dts) {
@@ -2782,22 +3266,23 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                         }
                     }
                     if (is_gap) goto absorb_done;
-                    if (g_progoff_av) {
-                        /* §5.A.2 (adopt-on-crossing, SHARED amount): each dense stream still self-rebases its
-                         * OWN wrap_off at its OWN crossing (the v0.6.23-proven path — a not-yet-crossed stream
-                         * is NEVER given the offset, so the compositor h0/skew math sees no premature leap),
-                         * but it absorbs the SHARED first-crosser delta instead of its own → V and A land on the
-                         * same offset → zero A/V divergence. First dense stream to cross a splice sets the shared
-                         * adj; another stream crossing within g_progoff_debounce_us adopts it.
-                         *   ⚠ v0.7.7's "apply prog_off to ALL packets" was WRONG — it offset un-crossed packets
-                         *   during the V/A straddle → house_skew/aresample blew up ~a full splice (live). This
-                         *   rebases each stream only at its OWN crossing, just by the shared amount. */
-                        int64_t nowb = av_gettime_relative();
+                    int64_t nowb = av_gettime_relative();
+                    if (g_layera) {
+                        /* Layer A = the legacy-0004 buffer-classify-discard mechanism, which lives in
+                         * demux_thread (ptv_disc_*): it BUFFERS dense V/A across the straddle, discards
+                         * OLD-timeline packets, computes ONE audio-derived offset, and applies it at flush.
+                         * So demux_unwrap must NOT also absorb this crossing into wrap_off/prog_off — that
+                         * would double-rebase the kept packets. Skip the per-stream absorber entirely (the
+                         * 33-bit wrap branches above still ran, which the buffer relies on); leave DUKF and
+                         * the disturb bump to the buffer/normal-path. (g_layera==0 path is unchanged.) */
+                        goto absorb_done;
+                    } else if (g_progoff_av) {
+                        /* §5.A.2 (adopt-on-crossing, SHARED first-crosser amount — PRESERVES source A/V, see g_layera). */
                         if (nowb - d->splice_adj_us <= g_progoff_debounce_us)
                             adj = d->splice_adj;                                   /* same splice → adopt shared amount */
                         else { d->splice_adj = adj; d->splice_adj_us = nowb; }     /* first crosser sets the shared amount */
                     }
-                    d->wrap_off[pkt->stream_index] -= adj;   /* per-stream rebase AT OWN CROSSING (shared amount when g_progoff_av) */
+                    d->wrap_off[pkt->stream_index] -= adj;   /* per-stream rebase AT OWN CROSSING (audio-derived common offset when g_layera) */
                     if (ct == AVMEDIA_TYPE_VIDEO) {
                         d->prog_off -= adj;                  /* P2: sparse sub/data/SCTE ride this */
                         if (delta > 0) d->video_fwd_us = wall_now;   /* gap-fix: video forward crossing = whole-program-splice signal for the audio gap discriminator */
@@ -2851,9 +3336,19 @@ static void *demux_thread(void *arg)
         if (g_diag) {
             int64_t now = av_gettime_relative();
             if (now - diag_last >= 1000000) {
+                /* Layer-A probe: the APPLIED A/V wrap_off differential (audio − video), rescaled to ms.
+                 * For A/V sync the CHANGE in this across a splice must be ~0 (both rebased equally). A
+                 * persistent jump that accumulates over splices is the per-stream-rebase divergence we're
+                 * chasing; a value that returns to baseline after a straddle is only a transient. */
+                int64_t avoff_ms = 0;
+                if (d->n_audio > 0) {
+                    int va = d->vstream, aa = d->astream[0];
+                    avoff_ms = av_rescale_q(d->wrap_off[aa], d->ifmt->streams[aa]->time_base, (AVRational){1,1000})
+                             - av_rescale_q(d->wrap_off[va], d->ifmt->streams[va]->time_base, (AVRational){1,1000});
+                }
                 av_log(NULL, AV_LOG_INFO, "[PTV-DIAG] demux vpkt=%"PRId64" vdrop=%"PRId64" vcorrupt=%"PRId64
-                       " apkt=%"PRId64" adrop=%"PRId64" ppkt=%"PRId64" pdrop=%"PRId64"\n",
-                       d->vpkt, d->vdrop, d->vcorrupt, d->apkt, d->adrop, d->ppkt, d->pdrop);
+                       " apkt=%"PRId64" adrop=%"PRId64" ppkt=%"PRId64" pdrop=%"PRId64" avoff=%"PRId64"ms\n",
+                       d->vpkt, d->vdrop, d->vcorrupt, d->apkt, d->adrop, d->ppkt, d->pdrop, avoff_ms);
                 diag_last = now;
             }
         }
@@ -2871,15 +3366,120 @@ static void *demux_thread(void *arg)
                 atomic_store_explicit(&g_ch_asrc_raw, av_rescale_q(out->pts, d->ifmt->streams[out->stream_index]->time_base, AV_TIME_BASE_Q), memory_order_relaxed);
         }
         demux_unwrap(d, out);               /* 33-bit source wrap -> monotonic extended ts (ONCE) */
-        if ((out->flags & AV_PKT_FLAG_CORRUPT) && g_discardcorrupt) {
-            /* = -fflags +discardcorrupt, ALL streams — but COUNTED (video) so frame loss shows in stats
-             * (libavformat's own flag discards silently, hiding the count). Drop before decode: a corrupt
-             * frame, like a dropped one, becomes a content gap the position-anchored composite leaps
-             * across → desync. PTV_KEEP_CORRUPT=1 disables (lets the decoder try to use them). */
-            if (out->stream_index == d->vstream) d->vcorrupt++;
-            av_packet_free(&out);
-            continue;
+
+        /* legacy-0004 TS-discontinuity buffer (g_layera only). Dense V/A get
+         * detect→buffer→classify→discard-OLD→single-offset; sparse SUBTITLE/DATA
+         * (incl. SCTE-35) are NEVER buffered — they fall straight through to
+         * demux_dispatch and keep the prog_off path. */
+        if (g_layera && d->disc && out->dts != AV_NOPTS_VALUE) {
+            AVStream *st = d->ifmt->streams[out->stream_index];
+            int ct = st->codecpar->codec_type;
+            if (ct == AVMEDIA_TYPE_VIDEO || ct == AVMEDIA_TYPE_AUDIO) {
+                PtvDiscBuf *b = d->disc;
+                int sidx = out->stream_index;
+                int64_t raw_dts = av_rescale_q_rnd(out->dts, st->time_base, AV_TIME_BASE_Q,
+                                                   AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+                int64_t last_dts = (sidx < b->nb_streams) ? b->stream_state[sidx].last_dts_us
+                                                          : AV_NOPTS_VALUE;
+                /* Arm buffering on a fresh jump. */
+                if (!b->active && ptv_disc_detect_jump(d, b, sidx, raw_dts, last_dts)) {
+                    b->active = 1;
+                    b->buffer_start_time = av_gettime_relative();
+                    if (d->disturb_epoch)   /* a real content discontinuity → arm the PLL re-acquire */
+                        atomic_fetch_add_explicit(d->disturb_epoch, 1, memory_order_relaxed);
+                }
+                if (sidx < b->nb_streams)
+                    b->stream_state[sidx].last_dts_us = raw_dts;
+
+                if (b->active) {
+                    int timeline;
+                    ret = ptv_disc_add(b, out, sidx, raw_dts);
+                    if (ret == AVERROR(ENOSPC)) {       /* buffer full → force flush, then re-add */
+                        ret = ptv_disc_flush(d, b);
+                        if (ret >= 0)
+                            ret = ptv_disc_add(b, out, sidx, raw_dts);
+                    }
+                    av_packet_free(&out);               /* buffer holds its own clone */
+                    if (ret < 0) break;
+                    /* Mark transitioned + record this stream's bases if it didn't
+                     * trigger detection itself (faithful to 0004). */
+                    timeline = ptv_disc_classify(b, sidx, raw_dts);
+                    if (timeline == 1 && sidx < b->nb_streams) {
+                        PtvDiscStreamState *ss = &b->stream_state[sidx];
+                        b->stream_transitioned[sidx] = 1;
+                        if (!ss->has_new_base) {
+                            ss->new_timeline_base = raw_dts;
+                            ss->has_new_base = 1;
+                            if (!ss->has_old_base && last_dts != AV_NOPTS_VALUE) {
+                                ss->old_timeline_base = last_dts;
+                                ss->has_old_base = 1;
+                            }
+                        }
+                    }
+                    if (ptv_disc_all_transitioned(d, b) || ptv_disc_timeout(b)) {
+                        ret = ptv_disc_flush(d, b);
+                        if (ret < 0) break;
+                    }
+                    continue;                           /* don't dispatch now — held/released by flush */
+                }
+            }
         }
+
+        /* Layer A: track last-sent DTS (output domain, +duration) per dense stream on the NORMAL
+         * path too. The flush computes its rebase as (last_sent_dts − new_timeline_base); without
+         * this the first glue saw last_sent_dts==NOPTS → offset 0 → the jump was NOT corrected.
+         * Normal-path packets carry no disc offset, so their dispatched DTS IS the output DTS. */
+        if (g_layera && d->disc && out->dts != AV_NOPTS_VALUE) {
+            int sx = out->stream_index;
+            if (sx >= 0 && sx < d->disc->nb_streams) {
+                AVStream *st2 = d->ifmt->streams[sx];
+                int ct2 = st2->codecpar->codec_type;
+                if (ct2 == AVMEDIA_TYPE_VIDEO || ct2 == AVMEDIA_TYPE_AUDIO)
+                    d->disc->stream_state[sx].last_sent_dts =
+                        av_rescale_q(out->dts, st2->time_base, AV_TIME_BASE_Q)
+                        + ptv_disc_pkt_duration(st2, out);
+            }
+        }
+
+        ret = demux_dispatch(d, out);
+        if (ret < 0)
+            break;
+    }
+end:
+    /* producer done → signal CONSUMERS to drain then get EOF. recv() returns
+     * err_recv (set_err_send is invisible to receivers), so this MUST be
+     * set_err_recv or decode/audio block forever (the offline-EOF deadlock). */
+    av_thread_message_queue_set_err_recv(d->video_q, AVERROR_EOF);
+    { int k; for (k = 0; k < d->n_audio; k++)
+        av_thread_message_queue_set_err_recv(d->audio_q[k], AVERROR_EOF); }
+    if (d->n_pass > 0) {                     /* copy-passthrough producer EOF, per muxer */
+        int i;
+        for (i = 0; i < d->n_out; i++) {
+            AVPacket *eof = NULL;
+            av_thread_message_queue_send(d->mux_q[i], &eof, 0);
+        }
+    }
+    av_packet_free(&pkt);
+    return NULL;
+}
+
+/* Route one post-unwrap input packet to its queue: corrupt-discard, then video
+ * (DUKF + genlock + CHAIN tap + video_q) or audio (fan to audio_q[] + copy via
+ * demux_pass). Extracted verbatim from demux_thread so the disc-buffer flush can
+ * re-inject kept NEW packets through the identical path. Takes ownership of out
+ * (frees it). Returns 0, or <0 on a queue-closed error. */
+static int demux_dispatch(DemuxArgs *d, AVPacket *out)
+{
+    int ret = 0;
+    if ((out->flags & AV_PKT_FLAG_CORRUPT) && g_discardcorrupt) {
+        /* = -fflags +discardcorrupt, ALL streams — but COUNTED (video) so frame loss shows in stats
+         * (libavformat's own flag discards silently, hiding the count). Drop before decode: a corrupt
+         * frame, like a dropped one, becomes a content gap the position-anchored composite leaps
+         * across → desync. PTV_KEEP_CORRUPT=1 disables (lets the decoder try to use them). */
+        if (out->stream_index == d->vstream) d->vcorrupt++;
+        av_packet_free(&out);
+        return 0;
+    }
         if (out->stream_index == d->vstream) {
             if (d->drop_until_kf) {   /* P2 2b: post-splice → drop video until the next IDR (bounded by the escape) */
                 if (out->flags & AV_PKT_FLAG_KEY) {
@@ -2895,7 +3495,7 @@ static void *demux_thread(void *arg)
                         g_dukf_escape_us/1000, d->vdrop - d->kf_arm_vdrop,
                         atomic_load_explicit(&g_frameq_depth, memory_order_relaxed));
                 } else {
-                    d->vdrop++; av_packet_free(&out); continue;           /* drop the mid-GOP new-timeline burst */
+                    d->vdrop++; av_packet_free(&out); return 0;           /* drop the mid-GOP new-timeline burst */
                 }
             }
             d->vpkt++;
@@ -2978,25 +3578,7 @@ static void *demux_thread(void *arg)
             }
             ret = demux_pass(d, out);       /* copy fan + monotonic-DTS clamp; frees out */
         }
-        if (ret < 0)
-            break;
-    }
-end:
-    /* producer done → signal CONSUMERS to drain then get EOF. recv() returns
-     * err_recv (set_err_send is invisible to receivers), so this MUST be
-     * set_err_recv or decode/audio block forever (the offline-EOF deadlock). */
-    av_thread_message_queue_set_err_recv(d->video_q, AVERROR_EOF);
-    { int k; for (k = 0; k < d->n_audio; k++)
-        av_thread_message_queue_set_err_recv(d->audio_q[k], AVERROR_EOF); }
-    if (d->n_pass > 0) {                     /* copy-passthrough producer EOF, per muxer */
-        int i;
-        for (i = 0; i < d->n_out; i++) {
-            AVPacket *eof = NULL;
-            av_thread_message_queue_send(d->mux_q[i], &eof, 0);
-        }
-    }
-    av_packet_free(&pkt);
-    return NULL;
+        return ret;
 }
 
 static void *mux_thread(void *arg)
@@ -3156,6 +3738,7 @@ typedef struct Input {
     int64_t              *wrap_off;          /* per stream: 33-bit wrap offset (stream tb) */
     int64_t              *wrap_last;         /* per stream: last RAW ts (wrap detection) */
     int64_t              *wrap_wall_last;    /* per stream: wall-clock (us) of last packet (gap-vs-splice discriminator) */
+    PtvDiscBuf            disc;              /* legacy-0004 buffer-classify-discard state (used only when g_layera) */
     DecodeCtx             dc;
     DemuxArgs             da;
     pthread_t             th_demux, th_decode;
@@ -3666,6 +4249,10 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         inputs[k].wrap_wall_last = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].wrap_wall_last)); /* 0 = no prev packet yet */
         if (!inputs[k].wrap_off || !inputs[k].wrap_last || !inputs[k].wrap_wall_last) { ret = AVERROR(ENOMEM); goto end; }
         for (si = 0; si < (int)inputs[k].ifmt->nb_streams; si++) inputs[k].wrap_last[si] = AV_NOPTS_VALUE;
+        if (g_layera) {   /* legacy-0004 buffer-classify-discard state (only when enabled) */
+            if ((ret = ptv_disc_init(&inputs[k].disc, PTV_DISC_CAPACITY,
+                                     inputs[k].ifmt->nb_streams)) < 0) goto end;
+        }
     }
     vdec = inputs[0].vdec; vist = inputs[0].vist;
     vstream = inputs[0].vstream; vdecoder = inputs[0].vdecoder; (void)vstream;
@@ -4098,6 +4685,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         d->disturb_epoch = &inputs[kk].house_disturb;   /* B3: discont absorber arms the PLL mid-run re-acquire */
         d->wrap_off = inputs[kk].wrap_off; d->wrap_last = inputs[kk].wrap_last;
         d->wrap_wall_last = inputs[kk].wrap_wall_last; d->video_fwd_us = 0;
+        d->disc = g_layera ? &inputs[kk].disc : NULL;   /* legacy-0004 buffer (NULL when off) */
         for (r = 0; r < n_rung; r++) {
             d->mux_q[r] = rung[r].mux_q;
             d->gate[r]  = delivery_on ? &rung[r].gate : NULL;   /* §7.5a: dense copied audio rides the gate */
@@ -4241,6 +4829,7 @@ end:
         av_freep(&inputs[k].wrap_off);
         av_freep(&inputs[k].wrap_last);
         av_freep(&inputs[k].wrap_wall_last);
+        ptv_disc_free(&inputs[k].disc);   /* legacy-0004 buffer (no-op if never inited) */
         if (inputs[k].ifmt) avformat_close_input(&inputs[k].ifmt);
         pthread_mutex_destroy(&inputs[k].h0_lock);
         pthread_mutex_destroy(&inputs[k].hold.lock);
@@ -4663,6 +5252,8 @@ int main(int argc, char **argv)
     av_log_set_level(AV_LOG_INFO);
     g_diag = !!getenv("PTV_DIAG");
     if (getenv("PTV_NO_AVLOCK")) g_avlock = 0;   /* revert to source-locked audio (drifts on dup) */
+    if (getenv("PTV_LAYERA")) g_layera = 1;       /* legacy 0004: audio-derived common offset at glue points (corrects source A/V mis-mux) */
+    if (getenv("PTV_REPRIME")) g_reprime = 1;     /* fast buffer re-prime after a glue (needs PTV_WUCR — acts in the occupancy servo) */
     if (getenv("PTV_NO_GENLOCK")) g_genlock = 0; /* v0.9.0: revert to free-run nominal pacing (+ old 350ms prime) = byte-identical */
     if (getenv("PTV_RATE_LOCK")) g_rate_lock = 1; /* occupancy rate servo (video-side house_skew bound); replaces the DTS-vs-wall FLL */
     if (getenv("PTV_WUCR")) {                    /* occupancy-ρ video pacing (EMA-filtered + ±1f deadband, gain-6/±6%) + buf/rho readout. AVLOCK KEPT ON: ρ bounds house_skew so AVLOCK's audio-follow is harmless in steady state and keeps A/V matched through unavoidable dups. FLL still computes srcppm for comparison. */
