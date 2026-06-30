@@ -233,6 +233,7 @@ static int     g_avlock = 1;
  * out_audio_dts, two genuinely-divergent clocks) tracks the external oracle. Proves the rebuild's
  * measurement premise before any actuator. NOT for production (audio will drift unbounded). */
 static int             g_phi1 = 0;
+static int             g_phiav = 0;                   /* PTV_PHIAV (Stage-1): AVLOCK stays ON + publish the [PTV-PHI1] content sensor (measurement only, NO actuator) — proves the in-process (vout-aout) residual tracks the external oracle before any PLL closes on it */
 static _Atomic int64_t g_phi1_vout_us;               /* Φ1: latest master video OUTPUT time (us, h0-anchored) for the pre-mux (content) sensor */
 static int64_t         g_phi1_mux_vdts_us;           /* Φ1′: latest master-muxer VIDEO packet DTS (us, POST-encode CFR) — master mux thread only */
 static int64_t         g_phi1_mux_last;              /* Φ1′: [PTV-PHI1MUX] wire-sensor log throttle */
@@ -1539,7 +1540,7 @@ static void *output_thread(void *arg)
              * staying source-locked (which is what drifts ~40ms per dup). */
             if (v->is_master && v->house_skew && content_vpts >= 0)
                 *v->house_skew = (vpts - content_vpts) * v->tick_dur_us;
-            if (v->is_master && g_phi1)               /* Φ1: publish video OUTPUT time (us, h0-anchored) for the non-blind sensor */
+            if (v->is_master && (g_phi1 || g_phiav))  /* Φ1: publish video OUTPUT time (us, h0-anchored) for the non-blind sensor */
                 atomic_store_explicit(&g_phi1_vout_us, (int64_t)vpts * v->tick_dur_us, memory_order_relaxed);
             if (src_ts != AV_NOPTS_VALUE)   /* [PTV-CHAIN] video source-content being emitted (us); any rung (same content) */
                 atomic_store_explicit(&g_ch_vout_src, av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q), memory_order_relaxed);
@@ -1840,7 +1841,7 @@ static int audio_drain_fg(AudioState *a)
             if (g_phi1_ramp_ppm)                      /* slope test: stretch the audio PTS by 1+ppm/1e6 → known content drift */
                 opts += av_rescale(opts, g_phi1_ramp_ppm, 1000000);
             filt->pts = opts;
-            if (g_phi1 && a->dbg_k == 0) {                /* Φ1 non-blind sensor: out_video_dts − out_audio_dts (both us, h0-anchored) */
+            if ((g_phi1 || g_phiav) && a->dbg_k == 0) {  /* Φ1 non-blind sensor: out_video_dts − out_audio_dts (both us, h0-anchored) */
                 int64_t aout_us = av_rescale(opts, 1000000, a->out_rate);
                 int64_t vout_us = atomic_load_explicit(&g_phi1_vout_us, memory_order_relaxed);
                 int64_t nowb    = av_gettime_relative();
@@ -5276,6 +5277,10 @@ int main(int argc, char **argv)
         g_wucr = 1;
         av_log(NULL, AV_LOG_INFO, "ptvencoder: [WUCR] active — PROPORTIONAL occupancy-ρ pacing (ρ=500·err, EMA N=16, ±6%% clamp) + AVLOCK ON "
                "(ρ bounds house_skew; audio follows it so A/V stays matched through dups). Expect: ρ smooth, parks near −(source ppm offset) with no wobble, dlvforced≈0, dup low, speed=1.00x.\n");
+    }
+    if (getenv("PTV_PHIAV")) {                   /* Stage-1: AVLOCK-on content sensor (measurement only, no actuator) */
+        g_phiav = 1;
+        av_log(NULL, AV_LOG_INFO, "ptvencoder: [PTV-PHIAV] AVLOCK-on content-sensor MEASUREMENT mode — [PTV-PHI1] error=(vout-aout) is the post-AVLOCK residual; verify it tracks the external oracle. NO actuator.\n");
     }
     if (getenv("PTV_PHI1")) {                    /* legacy-rebuild measurement gate (see g_phi1) */
         g_phi1 = 1;
