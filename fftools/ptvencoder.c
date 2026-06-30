@@ -235,6 +235,7 @@ static _Atomic int64_t g_phi1_vout_us;               /* Φ1: latest master video
 static int64_t         g_phi1_mux_vdts_us;           /* Φ1′: latest master-muxer VIDEO packet DTS (us, POST-encode CFR) — master mux thread only */
 static int64_t         g_phi1_mux_last;              /* Φ1′: [PTV-PHI1MUX] wire-sensor log throttle */
 static int             g_phi1_ramp_ppm = 0;          /* Φ1′ slope test (PTV_PHI1_RAMP): inject a KNOWN +ppm ramp into the audio output PTS (stretch by 1+ppm/1e6) → forces a known content drift the oracle AND the wire sensor must both report at the same rate. Implies PTV_PHI1. */
+static int             g_phi1_freecnt = 0;           /* PTV_PHI1_FREECNT: original-PHI1 measurement ONLY — free sample-counter audio PTS (NOT discontinuity-absorbed; bypasses demux_unwrap → runs away on real splices). Default OFF: g_phi1 uses the content-anchored (absorbed) path so Φ2/Φ-real can run on real sources. */
 /* Φ2 (PTV_PHI2) — the legacy-0007 A/V-sync PLL, servoing on the [PTV-PHI1MUX] wire sensor. Implies
  * PTV_PHI1. In the master mux thread: EMA(τ≈60s) the wire error → capture ONE fixed baseline (the
  * constant pipeline delay) after warmup → drift = ema−baseline → rate = clamp(drift/60, ±1ms/s) →
@@ -647,6 +648,11 @@ typedef struct DlvGate {
     int             inited;
     int64_t         cap_us;
     _Atomic int64_t v_enc_dts_hi;       /* newest video DTS the encoder has emitted (µs); INT64_MIN = none yet */
+    _Atomic int64_t v_hi_change_wc;     /* monotonic wall time v_enc_dts_hi last ADVANCED — stall detector:
+                                         * the cap force-release fires only when video is GENUINELY stuck
+                                         * (this hasn't moved within cap_us), NOT when the pipeline merely
+                                         * carries a long-but-healthy steady hold (preroll + audio-ahead +
+                                         * encoder latency ≈ a few s). Absolute-age cap mis-fired there. */
     /* stats (NFR-OBS) */
     _Atomic int64_t st_hold_us;         /* age of the oldest still-held packet at the last drain */
     _Atomic int64_t st_forced;          /* cap_us-forced releases (encoder latency > cap) */
@@ -663,6 +669,7 @@ static void dlv_init(DlvGate *g, AVThreadMessageQueue *mux_q, int64_t cap_us, in
     g->cap_us = cap_us > 0 ? cap_us : 2000000;
     g->maxq = maxq > 0 ? maxq : 512;
     atomic_store(&g->v_enc_dts_hi, INT64_MIN);
+    atomic_store(&g->v_hi_change_wc, av_gettime_relative());   /* "advanced just now" so startup isn't seen as a stall */
     atomic_store(&g->st_hold_us, 0);
     atomic_store(&g->st_forced, 0);
     atomic_store(&g->st_dropped, 0);
@@ -672,10 +679,17 @@ static void dlv_init(DlvGate *g, AVThreadMessageQueue *mux_q, int64_t cap_us, in
 static void dlv_publish_video(DlvGate *g, int64_t dts_us)
 {
     int64_t cur = atomic_load_explicit(&g->v_enc_dts_hi, memory_order_relaxed);
-    while (dts_us > cur &&
-           !atomic_compare_exchange_weak_explicit(&g->v_enc_dts_hi, &cur, dts_us,
-                                                  memory_order_relaxed, memory_order_relaxed))
-        ;   /* cur reloaded on failure */
+    int advanced = 0;
+    while (dts_us > cur) {
+        if (atomic_compare_exchange_weak_explicit(&g->v_enc_dts_hi, &cur, dts_us,
+                                                  memory_order_relaxed, memory_order_relaxed)) {
+            advanced = 1;
+            break;
+        }
+        /* cur reloaded on failure */
+    }
+    if (advanced)   /* high-water mark moved up → video is alive and progressing (resets the stall timer) */
+        atomic_store_explicit(&g->v_hi_change_wc, av_gettime_relative(), memory_order_relaxed);
 }
 
 /* enqueue a dense audio/copy packet; takes ownership of *pkt. block=1 → back-pressure (the audio
@@ -708,14 +722,22 @@ static void dlv_enqueue(DlvGate *g, AVPacket *pkt, int64_t dts_us, int block)
     pthread_mutex_unlock(&g->lock);
 }
 
-/* release every held packet the video has caught up to (dts ≤ v_enc_dts_hi) OR that has waited
- * longer than cap_us (forced — video slow/blocked beyond budget; degrade to "audio ahead", keep
- * flowing). Called by the rung's video output thread on each emit. Collect under lock, send after
+/* release every held packet the video has caught up to (dts ≤ v_enc_dts_hi) OR — only when video has
+ * STALLED (v_enc_dts_hi not advanced within cap_us) — every aged packet (forced: video dead/blocked,
+ * degrade to "audio ahead", keep flowing). A long but healthy steady hold (video still advancing) is
+ * NOT forced. Called by the rung's video output thread on each emit. Collect under lock, send after
  * (never hold the lock across a blocking mux_q send). */
 static void dlv_drain(DlvGate *g)
 {
     int64_t hi  = atomic_load_explicit(&g->v_enc_dts_hi, memory_order_relaxed);
     int64_t now = av_gettime_relative();
+    int64_t adv = atomic_load_explicit(&g->v_hi_change_wc, memory_order_relaxed);
+    /* Force-release ONLY when video is genuinely stuck — its emitted DTS hasn't advanced within cap_us.
+     * A healthy pipeline carries a long-but-steady hold (preroll + audio-ahead + encoder latency); video
+     * keeps advancing, so packets drain naturally as it reaches them and we must NOT force them out early
+     * (the old absolute packet-age cap did, on every jitter excursion past the steady hold → dlvforced
+     * storms that also fed "audio-way-ahead" bursts into the downstream PLL). */
+    int video_stalled = (now - adv) > g->cap_us;
     DlvNode *out_head = NULL, *out_tail = NULL;   /* released, FIFO order */
     DlvNode *p, *prev, *nx;
     int64_t oldest = 0;
@@ -725,7 +747,7 @@ static void dlv_drain(DlvGate *g)
     prev = NULL; p = g->head;
     while (p) {
         int reached = (hi != INT64_MIN && p->dts_us <= hi);
-        int cap     = (now - p->enq_us) > g->cap_us;
+        int cap     = video_stalled && (now - p->enq_us) > g->cap_us;
         nx = p->next;
         if (reached || cap) {
             if (prev) prev->next = nx; else g->head = nx;
@@ -1786,26 +1808,18 @@ static int audio_drain_fg(AudioState *a)
             int64_t src_abs_us = av_rescale_q(filt->pts, sink_tb, AV_TIME_BASE_Q);  /* A/V probe: this frame's (post-async) source content time (us), before pts is rebased */
             if (a->dbg_k == 0)   /* [PTV-CHAIN] primary-audio source-content being emitted (us) */
                 atomic_store_explicit(&g_ch_aout_src, src_abs_us, memory_order_relaxed);
-            int64_t opts;
-            if (g_phi1) {
-                /* Φ1: LEGACY free-running source-clocked counter — audio rides aresample's output
-                 * sample count (which, with AVLOCK off, tracks the SOURCE clock), NOT re-anchored to
-                 * content each frame. This is the model ptvencoder replaced with content-anchoring;
-                 * restoring it gives a source-clocked audio output DTS that genuinely diverges from
-                 * the CFR video → the non-blind sensor below has something real to measure. */
-                if (!a->phi1_seeded) {              /* seed to the first at/after-h0 frame's h0-RELATIVE position (matches vout's origin), then free-run */
-                    int64_t first = av_rescale_q(filt->pts, sink_tb, (AVRational){1, a->out_rate}) - h0_samp;
-                    if (first < 0) { av_frame_unref(filt); continue; }   /* wait for the first frame at/after h0 */
-                    a->next_pts = first; a->phi1_seeded = 1;
-                }
-                opts = a->next_pts;
-                a->next_pts += filt->nb_samples;
-                if (g_phi1_ramp_ppm)                  /* Φ1′ slope test: stretch the audio PTS by 1+ppm/1e6 → known content drift */
-                    opts += av_rescale(opts, g_phi1_ramp_ppm, 1000000);
-            } else {
-                opts = av_rescale_q(filt->pts, sink_tb, (AVRational){1, a->out_rate}) - h0_samp;
-                if (opts < 0) { av_frame_unref(filt); continue; }   /* precedes video anchor */
+            /* Content-anchored output PTS = source content − h0. This rides the source clock (so with
+             * AVLOCK off the wire sensor is non-blind) AND is discontinuity-absorbed by demux_unwrap
+             * (so it survives real splices) — this is the Φ-real path. The free-running counter below
+             * (PTV_PHI1_FREECNT, original-measurement only) is NOT absorbed and runs away on splices. */
+            int64_t opts = av_rescale_q(filt->pts, sink_tb, (AVRational){1, a->out_rate}) - h0_samp;
+            if (opts < 0) { av_frame_unref(filt); continue; }   /* precedes video anchor */
+            if (g_phi1_freecnt) {
+                if (!a->phi1_seeded) { a->next_pts = opts; a->phi1_seeded = 1; }
+                opts = a->next_pts; a->next_pts += filt->nb_samples;
             }
+            if (g_phi1_ramp_ppm)                      /* slope test: stretch the audio PTS by 1+ppm/1e6 → known content drift */
+                opts += av_rescale(opts, g_phi1_ramp_ppm, 1000000);
             filt->pts = opts;
             if (g_phi1 && a->dbg_k == 0) {                /* Φ1 non-blind sensor: out_video_dts − out_audio_dts (both us, h0-anchored) */
                 int64_t aout_us = av_rescale(opts, 1000000, a->out_rate);
@@ -4608,8 +4622,8 @@ static void ptv_print_log_legend(int full)
         "             sync with the EXTERNAL wire oracle test-scripts/repro/drift-continuous.py.\n"
         "  dlvhold    (delivery gate active) ms of audio currently HELD waiting for the matching video\n"
         "             to leave the encoder (≈ encoder latency); normal ~1-2s under NVENC load\n"
-        "  dlvforced  (gate active) cumulative packets FORCE-released at the 3s cap because video never\n"
-        "             caught up — MUST stay ~0; sustained growth = audio leaking ahead of video\n");
+        "  dlvforced  (gate active) cumulative packets force-released because video STALLED (its DTS\n"
+        "             stopped advancing within the cap) — MUST stay ~0; sustained growth = video wedged\n");
     if (!full)
         return;
     av_log(NULL, AV_LOG_INFO,
@@ -4666,6 +4680,7 @@ int main(int argc, char **argv)
         av_log(NULL, AV_LOG_INFO, "ptvencoder: [PTV-PHI1RAMP] injecting %+d ppm audio-PTS ramp (= %+.0f ms/hr) — both the oracle and [PTV-PHI1MUX] must report this rate.\n",
                g_phi1_ramp_ppm, g_phi1_ramp_ppm * 3.6);
     } }
+    if (getenv("PTV_PHI1_FREECNT")) { g_phi1 = 1; g_phi1_freecnt = 1; }   /* original-PHI1 measurement: free-counter audio (not absorbed; off by default) */
     if (getenv("PTV_PHI2")) {                    /* Φ2: the legacy-0007 PLL servoing on the wire sensor (implies PTV_PHI1) */
         g_phi1 = 1; g_phi2 = 1;
         av_log(NULL, AV_LOG_INFO, "ptvencoder: [PTV-PHI2] A/V-sync PLL active — EMA(τ60s)→fixed baseline→±1ms/s integral on the [PTV-PHI1MUX] wire error, shifting audio wire DTS. Expect: raw error drifts, corrected_err holds at baseline, cum tracks −(drift). With PTV_PHI1_RAMP set, the PLL should CANCEL the injected ramp.\n");
