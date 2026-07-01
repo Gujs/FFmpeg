@@ -329,6 +329,7 @@ static int64_t g_progoff_debounce_us = 1000000;   /* PTV_PROGOFF_DEBOUNCE_MS: co
  * unwrap_inj≈0 → fast channels that glue mis-muxed content accumulate the error). Supersedes
  * g_progoff_av when set. Re-aligns video if it crossed before audio within the debounce window. */
 static int     g_layera = 0;
+static int64_t g_disc_viderr_sum;    /* PTV-FLUSHAV: running total of per-flush vid_err (source A/V misalignment absorbed at glues, us) — correlate its growth vs the oracle drift to test whether flushes leak into audio-behind */
 /* P2 §7.1 / stage 2b: after a detected source discontinuity, DROP video packets until the next keyframe
  * (IDR) before they reach the decoder — a splice starts a NEW timeline mid-GOP, so the P/B frames that
  * reference the missing IDR decode as a corruption burst (greyed/torn frames) that the house clock would
@@ -3091,14 +3092,16 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
     }
     if (has_aud)      b->applied_offset = aud_off;
     else if (has_vid) b->applied_offset = vid_off;
+    if (has_vid && has_aud) g_disc_viderr_sum += (vid_off - aud_off);   /* PTV-FLUSHAV: running total of source A/V misalignment absorbed at glues */
 
     if (g_diag)
         av_log(NULL, AV_LOG_INFO,
-               "[PTV-LAYERA] flush %d pkts: old=%d new=%d keep=%s applied_offset=%.3fs (vid=%.3fs aud=%.3fs vid_err=%.3fs)\n",
+               "[PTV-LAYERA] flush %d pkts: old=%d new=%d keep=%s applied_offset=%.3fs (vid=%.3fs aud=%.3fs vid_err=%.3fs cum_vid_err=%.3fs)\n",
                b->nb_packets, old_count, new_count, keep_timeline ? "NEW" : "OLD",
                (double)b->applied_offset / AV_TIME_BASE,
                (double)vid_off / AV_TIME_BASE, (double)aud_off / AV_TIME_BASE,
-               (double)(vid_off - aud_off) / AV_TIME_BASE);
+               (double)(vid_off - aud_off) / AV_TIME_BASE,
+               (double)g_disc_viderr_sum / AV_TIME_BASE);
 
     for (i = 0; i < b->nb_packets; i++) {
         PtvDiscPacket *dp = b->packets[i];
