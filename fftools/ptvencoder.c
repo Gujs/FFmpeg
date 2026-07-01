@@ -240,6 +240,8 @@ static int64_t         g_drift_wc0;                   /* latched first wallclock
 static int             g_drift_set;                   /* latched */
 static double          g_drift_d0[3];                 /* first sample per detector (ms) */
 static double          g_dreg_n, g_dreg_st, g_dreg_stt, g_dreg_sd[3], g_dreg_std[3];  /* regression accumulators */
+static int64_t         g_rate_v0, g_rate_a0;         /* PTV-RATE: first vout/aout (us) */
+static double          g_rreg_n, g_rreg_sw, g_rreg_sww, g_rreg_sv, g_rreg_swv, g_rreg_sa, g_rreg_swa; /* PTV-RATE: video/audio emit-rate regression vs wall (finds the ppm mismatch that D3 can't see) */
 static _Atomic int64_t g_phi1_vout_us;               /* Φ1: latest master video OUTPUT time (us, h0-anchored) for the pre-mux (content) sensor */
 static int64_t         g_phi1_mux_vdts_us;           /* Φ1′: latest master-muxer VIDEO packet DTS (us, POST-encode CFR) — master mux thread only */
 static int64_t         g_phi1_mux_last;              /* Φ1′: [PTV-PHI1MUX] wire-sensor log throttle */
@@ -1864,7 +1866,7 @@ static int audio_drain_fg(AudioState *a)
                         dv[0] = (double)(vout_us - aout_us) / 1000.0;  /* D1 output A/V: house-video-out vs audio-content-out (what the oracle sees) */
                         dv[1] = (double)(sv - sa) / 1000.0;            /* D2 source A/V: src-video vs src-audio (is the drift in the source?) */
                         dv[2] = (double)(vout_us - sv) / 1000.0;       /* D3 house vs source-video: genlock/house-clock error */
-                        if (!g_drift_set) { g_drift_wc0 = nowb; g_drift_d0[0]=dv[0]; g_drift_d0[1]=dv[1]; g_drift_d0[2]=dv[2]; g_drift_set = 1; }
+                        if (!g_drift_set) { g_drift_wc0 = nowb; g_drift_d0[0]=dv[0]; g_drift_d0[1]=dv[1]; g_drift_d0[2]=dv[2]; g_rate_v0=vout_us; g_rate_a0=aout_us; g_drift_set = 1; }
                         double t = (double)(nowb - g_drift_wc0) / 1e6;   /* seconds */
                         int k; g_dreg_n++; g_dreg_st += t; g_dreg_stt += t*t;
                         for (k = 0; k < 3; k++) { g_dreg_sd[k] += dv[k]; g_dreg_std[k] += t*dv[k]; }
@@ -1874,6 +1876,22 @@ static int audio_drain_fg(AudioState *a)
                         av_log(NULL, AV_LOG_INFO,
                             "ptvencoder: [PTV-DRIFT] t=%.0fs  D1_outAV %+.0fms %+.1fppm | D2_srcAV %+.0fms %+.1fppm | D3_house %+.0fms %+.1fppm\n",
                             t, dv[0]-g_drift_d0[0], sl[0]*1000.0, dv[1]-g_drift_d0[1], sl[1]*1000.0, dv[2]-g_drift_d0[2], sl[2]*1000.0);
+                        /* PTV-RATE: video- and audio-emit RATES vs wall, regressed independently → the ppm mismatch that accumulates as drift (audio-behind = video faster than audio). This is the RATE view D3 (a position) can't show. */
+                        {
+                            double w  = (double)(nowb - g_drift_wc0) / 1e6;      /* wall seconds */
+                            double vv = (double)(vout_us - g_rate_v0) / 1e6;     /* video content seconds emitted */
+                            double aa = (double)(aout_us - g_rate_a0) / 1e6;     /* audio content seconds emitted */
+                            g_rreg_n++; g_rreg_sw += w; g_rreg_sww += w*w;
+                            g_rreg_sv += vv; g_rreg_swv += w*vv; g_rreg_sa += aa; g_rreg_swa += w*aa;
+                            double rden = g_rreg_n*g_rreg_sww - g_rreg_sw*g_rreg_sw;
+                            if (rden > 0) {
+                                double slv = (g_rreg_n*g_rreg_swv - g_rreg_sw*g_rreg_sv) / rden;   /* video content-s per wall-s */
+                                double sla = (g_rreg_n*g_rreg_swa - g_rreg_sw*g_rreg_sa) / rden;   /* audio content-s per wall-s */
+                                av_log(NULL, AV_LOG_INFO,
+                                    "ptvencoder: [PTV-RATE] video=%+.1fppm audio=%+.1fppm diff(v-a)=%+.1fppm  (diff>0 = audio falls behind at this rate)\n",
+                                    (slv-1.0)*1e6, (sla-1.0)*1e6, (slv-sla)*1e6);
+                            }
+                        }
                     }
                 }
             }
