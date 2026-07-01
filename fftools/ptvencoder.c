@@ -235,6 +235,11 @@ static int     g_avlock = 1;
 static int             g_phi1 = 0;
 static int             g_phiav = 0;                   /* PTV_PHIAV (Stage-1): AVLOCK stays ON + publish the [PTV-PHI1] content sensor (measurement only, NO actuator) — proves the in-process (vout-aout) residual tracks the external oracle before any PLL closes on it */
 static int             g_pll = 0;                     /* PTV_PLL: legacy-0007 wire-PLL (Φ2 integral on the WIRE offset video_dts-audio_dts) but with AVLOCK KEPT ON. Division of labour: AVLOCK absorbs the dup-lag (house_skew steps, which the wire sensor is blind to), the PLL corrects the slow continuous CFR-vs-source-audio rate drift (which AVLOCK can't see). The AVLOCK-off PHI2 ran away precisely because the wire sensor was blind to the dup-lag it was left to handle. */
+static int             g_driftprobe = 0;              /* PTV_DRIFTPROBE: read-only — 3 drift detectors, each a running linear regression of the slope, compared vs the external oracle to pick the trustworthy signal before building any corrector. D1=output A/V (vout-aout), D2=source A/V (src_v-src_a), D3=house-vs-source-video (genlock err). */
+static int64_t         g_drift_wc0;                   /* latched first wallclock (us) */
+static int             g_drift_set;                   /* latched */
+static double          g_drift_d0[3];                 /* first sample per detector (ms) */
+static double          g_dreg_n, g_dreg_st, g_dreg_stt, g_dreg_sd[3], g_dreg_std[3];  /* regression accumulators */
 static _Atomic int64_t g_phi1_vout_us;               /* Φ1: latest master video OUTPUT time (us, h0-anchored) for the pre-mux (content) sensor */
 static int64_t         g_phi1_mux_vdts_us;           /* Φ1′: latest master-muxer VIDEO packet DTS (us, POST-encode CFR) — master mux thread only */
 static int64_t         g_phi1_mux_last;              /* Φ1′: [PTV-PHI1MUX] wire-sensor log throttle */
@@ -1854,6 +1859,22 @@ static int audio_drain_fg(AudioState *a)
                            "ptvencoder: [PTV-PHI1] error=%+lldms (vout=%lldms aout=%lldms)  src_av=%+lldms  [>0 = audio behind video]\n",
                            (long long)((vout_us - aout_us) / 1000), (long long)(vout_us / 1000), (long long)(aout_us / 1000),
                            (long long)((sv - sa) / 1000));
+                    if (g_driftprobe) {
+                        double dv[3];
+                        dv[0] = (double)(vout_us - aout_us) / 1000.0;  /* D1 output A/V: house-video-out vs audio-content-out (what the oracle sees) */
+                        dv[1] = (double)(sv - sa) / 1000.0;            /* D2 source A/V: src-video vs src-audio (is the drift in the source?) */
+                        dv[2] = (double)(vout_us - sv) / 1000.0;       /* D3 house vs source-video: genlock/house-clock error */
+                        if (!g_drift_set) { g_drift_wc0 = nowb; g_drift_d0[0]=dv[0]; g_drift_d0[1]=dv[1]; g_drift_d0[2]=dv[2]; g_drift_set = 1; }
+                        double t = (double)(nowb - g_drift_wc0) / 1e6;   /* seconds */
+                        int k; g_dreg_n++; g_dreg_st += t; g_dreg_stt += t*t;
+                        for (k = 0; k < 3; k++) { g_dreg_sd[k] += dv[k]; g_dreg_std[k] += t*dv[k]; }
+                        double den = g_dreg_n*g_dreg_stt - g_dreg_st*g_dreg_st;
+                        double sl[3];
+                        for (k = 0; k < 3; k++) sl[k] = den > 0 ? (g_dreg_n*g_dreg_std[k] - g_dreg_st*g_dreg_sd[k]) / den : 0.0; /* ms/s */
+                        av_log(NULL, AV_LOG_INFO,
+                            "ptvencoder: [PTV-DRIFT] t=%.0fs  D1_outAV %+.0fms %+.1fppm | D2_srcAV %+.0fms %+.1fppm | D3_house %+.0fms %+.1fppm\n",
+                            t, dv[0]-g_drift_d0[0], sl[0]*1000.0, dv[1]-g_drift_d0[1], sl[1]*1000.0, dv[2]-g_drift_d0[2], sl[2]*1000.0);
+                    }
                 }
             }
             /* AUDIO-FOLLOW (Option A, multiview only): apply the compositor's latched per-slot
@@ -5282,6 +5303,10 @@ int main(int argc, char **argv)
     if (getenv("PTV_PHIAV")) {                   /* Stage-1: AVLOCK-on content sensor (measurement only, no actuator) */
         g_phiav = 1;
         av_log(NULL, AV_LOG_INFO, "ptvencoder: [PTV-PHIAV] AVLOCK-on content-sensor MEASUREMENT mode — [PTV-PHI1] error=(vout-aout) is the post-AVLOCK residual; verify it tracks the external oracle. NO actuator.\n");
+    }
+    if (getenv("PTV_DRIFTPROBE")) {              /* read-only drift-rate probe (reuses the PHIAV sensor plumbing) */
+        g_phiav = 1; g_driftprobe = 1;
+        av_log(NULL, AV_LOG_INFO, "ptvencoder: [PTV-DRIFT] drift-rate probe ACTIVE (read-only) — logs the slope of (vout-aout) = house-vs-source-audio rate. Validate [PTV-DRIFT] rate/since_start against the external oracle before actuating.\n");
     }
     if (getenv("PTV_PLL")) {                     /* legacy-0007 wire-PLL WITH AVLOCK kept on (g_pll keeps 2383 AVLOCK active even though g_phi1 is set) */
         g_phi1 = 1; g_phi2 = 1; g_pll = 1;
