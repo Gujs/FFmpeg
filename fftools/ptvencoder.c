@@ -69,7 +69,14 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.9.7"  /* 0.9.7 (audio filtergraph reconfig, 2026-06-29): rebuild the -af graph/swr when the SOURCE audio changes channel-layout/rate/fmt mid-stream (e.g. stereo→mono at an ad-splice) — fixes permanent audio loss; hysteresis ignores transient splice flips. Ported from legacy 0003. Output stays pinned stereo/48k. */
+#define PTVENCODER_VERSION "0.9.9"  /* 0.9.9 (EXACTTICK, 2026-07-02): video content index stamped at the EXACT
+                                    rational frame rate (was: divide by integer-us tick_dur_us -> ~10ppm mapping
+                                    compression at 30000/1001 -> chronic audio-behind lip-sync drift +36ms/h on
+                                    NTSC channels, zero at 25/50fps; found by 4-agent audit, confirmed by 6h
+                                    oracle regression +42..52ms/h vs +36 predicted). PTV_NO_EXACTTICK reverts;
+                                    PTV_TICK_ADJ_US=+N accelerates the old bug for falsification. */
+                                    /* 0.9.8 (deep frame_q cushion, 2026-07-01): PTV_FRAMEQ raises the decode->output jitter-buffer cap (default 48) so a deep PTV_PREROLL_MS can hold a ~3-4s post-decode cushion — rides out an AWE ad-break decode-rate DIP without frame_q draining -> no house dup-fill -> no house_skew step. Default 48 = byte-identical. */
+                                    /* 0.9.7 (audio filtergraph reconfig, 2026-06-29): rebuild the -af graph/swr when the SOURCE audio changes channel-layout/rate/fmt mid-stream (e.g. stereo→mono at an ad-splice) — fixes permanent audio loss; hysteresis ignores transient splice flips. Ported from legacy 0003. Output stays pinned stereo/48k. */
                                     /* 0.9.6 (WUCR proportional ρ servo, 2026-06-29): occupancy-locked house rate via a PROPORTIONAL controller (ρ=Kp·err) — kills the integral servo's ±7-13k ppm limit cycle; ρ parks at −(source ppm) so it doubles as a per-source rate readout. PTV_WUCR=1. */
                                     /* 0.9.5 (genlock phase-2a — LONG-BASELINE rate, 2026-06-27): the real cure
                                     * for the runaway the 0.9.4 guard only CAPPED. The 3s FLL window aliases bursty
@@ -453,6 +460,18 @@ static int     g_pll_dev_shift = 9;          /* v0.6.22: EMA shift for pll_dev (
  * up — multicast/live is realtime steady-state, so video_q sits near-empty after). drop-newest remains
  * the backstop for genuine SUSTAINED overload. PTV_VIDEOQ overrides. */
 static int     g_videoq = 256;
+static int     g_exacttick = 1;      /* v0.9.9 EXACTTICK (PTV_NO_EXACTTICK reverts): compute the video content
+                                      * index with the EXACT rational frame duration instead of dividing by the
+                                      * integer-us tick_dur_us. The integer tick (e.g. 33367 vs true 33366.667us
+                                      * at 30000/1001) compresses video's content->PTS mapping by ~10ppm while
+                                      * audio is stamped sample-exact -> audio drifts BEHIND at ~36ms/h on every
+                                      * NTSC-rate channel (TruBLU/AWE), zero at 25/50fps (Fintech/Cinestar) --
+                                      * invisible to hs/dup by construction. Root cause of the chronic lip-sync
+                                      * drift (4-agent audit 2026-07-02; oracle-measured +42..52ms/h vs +36 predicted). */
+static int64_t g_tick_adj_us = 0;    /* PTV_TICK_ADJ_US (diag): deliberately skew tick_dur_us by +/-N us to
+                                      * ACCELERATE the quantization drift for falsification (e.g. +10us at 29.97
+                                      * = +300ppm = ~65ms/min audio-behind with EXACTTICK off; flat with it on). */
+static int     g_frameq_cap = PTV_FRAME_QDEPTH;  /* decode->output jitter-buffer capacity (frames). Default 48 = byte-identical. PTV_FRAMEQ raises it so a DEEP post-decode cushion can ride out an ad-break decode-rate DIP (AWE bwdif dip) without the frame_q draining -> no house dup-fill -> no house_skew step. Only useful together with a matching deep PTV_PREROLL_MS to actually FILL the deeper buffer. */
 static int     g_preroll_ms = 350;   /* §13: house-clock startup cushion (ms). >~1.6s (frame_q cap) → single-input decode delays its start until video_q banks this much (deep bursty-input prime). Default 350 → 0 deep packets → byte-identical. Bounded [0,30000]; PTV_PREROLL_MS sets it. v0.9.0: genlock defaults this to ~1 GOP (2000) unless set explicitly. */
 static int     g_preroll_set;        /* PTV_PREROLL_MS set explicitly → suppresses the v0.9.0 genlock ~1-GOP default */
 static int     g_aq_cap = 256;       /* §13: effective pre-h0 audio ring depth (<= PTV_AQ_PREROLL). Default 256 = historical (byte-identical); raised to PTV_AQ_PREROLL only for a deep prime so audio buffers through the long video-decode delay. */
@@ -532,6 +551,28 @@ static _Atomic int64_t g_rho_corr_ppm;               /* WUCR ρ: applied house-r
 static int64_t         g_occ_ema_milli;              /* WUCR: EMA-filtered master frame_q occupancy (milli-frames); master-thread only, non-atomic */
 static int             g_occ_ema_seeded;             /* WUCR: seed the EMA to the first occupancy sample so there is no startup-ramp transient */
 static _Atomic int     g_frameq_depth;               /* DIAG: master video frame_q occupancy (frames), published each tick for the discontinuity logs */
+/* PTV-EMPTY (g_diag): edge-triggered per-queue starvation logger. Logs one line the instant a
+ * pipeline queue empties, one when it refills (with the empty duration), and a heartbeat every 5s
+ * while it stays empty. This makes decode-feed starvation self-reporting and gives the exact
+ * empty-duration (e.g. an ad-break decode dip = "video_q empty NNNNms") to size the frame_q cushion. */
+static void ptv_empty_watch(const char *name, int depth, int64_t now,
+                            int64_t *since, int64_t *hb)
+{
+    if (depth == 0) {
+        if (*since == 0) { *since = now; *hb = now; }          /* enter empty silently (normal 0-crossings are noise) */
+        else if (now - *hb >= 5000000) {                       /* chronic: heartbeat every 5s so "empty now" is visible */
+            *hb = now;
+            av_log(NULL, AV_LOG_INFO, "[PTV-EMPTY] %s still empty %lldms\n",
+                   name, (long long)((now - *since) / 1000));
+        }
+    } else if (*since) {
+        int64_t dur = now - *since;
+        if (dur >= 200000)                                     /* only report episodes >=200ms — the real starvation, not tick jitter */
+            av_log(NULL, AV_LOG_INFO, "[PTV-EMPTY] %s refilled after %lldms empty\n",
+                   name, (long long)(dur / 1000));
+        *since = 0;
+    }
+}
 /* v0.9.4 genlock GUARD (PTV_NO_GENLOCK_GUARD reverts to exact v0.9.x behavior). TruBLU-class jittery/
  * bursty sources alias the 3s FLL window → noisy sub-window rates that the loose ±1% gate folded in,
  * driving a slew-limited ±1000ppm limit cycle + an UNBOUNDED house_skew runaway (cor-1: 8.6→28s over
@@ -989,6 +1030,7 @@ typedef struct VideoCtx {
     AVCodecContext  *venc;
     AVStream        *ost;
     int64_t          tick_dur_us;
+    AVRational       out_fps;        /* exact output rate — EXACTTICK content-index stamping (v0.9.9) */
     int              live;
     int              passthrough;    /* multiview: compositor already paced+stamped; encode 1:1 */
     int              is_master;      /* only the master rung prints stats/diag */
@@ -1421,7 +1463,8 @@ static void *output_thread(void *arg)
         int n_prime = (preroll_ms > 0 && v->tick_dur_us > 0)
                           ? (int)((int64_t)preroll_ms * 1000 / v->tick_dur_us) : 0;
         int primed;
-        if (n_prime > PTV_FRAME_QDEPTH - 8) n_prime = PTV_FRAME_QDEPTH - 8;
+        int64_t eq_vq_s = 0, eq_vq_h = 0, eq_fq_s = 0, eq_fq_h = 0, eq_mq_s = 0, eq_mq_h = 0;  /* PTV-EMPTY per-queue empty-since/heartbeat state */
+        if (n_prime > g_frameq_cap - 8) n_prime = g_frameq_cap - 8;
         if (n_prime < 0) n_prime = 0;
         primed = (n_prime == 0);
 
@@ -1453,8 +1496,15 @@ static void *output_thread(void *arg)
             /* v0.9.0 genlock: pace off a phase accumulator (not tick*tick_dur) so a rate change never
              * teleports the target. per_tick scales by the recovered source rate (ALL single-input rungs,
              * once locked); otherwise == tick_dur_us → gl_phase == tick*tick_dur → byte-identical free-run. */
-            if (v->is_master)   /* DIAG: publish frame_q depth so the demux-thread discontinuity logs can show the drain */
+            if (v->is_master) {  /* DIAG: publish frame_q depth so the demux-thread discontinuity logs can show the drain */
                 atomic_store_explicit(&g_frameq_depth, av_thread_message_queue_nb_elems(v->frame_q), memory_order_relaxed);
+                if (g_diag) {
+                    int64_t nw = av_gettime_relative();
+                    if (v->dbg_video_q) ptv_empty_watch("video_q", av_thread_message_queue_nb_elems(v->dbg_video_q), nw, &eq_vq_s, &eq_vq_h);
+                    ptv_empty_watch("frame_q", av_thread_message_queue_nb_elems(v->frame_q), nw, &eq_fq_s, &eq_fq_h);
+                    if (v->mux_q) ptv_empty_watch("mux_q", av_thread_message_queue_nb_elems(v->mux_q), nw, &eq_mq_s, &eq_mq_h);
+                }
+            }
             int64_t per_tick = v->tick_dur_us;
             if (g_wucr) {
                 /* WUCR ρ (W0): PROPORTIONAL occupancy controller. corr = Kp·(setpoint − occ_ema).
@@ -1534,7 +1584,14 @@ static void *output_thread(void *arg)
             if (src_ts != AV_NOPTS_VALUE && *v->h0 != AV_NOPTS_VALUE) {
                 int64_t house_us = av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q) - *v->h0;
                 if (house_us < 0) house_us = 0;
-                content_vpts = (house_us + v->tick_dur_us / 2) / v->tick_dur_us;
+                if (g_exacttick && v->out_fps.num > 0)
+                    /* EXACTTICK (v0.9.9): round-nearest content index at the EXACT rational rate.
+                     * Dividing by the integer-us tick (33367 vs 33366.667 at 30000/1001) compressed
+                     * the mapping ~10ppm -> chronic audio-behind drift; exact rational = zero slope. */
+                    content_vpts = av_rescale_rnd(house_us, v->out_fps.num,
+                                                  1000000LL * v->out_fps.den, AV_ROUND_NEAR_INF);
+                else
+                    content_vpts = (house_us + v->tick_dur_us / 2) / v->tick_dur_us;
                 vpts = content_vpts;
             } else {
                 vpts = last_vpts + 1;
@@ -2997,6 +3054,28 @@ static int ptv_disc_compare(const void *a, const void *bb)
 /* Record this stream's old/new bases on a detected jump and arm jump_detected.
  * Detection runs against the per-stream wrap_last_us we keep in the disc buffer
  * (post-unwrap DTS in us), NOT the demux_unwrap wrap_last (stream-tb raw). */
+/* PTV-QSNAP: one-line depth snapshot of EVERY queue in the pipeline — video_q (demux->decode
+ * feed), frame_q cushion (via the published g_frameq_depth atomic), each transcoded audio_q,
+ * each per-rung mux_q, and the LAYERA disc buffer. Logged at buffer-start and at flush so the
+ * pair shows whether the rebase window starves the decode feed (video_q/frame_q drain during
+ * the straddle -> house dup-fill). g_diag-gated, alongside the [PTV-LAYERA] logs. */
+static void ptv_qsnap(DemuxArgs *d, PtvDiscBuf *b, const char *tag)
+{
+    char qs[320]; int p = 0, k;
+    p += snprintf(qs + p, sizeof(qs) - p, "vq=%d frameq=%d aq=[",
+                  av_thread_message_queue_nb_elems(d->video_q),
+                  (int)atomic_load_explicit(&g_frameq_depth, memory_order_relaxed));
+    for (k = 0; k < d->n_audio && p < (int)sizeof(qs); k++)
+        p += snprintf(qs + p, sizeof(qs) - p, "%s%d", k ? "," : "",
+                      av_thread_message_queue_nb_elems(d->audio_q[k]));
+    p += snprintf(qs + p, sizeof(qs) - p, "] muxq=[");
+    for (k = 0; k < d->n_out && p < (int)sizeof(qs); k++)
+        p += snprintf(qs + p, sizeof(qs) - p, "%s%d", k ? "," : "",
+                      av_thread_message_queue_nb_elems(d->mux_q[k]));
+    snprintf(qs + p, sizeof(qs) - p, "] disc=%d", b->nb_packets);
+    av_log(NULL, AV_LOG_INFO, "[PTV-QSNAP] %s: %s\n", tag, qs);
+}
+
 static int ptv_disc_detect_jump(DemuxArgs *d, PtvDiscBuf *b, int stream_idx,
                                 int64_t raw_dts, int64_t last_dts)
 {
@@ -3019,6 +3098,7 @@ static int ptv_disc_detect_jump(DemuxArgs *d, PtvDiscBuf *b, int stream_idx,
                "[PTV-LAYERA] jump on stream %d: %.3fs -> %.3fs (delta=%.3fs) — buffering\n",
                stream_idx, (double)last_dts / AV_TIME_BASE,
                (double)raw_dts / AV_TIME_BASE, (double)delta / AV_TIME_BASE);
+    if (g_diag) ptv_qsnap(d, b, "buffer-start");
     return 1;
 }
 
@@ -3102,6 +3182,7 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
                (double)vid_off / AV_TIME_BASE, (double)aud_off / AV_TIME_BASE,
                (double)(vid_off - aud_off) / AV_TIME_BASE,
                (double)g_disc_viderr_sum / AV_TIME_BASE);
+    if (g_diag) ptv_qsnap(d, b, "at-flush");
 
     for (i = 0; i < b->nb_packets; i++) {
         PtvDiscPacket *dp = b->packets[i];
@@ -3892,7 +3973,7 @@ static void *compositor_thread(void *arg)
     int64_t stat_last = diag_t0, stat_prev = 0;
 
     if (!filt) goto done;
-    if (n_prime > PTV_FRAME_QDEPTH - 8) n_prime = PTV_FRAME_QDEPTH - 8;
+    if (n_prime > g_frameq_cap - 8) n_prime = g_frameq_cap - 8;
     if (n_prime < 0) n_prime = 0;
     for (k = 0; k < n; k++) blackf[k] = make_black_frame(c->inputs[k].vdec);
 
@@ -4249,7 +4330,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         pthread_mutex_init(&inputs[k].hold.lock, NULL);
         pthread_mutex_init(&inputs[k].vring.lock, NULL);
         if (multiview) {                         /* per-input jitter buffer for the compositor */
-            if ((ret = av_thread_message_queue_alloc(&inputs[k].hold.q, PTV_FRAME_QDEPTH, sizeof(AVFrame *))) < 0) goto end;
+            if ((ret = av_thread_message_queue_alloc(&inputs[k].hold.q, g_frameq_cap, sizeof(AVFrame *))) < 0) goto end;
             av_thread_message_queue_set_free_func(inputs[k].hold.q, free_frame_msg);
         }
         /* Take raw 33-bit timestamps; demux_unwrap extends them (libav's
@@ -4657,7 +4738,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         av_thread_message_queue_set_free_func(audio_q[k], free_pkt_msg);
     }
     for (r = 0; r < n_rung; r++) {
-        if ((ret = av_thread_message_queue_alloc(&rung[r].frame_q, PTV_FRAME_QDEPTH, sizeof(AVFrame *))) < 0) goto end;
+        if ((ret = av_thread_message_queue_alloc(&rung[r].frame_q, g_frameq_cap, sizeof(AVFrame *))) < 0) goto end;
         av_thread_message_queue_set_free_func(rung[r].frame_q, free_frame_msg);
         if ((ret = av_thread_message_queue_alloc(&rung[r].mux_q, PTV_QDEPTH, sizeof(AVPacket *))) < 0) goto end;
         av_thread_message_queue_set_free_func(rung[r].mux_q, free_pkt_msg);
@@ -4689,7 +4770,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         if (!multiview && out_fps.num > 0) {         /* v0.9.1: deep video_q prime is single-input only; multiview relies on the compositor's hold.q (already a paced per-input de-jitter buffer) */
             int tgt = (int)((int64_t)g_preroll_ms * out_fps.num / (1000LL * out_fps.den));
             if (tgt > g_videoq - 32) tgt = g_videoq - 32;
-            if (tgt > PTV_FRAME_QDEPTH - 8) d->deep_prime_packets = tgt;
+            if (tgt > g_frameq_cap - 8) d->deep_prime_packets = tgt;
         }
     }
 
@@ -4697,7 +4778,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
 
     if (multiview) {                                 /* compositor = the video house clock */
         comp.inputs = inputs; comp.n_input = n_input; comp.fg = fg; comp.n_rung = n_rung;
-        comp.tick_dur_us = av_rescale(1000000, out_fps.den, out_fps.num);
+        comp.tick_dur_us = av_rescale(1000000, out_fps.den, out_fps.num) + g_tick_adj_us;
         comp.live = live;
         comp.slate_after_us = live ? 5 * (int64_t)AV_TIME_BASE : 0;   /* stale cell -> black after 5s */
         for (k = 0; k < n_input; k++) comp.fsrc[k] = fsrc[k];
@@ -4710,7 +4791,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         vc->frame_q = rung[r].frame_q; vc->mux_q = rung[r].mux_q; vc->venc = rung[r].venc;
         vc->gate = delivery_on ? &rung[r].gate : NULL;   /* §7.5a: this rung's delivery-alignment FIFO */
         vc->out_tb = filtering ? av_buffersink_get_time_base(vsink[r]) : inputs[0].ist_tb;
-        vc->tick_dur_us = av_rescale(1000000, out_fps.den, out_fps.num);
+        vc->tick_dur_us = av_rescale(1000000, out_fps.den, out_fps.num) + g_tick_adj_us;
+        vc->out_fps = out_fps;                       /* EXACTTICK: exact rational for content-index stamping */
         vc->live = live; vc->passthrough = multiview;
         vc->h0 = &inputs[0].h0; vc->h0_lock = &inputs[0].h0_lock;
         vc->house_skew = &inputs[0].house_skew;
@@ -5376,6 +5458,9 @@ int main(int argc, char **argv)
     if (getenv("PTV_AF_NO_ANCHOR")) g_af_anchor = 0;        /* A/B: revert B1 → pre-B1 free-running counter */
     { const char *pe = getenv("PTV_PREROLL_MS"); if (pe) { int v = atoi(pe); if (v < 0) v = 0; if (v > 30000) v = 30000; g_preroll_ms = v; g_preroll_set = 1; } }  /* §13: startup cushion target (ms), bounded 0-30s */
     { const char *vq = getenv("PTV_VIDEOQ"); if (vq && atoi(vq) > 0) g_videoq = atoi(vq); }   /* video_q depth (startup-burst absorb) */
+    { const char *fq = getenv("PTV_FRAMEQ"); if (fq && atoi(fq) > 0) { int v = atoi(fq); if (v < PTV_FRAME_QDEPTH) v = PTV_FRAME_QDEPTH; if (v > 1024) v = 1024; g_frameq_cap = v; } }   /* frame_q (decode->output) capacity; raise + deep PTV_PREROLL_MS to absorb an ad-break decode-rate dip (AWE) */
+    if (getenv("PTV_NO_EXACTTICK")) g_exacttick = 0;   /* revert to integer-us tick content index (the ~10ppm NTSC drift) */
+    { const char *ta = getenv("PTV_TICK_ADJ_US"); if (ta) { int64_t v = atoll(ta); if (v < -1000) v = -1000; if (v > 1000) v = 1000; g_tick_adj_us = v; } }   /* diag: accelerate the tick-quantization drift for falsification */
     if (g_genlock && !g_preroll_set) g_preroll_ms = 1000;  /* v0.9.1: default the single-input prime to ~1s (frame_q cushion) — smooths decode-rate dips while video+gate-hold stays under the 3s gate cap (cap scaling stays dormant). Deep video_q prime + cap-scale remain available for explicit high PTV_PREROLL_MS (bursty Fintech-class). PTV_PREROLL_MS overrides, PTV_NO_GENLOCK reverts to 350. */
     if (g_preroll_ms > 1600) g_delivery_cap_us += (int64_t)g_preroll_ms * 1000;  /* v0.9.0: the deep input prime delays VIDEO ~g_preroll_ms; the §7.5a gate holds audio+copy to match (it IS the audio-side of the whole-stream delay), so size its cap to the prime — else it force-releases and audio leaks ahead (TruBLU dlvforced). Explicit PTV_DELIVERY_CAP_MS (below) overrides. */
     if (g_preroll_ms > 1600) g_delivery_maxq = FFMAX(g_delivery_maxq, (int)(g_delivery_cap_us / 1000000 * 256));  /* v0.9.0: the deeper hold needs more FIFO nodes (≤ cap_s × Σ stream pkt-rates); without this a multi-audio channel (2 transcoded + copied AC-3) hits the maxq backstop and back-pressure-stalls before the cap. Explicit PTV_DELIVERY_MAXQ (below) overrides. */
