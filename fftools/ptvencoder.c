@@ -1091,8 +1091,12 @@ static void push_frame_q(AVThreadMessageQueue *q, int live, int64_t *framedrop, 
     int ret = av_thread_message_queue_send(q, &out, AV_THREAD_MESSAGE_NONBLOCK);
     if (ret == AVERROR(EAGAIN)) {                    /* full -> drop oldest, keep newest */
         AVFrame *old;
-        if (av_thread_message_queue_recv(q, &old, AV_THREAD_MESSAGE_NONBLOCK) >= 0)
+        if (av_thread_message_queue_recv(q, &old, AV_THREAD_MESSAGE_NONBLOCK) >= 0) {
             av_frame_free(&old);
+            (*framedrop)++;                          /* v0.9.10: count drop-oldest — this is real skipped content
+                                                      * (catch-up overflow = the latency-drain meter); it was
+                                                      * silent before, leaving stats drop= misleadingly at 0 */
+        }
         if (av_thread_message_queue_send(q, &out, AV_THREAD_MESSAGE_NONBLOCK) < 0) {
             av_frame_free(&out);
             (*framedrop)++;
@@ -1441,7 +1445,7 @@ static void *output_thread(void *arg)
     int64_t held_src_pts = AV_NOPTS_VALUE;   /* ORIGINAL source pts of held frame (held->pts gets
                                                 overwritten to vpts on emit; dups must not re-read it) */
     int64_t diag_t0 = av_gettime_relative(), diag_last = diag_t0;
-    int64_t stat_last = diag_t0, stat_prev = 0;
+    int64_t stat_last = diag_t0;
 
     if (!held)
         goto done;
@@ -1720,30 +1724,22 @@ static void *output_thread(void *arg)
         if (g_stats && v->is_master) {          /* ffmpeg-style progress line */
             int64_t nows = av_gettime_relative();
             if (nows - stat_last >= g_stats_period_us) {
-                double dt    = (nows - stat_last) / 1000000.0;
-                double fps   = (v->emitted - stat_prev) / (dt > 0 ? dt : 1);
                 double secs  = v->emitted * v->tick_dur_us / 1000000.0;   /* CFR output time */
                 double wall  = (nows - wall0) / 1000000.0;
                 double speed = wall > 0 ? secs / wall : 0;
                 double kbps  = secs > 0 ? g_muxed_bytes * 8.0 / secs / 1000.0 : 0;
                 int hh = (int)(secs / 3600), mm = ((int)secs % 3600) / 60;
                 double ss = secs - hh * 3600 - mm * 60;
-                int64_t qd = v->dbg_vdrop ? *v->dbg_vdrop : 0;       /* video_q overflow drops */
                 int64_t cr = (v->dbg_pcorrupt ? *v->dbg_pcorrupt : 0) + (v->dbg_vcorrupt ? *v->dbg_vcorrupt : 0);  /* corrupt: demux + decode */
                 char dlv[64] = "";                                   /* §7.5a delivery gate: max hold + cap-forced releases */
                 if (v->gate)
                     snprintf(dlv, sizeof dlv, " dlvhold=%"PRId64"ms dlvforced=%"PRId64,
                              atomic_load_explicit(&v->gate->st_hold_us, memory_order_relaxed) / 1000,
                              atomic_load_explicit(&v->gate->st_forced, memory_order_relaxed));
-                char gl[48];                                         /* clock health: genlock lock + recovered source ppm (single-input live only) */
-                if (!(g_genlock && g_genlock_ok))
-                    snprintf(gl, sizeof gl, "genlock=off");
-                else if (atomic_load_explicit(&g_src_rate_locked, memory_order_relaxed))
-                    snprintf(gl, sizeof gl, "genlock=1 srcppm=%+.0f",
-                             (atomic_load_explicit(&g_src_rate_q20, memory_order_relaxed) - (1 << 20)) * 1e6 / (1 << 20));
-                else
-                    snprintf(gl, sizeof gl, "genlock=0");
                 int64_t aw = atomic_load_explicit(&g_async_ppm, memory_order_relaxed);  /* aresample work (ppm) */
+                /* v0.9.10 cleanup: genlock=/srcppm= dropped from stats — WUCR (default) never uses the FLL
+                 * for pacing and wucr_rho IS the source-ppm readout (rho parks at -srcppm). fps= dropped
+                 * (== nominal x speed). qdrop= dropped (PTV_DIAG demux line still carries it). */
                 char wu[96] = "";                                    /* WUCR readout: buffer depth + recovered ρ (go/no-go vs srcppm) */
                 if (g_wucr) {
                     int occ = av_thread_message_queue_nb_elems(v->frame_q);
@@ -1754,12 +1750,12 @@ static void *output_thread(void *arg)
                              (int)((int64_t)cur_sp * v->tick_dur_us / 1000));  /* -corr = recovered source dev (+=faster); cushion = adaptive tier target */
                 }
                 av_log(NULL, AV_LOG_INFO,
-                    "frame=%6"PRId64" fps=%3.0f size=%8"PRId64"KiB time=%02d:%02d:%05.2f "
-                    "bitrate=%7.1fkbits/s dup=%"PRId64" drop=%"PRId64" qdrop=%"PRId64" corrupt=%"PRId64" speed=%4.2fx "
-                    "%s async=%+"PRId64"ppm%s%s\n",
-                    v->emitted, fps, g_muxed_bytes / 1024, hh, mm, ss, kbps,
-                    v->dup, v->framedrop, qd, cr, speed, gl, aw, dlv, wu);
-                stat_last = nows; stat_prev = v->emitted;
+                    "frame=%6"PRId64" size=%8"PRId64"KiB time=%02d:%02d:%05.2f "
+                    "bitrate=%7.1fkbits/s dup=%"PRId64" drop=%"PRId64" corrupt=%"PRId64" speed=%4.2fx "
+                    "async=%+"PRId64"ppm%s%s\n",
+                    v->emitted, g_muxed_bytes / 1024, hh, mm, ss, kbps,
+                    v->dup, v->framedrop, cr, speed, aw, dlv, wu);
+                stat_last = nows;
             }
         }
     }
