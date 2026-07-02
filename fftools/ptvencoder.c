@@ -69,7 +69,19 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.9.9"  /* 0.9.9 (EXACTTICK, 2026-07-02): video content index stamped at the EXACT
+#define PTVENCODER_VERSION "0.9.10" /* 0.9.10 (adaptive cushion + proven-base defaults, 2026-07-02): (1) ADAPTIVE
+                                    frame_q cushion — two discrete targets (BASE=resolved preroll ~1s, RAISED=
+                                    PTV_CUSHION_MS default 4s); grows on 2 starvation episodes (>=200ms) within
+                                    60min, shrinks after 6h quiet; fill/drain are LAZY via the servo gentle zone
+                                    (+/-0.6% above the base floor) so transitions never jerk delivery; logs
+                                    [PTV-CUSHION], -stats shows cushion=. PTV_NO_ADAPTIVE reverts. (2) WUCR +
+                                    LAYERA + REPRIME now DEFAULT-ON (proven production posture; PTV_NO_WUCR/
+                                    PTV_NO_LAYERA/PTV_NO_REPRIME revert); reprime rate-limited (1 per 5min) and
+                                    triggered on the BASE floor, not the raised tier. (3) frame_q capacity default
+                                    160 (slots only; PTV_FRAMEQ overrides). (4) PTV-EMPTY polish: video_q/mux_q
+                                    lose the misleading chronic heartbeat (empty is their healthy state); frame_q
+                                    watch runs ungated and feeds the adaptive cushion. LAYERA logic UNTOUCHED. */
+                                    /* 0.9.9 (EXACTTICK, 2026-07-02): video content index stamped at the EXACT
                                     rational frame rate (was: divide by integer-us tick_dur_us -> ~10ppm mapping
                                     compression at 30000/1001 -> chronic audio-behind lip-sync drift +36ms/h on
                                     NTSC channels, zero at 25/50fps; found by 4-agent audit, confirmed by 6h
@@ -335,7 +347,7 @@ static int64_t g_progoff_debounce_us = 1000000;   /* PTV_PROGOFF_DEBOUNCE_MS: co
  * mis-alignment (g_progoff_av merely shares the first-crosser amount → preserves the source A/V,
  * unwrap_inj≈0 → fast channels that glue mis-muxed content accumulate the error). Supersedes
  * g_progoff_av when set. Re-aligns video if it crossed before audio within the debounce window. */
-static int     g_layera = 0;
+static int     g_layera = 1;   /* v0.9.10: DEFAULT ON (proven production posture); PTV_NO_LAYERA reverts */
 static int64_t g_disc_viderr_sum;    /* PTV-FLUSHAV: running total of per-flush vid_err (source A/V misalignment absorbed at glues, us) — correlate its growth vs the oracle drift to test whether flushes leak into audio-behind */
 /* P2 §7.1 / stage 2b: after a detected source discontinuity, DROP video packets until the next keyframe
  * (IDR) before they reach the decoder — a splice starts a NEW timeline mid-GOP, so the P/B frames that
@@ -471,7 +483,11 @@ static int     g_exacttick = 1;      /* v0.9.9 EXACTTICK (PTV_NO_EXACTTICK rever
 static int64_t g_tick_adj_us = 0;    /* PTV_TICK_ADJ_US (diag): deliberately skew tick_dur_us by +/-N us to
                                       * ACCELERATE the quantization drift for falsification (e.g. +10us at 29.97
                                       * = +300ppm = ~65ms/min audio-behind with EXACTTICK off; flat with it on). */
-static int     g_frameq_cap = PTV_FRAME_QDEPTH;  /* decode->output jitter-buffer capacity (frames). Default 48 = byte-identical. PTV_FRAMEQ raises it so a DEEP post-decode cushion can ride out an ad-break decode-rate DIP (AWE bwdif dip) without the frame_q draining -> no house dup-fill -> no house_skew step. Only useful together with a matching deep PTV_PREROLL_MS to actually FILL the deeper buffer. */
+static int     g_frameq_cap = 160;  /* decode->output jitter-buffer CAPACITY (frames; slots are pointers — memory
+                                     * is used only by FILLED depth). v0.9.10 default 160 = headroom for the 4s
+                                     * adaptive tier (~120f @30fps) + catch-up bursts, while bounding the worst-case
+                                     * transient bank (~1GB VRAM ladder-wide on CUDA channels vs ~2GB at 320).
+                                     * PTV_FRAMEQ overrides [48,1024] for explicit deep setups (e.g. 8s + preroll). */
 static int     g_preroll_ms = 350;   /* §13: house-clock startup cushion (ms). >~1.6s (frame_q cap) → single-input decode delays its start until video_q banks this much (deep bursty-input prime). Default 350 → 0 deep packets → byte-identical. Bounded [0,30000]; PTV_PREROLL_MS sets it. v0.9.0: genlock defaults this to ~1 GOP (2000) unless set explicitly. */
 static int     g_preroll_set;        /* PTV_PREROLL_MS set explicitly → suppresses the v0.9.0 genlock ~1-GOP default */
 static int     g_aq_cap = 256;       /* §13: effective pre-h0 audio ring depth (<= PTV_AQ_PREROLL). Default 256 = historical (byte-identical); raised to PTV_AQ_PREROLL only for a deep prime so audio buffers through the long video-decode delay. */
@@ -543,35 +559,52 @@ static _Atomic int64_t g_rate_corr_ppm;              /* shared house-rate correc
  * runs (srcppm computed for comparison) but does not pace. Audio coupling to ρ is W1. Default OFF —
  * PTV_RATE_LOCK / genlock unchanged as the fallback. g_rho_corr_ppm = the APPLIED correction (I+P),
  * one producer (master), all rungs apply it identically. */
-static int             g_wucr = 0;
-static int             g_reprime = 0;                /* PTV_REPRIME: when a glue drains frame_q ≤½ setpoint, slow the house HARD (≈0.77x) to refill
-                                                      * fast → dups stop, house_skew stays bounded (the ±6% refill let it run to 7-15s overnight).
-                                                      * Composes with WUCR (occupancy servo) + AVLOCK. Default OFF. */
+static int             g_wucr = 1;                   /* v0.9.10: DEFAULT ON (proven production posture); PTV_NO_WUCR reverts */
+static int             g_reprime = 1;                /* PTV_REPRIME: when a glue drains frame_q below half the BASE floor, slow the house HARD (≈0.77x)
+                                                      * to refill fast → dups stop, house_skew stays bounded (the ±6% refill let it run to 7-15s overnight).
+                                                      * Composes with WUCR (occupancy servo) + AVLOCK. v0.9.10: DEFAULT ON, rate-limited to one
+                                                      * engagement per 5min (PTV_NO_REPRIME reverts). */
+static int64_t         g_reprime_last_us;            /* rate limit: wall time of the last reprime engagement (master emit thread only) */
+/* v0.9.10 ADAPTIVE CUSHION (PTV_NO_ADAPTIVE reverts to a fixed preroll target). Two discrete frame_q
+ * targets, no continuous wander: BASE = the resolved preroll (~1s) and RAISED = g_cushion_ms (~4s).
+ * GROW: two starvation episodes (frame_q empty >=200ms) within 60min -> RAISED (one-off glitches never
+ * grow it). Fill is LAZY: no house slow-down — the servo's gentle zone (+/-0.6% above the base floor)
+ * lets natural source catch-up bursts fill the deeper target, so downstream delivery never jerks.
+ * SHRINK: 6h with zero starvations -> back to BASE (drains at ppm scale; GPU frames free as it drains).
+ * State is quantized + hysteretic (grow needs recurrence in 1h, shrink needs 6h silence) -> no
+ * oscillation, no per-channel tuning; transitions log [PTV-CUSHION] and depth shows in -stats. */
+static int             g_adapt_cushion = 1;
+static int             g_cushion_ms = 4000;          /* RAISED tier (ms of frames); PTV_CUSHION_MS overrides, [1000,10000] */
 static _Atomic int64_t g_rho_corr_ppm;               /* WUCR ρ: applied house-rate correction (ppm, corr>0 = house slower); ±6% clamp (±30% under re-prime) */
 static int64_t         g_occ_ema_milli;              /* WUCR: EMA-filtered master frame_q occupancy (milli-frames); master-thread only, non-atomic */
 static int             g_occ_ema_seeded;             /* WUCR: seed the EMA to the first occupancy sample so there is no startup-ramp transient */
 static _Atomic int     g_frameq_depth;               /* DIAG: master video frame_q occupancy (frames), published each tick for the discontinuity logs */
-/* PTV-EMPTY (g_diag): edge-triggered per-queue starvation logger. Logs one line the instant a
- * pipeline queue empties, one when it refills (with the empty duration), and a heartbeat every 5s
- * while it stays empty. This makes decode-feed starvation self-reporting and gives the exact
- * empty-duration (e.g. an ad-break decode dip = "video_q empty NNNNms") to size the frame_q cushion. */
-static void ptv_empty_watch(const char *name, int depth, int64_t now,
-                            int64_t *since, int64_t *hb)
+/* PTV-EMPTY: edge-triggered per-queue starvation logger. Logs a refill line with the empty duration
+ * for episodes >=200ms, plus (only when hb != NULL) a 5s chronic heartbeat while empty. Returns the
+ * episode duration (us) when a >=200ms episode just ended, else 0 — the adaptive cushion feeds on
+ * frame_q episodes. v0.9.10: no heartbeat for video_q/mux_q (empty is their NORMAL state — the
+ * consumer drains them instantly; a healthy channel reads "empty" at every sample. Only frame_q
+ * empty means real starvation → it keeps the heartbeat). */
+static int64_t ptv_empty_watch(const char *name, int depth, int64_t now,
+                               int64_t *since, int64_t *hb)
 {
     if (depth == 0) {
-        if (*since == 0) { *since = now; *hb = now; }          /* enter empty silently (normal 0-crossings are noise) */
-        else if (now - *hb >= 5000000) {                       /* chronic: heartbeat every 5s so "empty now" is visible */
+        if (*since == 0) { *since = now; if (hb) *hb = now; }  /* enter empty silently (normal 0-crossings are noise) */
+        else if (hb && now - *hb >= 5000000) {                 /* chronic: heartbeat every 5s so "empty now" is visible */
             *hb = now;
             av_log(NULL, AV_LOG_INFO, "[PTV-EMPTY] %s still empty %lldms\n",
                    name, (long long)((now - *since) / 1000));
         }
     } else if (*since) {
         int64_t dur = now - *since;
-        if (dur >= 200000)                                     /* only report episodes >=200ms — the real starvation, not tick jitter */
+        *since = 0;
+        if (dur >= 200000) {                                   /* only report episodes >=200ms — the real starvation, not tick jitter */
             av_log(NULL, AV_LOG_INFO, "[PTV-EMPTY] %s refilled after %lldms empty\n",
                    name, (long long)(dur / 1000));
-        *since = 0;
+            return dur;
+        }
     }
+    return 0;
 }
 /* v0.9.4 genlock GUARD (PTV_NO_GENLOCK_GUARD reverts to exact v0.9.x behavior). TruBLU-class jittery/
  * bursty sources alias the 3s FLL window → noisy sub-window rates that the loose ±1% gate folded in,
@@ -1463,10 +1496,17 @@ static void *output_thread(void *arg)
         int n_prime = (preroll_ms > 0 && v->tick_dur_us > 0)
                           ? (int)((int64_t)preroll_ms * 1000 / v->tick_dur_us) : 0;
         int primed;
-        int64_t eq_vq_s = 0, eq_vq_h = 0, eq_fq_s = 0, eq_fq_h = 0, eq_mq_s = 0, eq_mq_h = 0;  /* PTV-EMPTY per-queue empty-since/heartbeat state */
+        int64_t eq_vq_s = 0, eq_fq_s = 0, eq_fq_h = 0, eq_mq_s = 0;  /* PTV-EMPTY per-queue empty-since (+ frame_q heartbeat) state */
         if (n_prime > g_frameq_cap - 8) n_prime = g_frameq_cap - 8;
         if (n_prime < 0) n_prime = 0;
         primed = (n_prime == 0);
+        /* v0.9.10 adaptive cushion (master only): two discrete frame_q targets, lazy transitions. */
+        int base_sp   = n_prime > 2 ? n_prime : 4;                    /* safety floor = the resolved preroll */
+        int raised_sp = (v->tick_dur_us > 0) ? (int)((int64_t)g_cushion_ms * 1000 / v->tick_dur_us) : base_sp;
+        int cur_sp    = base_sp;
+        int64_t ep_last_us = 0, ep_prev_us = 0;                       /* starvation-episode wall times (grow gate) */
+        if (raised_sp > g_frameq_cap - 8) raised_sp = g_frameq_cap - 8;
+        if (raised_sp < base_sp) raised_sp = base_sp;                 /* explicit deep preroll >= cushion -> adaptive no-op */
 
     for (;;) {
         int fresh = 0;
@@ -1497,12 +1537,31 @@ static void *output_thread(void *arg)
              * teleports the target. per_tick scales by the recovered source rate (ALL single-input rungs,
              * once locked); otherwise == tick_dur_us → gl_phase == tick*tick_dur → byte-identical free-run. */
             if (v->is_master) {  /* DIAG: publish frame_q depth so the demux-thread discontinuity logs can show the drain */
+                int64_t nw = av_gettime_relative();
+                int64_t ep;
                 atomic_store_explicit(&g_frameq_depth, av_thread_message_queue_nb_elems(v->frame_q), memory_order_relaxed);
-                if (g_diag) {
-                    int64_t nw = av_gettime_relative();
-                    if (v->dbg_video_q) ptv_empty_watch("video_q", av_thread_message_queue_nb_elems(v->dbg_video_q), nw, &eq_vq_s, &eq_vq_h);
-                    ptv_empty_watch("frame_q", av_thread_message_queue_nb_elems(v->frame_q), nw, &eq_fq_s, &eq_fq_h);
-                    if (v->mux_q) ptv_empty_watch("mux_q", av_thread_message_queue_nb_elems(v->mux_q), nw, &eq_mq_s, &eq_mq_h);
+                if (g_diag) {   /* video_q/mux_q: refill-episode logs only — empty is their normal state (no heartbeat) */
+                    if (v->dbg_video_q) ptv_empty_watch("video_q", av_thread_message_queue_nb_elems(v->dbg_video_q), nw, &eq_vq_s, NULL);
+                    if (v->mux_q) ptv_empty_watch("mux_q", av_thread_message_queue_nb_elems(v->mux_q), nw, &eq_mq_s, NULL);
+                }
+                /* frame_q starvation watch runs UNGATED — it feeds the adaptive cushion */
+                ep = ptv_empty_watch("frame_q", av_thread_message_queue_nb_elems(v->frame_q), nw, &eq_fq_s, &eq_fq_h);
+                if (g_adapt_cushion && !v->passthrough) {
+                    if (ep > 0) {                                     /* a >=200ms starvation episode just ended */
+                        ep_prev_us = ep_last_us; ep_last_us = nw;
+                        if (cur_sp < raised_sp && ep_prev_us && nw - ep_prev_us < 3600LL * 1000000) {
+                            cur_sp = raised_sp;                        /* GROW: 2nd episode within 60min; fill is lazy (gentle zone) */
+                            g_delivery_cap_us += (int64_t)(raised_sp - base_sp) * v->tick_dur_us;  /* audio gate rides the deeper video hold */
+                            g_delivery_maxq = FFMAX(g_delivery_maxq, (int)(g_delivery_cap_us / 1000000 * 256));
+                            av_log(NULL, AV_LOG_INFO,
+                                   "[PTV-CUSHION] target %d->%d frames (~%dms): 2 starvations within %lldmin (last %lldms)\n",
+                                   base_sp, raised_sp, (int)((int64_t)raised_sp * v->tick_dur_us / 1000),
+                                   (long long)((nw - ep_prev_us) / 60000000), (long long)(ep / 1000));
+                        }
+                    } else if (cur_sp > base_sp && ep_last_us && nw - ep_last_us > 6LL * 3600 * 1000000) {
+                        cur_sp = base_sp;                              /* SHRINK: 6h with zero starvations; drains at ppm scale */
+                        av_log(NULL, AV_LOG_INFO, "[PTV-CUSHION] target back to %d frames (quiet 6h)\n", base_sp);
+                    }
                 }
             }
             int64_t per_tick = v->tick_dur_us;
@@ -1529,20 +1588,37 @@ static void *output_thread(void *arg)
                      * source). A light EMA gives fractional occ so ρ doesn't step on integer-frame
                      * quantization; with P-control its lag is harmless. */
                     int occ = av_thread_message_queue_nb_elems(v->frame_q);
-                    int sp  = n_prime > 2 ? n_prime : 4;                            /* setpoint (frames) */
+                    int sp  = cur_sp;                                              /* v0.9.10: adaptive tier target (base preroll unless grown) */
+                    int repriming = 0;
                     if (!g_occ_ema_seeded) { g_occ_ema_milli = (int64_t)occ * 1000; g_occ_ema_seeded = 1; }
                     g_occ_ema_milli += ((int64_t)occ * 1000 - g_occ_ema_milli) / 16;   /* EMA N=16 → smooth fractional occ */
                     int64_t err_milli = (int64_t)sp * 1000 - g_occ_ema_milli;          /* setpoint − occ (milli-frames) */
                     int64_t corr = (err_milli * 500) / 1000;                           /* ρ = Kp·err, Kp=500 ppm/frame (PROPORTIONAL, no accumulation) */
                     int64_t hi = 60000;                                            /* +6% normal positive clamp */
-                    if (g_reprime && occ <= (sp + 1) / 2) {                        /* RE-PRIME: a glue drained frame_q to ≤½ setpoint → the ±6% refill is far
-                                                                                    * too weak (overnight house_skew ran to 7-15s). Slow the house HARD to
-                                                                                    * refill FAST so dups stop and house_skew stays bounded; the normal servo
-                                                                                    * drains the transient latency once occ recovers above ½ setpoint. */
-                        corr = 300000; hi = 300000;                                /* ≈ house 0.77x until refilled */
+                    if (g_reprime && occ <= (base_sp + 1) / 2) {                   /* RE-PRIME: drained below half the BASE floor (true starvation —
+                                                                                    * NOT the adaptive raised target) → the ±6% refill is far too weak
+                                                                                    * (overnight house_skew ran to 7-15s). Slow the house HARD to refill
+                                                                                    * fast; the normal servo drains the transient latency afterwards.
+                                                                                    * v0.9.10 rate limit: one engagement per 5min (a chronically-starved
+                                                                                    * channel must not ride 0.77x delivery back-to-back). */
+                        int64_t nw2 = av_gettime_relative();
+                        if (g_reprime_last_us == 0 ||
+                            nw2 - g_reprime_last_us < 15LL * 1000000 ||            /* continuing the current engagement */
+                            nw2 - g_reprime_last_us > 300LL * 1000000) {           /* rate-limit window expired */
+                            corr = 300000; hi = 300000;                            /* ≈ house 0.77x until refilled */
+                            g_reprime_last_us = nw2; repriming = 1;
+                        }
                     }
                     if (corr >  hi)     corr =  hi;
                     if (corr < -60000)  corr = -60000;
+                    /* v0.9.10 gentle zone: above the BASE safety floor the servo only nudges (±0.6%) —
+                     * an adaptive GROW fills lazily from the source's natural catch-up bursts and a
+                     * SHRINK drains at ppm scale, so tier transitions never jerk downstream delivery.
+                     * Full authority below the floor (real starvation) and under re-prime. */
+                    if (g_adapt_cushion && !repriming && g_occ_ema_milli >= (int64_t)base_sp * 1000) {
+                        if (corr >  6000) corr =  6000;
+                        if (corr < -6000) corr = -6000;
+                    }
                     atomic_store_explicit(&g_rho_corr_ppm, corr, memory_order_relaxed);
                 }
                 int64_t corr = atomic_load_explicit(&g_rho_corr_ppm, memory_order_relaxed);
@@ -1668,13 +1744,14 @@ static void *output_thread(void *arg)
                 else
                     snprintf(gl, sizeof gl, "genlock=0");
                 int64_t aw = atomic_load_explicit(&g_async_ppm, memory_order_relaxed);  /* aresample work (ppm) */
-                char wu[80] = "";                                    /* WUCR readout: buffer depth + recovered ρ (go/no-go vs srcppm) */
+                char wu[96] = "";                                    /* WUCR readout: buffer depth + recovered ρ (go/no-go vs srcppm) */
                 if (g_wucr) {
                     int occ = av_thread_message_queue_nb_elems(v->frame_q);
                     int64_t corr = atomic_load_explicit(&g_rho_corr_ppm, memory_order_relaxed);
                     int64_t hs   = v->house_skew ? *v->house_skew : 0;   /* W1 check: must stay ≈0 (ρ genlock → dups→0 → AVLOCK has nothing to inject) */
-                    snprintf(wu, sizeof wu, " wucr_buf=%df/%lldms wucr_rho=%+lldppm hs=%+lldms",
-                             occ, (long long)(occ * v->tick_dur_us / 1000), (long long)(-corr), (long long)(hs / 1000));  /* -corr = recovered source dev (+=faster), comparable to srcppm */
+                    snprintf(wu, sizeof wu, " wucr_buf=%df/%lldms wucr_rho=%+lldppm hs=%+lldms cushion=%dms",
+                             occ, (long long)(occ * v->tick_dur_us / 1000), (long long)(-corr), (long long)(hs / 1000),
+                             (int)((int64_t)cur_sp * v->tick_dur_us / 1000));  /* -corr = recovered source dev (+=faster); cushion = adaptive tier target */
                 }
                 av_log(NULL, AV_LOG_INFO,
                     "frame=%6"PRId64" fps=%3.0f size=%8"PRId64"KiB time=%02d:%02d:%05.2f "
@@ -5395,7 +5472,11 @@ int main(int argc, char **argv)
     g_diag = !!getenv("PTV_DIAG");
     if (getenv("PTV_NO_AVLOCK")) g_avlock = 0;   /* revert to source-locked audio (drifts on dup) */
     if (getenv("PTV_LAYERA")) g_layera = 1;       /* legacy 0004: audio-derived common offset at glue points (corrects source A/V mis-mux) */
-    if (getenv("PTV_REPRIME")) g_reprime = 1;     /* fast buffer re-prime after a glue (needs PTV_WUCR — acts in the occupancy servo) */
+    if (getenv("PTV_REPRIME")) g_reprime = 1;     /* fast buffer re-prime after a glue (default ON since v0.9.10; kept for compat) */
+    if (getenv("PTV_NO_REPRIME")) g_reprime = 0;
+    if (getenv("PTV_NO_LAYERA"))  g_layera  = 0;  /* v0.9.10: WUCR/LAYERA/REPRIME are default-on; NO_* revert */
+    if (getenv("PTV_NO_ADAPTIVE")) g_adapt_cushion = 0;   /* fixed preroll target (pre-0.9.10 behavior) */
+    { const char *cm = getenv("PTV_CUSHION_MS"); if (cm && atoi(cm) > 0) { int x = atoi(cm); if (x < 1000) x = 1000; if (x > 10000) x = 10000; g_cushion_ms = x; } }   /* adaptive RAISED tier */
     if (getenv("PTV_NO_GENLOCK")) g_genlock = 0; /* v0.9.0: revert to free-run nominal pacing (+ old 350ms prime) = byte-identical */
     if (getenv("PTV_RATE_LOCK")) g_rate_lock = 1; /* occupancy rate servo (video-side house_skew bound); replaces the DTS-vs-wall FLL */
     if (getenv("PTV_WUCR")) {                    /* occupancy-ρ video pacing (EMA-filtered + ±1f deadband, gain-6/±6%) + buf/rho readout. AVLOCK KEPT ON: ρ bounds house_skew so AVLOCK's audio-follow is harmless in steady state and keeps A/V matched through unavoidable dups. FLL still computes srcppm for comparison. */
@@ -5403,6 +5484,7 @@ int main(int argc, char **argv)
         av_log(NULL, AV_LOG_INFO, "ptvencoder: [WUCR] active — PROPORTIONAL occupancy-ρ pacing (ρ=500·err, EMA N=16, ±6%% clamp) + AVLOCK ON "
                "(ρ bounds house_skew; audio follows it so A/V stays matched through dups). Expect: ρ smooth, parks near −(source ppm offset) with no wobble, dlvforced≈0, dup low, speed=1.00x.\n");
     }
+    if (getenv("PTV_NO_WUCR")) g_wucr = 0;       /* v0.9.10: WUCR default-on; revert to genlock/free-run */
     if (getenv("PTV_PHIAV")) {                   /* Stage-1: AVLOCK-on content sensor (measurement only, no actuator) */
         g_phiav = 1;
         av_log(NULL, AV_LOG_INFO, "ptvencoder: [PTV-PHIAV] AVLOCK-on content-sensor MEASUREMENT mode — [PTV-PHI1] error=(vout-aout) is the post-AVLOCK residual; verify it tracks the external oracle. NO actuator.\n");
