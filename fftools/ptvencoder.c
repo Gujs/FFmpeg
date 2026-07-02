@@ -69,7 +69,19 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.9.10" /* 0.9.10 (adaptive cushion + proven-base defaults, 2026-07-02): (1) ADAPTIVE
+#define PTVENCODER_VERSION "0.9.10.1" /* 0.9.10.1 (film-cadence hotfix, 2026-07-02 late): (1) REPRIME state machine —
+                                    an engagement is hard-capped at 10s with an UNCONDITIONAL 300s cooldown (the
+                                    0.9.10 "continuing" clause let occupancy oscillating around the trigger re-arm
+                                    forever: AWE 23.976-film segments [2:3 pulldown, ~24 AU/s — CONFIRMED by live
+                                    telecine dissection, repeat_pict on 51% of frames] pinned the house at 0.77x
+                                    for whole movie blocks -> downstream underrun). (2) Sustained positive servo
+                                    authority capped +1.5% (pre-0.9.10 proven level): NEVER rate-match a content-
+                                    rate deficit — film-in-NTSC dups ARE 3:2 pulldown; real clock offsets are
+                                    ppm-scale. (3) PTV-EMPTY frame_q: per-episode lines only >=2s; sub-2s episodes
+                                    -> one 60s summary line (film segments spammed a line every few seconds).
+                                    0.9.11 TODO: honor repeat_pict in the emit (flagged frame = 1.5 ticks) so film
+                                    consumption matches supply — no starvation/dups/spam at all. */
+                                    /* 0.9.10 (adaptive cushion + proven-base defaults, 2026-07-02): (1) ADAPTIVE
                                     frame_q cushion — two discrete targets (BASE=resolved preroll ~1s, RAISED=
                                     PTV_CUSHION_MS default 4s); grows on 2 starvation episodes (>=200ms) within
                                     60min, shrinks after 6h quiet; fill/drain are LAZY via the servo gentle zone
@@ -564,7 +576,11 @@ static int             g_reprime = 1;                /* PTV_REPRIME: when a glue
                                                       * to refill fast → dups stop, house_skew stays bounded (the ±6% refill let it run to 7-15s overnight).
                                                       * Composes with WUCR (occupancy servo) + AVLOCK. v0.9.10: DEFAULT ON, rate-limited to one
                                                       * engagement per 5min (PTV_NO_REPRIME reverts). */
-static int64_t         g_reprime_last_us;            /* rate limit: wall time of the last reprime engagement (master emit thread only) */
+static int64_t         g_reprime_start;              /* 0.9.10.1: wall time the CURRENT reprime engagement began (0 = idle). An
+                                                      * engagement is hard-capped at 10s, then a 300s cooldown applies UNCONDITIONALLY
+                                                      * — the 0.9.10 "continuing" clause let occupancy oscillating around the trigger
+                                                      * re-arm forever (observed live: AWE film segments pinned the house at 0.77x). */
+static int64_t         g_reprime_last_end;           /* wall time the last engagement ended (cooldown reference) */
 /* v0.9.10 ADAPTIVE CUSHION (PTV_NO_ADAPTIVE reverts to a fixed preroll target). Two discrete frame_q
  * targets, no continuous wander: BASE = the resolved preroll (~1s) and RAISED = g_cushion_ms (~4s).
  * GROW: two starvation episodes (frame_q empty >=200ms) within 60min -> RAISED (one-off glitches never
@@ -586,7 +602,7 @@ static _Atomic int     g_frameq_depth;               /* DIAG: master video frame
  * consumer drains them instantly; a healthy channel reads "empty" at every sample. Only frame_q
  * empty means real starvation → it keeps the heartbeat). */
 static int64_t ptv_empty_watch(const char *name, int depth, int64_t now,
-                               int64_t *since, int64_t *hb)
+                               int64_t *since, int64_t *hb, int64_t log_thresh_us)
 {
     if (depth == 0) {
         if (*since == 0) { *since = now; if (hb) *hb = now; }  /* enter empty silently (normal 0-crossings are noise) */
@@ -598,9 +614,12 @@ static int64_t ptv_empty_watch(const char *name, int depth, int64_t now,
     } else if (*since) {
         int64_t dur = now - *since;
         *since = 0;
-        if (dur >= 200000) {                                   /* only report episodes >=200ms — the real starvation, not tick jitter */
-            av_log(NULL, AV_LOG_INFO, "[PTV-EMPTY] %s refilled after %lldms empty\n",
-                   name, (long long)(dur / 1000));
+        if (dur >= 200000) {                                   /* episodes >=200ms are real starvation, not tick jitter */
+            if (dur >= log_thresh_us)                          /* 0.9.10.1: per-episode line only above the caller's threshold
+                                                                * (frame_q passes 2s — sub-2s episodes go to the 60s SUMMARY;
+                                                                * a 23.976-film segment produced one line every few seconds) */
+                av_log(NULL, AV_LOG_INFO, "[PTV-EMPTY] %s refilled after %lldms empty\n",
+                       name, (long long)(dur / 1000));
             return dur;
         }
     }
@@ -1501,6 +1520,7 @@ static void *output_thread(void *arg)
                           ? (int)((int64_t)preroll_ms * 1000 / v->tick_dur_us) : 0;
         int primed;
         int64_t eq_vq_s = 0, eq_fq_s = 0, eq_fq_h = 0, eq_mq_s = 0;  /* PTV-EMPTY per-queue empty-since (+ frame_q heartbeat) state */
+        int64_t ep_agg_cnt = 0, ep_agg_min = 0, ep_agg_max = 0, ep_agg_t0 = 0;  /* 0.9.10.1: frame_q sub-2s episode aggregator (60s summary) */
         if (n_prime > g_frameq_cap - 8) n_prime = g_frameq_cap - 8;
         if (n_prime < 0) n_prime = 0;
         primed = (n_prime == 0);
@@ -1544,12 +1564,27 @@ static void *output_thread(void *arg)
                 int64_t nw = av_gettime_relative();
                 int64_t ep;
                 atomic_store_explicit(&g_frameq_depth, av_thread_message_queue_nb_elems(v->frame_q), memory_order_relaxed);
-                if (g_diag) {   /* video_q/mux_q: refill-episode logs only — empty is their normal state (no heartbeat) */
-                    if (v->dbg_video_q) ptv_empty_watch("video_q", av_thread_message_queue_nb_elems(v->dbg_video_q), nw, &eq_vq_s, NULL);
-                    if (v->mux_q) ptv_empty_watch("mux_q", av_thread_message_queue_nb_elems(v->mux_q), nw, &eq_mq_s, NULL);
+                if (g_diag) {   /* video_q/mux_q: log only >=2s episodes — empty is their NORMAL state (consumer
+                                 * drains instantly; sub-2s "refills" are sampling noise — the Cinestar lesson).
+                                 * A >=2s video_q episode = a real input stall, still event-worthy. */
+                    if (v->dbg_video_q) ptv_empty_watch("video_q", av_thread_message_queue_nb_elems(v->dbg_video_q), nw, &eq_vq_s, NULL, 2000000);
+                    if (v->mux_q) ptv_empty_watch("mux_q", av_thread_message_queue_nb_elems(v->mux_q), nw, &eq_mq_s, NULL, 2000000);
                 }
-                /* frame_q starvation watch runs UNGATED — it feeds the adaptive cushion */
-                ep = ptv_empty_watch("frame_q", av_thread_message_queue_nb_elems(v->frame_q), nw, &eq_fq_s, &eq_fq_h);
+                /* frame_q starvation watch runs UNGATED — it feeds the adaptive cushion. Per-episode
+                 * lines only >=2s; sub-2s episodes aggregate into one summary line per minute. */
+                ep = ptv_empty_watch("frame_q", av_thread_message_queue_nb_elems(v->frame_q), nw, &eq_fq_s, &eq_fq_h, 2000000);
+                if (ep > 0 && ep < 2000000) {
+                    if (!ep_agg_cnt) { ep_agg_min = ep_agg_max = ep; ep_agg_t0 = ep_agg_t0 ? ep_agg_t0 : nw; }
+                    else { if (ep < ep_agg_min) ep_agg_min = ep; if (ep > ep_agg_max) ep_agg_max = ep; }
+                    ep_agg_cnt++;
+                    if (!ep_agg_t0) ep_agg_t0 = nw;
+                }
+                if (ep_agg_cnt && nw - ep_agg_t0 >= 60LL * 1000000) {
+                    av_log(NULL, AV_LOG_INFO, "[PTV-EMPTY] frame_q: %lld episodes in %llds (%lld-%lldms)\n",
+                           (long long)ep_agg_cnt, (long long)((nw - ep_agg_t0) / 1000000),
+                           (long long)(ep_agg_min / 1000), (long long)(ep_agg_max / 1000));
+                    ep_agg_cnt = 0; ep_agg_t0 = nw;
+                }
                 if (g_adapt_cushion && !v->passthrough) {
                     if (ep > 0) {                                     /* a >=200ms starvation episode just ended */
                         ep_prev_us = ep_last_us; ep_last_us = nw;
@@ -1600,19 +1635,30 @@ static void *output_thread(void *arg)
                     int64_t corr = (err_milli * 500) / 1000;                           /* ρ = Kp·err, Kp=500 ppm/frame (PROPORTIONAL, no accumulation) */
                     int64_t hi = 60000;                                            /* +6% normal positive clamp */
                     if (g_reprime && occ <= (base_sp + 1) / 2) {                   /* RE-PRIME: drained below half the BASE floor (true starvation —
-                                                                                    * NOT the adaptive raised target) → the ±6% refill is far too weak
-                                                                                    * (overnight house_skew ran to 7-15s). Slow the house HARD to refill
-                                                                                    * fast; the normal servo drains the transient latency afterwards.
-                                                                                    * v0.9.10 rate limit: one engagement per 5min (a chronically-starved
-                                                                                    * channel must not ride 0.77x delivery back-to-back). */
+                                                                                    * NOT the adaptive raised target). Slow the house HARD to refill fast.
+                                                                                    * 0.9.10.1 state machine: an engagement lasts AT MOST 10s, then a 300s
+                                                                                    * cooldown applies unconditionally — occupancy oscillating around the
+                                                                                    * trigger must NOT re-arm (the 0.9.10 flaw: AWE 23.976-film segments
+                                                                                    * kept occ at the threshold → reprime pinned the house at 0.77x for
+                                                                                    * the whole segment → downstream underrun). */
                         int64_t nw2 = av_gettime_relative();
-                        if (g_reprime_last_us == 0 ||
-                            nw2 - g_reprime_last_us < 15LL * 1000000 ||            /* continuing the current engagement */
-                            nw2 - g_reprime_last_us > 300LL * 1000000) {           /* rate-limit window expired */
-                            corr = 300000; hi = 300000;                            /* ≈ house 0.77x until refilled */
-                            g_reprime_last_us = nw2; repriming = 1;
+                        if (g_reprime_start == 0 &&
+                            (g_reprime_last_end == 0 || nw2 - g_reprime_last_end > 300LL * 1000000))
+                            g_reprime_start = nw2;                                 /* begin a new engagement (cooldown clear) */
+                        if (g_reprime_start && nw2 - g_reprime_start <= 10LL * 1000000) {
+                            corr = 300000; hi = 300000;                            /* ≈ house 0.77x, bounded to 10s */
+                            repriming = 1;
+                        } else if (g_reprime_start) {
+                            g_reprime_last_end = nw2; g_reprime_start = 0;         /* cap hit → end + cooldown */
                         }
+                    } else if (g_reprime_start) {
+                        g_reprime_last_end = av_gettime_relative(); g_reprime_start = 0;   /* occ recovered → end + cooldown */
                     }
+                    if (!repriming && corr > 15000) corr = 15000;                  /* 0.9.10.1: sustained positive (slow-down) authority capped at 1.5%
+                                                                                    * — the proven pre-0.9.10 level (Kp x base_sp). The servo must never
+                                                                                    * RATE-MATCH a sustained content-rate deficit (23.976 film in a 29.97
+                                                                                    * container = 24 AU/s is LEGITIMATE; dups there are 3:2 pulldown).
+                                                                                    * Real source-clock offsets are ppm-scale; 1.5% covers any crystal. */
                     if (corr >  hi)     corr =  hi;
                     if (corr < -60000)  corr = -60000;
                     /* v0.9.10 gentle zone: above the BASE safety floor the servo only nudges (±0.6%) —
