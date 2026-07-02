@@ -1445,7 +1445,7 @@ static void *output_thread(void *arg)
     int64_t held_src_pts = AV_NOPTS_VALUE;   /* ORIGINAL source pts of held frame (held->pts gets
                                                 overwritten to vpts on emit; dups must not re-read it) */
     int64_t diag_t0 = av_gettime_relative(), diag_last = diag_t0;
-    int64_t stat_last = diag_t0;
+    int64_t stat_last = diag_t0, stat_prev = 0;
 
     if (!held)
         goto done;
@@ -1724,10 +1724,12 @@ static void *output_thread(void *arg)
         if (g_stats && v->is_master) {          /* ffmpeg-style progress line */
             int64_t nows = av_gettime_relative();
             if (nows - stat_last >= g_stats_period_us) {
+                double dt    = (nows - stat_last) / 1000000.0;
+                double fps   = (v->emitted - stat_prev) / (dt > 0 ? dt : 1);   /* INSTANTANEOUS emit rate — the
+                                                                                * "alive right now" signal (cumulative
+                                                                                * speed= froze at 1.00x after hours and
+                                                                                * hid current wedges; removed v0.9.10) */
                 double secs  = v->emitted * v->tick_dur_us / 1000000.0;   /* CFR output time */
-                double wall  = (nows - wall0) / 1000000.0;
-                double speed = wall > 0 ? secs / wall : 0;
-                double kbps  = secs > 0 ? g_muxed_bytes * 8.0 / secs / 1000.0 : 0;
                 int hh = (int)(secs / 3600), mm = ((int)secs % 3600) / 60;
                 double ss = secs - hh * 3600 - mm * 60;
                 int64_t cr = (v->dbg_pcorrupt ? *v->dbg_pcorrupt : 0) + (v->dbg_vcorrupt ? *v->dbg_vcorrupt : 0);  /* corrupt: demux + decode */
@@ -1737,9 +1739,10 @@ static void *output_thread(void *arg)
                              atomic_load_explicit(&v->gate->st_hold_us, memory_order_relaxed) / 1000,
                              atomic_load_explicit(&v->gate->st_forced, memory_order_relaxed));
                 int64_t aw = atomic_load_explicit(&g_async_ppm, memory_order_relaxed);  /* aresample work (ppm) */
-                /* v0.9.10 cleanup: genlock=/srcppm= dropped from stats — WUCR (default) never uses the FLL
-                 * for pacing and wucr_rho IS the source-ppm readout (rho parks at -srcppm). fps= dropped
-                 * (== nominal x speed). qdrop= dropped (PTV_DIAG demux line still carries it). */
+                /* v0.9.10 cleanup: genlock=/srcppm= dropped — WUCR (default) never paces via the FLL and
+                 * wucr_rho IS the source-ppm readout. size=/bitrate= dropped (CBR is configured; cumulative
+                 * averages carry no signal). speed= (cumulative) replaced by instantaneous fps=. qdrop=
+                 * dropped (PTV_DIAG demux line still carries it). */
                 char wu[96] = "";                                    /* WUCR readout: buffer depth + recovered ρ (go/no-go vs srcppm) */
                 if (g_wucr) {
                     int occ = av_thread_message_queue_nb_elems(v->frame_q);
@@ -1750,12 +1753,12 @@ static void *output_thread(void *arg)
                              (int)((int64_t)cur_sp * v->tick_dur_us / 1000));  /* -corr = recovered source dev (+=faster); cushion = adaptive tier target */
                 }
                 av_log(NULL, AV_LOG_INFO,
-                    "frame=%6"PRId64" size=%8"PRId64"KiB time=%02d:%02d:%05.2f "
-                    "bitrate=%7.1fkbits/s dup=%"PRId64" drop=%"PRId64" corrupt=%"PRId64" speed=%4.2fx "
+                    "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f "
+                    "dup=%"PRId64" drop=%"PRId64" corrupt=%"PRId64" "
                     "async=%+"PRId64"ppm%s%s\n",
-                    v->emitted, g_muxed_bytes / 1024, hh, mm, ss, kbps,
-                    v->dup, v->framedrop, cr, speed, aw, dlv, wu);
-                stat_last = nows;
+                    v->emitted, fps, hh, mm, ss,
+                    v->dup, v->framedrop, cr, aw, dlv, wu);
+                stat_last = nows; stat_prev = v->emitted;
             }
         }
     }
@@ -5400,34 +5403,30 @@ static void ptv_print_log_legend(int full)
     av_log(NULL, AV_LOG_INFO,
         "log legend — the always-on `-stats` progress line (one per -stats_period, default 1s):\n"
         "  frame      output frames emitted so far (CFR count)\n"
-        "  fps        output frame rate over the last interval\n"
-        "  size       total bytes written to the output (KiB)\n"
-        "  time       output media time HH:MM:SS.ss\n"
-        "  bitrate    average output bitrate (kbit/s)\n"
-        "  speed      output-vs-wallclock realtime ratio; 1.00x = keeping up, <1 = falling behind\n");
+        "  fps        INSTANTANEOUS emit rate over the last interval — the 'alive right now' check\n"
+        "             (must sit at the output rate, e.g. 29.97; a current wedge shows here immediately)\n"
+        "  time       output media time HH:MM:SS.ss\n");
     av_log(NULL, AV_LOG_INFO,
-        "  dup        frames DUPLICATED to fill the house clock when the source briefly starved the\n"
-        "             buffer; sustained rise = input gaps / decode-rate dips\n"
-        "  drop       frames DROPPED because decode outran the house clock (frame_q overflow)\n"
-        "  qdrop      packets DROPPED before decode — decoder fell behind the demuxer; rising =\n"
-        "             bursty input delivery (HLS-segment / network bursts)\n"
-        "  corrupt    corrupt packets discarded (demux + decode)\n");
+        "  dup        frames REPEATED because content was missing or late (feed-health meter):\n"
+        "             steady trickle = source dropping frames upstream; bursts = delivery droughts\n"
+        "  drop       frames SKIPPED at frame_q overflow — the latency-drain meter: after a stall,\n"
+        "             drop= ticks up while hs= bleeds down (the debt repaid in skipped content)\n"
+        "  corrupt    corrupt packets discarded (demux + decode)\n"
+        "  async      aresample compensation RATE (ppm); ~0 = idle/healthy, large = resampler fighting\n");
     av_log(NULL, AV_LOG_INFO,
-        "  genlock    source-clock lock: 1 = output cadence SLAVED to the recovered source rate\n"
-        "             (drift-free); 0 = still acquiring (~24s); off = N/A (multiview / offline)\n"
-        "  srcppm     recovered source-clock deviation from nominal (ppm, + = source faster) that\n"
-        "             genlock is compensating; shown only once locked\n"
-        "  async      aresample compensation RATE (ppm, + = stretching/adding samples, − = compressing/\n"
-        "             dropping); ~0 = idle/healthy, large = the resampler is fighting\n");
+        "  dlvhold    (delivery gate) ms of audio HELD waiting for matching video (≈ encoder latency +\n"
+        "             cushion); normal ~1-2s, scales with the cushion\n"
+        "  dlvforced  (gate) packets force-released because video STALLED — MUST stay ~0\n"
+        "  wucr_buf   frame_q occupancy (frames/ms) — the jitter cushion fill vs cushion= target\n"
+        "  wucr_rho   applied house-rate offset (ppm) = recovered source-clock deviation (+ = source\n"
+        "             faster); pegged ±6000 = gentle-zone fill/drain in progress\n");
     av_log(NULL, AV_LOG_INFO,
-        "  lip-sync   NOT self-reported: a faithful internal ±ms is not achievable — the emitted-PES\n"
-        "             A/V skew is dominated by encoder reorder and is blind to the content↔PTS offset\n"
-        "             that IS lip-sync (validated: a +200ms content shift moved it 0ms). Measure A/V\n"
-        "             sync with the EXTERNAL wire oracle test-scripts/repro/drift-continuous.py.\n"
-        "  dlvhold    (delivery gate active) ms of audio currently HELD waiting for the matching video\n"
-        "             to leave the encoder (≈ encoder latency); normal ~1-2s under NVENC load\n"
-        "  dlvforced  (gate active) cumulative packets force-released because video STALLED (its DTS\n"
-        "             stopped advancing within the cap) — MUST stay ~0; sustained growth = video wedged\n");
+        "  hs         house_skew: latency debt vs baseline (ms) — a feed stall steps it up, catch-up\n"
+        "             drops bleed it back; A/V stays LOCKED throughout (this is delay, not lip-sync)\n"
+        "  cushion    adaptive frame_q target: ~1s lean tier or ~4s raised tier ([PTV-CUSHION] logs\n"
+        "             each transition: grows on 2 starvations/60min, shrinks after 6h quiet)\n"
+        "  lip-sync   NOT self-reported (internal PES skew is blind to content↔PTS offset). Measure\n"
+        "             with the EXTERNAL oracle test-scripts/repro/drift-continuous.py.\n");
     if (!full)
         return;
     av_log(NULL, AV_LOG_INFO,
@@ -5447,12 +5446,17 @@ static void ptv_print_log_legend(int full)
         "                 wall = wall_a(C)−wall_v(C) production timing · dts = the timestamp offset (expect\n"
         "                 flat = masked by AVLOCK) · span = async sample-vs-source-content slip (content domain)\n"
         "  [PTV-WATCHDOG] (always-on WARNING) the encoder stalled and stopped advancing\n"
-        "env switches: PTV_AVSYNC_PROBE=1 [PTV-AVSYNC2] decomposition · PTV_ATRACE=1 startup audio trace ·\n"
-        "  PTV_AVTRIM_PROBE=1 measure [PTV-AVTRIM] only · PTV_AVTRIM=1 actuate the single-input drift-null ·\n"
-        "  PTV_LOG_TS=1 prepend [timestamp] · PTV_NO_GENLOCK=1 disable source-clock slave (free-run) ·\n"
-        "  PTV_NO_GENLOCK_GUARD=1 revert the rate bound+outlier-reject · PTV_GENLOCK_MAX_PPM / _REJECT_PPM tune them ·\n"
-        "  PTV_GENLOCK_WINDOW_MS=N long-baseline rate (less burst-alias; default 3000) · PTV_GENLOCK_EMA_SHIFT=N ·\n"
-        "  PTV_NO_AVLOCK=1 disable audio house-lock\n");
+        "defaults (v0.9.10): WUCR occupancy pacing + LAYERA glue handling + REPRIME fast refill +\n"
+        "  ADAPTIVE cushion are all ON — no env needed for the production posture. Reverts:\n"
+        "  PTV_NO_WUCR · PTV_NO_LAYERA · PTV_NO_REPRIME · PTV_NO_ADAPTIVE · PTV_NO_AVLOCK ·\n"
+        "  PTV_NO_EXACTTICK (re-enables the integer-tick ~10ppm NTSC lip-sync drift; A/B only)\n");
+    av_log(NULL, AV_LOG_INFO,
+        "tuning: PTV_CUSHION_MS=N adaptive raised tier (default 4000, [1000,10000]) · PTV_FRAMEQ=N\n"
+        "  frame_q capacity (default 160, [48,1024]) · PTV_PREROLL_MS=N startup cushion / base tier ·\n"
+        "  PTV_DELIVERY_CAP_MS / PTV_DELIVERY_MAXQ delivery-gate sizing\n"
+        "probes: PTV_DIAG=1 debug lines above · PTV_LOG_TS=1 prepend [timestamp] · PTV_DRIFTPROBE=1\n"
+        "  D1/D2/D3 drift regressions · PTV_AVSYNC_PROBE=1 [PTV-AVSYNC2] decomposition · PTV_ATRACE=1\n"
+        "  startup audio trace · PTV_TICK_ADJ_US=N accelerate the tick-drift bug (falsification ONLY)\n");
 }
 
 int main(int argc, char **argv)
