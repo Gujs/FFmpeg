@@ -2763,6 +2763,14 @@ typedef struct PtvDiscBuf {
     int                 nb_streams;
     PtvDiscStreamState *stream_state;
     int64_t             applied_offset;     /* single offset (us, audio-derived) applied to ALL kept packets */
+    /* v0.9.13 [PTV-GLUE] running stats — the LAYERA-retirement decision data: vid_err = how much
+     * source A/V mis-mux each glue carried (what LAYERA corrects and the plain absorber would
+     * leak into audio). |err| persistently ~0 => the simpler absorber suffices. */
+    int64_t             glue_cnt;           /* glues with BOTH media measured */
+    int64_t             glue_partial;       /* flushes where only one media type crossed in the window */
+    int64_t             err_abs_sum_us;     /* Σ|vid_err| */
+    int64_t             err_abs_max_us;     /* max|vid_err| */
+    int64_t             err_gt100_cnt;      /* glues with |vid_err| > 100ms */
 } PtvDiscBuf;
 
 typedef struct DemuxArgs {
@@ -3211,6 +3219,27 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
            (double)vid_off / AV_TIME_BASE, (double)aud_off / AV_TIME_BASE,
            (double)(vid_off - aud_off) / AV_TIME_BASE,
            (double)g_disc_viderr_sum / AV_TIME_BASE);
+    /* v0.9.13 [PTV-GLUE] — the LAYERA-vs-absorber decision line: running per-input stats of the
+     * source A/V mis-mux at glues. The LAST such line in a log answers "does LAYERA earn its
+     * keep on this channel" at a glance (mean/max ~0 => plain absorber suffices). */
+    if (has_vid && has_aud) {
+        int64_t e = vid_off - aud_off, ae = llabs(e);
+        b->glue_cnt++;
+        b->err_abs_sum_us += ae;
+        if (ae > b->err_abs_max_us) b->err_abs_max_us = ae;
+        if (ae > 100000) b->err_gt100_cnt++;
+        av_log(NULL, AV_LOG_INFO,
+               "[PTV-GLUE] #%"PRId64" vid_err=%+.3fs — run: mean|err|=%.3fs max=%.3fs >100ms=%"PRId64"/%"PRId64" partial=%"PRId64"\n",
+               b->glue_cnt, (double)e / AV_TIME_BASE,
+               (double)(b->err_abs_sum_us / b->glue_cnt) / AV_TIME_BASE,
+               (double)b->err_abs_max_us / AV_TIME_BASE,
+               b->err_gt100_cnt, b->glue_cnt, b->glue_partial);
+    } else {
+        b->glue_partial++;
+        av_log(NULL, AV_LOG_INFO,
+               "[PTV-GLUE] partial flush (only %s crossed in the window) — mis-mux not measurable this glue (partial=%"PRId64")\n",
+               has_vid ? "video" : "audio", b->glue_partial);
+    }
     if (g_diag) ptv_qsnap(d, b, "at-flush");
 
     for (i = 0; i < b->nb_packets; i++) {
@@ -5547,6 +5576,13 @@ static void ptv_print_log_legend(int full)
         "             each transition: grows on 2 starvations/60min, shrinks after 6h quiet)\n"
         "  lip-sync   NOT self-reported (internal PES skew is blind to content↔PTS offset). Measure\n"
         "             with the EXTERNAL oracle test-scripts/repro/drift-continuous.py.\n");
+    av_log(NULL, AV_LOG_INFO,
+        "discontinuity events (always-on since v0.9.13; were PTV_DIAG-only):\n"
+        "  [PTV-LAYERA]   jump = a >1s splice detected (buffering starts); flush = the glue applied\n"
+        "                 (vid_err = source A/V mis-mux this glue corrected)\n"
+        "  [PTV-GLUE]     running per-input mis-mux stats — the LAYERA-retirement decision line:\n"
+        "                 mean/max|err| ~0 over days => the simpler per-stream absorber suffices\n"
+        "  [PTV-DISCONT]  per-stream PTS jump absorbed / audio GAP left to aresample padding\n");
     av_log(NULL, AV_LOG_INFO,
         "multiview stats line — same head (frame/fps/time/dup/drop/dlvhold/dlvforced) + per slot:\n"
         "  inK:qdrop    input-K video queue overflow drops (demux side)\n"
