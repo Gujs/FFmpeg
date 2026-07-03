@@ -6,6 +6,27 @@ keep only the current `PTVENCODER_VERSION` define in the source. This file is pa
 the v2 `0001` patch (additive, travels with the source to the build box).
 
 
+## 0.9.14 (2026-07-03)
+
+- **AUTO-BANK: the runtime cushion escalation for bursty channels** (`PTV_NO_AUTOBANK` reverts;
+  ceiling `PTV_CUSHION_MAX_MS`, default 12000 — owner-set: >12s stalls are upstream incidents to
+  surface, not absorb). The 0.9.10 adaptive cushion lives in frame_q (DECODED frames) and maxes
+  at ~4s — structurally too shallow for HLS-burst channels with 6-8s gaps (Unique_TV/ZOE class),
+  which until now needed the manual `PTV_PREROLL_MS/PTV_VIDEOQ` recipe. Now the demux BURSTY
+  detector escalates at runtime: on >=3 stalls >=1.5s per 60s, or a single stall >=3s, the bank
+  target becomes 1.5x the worst observed stall (capped). Arming flips the master rung to the
+  deep-prime BLOCKING push, so each stall's own latency is RETAINED as a compressed-packet bank
+  in video_q (~KBs) instead of draining — the channel self-heals within a stall cycle or two,
+  no restart, no fill artifacts. Growth is self-limiting: once bank >= gap, stalls stop starving.
+  The per-rung delivery-gate cap rides the bank (audio waits out long stalls with video; gate
+  cap_us is now runtime-atomic). Retires after 6h without qualifying stalls (`PTV_BANK_DECAY_S`
+  test hook). Stats gain ` bank=actual/target ms` while armed. The [PTV-BURSTY] env-recipe
+  advisory now fires only in the one case left for a human: bank at its ceiling and still short.
+  `video_q` default 256 -> 512 (bank headroom; compressed packets, negligible memory). Explicit
+  `PTV_PREROLL_MS` deep primes keep working and pre-fill at startup as before. Single-input live
+  only (mosaic slots ride 0.9.13 cadence-residence starvation-slip; a per-slot mv bank is future
+  work if ever needed).
+
 ## 0.9.13 (2026-07-03)
 
 - **Per-slot CADENCE RESIDENCE in the compositor** (`PTV_NO_RESIDENCE` reverts). A slot is now
