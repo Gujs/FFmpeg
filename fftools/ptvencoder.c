@@ -1609,9 +1609,12 @@ static void *output_thread(void *arg)
                      * imperceptible) until video_q holds the bank target; normal servo resumes there. */
                     {
                         int64_t bt = atomic_load_explicit(&g_bank_us, memory_order_relaxed);
+                        /* margin = TOTAL buffered content: compressed video_q + decoded frame_q
+                         * (counting video_q alone would overshoot by frame_q's depth, ~5s) */
+                        int64_t have = ((int64_t)atomic_load_explicit(&g_vq_elems, memory_order_relaxed) + occ)
+                                       * v->tick_dur_us;
                         if (bt > 0 && !repriming && g_occ_ema_milli >= (int64_t)base_sp * 1000 &&
-                            (int64_t)atomic_load_explicit(&g_vq_elems, memory_order_relaxed) * v->tick_dur_us < bt &&
-                            corr < 6000)
+                            have < bt && corr < 6000)
                             corr = 6000;
                     }
                     atomic_store_explicit(&g_rho_corr_ppm, corr, memory_order_relaxed);
@@ -1738,12 +1741,14 @@ static void *output_thread(void *arg)
                              occ, (long long)(occ * v->tick_dur_us / 1000), (long long)(-corr), (long long)(hs / 1000),
                              (int)((int64_t)cur_sp * v->tick_dur_us / 1000));  /* -corr = recovered source dev (+=faster); cushion = adaptive tier target */
                 }
-                char bk[48] = "";                                    /* v0.9.14 AUTO-BANK: actual/target */
+                char bk[48] = "";                                    /* v0.9.14 AUTO-BANK: actual/target — actual = TOTAL
+                                                                      * buffered margin (compressed video_q + decoded frame_q) */
                 {
                     int64_t bt = atomic_load_explicit(&g_bank_us, memory_order_relaxed);
                     if (bt > 0)
                         snprintf(bk, sizeof bk, " bank=%lld/%lldms",
-                                 (long long)((int64_t)atomic_load_explicit(&g_vq_elems, memory_order_relaxed) * v->tick_dur_us / 1000),
+                                 (long long)(((int64_t)atomic_load_explicit(&g_vq_elems, memory_order_relaxed)
+                                              + av_thread_message_queue_nb_elems(v->frame_q)) * v->tick_dur_us / 1000),
                                  (long long)(bt / 1000));
                 }
                 av_log(NULL, AV_LOG_INFO,
@@ -3825,6 +3830,10 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                     }
                     /* v0.9.14 decay: a long quiet spell retires the bank (latency then bleeds via
                      * the normal catch-up path once the master rung returns to drop-oldest). */
+                    if (g_diag && atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0)
+                        av_log(NULL, AV_LOG_INFO, "[PTV-BANK] window close: quiet=%.1fs decay_after=%llds gap_cnt=%d\n",
+                               d->by_bank_last_q ? (bw - d->by_bank_last_q) / 1e6 : -1.0,
+                               (long long)(g_bank_decay_us / 1000000), d->by_gap_cnt);
                     if (d->autobank && d->by_bank_last_q &&
                         atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 &&
                         bw - d->by_bank_last_q > g_bank_decay_us) {
