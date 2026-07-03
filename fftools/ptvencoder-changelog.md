@@ -238,3 +238,32 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 /* Diagnostics (env PTV_DIAG=1): per-second stage counters + slow-call
  * breadcrumbs to localize a stall. Temporary, gated, low-overhead (Rule 0). */
 ```
+
+## Appendix — architecture sketch & version-string rationale (moved from the ptvencoder.c header, 2026-07-03)
+
+Pull-based multi-stage pipeline (the professional model):
+
+```
+  demux ─video_q─▶ decode (free-run) ─frame_q─▶ output(master clock, sample
+        ─audio_q─▶ audio (decode▶resample▶AAC) ──────────────────┐  & hold)
+                                                         mux_q ◀──┴──▶ mux
+```
+
+- A free-running output clock is the master: a wall-paced timer in the output thread emits at
+  the house rate no matter what upstream does.
+- The frame synchronizer is sample-and-hold: decode runs free in its own thread and keeps the
+  latest decoded frame current (frame_q, drop-oldest); each output tick samples it — repeat if
+  decode is behind, drop intermediate frames if it is ahead. Source PTS is advisory; video
+  output PTS is the tick counter, so source wrap/jump/gap is invisible to the output (no
+  re-anchor needed — the pull model dissolves it).
+- The encoder is downstream and never allowed to block the clock from draining input: if it
+  stalls (e.g. NVENC blocking the caller under GPU load — the failure this design exists to
+  survive), decode keeps running, the demuxer keeps draining the socket (dropping on a full
+  queue), and a watchdog flags the stall.
+- The mux is clock-locked and keeps emitting (dup-fill) so the TS never stops.
+- Video and audio map onto one shared input anchor (h0) for the A/V start offset.
+
+`PTVENCODER_VERSION` is ptvencoder's OWN version, independent of the FFmpeg git-describe string
+(which, on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT encode which
+patch revision is applied). Bump it by hand on each release so a deployed binary self-identifies
+via the banner / `-version`.

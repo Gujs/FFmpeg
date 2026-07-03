@@ -1,33 +1,7 @@
 /*
- * ptvencoder — purpose-built live MPEG-TS re-encoder.
- *
- * A sibling fftools program (alongside ffmpeg/ffprobe/ffplay) that links the
- * same patched libav* libraries but runs on its own house-clock timing engine.
- * See analysis/ptvencoder-functional-spec.md.
- *
- * Phase 1, increment 5: pull-based multi-stage pipeline (the professional model).
- *
- *   demux ─video_q─▶ decode (free-run) ─frame_q─▶ output(master clock, sample
- *         ─audio_q─▶ audio (decode▶resample▶AAC) ──────────────────┐  & hold)
- *                                                          mux_q ◀──┴──▶ mux
- *
- *  - A free-running output clock is the master: a wall-paced timer in the output
- *    thread emits at the house rate no matter what upstream does.
- *  - The frame synchronizer is sample-and-hold: decode runs free in its own
- *    thread and keeps the latest decoded frame current (frame_q, drop-oldest);
- *    each output tick samples it — repeat if decode is behind, drop intermediate
- *    frames if it is ahead. Source PTS is advisory; video output PTS is the tick
- *    counter, so source wrap/jump/gap is invisible to the output (no re-anchor
- *    needed — the pull model dissolves it).
- *  - The encoder is downstream and never allowed to block the clock from
- *    draining input: if it stalls (e.g. NVENC blocking the caller under GPU
- *    load — the failure this design exists to survive), decode keeps running,
- *    the demuxer keeps draining the socket (dropping on a full queue), and a
- *    watchdog flags the stall. (Auto-reinit of a hung in-process session is a
- *    follow-up; this build contains + detects.)
- *  - The mux is clock-locked and keeps emitting (dup-fill) so the TS never stops.
- *
- * Video and audio map onto one shared input anchor (h0) for A/V start offset.
+ * ptvencoder — purpose-built live MPEG-TS re-encoder on a house-clock timing engine.
+ * Architecture & design: analysis/ptvencoder-functional-spec.md
+ * Version history / release notes: fftools/ptvencoder-changelog.md
  *
  * This file is licensed under the same terms as FFmpeg (GPL, --enable-gpl).
  */
@@ -65,13 +39,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-/* ptvencoder's OWN version, independent of the FFmpeg git-describe string (which,
- * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
- * encode which patch revision is applied). Bump by hand on each meaningful fix/
- * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.9.12.1"
-/* Version history / per-release notes: fftools/ptvencoder-changelog.md (extracted from this
- * header 2026-07-03). Put NEW release notes THERE, not here — only bump the define above. */
+#define PTVENCODER_VERSION "0.9.12.1"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 #define PTV_WD_DEADLINE_US (2 * (int64_t)AV_TIME_BASE)   /* watchdog stall threshold */
