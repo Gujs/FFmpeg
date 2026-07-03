@@ -39,7 +39,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "0.9.13"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "0.9.14"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 #define PTV_WD_DEADLINE_US (2 * (int64_t)AV_TIME_BASE)   /* watchdog stall threshold */
@@ -289,7 +289,32 @@ static int     g_pll_dev_shift = 9;          /* v0.6.22: EMA shift for pll_dev (
  * queue ABSORBS the one-time init backlog (the decoder then drains it faster than realtime and catches
  * up — multicast/live is realtime steady-state, so video_q sits near-empty after). drop-newest remains
  * the backstop for genuine SUSTAINED overload. PTV_VIDEOQ overrides. */
-static int     g_videoq = 256;
+static int     g_videoq = 512;       /* v0.9.14: default 256->512 — headroom for the runtime AUTO-BANK
+                                      * (compressed packets, ~KBs each; 512 covers a 12s bank at 30fps
+                                      * with margin, and removes the manual PTV_VIDEOQ for bursty channels) */
+/* v0.9.14 AUTO-BANK (the owner-agreed auto-cushion escalation, cap 12s). The 0.9.10 adaptive
+ * cushion lives in frame_q (DECODED frames) and maxes at ~4s — structurally too shallow for
+ * HLS-burst channels with 6-8s gaps (Unique_TV/ZOE class), whose fix has been a MANUAL deep
+ * startup prime (PTV_PREROLL_MS/PTV_VIDEOQ). This closes the loop at runtime: when the demux
+ * BURSTY detector qualifies a channel (>=3 stalls >=1.5s per 60s, or a single stall >=3s), the
+ * bank target becomes 1.5x the worst observed stall, capped at PTV_CUSHION_MAX_MS (12s). Arming
+ * flips the master rung to the deep-prime BLOCKING push (frame_q gates decode -> the excess
+ * banks in video_q as COMPRESSED packets — cheap), so each stall's own latency is RETAINED as
+ * the bank instead of being drained: the channel self-heals within a stall cycle or two, no
+ * restart, no viewer-visible fill. Growth is self-limiting (once bank >= gap, stalls stop
+ * starving so latency stops growing). The per-rung delivery-gate cap rides the bank so audio
+ * waits out long stalls with video. Decays after 6h without qualifying stalls (the drained
+ * latency then bleeds via the normal catch-up path). PTV_NO_AUTOBANK reverts to advisor-only;
+ * an explicit PTV_PREROLL_MS deep prime keeps working and pre-fills at startup as before.
+ * Single-input live only (mosaic slots ride cadence-residence starvation-slip; mv bank later). */
+static int     g_autobank = 1;
+static int64_t g_cushion_max_ms = 12000;      /* PTV_CUSHION_MAX_MS: bank ceiling (owner: >12s stalls are
+                                               * upstream INCIDENTS to surface, not absorb; also = startup
+                                               * darkness after every restart if baked into a preroll) */
+static int64_t g_bank_decay_us = 6 * 3600 * 1000000LL;   /* PTV_BANK_DECAY_S: quiet time before the bank drops */
+static _Atomic int     g_bank_pkts;           /* >0 = deep-bank semantics armed (master rung blocking push) */
+static _Atomic int64_t g_bank_us;             /* current bank TARGET (us) — stats/log readout */
+static _Atomic int     g_vq_elems;            /* video_q depth (pkts), demux-updated — the bank ACTUAL readout */
 static int     g_exacttick = 1;      /* v0.9.9 EXACTTICK (PTV_NO_EXACTTICK reverts): compute the video content
                                       * index with the EXACT rational frame duration instead of dividing by the
                                       * integer-us tick_dur_us. The integer tick (e.g. 33367 vs true 33366.667us
@@ -571,6 +596,8 @@ void show_help_default(const char *opt, const char *arg)
         "    PTV_VIDEOQ=N        demux->decode packet-queue depth (default 256; raise with deep preroll)\n"
         "    PTV_FRAMEQ=N        decode->output frame-buffer capacity (default 160, slots only)\n"
         "    PTV_CUSHION_MS=N    adaptive cushion RAISED tier (default 4000, grows on repeated starvation)\n"
+        "    PTV_CUSHION_MAX_MS  AUTO-BANK ceiling (default 12000): bursty channels self-escalate a\n"
+        "                        compressed video_q bank to 1.5x their worst stall — no env needed\n"
         "    PTV_DELIVERY_CAP_MS / PTV_DELIVERY_MAXQ   audio delivery-gate sizing (auto-sized normally)\n"
         "   reverts (each disables one default-on mechanism; for A/B and rollback only):\n"
         "    PTV_NO_WUCR         occupancy-servo house pacing      PTV_NO_LAYERA   glue/discontinuity buffer\n"
@@ -580,6 +607,7 @@ void show_help_default(const char *opt, const char *arg)
         "    PTV_NO_GENLOCK      source-rate estimator             PTV_NO_GAPDISCRIM audio gap-vs-splice\n"
         "    PTV_NO_DELIVERY     audio delivery-alignment gate     PTV_NO_DELIVERY_MV ungated mosaics (pre-0.9.12.1)\n"
         "    PTV_NO_RESIDENCE    mosaic per-slot source-rate cadence (pre-0.9.13 pop-per-tick)\n"
+        "    PTV_NO_AUTOBANK     runtime bursty-channel bank escalation (back to advisor-only)\n"
         "   logging: PTV_DIAG=1 debug lines · PTV_LOG_TS=1 timestamp prefix · see -log-legend for probes\n");
 }
 
@@ -611,7 +639,7 @@ typedef struct DlvGate {
     int             count, maxq;
     int             closed;             /* video thread done → enqueuers fall through to a direct send */
     int             inited;
-    int64_t         cap_us;
+    _Atomic int64_t cap_us;     /* v0.9.14: runtime-adjustable (AUTO-BANK extends it so audio waits out long stalls) */
     _Atomic int64_t v_enc_dts_hi;       /* newest video DTS the encoder has emitted (µs); INT64_MIN = none yet */
     _Atomic int64_t v_hi_change_wc;     /* monotonic wall time v_enc_dts_hi last ADVANCED — stall detector:
                                          * the cap force-release fires only when video is GENUINELY stuck
@@ -631,7 +659,7 @@ static void dlv_init(DlvGate *g, AVThreadMessageQueue *mux_q, int64_t cap_us, in
     g->head = g->tail = NULL;
     g->count = 0; g->closed = 0; g->inited = 1;
     g->mux_q = mux_q;
-    g->cap_us = cap_us > 0 ? cap_us : 2000000;
+    atomic_store_explicit(&g->cap_us, cap_us > 0 ? cap_us : 2000000, memory_order_relaxed);
     g->maxq = maxq > 0 ? maxq : 512;
     atomic_store(&g->v_enc_dts_hi, INT64_MIN);
     atomic_store(&g->v_hi_change_wc, av_gettime_relative());   /* "advanced just now" so startup isn't seen as a stall */
@@ -702,7 +730,8 @@ static void dlv_drain(DlvGate *g)
      * keeps advancing, so packets drain naturally as it reaches them and we must NOT force them out early
      * (the old absolute packet-age cap did, on every jitter excursion past the steady hold → dlvforced
      * storms that also fed "audio-way-ahead" bursts into the downstream PLL). */
-    int video_stalled = (now - adv) > g->cap_us;
+    int64_t cap_now = atomic_load_explicit(&g->cap_us, memory_order_relaxed);
+    int video_stalled = (now - adv) > cap_now;
     DlvNode *out_head = NULL, *out_tail = NULL;   /* released, FIFO order */
     DlvNode *p, *prev, *nx;
     int64_t oldest = 0;
@@ -712,7 +741,7 @@ static void dlv_drain(DlvGate *g)
     prev = NULL; p = g->head;
     while (p) {
         int reached = (hi != INT64_MIN && p->dts_us <= hi);
-        int cap     = video_stalled && (now - p->enq_us) > g->cap_us;
+        int cap     = video_stalled && (now - p->enq_us) > cap_now;
         nx = p->next;
         if (reached || cap) {
             if (prev) prev->next = nx; else g->head = nx;
@@ -1178,7 +1207,7 @@ static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
             AVFrame *out;
             if (i == d->n_rung - 1) { out = av_frame_alloc(); if (out) av_frame_move_ref(out, frame); }
             else                    { out = av_frame_clone(frame); }
-            if (out) push_frame_q(d->frame_q[i], (d->deep_prime_packets > 0 && i == 0) ? 0 : d->live, &d->framedrop[i], out);
+            if (out) push_frame_q(d->frame_q[i], ((d->deep_prime_packets > 0 || atomic_load_explicit(&g_bank_pkts, memory_order_relaxed) > 0) && i == 0) ? 0 : d->live, &d->framedrop[i], out);
             else if (i == d->n_rung - 1) av_frame_unref(frame);
         }
         return;
@@ -1189,7 +1218,7 @@ static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
     for (i = 0; i < d->n_rung; i++) {                 /* split branch -> each rung's frame_q */
         while (av_buffersink_get_frame(d->fsink[i], filt) >= 0) {
             AVFrame *out = av_frame_alloc();
-            if (out) { av_frame_move_ref(out, filt); push_frame_q(d->frame_q[i], (d->deep_prime_packets > 0 && i == 0) ? 0 : d->live, &d->framedrop[i], out); }
+            if (out) { av_frame_move_ref(out, filt); push_frame_q(d->frame_q[i], ((d->deep_prime_packets > 0 || atomic_load_explicit(&g_bank_pkts, memory_order_relaxed) > 0) && i == 0) ? 0 : d->live, &d->framedrop[i], out); }
             else     { av_frame_unref(filt); }
         }
     }
@@ -1285,7 +1314,7 @@ static void *decode_thread(void *arg)
         for (i = 0; i < d->n_rung; i++)
             while (av_buffersink_get_frame(d->fsink[i], filt) >= 0) {
                 AVFrame *out = av_frame_alloc();
-                if (out) { av_frame_move_ref(out, filt); push_frame_q(d->frame_q[i], (d->deep_prime_packets > 0 && i == 0) ? 0 : d->live, &d->framedrop[i], out); }
+                if (out) { av_frame_move_ref(out, filt); push_frame_q(d->frame_q[i], ((d->deep_prime_packets > 0 || atomic_load_explicit(&g_bank_pkts, memory_order_relaxed) > 0) && i == 0) ? 0 : d->live, &d->framedrop[i], out); }
                 else     { av_frame_unref(filt); }
             }
     }
@@ -1573,6 +1602,18 @@ static void *output_thread(void *arg)
                         if (corr >  6000) corr =  6000;
                         if (corr < -6000) corr = -6000;
                     }
+                    /* v0.9.14 AUTO-BANK top-up: deficit retention alone converges to BREAK-EVEN only
+                     * (each cycle starves by gap−coverage and retains exactly that; the 1.5x margin
+                     * never builds — measured: dup trickle persists at the boundary). Fill the margin
+                     * actively: above the safety floor, bias the gentle zone to slow-fill (+0.6%,
+                     * imperceptible) until video_q holds the bank target; normal servo resumes there. */
+                    {
+                        int64_t bt = atomic_load_explicit(&g_bank_us, memory_order_relaxed);
+                        if (bt > 0 && !repriming && g_occ_ema_milli >= (int64_t)base_sp * 1000 &&
+                            (int64_t)atomic_load_explicit(&g_vq_elems, memory_order_relaxed) * v->tick_dur_us < bt &&
+                            corr < 6000)
+                            corr = 6000;
+                    }
                     atomic_store_explicit(&g_rho_corr_ppm, corr, memory_order_relaxed);
                 }
                 int64_t corr = atomic_load_explicit(&g_rho_corr_ppm, memory_order_relaxed);
@@ -1697,12 +1738,20 @@ static void *output_thread(void *arg)
                              occ, (long long)(occ * v->tick_dur_us / 1000), (long long)(-corr), (long long)(hs / 1000),
                              (int)((int64_t)cur_sp * v->tick_dur_us / 1000));  /* -corr = recovered source dev (+=faster); cushion = adaptive tier target */
                 }
+                char bk[48] = "";                                    /* v0.9.14 AUTO-BANK: actual/target */
+                {
+                    int64_t bt = atomic_load_explicit(&g_bank_us, memory_order_relaxed);
+                    if (bt > 0)
+                        snprintf(bk, sizeof bk, " bank=%lld/%lldms",
+                                 (long long)((int64_t)atomic_load_explicit(&g_vq_elems, memory_order_relaxed) * v->tick_dur_us / 1000),
+                                 (long long)(bt / 1000));
+                }
                 av_log(NULL, AV_LOG_INFO,
                     "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f "
                     "dup=%"PRId64" pd=%"PRId64" drop=%"PRId64" corrupt=%"PRId64" "
-                    "async=%+"PRId64"ppm%s%s\n",
+                    "async=%+"PRId64"ppm%s%s%s\n",
                     v->emitted, fps, hh, mm, ss,
-                    v->dup, v->pd, v->framedrop, cr, aw, dlv, wu);
+                    v->dup, v->pd, v->framedrop, cr, aw, dlv, wu, bk);
                 stat_last = nows; stat_prev = v->emitted;
             }
         }
@@ -2816,6 +2865,9 @@ typedef struct DemuxArgs {
     int64_t               by_win_start;     /* rolling 60s window start */
     int64_t               by_max_gap;       /* max arrival gap in the window (us) */
     int                   by_gap_cnt;       /* completed gaps >=1.5s in the window */
+    int                   autobank;         /* v0.9.14: runtime bank escalation armed for this input (single-input live) */
+    int64_t               by_bank_last_q;   /* v0.9.14: wall time of the last QUALIFYING stall (decay reference) */
+    int64_t               by_bank_advise_us;/* v0.9.14: rate-limit for the at-ceiling advisory */
     int64_t               vcorrupt;       /* video packets flagged AV_PKT_FLAG_CORRUPT (discarded if g_discardcorrupt) */
 } DemuxArgs;
 
@@ -3667,6 +3719,46 @@ end:
  * demux_pass). Extracted verbatim from demux_thread so the disc-buffer flush can
  * re-inject kept NEW packets through the identical path. Takes ownership of out
  * (frees it). Returns 0, or <0 on a queue-closed error. */
+/* v0.9.14 AUTO-BANK escalation: raise the runtime bank target to 1.5x the worst observed stall,
+ * capped at PTV_CUSHION_MAX_MS. Arming flips the master rung to blocking pushes (deep-prime
+ * semantics), so each subsequent stall's own latency is RETAINED as a compressed-packet bank in
+ * video_q instead of draining — the channel self-heals within a stall cycle or two. Idempotent:
+ * the target only ever rises (decay handles the way down); every qualifying stall refreshes the
+ * decay reference. Runs in the demux thread; readers are the decode pushes (g_bank_pkts) and the
+ * gate drains (cap_us) — all relaxed atomics, no ordering needed (advisory values). */
+static void ptv_autobank_escalate(DemuxArgs *d, int64_t worst_us, int64_t now)
+{
+    int64_t want_us = worst_us * 3 / 2;
+    int64_t ceil_us = g_cushion_max_ms * 1000;
+    int64_t cur     = atomic_load_explicit(&g_bank_us, memory_order_relaxed);
+    int     pkts, r;
+    d->by_bank_last_q = now;
+    if (want_us > ceil_us) {
+        want_us = ceil_us;
+        /* at the ceiling AND still short: the one case left for a human — surface it, rate-limited */
+        if (worst_us * 12 / 10 > ceil_us && now - d->by_bank_advise_us > 60000000) {
+            d->by_bank_advise_us = now;
+            av_log(NULL, AV_LOG_WARNING,
+                   "[PTV-CUSHION] BANK at its %llds ceiling but the worst stall is %.1fs — stalls this size are "
+                   "an upstream incident; raising PTV_CUSHION_MAX_MS is a conscious latency trade.\n",
+                   (long long)(g_cushion_max_ms / 1000), worst_us / 1e6);
+        }
+    }
+    if (want_us <= cur + 500000)                    /* hysteresis: gap jitter must not re-log identical escalations */
+        return;
+    pkts = (int)(want_us / 1000000 * 35) + 64;      /* ~35 pkt/s + margin (the advisor's proven sizing) */
+    if (pkts > g_videoq - 32) pkts = g_videoq - 32;
+    atomic_store_explicit(&g_bank_us, want_us, memory_order_relaxed);
+    atomic_store_explicit(&g_bank_pkts, pkts, memory_order_relaxed);
+    for (r = 0; r < d->n_out; r++)                  /* audio gate rides the deeper hold (waits out long stalls) */
+        if (d->gate[r])
+            atomic_store_explicit(&d->gate[r]->cap_us, g_delivery_cap_us + want_us, memory_order_relaxed);
+    av_log(NULL, AV_LOG_WARNING,
+           "[PTV-CUSHION] BANK escalated to %.1fs (worst stall %.1fs x1.5, ceiling %llds): stall latency is now "
+           "RETAINED as a compressed video_q bank — self-heals within a stall cycle, no restart needed\n",
+           want_us / 1e6, worst_us / 1e6, (long long)(g_cushion_max_ms / 1000));
+}
+
 static int demux_dispatch(DemuxArgs *d, AVPacket *out)
 {
     int ret = 0;
@@ -3698,34 +3790,57 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                 }
             }
             d->vpkt++;
-            {   /* [PTV-BURSTY] burst-delivery advisor (log-only; see DemuxArgs comment) */
+            {   /* [PTV-BURSTY]/AUTO-BANK — burst detection drives the runtime cushion escalation
+                 * (v0.9.14) on qualifying inputs, and remains a log-only advisor otherwise. */
                 int64_t bw = av_gettime_relative();
                 if (d->by_last_v_wall) {
                     int64_t gap = bw - d->by_last_v_wall;
                     if (gap >= 1500000) {                       /* a completed >=1.5s arrival stall */
                         d->by_gap_cnt++;
                         if (gap > d->by_max_gap) d->by_max_gap = gap;
+                        if (d->autobank && gap >= 3000000)      /* one BIG stall qualifies immediately (sparse-glitch class) */
+                            ptv_autobank_escalate(d, gap, bw);
                     }
                 }
                 d->by_last_v_wall = bw;
                 if (!d->by_win_start) d->by_win_start = bw;
                 if (bw - d->by_win_start >= 60000000) {         /* 60s window closes */
-                    int64_t need_ms = (d->by_max_gap * 3 / 2) / 1000;   /* 1.5x worst gap */
-                    need_ms = ((need_ms + 999) / 1000) * 1000;
-                    if (need_ms > 30000) need_ms = 30000;
-                    if (d->by_gap_cnt >= 3 && (int64_t)g_preroll_ms < (d->by_max_gap * 12 / 10) / 1000) {
-                        int vq = (int)(need_ms / 1000 * 35) + 64;        /* ~35 pkt/s at 29.97 + margin */
-                        av_log(NULL, AV_LOG_WARNING,
-                               "[PTV-BURSTY] video arrives in bursts: %d stalls >=1.5s in the last 60s "
-                               "(worst %.1fs). The frame cushion cannot ride gaps this size — this looks "
-                               "like HLS-segment delivery over SRT. Add to the channel environment and "
-                               "restart: PTV_PREROLL_MS=\"%lld\",PTV_VIDEOQ=\"%d\" "
-                               "(deep packet prime; adds ~%llds latency). See -log-legend.\n",
-                               d->by_gap_cnt, d->by_max_gap / 1e6,
-                               (long long)need_ms, vq, (long long)(need_ms / 1000));
+                    if (d->by_gap_cnt >= 3) {                   /* HLS-burst cadence */
+                        if (d->autobank) {
+                            ptv_autobank_escalate(d, d->by_max_gap, bw);
+                        } else if ((int64_t)g_preroll_ms < (d->by_max_gap * 12 / 10) / 1000) {
+                            int64_t need_ms = (d->by_max_gap * 3 / 2) / 1000;   /* 1.5x worst gap */
+                            need_ms = ((need_ms + 999) / 1000) * 1000;
+                            if (need_ms > 30000) need_ms = 30000;
+                            int vq = (int)(need_ms / 1000 * 35) + 64;           /* ~35 pkt/s at 29.97 + margin */
+                            av_log(NULL, AV_LOG_WARNING,
+                                   "[PTV-BURSTY] video arrives in bursts: %d stalls >=1.5s in the last 60s "
+                                   "(worst %.1fs). The frame cushion cannot ride gaps this size — this looks "
+                                   "like HLS-segment delivery over SRT. Add to the channel environment and "
+                                   "restart: PTV_PREROLL_MS=\"%lld\",PTV_VIDEOQ=\"%d\" "
+                                   "(deep packet prime; adds ~%llds latency). See -log-legend.\n",
+                                   d->by_gap_cnt, d->by_max_gap / 1e6,
+                                   (long long)need_ms, vq, (long long)(need_ms / 1000));
+                        }
+                    }
+                    /* v0.9.14 decay: a long quiet spell retires the bank (latency then bleeds via
+                     * the normal catch-up path once the master rung returns to drop-oldest). */
+                    if (d->autobank && d->by_bank_last_q &&
+                        atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 &&
+                        bw - d->by_bank_last_q > g_bank_decay_us) {
+                        int r2;
+                        atomic_store_explicit(&g_bank_us, 0, memory_order_relaxed);
+                        atomic_store_explicit(&g_bank_pkts, 0, memory_order_relaxed);
+                        for (r2 = 0; r2 < d->n_out; r2++)
+                            if (d->gate[r2])
+                                atomic_store_explicit(&d->gate[r2]->cap_us, g_delivery_cap_us, memory_order_relaxed);
+                        av_log(NULL, AV_LOG_INFO,
+                               "[PTV-CUSHION] BANK retired after %llds without qualifying stalls; banked latency drains via catch-up\n",
+                               (long long)(g_bank_decay_us / 1000000));
                     }
                     d->by_win_start = bw; d->by_gap_cnt = 0; d->by_max_gap = 0;
                 }
+                atomic_store_explicit(&g_vq_elems, av_thread_message_queue_nb_elems(d->video_q), memory_order_relaxed);
             }
             if (out->pts != AV_NOPTS_VALUE)   /* [PTV-CHAIN] video source-content at demux (us) */
                 atomic_store_explicit(&g_ch_vsrc, av_rescale_q(out->pts, d->ifmt->streams[d->vstream]->time_base, AV_TIME_BASE_Q), memory_order_relaxed);
@@ -5050,6 +5165,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         d->wrap_off = inputs[kk].wrap_off; d->wrap_last = inputs[kk].wrap_last;
         d->wrap_wall_last = inputs[kk].wrap_wall_last; d->video_fwd_us = 0;
         d->disc = g_layera ? &inputs[kk].disc : NULL;   /* legacy-0004 buffer (NULL when off) */
+        d->autobank = g_autobank && !multiview && live && is_net_url(inputs[kk].url);   /* v0.9.14: single-input live only */
         for (r = 0; r < n_rung; r++) {
             d->mux_q[r] = rung[r].mux_q;
             d->gate[r]  = delivery_on ? &rung[r].gate : NULL;   /* §7.5a: dense copied audio rides the gate */
@@ -5574,6 +5690,9 @@ static void ptv_print_log_legend(int full)
         "             drops bleed it back; A/V stays LOCKED throughout (this is delay, not lip-sync)\n"
         "  cushion    adaptive frame_q target: ~1s lean tier or ~4s raised tier ([PTV-CUSHION] logs\n"
         "             each transition: grows on 2 starvations/60min, shrinks after 6h quiet)\n"
+        "  bank       (v0.9.14, shown when armed) AUTO-BANK actual/target ms: a bursty channel's\n"
+        "             self-escalated compressed video_q cushion (1.5x worst stall, cap 12s); fills\n"
+        "             from the stalls' own retained latency, retires after 6h quiet\n"
         "  lip-sync   NOT self-reported (internal PES skew is blind to content↔PTS offset). Measure\n"
         "             with the EXTERNAL oracle test-scripts/repro/drift-continuous.py.\n");
     av_log(NULL, AV_LOG_INFO,
@@ -5705,6 +5824,9 @@ int main(int argc, char **argv)
     if (getenv("PTV_AF_NO_ANCHOR")) g_af_anchor = 0;        /* A/B: revert B1 → pre-B1 free-running counter */
     { const char *pe = getenv("PTV_PREROLL_MS"); if (pe) { int v = atoi(pe); if (v < 0) v = 0; if (v > 30000) v = 30000; g_preroll_ms = v; g_preroll_set = 1; } }  /* §13: startup cushion target (ms), bounded 0-30s */
     { const char *vq = getenv("PTV_VIDEOQ"); if (vq && atoi(vq) > 0) g_videoq = atoi(vq); }   /* video_q depth (startup-burst absorb) */
+    { const char *cm = getenv("PTV_CUSHION_MAX_MS"); if (cm && atoi(cm) > 0) g_cushion_max_ms = atoi(cm); }  /* v0.9.14: AUTO-BANK ceiling (default 12000) */
+    { const char *bd = getenv("PTV_BANK_DECAY_S"); if (bd && atoi(bd) > 0) g_bank_decay_us = (int64_t)atoi(bd) * 1000000; }  /* v0.9.14: quiet time before bank retires (test hook; default 6h) */
+    if (getenv("PTV_NO_AUTOBANK")) g_autobank = 0;   /* v0.9.14: revert to advisor-only (manual PTV_PREROLL_MS recipe) */
     { const char *fq = getenv("PTV_FRAMEQ"); if (fq && atoi(fq) > 0) { int v = atoi(fq); if (v < PTV_FRAME_QDEPTH) v = PTV_FRAME_QDEPTH; if (v > 1024) v = 1024; g_frameq_cap = v; } }   /* frame_q (decode->output) capacity; raise + deep PTV_PREROLL_MS to absorb an ad-break decode-rate dip (AWE) */
     if (getenv("PTV_NO_EXACTTICK")) g_exacttick = 0;   /* revert to integer-us tick content index (the ~10ppm NTSC drift) */
     if (getenv("PTV_NO_PULLDOWN"))  g_pulldown = 0;    /* v0.9.11: revert telecine-aware emit (film segments back to dup-fill) */
