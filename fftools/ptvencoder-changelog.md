@@ -6,6 +6,26 @@ keep only the current `PTVENCODER_VERSION` define in the source. This file is pa
 the v2 `0001` patch (additive, travels with the source to the build box).
 
 
+## 0.9.12.1 (2026-07-03)
+
+- **Delivery gate default-ON for multiview** (`PTV_NO_DELIVERY_MV` reverts; `PTV_DELIVERY_MV`, the
+  old opt-in, is now a harmless no-op). The wire skew on an ungated output equals the CURRENT
+  video in-process hold: the muxer interleaves by DTS but waits only max_interleave_delta (200ms)
+  for the late stream, so video held in-process (frame_q occupancy + ~1s NVENC steady, several
+  seconds during post-stall catch-up on bursty slots) lands on the wire out-of-order behind
+  already-written audio. cor-2's downstream sync_check (first-50-packets
+  `D = video_last_pts - audio_last_pts`, restart at |D| > 2s) measured D = -0.6..-5.9s on the
+  ungated mosaics and restart-looped them 12-67x/day. Single-input never showed it because the
+  gate ships there since v0.7.0. With the gate, audio holds until the encoder's video front
+  reaches its DTS → wire D ≈ -0.1s. Player lip-sync was never affected (PTS mapping correct);
+  this fixes wire STAGING. Local 2x2 A/B (VideoToolbox mirror, sync_check's exact probe):
+  gate-on D = -0.05..-0.08s flat across normal, 3s-primed, and 4s-burst-slot runs, fps=30 dup≈0
+  drop=0 (no pipeline disturbance); the [PTV-BURSTY] advisor fires per-input on mosaics.
+  (Local controls can't reproduce the production magnitude — the VT video path holds only
+  ~100ms; the -0.6..-5.9s figures are the production measurement itself.) The hold-FIFO
+  backstop auto-sizes by audio-track count (each track fans into every rung's gate: a 2x2 mosaic =
+  4 AAC x ~47pkt/s x 3s cap ≈ 570 > the 512 single-input default; explicit PTV_DELIVERY_MAXQ wins).
+
 ## 0.9.12 (2026-07-03)
 
 - **MV-EXACTTICK** (`PTV_NO_MV_EXACTTICK` reverts): the compositor's MEASUREMENT axes (B3 PLL vring
