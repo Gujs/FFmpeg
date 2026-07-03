@@ -39,7 +39,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "0.9.15.1"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "0.9.15.2"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 #define PTV_WD_DEADLINE_US (2 * (int64_t)AV_TIME_BASE)   /* watchdog stall threshold */
@@ -333,6 +333,12 @@ static int     g_mv_exacttick = 1;   /* v0.9.12 MV-EXACTTICK (PTV_NO_MV_EXACTTIC
                                       * video axis at 30000/1001, so the per-slot audio followers ENFORCED
                                       * ~36ms/h audio-late onto the wire while every internal offset read bounded.
                                       * See analysis/ptvencoder-0911-multiview-tick-audit.md. */
+static int     g_decimate = 1;       /* v0.9.15.2 cadence decimation (PTV_NO_DECIMATE reverts): a frame whose
+                                      * content index does not advance past the last emitted tick is surplus
+                                      * (source delivers MORE real frames than its declared rate — NewsNation
+                                      * ~25.3-25.5 real fps declared 25/1, cadence wandering) — replace it with
+                                      * the next and display only the newest due frame. The output samples the
+                                      * source's own timeline at the house rate: lip-sync exact, frame_q level. */
 static int     g_pulldown = 1;       /* v0.9.11 telecine-aware emit (PTV_NO_PULLDOWN reverts): during 23.976-film-
                                       * in-29.97 segments (2:3 soft pulldown, repeat_pict flags — AWE movies) a
                                       * flagged frame legitimately OCCUPIES extra emission ticks. repeat_pict only
@@ -989,6 +995,7 @@ typedef struct VideoCtx {
     int64_t         *dbg_vdrop, *dbg_pcorrupt;       /* single-input stats: demux video_q drops + corrupt-pkt count */
     /* counters */
     int64_t          framedrop, emitted, dup, pd;   /* pd = intentional cadence holds (telecine residence), split from dup (health alarm) */
+    int64_t          decim;          /* v0.9.15.2: surplus frames decimated by content mapping (>house-rate source) */
     /* watchdog */
     int64_t          last_emit_us;
     volatile int     output_done;
@@ -1466,14 +1473,37 @@ static void *output_thread(void *arg)
             }
             /* queue empty + no lookahead: fall through = dup-on-empty exactly as today */
         } else {
-            ret = av_thread_message_queue_recv(v->frame_q, &f, AV_THREAD_MESSAGE_NONBLOCK);
-            if (ret >= 0) {
-                av_frame_unref(held); av_frame_move_ref(held, f); av_frame_free(&f);
-                have = 1; fresh = 1; held_src_pts = held->pts;   /* capture before emit overwrites it */
-                held_extra = 0;
-            } else if (ret == AVERROR_EOF) {
-                break;                              /* decode finished, queue drained */
+            /* v0.9.15.2 CADENCE DECIMATION (single-input mirror of the 0.9.13 mosaic multi-pop):
+             * a frame whose content index does NOT advance past the last emitted tick is SURPLUS —
+             * a stream delivering more real frames than its declared rate (NewsNation: ~25.3-25.5
+             * real fps stamped truly, declared 25/1; cadence WANDERS so no fixed house rate fits).
+             * Take the next frame instead and display only the newest due one: the output samples
+             * the source's own timeline at the house rate, so lip-sync stays exact and frame_q
+             * stays level (before: +0.45f/s surplus pinned it at 160 -> bursty drop-oldest +
+             * async churn). Never fires for <=house-rate content (indices always advance) — film
+             * pulldown, exact-rate and slow sources are untouched. Bounded 3 pops/tick (+8%).
+             * PTV_NO_DECIMATE reverts. */
+            int pops = 0, got_eof = 0;
+            for (;;) {
+                ret = av_thread_message_queue_recv(v->frame_q, &f, AV_THREAD_MESSAGE_NONBLOCK);
+                if (ret >= 0) {
+                    av_frame_unref(held); av_frame_move_ref(held, f); av_frame_free(&f);
+                    have = 1; fresh = 1; held_src_pts = held->pts;   /* capture before emit overwrites it */
+                    held_extra = 0;
+                    pops++;
+                    if (g_decimate && pops < 3) {
+                        int64_t hc = content_index(v, held->pts);
+                        if (hc >= 0 && hc <= last_vpts) { v->decim++; continue; }   /* surplus: take a fresher one */
+                    }
+                    break;
+                } else if (ret == AVERROR_EOF) {
+                    if (!fresh) got_eof = 1;        /* terminal only if nothing taken this tick */
+                    break;
+                } else
+                    break;                          /* queue empty */
             }
+            if (got_eof)
+                break;                              /* decode finished, queue drained */
         }
         if (!have) { av_usleep(2000); continue; }   /* await first frame (no startup dups) */
 
@@ -1796,13 +1826,16 @@ static void *output_thread(void *arg)
                                               + av_thread_message_queue_nb_elems(v->frame_q)) * v->tick_dur_us / 1000),
                                  (long long)(bt / 1000));
                 }
-                char cfs[32] = "";                                   /* v0.9.15.1 CLOCK-FOLLOW readout (shown when notable) */
+                char cfs[56] = "";                                   /* v0.9.15.1 CLOCK-FOLLOW readout (shown when notable) */
                 {
                     int64_t cq = atomic_load_explicit(&g_cf_rate_q20, memory_order_relaxed);
                     int64_t cp = ((cq - (1 << 20)) * 1000000) >> 20;
                     int     lk = atomic_load_explicit(&g_cf_locked, memory_order_relaxed);
+                    int     n = 0;
                     if (lk || llabs(cp) > 500)
-                        snprintf(cfs, sizeof cfs, " cf=%+lldppm%s", (long long)cp, lk ? "" : "?");
+                        n = snprintf(cfs, sizeof cfs, " cf=%+lldppm%s", (long long)cp, lk ? "" : "?");
+                    if (v->decim > 0)                                /* v0.9.15.2: surplus-cadence decimation count */
+                        snprintf(cfs + n, sizeof cfs - n, " decim=%"PRId64, v->decim);
                 }
                 av_log(NULL, AV_LOG_INFO,
                     "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f "
@@ -5948,6 +5981,7 @@ int main(int argc, char **argv)
     { const char *bd = getenv("PTV_BANK_DECAY_S"); if (bd && atoi(bd) > 0) g_bank_decay_us = (int64_t)atoi(bd) * 1000000; }  /* v0.9.14: quiet time before bank retires (test hook; default 6h) */
     if (getenv("PTV_NO_AUTOBANK")) g_autobank = 0;   /* v0.9.14: revert to advisor-only (manual PTV_PREROLL_MS recipe) */
     if (getenv("PTV_NO_CLOCKFOLLOW")) g_clockfollow = 0;   /* v0.9.15: never follow a large source-clock offset (buffers pin + resampler churns on such sources) */
+    if (getenv("PTV_NO_DECIMATE")) g_decimate = 0;         /* v0.9.15.2: keep pop-per-tick even for >house-rate sources (frame_q pins on surplus) */
     { const char *fq = getenv("PTV_FRAMEQ"); if (fq && atoi(fq) > 0) { int v = atoi(fq); if (v < PTV_FRAME_QDEPTH) v = PTV_FRAME_QDEPTH; if (v > 1024) v = 1024; g_frameq_cap = v; } }   /* frame_q (decode->output) capacity; raise + deep PTV_PREROLL_MS to absorb an ad-break decode-rate dip (AWE) */
     if (getenv("PTV_NO_EXACTTICK")) g_exacttick = 0;   /* revert to integer-us tick content index (the ~10ppm NTSC drift) */
     if (getenv("PTV_NO_PULLDOWN"))  g_pulldown = 0;    /* v0.9.11: revert telecine-aware emit (film segments back to dup-fill) */
