@@ -47,6 +47,11 @@ the v2 `0001` patch (additive, travels with the source to the build box).
   operationally meaningful. The verbose [PTV-QSNAP] queue dumps stay diag-gated. Verified with
   the send-jump harness: a +30s injected splice logs jump+flush (applied_offset=-29.98s) with
   no PTV_DIAG; behavior itself is unchanged (identical outcome counters diag vs not).
+  Each flush also emits `[PTV-GLUE]` — running per-input source A/V mis-mux stats
+  (per-glue vid_err, mean/max |err|, >100ms count) — the LAYERA-retirement decision data:
+  if real glues show |err| ~0 over days, the simpler per-stream absorber suffices and the
+  LAYERA state machine can go; persistent 100ms+ errors mean LAYERA is actively correcting
+  mis-muxed splices the absorber would leak into audible audio steps.
 - **Multiview stats-line parity**: the mosaic line now matches single-input
   (`frame= fps= time= dup= drop=` + `dlvhold=/dlvforced=` gate readout; size/bitrate/speed/
   genlock dropped per the v0.9.10 rationale) plus per-slot
