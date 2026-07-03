@@ -5,6 +5,20 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 0.9.14.2 (2026-07-03)
+
+- **AUTO-BANK: audio_q sized like the deep preroll (the THIRD and last sizing side-car).**
+  Second live deploy (Unique_TV, 0.9.14.1): video stayed perfect but audio still clicked —
+  PTV_DIAG showed `adrop` ~25/s: a 7s delivery clump slams ~330 audio packets into the
+  demux->audio queue, which was still PTV_QDEPTH=48 deep unless the manual PTV_PREROLL_MS
+  path resized it. Now sized for the bank ceiling with the manual path's own formula
+  (~50 pkt/s x ceiling + margin => 648 @ 12s), live runs only. Root lesson recorded: the
+  manual PTV_PREROLL_MS env never worked by the prime alone — it also resizes video_q, the
+  delivery-gate FIFO, and audio_q at startup; the runtime bank had to replicate ALL THREE
+  (0.9.14 video_q, 0.9.14.1 gate, 0.9.14.2 audio_q). Validated under 7s clumps with diag:
+  adrop=0, async=+0ppm, bank at target. Acceptance metric set for bursty channels is now:
+  dup + drop + async + ADROP (diag).
+
 ## 0.9.14.1 (2026-07-03)
 
 - **AUTO-BANK audio-path sizing** — the deep-preroll path's own sizing rules, applied
