@@ -69,7 +69,7 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.9.12"
+#define PTVENCODER_VERSION "0.9.12.1"
 /* Version history / per-release notes: fftools/ptvencoder-changelog.md (extracted from this
  * header 2026-07-03). Put NEW release notes THERE, not here — only bump the define above. */
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
@@ -361,11 +361,17 @@ static int     g_discardcorrupt = 1;
  * the DENSE near-zero-latency streams (transcoded audio + copied AC-3/MP2): hold each until the
  * VIDEO encoder's emitted DTS has reached that packet's DTS, then release in lockstep. PTS are
  * NEVER modified — only WHEN a packet reaches the muxer. Sparse SCTE-35/subs BYPASS (their wire-
- * arrival lead is a feature). Default ON for LIVE single-input; PTV_NO_DELIVERY=1 reverts (audio
- * sent direct = byte-identical to v0.6.23); PTV_DELIVERY_MV=1 also gates multiview (default OFF in
- * P1 — the multiview audio path is reworked in P3). Offline (file out) always bypasses. */
+ * arrival lead is a feature). Default ON for LIVE single-input AND multiview (v0.9.12.1). The
+ * wire skew equals the CURRENT video in-process hold: the interleaver orders by DTS but only
+ * waits max_interleave_delta (200ms) for the late stream, so when video reaches the muxer
+ * held back by frame_q occupancy + the HW encoder (~1s NVENC steady, several s during
+ * post-stall catch-up on bursty slots), audio passes through and video lands out-of-order
+ * behind it. cor-2's downstream sync_check measured D = video-audio = -0.6..-5.9s on ungated
+ * mosaics and restart-looped them (|D|>2s => restart). PTV_NO_DELIVERY=1 kills the gate
+ * everywhere (audio sent direct = byte-identical to v0.6.23); PTV_NO_DELIVERY_MV=1 keeps only
+ * multiview ungated (pre-0.9.12.1 wire staging). Offline (file out) always bypasses. */
 static int     g_delivery = 1;
-static int     g_delivery_mv;                 /* PTV_DELIVERY_MV=1: also gate multiview (default off in P1) */
+static int     g_delivery_mv = 1;             /* v0.9.12.1: gate multiview too (PTV_NO_DELIVERY_MV reverts) */
 static int64_t g_delivery_cap_us = 3000000;   /* PTV_DELIVERY_CAP_MS: force-release ceiling (≥ max encoder latency).
                                                 * 3s (v0.7.3): the real steady-state hold under production load is ~2s
                                                 * (box: TruBLU on cor-1 dlvhold=2055ms — A0's 845ms underestimated it),
@@ -591,7 +597,7 @@ void show_help_default(const char *opt, const char *arg)
         "    PTV_NO_EXACTTICK    exact-rational video stamping     PTV_NO_MV_EXACTTICK  mosaic measurement axes\n"
         "    PTV_NO_PULLDOWN     telecine-aware film emit          PTV_NO_AVLOCK   audio house-lock\n"
         "    PTV_NO_GENLOCK      source-rate estimator             PTV_NO_GAPDISCRIM audio gap-vs-splice\n"
-        "    PTV_NO_DELIVERY     audio delivery-alignment gate\n"
+        "    PTV_NO_DELIVERY     audio delivery-alignment gate     PTV_NO_DELIVERY_MV ungated mosaics (pre-0.9.12.1)\n"
         "   logging: PTV_DIAG=1 debug lines · PTV_LOG_TS=1 timestamp prefix · see -log-legend for probes\n");
 }
 
@@ -4833,12 +4839,20 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         if ((ret = av_thread_message_queue_alloc(&rung[r].mux_q, PTV_QDEPTH, sizeof(AVPacket *))) < 0) goto end;
         av_thread_message_queue_set_free_func(rung[r].mux_q, free_pkt_msg);
     }
-    /* §7.5a delivery-alignment gate: LIVE single-input by default (PTV_DELIVERY_MV=1 also gates
-     * multiview; PTV_NO_DELIVERY=0 disables). Offline always bypasses → byte-identical. */
+    /* §7.5a delivery-alignment gate: default ON for LIVE, single-input AND (since v0.9.12.1)
+     * multiview (PTV_NO_DELIVERY / PTV_NO_DELIVERY_MV revert). Offline always bypasses →
+     * byte-identical. Every transcoded audio track fans into EVERY rung's gate, so size the
+     * hold-FIFO backstop by the track count (a 2x2 mosaic = 4 AAC x ~47pkt/s x 3s cap ≈ 570 >
+     * the 512 single-input default; FFMAX only raises, nodes are per-enqueue not preallocated;
+     * an explicit PTV_DELIVERY_MAXQ still wins). */
     delivery_on = live && g_delivery && (!multiview || g_delivery_mv);
-    if (delivery_on)
+    if (delivery_on) {
+        int maxq = g_delivery_maxq;
+        if (!getenv("PTV_DELIVERY_MAXQ"))
+            maxq = FFMAX(maxq, n_audio * 256);
         for (r = 0; r < n_rung; r++)
-            dlv_init(&rung[r].gate, rung[r].mux_q, g_delivery_cap_us, g_delivery_maxq);
+            dlv_init(&rung[r].gate, rung[r].mux_q, g_delivery_cap_us, maxq);
+    }
 
     /* per-input decode side. single-input: inputs[0].dc already holds the graph
      * (fg/fsrc/fsink/filtering) + feeds the rung frame_q inline. multiview: each
@@ -5572,7 +5586,8 @@ int main(int argc, char **argv)
     if (g_preroll_ms > 1600) { int need = (int)((int64_t)g_preroll_ms * 60 / 1000) + 64; if (need > 2048) need = 2048; if (g_videoq < need) g_videoq = need; g_aq_cap = PTV_AQ_PREROLL; }  /* deep prime: also raise the pre-h0 audio ring (default stays 256 = byte-identical) */
     if (getenv("PTV_KEEP_CORRUPT")) g_discardcorrupt = 0;   /* keep AV_PKT_FLAG_CORRUPT video packets (don't +discardcorrupt) */
     if (getenv("PTV_NO_DELIVERY")) g_delivery = 0;          /* §7.5a: disable the A/V delivery-alignment gate (audio sent direct = v0.6.23) */
-    if (getenv("PTV_DELIVERY_MV")) g_delivery_mv = 1;       /* §7.5a: also gate multiview (default OFF in P1) */
+    if (getenv("PTV_DELIVERY_MV")) g_delivery_mv = 1;       /* pre-0.9.12.1 opt-in — now the default; kept as a harmless no-op for existing configs */
+    if (getenv("PTV_NO_DELIVERY_MV")) g_delivery_mv = 0;    /* v0.9.12.1: revert multiview to ungated wire staging (sync_check-visible audio lead) */
     { const char *dc = getenv("PTV_DELIVERY_CAP_MS"); if (dc && atoi(dc) > 0) g_delivery_cap_us = (int64_t)atoi(dc) * 1000; }  /* force-release ceiling (A0 ≈1.5–2s) */
     { const char *dq = getenv("PTV_DELIVERY_MAXQ");   if (dq && atoi(dq) > 0) g_delivery_maxq = atoi(dq); }                    /* hold-FIFO size backstop */
     if (getenv("PTV_AVSYNC_PROBE")) g_avsync_probe = 1;    /* Phase A: read-only [PTV-AVSYNC2] real A/V offset */
