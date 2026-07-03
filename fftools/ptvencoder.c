@@ -39,7 +39,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "0.9.14.1"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "0.9.14.2"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 #define PTV_WD_DEADLINE_US (2 * (int64_t)AV_TIME_BASE)   /* watchdog stall threshold */
@@ -5088,6 +5088,13 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
          * demux dropping on a full audio_q during bursts. Size audio_q to the cushion (~50 audio
          * frames/s + margin), bounded; default 350ms -> PTV_QDEPTH unchanged. */
         int aqd = PTV_QDEPTH;
+        /* v0.9.14.2 AUTO-BANK: clumped delivery slams a whole burst of audio into this queue at
+         * once (Unique_TV live: 7s clump = ~330 pkts into the old 48-deep queue -> adrop ~25/s =
+         * HALF the audio dropped at the demux door = the clicks, with a perfect video bank and an
+         * idle gate). Size it for the bank ceiling with the SAME formula the manual deep preroll
+         * uses — the last of its three sizing side-cars (video_q, gate FIFO, audio_q) applied
+         * automatically. Live only; a pointer array, so capacity is free. */
+        if (live) { int need = (int)(g_cushion_max_ms * 50 / 1000) + 48; if (need > 2048) need = 2048; if (aqd < need) aqd = need; }
         if (g_preroll_ms > 1600) { int need = (int)((int64_t)g_preroll_ms * 50 / 1000) + 48; if (need > 2048) need = 2048; if (aqd < need) aqd = need; }
         if ((ret = av_thread_message_queue_alloc(&audio_q[k], aqd, sizeof(AVPacket *))) < 0) goto end;
         av_thread_message_queue_set_free_func(audio_q[k], free_pkt_msg);
