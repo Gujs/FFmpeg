@@ -69,7 +69,16 @@ const int  program_birth_year = 2026;
  * on the BtbN box build, reflects fresh-upstream + `git apply` and so does NOT
  * encode which patch revision is applied). Bump by hand on each meaningful fix/
  * feature so a deployed binary self-identifies via the banner / -version. */
-#define PTVENCODER_VERSION "0.9.10.1" /* 0.9.10.1 (film-cadence hotfix, 2026-07-02 late): (1) REPRIME state machine —
+#define PTVENCODER_VERSION "0.9.11" /* 0.9.11 (telecine-aware emit, 2026-07-03): honor repeat_pict — during
+                                    23.976-film-in-29.97 (2:3 soft pulldown; AWE movies) a flagged frame OCCUPIES
+                                    its content-projected extra ticks via a 1-frame lookahead sharing the stamping
+                                    arithmetic (content_index()); repeat_pict only ARMS the mode (>=3 progressive-
+                                    rff of last 8). Film segments: consumption==supply -> no starvation dups
+                                    (irregular stutter GONE), hs pinned 0 (aresample hard-comp clicks GONE),
+                                    proper 2:3 wire cadence, servo/cushion quiet. New pd= counter (cadence holds)
+                                    split from dup= (health). PTV_NO_PULLDOWN reverts. Design:
+                                    analysis/ptvencoder-0911-repeat-pict-design.md. */
+                                    /* 0.9.10.1 (film-cadence hotfix, 2026-07-02 late): (1) REPRIME state machine —
                                     an engagement is hard-capped at 10s with an UNCONDITIONAL 300s cooldown (the
                                     0.9.10 "continuing" clause let occupancy oscillating around the trigger re-arm
                                     forever: AWE 23.976-film segments [2:3 pulldown, ~24 AU/s — CONFIRMED by live
@@ -495,6 +504,17 @@ static int     g_exacttick = 1;      /* v0.9.9 EXACTTICK (PTV_NO_EXACTTICK rever
 static int64_t g_tick_adj_us = 0;    /* PTV_TICK_ADJ_US (diag): deliberately skew tick_dur_us by +/-N us to
                                       * ACCELERATE the quantization drift for falsification (e.g. +10us at 29.97
                                       * = +300ppm = ~65ms/min audio-behind with EXACTTICK off; flat with it on). */
+static int     g_pulldown = 1;       /* v0.9.11 telecine-aware emit (PTV_NO_PULLDOWN reverts): during 23.976-film-
+                                      * in-29.97 segments (2:3 soft pulldown, repeat_pict flags — AWE movies) a
+                                      * flagged frame legitimately OCCUPIES extra emission ticks. repeat_pict only
+                                      * ARMS the mode (>=3 progressive-rff frames of the last 8); the hold decision
+                                      * is CONTENT-PROJECTED via a 1-frame lookahead using the SAME content-index
+                                      * arithmetic as the stamps — a blind rff half-tick accumulator was REJECTED
+                                      * (uniform-stamped telecine would ratchet hs +0.5s/min; see
+                                      * analysis/ptvencoder-0911-repeat-pict-design.md). Result during film:
+                                      * consumption matches supply -> no starvation dups (irregular stutter), no
+                                      * hs sawtooth -> no aresample hard-comps (the audio clicks), proper 2:3
+                                      * cadence on the wire. Inert unless armed; non-film pop path is verbatim. */
 static int     g_frameq_cap = 160;  /* decode->output jitter-buffer CAPACITY (frames; slots are pointers — memory
                                      * is used only by FILLED depth). v0.9.10 default 160 = headroom for the 4s
                                      * adaptive tier (~120f @30fps) + catch-up bursts, while bounding the worst-case
@@ -1091,7 +1111,7 @@ typedef struct VideoCtx {
     int64_t         *dbg_dec_frames, *dbg_vcorrupt;
     int64_t         *dbg_vdrop, *dbg_pcorrupt;       /* single-input stats: demux video_q drops + corrupt-pkt count */
     /* counters */
-    int64_t          framedrop, emitted, dup;
+    int64_t          framedrop, emitted, dup, pd;   /* pd = intentional cadence holds (telecine residence), split from dup (health alarm) */
     /* watchdog */
     int64_t          last_emit_us;
     volatile int     output_done;
@@ -1454,6 +1474,21 @@ done:
     return NULL;
 }
 
+/* Content index of a source pts on the house grid — THE single copy of the stamping arithmetic
+ * (EXACTTICK exact-rational, integer-tick fallback). The v0.9.11 pulldown lookahead uses the SAME
+ * function for its hold decision so lookahead and stamp can never disagree (a diverging second
+ * copy would reintroduce the monotonic-guard ratchet). Returns -1 when not computable. */
+static int64_t content_index(VideoCtx *v, int64_t src_pts)
+{
+    int64_t house_us;
+    if (src_pts == AV_NOPTS_VALUE || *v->h0 == AV_NOPTS_VALUE) return -1;
+    house_us = av_rescale_q(src_pts, v->out_tb, AV_TIME_BASE_Q) - *v->h0;
+    if (house_us < 0) house_us = 0;
+    if (g_exacttick && v->out_fps.num > 0)
+        return av_rescale_rnd(house_us, v->out_fps.num, 1000000LL * v->out_fps.den, AV_ROUND_NEAR_INF);
+    return (house_us + v->tick_dur_us / 2) / v->tick_dur_us;
+}
+
 static void *output_thread(void *arg)
 {
     VideoCtx *v = arg;
@@ -1531,17 +1566,56 @@ static void *output_thread(void *arg)
         int64_t ep_last_us = 0, ep_prev_us = 0;                       /* starvation-episode wall times (grow gate) */
         if (raised_sp > g_frameq_cap - 8) raised_sp = g_frameq_cap - 8;
         if (raised_sp < base_sp) raised_sp = base_sp;                 /* explicit deep preroll >= cushion -> adaptive no-op */
+        /* v0.9.11 pulldown state: 1-frame lookahead + film-mode detector (see g_pulldown comment) */
+        AVFrame *nextf = NULL;
+        int next_have = 0, film_arm = 0, held_extra = 0;
+        unsigned rff_bits = 0;
 
     for (;;) {
-        int fresh = 0;
-        ret = av_thread_message_queue_recv(v->frame_q, &f, AV_THREAD_MESSAGE_NONBLOCK);
-        if (ret >= 0) {
-            av_frame_unref(held); av_frame_move_ref(held, f); av_frame_free(&f);
-            have = 1; fresh = 1; held_src_pts = held->pts;   /* capture before emit overwrites it */
-        } else if (ret == AVERROR_EOF) {
-            break;                                  /* decode finished, queue drained */
+        int fresh = 0, cadence_hold = 0;
+        if (g_pulldown && film_arm && have) {       /* film cadence: pop via content-projected lookahead */
+            if (!next_have) {
+                ret = av_thread_message_queue_recv(v->frame_q, &f, AV_THREAD_MESSAGE_NONBLOCK);
+                if (ret >= 0) { nextf = f; next_have = 1; }
+                else if (ret == AVERROR_EOF) break; /* pending nextf was already promoted (recv only when empty) */
+            }
+            if (next_have) {
+                int64_t nc = content_index(v, nextf->pts);
+                if (nc < 0 || nc <= last_vpts + 1 || held_extra >= 1) {   /* due, unstampable, or residence CAP hit */
+                    av_frame_unref(held); av_frame_move_ref(held, nextf); av_frame_free(&nextf);
+                    next_have = 0; fresh = 1; held_src_pts = held->pts; held_extra = 0;
+                } else
+                    cadence_hold = 1;               /* held frame legitimately occupies this tick (3-field residence) */
+            }
+            /* queue empty + no lookahead: fall through = dup-on-empty exactly as today */
+        } else {
+            ret = av_thread_message_queue_recv(v->frame_q, &f, AV_THREAD_MESSAGE_NONBLOCK);
+            if (ret >= 0) {
+                av_frame_unref(held); av_frame_move_ref(held, f); av_frame_free(&f);
+                have = 1; fresh = 1; held_src_pts = held->pts;   /* capture before emit overwrites it */
+                held_extra = 0;
+            } else if (ret == AVERROR_EOF) {
+                break;                              /* decode finished, queue drained */
+            }
         }
         if (!have) { av_usleep(2000); continue; }   /* await first frame (no startup dups) */
+
+        if (fresh && g_pulldown) {                  /* film-mode detector: progressive frames with rff==1 only
+                                                     * (==1 excludes doubling/tripling 2/4 — the bogus pic_struct=7
+                                                     * class; interlaced-flagged rff never arms) */
+            rff_bits = (rff_bits << 1) |
+                       (held->repeat_pict == 1 && !(held->flags & AV_FRAME_FLAG_INTERLACED));
+            int rn = av_popcount(rff_bits & 0xffu);
+            if (!film_arm && rn >= 3) {
+                film_arm = 1;
+                if (v->is_master)
+                    av_log(NULL, AV_LOG_INFO, "[PTV-PULLDOWN] armed (telecine cadence detected: %d/8 rff frames)\n", rn);
+            } else if (film_arm && rn == 0) {
+                film_arm = 0;
+                if (v->is_master)
+                    av_log(NULL, AV_LOG_INFO, "[PTV-PULLDOWN] disarmed (cadence ended; %"PRId64" holds)\n", v->pd);
+            }
+        }
 
         if (!primed) {                              /* one-time jitter-buffer pre-roll */
             int64_t pt0 = av_gettime_relative();
@@ -1705,33 +1779,28 @@ static void *output_thread(void *arg)
          * drifts by the number of startup/stall-dropped frames -> A/V skew.)
          * Pacing still rides the wall clock via `tick`; PTS rides content. */
         {
-            int64_t vpts, content_vpts = -1;
+            int64_t vpts;
             int64_t src_ts = held_src_pts;   /* ORIGINAL source pts (out_tb); survives dups */
-            if (src_ts != AV_NOPTS_VALUE && *v->h0 != AV_NOPTS_VALUE) {
-                int64_t house_us = av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q) - *v->h0;
-                if (house_us < 0) house_us = 0;
-                if (g_exacttick && v->out_fps.num > 0)
-                    /* EXACTTICK (v0.9.9): round-nearest content index at the EXACT rational rate.
-                     * Dividing by the integer-us tick (33367 vs 33366.667 at 30000/1001) compressed
-                     * the mapping ~10ppm -> chronic audio-behind drift; exact rational = zero slope. */
-                    content_vpts = av_rescale_rnd(house_us, v->out_fps.num,
-                                                  1000000LL * v->out_fps.den, AV_ROUND_NEAR_INF);
-                else
-                    content_vpts = (house_us + v->tick_dur_us / 2) / v->tick_dur_us;
-                vpts = content_vpts;
-            } else {
-                vpts = last_vpts + 1;
-            }
-            if (vpts <= last_vpts) vpts = last_vpts + 1;   /* monotonic CFR; dup -> next slot */
+            /* EXACTTICK (v0.9.9) content index, via the shared helper (v0.9.11): exact-rational
+             * round-nearest — the integer-us divisor (33367 vs 33366.667 at 30000/1001) compressed
+             * the mapping ~10ppm -> the chronic audio-behind drift. */
+            int64_t content_vpts = content_index(v, src_ts);
+            vpts = (content_vpts >= 0) ? content_vpts : last_vpts + 1;
+            if (vpts <= last_vpts) vpts = last_vpts + 1;   /* monotonic CFR; dup/hold -> next slot */
             held->pts = vpts; held->pkt_dts = AV_NOPTS_VALUE; held->duration = 0;
             last_vpts = vpts;
             /* Publish how far the house clock now runs AHEAD of source content
              * (vpts - content_vpts, in ticks). Each dup bumps vpts past content via
              * the monotonic guard, so this grows by one tick per dup and persists.
              * The audio path adds it so audio rides the same house clock instead of
-             * staying source-locked (which is what drifts ~40ms per dup). */
+             * staying source-locked (which is what drifts ~40ms per dup).
+             * v0.9.11: a cadence HOLD is content-legitimate residence, NOT skew — subtract
+             * held_extra so hs stays 0 through film (the 0<->33ms sawtooth that caused
+             * aresample hard-comps = the audible clicks is gone at the SENSOR, not masked).
+             * A genuine starvation dup after a hold still measures +1 tick. */
+            if (cadence_hold) held_extra++;
             if (v->is_master && v->house_skew && content_vpts >= 0)
-                *v->house_skew = (vpts - content_vpts) * v->tick_dur_us;
+                *v->house_skew = (vpts - content_vpts - held_extra) * v->tick_dur_us;
             if (v->is_master && (g_phi1 || g_phiav))  /* Φ1: publish video OUTPUT time (us, h0-anchored) for the non-blind sensor */
                 atomic_store_explicit(&g_phi1_vout_us, (int64_t)vpts * v->tick_dur_us, memory_order_relaxed);
             if (src_ts != AV_NOPTS_VALUE)   /* [PTV-CHAIN] video source-content being emitted (us); any rung (same content) */
@@ -1745,7 +1814,7 @@ static void *output_thread(void *arg)
         ret = encode_push(v->mux_q, v->venc, v->ost, held, v->gate);   /* §7.5a: publish video front + release caught-up audio/copy */
         v->last_emit_us = av_gettime_relative();
         tick++; v->emitted++;
-        if (!fresh) v->dup++;
+        if (!fresh) { if (cadence_hold) v->pd++; else v->dup++; }   /* pd = intentional cadence residence; dup stays the health alarm */
         if (g_slow) av_usleep(g_slow);
         if (ret < 0) break;
 
@@ -1754,9 +1823,9 @@ static void *output_thread(void *arg)
             if (nowd - diag_last >= 1000000) {
                 av_log(NULL, AV_LOG_INFO,
                     "[PTV-DIAG] t=%.1fs dec=%"PRId64" vcorrupt=%"PRId64" emitted=%"PRId64
-                    " muxed=%"PRId64" dup=%"PRId64" framedrop=%"PRId64" vq=%d frameq=%d muxq=%d genlock=%d rate=%+.0fppm wucr_rho=%+.0fppm\n",
+                    " muxed=%"PRId64" dup=%"PRId64" pd=%"PRId64" framedrop=%"PRId64" vq=%d frameq=%d muxq=%d genlock=%d rate=%+.0fppm wucr_rho=%+.0fppm\n",
                     (nowd - diag_t0) / 1000000.0, *v->dbg_dec_frames, *v->dbg_vcorrupt, v->emitted,
-                    g_muxed, v->dup, v->framedrop,
+                    g_muxed, v->dup, v->pd, v->framedrop,
                     av_thread_message_queue_nb_elems(v->dbg_video_q),
                     av_thread_message_queue_nb_elems(v->frame_q),
                     av_thread_message_queue_nb_elems(v->mux_q),
@@ -1800,15 +1869,16 @@ static void *output_thread(void *arg)
                 }
                 av_log(NULL, AV_LOG_INFO,
                     "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f "
-                    "dup=%"PRId64" drop=%"PRId64" corrupt=%"PRId64" "
+                    "dup=%"PRId64" pd=%"PRId64" drop=%"PRId64" corrupt=%"PRId64" "
                     "async=%+"PRId64"ppm%s%s\n",
                     v->emitted, fps, hh, mm, ss,
-                    v->dup, v->framedrop, cr, aw, dlv, wu);
+                    v->dup, v->pd, v->framedrop, cr, aw, dlv, wu);
                 stat_last = nows; stat_prev = v->emitted;
             }
         }
     }
     encode_push(v->mux_q, v->venc, v->ost, NULL, v->gate);
+    av_frame_free(&nextf);   /* v0.9.11: pending pulldown lookahead (normally promoted before EOF) */
     }
 done:
     av_frame_free(&held);
@@ -5495,7 +5565,8 @@ static void ptv_print_log_legend(int full)
         "defaults (v0.9.10): WUCR occupancy pacing + LAYERA glue handling + REPRIME fast refill +\n"
         "  ADAPTIVE cushion are all ON — no env needed for the production posture. Reverts:\n"
         "  PTV_NO_WUCR · PTV_NO_LAYERA · PTV_NO_REPRIME · PTV_NO_ADAPTIVE · PTV_NO_AVLOCK ·\n"
-        "  PTV_NO_EXACTTICK (re-enables the integer-tick ~10ppm NTSC lip-sync drift; A/B only)\n");
+        "  PTV_NO_EXACTTICK (re-enables the integer-tick ~10ppm NTSC lip-sync drift; A/B only) ·\n"
+        "  PTV_NO_PULLDOWN (revert telecine-aware emit: film segments back to dup-fill + hs sawtooth)\n");
     av_log(NULL, AV_LOG_INFO,
         "tuning: PTV_CUSHION_MS=N adaptive raised tier (default 4000, [1000,10000]) · PTV_FRAMEQ=N\n"
         "  frame_q capacity (default 160, [48,1024]) · PTV_PREROLL_MS=N startup cushion / base tier ·\n"
@@ -5588,6 +5659,7 @@ int main(int argc, char **argv)
     { const char *vq = getenv("PTV_VIDEOQ"); if (vq && atoi(vq) > 0) g_videoq = atoi(vq); }   /* video_q depth (startup-burst absorb) */
     { const char *fq = getenv("PTV_FRAMEQ"); if (fq && atoi(fq) > 0) { int v = atoi(fq); if (v < PTV_FRAME_QDEPTH) v = PTV_FRAME_QDEPTH; if (v > 1024) v = 1024; g_frameq_cap = v; } }   /* frame_q (decode->output) capacity; raise + deep PTV_PREROLL_MS to absorb an ad-break decode-rate dip (AWE) */
     if (getenv("PTV_NO_EXACTTICK")) g_exacttick = 0;   /* revert to integer-us tick content index (the ~10ppm NTSC drift) */
+    if (getenv("PTV_NO_PULLDOWN"))  g_pulldown = 0;    /* v0.9.11: revert telecine-aware emit (film segments back to dup-fill) */
     { const char *ta = getenv("PTV_TICK_ADJ_US"); if (ta) { int64_t v = atoll(ta); if (v < -1000) v = -1000; if (v > 1000) v = 1000; g_tick_adj_us = v; } }   /* diag: accelerate the tick-quantization drift for falsification */
     if (g_genlock && !g_preroll_set) g_preroll_ms = 1000;  /* v0.9.1: default the single-input prime to ~1s (frame_q cushion) — smooths decode-rate dips while video+gate-hold stays under the 3s gate cap (cap scaling stays dormant). Deep video_q prime + cap-scale remain available for explicit high PTV_PREROLL_MS (bursty Fintech-class). PTV_PREROLL_MS overrides, PTV_NO_GENLOCK reverts to 350. */
     if (g_preroll_ms > 1600) g_delivery_cap_us += (int64_t)g_preroll_ms * 1000;  /* v0.9.0: the deep input prime delays VIDEO ~g_preroll_ms; the §7.5a gate holds audio+copy to match (it IS the audio-side of the whole-stream delay), so size its cap to the prime — else it force-releases and audio leaks ahead (TruBLU dlvforced). Explicit PTV_DELIVERY_CAP_MS (below) overrides. */
