@@ -5,6 +5,27 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 0.9.15.2 (2026-07-03)
+
+- **CADENCE DECIMATION: surplus real-frame sources** (`PTV_NO_DECIMATE` reverts; `decim=`
+  counter in stats). The 0.9.15.1 `cf=` readout on live NewsNation showed **-823ppm locked** —
+  the transport clock is TRUE, so clock-follow (correctly) stayed dark and the real fault
+  surfaced: wall-timed measurement (509 frames / 20.0s wall, DTS span 19.92s) proves the source
+  delivers a wandering **~25.3-25.5 REAL frames per second, consistently stamped, while
+  declaring 25/1**. (The original "+1.2% fast clock" wire read was stamp SPACING over a packet
+  count — it cannot distinguish clock offset from surplus cadence; `cf=` can, and did.) Surplus
+  cadence can't be rate-followed (output would wander with it) — the frames must be decimated
+  by CONTENT: in the normal emit pop path, a popped frame whose `content_index` does not
+  advance past the last emitted tick is surplus — pop through to a fresher one (<=3 pops/tick,
+  bounded). The output samples the source's own timeline at exactly house rate, so lip-sync is
+  exact by construction; frame_q stays level (consumption self-adapts to the true delivered
+  cadence), hs stays flat, aresample goes quiet. The single-input mirror of the 0.9.13 mosaic
+  per-slot multi-pop. Can never fire on <=house-rate sources (their content indices always
+  advance). Validated on a +1.8% surplus fixture (setts ts x1000/1018 sent plain `-re`; SPS
+  still declares 25 — needs the new cmd-single.sh `FPS=25` override because avg_frame_rate
+  probes 305/12): house 25/1, `decim=` accruing evenly ~27/min (= the surplus, exactly),
+  dup=0, hs=+0ms flat, cf stayed <+2100ppm (clock-follow dark, as it must be).
+
 ## 0.9.15.1 (2026-07-03)
 
 - **CLOCK-FOLLOW convergence + observability fixes** (first NewsNation deploy didn't arm in
