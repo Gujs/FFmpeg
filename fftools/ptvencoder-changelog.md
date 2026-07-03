@@ -6,6 +6,47 @@ keep only the current `PTVENCODER_VERSION` define in the source. This file is pa
 the v2 `0001` patch (additive, travels with the source to the build box).
 
 
+## 0.9.13 (2026-07-03)
+
+- **Per-slot CADENCE RESIDENCE in the compositor** (`PTV_NO_RESIDENCE` reverts). A slot is now
+  consumed at its SOURCE rate: the next frame pops only when the previous frame's
+  content-projected residence has elapsed on the house axis (EMA-smoothed content deltas —
+  never raw per-frame deltas, which are jittery on real interlaced feeds and caused the old
+  content clamp's stutter regression; the clamp stays opt-in and unchanged). Effects:
+  - A rate-mismatched slot (25fps in a 29.97 mosaic — GB News class) holds a regular 5:6
+    cadence instead of draining its buffer at house rate and living at the empty boundary,
+    so clumped SRT/HLS arrival is absorbed by the buffer instead of showing as
+    freeze-then-1.2x-fast batching. On display the due time re-bases with
+    max(due, now − half-tick): a starvation deficit becomes constant slot latency (like a
+    matched-rate slot's jitter buffer), NEVER fast-motion catch-up.
+  - A high-rate slot (59.94 in a 29.97 house) pops multiple due frames per tick (≤4) and
+    displays the newest — clean 2:1 decimation instead of hold-queue overflow.
+  - Matched-rate slots are untouched by construction (due advances exactly one tick per frame).
+  - Occupancy servo: residence trimmed proportionally (max ±2%) toward the primed jitter depth,
+    so long-term consumption equals arrival even if the cadence estimate is biased (the
+    single-input WUCR lesson: proportional, small, capped). Target clamps below the valve.
+  - Pressure valve: a ≥75%-full hold queue bypasses the gate (self-corrects a wrong estimate);
+    a valve-forced pop RE-BASES the schedule instead of advancing it (accumulating ratcheted
+    the schedule +1.0-1.6s inside the first second of a backlogged start).
+  - Startup backlog trim (live only): after preroll each slot's hold queue is trimmed to the
+    primed depth — a join can dump seconds of banked frames at once (deep UDP socket buffer
+    read in one burst), and a jitter buffer must ACQUIRE at its target depth; the excess is
+    stale latency (measured: occ pinned at the valve from tick 0 without this).
+  - Residence holds park the frame in `pending`, so the existing "deliberate pacing must not
+    ratchet audio skew" rule applies unchanged.
+  - Validated (local 2x2, VT mirror; slot0=25fps CFR, slot2=29.97 CFR, YDIF repeat analysis
+    on decoded quadrants vs PTV_NO_RESIDENCE controls): repeat-gap regularity 4-6x better
+    (gap_sd 2.8-3.8 vs 14.6 in every control), matched slot pd=0 and repeats at content
+    baseline, per-slot sk bounded (+0 smooth; burst deficit converts to CONSTANT latency,
+    +2.3s stable, vs unbounded ratchet pre-servo), pd=4.4/s on 25-in-29.97 slots = the exact
+    5:6 conversion rate; with a 4.5s prime the bursty slot runs sv=0 after acquisition.
+- **Multiview stats-line parity**: the mosaic line now matches single-input
+  (`frame= fps= time= dup= drop=` + `dlvhold=/dlvforced=` gate readout; size/bitrate/speed/
+  genlock dropped per the v0.9.10 rationale) plus per-slot
+  `inK:qdrop/corrupt/pd/sv/sk` — `pd` = cadence holds (NORMAL for a rate-mismatched slot),
+  `sv` = genuine starvation dups, `sk` = the published per-slot audio skew (ms).
+  `-log-legend` documents the mv line.
+
 ## 0.9.12.1 (2026-07-03)
 
 - **Delivery gate default-ON for multiview** (`PTV_NO_DELIVERY_MV` reverts; `PTV_DELIVERY_MV`, the

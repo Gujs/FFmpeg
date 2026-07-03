@@ -39,7 +39,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "0.9.12.1"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "0.9.13"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 #define PTV_WD_DEADLINE_US (2 * (int64_t)AV_TIME_BASE)   /* watchdog stall threshold */
@@ -94,6 +94,19 @@ static int     g_reanchor = 1;
  * opt-in experiment: PTV_MV_CLAMP=1 enables it. The real cause (a source PTS discontinuity, not
  * a content gap) is fixed at the source by g_discont, which keeps video smooth. */
 static int     g_mv_clamp = 0;
+/* v0.9.13 per-slot CADENCE RESIDENCE (multiview): pop a slot's next frame only when its
+ * content-projected residence has elapsed on the house axis, so the slot is CONSUMED at the
+ * source rate (a 25fps slot in a 29.97 mosaic pops 5-per-6 ticks) instead of one-pop-per-tick.
+ * Without it a rate-mismatched slot lives at the buffer boundary: clumped (SRT/HLS) arrival
+ * turns into freeze-then-1.2x-fast batching (drain at house rate, starve, catch up at house
+ * rate). The gate keys on an EMA of content deltas — NEVER raw per-frame deltas, which are
+ * jittery on real interlaced feeds and caused the old content clamp's stutter regression.
+ * On display the due time re-bases with FFMAX(due, now-half_tick): a starvation deficit
+ * becomes constant slot latency (like a matched-rate slot's jitter buffer), never fast-motion
+ * catch-up. High-rate slots (59.94-in-29.97) pop multiple due frames per tick and display the
+ * newest (clean 2:1 decimation instead of hold-queue overflow). A ≥75%-full hold queue
+ * bypasses the gate (pressure valve vs a wrong rate estimate). PTV_NO_RESIDENCE reverts. */
+static int     g_mv_residence = 1;
 /* Per-input source PTS-discontinuity absorber (THE multiview audio-late fix). Real live feeds
  * (the 1080i50 Grid SRT inputs) throw a forward PTS jump of a few hundred ms at the join while
  * FRAMES stay continuous (one per tick, buffer full) — a timestamp glitch, not lost frames. Left
@@ -566,6 +579,7 @@ void show_help_default(const char *opt, const char *arg)
         "    PTV_NO_PULLDOWN     telecine-aware film emit          PTV_NO_AVLOCK   audio house-lock\n"
         "    PTV_NO_GENLOCK      source-rate estimator             PTV_NO_GAPDISCRIM audio gap-vs-splice\n"
         "    PTV_NO_DELIVERY     audio delivery-alignment gate     PTV_NO_DELIVERY_MV ungated mosaics (pre-0.9.12.1)\n"
+        "    PTV_NO_RESIDENCE    mosaic per-slot source-rate cadence (pre-0.9.13 pop-per-tick)\n"
         "   logging: PTV_DIAG=1 debug lines · PTV_LOG_TS=1 timestamp prefix · see -log-legend for probes\n");
 }
 
@@ -3953,6 +3967,7 @@ typedef struct CompositorCtx {
     /* stats (compositor is the cadence owner in multiview) */
     int64_t               emitted, dup;
     int64_t              *dbg_dec_sum;        /* optional: sum of per-input dec_frames */
+    struct DlvGate       *gate0;              /* rung-0 delivery gate for the stats readout (NULL = ungated) */
 } CompositorCtx;
 
 /* fill a planar-YUV / RGB frame with black (held cell for a not-yet-arrived or
@@ -4018,6 +4033,13 @@ static void *compositor_thread(void *arg)
     int64_t lag_true_us[PTV_MAX_INPUT] = {0}; /* PTV_DIAG: TRUE uncapped signed video lag (output−content); when
                                                * this >> skew_us the 250ms cap is saturating = audio can't follow */
     int      slated[PTV_MAX_INPUT] = {0};     /* slot is/was black-slated (outage) since last fresh frame */
+    int64_t res_due_us[PTV_MAX_INPUT] = {0};  /* v0.9.13 residence: house-time the next pop is allowed (0 = immediate) */
+    int64_t res_ema_us[PTV_MAX_INPUT];        /* v0.9.13: EMA of content deltas = the slot's smoothed cadence */
+    int64_t res_src_us[PTV_MAX_INPUT];        /* v0.9.13: content time (us) of the last popped frame */
+    int64_t pd_cnt[PTV_MAX_INPUT] = {0};      /* v0.9.13: residence holds (correct cadence, not starvation) */
+    int64_t sv_cnt[PTV_MAX_INPUT] = {0};      /* v0.9.13: genuine starvation dups (due but buffer empty) */
+    int64_t md_cnt[PTV_MAX_INPUT] = {0};      /* v0.9.13: decimation drops (multiple frames due in one tick) */
+    int     res_occ_tgt = 4;                  /* v0.9.13: occupancy-servo target (set from the primed depth) */
     /* AUDIO-FOLLOW (Option A) latch: average the per-slot lag over a startup window (past the
      * lossy join) and latch a STABLE signed offset, published to house_skew for the audio's
      * one-time deterministic correction. Re-latched on outage return. */
@@ -4037,7 +4059,20 @@ static void *compositor_thread(void *arg)
     if (!filt) goto done;
     if (n_prime > g_frameq_cap - 8) n_prime = g_frameq_cap - 8;
     if (n_prime < 0) n_prime = 0;
+    res_occ_tgt = n_prime > 4 ? n_prime : 4;   /* v0.9.13 servo target = the primed jitter depth,
+                                                * clamped below the pressure valve (a deep PTV_PREROLL_MS
+                                                * would otherwise put the target INSIDE the bypass zone
+                                                * and the two would fight) */
+    if (res_occ_tgt > g_frameq_cap - g_frameq_cap / 4 - 8)
+        res_occ_tgt = g_frameq_cap - g_frameq_cap / 4 - 8;
     for (k = 0; k < n; k++) blackf[k] = make_black_frame(c->inputs[k].vdec);
+    for (k = 0; k < n; k++) {                 /* v0.9.13: seed cadence at the house rate; EMA adapts in ~16 frames.
+                                               * Known limit: a source FASTER than ~2x house sits outside the
+                                               * acceptance band and keeps the house-rate estimate — the pressure
+                                               * valve then bounds it to today's overflow-decimation behavior. */
+        res_ema_us[k] = mv_tick_us(c, 1);
+        res_src_us[k] = AV_NOPTS_VALUE;
+    }
 
     /* preroll: prime every input's jitter buffer to ~PTV_PREROLL_MS so bursty
      * decode delivery has a cushion (no startup dup storm) and the mosaic starts
@@ -4055,6 +4090,24 @@ static void *compositor_thread(void *arg)
             if (ready == n || eofall) break;
             if (av_gettime_relative() - t0 > 3000000) break;   /* 3s: start with what's there */
             av_usleep(5000);
+        }
+        /* v0.9.13: trim any startup BACKLOG down to the primed depth (live+residence only). A join
+         * can dump seconds of banked frames at once (deep UDP socket buffer read in one burst,
+         * inputs that filled while the preroll waited on a slower sibling) — a jitter buffer must
+         * ACQUIRE at its target depth; the excess is stale latency that pinned the queue at the
+         * pressure valve and ratcheted the residence schedule (measured: occ=119 at tick 0). The
+         * legacy path (PTV_NO_RESIDENCE) keeps the old catch-up-by-consumption behavior. */
+        if (c->live && g_mv_residence) {
+            for (k = 0; k < n; k++) {
+                AVFrame *tf; int trimmed = 0;
+                while (av_thread_message_queue_nb_elems(c->inputs[k].hold.q) > res_occ_tgt &&
+                       av_thread_message_queue_recv(c->inputs[k].hold.q, &tf, AV_THREAD_MESSAGE_NONBLOCK) >= 0) {
+                    av_frame_free(&tf); trimmed++;
+                }
+                if (trimmed)
+                    av_log(NULL, AV_LOG_INFO, "[PTV-RES] in%d startup backlog trimmed %d frames (keep %d)\n",
+                           k, trimmed, res_occ_tgt);
+            }
         }
         wall0 = av_gettime_relative();
     }
@@ -4078,26 +4131,83 @@ static void *compositor_thread(void *arg)
                                                       * its last frame on underrun, black when stale */
             VideoHold *h = &c->inputs[k].hold;
             AVFrame *f = NULL, *st; int stale, fresh = 0;
-            /* Take a candidate: a frame held back last tick (pending) or a fresh pop. The
-             * CONTENT CLAMP then only DISPLAYS it once the house clock reaches its content-time;
-             * a frame whose content leaps ahead of the clock (a startup/source PTS gap from
-             * skipped/corrupt frames) is held — the cell's video freezes across the gap while
-             * audio continues, instead of the video racing ahead (the per-slot audio-late). */
-            AVFrame *cand = pending[k];
-            pending[k] = NULL;
-            if (!cand) {
-                int rr = av_thread_message_queue_recv(h->q, &f, AV_THREAD_MESSAGE_NONBLOCK);
-                if (rr >= 0)                cand = f;
-                else if (rr == AVERROR_EOF) done_in[k] = 1;
-            }
-            if (cand && g_mv_clamp && c->tick_dur_us > 0 && cand->pts != AV_NOPTS_VALUE) {
-                int64_t h0c; pthread_mutex_lock(&c->inputs[k].h0_lock); h0c = c->inputs[k].h0; pthread_mutex_unlock(&c->inputs[k].h0_lock);
-                if (h0c != AV_NOPTS_VALUE) {
-                    int64_t cand_age = av_rescale_q(cand->pts, c->inputs[k].ist_tb, AV_TIME_BASE_Q) - h0c;
-                    if (cand_age > mv_tick_us(c, tick + 1)) {  /* content leads the clock -> hold (exact tick+1 since v0.9.12) */
-                        pending[k] = cand; cand = NULL;
+            /* Take a candidate: a frame held back last tick (pending) or a fresh pop. Two hold
+             * gates may keep it back (frame stays in pending, skew/EMA freeze via pending[k]):
+             *  - CONTENT CLAMP (opt-in, g_mv_clamp): content-age leads the house clock.
+             *  - CADENCE RESIDENCE (v0.9.13, default): the previous frame's content-projected
+             *    residence hasn't elapsed — the slot is consumed at its SOURCE rate, so a
+             *    rate-mismatched slot holds a regular cadence (5:6 for 25-in-29.97) and a
+             *    burst of late frames NEVER fast-forwards (the due re-base turns a starvation
+             *    deficit into constant slot latency). Multiple due frames in one tick (a
+             *    59.94 slot in a 29.97 house) pop through and the newest displays. */
+            AVFrame *cand = NULL;
+            {
+                int   resid = g_mv_residence && c->tick_dur_us > 0;
+                int64_t hnow = mv_tick_us(c, tick);
+                int64_t half = c->tick_dur_us / 2;
+                int   qhot  = av_thread_message_queue_nb_elems(h->q) >= g_frameq_cap - g_frameq_cap / 4;
+                int   pops;
+                for (pops = 0; pops < 4; pops++) {
+                    AVFrame *nx = pending[k];
+                    pending[k] = NULL;
+                    if (!nx) {
+                        int rr = av_thread_message_queue_recv(h->q, &nx, AV_THREAD_MESSAGE_NONBLOCK);
+                        if (rr == AVERROR_EOF) { done_in[k] = 1; break; }
+                        if (rr < 0) break;                       /* jitter buffer empty */
                     }
+                    if (g_mv_clamp && c->tick_dur_us > 0 && nx->pts != AV_NOPTS_VALUE) {
+                        int64_t h0c; pthread_mutex_lock(&c->inputs[k].h0_lock); h0c = c->inputs[k].h0; pthread_mutex_unlock(&c->inputs[k].h0_lock);
+                        if (h0c != AV_NOPTS_VALUE &&
+                            av_rescale_q(nx->pts, c->inputs[k].ist_tb, AV_TIME_BASE_Q) - h0c > mv_tick_us(c, tick + 1)) {
+                            pending[k] = nx;                     /* content leads the clock -> hold (exact tick+1 since v0.9.12) */
+                            break;
+                        }
+                    }
+                    if (resid && !qhot && hnow + half < res_due_us[k]) {
+                        pending[k] = nx;                         /* residence hold: not due yet (deliberate pacing) */
+                        if (!cand) pd_cnt[k]++;
+                        break;
+                    }
+                    if (cand) { av_frame_free(&cand); md_cnt[k]++; }   /* superseded within one tick (decimation) */
+                    cand = nx;
+                    if (resid) {
+                        int64_t src = nx->pts != AV_NOPTS_VALUE ?
+                                      av_rescale_q(nx->pts, c->inputs[k].ist_tb, AV_TIME_BASE_Q) : AV_NOPTS_VALUE;
+                        if (src != AV_NOPTS_VALUE && res_src_us[k] != AV_NOPTS_VALUE) {
+                            /* Cadence estimate: EMA over deltas ACCEPTED only inside a band around the
+                             * current estimate ([ema/2, 2*ema]) — a delta spanning skipped frames
+                             * (drop-oldest, decode drops, corrupt skips) would inflate the estimate,
+                             * which over-holds, which overflows the buffer, which drops more frames:
+                             * a runaway (v1 of this gate ratcheted sk to +23s exactly this way). */
+                            int64_t d = src - res_src_us[k];
+                            if (d > res_ema_us[k] / 2 && d < res_ema_us[k] * 2)
+                                res_ema_us[k] += (d - res_ema_us[k]) / 16;
+                            /* hard bounds: 3x house tick covers 10fps..90fps sources in a 29.97 house */
+                            res_ema_us[k] = av_clip64(res_ema_us[k], c->tick_dur_us / 3, c->tick_dur_us * 3);
+                        }
+                        if (src != AV_NOPTS_VALUE) res_src_us[k] = src;
+                        if (qhot && hnow + half < res_due_us[k]) {
+                            /* valve-FORCED pop (gate wanted to hold): not a cadence event — re-base
+                             * instead of accumulating, else a hot queue ratchets the schedule ahead
+                             * (measured +1.0-1.6s duephase in the first second of a startup-backlog
+                             * run, which the servo then needed ~90s to bleed off). */
+                            res_due_us[k] = hnow - half + res_ema_us[k];
+                        } else {
+                            /* Occupancy servo (the single-input WUCR lesson: PROPORTIONAL, small,
+                             * capped): trim the residence toward the primed jitter-buffer depth so
+                             * long-term consumption always equals arrival even if the cadence
+                             * estimate is biased. +-2% authority: enough to null estimator bias,
+                             * far too weak to disturb the 5:6 cadence pattern. */
+                            int64_t corr = ((int64_t)av_thread_message_queue_nb_elems(h->q) - res_occ_tgt) * 1000;
+                            corr = av_clip64(corr, -20000, 20000);
+                            res_due_us[k] = FFMAX(res_due_us[k], hnow - half)
+                                            + res_ema_us[k] - res_ema_us[k] * corr / 1000000;
+                        }
+                    } else break;                                /* residence off: exactly one pop per tick (legacy) */
                 }
+                if (!cand && !pending[k] && resid && !done_in[k] && last[k] &&
+                    hnow + half >= res_due_us[k])
+                    sv_cnt[k]++;                                 /* due but nothing arrived = genuine starvation dup */
             }
             fresh = (cand != NULL);
             if (fresh) {
@@ -4263,11 +4373,18 @@ static void *compositor_thread(void *arg)
         if (g_diag) {
             int64_t nowd = av_gettime_relative();
             if (nowd - diag_last >= 1000000) {
+                char rb[448]; int rp = 0;    /* v0.9.13 residence internals: occ vs target, ema, due phase */
+                for (k = 0; k < n && rp < (int)sizeof rb - 64; k++)
+                    rp += snprintf(rb + rp, sizeof rb - rp, " in%d:occ=%d/ema=%.2fms/duephase=%+.1fms/pd=%"PRId64"/md=%"PRId64,
+                                   k, av_thread_message_queue_nb_elems(c->inputs[k].hold.q),
+                                   res_ema_us[k] / 1000.0, (res_due_us[k] - mv_tick_us(c, tick)) / 1000.0,
+                                   pd_cnt[k], md_cnt[k]);
+                av_log(NULL, AV_LOG_INFO, "[PTV-RES] t=%"PRId64" tgt=%d%s\n", tick, res_occ_tgt, rb);
                 char db[448]; int dp = 0;
                 for (k = 0; k < n && dp < (int)sizeof db - 56; k++)
-                    dp += snprintf(db + dp, sizeof db - dp, " in%d:dec=%"PRId64"/skew=%dms/lag=%dms/holddrop=%"PRId64,
+                    dp += snprintf(db + dp, sizeof db - dp, " in%d:dec=%"PRId64"/skew=%dms/lag=%dms/holddrop=%"PRId64"/md=%"PRId64,
                                    k, c->inputs[k].dc.dec_frames, (int)(skew_us[k] / 1000), (int)(lag_true_us[k] / 1000),
-                                   c->inputs[k].hold.framedrop);   /* drop-oldest count: startup overflow = video-lead cause */
+                                   c->inputs[k].hold.framedrop, md_cnt[k]);   /* drop-oldest count: startup overflow = video-lead cause; md = residence decimation */
                 av_log(NULL, AV_LOG_INFO,
                     "[PTV-DIAG] mv t=%.1fs emitted=%"PRId64" dup=%"PRId64" muxed=%"PRId64" frameq0=%d%s\n",
                     (nowd - diag_t0) / 1000000.0, c->emitted, c->dup, g_muxed,
@@ -4279,22 +4396,26 @@ static void *compositor_thread(void *arg)
             int64_t nows = av_gettime_relative();
             if (nows - stat_last >= g_stats_period_us) {
                 double dt    = (nows - stat_last) / 1000000.0;
-                double fps   = (c->emitted - stat_prev) / (dt > 0 ? dt : 1);
+                double fps   = (c->emitted - stat_prev) / (dt > 0 ? dt : 1);   /* instantaneous, like single-input */
                 double secs  = mv_tick_us(c, c->emitted) / 1000000.0;
-                double wall  = (nows - wall0) / 1000000.0;
-                double speed = wall > 0 ? secs / wall : 0;
-                double kbps  = secs > 0 ? g_muxed_bytes * 8.0 / secs / 1000.0 : 0;
                 int hh = (int)(secs / 3600), mm = ((int)secs % 3600) / 60;
                 double ss = secs - hh * 3600 - mm * 60;
-                char ls[320]; int lp = 0;   /* per-input frame loss: qdrop = video_q overflow, corrupt = demux+decode */
-                for (k = 0; k < n && lp < (int)sizeof ls - 48; k++)
-                    lp += snprintf(ls + lp, sizeof ls - lp, " in%d:qdrop=%"PRId64"/corrupt=%"PRId64,
-                                   k, c->inputs[k].da.vdrop, c->inputs[k].da.vcorrupt + c->inputs[k].dc.vcorrupt);
-                av_log(NULL, AV_LOG_INFO,        /* genlock=off — multiview compositor clock free-runs (ADR-002) */
-                    "frame=%6"PRId64" fps=%3.0f size=%8"PRId64"KiB time=%02d:%02d:%05.2f "
-                    "bitrate=%7.1fkbits/s dup=%"PRId64" drop=%"PRId64" speed=%4.2fx genlock=off%s\n",
-                    c->emitted, fps, g_muxed_bytes / 1024, hh, mm, ss, kbps,
-                    c->dup, c->framedrop[0], speed, ls);
+                char dlv[64] = "";                   /* §7.5a delivery gate readout (mv gated since v0.9.12.1) */
+                if (c->gate0)
+                    snprintf(dlv, sizeof dlv, " dlvhold=%"PRId64"ms dlvforced=%"PRId64,
+                             atomic_load_explicit(&c->gate0->st_hold_us, memory_order_relaxed) / 1000,
+                             atomic_load_explicit(&c->gate0->st_forced, memory_order_relaxed));
+                char ls[384]; int lp = 0;   /* per-slot: qdrop=input-q overflow, corrupt=demux+decode,
+                                             * pd=cadence holds (NORMAL for a rate-mismatched slot),
+                                             * sv=starvation dups, sk=published audio skew */
+                for (k = 0; k < n && lp < (int)sizeof ls - 72; k++)
+                    lp += snprintf(ls + lp, sizeof ls - lp,
+                                   " in%d:qdrop=%"PRId64"/corrupt=%"PRId64"/pd=%"PRId64"/sv=%"PRId64"/sk=%+dms",
+                                   k, c->inputs[k].da.vdrop, c->inputs[k].da.vcorrupt + c->inputs[k].dc.vcorrupt,
+                                   pd_cnt[k], sv_cnt[k], (int)(c->inputs[k].house_skew / 1000));
+                av_log(NULL, AV_LOG_INFO,   /* v0.9.13 parity: size/bitrate/speed/genlock dropped (v0.9.10 single-input rationale) */
+                    "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f dup=%"PRId64" drop=%"PRId64"%s%s\n",
+                    c->emitted, fps, hh, mm, ss, c->dup, c->framedrop[0], dlv, ls);
                 stat_last = nows; stat_prev = c->emitted;
             }
         }
@@ -4852,6 +4973,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         comp.inputs = inputs; comp.n_input = n_input; comp.fg = fg; comp.n_rung = n_rung;
         comp.tick_dur_us = av_rescale(1000000, out_fps.den, out_fps.num) + g_tick_adj_us;
         comp.out_fps = out_fps;                      /* v0.9.12 MV-EXACTTICK: exact measurement axis */
+        comp.gate0 = delivery_on ? &rung[0].gate : NULL;   /* v0.9.13: dlvhold=/dlvforced= in the mv stats line */
         comp.live = live;
         comp.slate_after_us = live ? 5 * (int64_t)AV_TIME_BASE : 0;   /* stale cell -> black after 5s */
         for (k = 0; k < n_input; k++) comp.fsrc[k] = fsrc[k];
@@ -5427,6 +5549,14 @@ static void ptv_print_log_legend(int full)
         "             each transition: grows on 2 starvations/60min, shrinks after 6h quiet)\n"
         "  lip-sync   NOT self-reported (internal PES skew is blind to content↔PTS offset). Measure\n"
         "             with the EXTERNAL oracle test-scripts/repro/drift-continuous.py.\n");
+    av_log(NULL, AV_LOG_INFO,
+        "multiview stats line — same head (frame/fps/time/dup/drop/dlvhold/dlvforced) + per slot:\n"
+        "  inK:qdrop    input-K video queue overflow drops (demux side)\n"
+        "  inK:corrupt  input-K corrupt packets (demux + decode)\n"
+        "  inK:pd       cadence-residence holds (v0.9.13) — a 25fps slot in a 29.97 mosaic holds\n"
+        "               every 6th tick BY DESIGN (~5/s is correct rate conversion, not a fault)\n"
+        "  inK:sv       genuine starvation dups (frame was DUE but the jitter buffer was empty)\n"
+        "  inK:sk       published per-slot audio skew (ms) the slot's audio follows\n");
     if (!full)
         return;
     av_log(NULL, AV_LOG_INFO,
@@ -5545,6 +5675,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_EXACTTICK")) g_exacttick = 0;   /* revert to integer-us tick content index (the ~10ppm NTSC drift) */
     if (getenv("PTV_NO_PULLDOWN"))  g_pulldown = 0;    /* v0.9.11: revert telecine-aware emit (film segments back to dup-fill) */
     if (getenv("PTV_NO_MV_EXACTTICK")) g_mv_exacttick = 0;  /* v0.9.12: revert mv measurement axes to integer tick (re-enables the enforced ~10ppm mosaic drift) */
+    if (getenv("PTV_NO_RESIDENCE")) g_mv_residence = 0;     /* v0.9.13: revert to one-pop-per-tick (rate-mismatched slots batch dups + fast-forward after starvation) */
     { const char *ta = getenv("PTV_TICK_ADJ_US"); if (ta) { int64_t v = atoll(ta); if (v < -1000) v = -1000; if (v > 1000) v = 1000; g_tick_adj_us = v; } }   /* diag: accelerate the tick-quantization drift for falsification */
     if (g_genlock && !g_preroll_set) g_preroll_ms = 1000;  /* v0.9.1: default the single-input prime to ~1s (frame_q cushion) — smooths decode-rate dips while video+gate-hold stays under the 3s gate cap (cap scaling stays dormant). Deep video_q prime + cap-scale remain available for explicit high PTV_PREROLL_MS (bursty Fintech-class). PTV_PREROLL_MS overrides, PTV_NO_GENLOCK reverts to 350. */
     if (g_preroll_ms > 1600) g_delivery_cap_us += (int64_t)g_preroll_ms * 1000;  /* v0.9.0: the deep input prime delays VIDEO ~g_preroll_ms; the §7.5a gate holds audio+copy to match (it IS the audio-side of the whole-stream delay), so size its cap to the prime — else it force-releases and audio leaks ahead (TruBLU dlvforced). Explicit PTV_DELIVERY_CAP_MS (below) overrides. */
