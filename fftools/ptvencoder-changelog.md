@@ -5,6 +5,18 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 0.9.15.1 (2026-07-03)
+
+- **CLOCK-FOLLOW convergence + observability fixes** (first NewsNation deploy didn't arm in
+  4min and was silent about why): (1) the post-lock outlier-reject band was ±3000ppm, but the
+  EMA sits at only ~72% of a true offset at lock — every honest window of a clean +12000ppm
+  source then exceeded the band and the estimate deadlocked below truth; band now ±8000ppm
+  (still rejects burst-alias spikes; max honest gap for the ±2% cap is ~5500). (2) The stats
+  line now shows ` cf=<ppm>` whenever notable (`?` suffix = not yet locked), and an always-on
+  breadcrumb reports "N/M windows accepted, ema X" every ~3min while unlocked — estimator
+  starvation is never silent again. Re-validated on the +1.2% fixture: armed at lock,
+  converged past the old deadlock point, health flat.
+
 ## 0.9.15 (2026-07-03)
 
 - **CLOCK-FOLLOW: follow a large verified source-clock offset** (`PTV_NO_CLOCKFOLLOW` reverts;

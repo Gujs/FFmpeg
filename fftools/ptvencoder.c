@@ -39,7 +39,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "0.9.15"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "0.9.15.1"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 #define PTV_WD_DEADLINE_US (2 * (int64_t)AV_TIME_BASE)   /* watchdog stall threshold */
@@ -1796,12 +1796,20 @@ static void *output_thread(void *arg)
                                               + av_thread_message_queue_nb_elems(v->frame_q)) * v->tick_dur_us / 1000),
                                  (long long)(bt / 1000));
                 }
+                char cfs[32] = "";                                   /* v0.9.15.1 CLOCK-FOLLOW readout (shown when notable) */
+                {
+                    int64_t cq = atomic_load_explicit(&g_cf_rate_q20, memory_order_relaxed);
+                    int64_t cp = ((cq - (1 << 20)) * 1000000) >> 20;
+                    int     lk = atomic_load_explicit(&g_cf_locked, memory_order_relaxed);
+                    if (lk || llabs(cp) > 500)
+                        snprintf(cfs, sizeof cfs, " cf=%+lldppm%s", (long long)cp, lk ? "" : "?");
+                }
                 av_log(NULL, AV_LOG_INFO,
                     "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f "
                     "dup=%"PRId64" pd=%"PRId64" drop=%"PRId64" corrupt=%"PRId64" "
-                    "async=%+"PRId64"ppm%s%s%s\n",
+                    "async=%+"PRId64"ppm%s%s%s%s\n",
                     v->emitted, fps, hh, mm, ss,
-                    v->dup, v->pd, v->framedrop, cr, aw, dlv, wu, bk);
+                    v->dup, v->pd, v->framedrop, cr, aw, dlv, wu, bk, cfs);
                 stat_last = nows; stat_prev = v->emitted;
             }
         }
@@ -3944,9 +3952,16 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                              * WUCR follow; the tight FLL below keeps its crystal-scale guards. */
                             {
                                 static int64_t cf_ema = (1 << 20);
-                                static int     cf_chunks = 0;
+                                static int     cf_chunks = 0, cf_skips = 0, cf_wins = 0;
                                 int64_t cf_env = ((int64_t)(1 << 20)) * 3 / 100;    /* ±3% */
-                                int64_t cf_rej = ((int64_t)(1 << 20)) * 3 / 1000;   /* ±3000ppm */
+                                /* v0.9.15.1: reject band 3000→8000ppm — at lock the EMA sits at only
+                                 * ~72% of a true offset (alpha 1/16 x 20 chunks), so a ±3000 band
+                                 * rejected every honest window of a clean +12000ppm source and the
+                                 * estimate deadlocked below truth (NewsNation first deploy). 8000
+                                 * still rejects burst-alias spikes; max honest gap at lock for the
+                                 * ±2% follow cap is ~5500. */
+                                int64_t cf_rej = ((int64_t)(1 << 20)) * 8 / 1000;   /* ±8000ppm */
+                                cf_wins++;
                                 if (r > (1 << 20) - cf_env && r < (1 << 20) + cf_env &&
                                     (cf_chunks < 20 || (r - cf_ema < cf_rej && cf_ema - r < cf_rej))) {
                                     cf_ema += (r - cf_ema) >> 4;                    /* alpha 1/16, tau ~50s */
@@ -3954,7 +3969,16 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                                     atomic_store_explicit(&g_cf_rate_q20, cf_ema, memory_order_relaxed);
                                     if (cf_chunks >= 20)
                                         atomic_store_explicit(&g_cf_locked, 1, memory_order_relaxed);
-                                }
+                                } else
+                                    cf_skips++;
+                                /* v0.9.15.1 breadcrumb: if the estimator can't lock, say why (always-on,
+                                 * once per ~3min of windows) — first NewsNation deploy starved silently */
+                                if (!atomic_load_explicit(&g_cf_locked, memory_order_relaxed) &&
+                                    cf_wins % 60 == 0)
+                                    av_log(NULL, AV_LOG_INFO,
+                                           "[PTV-CLOCK] estimator: %d/%d windows accepted, ema %+lldppm (lock needs 20)\n",
+                                           cf_chunks, cf_wins,
+                                           (long long)(((cf_ema - (1 << 20)) * 1000000) >> 20));
                             }
                             /* GUARD-B: relative outlier reject — a burst-aliased window that jumps far from the
                              * running estimate is jitter, not a real rate change; skip it (slide the window
