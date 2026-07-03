@@ -39,7 +39,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "0.9.14"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "0.9.14.1"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 #define PTV_WD_DEADLINE_US (2 * (int64_t)AV_TIME_BASE)   /* watchdog stall threshold */
@@ -384,7 +384,12 @@ static int64_t g_delivery_cap_us = 3000000;   /* PTV_DELIVERY_CAP_MS: force-rele
                                                 * so the old 2s default cap-saturated (dlvforced climbing); 3s lets the
                                                 * precise DTS-match win (dlvforced→0) with margin, harmless on low-hold
                                                 * channels (match wins well before 3s), still bounds a stuck encoder to 3s. */
-static int     g_delivery_maxq = 512;         /* PTV_DELIVERY_MAXQ: hold-FIFO size backstop (total-stall back-pressure point) */
+static int     g_delivery_maxq = 1024;        /* PTV_DELIVERY_MAXQ: hold-FIFO size backstop (total-stall back-pressure point).
+                                               * v0.9.14.1: default 512->1024 and auto-sized for the AUTO-BANK ceiling like
+                                               * the deep-preroll path sizes itself (Unique_TV: a 10s bank holds ~470 audio
+                                               * pkts steady + a 7s clump surge ~800 peak > the old 512 -> back-pressure ->
+                                               * demux audio drops -> resampler comps = clicks WITH a perfect video bank).
+                                               * Nodes are per-enqueue, not preallocated - a generous backstop is free. */
 /* Muxed-packet stats counters. Written by N mux threads (6-rung ABR) -> atomic to avoid a
  * data race / lost updates in the bitrate=/size= stat line. Stats-only; not on any hot path. */
 static _Atomic int64_t g_muxed;
@@ -5103,7 +5108,10 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
     if (delivery_on) {
         int maxq = g_delivery_maxq;
         if (!getenv("PTV_DELIVERY_MAXQ"))
-            maxq = FFMAX(maxq, n_audio * 256);
+            maxq = FFMAX(maxq, n_audio * 50 *
+                         (int)(g_delivery_cap_us / 1000000 + g_cushion_max_ms / 1000 + 5));
+            /* per gated track: ~50 pkt/s x (gate cap + bank ceiling + clump surge headroom) —
+             * the same sizing the deep-preroll path applies, computed automatically (v0.9.14.1) */
         for (r = 0; r < n_rung; r++)
             dlv_init(&rung[r].gate, rung[r].mux_q, g_delivery_cap_us, maxq);
     }

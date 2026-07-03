@@ -5,6 +5,19 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 0.9.14.1 (2026-07-03)
+
+- **AUTO-BANK audio-path sizing** — the deep-preroll path's own sizing rules, applied
+  automatically (owner: "same system as PTV_PREROLL_MS, just automatic sizing"). First live
+  deploy (Unique_TV) healed the VIDEO completely (dup 397/9min -> 0, hs=+0) but audio kept
+  clicking (async swinging +-1000ppm): with a 10s bank the delivery gate holds ~470 audio
+  packets steady and a burst clump surges it to ~800 — past the old maxq=512 backstop ->
+  back-pressure -> demux audio drops -> resampler compensation. The hold-FIFO backstop is now
+  1024 by default and auto-sized per gated track for gate-cap + bank-ceiling + clump surge
+  (~50 pkt/s x 20s), exactly as the manual deep-preroll sized itself; nodes are per-enqueue so
+  the generous backstop costs nothing. Validated at the 12s ceiling bank under 8s clumps:
+  async=+0ppm at every sample (the live channel swung +-1000ppm).
+
 
 ## 0.9.14 (2026-07-03)
 
