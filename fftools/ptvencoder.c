@@ -39,7 +39,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "0.9.14.2"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "0.9.15"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 #define PTV_WD_DEADLINE_US (2 * (int64_t)AV_TIME_BASE)   /* watchdog stall threshold */
@@ -414,6 +414,18 @@ static _Atomic int64_t g_ch_vsrc_raw, g_ch_asrc_raw;   /* [PTV-CHAIN] PRE-unwrap
  * multiview compositor is unaffected). PTV_NO_GENLOCK reverts to byte-identical free-run. */
 static int             g_genlock = 1;
 static int             g_genlock_ok;                  /* runtime: single-input live (set at setup) */
+/* v0.9.15 CLOCK-FOLLOW: some real sources run their transport clock PERCENT-scale fast/slow
+ * (NewsNation measured +12200ppm: a relay/playout fault the provider won't fix). The tight FLL
+ * above correctly rejects that as insane for crystal-drift sensing (±300ppm guard), so a
+ * PARALLEL coarse estimator (same unbiased sub-window rate, ±3% envelope, own outlier reject,
+ * 60s lock) feeds the WUCR servo, which then FOLLOWS the verified offset beyond its ±0.6%
+ * gentle zone (cap ±2%): output pacing (and PCR) run at the source's true rate — receivers
+ * slave to PCR, buffers stay level, and aresample drops from churning hard-comps to a steady
+ * soft ratio. Film-in-NTSC can never arm this (its DTS advance is realtime; the estimator
+ * reads ~0). Single-input live only. PTV_NO_CLOCKFOLLOW reverts. */
+static int             g_clockfollow = 1;
+static _Atomic int64_t g_cf_rate_q20 = (1 << 20);     /* coarse source rate (content-us/wall-us, Q20) */
+static _Atomic int     g_cf_locked;                    /* 20 clean chunks (~60s) before the servo may follow */
 static _Atomic int64_t g_src_rate_q20 = (1 << 20);   /* recovered source rate (content-µs/wall-µs), Q20 */
 static _Atomic int     g_src_rate_locked;            /* 0 until the FLL trusts the estimate */
 /* PTV_RATE_LOCK — VIDEO-SIDE house_skew bound. An occupancy servo holds the master's frame_q depth at
@@ -613,6 +625,7 @@ void show_help_default(const char *opt, const char *arg)
         "    PTV_NO_DELIVERY     audio delivery-alignment gate     PTV_NO_DELIVERY_MV ungated mosaics (pre-0.9.12.1)\n"
         "    PTV_NO_RESIDENCE    mosaic per-slot source-rate cadence (pre-0.9.13 pop-per-tick)\n"
         "    PTV_NO_AUTOBANK     runtime bursty-channel bank escalation (back to advisor-only)\n"
+        "    PTV_NO_CLOCKFOLLOW  following a large verified source-clock offset (>0.3%; e.g. a fast relay)\n"
         "   logging: PTV_DIAG=1 debug lines · PTV_LOG_TS=1 timestamp prefix · see -log-legend for probes\n");
 }
 
@@ -1622,6 +1635,31 @@ static void *output_thread(void *arg)
                             have < bt && corr < 6000)
                             corr = 6000;
                     }
+                    /* v0.9.15 CLOCK-FOLLOW: a locked coarse-FLL offset beyond +-3000ppm is a real
+                     * source-clock fault (NewsNation: +12200ppm relay clock) — follow it beyond the
+                     * gentle zone, else the servo pegs at +-0.6%, buffers pin and aresample churns
+                     * forever. Hysteresis latch (arm >3000, release <2000); capped +-2%. The tick
+                     * pacing (and thus output PCR) runs at the source's true rate — receivers slave
+                     * to PCR, so the chain simply runs at source pace, as with any PCR-locked feed. */
+                    if (g_clockfollow && atomic_load_explicit(&g_cf_locked, memory_order_relaxed)) {
+                        static int cf_following = 0;
+                        int64_t cf_ppm = ((atomic_load_explicit(&g_cf_rate_q20, memory_order_relaxed)
+                                           - (1 << 20)) * 1000000) >> 20;
+                        if (!cf_following && llabs(cf_ppm) > 3000) {
+                            cf_following = 1;
+                            av_log(NULL, AV_LOG_WARNING,
+                                   "[PTV-CLOCK] source clock runs %+lldppm off realtime — FOLLOWING it "
+                                   "(output+PCR pace at the source's true rate; PTV_NO_CLOCKFOLLOW reverts)\n",
+                                   (long long)cf_ppm);
+                        } else if (cf_following && llabs(cf_ppm) < 2000) {
+                            cf_following = 0;
+                            av_log(NULL, AV_LOG_WARNING,
+                                   "[PTV-CLOCK] source clock back within normal range (%+lldppm) — released\n",
+                                   (long long)cf_ppm);
+                        }
+                        if (cf_following)
+                            corr -= av_clip64(cf_ppm, -20000, 20000);
+                    }
                     atomic_store_explicit(&g_rho_corr_ppm, corr, memory_order_relaxed);
                 }
                 int64_t corr = atomic_load_explicit(&g_rho_corr_ppm, memory_order_relaxed);
@@ -1702,7 +1740,7 @@ static void *output_thread(void *arg)
             if (nowd - diag_last >= 1000000) {
                 av_log(NULL, AV_LOG_INFO,
                     "[PTV-DIAG] t=%.1fs dec=%"PRId64" vcorrupt=%"PRId64" emitted=%"PRId64
-                    " muxed=%"PRId64" dup=%"PRId64" pd=%"PRId64" framedrop=%"PRId64" vq=%d frameq=%d muxq=%d genlock=%d rate=%+.0fppm wucr_rho=%+.0fppm\n",
+                    " muxed=%"PRId64" dup=%"PRId64" pd=%"PRId64" framedrop=%"PRId64" vq=%d frameq=%d muxq=%d genlock=%d rate=%+.0fppm wucr_rho=%+.0fppm cf=%+.0fppm/%d\n",
                     (nowd - diag_t0) / 1000000.0, *v->dbg_dec_frames, *v->dbg_vcorrupt, v->emitted,
                     g_muxed, v->dup, v->pd, v->framedrop,
                     av_thread_message_queue_nb_elems(v->dbg_video_q),
@@ -1710,7 +1748,9 @@ static void *output_thread(void *arg)
                     av_thread_message_queue_nb_elems(v->mux_q),
                     atomic_load_explicit(&g_src_rate_locked, memory_order_relaxed),
                     (atomic_load_explicit(&g_src_rate_q20, memory_order_relaxed) - (1 << 20)) * 1e6 / (1 << 20),
-                    (double)(-atomic_load_explicit(&g_rho_corr_ppm, memory_order_relaxed)));
+                    (double)(-atomic_load_explicit(&g_rho_corr_ppm, memory_order_relaxed)),
+                    (atomic_load_explicit(&g_cf_rate_q20, memory_order_relaxed) - (1 << 20)) * 1e6 / (1 << 20),
+                    atomic_load_explicit(&g_cf_locked, memory_order_relaxed));
                 diag_last = nowd;
             }
         }
@@ -3898,6 +3938,24 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                             int64_t r  = av_rescale(win_c, 1 << 20, win_w); /* unbiased sub-window rate, Q20 */
                             int64_t lo = (1 << 20) - ((1 << 20) / 100);     /* coarse sane gate (±1%) */
                             int64_t hi = (1 << 20) + ((1 << 20) / 100);
+                            /* v0.9.15 CLOCK-FOLLOW coarse estimator: the same unbiased rate, WIDE
+                             * envelope (±3%) with its own outlier reject (±3000ppm vs own EMA after
+                             * lock) and a slower lock (20 clean chunks ≈ 60s). Sensor-only for the
+                             * WUCR follow; the tight FLL below keeps its crystal-scale guards. */
+                            {
+                                static int64_t cf_ema = (1 << 20);
+                                static int     cf_chunks = 0;
+                                int64_t cf_env = ((int64_t)(1 << 20)) * 3 / 100;    /* ±3% */
+                                int64_t cf_rej = ((int64_t)(1 << 20)) * 3 / 1000;   /* ±3000ppm */
+                                if (r > (1 << 20) - cf_env && r < (1 << 20) + cf_env &&
+                                    (cf_chunks < 20 || (r - cf_ema < cf_rej && cf_ema - r < cf_rej))) {
+                                    cf_ema += (r - cf_ema) >> 4;                    /* alpha 1/16, tau ~50s */
+                                    if (cf_chunks < 100000) cf_chunks++;
+                                    atomic_store_explicit(&g_cf_rate_q20, cf_ema, memory_order_relaxed);
+                                    if (cf_chunks >= 20)
+                                        atomic_store_explicit(&g_cf_locked, 1, memory_order_relaxed);
+                                }
+                            }
                             /* GUARD-B: relative outlier reject — a burst-aliased window that jumps far from the
                              * running estimate is jitter, not a real rate change; skip it (slide the window
                              * anyway). Anchored by GUARD-A's bound so `ema` can't itself wander far. ONLY after
@@ -5865,6 +5923,7 @@ int main(int argc, char **argv)
     { const char *cm = getenv("PTV_CUSHION_MAX_MS"); if (cm && atoi(cm) > 0) g_cushion_max_ms = atoi(cm); }  /* v0.9.14: AUTO-BANK ceiling (default 12000) */
     { const char *bd = getenv("PTV_BANK_DECAY_S"); if (bd && atoi(bd) > 0) g_bank_decay_us = (int64_t)atoi(bd) * 1000000; }  /* v0.9.14: quiet time before bank retires (test hook; default 6h) */
     if (getenv("PTV_NO_AUTOBANK")) g_autobank = 0;   /* v0.9.14: revert to advisor-only (manual PTV_PREROLL_MS recipe) */
+    if (getenv("PTV_NO_CLOCKFOLLOW")) g_clockfollow = 0;   /* v0.9.15: never follow a large source-clock offset (buffers pin + resampler churns on such sources) */
     { const char *fq = getenv("PTV_FRAMEQ"); if (fq && atoi(fq) > 0) { int v = atoi(fq); if (v < PTV_FRAME_QDEPTH) v = PTV_FRAME_QDEPTH; if (v > 1024) v = 1024; g_frameq_cap = v; } }   /* frame_q (decode->output) capacity; raise + deep PTV_PREROLL_MS to absorb an ad-break decode-rate dip (AWE) */
     if (getenv("PTV_NO_EXACTTICK")) g_exacttick = 0;   /* revert to integer-us tick content index (the ~10ppm NTSC drift) */
     if (getenv("PTV_NO_PULLDOWN"))  g_pulldown = 0;    /* v0.9.11: revert telecine-aware emit (film segments back to dup-fill) */

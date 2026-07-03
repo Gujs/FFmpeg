@@ -5,6 +5,26 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 0.9.15 (2026-07-03)
+
+- **CLOCK-FOLLOW: follow a large verified source-clock offset** (`PTV_NO_CLOCKFOLLOW` reverts;
+  single-input live only — a mosaic has one output clock and N source clocks, and its slots
+  already absorb fast sources via 0.9.13 per-slot residence decimation). NewsNation measured at
+  the wire: PTS advance 25.305 fps from a stream declaring 25.0 = a +12,200ppm transport clock
+  (relay/playout fault, provider won't fix). The WUCR servo pegged at its +-0.6% gentle limit ->
+  frame_q pinned full forever (also the 2.2GB VRAM high-water), hs climbing, aresample churning
+  at +-1% (audible). Now a PARALLEL coarse FLL (same unbiased sub-window rate as the v0.9.0
+  estimator, but +-3% envelope, own +-3000ppm outlier reject, 60s lock — the tight FLL keeps its
+  +-300ppm crystal guards for genlock pacing) feeds the servo, which FOLLOWS offsets beyond
+  +-3000ppm (hysteresis release <2000, cap +-2%): output pacing and PCR run at the source's true
+  rate — receivers slave to PCR as with any PCR-locked feed — buffers stay level and audio drops
+  to a steady soft resample. Film-in-NTSC can never arm it (film DTS advance is realtime; the
+  estimator reads ~0 — the 0.9.10.1 content-vs-clock discrimination, by construction).
+  `[PTV-CLOCK]` logs arm/release; PTV_DIAG line gains `cf=<ppm>/<locked>`. Validated against a
+  clean +1.2%-clock fixture (setts-retimed -re + wire-restore bsf; note: burst_send's byte-budget
+  pacing is NOT a clock-offset fixture on VBR files): armed at lock, fps 30.5 = source pace,
+  dup=0, hs flat, async=+0ppm.
+
 ## 0.9.14.2 (2026-07-03)
 
 - **AUTO-BANK: audio_q sized like the deep preroll (the THIRD and last sizing side-car).**
