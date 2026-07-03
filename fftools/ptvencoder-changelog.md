@@ -40,6 +40,13 @@ the v2 `0001` patch (additive, travels with the source to the build box).
     baseline, per-slot sk bounded (+0 smooth; burst deficit converts to CONSTANT latency,
     +2.3s stable, vs unbounded ratchet pre-servo), pd=4.4/s on 25-in-29.97 slots = the exact
     5:6 conversion rate; with a 4.5s prime the bursty slot runs sv=0 after acquisition.
+- **Discontinuity events log ALWAYS-ON** (were PTV_DIAG-only — on single-input AND multiview,
+  so production logs were silent no matter how many glues fired; TruBLU's ~15-min splices have
+  been absorbed invisibly all along). `[PTV-LAYERA] jump/flush` and `[PTV-DISCONT] absorbed /
+  audio GAP` now print unconditionally at INFO — they are rare (few/hour worst case) and
+  operationally meaningful. The verbose [PTV-QSNAP] queue dumps stay diag-gated. Verified with
+  the send-jump harness: a +30s injected splice logs jump+flush (applied_offset=-29.98s) with
+  no PTV_DIAG; behavior itself is unchanged (identical outcome counters diag vs not).
 - **Multiview stats-line parity**: the mosaic line now matches single-input
   (`frame= fps= time= dup= drop=` + `dlvhold=/dlvforced=` gate readout; size/bitrate/speed/
   genlock dropped per the v0.9.10 rationale) plus per-slot

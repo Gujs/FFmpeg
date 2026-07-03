@@ -3124,11 +3124,10 @@ static int ptv_disc_detect_jump(DemuxArgs *d, PtvDiscBuf *b, int stream_idx,
         ss->has_new_base = 1;
     }
     b->jump_detected = 1;
-    if (g_diag)
-        av_log(NULL, AV_LOG_INFO,
-               "[PTV-LAYERA] jump on stream %d: %.3fs -> %.3fs (delta=%.3fs) — buffering\n",
-               stream_idx, (double)last_dts / AV_TIME_BASE,
-               (double)raw_dts / AV_TIME_BASE, (double)delta / AV_TIME_BASE);
+    av_log(NULL, AV_LOG_INFO,   /* v0.9.13: always-on — a glue is rare (few/hour worst case) and operators need it in the log */
+           "[PTV-LAYERA] jump on stream %d: %.3fs -> %.3fs (delta=%.3fs) — buffering\n",
+           stream_idx, (double)last_dts / AV_TIME_BASE,
+           (double)raw_dts / AV_TIME_BASE, (double)delta / AV_TIME_BASE);
     if (g_diag) ptv_qsnap(d, b, "buffer-start");
     return 1;
 }
@@ -3205,14 +3204,13 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
     else if (has_vid) b->applied_offset = vid_off;
     if (has_vid && has_aud) g_disc_viderr_sum += (vid_off - aud_off);   /* PTV-FLUSHAV: running total of source A/V misalignment absorbed at glues */
 
-    if (g_diag)
-        av_log(NULL, AV_LOG_INFO,
-               "[PTV-LAYERA] flush %d pkts: old=%d new=%d keep=%s applied_offset=%.3fs (vid=%.3fs aud=%.3fs vid_err=%.3fs cum_vid_err=%.3fs)\n",
-               b->nb_packets, old_count, new_count, keep_timeline ? "NEW" : "OLD",
-               (double)b->applied_offset / AV_TIME_BASE,
-               (double)vid_off / AV_TIME_BASE, (double)aud_off / AV_TIME_BASE,
-               (double)(vid_off - aud_off) / AV_TIME_BASE,
-               (double)g_disc_viderr_sum / AV_TIME_BASE);
+    av_log(NULL, AV_LOG_INFO,   /* v0.9.13: always-on (paired with the jump line above) */
+           "[PTV-LAYERA] flush %d pkts: old=%d new=%d keep=%s applied_offset=%.3fs (vid=%.3fs aud=%.3fs vid_err=%.3fs cum_vid_err=%.3fs)\n",
+           b->nb_packets, old_count, new_count, keep_timeline ? "NEW" : "OLD",
+           (double)b->applied_offset / AV_TIME_BASE,
+           (double)vid_off / AV_TIME_BASE, (double)aud_off / AV_TIME_BASE,
+           (double)(vid_off - aud_off) / AV_TIME_BASE,
+           (double)g_disc_viderr_sum / AV_TIME_BASE);
     if (g_diag) ptv_qsnap(d, b, "at-flush");
 
     for (i = 0; i < b->nb_packets; i++) {
@@ -3432,9 +3430,9 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                             is_gap = 1;
                             if (d->disturb_epoch)   /* audio dropout is a disturbance (freeze rate-recovery / arm re-acquire) */
                                 atomic_fetch_add_explicit(d->disturb_epoch, 1, memory_order_relaxed);
-                            if (g_diag)
-                                av_log(NULL, AV_LOG_INFO, "[PTV-DISCONT] stream %d: %+"PRId64"ms audio GAP — NOT absorbed (aresample pads; wall_gap=%"PRId64"ms)\n",
-                                       pkt->stream_index, av_rescale_q(delta, st->time_base, (AVRational){1,1000}), wall_gap / 1000);
+                            av_log(NULL, AV_LOG_INFO,   /* v0.9.13: always-on — a real source audio dropout, rare + meaningful */
+                                   "[PTV-DISCONT] stream %d: %+"PRId64"ms audio GAP — NOT absorbed (aresample pads; wall_gap=%"PRId64"ms)\n",
+                                   pkt->stream_index, av_rescale_q(delta, st->time_base, (AVRational){1,1000}), wall_gap / 1000);
                         }
                     }
                     if (is_gap) goto absorb_done;
@@ -3469,11 +3467,11 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                     }
                     if (d->disturb_epoch)   /* B3: a real content discontinuity → arm the PLL's mid-run re-acquire */
                         atomic_fetch_add_explicit(d->disturb_epoch, 1, memory_order_relaxed);
-                    if (g_diag)
-                        av_log(NULL, AV_LOG_INFO, "[PTV-DISCONT] stream %d: %+"PRId64"ms PTS jump absorbed (re-based to continuous)%s; frame_q=%d at jump\n",
-                               pkt->stream_index, av_rescale_q(delta, st->time_base, (AVRational){1,1000}),
-                               (ct == AVMEDIA_TYPE_VIDEO && d->drop_until_kf) ? " [DUKF armed → video drops until IDR]" : "",
-                               atomic_load_explicit(&g_frameq_depth, memory_order_relaxed));
+                    av_log(NULL, AV_LOG_INFO,   /* v0.9.13: always-on — one line per stream per crossing, events are rare */
+                           "[PTV-DISCONT] stream %d: %+"PRId64"ms PTS jump absorbed (re-based to continuous)%s; frame_q=%d at jump\n",
+                           pkt->stream_index, av_rescale_q(delta, st->time_base, (AVRational){1,1000}),
+                           (ct == AVMEDIA_TYPE_VIDEO && d->drop_until_kf) ? " [DUKF armed → video drops until IDR]" : "",
+                           atomic_load_explicit(&g_frameq_depth, memory_order_relaxed));
                     absorb_done: ;   /* gap-fix: a non-absorbed audio GAP jumps here — wrap_off left untouched, aresample pads */
                 }
             }
