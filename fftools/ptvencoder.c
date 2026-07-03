@@ -3810,6 +3810,20 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                 d->by_last_v_wall = bw;
                 if (!d->by_win_start) d->by_win_start = bw;
                 if (bw - d->by_win_start >= 60000000) {         /* 60s window closes */
+                    /* per-minute burst visibility (owner-requested): any window with stalls logs
+                     * count + worst gap + how the bank is handling it; quiet windows stay silent.
+                     * (Current fill level is on the stats line as bank=actual/target.) */
+                    if (d->autobank && d->by_gap_cnt > 0) {
+                        int64_t bt = atomic_load_explicit(&g_bank_us, memory_order_relaxed);
+                        if (bt > 0)
+                            av_log(NULL, AV_LOG_INFO,
+                                   "[PTV-BURSTY] %d stall%s >=1.5s in the last 60s (worst %.1fs) — auto-bank target %.1fs\n",
+                                   d->by_gap_cnt, d->by_gap_cnt == 1 ? "" : "s", d->by_max_gap / 1e6, bt / 1e6);
+                        else
+                            av_log(NULL, AV_LOG_INFO,
+                                   "[PTV-BURSTY] %d stall%s >=1.5s in the last 60s (worst %.1fs) — below auto-bank threshold\n",
+                                   d->by_gap_cnt, d->by_gap_cnt == 1 ? "" : "s", d->by_max_gap / 1e6);
+                    }
                     if (d->by_gap_cnt >= 3) {                   /* HLS-burst cadence */
                         if (d->autobank) {
                             ptv_autobank_escalate(d, d->by_max_gap, bw);
