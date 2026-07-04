@@ -5,6 +5,31 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 0.9.16.1 (2026-07-04) — stability release, part 2
+
+- **Sparse-PID wrap guard** (1.0 review §3.2): a PID silent for more than HALF the 33-bit wrap
+  period (13.26 h @90 kHz) aliased the ±half unwrap heuristic BOTH ways — a no-wrap gap >13.26 h
+  read as "late pre-roll" (−2^33 → the PID lands 26.5 h in the past → `demux_pass` drops every
+  later packet FOREVER), and ≥1 wraps crossed during the silence read as small deltas (the +2^33
+  silently missed → same landing). SCTE-35 quiet overnight/weekend = the realistic victim on
+  months-scale uptimes. Fix: past the half-period wall threshold, RE-ANCHOR by wall projection —
+  choose the wrap count landing the packet nearest its wall-expected position (a live mux stamps
+  a resuming PID with the current STC, so projection is exact to clock-ppm ≪ half; handles any
+  number of missed wraps). Below the threshold the delta branches are provably always correct —
+  zero change to normal operation. Always-on `[PTV-DISCONT] re-anchored after N.Nh silence
+  (±k wraps)` line; `PTV_WRAP_GUARD_S` overrides the threshold (TEST ONLY). k-arithmetic
+  unit-checked (0/±1/±2 wraps, ±30 min projection error); live-path A/B with a 10 s test
+  threshold on DVB-sub gaps: fires with k=+0 (no-op), health + sub passthrough identical to
+  control.
+- **Delivery-cap ratchet fixed** (1.0 review §3.3, found independently by 3 of 4 review agents):
+  adaptive-cushion GROW added `(raised−base)×tick` to `g_delivery_cap_us` (+ maxq) but SHRINK
+  never restored it — daily grow/shrink cycles ratcheted the gate's video-stall force-release
+  ceiling ~+3 s per cycle FOREVER (months → minutes of held audio + tens of MB per rung when a
+  real wedge finally happens). SHRINK now subtracts the exact GROW amount; `g_delivery_cap_us`
+  is now `_Atomic` (was a plain cross-thread int64: output-thread writer, demux readers). maxq
+  intentionally stays as a high-water backstop (RAM materializes only while holding, and the
+  restored cap bounds that duration).
+
 ## 0.9.16 (2026-07-04) — stability release, part 1
 
 - **MULTIVIEW MEMORY LEAK FIXED — one AVFrame shell (448 B) leaked per slot per tick.** The

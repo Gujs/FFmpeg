@@ -39,7 +39,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "0.9.16"     /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "0.9.16.1"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 #define PTV_WD_DEADLINE_US (2 * (int64_t)AV_TIME_BASE)   /* watchdog stall threshold */
@@ -134,6 +134,7 @@ static int     g_gapdiscrim = 1;          /* gap-fix (2026-06-26): on a FORWARD 
                                            * with the continuous video (fixes the AWE audio-gap → permanent A/V step). A SPLICE absorbs
                                            * as before. PTV_NO_GAPDISCRIM=1 reverts to unconditional forward absorb (old behaviour). */
 static int64_t g_gap_min_us = 700000;     /* min wall-absence (us) to call a forward audio jump a real GAP when video did not also cross */
+static int64_t g_wrap_guard_us = 0;       /* v0.9.16.1: sparse-PID wrap-guard threshold override (us); 0 = half the wrap period (13.26h @90kHz). PTV_WRAP_GUARD_S, TEST ONLY */
 /* P2 §7.1 (hybrid): apply the program-level discontinuity offset (tracked from the dense VIDEO reference)
  * to the SPARSE copied streams (DVB-sub/teletext, data, SCTE-35) that can't self-rebase — so an ad-break
  * PTS jump shifts them WITH the video instead of orphaning/vanishing them. Dense V/A (incl. copied AC-3)
@@ -384,7 +385,9 @@ static int     g_discardcorrupt = 1;
  * multiview ungated (pre-0.9.12.1 wire staging). Offline (file out) always bypasses. */
 static int     g_delivery = 1;
 static int     g_delivery_mv = 1;             /* v0.9.12.1: gate multiview too (PTV_NO_DELIVERY_MV reverts) */
-static int64_t g_delivery_cap_us = 3000000;   /* PTV_DELIVERY_CAP_MS: force-release ceiling (≥ max encoder latency).
+static _Atomic int64_t g_delivery_cap_us = 3000000;   /* PTV_DELIVERY_CAP_MS: force-release ceiling (≥ max encoder latency).
+                                                * v0.9.16.2: _Atomic — runtime writer is the master output thread
+                                                * (cushion GROW/SHRINK), readers are demux (bank stores) + init.
                                                 * 3s (v0.7.3): the real steady-state hold under production load is ~2s
                                                 * (box: TruBLU on cor-1 dlvhold=2055ms — A0's 845ms underestimated it),
                                                 * so the old 2s default cap-saturated (dlvforced climbing); 3s lets the
@@ -1581,8 +1584,9 @@ static void *output_thread(void *arg)
                         ep_prev_us = ep_last_us; ep_last_us = nw;
                         if (cur_sp < raised_sp && ep_prev_us && nw - ep_prev_us < 3600LL * 1000000) {
                             cur_sp = raised_sp;                        /* GROW: 2nd episode within 60min; fill is lazy (gentle zone) */
-                            g_delivery_cap_us += (int64_t)(raised_sp - base_sp) * v->tick_dur_us;  /* audio gate rides the deeper video hold */
-                            g_delivery_maxq = FFMAX(g_delivery_maxq, (int)(g_delivery_cap_us / 1000000 * 256));
+                            int64_t add = (int64_t)(raised_sp - base_sp) * v->tick_dur_us;  /* audio gate rides the deeper video hold */
+                            int64_t nc  = atomic_fetch_add_explicit(&g_delivery_cap_us, add, memory_order_relaxed) + add;
+                            g_delivery_maxq = FFMAX(g_delivery_maxq, (int)(nc / 1000000 * 256));
                             av_log(NULL, AV_LOG_INFO,
                                    "[PTV-CUSHION] target %d->%d frames (~%dms): 2 starvations within %lldmin (last %lldms)\n",
                                    base_sp, raised_sp, (int)((int64_t)raised_sp * v->tick_dur_us / 1000),
@@ -1590,6 +1594,13 @@ static void *output_thread(void *arg)
                         }
                     } else if (cur_sp > base_sp && ep_last_us && nw - ep_last_us > 6LL * 3600 * 1000000) {
                         cur_sp = base_sp;                              /* SHRINK: 6h with zero starvations; drains at ppm scale */
+                        /* v0.9.16.2: symmetric restore of the gate base — GROW added exactly this much;
+                         * without it, daily grow/shrink cycles RATCHET the stall force-release ceiling
+                         * ~+(raised−base) ticks per cycle FOREVER (months → minutes of held audio on a
+                         * real video wedge). maxq stays as a high-water backstop (RAM materializes only
+                         * while actually holding, and the restored cap bounds that duration). */
+                        atomic_fetch_sub_explicit(&g_delivery_cap_us,
+                            (int64_t)(raised_sp - base_sp) * v->tick_dur_us, memory_order_relaxed);
                         av_log(NULL, AV_LOG_INFO, "[PTV-CUSHION] target back to %d frames (quiet 6h)\n", base_sp);
                     }
                 }
@@ -3579,7 +3590,32 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
         if (last != AV_NOPTS_VALUE) {
             int64_t delta = raw - last;
             int ct = st->codecpar->codec_type;
-            if (delta < -half)      d->wrap_off[pkt->stream_index] += mask;  /* 33-bit wrap: rolled forward */
+            /* v0.9.16.1 sparse-PID wrap guard: past HALF the wrap period (13.26h @90kHz) of wall
+             * silence, the ±half delta heuristic ALIASES both ways — a no-wrap gap >13.26h reads
+             * as "late pre-roll" (−2^33 → the PID lands 26.5h in the past and demux_pass drops it
+             * FOREVER), and ≥1 wraps crossed during the silence read as small deltas (the +2^33
+             * is missed → same landing). SCTE-35 quiet overnight/weekend is the real-world case.
+             * Below the threshold the delta branches are provably always right (gap G<13.26h ⇒
+             * a genuine wrap gives delta<−half, no wrap gives |delta|<half), so nothing changes
+             * for normal operation. Fix: re-anchor by WALL PROJECTION — choose the wrap count
+             * that lands the packet nearest its wall-expected position (a live mux stamps a
+             * resuming PID with the CURRENT STC, so projection is exact up to clock ppm ≪ half).
+             * PTV_WRAP_GUARD_S overrides the threshold (test only). */
+            int64_t wl        = d->wrap_wall_last[pkt->stream_index];
+            int64_t period_us = av_rescale(mask, (int64_t)st->time_base.num * 1000000, st->time_base.den);
+            int64_t guard_us  = g_wrap_guard_us > 0 ? g_wrap_guard_us : period_us / 2;
+            if (wl > 0 && wall_now - wl > guard_us) {
+                int64_t expect = last + av_rescale(wall_now - wl, st->time_base.den,
+                                                   (int64_t)st->time_base.num * 1000000);
+                int64_t diff = expect - raw;
+                int64_t k = diff >= 0 ? (diff + half) / mask : -((-diff + half) / mask);
+                d->wrap_off[pkt->stream_index] += k * mask;
+                av_log(NULL, AV_LOG_INFO,
+                       "[PTV-DISCONT] stream %d: re-anchored after %.1fh silence (%+"PRId64" wraps; "
+                       "delta heuristic aliases past %.1fh)\n",
+                       pkt->stream_index, (wall_now - wl) / 3600.0e6, k, guard_us / 3600.0e6);
+            }
+            else if (delta < -half) d->wrap_off[pkt->stream_index] += mask;  /* 33-bit wrap: rolled forward */
             else if (delta >  half) d->wrap_off[pkt->stream_index] -= mask;  /* late pre-roll pkt */
             else if (g_discont && (ct == AVMEDIA_TYPE_VIDEO || ct == AVMEDIA_TYPE_AUDIO)) {
                 /* Source PTS discontinuity (a DTS jump, NOT a 33-bit wrap), either direction.
@@ -6050,6 +6086,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_DISCONT")) g_discont = 0;     /* A/B: don't absorb source PTS discontinuities */
     if (getenv("PTV_NO_GAPDISCRIM")) g_gapdiscrim = 0;   /* gap-fix A/B: revert to unconditional forward absorb (old desync-on-audio-gap behaviour) */
     { const char *gm = getenv("PTV_GAP_MIN_MS"); if (gm && atoi(gm) > 0) g_gap_min_us = (int64_t)atoi(gm) * 1000; }  /* min wall-absence to call a forward audio jump a GAP */
+    { const char *wg = getenv("PTV_WRAP_GUARD_S"); if (wg && atoi(wg) > 0) g_wrap_guard_us = (int64_t)atoi(wg) * 1000000; }  /* v0.9.16.1 wrap-guard threshold override (TEST ONLY) */
     { const char *dm = getenv("PTV_DISCONT_MS"); if (dm && atoi(dm) > 0) g_discont_ms = atoi(dm); }            /* forward jump threshold */
     { const char *dm = getenv("PTV_DISCONT_BACK_MS"); if (dm && atoi(dm) > 0) g_discont_back_ms = atoi(dm); }   /* backward jump threshold (anti-stall) */
     if (getenv("PTV_NO_PROG_OFF")) g_prog_off = 0;   /* P2: A/B — sparse copied streams get 33-bit wrap only (v0.6.23) */
