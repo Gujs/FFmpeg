@@ -39,7 +39,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "0.9.15.4"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "0.9.15.5"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 #define PTV_WD_DEADLINE_US (2 * (int64_t)AV_TIME_BASE)   /* watchdog stall threshold */
@@ -1675,12 +1675,15 @@ static void *output_thread(void *arg)
                             have < bt && corr < 6000)
                             corr = 6000;
                     }
-                    /* v0.9.15 CLOCK-FOLLOW: a locked coarse-FLL offset beyond +-3000ppm is a real
-                     * source-clock fault (NewsNation: +12200ppm relay clock) — follow it beyond the
-                     * gentle zone, else the servo pegs at +-0.6%, buffers pin and aresample churns
-                     * forever. Hysteresis latch (arm >3000, release <2000); capped +-2%. The tick
-                     * pacing (and thus output PCR) runs at the source's true rate — receivers slave
-                     * to PCR, so the chain simply runs at source pace, as with any PCR-locked feed. */
+                    /* v0.9.15 CLOCK-FOLLOW: a locked coarse-FLL offset beyond the arm threshold is a
+                     * real source-clock fault — follow it beyond the gentle zone, else the servo pegs
+                     * at +-0.6%, buffers pin and aresample churns forever. Hysteresis latch (arm
+                     * >5000, release <2000); capped +-2%. The tick pacing (and thus output PCR) runs
+                     * at the source's true rate — receivers slave to PCR, so the chain simply runs at
+                     * source pace, as with any PCR-locked feed. v0.9.15.5: arm 3000->5000 — NewsNation's
+                     * clock WANDERS -700..-3400ppm and chattered arm/release across 3000 (~15/day);
+                     * sub-5000 offsets are handled fine unfollowed (WUCR + decimation, proven live),
+                     * so follow engages only for the genuinely-broken-clock class it was built for. */
                     if (g_clockfollow && atomic_load_explicit(&g_cf_locked, memory_order_relaxed)) {
                         static int cf_following = 0;
                         int64_t cf_ppm = ((atomic_load_explicit(&g_cf_rate_q20, memory_order_relaxed)
@@ -1696,7 +1699,7 @@ static void *output_thread(void *arg)
                                        "[PTV-CLOCK] BURSTY channel (bank armed) — follow released, estimator untrusted\n");
                             }
                         } else
-                        if (!cf_following && llabs(cf_ppm) > 3000) {
+                        if (!cf_following && llabs(cf_ppm) > 5000) {
                             cf_following = 1;
                             av_log(NULL, AV_LOG_WARNING,
                                    "[PTV-CLOCK] source clock runs %+lldppm off realtime — FOLLOWING it "
@@ -5909,7 +5912,7 @@ static void ptv_print_log_legend(int full)
         "             from the stalls' own retained latency, retires after 6h quiet\n");
     av_log(NULL, AV_LOG_INFO,
         "  cf         (v0.9.15, shown when notable) coarse source-CLOCK estimate (ppm vs realtime,\n"
-        "             `?` = not yet locked ~60s). |cf|>3000 locked => output+PCR FOLLOW the source's\n"
+        "             `?` = not yet locked ~60s). |cf|>5000 locked => output+PCR FOLLOW the source's\n"
         "             true rate ([PTV-CLOCK] logs arm/release); frozen while BURSTY/bank is armed\n"
         "             (clump delivery is not a clock measurement)\n"
         "  decim      (v0.9.15.2, shown when >0) SURPLUS frames decimated: source delivers more real\n"

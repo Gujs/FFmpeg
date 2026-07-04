@@ -5,6 +5,15 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 0.9.15.5 (2026-07-04)
+
+- **Clock-follow arm threshold 3000 → 5000ppm (owner-approved).** NewsNation's transport clock
+  WANDERS −700..−3400ppm and chattered arm/release across the old 3000 line (~15 events/day,
+  ±0.3% pace steps — harmless but noisy, and follow demonstrably isn't load-bearing there:
+  the channel ran equally perfect unfollowed on WUCR + decimation). Follow now engages only
+  for the genuinely-broken-clock class it was built for (the +12000ppm relay-fault class);
+  release stays <2000 (wider hysteresis). Estimator, freeze, and unlatch logic unchanged.
+
 ## 0.9.15.4 (2026-07-04)
 
 - **Log legend caught up to 0.9.14/0.9.15 (owner-requested; doc-only, no behavior change).**
