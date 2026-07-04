@@ -39,7 +39,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "0.9.15.3"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "0.9.15.4"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 #define PTV_WD_DEADLINE_US (2 * (int64_t)AV_TIME_BASE)   /* watchdog stall threshold */
@@ -5906,7 +5906,16 @@ static void ptv_print_log_legend(int full)
         "             each transition: grows on 2 starvations/60min, shrinks after 6h quiet)\n"
         "  bank       (v0.9.14, shown when armed) AUTO-BANK actual/target ms: a bursty channel's\n"
         "             self-escalated compressed video_q cushion (1.5x worst stall, cap 12s); fills\n"
-        "             from the stalls' own retained latency, retires after 6h quiet\n"
+        "             from the stalls' own retained latency, retires after 6h quiet\n");
+    av_log(NULL, AV_LOG_INFO,
+        "  cf         (v0.9.15, shown when notable) coarse source-CLOCK estimate (ppm vs realtime,\n"
+        "             `?` = not yet locked ~60s). |cf|>3000 locked => output+PCR FOLLOW the source's\n"
+        "             true rate ([PTV-CLOCK] logs arm/release); frozen while BURSTY/bank is armed\n"
+        "             (clump delivery is not a clock measurement)\n"
+        "  decim      (v0.9.15.2, shown when >0) SURPLUS frames decimated: source delivers more real\n"
+        "             frames than its declared rate (e.g. ~25.4 fps declaring 25) — each skip is a\n"
+        "             content position already displayed, so perceived speed is always EXACTLY 1x;\n"
+        "             steady even accrual = correct (equals the surplus); never fires <=house-rate\n"
         "  lip-sync   NOT self-reported (internal PES skew is blind to content↔PTS offset). Measure\n"
         "             with the EXTERNAL oracle test-scripts/repro/drift-continuous.py.\n");
     av_log(NULL, AV_LOG_INFO,
@@ -5916,6 +5925,14 @@ static void ptv_print_log_legend(int full)
         "  [PTV-GLUE]     running per-input mis-mux stats — the LAYERA-retirement decision line:\n"
         "                 mean/max|err| ~0 over days => the simpler per-stream absorber suffices\n"
         "  [PTV-DISCONT]  per-stream PTS jump absorbed / audio GAP left to aresample padding\n");
+    av_log(NULL, AV_LOG_INFO,
+        "health events (always-on):\n"
+        "  [PTV-BURSTY]   per-minute delivery-stall status (count + worst gap + bank state) while a\n"
+        "                 channel is bursty-classified; also the auto-bank escalation advisor\n"
+        "  [PTV-CUSHION]  adaptive cushion tier moves + BANK escalations (target, sizing rationale)\n"
+        "  [PTV-CLOCK]    clock-follow arm/release (source clock offset FOLLOWED/back-in-range) +\n"
+        "                 estimator lifecycle (frozen on BURSTY, stuck-latch re-acquire, lock progress)\n"
+        "  [PTV-EMPTY]    frame_q starvation episodes >=2s (refill time; sub-2s aggregate per 60s)\n");
     av_log(NULL, AV_LOG_INFO,
         "multiview stats line — same head (frame/fps/time/dup/drop/dlvhold/dlvforced) + per slot:\n"
         "  inK:qdrop    input-K video queue overflow drops (demux side)\n"
@@ -5943,13 +5960,17 @@ static void ptv_print_log_legend(int full)
         "                 wall = wall_a(C)−wall_v(C) production timing · dts = the timestamp offset (expect\n"
         "                 flat = masked by AVLOCK) · span = async sample-vs-source-content slip (content domain)\n"
         "  [PTV-WATCHDOG] (always-on WARNING) the encoder stalled and stopped advancing\n"
-        "defaults (v0.9.10): WUCR occupancy pacing + LAYERA glue handling + REPRIME fast refill +\n"
-        "  ADAPTIVE cushion are all ON — no env needed for the production posture. Reverts:\n"
-        "  PTV_NO_WUCR · PTV_NO_LAYERA · PTV_NO_REPRIME · PTV_NO_ADAPTIVE · PTV_NO_AVLOCK ·\n"
+        "defaults (v0.9.15): WUCR occupancy pacing + LAYERA glue handling + REPRIME fast refill +\n"
+        "  ADAPTIVE cushion + delivery gate (single & mosaic) + cadence residence + AUTO-BANK +\n"
+        "  clock-follow + cadence decimation are all ON — no env needed for the production posture.\n"
+        "  Reverts: PTV_NO_WUCR · PTV_NO_LAYERA · PTV_NO_REPRIME · PTV_NO_ADAPTIVE · PTV_NO_AVLOCK ·\n"
+        "  PTV_NO_DELIVERY_MV · PTV_NO_RESIDENCE · PTV_NO_AUTOBANK · PTV_NO_CLOCKFOLLOW ·\n"
+        "  PTV_NO_DECIMATE ·\n"
         "  PTV_NO_EXACTTICK (re-enables the integer-tick ~10ppm NTSC lip-sync drift; A/B only) ·\n"
         "  PTV_NO_PULLDOWN (revert telecine-aware emit: film segments back to dup-fill + hs sawtooth)\n");
     av_log(NULL, AV_LOG_INFO,
-        "tuning: PTV_CUSHION_MS=N adaptive raised tier (default 4000, [1000,10000]) · PTV_FRAMEQ=N\n"
+        "tuning: PTV_CUSHION_MS=N adaptive raised tier (default 4000, [1000,10000]) · PTV_CUSHION_MAX_MS=N\n"
+        "  auto-bank ceiling (default 12000; beyond it = an upstream incident to surface) · PTV_FRAMEQ=N\n"
         "  frame_q capacity (default 160, [48,1024]) · PTV_PREROLL_MS=N startup cushion / base tier ·\n"
         "  PTV_DELIVERY_CAP_MS / PTV_DELIVERY_MAXQ delivery-gate sizing\n"
         "probes: PTV_DIAG=1 debug lines above · PTV_LOG_TS=1 prepend [timestamp] · PTV_DRIFTPROBE=1\n"

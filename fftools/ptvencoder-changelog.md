@@ -5,6 +5,17 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 0.9.15.4 (2026-07-04)
+
+- **Log legend caught up to 0.9.14/0.9.15 (owner-requested; doc-only, no behavior change).**
+  New `-stats` fields documented: `cf=` (coarse source-clock estimate, `?` unlocked, frozen on
+  BURSTY) and `decim=` (surplus-cadence decimation — steady even accrual is CORRECT and
+  perceived speed is always 1x). New "health events" section: [PTV-BURSTY] per-minute stall
+  status, [PTV-CUSHION] tier/BANK moves, [PTV-CLOCK] arm/release + estimator lifecycle,
+  [PTV-EMPTY] starvation episodes. Defaults block updated v0.9.10→v0.9.15 (adds delivery gate
+  mv, residence, auto-bank, clock-follow, decimation + their PTV_NO_* reverts); tuning adds
+  PTV_CUSHION_MAX_MS.
+
 ## 0.9.15.3 (2026-07-04)
 
 - **Unique TV pause/fast-forward REGRESSION fixed — decimation cursor + estimator bursty-freeze.**
