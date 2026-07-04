@@ -39,7 +39,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "0.9.15.5"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "0.9.16"     /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 #define PTV_WD_DEADLINE_US (2 * (int64_t)AV_TIME_BASE)   /* watchdog stall threshold */
@@ -631,7 +631,7 @@ void show_help_default(const char *opt, const char *arg)
         "    PTV_NO_DELIVERY     audio delivery-alignment gate     PTV_NO_DELIVERY_MV ungated mosaics (pre-0.9.12.1)\n"
         "    PTV_NO_RESIDENCE    mosaic per-slot source-rate cadence (pre-0.9.13 pop-per-tick)\n"
         "    PTV_NO_AUTOBANK     runtime bursty-channel bank escalation (back to advisor-only)\n"
-        "    PTV_NO_CLOCKFOLLOW  following a large verified source-clock offset (>0.3%; e.g. a fast relay)\n"
+        "    PTV_NO_CLOCKFOLLOW  following a large verified source-clock offset (>0.5%%; e.g. a fast relay)\n"
         "   logging: PTV_DIAG=1 debug lines · PTV_LOG_TS=1 timestamp prefix · see -log-legend for probes\n");
 }
 
@@ -4701,7 +4701,12 @@ static void *compositor_thread(void *arg)
             else                   st = blackf[k] ? av_frame_clone(blackf[k]) : NULL;
             if (!st) continue;
             st->pts = tick; st->pkt_dts = AV_NOPTS_VALUE;
-            if (av_buffersrc_add_frame(c->fsrc[k], st) < 0) av_frame_free(&st);
+            /* v0.9.16: add_frame consumes only the REFERENCE (frame reset, struct still ours) —
+             * the clone shell must be freed on success too, else 448B leak per slot per tick
+             * (~193MB/h on a 2x2 grid; the cor-2 mosaic RSS leak, masked for weeks by daily
+             * sync_check restarts). On failure the frame is untouched; free releases the ref. */
+            { int fr = av_buffersrc_add_frame(c->fsrc[k], st); (void)fr; }
+            av_frame_free(&st);
         }
 
         for (r = 0; r < R; r++) {                    /* pull each rung's composited frame */

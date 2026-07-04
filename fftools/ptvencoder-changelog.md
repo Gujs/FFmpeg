@@ -5,6 +5,23 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 0.9.16 (2026-07-04) — stability release, part 1
+
+- **MULTIVIEW MEMORY LEAK FIXED — one AVFrame shell (448 B) leaked per slot per tick.** The
+  compositor's per-slot graph feed cloned a frame shell each tick and relied on
+  `av_buffersrc_add_frame()` to dispose of it — but that call consumes only the *reference*
+  (struct reset, still caller-owned), so on every success the shell leaked: 4-slot grid ×
+  30 ticks/s × 448 B ≈ **193 MB/h**, 2-slot ≈ 97 MB/h. Exactly matches the cor-2 fleet
+  measurement (big mosaics 175–240 MB/h, small 85–125, 2:1 class ratio = slot count;
+  single-input unaffected — its feed reuses a long-lived struct correctly). **The leak was
+  historically masked by sync_check restarting mosaics daily; 0.9.12.1 stopped those restarts,
+  making this the #1 uptime bound (~4 GB/day/mosaic).** Confirmed with macOS `leaks` on a live
+  local 2×2: 11,835 leaked 448-byte allocations growing at ~120/s (= 4 × 29.97). Fix: free the
+  shell after the add (reference consumed on success; frame untouched on error). Found during
+  the 1.0 stability review (analysis/ptvencoder-v1-cleanup-plan.md §3.1).
+- Help text: escaped the `%` in the PTV_NO_CLOCKFOLLOW line (invalid printf conversion) and
+  updated its stale 0.3% figure to the 0.9.15.5 threshold (0.5%).
+
 ## 0.9.15.5 (2026-07-04)
 
 - **Clock-follow arm threshold 3000 → 5000ppm (owner-approved).** NewsNation's transport clock
