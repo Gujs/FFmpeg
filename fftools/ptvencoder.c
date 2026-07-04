@@ -39,7 +39,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "0.9.15.2"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "0.9.15.3"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 #define PTV_WD_DEADLINE_US (2 * (int64_t)AV_TIME_BASE)   /* watchdog stall threshold */
@@ -1380,6 +1380,12 @@ static void *output_thread(void *arg)
     AVFrame *f;
     int have = 0, ret = 0;
     int64_t tick = 0, wall0 = 0, last_vpts = -1, gl_phase = 0;   /* gl_phase: v0.9.0 genlock-scaled cumulative wall span */
+    int64_t last_content_vpts = -1;  /* v0.9.15.3: content index of the last REAL frame emitted. Decimation must
+                                      * compare against PLAYED CONTENT, not last_vpts: each dup bumps last_vpts one
+                                      * tick past content (monotonic guard), so after a delivery stall last_vpts sits
+                                      * N ticks ahead and the refill clump all reads as "surplus" -> decimation eats
+                                      * the very latency AUTO-BANK retains -> dup/decim oscillation (Unique TV,
+                                      * dup=615K = decim=613K over 10h45m, 6s pause/fast-forward cycle). */
     int64_t held_src_pts = AV_NOPTS_VALUE;   /* ORIGINAL source pts of held frame (held->pts gets
                                                 overwritten to vpts on emit; dups must not re-read it) */
     int64_t diag_t0 = av_gettime_relative(), diag_last = diag_t0;
@@ -1493,7 +1499,11 @@ static void *output_thread(void *arg)
                     pops++;
                     if (g_decimate && pops < 3) {
                         int64_t hc = content_index(v, held->pts);
-                        if (hc >= 0 && hc <= last_vpts) { v->decim++; continue; }   /* surplus: take a fresher one */
+                        /* v0.9.15.3: surplus = maps to already-PLAYED content (last_content_vpts), NOT to the
+                         * dup-advanced output cursor (last_vpts) — post-stall refill frames are new content and
+                         * must play at 1x with the latency retained (the AUTO-BANK posture); only a genuinely
+                         * >house-rate cadence decimates. Catch-up fast-forward is gone by construction. */
+                        if (hc >= 0 && hc <= last_content_vpts) { v->decim++; continue; }   /* surplus: take a fresher one */
                     }
                     break;
                 } else if (ret == AVERROR_EOF) {
@@ -1675,6 +1685,17 @@ static void *output_thread(void *arg)
                         static int cf_following = 0;
                         int64_t cf_ppm = ((atomic_load_explicit(&g_cf_rate_q20, memory_order_relaxed)
                                            - (1 << 20)) * 1000000) >> 20;
+                        /* v0.9.15.3: a BURSTY-classified channel (auto-bank armed) violates the coarse
+                         * estimator's smooth-delivery assumption — its clump windows alias into a bogus
+                         * offset (Unique TV latched cf=+28450ppm -> followed +2% fast -> drained the very
+                         * bank that absorbs the clumps). Never follow while the bank is armed. */
+                        if (atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0) {
+                            if (cf_following) {
+                                cf_following = 0;
+                                av_log(NULL, AV_LOG_WARNING,
+                                       "[PTV-CLOCK] BURSTY channel (bank armed) — follow released, estimator untrusted\n");
+                            }
+                        } else
                         if (!cf_following && llabs(cf_ppm) > 3000) {
                             cf_following = 1;
                             av_log(NULL, AV_LOG_WARNING,
@@ -1736,6 +1757,9 @@ static void *output_thread(void *arg)
             if (vpts <= last_vpts) vpts = last_vpts + 1;   /* monotonic CFR; dup/hold -> next slot */
             held->pts = vpts; held->pkt_dts = AV_NOPTS_VALUE; held->duration = 0;
             last_vpts = vpts;
+            if (content_vpts >= 0)
+                last_content_vpts = content_vpts;   /* v0.9.15.3 decimation cursor: real content played
+                                                     * (held_src_pts survives dups -> idempotent on dup/hold) */
             /* Publish how far the house clock now runs AHEAD of source content
              * (vpts - content_vpts, in ticks). Each dup bumps vpts past content via
              * the monotonic guard, so this grows by one tick per dup and persists.
@@ -3986,6 +4010,7 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                             {
                                 static int64_t cf_ema = (1 << 20);
                                 static int     cf_chunks = 0, cf_skips = 0, cf_wins = 0;
+                                static int     cf_la_acc = 0, cf_la_tot = 0, cf_frozen = 0;
                                 int64_t cf_env = ((int64_t)(1 << 20)) * 3 / 100;    /* ±3% */
                                 /* v0.9.15.1: reject band 3000→8000ppm — at lock the EMA sits at only
                                  * ~72% of a true offset (alpha 1/16 x 20 chunks), so a ±3000 band
@@ -3994,6 +4019,23 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                                  * still rejects burst-alias spikes; max honest gap at lock for the
                                  * ±2% follow cap is ~5500. */
                                 int64_t cf_rej = ((int64_t)(1 << 20)) * 8 / 1000;   /* ±8000ppm */
+                                /* v0.9.15.3: FREEZE + RESET while the auto-bank is armed — clump
+                                 * delivery aliases the sub-window rates (DTS advances in bursts), and a
+                                 * burst-poisoned ema must not survive into follow (Unique TV latched
+                                 * +28450ppm). The BURSTY classifier is exactly the "windows are garbage
+                                 * here" signal. Re-acquires from scratch if the bank ever decays away. */
+                                if (atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0) {
+                                    if (!cf_frozen) {
+                                        cf_frozen = 1;
+                                        av_log(NULL, AV_LOG_WARNING,
+                                               "[PTV-CLOCK] estimator frozen+reset — BURSTY channel (bank armed), "
+                                               "clump windows are not a clock measurement\n");
+                                    }
+                                    cf_ema = (1 << 20); cf_chunks = 0; cf_la_acc = cf_la_tot = 0;
+                                    atomic_store_explicit(&g_cf_rate_q20, (int64_t)(1 << 20), memory_order_relaxed);
+                                    atomic_store_explicit(&g_cf_locked, 0, memory_order_relaxed);
+                                } else {
+                                cf_frozen = 0;
                                 cf_wins++;
                                 if (r > (1 << 20) - cf_env && r < (1 << 20) + cf_env &&
                                     (cf_chunks < 20 || (r - cf_ema < cf_rej && cf_ema - r < cf_rej))) {
@@ -4002,8 +4044,26 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                                     atomic_store_explicit(&g_cf_rate_q20, cf_ema, memory_order_relaxed);
                                     if (cf_chunks >= 20)
                                         atomic_store_explicit(&g_cf_locked, 1, memory_order_relaxed);
+                                    if (cf_chunks > 20) cf_la_acc++;
                                 } else
                                     cf_skips++;
+                                /* v0.9.15.3 stuck-latch unlock: post-lock, if the reject band throws away
+                                 * most windows for ~2min, the LOCKED estimate is what's wrong (an honest
+                                 * source accepts nearly every window post-0.9.15.1) — unlock and
+                                 * re-acquire instead of holding a value reality keeps contradicting. */
+                                if (cf_chunks > 20 && ++cf_la_tot >= 40) {
+                                    if (cf_la_acc < 10) {
+                                        av_log(NULL, AV_LOG_WARNING,
+                                               "[PTV-CLOCK] estimator unlatched — locked ema %+lldppm rejected %d/%d "
+                                               "recent windows; re-acquiring\n",
+                                               (long long)(((cf_ema - (1 << 20)) * 1000000) >> 20),
+                                               cf_la_tot - cf_la_acc, cf_la_tot);
+                                        cf_ema = (1 << 20); cf_chunks = 0;
+                                        atomic_store_explicit(&g_cf_rate_q20, (int64_t)(1 << 20), memory_order_relaxed);
+                                        atomic_store_explicit(&g_cf_locked, 0, memory_order_relaxed);
+                                    }
+                                    cf_la_acc = cf_la_tot = 0;
+                                }
                                 /* v0.9.15.1 breadcrumb: if the estimator can't lock, say why (always-on,
                                  * once per ~3min of windows) — first NewsNation deploy starved silently */
                                 if (!atomic_load_explicit(&g_cf_locked, memory_order_relaxed) &&
@@ -4012,6 +4072,7 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                                            "[PTV-CLOCK] estimator: %d/%d windows accepted, ema %+lldppm (lock needs 20)\n",
                                            cf_chunks, cf_wins,
                                            (long long)(((cf_ema - (1 << 20)) * 1000000) >> 20));
+                                }
                             }
                             /* GUARD-B: relative outlier reject — a burst-aliased window that jumps far from the
                              * running estimate is jitter, not a real rate change; skip it (slide the window

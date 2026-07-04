@@ -5,6 +5,32 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 0.9.15.3 (2026-07-04)
+
+- **Unique TV pause/fast-forward REGRESSION fixed — decimation cursor + estimator bursty-freeze.**
+  First bursty-channel encounter of 0.9.15.x (glo-1 Unique TV, 10h45m): `dup=615288` ≈
+  `decim=613220` = 53% of ALL output, a ~6s pause(+dups)/fast-forward(3x pops) cycle, with
+  `cf=+28450ppm` LATCHED and clock-follow pacing +2% fast. Three-link chain: (1) the coarse
+  estimator locked onto burst-aliased windows (HLS-clump DTS advance) and the 0.9.15.1-widened
+  reject band then held it there forever; (2) clock-follow armed on the bogus offset — a
+  structural +2% over-consumption that drained the auto-bank 0.9.14.2 had validated on this
+  very channel; (3) each starvation dup bumps `last_vpts` one tick past content (the monotonic
+  guard, by design), so the refill clump all read as "surplus" to the decimation check —
+  decimation ate the very latency the bank retains, and the pair oscillated forever. Fixes:
+  **(a) decimation compares against `last_content_vpts`** — the content index of the last REAL
+  frame emitted (dups don't advance it): post-stall refills are new content, play at 1x, latency
+  retained (the AUTO-BANK posture); catch-up fast-forward is gone BY CONSTRUCTION — decimation
+  can only ever skip frames mapping to already-displayed content, so perceived speed is always
+  exactly 1x. The <=3 pops/tick stays as a loop bound only (a 50fps feed into a 25 house = every
+  other frame skipped = correct conversion, still 1x). **(b) The coarse estimator FREEZES +
+  RESETS while the auto-bank is armed** (the BURSTY classifier is precisely the "these windows
+  are not a clock measurement" signal), and clock-follow force-releases — re-acquires from
+  scratch only if the bank decays away. **(c) Stuck-latch unlock**: post-lock, if >75% of ~2min
+  of windows are rejected, the LOCKED estimate is what's wrong (an honest source accepts nearly
+  all post-0.9.15.1) — unlock and re-acquire. NewsNation (smooth surplus, never banks, never
+  dups) is untouched by all three. Interim channel mitigation until deploy:
+  `PTV_NO_CLOCKFOLLOW=1,PTV_NO_DECIMATE=1` = exact 0.9.14.2 behavior.
+
 ## 0.9.15.2 (2026-07-03)
 
 - **CADENCE DECIMATION: surplus real-frame sources** (`PTV_NO_DECIMATE` reverts; `decim=`
