@@ -5,6 +5,20 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 0.9.16.2 (2026-07-05)
+
+- **Defensive: drain a parked pulldown lookahead in the normal pop path.** If cadence ever
+  disarms with a frame still in `nextf`, it previously sat orphaned until the next arm promoted
+  it stale (out-of-order emission + a one-tick house-skew spike the audio path samples via
+  AVLOCK). Rare-path guard, NOT a lip-sync fix: a 46-flap flash+beep A/B on a synthetic
+  soft-telecine flapping fixture (x264 --pulldown 32 segments alternating with native 29.97 —
+  the AWE flag-dropout profile) measured **byte-identical A/V alignment with and without it**
+  (+42.8/+41.9 ms pre/post in both arms, 318 events each) — **flap transitions are A/V-neutral,
+  disproving pulldown flapping as the AWE lip-sync cause**. The AWE audio-early offset
+  (~−408 ms measured at 46 h uptime; owner: visible after ~24 h) is under investigation as a
+  slow accumulator — time-series tool: `test-scripts/repro/awe-drift-point.sh`. Fixture
+  generator: scratchpad make-flapfix.sh (soft-telecine SEI via x264 CLI; flash+beep ruler).
+
 ## 0.9.16.1 (2026-07-04) — stability release, part 2
 
 - **Sparse-PID wrap guard** (1.0 review §3.2): a PID silent for more than HALF the 33-bit wrap

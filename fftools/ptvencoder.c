@@ -39,7 +39,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "0.9.16.1"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "0.9.16.2"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 #define PTV_WD_DEADLINE_US (2 * (int64_t)AV_TIME_BASE)   /* watchdog stall threshold */
@@ -1481,6 +1481,18 @@ static void *output_thread(void *arg)
                     cadence_hold = 1;               /* held frame legitimately occupies this tick (3-field residence) */
             }
             /* queue empty + no lookahead: fall through = dup-on-empty exactly as today */
+        } else if (next_have) {
+            /* v0.9.16.2 (defensive): drain a PARKED pulldown lookahead first. If cadence ever
+             * disarms with a frame still in nextf, that frame would sit orphaned until the next
+             * arm promoted it STALE (out-of-order emission + a one-tick house-skew spike the
+             * audio path samples via AVLOCK). In the normal flow disarm lands on promote ticks
+             * (nextf just consumed), so this is a rare-path guard, NOT a lip-sync fix: a 46-flap
+             * flash+beep A/B (synthetic soft-telecine flapping, the AWE profile) measured
+             * byte-identical A/V alignment with and without it — flap transitions are A/V-neutral.
+             * The promoted frame is the NEXT content frame, so no decim check needed (mirrors the
+             * film path's own promotion). */
+            av_frame_unref(held); av_frame_move_ref(held, nextf); av_frame_free(&nextf);
+            next_have = 0; have = 1; fresh = 1; held_src_pts = held->pts; held_extra = 0;
         } else {
             /* v0.9.15.2 CADENCE DECIMATION (single-input mirror of the 0.9.13 mosaic multi-pop):
              * a frame whose content index does NOT advance past the last emitted tick is SURPLUS —
