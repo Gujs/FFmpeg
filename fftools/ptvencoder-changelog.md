@@ -5,6 +5,24 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 0.9.16.4 (2026-07-05) — HOTFIX: [PTV-AGLUE] forward steps are GAPS, not relabels
+
+- **Live failure of the 0.9.16.3 verdict rule within the hour of deploy (AWE Plus):** its audio
+  gaps are cut UPSTREAM, so the stream arrives flowing continuously — no wall pause at our end —
+  and the wall-continuity discriminator classified 4 forward gap steps (+87/+384/+85/+426ms,
+  splice pairs) as RELABELs, erasing +983ms in 16 s and putting audio visibly in front of video.
+  Owner caught it live; the event log made the wrong verdict diagnosable in minutes (these
+  events were fully invisible before 0.9.16.3).
+- **Corrected rule, direction-asymmetric:** BACKWARD steps → RELABEL erased (unambiguous —
+  content cannot be negatively missing; this is the real −9.5 ms/h audio-early accumulator fix,
+  A/B-validated: −308 ms permanent without glue → −10 ms with). FORWARD steps → GAP always:
+  labels kept, aresample pads — the pre-glue behavior that handled AWE's gaps correctly for
+  weeks. Wall-clock continuity is NOT usable evidence for forward steps; padding is faithful for
+  real gaps and latency-neutral for a genuine forward relabel (the source's own return step
+  cancels it).
+- Deploy note: any `PTV_AGLUE_MS=0` emergency override set for 0.9.16.3 should be REMOVED with
+  this version — =0 also disables the backward (accumulator) fix.
+
 ## 0.9.16.3 (2026-07-05) — the lip-sync accumulator fix ([PTV-AGLUE]) + birth log ([PTV-ANCHOR])
 
 - **[PTV-AGLUE] symmetric audio label-step glue — the AWE-class slow lip-sync accumulator,
