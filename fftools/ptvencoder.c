@@ -39,7 +39,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "0.9.16.2"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "0.9.16.3"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 #define PTV_WD_DEADLINE_US (2 * (int64_t)AV_TIME_BASE)   /* watchdog stall threshold */
@@ -135,6 +135,14 @@ static int     g_gapdiscrim = 1;          /* gap-fix (2026-06-26): on a FORWARD 
                                            * as before. PTV_NO_GAPDISCRIM=1 reverts to unconditional forward absorb (old behaviour). */
 static int64_t g_gap_min_us = 700000;     /* min wall-absence (us) to call a forward audio jump a real GAP when video did not also cross */
 static int64_t g_wrap_guard_us = 0;       /* v0.9.16.1: sparse-PID wrap-guard threshold override (us); 0 = half the wrap period (13.26h @90kHz). PTV_WRAP_GUARD_S, TEST ONLY */
+static int     g_aglue_ms = 60;           /* v0.9.16.3 [PTV-AGLUE]: audio label-step glue threshold (ms); a decoded-audio in-pts step
+                                           * beyond this (either direction) gets an explicit RELABEL-vs-GAP verdict at audio_feed —
+                                           * the sub-1s band where the demux absorber (LAYERA-disabled) and LAYERA (>1s) are both
+                                           * blind and aresample=async silently followed audio labels while video labels are
+                                           * structurally erased by the house clock (the AWE-class lip-sync accumulator).
+                                           * PTV_AGLUE_MS overrides; 0 disables (reverts to silent label-following). */
+static int     g_aglue_max_ms = 900;      /* [PTV-AGLUE] cap (ms): steps above this are the >1s discontinuity layer's job
+                                           * (demux_unwrap/LAYERA) — the glue logs and stands aside. PTV_AGLUE_MAX_MS overrides. */
 /* P2 §7.1 (hybrid): apply the program-level discontinuity offset (tracked from the dense VIDEO reference)
  * to the SPARSE copied streams (DVB-sub/teletext, data, SCTE-35) that can't self-rebase — so an ad-break
  * PTS jump shifts them WITH the video instead of orphaning/vanishing them. Dense V/A (incl. copied AC-3)
@@ -1319,7 +1327,14 @@ static void *decode_thread(void *arg)
                     const char *hd = getenv("PTV_H0_DELAY_MS");   /* TEST ONLY: simulate slow first-frame acquire */
                     if (hd && atoi(hd) > 0) av_usleep((unsigned)atoi(hd) * 1000);
                     pthread_mutex_lock(d->h0_lock);
-                    if (*d->h0 == AV_NOPTS_VALUE) *d->h0 = av_rescale_q(ts, d->ist_tb, AV_TIME_BASE_Q);
+                    if (*d->h0 == AV_NOPTS_VALUE) {
+                        *d->h0 = av_rescale_q(ts, d->ist_tb, AV_TIME_BASE_Q);
+                        /* [PTV-ANCHOR] (v0.9.16.3, always-on): the video half of the birth pair —
+                         * each audio track logs its first_audio-h0 offset against this. */
+                        av_log(NULL, AV_LOG_WARNING,
+                               "ptvencoder: [PTV-ANCHOR] h0 anchored at %"PRId64"ms (first decoded video frame)\n",
+                               *d->h0 / 1000);
+                    }
                     pthread_mutex_unlock(d->h0_lock);
                 }
             }
@@ -2031,6 +2046,26 @@ typedef struct AudioState {
     int              pll_drop, pll_pad;               /* pending one-shot acquire: frames to drop (advance) / pad (delay), on the B1 base */
     int64_t          pll_guard_fires;                 /* monotonic-guard activations (windup observability) */
     _Atomic int_least64_t *disturb_epoch;             /* compositor/demux publish this input's disturbance epoch (slate-return / discont) */
+    /* v0.9.16.x lip-sync instrumentation (PTV_DIAG): where do audio label steps get eaten?
+     * [PTV-ASTEP] fires on any in-pts (pre-graph) or sink-pts (post-graph) discontinuity;
+     * [PTV-AFLOW] cumulative in/out sample counters — a graph CONTENT drop/pad shows as a
+     * step in (in−out), a TIMELINE adoption shows sink-pts absorbing the step with (in−out)
+     * unchanged. The pair discriminates what black-box runs could not. */
+    int64_t          dbg_in_us, dbg_in_dur_us;        /* last in-pts (us) + expected frame span */
+    int64_t          dbg_sink_us, dbg_sink_dur_us;    /* last sink-pts (us) + expected span */
+    int64_t          dbg_in_samp, dbg_out_samp;       /* cumulative samples fed / drained */
+    int64_t          dbg_flow_last_us;                /* [PTV-AFLOW] cadence */
+    /* v0.9.16.3 [PTV-AGLUE] — symmetric audio label-step glue (see audio_feed). State is in the
+     * RAW label domain (pre-glue, pre-AVLOCK) so LAYERA/house_skew actuation never looks like a
+     * source step. glue_off_us accumulates erased relabels and is added to every graph-input pts. */
+    int64_t          glue_off_us;                     /* cumulative relabel offset applied to input labels (us) */
+    int64_t          glue_raw_last_us;                /* last RAW in-pts (us); NOPTS until first frame */
+    int64_t          glue_raw_dur_us;                 /* its frame span (us) */
+    int64_t          glue_wall_last_us;               /* monotonic wall time of the previous fed frame */
+    int              glue_events;                     /* RELABEL verdicts this run */
+    /* v0.9.16.3 [PTV-ANCHOR] — birth-relationship observability (Zimbo-class startup offsets). */
+    int              anchor_drop_pre;                 /* frames dropped because content preceded h0 */
+    int              anchor_drop_ring;                /* pre-h0 ring overflow drops (oldest evicted) */
 } AudioState;
 
 /* encode the SAME loudness-processed frame into each rung's own AAC encoder (so
@@ -2106,6 +2141,24 @@ static int audio_drain_fg(AudioState *a)
             int64_t src_abs_us = av_rescale_q(filt->pts, sink_tb, AV_TIME_BASE_Q);  /* A/V probe: this frame's (post-async) source content time (us), before pts is rebased */
             if (a->dbg_k == 0)   /* [PTV-CHAIN] primary-audio source-content being emitted (us) */
                 atomic_store_explicit(&g_ch_aout_src, src_abs_us, memory_order_relaxed);
+            if (g_diag) {   /* [PTV-ASTEP]/[PTV-AFLOW]: post-graph step detector + content-flow ledger */
+                if (a->dbg_sink_us && llabs(src_abs_us - (a->dbg_sink_us + a->dbg_sink_dur_us)) > 5000)
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-ASTEP] sink-pts step %+lldms (sink=%lldus expect=%lldus)\n",
+                           (long long)((src_abs_us - a->dbg_sink_us - a->dbg_sink_dur_us) / 1000),
+                           (long long)src_abs_us, (long long)(a->dbg_sink_us + a->dbg_sink_dur_us));
+                a->dbg_sink_us = src_abs_us;
+                a->dbg_sink_dur_us = av_rescale(filt->nb_samples, 1000000, a->out_rate);
+                a->dbg_out_samp += filt->nb_samples;
+                int64_t nowf = av_gettime_relative();
+                if (nowf - a->dbg_flow_last_us >= 5000000) {
+                    a->dbg_flow_last_us = nowf;
+                    av_log(NULL, AV_LOG_INFO,
+                           "[PTV-AFLOW] a%d in_samp=%lld out_samp=%lld imbalance=%+lldms in_pts=%lldms sink_pts=%lldms\n",
+                           a->dbg_k, (long long)a->dbg_in_samp, (long long)a->dbg_out_samp,
+                           (long long)((a->dbg_in_samp - a->dbg_out_samp) * 1000 / (a->out_rate > 0 ? a->out_rate : 48000)),
+                           (long long)(a->dbg_in_us / 1000), (long long)(src_abs_us / 1000));
+                }
+            }
             /* Content-anchored output PTS = source content − h0. This rides the source clock (so with
              * AVLOCK off the wire sensor is non-blind) AND is discontinuity-absorbed by demux_unwrap
              * (so it survives real splices) — this is the Φ-real path. The free-running counter below
@@ -2691,9 +2744,69 @@ static int audio_feed(AudioState *a, AVFrame *frame)
          * is the necessary coupling that keeps A/V matched through dups. AVLOCK was never the disease;
          * UNBOUNDED house_skew (free house clock) was — and W0's ρ servo bounds it, making AVLOCK
          * harmless + correct. Removing AVLOCK (the original W1) caused the −900ms desync on TruBLU. */
+        /* [PTV-AGLUE] Symmetric audio label-step glue (v0.9.16.3). Measured disease (3-act step
+         * fixture + [PTV-ASTEP]/[PTV-AFLOW], 2026-07-05): VIDEO label steps are structurally
+         * ERASED by the house clock (output is stamped by frame count, so input video label jumps
+         * are invisible — fixture boundary 1, +467ms video step, dup=0, no output change), but
+         * AUDIO label steps were FOLLOWED by aresample=async (fixture boundary 2, +465ms audio
+         * step → 450ms of silent pad → permanent audio-late residual, ZERO log lines). The
+         * per-track inconsistency turns any out-and-back or cross-track source relabel event into
+         * a permanent A/V offset equal to the audio step — the slow lip-sync accumulator class.
+         * Rule (both directions, so it cannot ratchet): a label step whose delivery kept flowing
+         * in wall-clock is a RELABEL → erase it (fold into glue_off_us; audio now matches the
+         * video side's structural erasure). A forward step whose delivery also gapped ~the step
+         * is real missing content → GAP → keep labels and let aresample pad (faithful, same as
+         * the v0.8.2 gap discriminator's logic). Backward steps are always relabels (content
+         * cannot be negatively missing). Steps above g_aglue_max_ms belong to the >1s
+         * discontinuity layer (demux_unwrap/LAYERA) — log and stand aside. Detection runs on RAW
+         * labels BEFORE the AVLOCK house_skew injection below, so LAYERA flushes / house_skew
+         * actuation never masquerade as source steps. */
+        if (g_aglue_ms > 0 && frame->pts != AV_NOPTS_VALUE) {
+            int64_t raw_us = av_rescale_q(frame->pts, a->ist_tb, AV_TIME_BASE_Q);
+            int64_t now_wc = av_gettime_relative();
+            if (a->glue_raw_last_us != AV_NOPTS_VALUE) {
+                int64_t step = raw_us - (a->glue_raw_last_us + a->glue_raw_dur_us);
+                if (llabs(step) > (int64_t)g_aglue_ms * 1000) {
+                    int64_t wall_gap = now_wc - a->glue_wall_last_us;
+                    if (llabs(step) > (int64_t)g_aglue_max_ms * 1000) {
+                        av_log(NULL, AV_LOG_WARNING,
+                               "ptvencoder: [PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms above %dms cap — left to the discontinuity layer\n",
+                               a->dbg_k, a->dbg_in, step / 1000, g_aglue_max_ms);
+                    } else if (step > 0 && wall_gap * 2 >= step) {
+                        av_log(NULL, AV_LOG_WARNING,
+                               "ptvencoder: [PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms with wall gap %"PRId64"ms — GAP (content missing; aresample pads)\n",
+                               a->dbg_k, a->dbg_in, step / 1000, wall_gap / 1000);
+                    } else {
+                        a->glue_off_us -= step;
+                        a->glue_events++;
+                        av_log(NULL, AV_LOG_WARNING,
+                               "ptvencoder: [PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms with wall gap %"PRId64"ms — RELABEL erased (glue total %+"PRId64"ms, event %d)\n",
+                               a->dbg_k, a->dbg_in, step / 1000, wall_gap / 1000,
+                               a->glue_off_us / 1000, a->glue_events);
+                    }
+                }
+            }
+            a->glue_raw_last_us  = raw_us;
+            a->glue_raw_dur_us   = frame->sample_rate > 0 ?
+                av_rescale(frame->nb_samples, 1000000, frame->sample_rate) : 0;
+            a->glue_wall_last_us = now_wc;
+            if (a->glue_off_us)
+                frame->pts += av_rescale_q(a->glue_off_us, AV_TIME_BASE_Q, a->ist_tb);
+        }
         if (g_avlock && (!g_phi1 || g_pll) && a->house_skew && !(a->multiview && g_audio_follow) && frame->pts != AV_NOPTS_VALUE) {
             int64_t sk = *a->house_skew;
             if (sk) frame->pts += av_rescale_q(sk, AV_TIME_BASE_Q, a->ist_tb);
+        }
+        if (g_diag && frame->pts != AV_NOPTS_VALUE) {   /* [PTV-ASTEP] pre-graph label-step detector */
+            int64_t inus = av_rescale_q(frame->pts, a->ist_tb, AV_TIME_BASE_Q);
+            if (a->dbg_in_us && llabs(inus - (a->dbg_in_us + a->dbg_in_dur_us)) > 5000)
+                av_log(NULL, AV_LOG_WARNING, "[PTV-ASTEP] in-pts step %+lldms (in=%lldus expect=%lldus)\n",
+                       (long long)((inus - a->dbg_in_us - a->dbg_in_dur_us) / 1000),
+                       (long long)inus, (long long)(a->dbg_in_us + a->dbg_in_dur_us));
+            a->dbg_in_us = inus;
+            a->dbg_in_dur_us = frame->sample_rate > 0 ?
+                av_rescale(frame->nb_samples, 1000000, frame->sample_rate) : 0;
+            a->dbg_in_samp += frame->nb_samples;
         }
         if ((ret = av_buffersrc_add_frame(a->afsrc, frame)) < 0)
             return ret;
@@ -2721,10 +2834,21 @@ static int audio_anchor_and_feed(AudioState *a, AVFrame *frame, int64_t h0)
     if (ts == AV_NOPTS_VALUE) return 0;
     if (!a->pts_set) {
         int64_t house_us = av_rescale_q(ts, a->ist_tb, AV_TIME_BASE_Q) - h0;
-        if (house_us < 0) return 0;                  /* audio precedes video anchor: drop */
+        if (house_us < 0) { a->anchor_drop_pre++; return 0; }   /* audio precedes video anchor: drop */
         a->next_pts = av_rescale(house_us, a->out_rate, 1000000);
         a->pts_set  = 1;
         a->dbg_first_src = ts;
+        /* [PTV-ANCHOR] (v0.9.16.3, always-on) — the birth A/V relationship this track is built on.
+         * house_us = first kept audio content − h0 (first video frame): the input-side head skew
+         * the whole run inherits. A large value here (with clean internals after) is the
+         * Zimbo-class startup-structural offset — visible at birth, invisible to every drift
+         * sensor. ring_dropped>0 means the pre-h0 buffer overflowed (audio led video by more
+         * than the ring; the kept head is NOT the true source head). */
+        av_log(NULL, AV_LOG_WARNING,
+               "ptvencoder: [PTV-ANCHOR] a%d(in%d) anchored: first_audio-h0=%+"PRId64"ms (h0=%"PRId64"ms) "
+               "dropped_pre_h0=%d ring_dropped=%d\n",
+               a->dbg_k, a->dbg_in, house_us / 1000, h0 / 1000,
+               a->anchor_drop_pre, a->anchor_drop_ring);
     }
     return audio_feed(a, frame);
 }
@@ -2751,6 +2875,7 @@ static int audio_push(AudioState *a, AVFrame *frame)
                 AVFrame *c = av_frame_clone(frame);
                 if (c) {
                     if (a->aq_npending >= g_aq_cap) {       /* ring (g_aq_cap; 256 default = byte-identical, PTV_AQ_PREROLL deep): drop oldest */
+                        a->anchor_drop_ring++;
                         av_frame_free(&a->aq_pending[0]);
                         memmove(a->aq_pending, a->aq_pending + 1,
                                 (g_aq_cap - 1) * sizeof(*a->aq_pending));
@@ -5421,6 +5546,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         as[k].multiview = (n_input > 1);                 /* multiview-only: enable deterministic audio-follow */
         as[k].af_applied_us = 0;
         as[k].dbg_k = k; as[k].dbg_in = asrc_in[k]; as[k].dbg_first_out = AV_NOPTS_VALUE;
+        as[k].glue_raw_last_us = AV_NOPTS_VALUE;         /* [PTV-AGLUE] no continuity reference yet */
         for (r = 0; r < n_rung; r++) {
             as[k].mux_q[r] = rung[r].mux_q;
             as[k].gate[r]  = delivery_on ? &rung[r].gate : NULL;   /* §7.5a: hold transcoded audio for the video front */
@@ -5980,7 +6106,15 @@ static void ptv_print_log_legend(int full)
         "                 (vid_err = source A/V mis-mux this glue corrected)\n"
         "  [PTV-GLUE]     running per-input mis-mux stats — the LAYERA-retirement decision line:\n"
         "                 mean/max|err| ~0 over days => the simpler per-stream absorber suffices\n"
-        "  [PTV-DISCONT]  per-stream PTS jump absorbed / audio GAP left to aresample padding\n");
+        "  [PTV-DISCONT]  per-stream PTS jump absorbed / audio GAP left to aresample padding\n"
+        "  [PTV-AGLUE]    (v0.9.16.3) sub-1s audio label step verdict: RELABEL (delivery kept\n"
+        "                 flowing => step erased, matching video's structural erasure) vs GAP\n"
+        "                 (delivery gapped too => real missing content, aresample pads). Closes\n"
+        "                 the silent band where async followed audio labels but video ignored\n"
+        "                 them — the slow lip-sync accumulator. PTV_AGLUE_MS=0 disables\n"
+        "  [PTV-ANCHOR]   (v0.9.16.3) birth A/V relationship: h0 (first video frame) + each\n"
+        "                 audio track's first_audio-h0 offset and pre-anchor drop counts — a\n"
+        "                 startup-structural lip-sync offset is visible HERE, not in drift\n");
     av_log(NULL, AV_LOG_INFO,
         "health events (always-on):\n"
         "  [PTV-BURSTY]   per-minute delivery-stall status (count + worst gap + bank state) while a\n"
@@ -6099,6 +6233,8 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_GAPDISCRIM")) g_gapdiscrim = 0;   /* gap-fix A/B: revert to unconditional forward absorb (old desync-on-audio-gap behaviour) */
     { const char *gm = getenv("PTV_GAP_MIN_MS"); if (gm && atoi(gm) > 0) g_gap_min_us = (int64_t)atoi(gm) * 1000; }  /* min wall-absence to call a forward audio jump a GAP */
     { const char *wg = getenv("PTV_WRAP_GUARD_S"); if (wg && atoi(wg) > 0) g_wrap_guard_us = (int64_t)atoi(wg) * 1000000; }  /* v0.9.16.1 wrap-guard threshold override (TEST ONLY) */
+    { const char *ag = getenv("PTV_AGLUE_MS");     if (ag) g_aglue_ms = atoi(ag); }          /* v0.9.16.3 label-step glue threshold; 0 disables */
+    { const char *ag = getenv("PTV_AGLUE_MAX_MS"); if (ag && atoi(ag) > 0) g_aglue_max_ms = atoi(ag); }
     { const char *dm = getenv("PTV_DISCONT_MS"); if (dm && atoi(dm) > 0) g_discont_ms = atoi(dm); }            /* forward jump threshold */
     { const char *dm = getenv("PTV_DISCONT_BACK_MS"); if (dm && atoi(dm) > 0) g_discont_back_ms = atoi(dm); }   /* backward jump threshold (anti-stall) */
     if (getenv("PTV_NO_PROG_OFF")) g_prog_off = 0;   /* P2: A/B — sparse copied streams get 33-bit wrap only (v0.6.23) */
