@@ -5,6 +5,34 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 0.9.16.3 (2026-07-05) — the lip-sync accumulator fix ([PTV-AGLUE]) + birth log ([PTV-ANCHOR])
+
+- **[PTV-AGLUE] symmetric audio label-step glue — the AWE-class slow lip-sync accumulator,
+  mechanism MEASURED and closed.** Instrumented 3-act step-fixture runs ([PTV-ASTEP] in-pts
+  camera + [PTV-AFLOW] sample ledger) plus raw-wire pts scans (`ffprobe -fflags nofillin`)
+  proved the disease is an ARCHITECTURAL inconsistency, not any single component: **video
+  label steps are structurally erased** by the house clock (output is stamped by frame count —
+  fixture boundary 1, a +467 ms video pts step: dup=0, output unchanged), while **audio label
+  steps were silently followed** by `aresample=async` (fixture boundary 2, +465 ms audio pts
+  step: ~450 ms of silence padded, flash+beep residual +471 ms PERMANENT, zero log lines).
+  Any source event that relabels tracks asymmetrically — or out-and-back — therefore banks a
+  permanent A/V offset equal to the audio step, invisible to every internal metric (avoff=0,
+  async ~0, the sub-1s band where the demux absorber is LAYERA-disabled and LAYERA is blind).
+  Fix: at `audio_feed`, a raw-label step beyond `PTV_AGLUE_MS` (default 60 ms, 0 disables) gets
+  an explicit logged verdict — **RELABEL** (wall-clock delivery kept flowing → erase the step
+  into a per-track glue offset, matching the video side) vs **GAP** (delivery gapped ~the step →
+  real missing content, labels kept, aresample pads — same logic as the v0.8.2 gap
+  discriminator). Backward steps are always relabels; steps above `PTV_AGLUE_MAX_MS` (900 ms)
+  are logged and left to the >1 s discontinuity layer. Detection runs on PRE-AVLOCK labels so
+  LAYERA/house_skew actuation can never masquerade as a source step.
+- **[PTV-ANCHOR] birth-relationship log (always-on, owner-requested):** h0 anchor (first decoded
+  video frame) + per-audio-track `first_audio-h0` offset with pre-anchor drop counts
+  (`dropped_pre_h0`, `ring_dropped`). A Zimbo-class startup-structural offset (fresh restart
+  already ~−1.1 s, internals flat forever after) is visible in THIS line, not in any drift
+  sensor.
+- Kept: the PTV_DIAG-gated [PTV-ASTEP]/[PTV-AFLOW] instrumentation that localized the mechanism
+  (in-pts/sink-pts step cameras + cumulative in/out sample ledger with 5 s cadence).
+
 ## 0.9.16.2 (2026-07-05)
 
 - **Defensive: drain a parked pulldown lookahead in the normal pop path.** If cadence ever
