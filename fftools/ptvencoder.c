@@ -39,7 +39,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "0.9.16.3"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "0.9.16.4"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 #define PTV_WD_DEADLINE_US (2 * (int64_t)AV_TIME_BASE)   /* watchdog stall threshold */
@@ -2744,23 +2744,29 @@ static int audio_feed(AudioState *a, AVFrame *frame)
          * is the necessary coupling that keeps A/V matched through dups. AVLOCK was never the disease;
          * UNBOUNDED house_skew (free house clock) was — and W0's ρ servo bounds it, making AVLOCK
          * harmless + correct. Removing AVLOCK (the original W1) caused the −900ms desync on TruBLU. */
-        /* [PTV-AGLUE] Symmetric audio label-step glue (v0.9.16.3). Measured disease (3-act step
-         * fixture + [PTV-ASTEP]/[PTV-AFLOW], 2026-07-05): VIDEO label steps are structurally
-         * ERASED by the house clock (output is stamped by frame count, so input video label jumps
-         * are invisible — fixture boundary 1, +467ms video step, dup=0, no output change), but
-         * AUDIO label steps were FOLLOWED by aresample=async (fixture boundary 2, +465ms audio
-         * step → 450ms of silent pad → permanent audio-late residual, ZERO log lines). The
-         * per-track inconsistency turns any out-and-back or cross-track source relabel event into
-         * a permanent A/V offset equal to the audio step — the slow lip-sync accumulator class.
-         * Rule (both directions, so it cannot ratchet): a label step whose delivery kept flowing
-         * in wall-clock is a RELABEL → erase it (fold into glue_off_us; audio now matches the
-         * video side's structural erasure). A forward step whose delivery also gapped ~the step
-         * is real missing content → GAP → keep labels and let aresample pad (faithful, same as
-         * the v0.8.2 gap discriminator's logic). Backward steps are always relabels (content
-         * cannot be negatively missing). Steps above g_aglue_max_ms belong to the >1s
-         * discontinuity layer (demux_unwrap/LAYERA) — log and stand aside. Detection runs on RAW
-         * labels BEFORE the AVLOCK house_skew injection below, so LAYERA flushes / house_skew
-         * actuation never masquerade as source steps. */
+        /* [PTV-AGLUE] Audio label-step glue (v0.9.16.3, verdict rule corrected v0.9.16.4).
+         * Measured disease (3-act step fixture + [PTV-ASTEP]/[PTV-AFLOW], 2026-07-05): VIDEO
+         * label steps are structurally ERASED by the house clock (output is stamped by frame
+         * count, so input video label jumps are invisible), but AUDIO label steps were silently
+         * FOLLOWED by aresample=async — a forward step pads silence (audio-late), a BACKWARD
+         * step drops content (audio-early: the AWE −9.5ms/h accumulator's sign; A/B-measured
+         * −308ms permanent from one −300ms wire step). ZERO log lines either way.
+         * Verdict rule, DIRECTION-ASYMMETRIC on purpose:
+         *   BACKWARD step → RELABEL, erase into glue_off_us. Content cannot be negatively
+         *   missing, so a backward label step is always a relabel; erasing matches the video
+         *   side's structural erasure and closes the audio-early accumulator.
+         *   FORWARD step → GAP, always: keep labels, aresample pads (the pre-glue behavior).
+         *   v0.9.16.3 tried to erase wall-continuous forward steps as relabels — LIVE FAILURE
+         *   within the hour (AWE 2026-07-05): its audio gaps are cut UPSTREAM, so the stream
+         *   arrives flowing with no wall pause at our end; 4 events erased +983ms in 16s and
+         *   put audio visibly in front of video. Wall-clock continuity is NOT usable evidence
+         *   for forward steps; padding is faithful for real gaps and merely latency-neutral
+         *   for a true forward relabel (audio-late by the step, which the source's own return
+         *   step later cancels).
+         * Steps above g_aglue_max_ms belong to the >1s discontinuity layer (demux_unwrap/
+         * LAYERA) — log and stand aside. Detection runs on RAW labels BEFORE the AVLOCK
+         * house_skew injection below, so LAYERA flushes / house_skew actuation never
+         * masquerade as source steps. */
         if (g_aglue_ms > 0 && frame->pts != AV_NOPTS_VALUE) {
             int64_t raw_us = av_rescale_q(frame->pts, a->ist_tb, AV_TIME_BASE_Q);
             int64_t now_wc = av_gettime_relative();
@@ -2772,15 +2778,15 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                         av_log(NULL, AV_LOG_WARNING,
                                "ptvencoder: [PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms above %dms cap — left to the discontinuity layer\n",
                                a->dbg_k, a->dbg_in, step / 1000, g_aglue_max_ms);
-                    } else if (step > 0 && wall_gap * 2 >= step) {
+                    } else if (step > 0) {
                         av_log(NULL, AV_LOG_WARNING,
-                               "ptvencoder: [PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms with wall gap %"PRId64"ms — GAP (content missing; aresample pads)\n",
+                               "ptvencoder: [PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms (wall gap %"PRId64"ms) — GAP; aresample pads\n",
                                a->dbg_k, a->dbg_in, step / 1000, wall_gap / 1000);
                     } else {
                         a->glue_off_us -= step;
                         a->glue_events++;
                         av_log(NULL, AV_LOG_WARNING,
-                               "ptvencoder: [PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms with wall gap %"PRId64"ms — RELABEL erased (glue total %+"PRId64"ms, event %d)\n",
+                               "ptvencoder: [PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms (wall gap %"PRId64"ms) — backward RELABEL erased (glue total %+"PRId64"ms, event %d)\n",
                                a->dbg_k, a->dbg_in, step / 1000, wall_gap / 1000,
                                a->glue_off_us / 1000, a->glue_events);
                     }
@@ -6107,11 +6113,11 @@ static void ptv_print_log_legend(int full)
         "  [PTV-GLUE]     running per-input mis-mux stats — the LAYERA-retirement decision line:\n"
         "                 mean/max|err| ~0 over days => the simpler per-stream absorber suffices\n"
         "  [PTV-DISCONT]  per-stream PTS jump absorbed / audio GAP left to aresample padding\n"
-        "  [PTV-AGLUE]    (v0.9.16.3) sub-1s audio label step verdict: RELABEL (delivery kept\n"
-        "                 flowing => step erased, matching video's structural erasure) vs GAP\n"
-        "                 (delivery gapped too => real missing content, aresample pads). Closes\n"
-        "                 the silent band where async followed audio labels but video ignored\n"
-        "                 them — the slow lip-sync accumulator. PTV_AGLUE_MS=0 disables\n"
+        "  [PTV-AGLUE]    (v0.9.16.4) sub-1s audio label step verdict, by direction: BACKWARD\n"
+        "                 => RELABEL erased (content can't be negatively missing; closes the\n"
+        "                 audio-early accumulator where aresample silently dropped content);\n"
+        "                 FORWARD => GAP, aresample pads (upstream-cut gaps arrive flowing, so\n"
+        "                 wall-clock is no evidence — the v0.9.16.3 lesson). PTV_AGLUE_MS=0 off\n"
         "  [PTV-ANCHOR]   (v0.9.16.3) birth A/V relationship: h0 (first video frame) + each\n"
         "                 audio track's first_audio-h0 offset and pre-anchor drop counts — a\n"
         "                 startup-structural lip-sync offset is visible HERE, not in drift\n");
