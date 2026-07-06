@@ -39,7 +39,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "0.9.17.1"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "0.9.18"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 #define PTV_WD_DEADLINE_US (2 * (int64_t)AV_TIME_BASE)   /* watchdog stall threshold */
@@ -282,6 +282,10 @@ static int64_t g_bank_decay_us = 6 * 3600 * 1000000LL;   /* PTV_BANK_DECAY_S: qu
 static _Atomic int     g_bank_pkts;           /* >0 = deep-bank semantics armed (master rung blocking push) */
 static _Atomic int64_t g_bank_us;             /* current bank TARGET (us) — stats/log readout */
 static _Atomic int     g_vq_elems;            /* video_q depth (pkts), demux-updated — the bank ACTUAL readout */
+static _Atomic int     g_fq_hw;               /* 0.9.18 #19: worst frame-queue depth ever seen (any rung; mv incl.
+                                               * hold.q) — one catch-up burst fills a rung to cap and the CUDA frame
+                                               * pool keeps that high-water forever, so this ≈ the per-process VRAM
+                                               * footprint driver (stats fqhw=) */
 static int     g_exacttick = 1;      /* v0.9.9 EXACTTICK (PTV_NO_EXACTTICK reverts): compute the video content
                                       * index with the EXACT rational frame duration instead of dividing by the
                                       * integer-us tick_dur_us. The integer tick (e.g. 33367 vs true 33366.667us
@@ -1000,6 +1004,11 @@ static void push_frame_q(AVThreadMessageQueue *q, int live, int64_t *framedrop, 
         }
     } else if (ret < 0) {
         av_frame_free(&out);
+    }
+    {   /* 0.9.18 #19: track the deepest any queue has ever been (fqhw=) */
+        int n  = av_thread_message_queue_nb_elems(q);
+        int hw = atomic_load_explicit(&g_fq_hw, memory_order_relaxed);
+        while (n > hw && !atomic_compare_exchange_weak(&g_fq_hw, &hw, n));
     }
 }
 
@@ -1814,14 +1823,15 @@ static void *output_thread(void *arg)
                  * wucr_rho IS the source-ppm readout. size=/bitrate= dropped (CBR is configured; cumulative
                  * averages carry no signal). speed= (cumulative) replaced by instantaneous fps=. qdrop=
                  * dropped (PTV_DIAG demux line still carries it). */
-                char wu[96] = "";                                    /* WUCR readout: buffer depth + recovered ρ (go/no-go vs srcppm) */
+                char wu[112] = "";                                   /* WUCR readout: buffer depth + recovered ρ (go/no-go vs srcppm) */
                 if (g_wucr) {
                     int occ = av_thread_message_queue_nb_elems(v->frame_q);
                     int64_t corr = atomic_load_explicit(&g_rho_corr_ppm, memory_order_relaxed);
                     int64_t hs   = v->house_skew ? *v->house_skew : 0;   /* W1 check: must stay ≈0 (ρ genlock → dups→0 → AVLOCK has nothing to inject) */
-                    snprintf(wu, sizeof wu, " wucr_buf=%df/%lldms wucr_rho=%+lldppm hs=%+lldms cushion=%dms",
+                    snprintf(wu, sizeof wu, " wucr_buf=%df/%lldms wucr_rho=%+lldppm hs=%+lldms cushion=%dms fqhw=%d",
                              occ, (long long)(occ * v->tick_dur_us / 1000), (long long)(-corr), (long long)(hs / 1000),
-                             (int)((int64_t)cur_sp * v->tick_dur_us / 1000));  /* -corr = recovered source dev (+=faster); cushion = adaptive tier target */
+                             (int)((int64_t)cur_sp * v->tick_dur_us / 1000),  /* -corr = recovered source dev (+=faster); cushion = adaptive tier target */
+                             atomic_load_explicit(&g_fq_hw, memory_order_relaxed));
                 }
                 char bk[48] = "";                                    /* v0.9.14 AUTO-BANK: actual/target — actual = TOTAL
                                                                       * buffered margin (compressed video_q + decoded frame_q) */
@@ -1993,6 +2003,10 @@ typedef struct AudioState {
     int64_t          glue_raw_dur_us;                 /* its frame span (us) */
     int64_t          glue_wall_last_us;               /* monotonic wall time of the previous fed frame */
     int              glue_events;                     /* RELABEL verdicts this run */
+    int64_t          glue_log_win_us;                 /* 0.9.18: verdict-log rate-limit window start (wall) */
+    int              glue_log_win_n;                  /* verdict lines emitted this window */
+    int              glue_supp_n;                     /* verdicts suppressed this window (still applied) */
+    int64_t          glue_supp_net_us;                /* net label movement of the suppressed verdicts */
     /* v0.9.16.3 [PTV-ANCHOR] — birth-relationship observability (Zimbo-class startup offsets). */
     int              anchor_drop_pre;                 /* frames dropped because content preceded h0 */
     int              anchor_drop_ring;                /* pre-h0 ring overflow drops (oldest evicted) */
@@ -2605,17 +2619,39 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                         av_log(NULL, AV_LOG_WARNING,
                                "[PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms above %dms cap — left to the discontinuity layer\n",
                                a->dbg_k, a->dbg_in, step / 1000, g_aglue_max_ms);
-                    } else if (step > 0) {
-                        av_log(NULL, AV_LOG_WARNING,
-                               "[PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms (wall gap %"PRId64"ms) — GAP; aresample pads\n",
-                               a->dbg_k, a->dbg_in, step / 1000, wall_gap / 1000);
                     } else {
-                        a->glue_off_us -= step;
-                        a->glue_events++;
-                        av_log(NULL, AV_LOG_WARNING,
-                               "[PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms (wall gap %"PRId64"ms) — backward RELABEL erased (glue total %+"PRId64"ms, event %d)\n",
-                               a->dbg_k, a->dbg_in, step / 1000, wall_gap / 1000,
-                               a->glue_off_us / 1000, a->glue_events);
+                        /* 0.9.18: verdict-LOG rate limit. An Azorse-class label flood (source labels
+                         * striding ~6x content = one verdict per frame, ~8 lines/s indefinitely) must
+                         * not drown the log. Verdicts still APPLY to every frame; only the per-event
+                         * lines are capped: 10 per 10s window, then one summary as the window rolls. */
+                        int allow;
+                        if (now_wc - a->glue_log_win_us >= 10000000) {
+                            if (a->glue_supp_n)
+                                av_log(NULL, AV_LOG_WARNING,
+                                       "[PTV-AGLUE] a%d(in%d) %d more label steps (net %+"PRId64"ms) suppressed in last 10s — source label flood, verdicts still applied\n",
+                                       a->dbg_k, a->dbg_in, a->glue_supp_n, a->glue_supp_net_us / 1000);
+                            a->glue_log_win_us = now_wc;
+                            a->glue_log_win_n  = 0;
+                            a->glue_supp_n     = 0;
+                            a->glue_supp_net_us = 0;
+                        }
+                        allow = a->glue_log_win_n < 10;
+                        if (allow) a->glue_log_win_n++;
+                        else     { a->glue_supp_n++; a->glue_supp_net_us += step; }
+                        if (step > 0) {
+                            if (allow)
+                                av_log(NULL, AV_LOG_WARNING,
+                                       "[PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms (wall gap %"PRId64"ms) — GAP; aresample pads\n",
+                                       a->dbg_k, a->dbg_in, step / 1000, wall_gap / 1000);
+                        } else {
+                            a->glue_off_us -= step;
+                            a->glue_events++;
+                            if (allow)
+                                av_log(NULL, AV_LOG_WARNING,
+                                       "[PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms (wall gap %"PRId64"ms) — backward RELABEL erased (glue total %+"PRId64"ms, event %d)\n",
+                                       a->dbg_k, a->dbg_in, step / 1000, wall_gap / 1000,
+                                       a->glue_off_us / 1000, a->glue_events);
+                        }
                     }
                 }
             }
@@ -5873,6 +5909,8 @@ static void ptv_print_log_legend(int full)
         "             cushion); normal ~1-2s, scales with the cushion\n"
         "  dlvforced  (gate) packets force-released because video STALLED — MUST stay ~0\n"
         "  wucr_buf   frame_q occupancy (frames/ms) — the jitter cushion fill vs cushion= target\n"
+        "  fqhw       deepest any frame queue has ever been (frames) — the CUDA pool high-water;\n"
+        "             this, not the cushion tier, sets the per-process VRAM footprint\n"
         "  wucr_rho   applied house-rate offset (ppm) = recovered source-clock deviation (+ = source\n"
         "             faster); pegged ±6000 = gentle-zone fill/drain in progress\n");
     av_log(NULL, AV_LOG_INFO,
@@ -6020,6 +6058,17 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_CLOCKFOLLOW")) g_clockfollow = 0;   /* v0.9.15: never follow a large source-clock offset (buffers pin + resampler churns on such sources) */
     if (getenv("PTV_NO_DECIMATE")) g_decimate = 0;         /* v0.9.15.2: keep pop-per-tick even for >house-rate sources (frame_q pins on surplus) */
     { const char *fq = getenv("PTV_FRAMEQ"); if (fq && atoi(fq) > 0) { int v = atoi(fq); if (v < PTV_FRAME_QDEPTH) v = PTV_FRAME_QDEPTH; if (v > 1024) v = 1024; g_frameq_cap = v; } }   /* frame_q (decode->output) capacity; raise + deep PTV_PREROLL_MS to absorb an ad-break decode-rate dip (AWE) */
+    {   /* 0.9.16.5 postmortem guard: a frame_q deeper than the NVENC registration cache makes every
+         * frame past the cache evict+re-register = 2 RM WRITE ioctls/frame/rung — at fleet scale that
+         * was the RM rwlock spiral. Cache is 512 (v2 patch 0003) unless PTV_NVENC_REG_CAP lowers it;
+         * an unpatched libavcodec is 64 and cannot be detected from here — patch 0003 is assumed. */
+        int reg = 512; const char *rc = getenv("PTV_NVENC_REG_CAP");
+        if (rc && atoi(rc) > 0) { reg = atoi(rc); if (reg < 64) reg = 64; if (reg > 512) reg = 512; }
+        if (g_frameq_cap + 32 > reg)
+            av_log(NULL, AV_LOG_WARNING,
+                   "PTV_FRAMEQ %d (+in-flight margin) exceeds the NVENC registration cache (%d) — expect per-frame registration thrash; lower PTV_FRAMEQ or raise PTV_NVENC_REG_CAP\n",
+                   g_frameq_cap, reg);
+    }
     if (getenv("PTV_NO_EXACTTICK")) g_exacttick = 0;   /* revert to integer-us tick content index (the ~10ppm NTSC drift) */
     if (getenv("PTV_NO_PULLDOWN"))  g_pulldown = 0;    /* v0.9.11: revert telecine-aware emit (film segments back to dup-fill) */
     if (getenv("PTV_NO_MV_EXACTTICK")) g_mv_exacttick = 0;  /* v0.9.12: revert mv measurement axes to integer tick (re-enables the enforced ~10ppm mosaic drift) */

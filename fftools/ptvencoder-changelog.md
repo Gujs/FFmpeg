@@ -5,6 +5,23 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 0.9.18 (in progress) — consolidation toward 1.0-rc
+
+Implementation map: `analysis/ptvencoder-0918-implementation-map.md`. Step 0 (this commit),
+observability only — zero behavior change:
+
+- **`fqhw=` stats field** (closes #19): deepest any frame queue has ever been. The 2026-07-06
+  fleet measurement + code trace showed per-process VRAM is set by the frame_q CUDA pool
+  HIGH-WATER (one catch-up burst fills a rung to `g_frameq_cap` and the pool keeps it forever),
+  NOT by the cushion tier — three live escalations moved GPU/RSS memory by zero. AUTO-BANK
+  banks compressed CPU packets by design; no structural fix needed or taken.
+- **[PTV-AGLUE] flood rate-limit**: an Azorse-class label flood (source audio labels striding
+  ~6× content = one verdict/frame ≈ 8 lines/s indefinitely) now logs 10 detail lines per 10 s
+  window + one suppression summary (net ms). Verdicts still apply to every frame.
+- **NVENC registration-cache startup guard** (0.9.16.5 postmortem): warn when
+  `PTV_FRAMEQ` + in-flight margin exceeds the registration cache (512 with v2 patch 0003,
+  or `PTV_NVENC_REG_CAP`) — the config that reproduces the fleet-wide RM rwlock spiral.
+
 ## 0.9.17.1 (2026-07-06) — audio path self-heals when an undecodable source recovers
 
 Azorse TV (live incident): the source intermittently emits broken 7.1-signaled AAC that NO
