@@ -39,7 +39,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "0.9.18"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "0.9.18.1"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 #define PTV_WD_DEADLINE_US (2 * (int64_t)AV_TIME_BASE)   /* watchdog stall threshold */
@@ -318,6 +318,14 @@ static int     g_pulldown = 1;       /* v0.9.11 telecine-aware emit (PTV_NO_PULL
                                       * consumption matches supply -> no starvation dups (irregular stutter), no
                                       * hs sawtooth -> no aresample hard-comps (the audio clicks), proper 2:3
                                       * cadence on the wire. Inert unless armed; non-film pop path is verbatim. */
+static int     g_cad_disarm = 1;     /* v0.9.18.1 M7 (PTV_NO_CADDISARM reverts): pulldown DISARM additionally
+                                      * requires CONTENT-RATE evidence (frame spacing back at ~house tick).
+                                      * AWE's encoder drops RFF flags for >=8-frame runs mid-film (measured
+                                      * 2026-07-06, test-results/pulldown-trap/): flag-only disarm then drains
+                                      * frame_q ~6f/s (29.97 house vs ~24 AU/s film — no cushion offsets a
+                                      * rate deficit) until the next flag run re-arms -> dup bursts + aresample
+                                      * hard-comps = the audible clicking. Frame spacing is evidence flags
+                                      * can't fake: film-in-NTSC arrives ~41.7ms/frame, real-time ~= tick. */
 static int     g_frameq_cap = 160;  /* decode->output jitter-buffer CAPACITY (frames; slots are pointers — memory
                                      * is used only by FILLED depth). v0.9.10 default 160 = headroom for the 4s
                                      * adaptive tier (~120f @30fps) + catch-up bursts, while bounding the worst-case
@@ -1734,6 +1742,9 @@ static void *output_thread(void *arg)
         AVFrame *nextf = NULL;
         int next_have = 0, film_arm = 0, held_extra = 0;
         unsigned rff_bits = 0;
+        int64_t cad_ema_us   = v->tick_dur_us;      /* M7: fresh-frame source-spacing EMA (tau ~8f); seeded real-time */
+        int64_t cad_prev_src = AV_NOPTS_VALUE;      /* previous fresh frame's SOURCE pts (held_src_pts domain) */
+        int     cad_dropouts = 0, cad_in_drop = 0;  /* flag-dropout EVENTS ridden this engagement + in-a-dropout flag */
 
     for (;;) {
         int fresh = 0, cadence_hold = 0;
@@ -1806,18 +1817,37 @@ static void *output_thread(void *arg)
         if (fresh && g_pulldown) {                  /* film-mode detector: progressive frames with rff==1 only
                                                      * (==1 excludes doubling/tripling 2/4 — the bogus pic_struct=7
                                                      * class; interlaced-flagged rff never arms) */
+            if (cad_prev_src != AV_NOPTS_VALUE && held_src_pts != AV_NOPTS_VALUE) {
+                int64_t dt = av_rescale_q(held_src_pts - cad_prev_src, v->out_tb, AV_TIME_BASE_Q);
+                if (dt > 0 && dt < 200000)          /* skip splices/jumps/wraps; keep the EMA honest */
+                    cad_ema_us += (dt - cad_ema_us) / 8;
+            }
+            cad_prev_src = held_src_pts;
             rff_bits = (rff_bits << 1) |
                        (held->repeat_pict == 1 && !(held->flags & AV_FRAME_FLAG_INTERLACED));
             int rn = av_popcount(rff_bits & 0xffu);
             if (!film_arm && rn >= 3) {
-                film_arm = 1;
+                film_arm = 1; cad_dropouts = 0; cad_in_drop = 0;
                 if (v->is_master)
                     av_log(NULL, AV_LOG_INFO, "[PTV-PULLDOWN] armed (telecine cadence detected: %d/8 rff frames)\n", rn);
             } else if (film_arm && rn == 0) {
-                film_arm = 0;
-                if (v->is_master)
-                    av_log(NULL, AV_LOG_INFO, "[PTV-PULLDOWN] disarmed (cadence ended; %"PRId64" holds)\n", v->pd);
-            }
+                /* v0.9.18.1 M7: disarm needs CONTENT-RATE evidence, not just absent flags (see
+                 * g_cad_disarm). Ride flag dropouts while spacing stays film-paced; a real
+                 * film->video transition brings spacing to ~tick within ~10-15 frames (EMA
+                 * tau 8) and disarms then — the few extra pd holds at the boundary are benign. */
+                if (!g_cad_disarm || cad_ema_us <= v->tick_dur_us + v->tick_dur_us / 8) {
+                    film_arm = 0;
+                    if (v->is_master)
+                        av_log(NULL, AV_LOG_INFO, "[PTV-PULLDOWN] disarmed (cadence ended; %"PRId64" holds, %d flag dropouts ridden)\n",
+                               v->pd, cad_dropouts);
+                } else if (!cad_in_drop) {
+                    cad_in_drop = 1;
+                    if (!cad_dropouts++ && v->is_master)
+                        av_log(NULL, AV_LOG_INFO, "[PTV-PULLDOWN] rff flags dropped out at film pacing (%.1fms/frame) — staying armed\n",
+                               cad_ema_us / 1000.0);
+                }
+            } else if (film_arm && rn > 0)
+                cad_in_drop = 0;                    /* flags returned — dropout event closed */
         }
 
         if (!primed) {                              /* one-time jitter-buffer pre-roll */
@@ -6280,6 +6310,7 @@ int main(int argc, char **argv)
     }
     if (getenv("PTV_NO_EXACTTICK")) g_exacttick = 0;   /* revert to integer-us tick content index (the ~10ppm NTSC drift) */
     if (getenv("PTV_NO_PULLDOWN"))  g_pulldown = 0;    /* v0.9.11: revert telecine-aware emit (film segments back to dup-fill) */
+    if (getenv("PTV_NO_CADDISARM")) g_cad_disarm = 0;  /* v0.9.18.1 M7: revert to flag-only pulldown disarm (dropouts drain frame_q again) */
     if (getenv("PTV_NO_MV_EXACTTICK")) g_mv_exacttick = 0;  /* v0.9.12: revert mv measurement axes to integer tick (re-enables the enforced ~10ppm mosaic drift) */
     if (getenv("PTV_NO_RESIDENCE")) g_mv_residence = 0;     /* v0.9.13: revert to one-pop-per-tick (rate-mismatched slots batch dups + fast-forward after starvation) */
     /* genlock preroll default + the three deep-prime side-cars moved to resolve_cushions() (0.9.18 M1) */

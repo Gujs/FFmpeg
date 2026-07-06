@@ -5,6 +5,26 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 0.9.18.1 (2026-07-06) — M7: cadence-evidence pulldown disarm (AWE clicking)
+
+Measured (test-results/pulldown-trap/ + cor-1/cor-3 log correlation): AWE's encoder emits
+unreliable RFF flags — solid-bogus segments (rff on EVERY frame of 29.97 real-time content;
+contained by content-projected residence, unchanged) AND >=8-frame flag DROPOUTS mid-film.
+Flag-only disarm (window==0) then drained frame_q ~6f/s (29.97 house vs ~24 AU/s film — no
+cushion offsets a rate deficit) until the next flag run re-armed: dup bursts + aresample
+hard-comps = the audible clicking (cor-1 AWE 14:00-15:00: queue pinned 1-3f, +1900 dups,
+async +-1900ppm).
+
+Fix: disarm additionally requires CONTENT-RATE evidence — fresh-frame source-spacing EMA
+(tau ~8f) at <= tick*9/8. Film pacing (~41.7ms) rides dropouts armed ("[PTV-PULLDOWN] rff
+flags dropped out at film pacing — staying armed" + dropouts-ridden count at disarm); a real
+film->video transition disarms within ~10-15 frames (few extra pd holds, benign). Arm logic
+unchanged. PTV_NO_CADDISARM reverts.
+
+Fixture A/B (synthetic soft-telecine + 12s flag dropout + real-time tail, x264 --pulldown 32):
+old = disarm at every dropout, dup=100; new = armed through dropouts, disarm on real-time
+evidence, dup=0.
+
 ## 0.9.18 (in progress) — consolidation toward 1.0-rc
 
 Implementation map: `analysis/ptvencoder-0918-implementation-map.md`. Step 0 (this commit),
