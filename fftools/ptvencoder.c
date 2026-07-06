@@ -39,7 +39,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "0.9.16.4"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "0.9.16.5"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 #define PTV_WD_DEADLINE_US (2 * (int64_t)AV_TIME_BASE)   /* watchdog stall threshold */
@@ -838,11 +838,22 @@ static void dlv_destroy(DlvGate *g)
     g->inited = 0;
 }
 
+/* PTV_NVENC_SERIALIZE (2026-07-06 scale incident, opt-in): serialize all rung threads' video
+ * encoder calls behind ONE process-wide mutex. Rationale: each avcodec_send/receive on NVENC
+ * enters the NVIDIA Resource-Manager rwlock via ioctl; 6 rung threads x N processes contending
+ * it collapses the driver lock into osq_lock spinning (measured 32% of box CPU at 56 channels;
+ * ffmpeg drives the same encoders from ONE thread per process at sys=5%). Serializing cuts this
+ * process's concurrent RM callers 6 -> 1. Costs sub-tick wall jitter only: pacing sleeps, PTS
+ * math and the delivery gate are untouched (the gate drain runs OUTSIDE the lock so a full
+ * mux_q can never stall sibling rungs behind the mutex). Default OFF until soaked. */
+static int             g_nvenc_serialize = 0;
+static pthread_mutex_t g_enc_serial_lock = PTHREAD_MUTEX_INITIALIZER;
+
 /* Drain an encoder, pushing packets to the mux queue. frame=NULL flushes. When `gate` is set, the
  * video front (the newest emitted DTS) is published and the held audio/copy is released in lockstep
  * (§7.5a). Video packets ALWAYS go straight to mux_q — they are the gating front, never held. */
-static int encode_push(AVThreadMessageQueue *mux_q, AVCodecContext *enc,
-                       AVStream *ost, AVFrame *frame, DlvGate *gate)
+static int encode_push_inner(AVThreadMessageQueue *mux_q, AVCodecContext *enc,
+                             AVStream *ost, AVFrame *frame, DlvGate *gate, int *need_drain)
 {
     int ret;
     /* Let the ENCODER choose the GOP: clear the decoder's leftover I/P/B
@@ -861,7 +872,7 @@ static int encode_push(AVThreadMessageQueue *mux_q, AVCodecContext *enc,
         ret = avcodec_receive_packet(enc, pkt);
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
             av_packet_free(&pkt);
-            if (gate) dlv_drain(gate);    /* video front advanced this call → release caught-up audio/copy */
+            if (gate) *need_drain = 1;    /* video front advanced this call → release caught-up audio/copy (outside the serialize lock) */
             return 0;
         }
         if (ret < 0) {
@@ -881,6 +892,17 @@ static int encode_push(AVThreadMessageQueue *mux_q, AVCodecContext *enc,
             if (gate && dts_us != AV_NOPTS_VALUE) dlv_publish_video(gate, dts_us);
         }
     }
+}
+
+static int encode_push(AVThreadMessageQueue *mux_q, AVCodecContext *enc,
+                       AVStream *ost, AVFrame *frame, DlvGate *gate)
+{
+    int need_drain = 0, ret;
+    if (g_nvenc_serialize) pthread_mutex_lock(&g_enc_serial_lock);
+    ret = encode_push_inner(mux_q, enc, ost, frame, gate, &need_drain);
+    if (g_nvenc_serialize) pthread_mutex_unlock(&g_enc_serial_lock);
+    if (need_drain && gate) dlv_drain(gate);
+    return ret;
 }
 
 /* ---- video: decode (free-run) + output (master clock, sample-and-hold) ---- */
@@ -6239,6 +6261,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_GAPDISCRIM")) g_gapdiscrim = 0;   /* gap-fix A/B: revert to unconditional forward absorb (old desync-on-audio-gap behaviour) */
     { const char *gm = getenv("PTV_GAP_MIN_MS"); if (gm && atoi(gm) > 0) g_gap_min_us = (int64_t)atoi(gm) * 1000; }  /* min wall-absence to call a forward audio jump a GAP */
     { const char *wg = getenv("PTV_WRAP_GUARD_S"); if (wg && atoi(wg) > 0) g_wrap_guard_us = (int64_t)atoi(wg) * 1000000; }  /* v0.9.16.1 wrap-guard threshold override (TEST ONLY) */
+    if (getenv("PTV_NVENC_SERIALIZE")) g_nvenc_serialize = 1;  /* v0.9.16.5 scale fix B2 (opt-in): one process-wide mutex around video encoder calls — cuts concurrent NVIDIA RM-lock callers 6->1 per process */
     { const char *ag = getenv("PTV_AGLUE_MS");     if (ag) g_aglue_ms = atoi(ag); }          /* v0.9.16.3 label-step glue threshold; 0 disables */
     { const char *ag = getenv("PTV_AGLUE_MAX_MS"); if (ag && atoi(ag) > 0) g_aglue_max_ms = atoi(ag); }
     { const char *dm = getenv("PTV_DISCONT_MS"); if (dm && atoi(dm) > 0) g_discont_ms = atoi(dm); }            /* forward jump threshold */

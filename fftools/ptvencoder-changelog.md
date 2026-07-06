@@ -5,6 +5,36 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 0.9.16.5 (2026-07-06) — SCALE FIX: NVIDIA RM-lock contention (the full-migration overload)
+
+Full cor-1 migration (~56 channels) overloaded the box while the same channels ran fine under
+ffmpeg (load 25 vs 270+, per-channel CPU 1.4×, ALL excess in sys time). Root cause measured on
+cor-3 (perf: osq_lock = 32% of box CPU; callgraph ioctl→rwsem_down_write_slowpath; live kernel
+stacks of the six per-rung threads all in os_acquire_rwlock_* [nvidia]): contention on the
+NVIDIA driver Resource-Manager rwlock, in a feedback spiral —
+
+  RM contention slows encode → frame_q backs up to its 160-frame cap (measured 56/56 channels
+  pinned) → the working set of CUDA buffers cycling through NVENC exceeds libavcodec's
+  64-entry registration cache → EVERY frame evicts+re-registers = 2 RM WRITE-lock ioctls per
+  frame per rung (~20k/s box-wide) → contention worsens. Invisible at 3 channels, cliff at 56.
+
+Two independent, env-gated fixes:
+- **B1 (libavcodec, rides the new v2 0003-nvenc patch): registration cache 64 → 512**
+  (MAX_REGISTERED_FRAMES, nvenc.h) so the deepest cushion (PTV_FRAMEQ cap 160 + in-flight)
+  re-registers nothing in steady state. PTV_NVENC_REG_CAP=64 restores byte-identical upstream
+  eviction for A/B. Registrations map already-allocated pool VRAM; entries are small records.
+- **B2 (ptvencoder.c, opt-in): PTV_NVENC_SERIALIZE=1** — one process-wide mutex around the
+  rung threads' video-encoder calls (encode_push), cutting this process's concurrent RM-lock
+  callers 6→1 (ffmpeg's single encode thread at sys=5% is the existence proof). Pacing, PTS
+  math and the delivery gate are untouched; the gate drain runs OUTSIDE the lock so a full
+  mux_q can never stall sibling rungs. Default OFF until soaked.
+
+Verify (same numbers that exposed it): perf osq_lock share, box sys% (target ≈5%), per-channel
+%CPU ≈ ffmpeg's ~50%, wucr_buf returning from 160f to the ~30f target, graduated ramp on cor-3
+(3→10→20→40→56). Secondary (NOT the gap, deferred): ptvencoder-added futex ~500-900/s from
+queue hops; the "mystery" ~660 nanosleeps/s are NVIDIA-driver backoff inside encode calls and
+should collapse with the contention.
+
 ## 0.9.16.4 (2026-07-05) — HOTFIX: [PTV-AGLUE] forward steps are GAPS, not relabels
 
 - **Live failure of the 0.9.16.3 verdict rule within the hour of deploy (AWE Plus):** its audio
