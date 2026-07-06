@@ -5,6 +5,33 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 0.9.17 (2026-07-06) — dead-code removal + logging cleanup (1.0 train, behavior-neutral)
+
+~330 lines of closed-investigation scaffolding deleted (1.0 review §4; every removed path was
+default-off env-gated → output-neutral by construction; build-verified per family):
+- **Φ suite** (~170): PTV_PHI1/PHIAV/PLL/PHI2/DRIFTPROBE/PHI1_RAMP/FREECNT — sensor block, mux
+  wire-PLL hooks, globals, env; AVLOCK gate simplified. EXACTTICK closed this investigation.
+- **PTV_AVTRIM** (~75): the actuator was never built (all 3 candidate signals proved blind);
+  the vring A/V probe STAYS but loses its AVTRIM-only wall[] column (vring_put/lookup simplified).
+- **PTV_RATE_LOCK** integral servo (~26, proven-bad WUCR ancestor), **PTV_ATRACE**,
+  **PTV_TICK_ADJ_US** (falsification-only; 4 pacing expressions simplified), **PTV_H0_DELAY_MS**.
+- Dormant B3 fields (g_pll_startup_us/g_pll_acquire_k set-never-read; AudioState pll_t0_us/
+  pll_arm_until_us/pll_disturb_seen/disturb_epoch — demux-side disturb_epoch/house_disturb STAY,
+  they feed the estimator freeze), dead singles (dbg_dec_sum, PTV_DISC_DROP_KF_TO_US, cf_skips),
+  repo-root stale test binaries.
+
+Logging (owner-flagged):
+- **Stripped the stray "ptvencoder: " prefix** from the remaining [PTV-*] event lines — the tag
+  is the identifier; grep patterns should match the bare tag.
+- **[PTV-CLOCK] estimator acquire-progress chatter → PTV_DIAG** ("X/N windows accepted"; on
+  chronically wandering sources it never durably locks by design and the line was permanent
+  noise ~15-25/h). FOLLOW/release + unlatch events stay always-on.
+- **PTV_AGLUE_MAX_MS default 900→1000**: closes the 900ms-1s orphan band (aglue stood aside,
+  LAYERA blind, aresample silently followed).
+
+Deferred to 0.9.18 (consolidation): env-surface tiering (~35 knobs → constants) — same lines as
+the statics→structs work, keeps this release small and provable.
+
 ## 0.9.16.5 (2026-07-06) — SCALE FIX: NVIDIA RM-lock contention (the full-migration overload)
 
 Full cor-1 migration (~56 channels) overloaded the box while the same channels ran fine under
