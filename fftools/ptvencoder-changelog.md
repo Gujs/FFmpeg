@@ -5,6 +5,26 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 0.9.17.1 (2026-07-06) — audio path self-heals when an undecodable source recovers
+
+Azorse TV (live incident): the source intermittently emits broken 7.1-signaled AAC that NO
+decoder setting can decode (verified: default AND -strict 1 both fail; ffmpeg's log shows the
+same errors). When ptvencoder STARTED during a broken phase, it built the audio path from the
+never-initialized decoder params (rate 0) → graph AND swr init failed → the track was skipped
+PERMANENTLY — audio never returned even after the source healed (ffmpeg recovers per-packet).
+The known "audio-init race" backlog item, observed live.
+
+Fix (app-layer): init failure is now retry-pending, not terminal — the tracked input params are
+seeded with an impossible rate (-1) so the FIRST cleanly decoded frames route through the
+existing [PTV-AFMT] hysteresis (5 stable frames) and rebuild the full -af path with real params;
+the AFMT rebuild also drops its old `was_fg` gate so a track that never had a working graph
+still gets one; a NULL-swr guard makes the dead-path window crash-proof. Validated on a
+dead-then-healing fixture (audio payloads corrupted for 60s then clean): init-fail logged,
+[PTV-AFMT] -1Hz→48kHz rebuild at heal, output audio present from the heal point.
+
+Note: while the source is IN a broken phase there is still no audio — that part is upstream's
+to fix; the encoder now rides through it and recovers on its own.
+
 ## 0.9.17 (2026-07-06) — dead-code removal + logging cleanup (1.0 train, behavior-neutral)
 
 ~330 lines of closed-investigation scaffolding deleted (1.0 review §4; every removed path was
