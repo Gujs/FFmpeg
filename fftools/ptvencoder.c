@@ -404,6 +404,25 @@ static _Atomic int64_t g_cf_rate_q20 = (1 << 20);     /* coarse source rate (con
 static _Atomic int     g_cf_locked;                    /* 20 clean chunks (~60s) before the servo may follow */
 static _Atomic int64_t g_src_rate_q20 = (1 << 20);   /* recovered source rate (content-µs/wall-µs), Q20 */
 static _Atomic int     g_src_rate_locked;            /* 0 until the FLL trusts the estimate */
+/* 0.9.18 R1 (map: analysis/ptvencoder-0918-implementation-map.md §2): demux-side rate-sensing
+ * state, hoisted verbatim from function-local statics in demux_dispatch. Conceptually one per
+ * INPUT (today exactly one → a singleton); R3/R4 fold the published g_src/cf atomics in and
+ * move the instance into the input wiring. Values below are the former statics' initializers. */
+typedef struct RateEstimator {
+    int64_t c0, w0, ema_q20;        /* tight-FLL sub-window anchor + rate EMA (Q20) */
+    int_least64_t ep_prev;          /* disturbance epoch of the current sub-window */
+    int     chunks;                 /* clean FLL chunks (lock at 8) */
+    int64_t cf_ema_q20;             /* coarse clock-follow rate EMA (Q20) */
+    int     cf_chunks, cf_wins, cf_la_acc, cf_la_tot, cf_frozen;
+} RateEstimator;
+static RateEstimator g_est = { .c0 = AV_NOPTS_VALUE, .ema_q20 = 1 << 20,
+                               .ep_prev = -1, .cf_ema_q20 = 1 << 20 };
+/* 0.9.18 R1: master-output-side house-rate actuation state (the ladder's memory). Starts with
+ * the clock-follow latch; R3/R4 fold in occ_ema/reprime/rho as the ladder is extracted. */
+typedef struct HouseRateState {
+    int cf_following;               /* clock-follow hysteresis latch (arm >5000, release <2000 ppm) */
+} HouseRateState;
+static HouseRateState g_hr;
 /* WUCR (W0): PTV_WUCR enables the occupancy-recovered house rate ρ — a type-2 PI loop on frame_q
  * fill, ±150ppm HARD clamp (physical crystal bound → runaway structurally impossible), burst-freeze
  * on super-physical fill slope. W0 drives ONLY the video pacer (per_tick) and surfaces buf/rho in
@@ -1693,7 +1712,7 @@ static void *output_thread(void *arg)
                      * sub-5000 offsets are handled fine unfollowed (WUCR + decimation, proven live),
                      * so follow engages only for the genuinely-broken-clock class it was built for. */
                     if (g_clockfollow && atomic_load_explicit(&g_cf_locked, memory_order_relaxed)) {
-                        static int cf_following = 0;
+                        HouseRateState *hr = &g_hr;   /* 0.9.18 R1: latch hoisted from a function-local static */
                         int64_t cf_ppm = ((atomic_load_explicit(&g_cf_rate_q20, memory_order_relaxed)
                                            - (1 << 20)) * 1000000) >> 20;
                         /* v0.9.15.3: a BURSTY-classified channel (auto-bank armed) violates the coarse
@@ -1701,25 +1720,25 @@ static void *output_thread(void *arg)
                          * offset (Unique TV latched cf=+28450ppm -> followed +2% fast -> drained the very
                          * bank that absorbs the clumps). Never follow while the bank is armed. */
                         if (atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0) {
-                            if (cf_following) {
-                                cf_following = 0;
+                            if (hr->cf_following) {
+                                hr->cf_following = 0;
                                 av_log(NULL, AV_LOG_WARNING,
                                        "[PTV-CLOCK] BURSTY channel (bank armed) — follow released, estimator untrusted\n");
                             }
                         } else
-                        if (!cf_following && llabs(cf_ppm) > 5000) {
-                            cf_following = 1;
+                        if (!hr->cf_following && llabs(cf_ppm) > 5000) {
+                            hr->cf_following = 1;
                             av_log(NULL, AV_LOG_WARNING,
                                    "[PTV-CLOCK] source clock runs %+lldppm off realtime — FOLLOWING it "
                                    "(output+PCR pace at the source's true rate; PTV_NO_CLOCKFOLLOW reverts)\n",
                                    (long long)cf_ppm);
-                        } else if (cf_following && llabs(cf_ppm) < 2000) {
-                            cf_following = 0;
+                        } else if (hr->cf_following && llabs(cf_ppm) < 2000) {
+                            hr->cf_following = 0;
                             av_log(NULL, AV_LOG_WARNING,
                                    "[PTV-CLOCK] source clock back within normal range (%+lldppm) — released\n",
                                    (long long)cf_ppm);
                         }
-                        if (cf_following)
+                        if (hr->cf_following)
                             corr -= av_clip64(cf_ppm, -20000, 20000);
                     }
                     atomic_store_explicit(&g_rho_corr_ppm, corr, memory_order_relaxed);
@@ -4034,16 +4053,14 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
              * re-anchors the CURRENT sub-window (discards the partial, can't skew Σdc) but KEEPS the learned
              * rate+lock (the source's physical clock is continuous across a content splice). */
             if (g_genlock && g_genlock_ok && out->dts != AV_NOPTS_VALUE) {
-                static int64_t c0 = AV_NOPTS_VALUE, w0 = 0, ema = (1 << 20);
-                static int_least64_t ep_prev = -1;
-                static int      chunks = 0;
+                RateEstimator *e = &g_est;   /* 0.9.18 R1: state hoisted from function-local statics */
                 int64_t c_now = av_rescale_q(out->dts, d->ifmt->streams[d->vstream]->time_base, AV_TIME_BASE_Q);
                 int64_t w_now = av_gettime_relative();
                 int_least64_t ep = d->disturb_epoch ? atomic_load_explicit(d->disturb_epoch, memory_order_relaxed) : 0;
-                if (c0 == AV_NOPTS_VALUE || ep != ep_prev) {     /* (re)anchor the current sub-window; keep ema+lock */
-                    ep_prev = ep; c0 = c_now; w0 = w_now;
+                if (e->c0 == AV_NOPTS_VALUE || ep != e->ep_prev) {   /* (re)anchor the current sub-window; keep ema+lock */
+                    e->ep_prev = ep; e->c0 = c_now; e->w0 = w_now;
                 } else {
-                    int64_t win_w = w_now - w0, win_c = c_now - c0;
+                    int64_t win_w = w_now - e->w0, win_c = c_now - e->c0;
                     if (win_w >= g_gl_window_us) {                          /* close a sub-window (default 3s; longer = less aliased) */
                         if (win_c > 0) {
                             int64_t r  = av_rescale(win_c, 1 << 20, win_w); /* unbiased sub-window rate, Q20 */
@@ -4054,9 +4071,6 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                              * lock) and a slower lock (20 clean chunks ≈ 60s). Sensor-only for the
                              * WUCR follow; the tight FLL below keeps its crystal-scale guards. */
                             {
-                                static int64_t cf_ema = (1 << 20);
-                                static int     cf_chunks = 0, cf_wins = 0;
-                                static int     cf_la_acc = 0, cf_la_tot = 0, cf_frozen = 0;
                                 int64_t cf_env = ((int64_t)(1 << 20)) * 3 / 100;    /* ±3% */
                                 /* v0.9.15.1: reject band 3000→8000ppm — at lock the EMA sits at only
                                  * ~72% of a true offset (alpha 1/16 x 20 chunks), so a ±3000 band
@@ -4071,43 +4085,43 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                                  * +28450ppm). The BURSTY classifier is exactly the "windows are garbage
                                  * here" signal. Re-acquires from scratch if the bank ever decays away. */
                                 if (atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0) {
-                                    if (!cf_frozen) {
-                                        cf_frozen = 1;
+                                    if (!e->cf_frozen) {
+                                        e->cf_frozen = 1;
                                         av_log(NULL, AV_LOG_WARNING,
                                                "[PTV-CLOCK] estimator frozen+reset — BURSTY channel (bank armed), "
                                                "clump windows are not a clock measurement\n");
                                     }
-                                    cf_ema = (1 << 20); cf_chunks = 0; cf_la_acc = cf_la_tot = 0;
+                                    e->cf_ema_q20 = (1 << 20); e->cf_chunks = 0; e->cf_la_acc = e->cf_la_tot = 0;
                                     atomic_store_explicit(&g_cf_rate_q20, (int64_t)(1 << 20), memory_order_relaxed);
                                     atomic_store_explicit(&g_cf_locked, 0, memory_order_relaxed);
                                 } else {
-                                cf_frozen = 0;
-                                cf_wins++;
+                                e->cf_frozen = 0;
+                                e->cf_wins++;
                                 if (r > (1 << 20) - cf_env && r < (1 << 20) + cf_env &&
-                                    (cf_chunks < 20 || (r - cf_ema < cf_rej && cf_ema - r < cf_rej))) {
-                                    cf_ema += (r - cf_ema) >> 4;                    /* alpha 1/16, tau ~50s */
-                                    if (cf_chunks < 100000) cf_chunks++;
-                                    atomic_store_explicit(&g_cf_rate_q20, cf_ema, memory_order_relaxed);
-                                    if (cf_chunks >= 20)
+                                    (e->cf_chunks < 20 || (r - e->cf_ema_q20 < cf_rej && e->cf_ema_q20 - r < cf_rej))) {
+                                    e->cf_ema_q20 += (r - e->cf_ema_q20) >> 4;      /* alpha 1/16, tau ~50s */
+                                    if (e->cf_chunks < 100000) e->cf_chunks++;
+                                    atomic_store_explicit(&g_cf_rate_q20, e->cf_ema_q20, memory_order_relaxed);
+                                    if (e->cf_chunks >= 20)
                                         atomic_store_explicit(&g_cf_locked, 1, memory_order_relaxed);
-                                    if (cf_chunks > 20) cf_la_acc++;
+                                    if (e->cf_chunks > 20) e->cf_la_acc++;
                                 }
                                 /* v0.9.15.3 stuck-latch unlock: post-lock, if the reject band throws away
                                  * most windows for ~2min, the LOCKED estimate is what's wrong (an honest
                                  * source accepts nearly every window post-0.9.15.1) — unlock and
                                  * re-acquire instead of holding a value reality keeps contradicting. */
-                                if (cf_chunks > 20 && ++cf_la_tot >= 40) {
-                                    if (cf_la_acc < 10) {
+                                if (e->cf_chunks > 20 && ++e->cf_la_tot >= 40) {
+                                    if (e->cf_la_acc < 10) {
                                         av_log(NULL, AV_LOG_WARNING,
                                                "[PTV-CLOCK] estimator unlatched — locked ema %+lldppm rejected %d/%d "
                                                "recent windows; re-acquiring\n",
-                                               (long long)(((cf_ema - (1 << 20)) * 1000000) >> 20),
-                                               cf_la_tot - cf_la_acc, cf_la_tot);
-                                        cf_ema = (1 << 20); cf_chunks = 0;
+                                               (long long)(((e->cf_ema_q20 - (1 << 20)) * 1000000) >> 20),
+                                               e->cf_la_tot - e->cf_la_acc, e->cf_la_tot);
+                                        e->cf_ema_q20 = (1 << 20); e->cf_chunks = 0;
                                         atomic_store_explicit(&g_cf_rate_q20, (int64_t)(1 << 20), memory_order_relaxed);
                                         atomic_store_explicit(&g_cf_locked, 0, memory_order_relaxed);
                                     }
-                                    cf_la_acc = cf_la_tot = 0;
+                                    e->cf_la_acc = e->cf_la_tot = 0;
                                 }
                                 /* v0.9.15.1 breadcrumb: if the estimator can't lock, say why (once per
                                  * ~3min of windows). v0.9.17: PTV_DIAG-gated — on chronically wandering
@@ -4116,11 +4130,11 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                                  * FOLLOW/release + unlatch events stay always-on and tell the real story. */
                                 if (g_diag &&
                                     !atomic_load_explicit(&g_cf_locked, memory_order_relaxed) &&
-                                    cf_wins % 60 == 0)
+                                    e->cf_wins % 60 == 0)
                                     av_log(NULL, AV_LOG_INFO,
                                            "[PTV-CLOCK] estimator: %d/%d windows accepted, ema %+lldppm (lock needs 20)\n",
-                                           cf_chunks, cf_wins,
-                                           (long long)(((cf_ema - (1 << 20)) * 1000000) >> 20));
+                                           e->cf_chunks, e->cf_wins,
+                                           (long long)(((e->cf_ema_q20 - (1 << 20)) * 1000000) >> 20));
                                 }
                             }
                             /* GUARD-B: relative outlier reject — a burst-aliased window that jumps far from the
@@ -4130,28 +4144,28 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                              * sub-window rates straddle the band would never accumulate the 8 chunks to lock
                              * (genlock would silently disable → revert to the old drift). The runaway is a
                              * post-lock phenomenon, so post-lock rejection is exactly what's needed. */
-                            int reject = g_genlock_guard && chunks >= 8 &&
-                                         (r - ema > g_gl_reject_q20 || ema - r > g_gl_reject_q20);
+                            int reject = g_genlock_guard && e->chunks >= 8 &&
+                                         (r - e->ema_q20 > g_gl_reject_q20 || e->ema_q20 - r > g_gl_reject_q20);
                             if (r >= lo && r <= hi && !reject) {
-                                int64_t step = (r - ema) >> g_gl_ema_shift; /* EMA (default α≈1/64 → τ≈4-5min) */
+                                int64_t step = (r - e->ema_q20) >> g_gl_ema_shift; /* EMA (default α≈1/64 → τ≈4-5min) */
                                 int64_t dmax = av_rescale((1 << 20) / 100000, g_gl_window_us, 3000000); /* slew ≈10ppm per 3s-window, scaled with the window → constant ppm/s */
                                 if (step > dmax) step = dmax;
                                 else if (step < -dmax) step = -dmax;
-                                ema += step;
+                                e->ema_q20 += step;
                                 /* GUARD-A: hard absolute bound — the applied house-clock rate can never exceed a
                                  * physical envelope, so a fooled estimate cannot drive the house_skew runaway. */
                                 if (g_genlock_guard) {
                                     int64_t emin = (1 << 20) - g_gl_max_q20, emax = (1 << 20) + g_gl_max_q20;
-                                    if (ema > emax) ema = emax;
-                                    else if (ema < emin) ema = emin;
+                                    if (e->ema_q20 > emax) e->ema_q20 = emax;
+                                    else if (e->ema_q20 < emin) e->ema_q20 = emin;
                                 }
-                                atomic_store_explicit(&g_src_rate_q20, ema, memory_order_relaxed);
-                                if (chunks < 100000) chunks++;
-                                if (chunks >= 8)                            /* ~24s+ of clean chunks → trust + apply */
+                                atomic_store_explicit(&g_src_rate_q20, e->ema_q20, memory_order_relaxed);
+                                if (e->chunks < 100000) e->chunks++;
+                                if (e->chunks >= 8)                         /* ~24s+ of clean chunks → trust + apply */
                                     atomic_store_explicit(&g_src_rate_locked, 1, memory_order_relaxed);
                             }
                         }
-                        c0 = c_now; w0 = w_now;                            /* slide to the next sub-window */
+                        e->c0 = c_now; e->w0 = w_now;                      /* slide to the next sub-window */
                     }
                 }
             }
