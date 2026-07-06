@@ -1026,25 +1026,27 @@ static void push_frame_q(AVThreadMessageQueue *q, int live, int64_t *framedrop, 
     if (!live) {                                  /* offline: lossless back-pressure */
         if (av_thread_message_queue_send(q, &out, 0) < 0)
             av_frame_free(&out);
-        return;
-    }
-    int ret = av_thread_message_queue_send(q, &out, AV_THREAD_MESSAGE_NONBLOCK);
-    if (ret == AVERROR(EAGAIN)) {                    /* full -> drop oldest, keep newest */
-        AVFrame *old;
-        if (av_thread_message_queue_recv(q, &old, AV_THREAD_MESSAGE_NONBLOCK) >= 0) {
-            av_frame_free(&old);
-            (*framedrop)++;                          /* v0.9.10: count drop-oldest — this is real skipped content
+    } else {
+        int ret = av_thread_message_queue_send(q, &out, AV_THREAD_MESSAGE_NONBLOCK);
+        if (ret == AVERROR(EAGAIN)) {                /* full -> drop oldest, keep newest */
+            AVFrame *old;
+            if (av_thread_message_queue_recv(q, &old, AV_THREAD_MESSAGE_NONBLOCK) >= 0) {
+                av_frame_free(&old);
+                (*framedrop)++;                      /* v0.9.10: count drop-oldest — this is real skipped content
                                                       * (catch-up overflow = the latency-drain meter); it was
                                                       * silent before, leaving stats drop= misleadingly at 0 */
-        }
-        if (av_thread_message_queue_send(q, &out, AV_THREAD_MESSAGE_NONBLOCK) < 0) {
+            }
+            if (av_thread_message_queue_send(q, &out, AV_THREAD_MESSAGE_NONBLOCK) < 0) {
+                av_frame_free(&out);
+                (*framedrop)++;
+            }
+        } else if (ret < 0) {
             av_frame_free(&out);
-            (*framedrop)++;
         }
-    } else if (ret < 0) {
-        av_frame_free(&out);
     }
-    {   /* 0.9.18 #19: track the deepest any queue has ever been (fqhw=) */
+    {   /* 0.9.18 #19: track the deepest any queue has ever been (fqhw=). Runs for the
+         * blocking path too — deep-prime/bank-armed masters are exactly the queues
+         * that pin deepest (the original early return blinded fqhw there). */
         int n  = av_thread_message_queue_nb_elems(q);
         int hw = atomic_load_explicit(&g_fq_hw, memory_order_relaxed);
         while (n > hw && !atomic_compare_exchange_weak(&g_fq_hw, &hw, n));
