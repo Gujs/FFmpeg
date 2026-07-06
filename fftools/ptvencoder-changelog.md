@@ -22,6 +22,16 @@ observability only — zero behavior change:
   `PTV_FRAMEQ` + in-flight margin exceeds the registration cache (512 with v2 patch 0003,
   or `PTV_NVENC_REG_CAP`) — the config that reproduces the fleet-wide RM rwlock spiral.
 
+Steps R1+R2 (pure code motion, zero behavior change; gated on identical regression set +
+live ρ/cf traces):
+
+- **R1** — the demux estimator's function-local statics hoisted into a `RateEstimator`
+  singleton; the clock-follow latch into `HouseRateState`.
+- **R2** — the house-rate correction ladder extracted as `house_rate_corr_ppm()` (its
+  signature declares the ladder's complete inputs) and both demux-side rate sensors as
+  `rate_estimator_feed()`. Prerequisites for per-input instances (R3/R4) and the 1.0-rc
+  file split.
+
 ## 0.9.17.1 (2026-07-06) — audio path self-heals when an undecodable source recovers
 
 Azorse TV (live incident): the source intermittently emits broken 7.1-signaled AAC that NO
