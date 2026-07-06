@@ -39,7 +39,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "0.9.17"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "0.9.17.1"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 #define PTV_WD_DEADLINE_US (2 * (int64_t)AV_TIME_BASE)   /* watchdog stall threshold */
@@ -2515,7 +2515,6 @@ static int audio_feed(AudioState *a, AVFrame *frame)
             return 0;                              /* still settling — drop (downstream can't take the change) */
         {   /* confirmed: rebuild for the new params (a->dec already reflects them) */
             char ochl[64], nchl[64], tchl[64];
-            int was_fg = a->use_fg;
             av_channel_layout_describe(&a->fg_in_chl, ochl, sizeof ochl);
             av_channel_layout_describe(&frame->ch_layout, nchl, sizeof nchl);
             av_channel_layout_describe(&a->out_chl, tchl, sizeof tchl);
@@ -2528,7 +2527,13 @@ static int audio_feed(AudioState *a, AVFrame *frame)
             a->afmt_stable = 0;
             if (a->afg) { avfilter_graph_free(&a->afg); a->afsrc = a->afsink = NULL; a->fg_swr = NULL; }
             a->use_fg = 0;
-            if (was_fg && a->fg_af &&
+            /* v0.9.17.1: rebuild the -af graph whenever the chain exists — INCLUDING for a track
+             * whose startup init failed outright (Azorse: source in an undecodable-AAC phase at
+             * open → probe/dec params garbage → graph AND swr init failed → the old code skipped
+             * the track FOREVER, even after the source healed; the old `was_fg` gate then also
+             * refused to build a graph here because the track never had one). a->dec reflects the
+             * confirmed good frames now, so this build has real params. */
+            if (a->fg_af &&
                 build_audio_filter(a, a->dec, a->ist_tb, a->fg_af, a->out_sfmt) < 0) {
                 avfilter_graph_free(&a->afg); a->use_fg = 0;
             }
@@ -2640,6 +2645,8 @@ static int audio_feed(AudioState *a, AVFrame *frame)
             return ret;
         return audio_drain_fg(a);
     }
+    if (!a->swr)                       /* v0.9.17.1: path dead (init failed, AFMT retry pending) — drop, never deref NULL */
+        return 0;
     out_max = av_rescale_rnd(swr_get_delay(a->swr, frame->sample_rate) + frame->nb_samples,
                              a->out_rate, frame->sample_rate, AV_ROUND_UP);
     if ((ret = av_samples_alloc_array_and_samples(&out, NULL, a->out_chl.nb_channels,
@@ -5114,12 +5121,27 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         if (!a->use_fg) {              /* no -af (or graph failed): plain resample */
             swr_alloc_set_opts2(&a->swr, &a->out_chl, sfmt, 48000,
                                 &a->dec->ch_layout, a->dec->sample_fmt, a->dec->sample_rate, 0, NULL);
-            if (!a->swr || swr_init(a->swr) < 0) { av_log(NULL, AV_LOG_WARNING, "audio track %d swr init failed; skipped\n", k); }
+            if (!a->swr || swr_init(a->swr) < 0) {
+                if (a->swr) swr_free(&a->swr);
+                av_log(NULL, AV_LOG_WARNING,
+                       "audio track %d path init failed (source audio undecodable/params unknown at open?) — "
+                       "will rebuild from the first cleanly decoded frames [PTV-AFMT]\n", k);
+            }
         }
         a->fg_af      = af;            /* remember the chain so audio_feed can rebuild on a source format change */
-        a->fg_in_rate = a->dec->sample_rate;   /* seed the tracked input params (so the first frame doesn't false-trigger) */
-        a->fg_in_fmt  = a->dec->sample_fmt;
-        av_channel_layout_copy(&a->fg_in_chl, &a->dec->ch_layout);
+        /* v0.9.17.1: seed the tracked input params — but if the path FAILED to init (dead source
+         * phase at open: Azorse's broken 7.1-signaled AAC decoded nothing → dec params garbage),
+         * seed an IMPOSSIBLE rate instead so the first cleanly decoded frame is guaranteed to
+         * differ and route through the [PTV-AFMT] hysteresis+rebuild — the skip is self-healing
+         * once the source recovers (ffmpeg-parity behavior) instead of permanent. */
+        if (a->use_fg || a->swr) {
+            a->fg_in_rate = a->dec->sample_rate;   /* live path: seed real params (no false trigger on frame 1) */
+            a->fg_in_fmt  = a->dec->sample_fmt;
+            av_channel_layout_copy(&a->fg_in_chl, &a->dec->ch_layout);
+        } else {
+            a->fg_in_rate = -1;                    /* dead path: force AFMT rebuild on first good frame */
+            a->fg_in_fmt  = AV_SAMPLE_FMT_NONE;
+        }
         asrc[n_audio]    = spec->stream;
         asrc_in[n_audio] = spec->input;
         n_audio++;
