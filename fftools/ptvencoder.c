@@ -450,6 +450,26 @@ static int64_t         g_reprime_last_end;           /* wall time the last engag
  * oscillation, no per-channel tuning; transitions log [PTV-CUSHION] and depth shows in -stats. */
 static int             g_adapt_cushion = 1;
 static int             g_cushion_ms = 4000;          /* RAISED tier (ms of frames); PTV_CUSHION_MS overrides, [1000,10000] */
+/* 0.9.18 M1 — CushionPlan: ALL cushion/queue sizing derived in ONE place (resolve_cushions()),
+ * in the units each value is consumed in. The g_* globals above stay authoritative for every
+ * consumer not yet repointed (mv compositor, BANK escalate/decay writes, adaptive GROW/SHRINK
+ * runtime stores, stats/log lines); resolve_cushions() assigns them AND mirrors them here. */
+typedef struct CushionPlan {
+    /* startup-resolved (env + genlock defaulting + deep-prime side-cars) */
+    int      preroll_ms;           /* resolved: env | genlock 1000 | 350   (replaces g_preroll_ms reads) */
+    int      videoq_pkts;          /* video_q capacity                     (g_videoq) */
+    int      frameq_cap;           /* per-rung frame_q capacity            (g_frameq_cap; parse stays in main()) */
+    int      audioq_pkts;          /* per-track audio_q capacity (live/deep rules folded in) */
+    int      aq_prehold;           /* pre-h0 audio ring depth              (g_aq_cap) */
+    int      deep_prime_pkts;      /* video_q startup bank; 0 = off        (single-input, from out_fps) */
+    int64_t  deep_prime_budget_us; /* decode start-delay budget (2x preroll) */
+    int64_t  delivery_cap_us;      /* gate force-release BASE (pre-bank)   (g_delivery_cap_us at init) */
+    int      delivery_maxq;        /* gate FIFO backstop                   (g_delivery_maxq) */
+    int64_t  cushion_raised_us;    /* adaptive RAISED tier                 (g_cushion_ms*1000) */
+    int64_t  bank_ceil_us;         /* AUTO-BANK ceiling                    (g_cushion_max_ms*1000) */
+    int64_t  bank_decay_us;        /* quiet time before the bank retires   (g_bank_decay_us) */
+} CushionPlan;
+static CushionPlan     g_cp;                          /* resolved once in transcode() setup, before threads start */
 static _Atomic int64_t g_rho_corr_ppm;               /* WUCR ρ: applied house-rate correction (ppm, corr>0 = house slower); ±6% clamp (±30% under re-prime) */
 static int64_t         g_occ_ema_milli;              /* WUCR: EMA-filtered master frame_q occupancy (milli-frames); master-thread only, non-atomic */
 static int             g_occ_ema_seeded;             /* WUCR: seed the EMA to the first occupancy sample so there is no startup-ramp transient */
@@ -1287,7 +1307,7 @@ static void *decode_thread(void *arg)
          * thread emits nothing — for up to `budget`. Normal (≈realtime source) fill takes ≈preroll_ms;
          * the 2x budget caps the worst case at ~2x preroll_ms (e.g. ~16s at PTV_PREROLL_MS=8000). This
          * is the deep buffer's latency, paid once at channel start (and on each crash-loop restart). */
-        int64_t budget = (int64_t)g_preroll_ms * 2000;   /* 2x preroll_ms, in us */
+        int64_t budget = g_cp.deep_prime_budget_us;   /* 2x preroll_ms, in us (resolve_cushions) */
         while (av_thread_message_queue_nb_elems(d->video_q) < d->deep_prime_packets
                && av_gettime_relative() - t0 < budget)
             av_usleep(5000);
@@ -1567,21 +1587,21 @@ static void *output_thread(void *arg)
      * PTS stays content-anchored to h0, so the cushion only shifts WHEN frames
      * emit, never their timestamps -> A/V sync is unchanged. */
     {
-        int preroll_ms = g_preroll_ms;   /* v0.9.1: single-input frame_q cushion tracks the resolved prime (genlock default ~1s); was a separate getenv→350 read */
+        int preroll_ms = g_cp.preroll_ms;   /* v0.9.1: single-input frame_q cushion tracks the resolved prime (genlock default ~1s); was a separate getenv→350 read */
         int n_prime = (preroll_ms > 0 && v->tick_dur_us > 0)
                           ? (int)((int64_t)preroll_ms * 1000 / v->tick_dur_us) : 0;
         int primed;
         int64_t eq_vq_s = 0, eq_fq_s = 0, eq_fq_h = 0, eq_mq_s = 0;  /* PTV-EMPTY per-queue empty-since (+ frame_q heartbeat) state */
         int64_t ep_agg_cnt = 0, ep_agg_min = 0, ep_agg_max = 0, ep_agg_t0 = 0;  /* 0.9.10.1: frame_q sub-2s episode aggregator (60s summary) */
-        if (n_prime > g_frameq_cap - 8) n_prime = g_frameq_cap - 8;
+        if (n_prime > g_cp.frameq_cap - 8) n_prime = g_cp.frameq_cap - 8;
         if (n_prime < 0) n_prime = 0;
         primed = (n_prime == 0);
         /* v0.9.10 adaptive cushion (master only): two discrete frame_q targets, lazy transitions. */
         int base_sp   = n_prime > 2 ? n_prime : 4;                    /* safety floor = the resolved preroll */
-        int raised_sp = (v->tick_dur_us > 0) ? (int)((int64_t)g_cushion_ms * 1000 / v->tick_dur_us) : base_sp;
+        int raised_sp = (v->tick_dur_us > 0) ? (int)(g_cp.cushion_raised_us / v->tick_dur_us) : base_sp;
         int cur_sp    = base_sp;
         int64_t ep_last_us = 0, ep_prev_us = 0;                       /* starvation-episode wall times (grow gate) */
-        if (raised_sp > g_frameq_cap - 8) raised_sp = g_frameq_cap - 8;
+        if (raised_sp > g_cp.frameq_cap - 8) raised_sp = g_cp.frameq_cap - 8;
         if (raised_sp < base_sp) raised_sp = base_sp;                 /* explicit deep preroll >= cushion -> adaptive no-op */
         /* v0.9.11 pulldown state: 1-frame lookahead + film-mode detector (see g_pulldown comment) */
         AVFrame *nextf = NULL;
@@ -2781,12 +2801,12 @@ static int audio_push(AudioState *a, AVFrame *frame)
             if (ts != AV_NOPTS_VALUE) {
                 AVFrame *c = av_frame_clone(frame);
                 if (c) {
-                    if (a->aq_npending >= g_aq_cap) {       /* ring (g_aq_cap; 256 default = byte-identical, PTV_AQ_PREROLL deep): drop oldest */
+                    if (a->aq_npending >= g_cp.aq_prehold) {       /* ring (aq_prehold; 256 default = byte-identical, PTV_AQ_PREROLL deep): drop oldest */
                         a->anchor_drop_ring++;
                         av_frame_free(&a->aq_pending[0]);
                         memmove(a->aq_pending, a->aq_pending + 1,
-                                (g_aq_cap - 1) * sizeof(*a->aq_pending));
-                        a->aq_npending = g_aq_cap - 1;
+                                (g_cp.aq_prehold - 1) * sizeof(*a->aq_pending));
+                        a->aq_npending = g_cp.aq_prehold - 1;
                     }
                     a->aq_pending[a->aq_npending++] = c;
                 }
@@ -3926,7 +3946,7 @@ end:
 static void ptv_autobank_escalate(DemuxArgs *d, int64_t worst_us, int64_t now)
 {
     int64_t want_us = worst_us * 3 / 2;
-    int64_t ceil_us = g_cushion_max_ms * 1000;
+    int64_t ceil_us = g_cp.bank_ceil_us;
     int64_t cur     = atomic_load_explicit(&g_bank_us, memory_order_relaxed);
     int     pkts, r;
     d->by_bank_last_q = now;
@@ -3944,7 +3964,7 @@ static void ptv_autobank_escalate(DemuxArgs *d, int64_t worst_us, int64_t now)
     if (want_us <= cur + 500000)                    /* hysteresis: gap jitter must not re-log identical escalations */
         return;
     pkts = (int)(want_us / 1000000 * 35) + 64;      /* ~35 pkt/s + margin (the advisor's proven sizing) */
-    if (pkts > g_videoq - 32) pkts = g_videoq - 32;
+    if (pkts > g_cp.videoq_pkts - 32) pkts = g_cp.videoq_pkts - 32;
     atomic_store_explicit(&g_bank_us, want_us, memory_order_relaxed);
     atomic_store_explicit(&g_bank_pkts, pkts, memory_order_relaxed);
     for (r = 0; r < d->n_out; r++)                  /* audio gate rides the deeper hold (waits out long stalls) */
@@ -4173,7 +4193,7 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                                (long long)(g_bank_decay_us / 1000000), d->by_gap_cnt);
                     if (d->autobank && d->by_bank_last_q &&
                         atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 &&
-                        bw - d->by_bank_last_q > g_bank_decay_us) {
+                        bw - d->by_bank_last_q > g_cp.bank_decay_us) {
                         int r2;
                         atomic_store_explicit(&g_bank_us, 0, memory_order_relaxed);
                         atomic_store_explicit(&g_bank_pkts, 0, memory_order_relaxed);
@@ -4845,6 +4865,79 @@ static int is_net_url(const char *u)
  * (single-input split, or N-input mosaic+split) feeds each rung's independent
  * muxer/encoder; audio + subs/data decoded/copied once and fanned out.
  * Selection (transcode vs copy) per group comes from its -map/-c. */
+/* 0.9.18 M1 — resolve ALL cushion/queue sizing in ONE place: the env parses, the genlock
+ * preroll default, the deep-prime side-cars (env-override-wins ordering preserved: side-cars
+ * BEFORE the explicit PTV_DELIVERY_CAP_MS/PTV_DELIVERY_MAXQ reads), the per-track audio_q
+ * depth rule and the deep-prime derivation — all moved VERBATIM from main()'s env block and
+ * transcode()'s alloc sites. Writes the same g_* globals as before (they stay the source for
+ * everything not yet repointed) and mirrors the results into *cp. Called once in transcode()
+ * setup, after out_fps/n_audio/live are known and before the first consuming allocation —
+ * i.e. before any thread starts, so cp is immutable once running.
+ * NOTE: PTV_FRAMEQ (+ its NVENC registration-cache warning) stays in main(): g_frameq_cap is
+ * consumed by the multiview hold.q alloc BEFORE this runs; mirrored into cp->frameq_cap here. */
+static void resolve_cushions(CushionPlan *cp, int live, int multiview,
+                             AVRational out_fps, int n_audio)
+{
+    /* ONCE-ONLY: the deep-prime side-cars below ACCUMULATE onto g_delivery_cap_us/g_videoq
+     * (+=/FFMAX) — a second call in one process would compound the sizing. transcode() runs
+     * once per process today; keep it that way or make these idempotent first. */
+    { const char *cm = getenv("PTV_CUSHION_MS"); if (cm && atoi(cm) > 0) { int x = atoi(cm); if (x < 1000) x = 1000; if (x > 10000) x = 10000; g_cushion_ms = x; } }   /* adaptive RAISED tier */
+    { const char *pe = getenv("PTV_PREROLL_MS"); if (pe) { int v = atoi(pe); if (v < 0) v = 0; if (v > 30000) v = 30000; g_preroll_ms = v; g_preroll_set = 1; } }  /* §13: startup cushion target (ms), bounded 0-30s */
+    { const char *vq = getenv("PTV_VIDEOQ"); if (vq && atoi(vq) > 0) g_videoq = atoi(vq); }   /* video_q depth (startup-burst absorb) */
+    { const char *cm = getenv("PTV_CUSHION_MAX_MS"); if (cm && atoi(cm) > 0) g_cushion_max_ms = atoi(cm); }  /* v0.9.14: AUTO-BANK ceiling (default 12000) */
+    { const char *bd = getenv("PTV_BANK_DECAY_S"); if (bd && atoi(bd) > 0) g_bank_decay_us = (int64_t)atoi(bd) * 1000000; }  /* v0.9.14: quiet time before bank retires (test hook; default 6h) */
+    if (g_genlock && !g_preroll_set) g_preroll_ms = 1000;  /* v0.9.1: default the single-input prime to ~1s (frame_q cushion) — smooths decode-rate dips while video+gate-hold stays under the 3s gate cap (cap scaling stays dormant). Deep video_q prime + cap-scale remain available for explicit high PTV_PREROLL_MS (bursty Fintech-class). PTV_PREROLL_MS overrides, PTV_NO_GENLOCK reverts to 350. */
+    if (g_preroll_ms > 1600) g_delivery_cap_us += (int64_t)g_preroll_ms * 1000;  /* v0.9.0: the deep input prime delays VIDEO ~g_preroll_ms; the §7.5a gate holds audio+copy to match (it IS the audio-side of the whole-stream delay), so size its cap to the prime — else it force-releases and audio leaks ahead (TruBLU dlvforced). Explicit PTV_DELIVERY_CAP_MS (below) overrides. */
+    if (g_preroll_ms > 1600) g_delivery_maxq = FFMAX(g_delivery_maxq, (int)(g_delivery_cap_us / 1000000 * 256));  /* v0.9.0: the deeper hold needs more FIFO nodes (≤ cap_s × Σ stream pkt-rates); without this a multi-audio channel (2 transcoded + copied AC-3) hits the maxq backstop and back-pressure-stalls before the cap. Explicit PTV_DELIVERY_MAXQ (below) overrides. */
+    /* §13: a cushion deeper than frame_q (~1.6s) is carried by video_q -> size it to hold the
+     * backlog (packets ~= preroll_ms x <=60fps + margin), bounded. Default 350ms -> no change. */
+    if (g_preroll_ms > 1600) { int need = (int)((int64_t)g_preroll_ms * 60 / 1000) + 64; if (need > 2048) need = 2048; if (g_videoq < need) g_videoq = need; g_aq_cap = PTV_AQ_PREROLL; }  /* deep prime: also raise the pre-h0 audio ring (default stays 256 = byte-identical) */
+    { const char *dc = getenv("PTV_DELIVERY_CAP_MS"); if (dc && atoi(dc) > 0) g_delivery_cap_us = (int64_t)atoi(dc) * 1000; }  /* force-release ceiling (A0 ≈1.5–2s) */
+    { const char *dq = getenv("PTV_DELIVERY_MAXQ");   if (dq && atoi(dq) > 0) g_delivery_maxq = atoi(dq); }                    /* hold-FIFO size backstop */
+
+    {
+        /* §13: deep prime delays video ~preroll_ms, so audio must buffer that long without the
+         * demux dropping on a full audio_q during bursts. Size audio_q to the cushion (~50 audio
+         * frames/s + margin), bounded; default 350ms -> PTV_QDEPTH unchanged. */
+        int aqd = PTV_QDEPTH;
+        /* v0.9.14.2 AUTO-BANK: clumped delivery slams a whole burst of audio into this queue at
+         * once (Unique_TV live: 7s clump = ~330 pkts into the old 48-deep queue -> adrop ~25/s =
+         * HALF the audio dropped at the demux door = the clicks, with a perfect video bank and an
+         * idle gate). Size it for the bank ceiling with the SAME formula the manual deep preroll
+         * uses — the last of its three sizing side-cars (video_q, gate FIFO, audio_q) applied
+         * automatically. Live only; a pointer array, so capacity is free. */
+        if (live) { int need = (int)(g_cushion_max_ms * 50 / 1000) + 48; if (need > 2048) need = 2048; if (aqd < need) aqd = need; }
+        if (g_preroll_ms > 1600) { int need = (int)((int64_t)g_preroll_ms * 50 / 1000) + 48; if (need > 2048) need = 2048; if (aqd < need) aqd = need; }
+        cp->audioq_pkts = aqd;
+    }
+
+    /* §13: deep startup cushion target (packets ~= preroll_ms x fps). Single-input + multiview inputs
+     * (both can be bursty, v0.9.0), and only when the cushion exceeds frame_q (~1.6s) -> then decode_thread delays its start
+     * until video_q banks this much. Default 350ms -> 0 -> no delay (byte-identical).
+     * NOTE: out_fps approximates the INPUT packet rate (exact when in==out fps, i.e. no -r
+     * conversion / not field-rate); bursty single-input channels have in==out so it holds.
+     * CLAMP to g_videoq-32 so the prime-wait is always satisfiable (video_q is the cap the
+     * banked packets sit in; a target above it could never be reached -> always time out). */
+    cp->deep_prime_pkts = 0;
+    if (!multiview && out_fps.num > 0) {         /* v0.9.1: deep video_q prime is single-input only; multiview relies on the compositor's hold.q (already a paced per-input de-jitter buffer) */
+        int tgt = (int)((int64_t)g_preroll_ms * out_fps.num / (1000LL * out_fps.den));
+        if (tgt > g_videoq - 32) tgt = g_videoq - 32;
+        if (tgt > g_frameq_cap - 8) cp->deep_prime_pkts = tgt;
+    }
+    cp->deep_prime_budget_us = (int64_t)g_preroll_ms * 2000;   /* 2x preroll_ms, in us (decode start-delay budget) */
+
+    cp->preroll_ms        = g_preroll_ms;
+    cp->videoq_pkts       = g_videoq;
+    cp->frameq_cap        = g_frameq_cap;
+    cp->aq_prehold        = g_aq_cap;
+    cp->delivery_cap_us   = g_delivery_cap_us;
+    cp->delivery_maxq     = g_delivery_maxq;
+    cp->cushion_raised_us = (int64_t)g_cushion_ms * 1000;
+    cp->bank_ceil_us      = g_cushion_max_ms * 1000;
+    cp->bank_decay_us     = g_bank_decay_us;
+    (void)n_audio;   /* reserved: M6 folds the per-track pkt-rate sizing (35/50/60) in here */
+}
+
 static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fcomplex,
                      const char *hwdev, int mode)
 {
@@ -5308,29 +5401,26 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
     net_input = is_net_url(inputs[0].url);
     live = mode < 0 ? net_input : mode;
 
+    /* 0.9.18 M1: resolve ALL cushion/queue sizing in one place (env parses + genlock default +
+     * deep-prime side-cars + per-track audio depth + deep-prime target). Writes the same g_*
+     * globals as before — runtime consumers (BANK escalate/decay, adaptive GROW/SHRINK, the mv
+     * compositor, stats/logs) still read them — and mirrors everything into g_cp. Must run
+     * before the first consuming allocation below and before any thread starts. */
+    resolve_cushions(&g_cp, live, multiview, out_fps, n_audio);
+
     /* queues: per-input video_q, one audio_q per transcoded track, per-rung frame_q + mux_q */
     for (k = 0; k < n_input; k++) {
-        if ((ret = av_thread_message_queue_alloc(&inputs[k].video_q, g_videoq, sizeof(AVPacket *))) < 0) goto end;
+        if ((ret = av_thread_message_queue_alloc(&inputs[k].video_q, g_cp.videoq_pkts, sizeof(AVPacket *))) < 0) goto end;
         av_thread_message_queue_set_free_func(inputs[k].video_q, free_pkt_msg);
     }
     for (k = 0; k < n_audio; k++) {
-        /* §13: deep prime delays video ~preroll_ms, so audio must buffer that long without the
-         * demux dropping on a full audio_q during bursts. Size audio_q to the cushion (~50 audio
-         * frames/s + margin), bounded; default 350ms -> PTV_QDEPTH unchanged. */
-        int aqd = PTV_QDEPTH;
-        /* v0.9.14.2 AUTO-BANK: clumped delivery slams a whole burst of audio into this queue at
-         * once (Unique_TV live: 7s clump = ~330 pkts into the old 48-deep queue -> adrop ~25/s =
-         * HALF the audio dropped at the demux door = the clicks, with a perfect video bank and an
-         * idle gate). Size it for the bank ceiling with the SAME formula the manual deep preroll
-         * uses — the last of its three sizing side-cars (video_q, gate FIFO, audio_q) applied
-         * automatically. Live only; a pointer array, so capacity is free. */
-        if (live) { int need = (int)(g_cushion_max_ms * 50 / 1000) + 48; if (need > 2048) need = 2048; if (aqd < need) aqd = need; }
-        if (g_preroll_ms > 1600) { int need = (int)((int64_t)g_preroll_ms * 50 / 1000) + 48; if (need > 2048) need = 2048; if (aqd < need) aqd = need; }
-        if ((ret = av_thread_message_queue_alloc(&audio_q[k], aqd, sizeof(AVPacket *))) < 0) goto end;
+        /* per-track depth rule (§13 deep-prime + v0.9.14.2 bank-ceiling sizing) moved to
+         * resolve_cushions() (0.9.18 M1) */
+        if ((ret = av_thread_message_queue_alloc(&audio_q[k], g_cp.audioq_pkts, sizeof(AVPacket *))) < 0) goto end;
         av_thread_message_queue_set_free_func(audio_q[k], free_pkt_msg);
     }
     for (r = 0; r < n_rung; r++) {
-        if ((ret = av_thread_message_queue_alloc(&rung[r].frame_q, g_frameq_cap, sizeof(AVFrame *))) < 0) goto end;
+        if ((ret = av_thread_message_queue_alloc(&rung[r].frame_q, g_cp.frameq_cap, sizeof(AVFrame *))) < 0) goto end;
         av_thread_message_queue_set_free_func(rung[r].frame_q, free_frame_msg);
         if ((ret = av_thread_message_queue_alloc(&rung[r].mux_q, PTV_QDEPTH, sizeof(AVPacket *))) < 0) goto end;
         av_thread_message_queue_set_free_func(rung[r].mux_q, free_pkt_msg);
@@ -5343,14 +5433,14 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
      * an explicit PTV_DELIVERY_MAXQ still wins). */
     delivery_on = live && g_delivery && (!multiview || g_delivery_mv);
     if (delivery_on) {
-        int maxq = g_delivery_maxq;
+        int maxq = g_cp.delivery_maxq;
         if (!getenv("PTV_DELIVERY_MAXQ"))
             maxq = FFMAX(maxq, n_audio * 50 *
-                         (int)(g_delivery_cap_us / 1000000 + g_cushion_max_ms / 1000 + 5));
+                         (int)(g_cp.delivery_cap_us / 1000000 + g_cushion_max_ms / 1000 + 5));
             /* per gated track: ~50 pkt/s x (gate cap + bank ceiling + clump surge headroom) —
              * the same sizing the deep-preroll path applies, computed automatically (v0.9.14.1) */
         for (r = 0; r < n_rung; r++)
-            dlv_init(&rung[r].gate, rung[r].mux_q, g_delivery_cap_us, maxq);
+            dlv_init(&rung[r].gate, rung[r].mux_q, g_cp.delivery_cap_us, maxq);
     }
 
     /* per-input decode side. single-input: inputs[0].dc already holds the graph
@@ -5362,19 +5452,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         d->h0 = &inputs[k].h0; d->h0_lock = &inputs[k].h0_lock; d->live = live;
         if (multiview) { d->hold = &inputs[k].hold; d->filtering = 0; d->n_rung = 0; }
         else { d->n_rung = n_rung; for (r = 0; r < n_rung; r++) d->frame_q[r] = rung[r].frame_q; }
-        /* §13: deep startup cushion target (packets ~= preroll_ms x fps). Single-input + multiview inputs
-         * (both can be bursty, v0.9.0), and only when the cushion exceeds frame_q (~1.6s) -> then decode_thread delays its start
-         * until video_q banks this much. Default 350ms -> 0 -> no delay (byte-identical).
-         * NOTE: out_fps approximates the INPUT packet rate (exact when in==out fps, i.e. no -r
-         * conversion / not field-rate); bursty single-input channels have in==out so it holds.
-         * CLAMP to g_videoq-32 so the prime-wait is always satisfiable (video_q is the cap the
-         * banked packets sit in; a target above it could never be reached -> always time out). */
-        d->deep_prime_packets = 0;
-        if (!multiview && out_fps.num > 0) {         /* v0.9.1: deep video_q prime is single-input only; multiview relies on the compositor's hold.q (already a paced per-input de-jitter buffer) */
-            int tgt = (int)((int64_t)g_preroll_ms * out_fps.num / (1000LL * out_fps.den));
-            if (tgt > g_videoq - 32) tgt = g_videoq - 32;
-            if (tgt > g_frameq_cap - 8) d->deep_prime_packets = tgt;
-        }
+        /* §13 deep startup cushion — target derivation moved to resolve_cushions() (0.9.18 M1) */
+        d->deep_prime_packets = g_cp.deep_prime_pkts;
     }
 
     g_genlock_ok = (live && !multiview);             /* v0.9.0: genlock applies to single-input live only */
@@ -6054,7 +6133,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_REPRIME")) g_reprime = 0;
     if (getenv("PTV_NO_LAYERA"))  g_layera  = 0;  /* v0.9.10: WUCR/LAYERA/REPRIME are default-on; NO_* revert */
     if (getenv("PTV_NO_ADAPTIVE")) g_adapt_cushion = 0;   /* fixed preroll target (pre-0.9.10 behavior) */
-    { const char *cm = getenv("PTV_CUSHION_MS"); if (cm && atoi(cm) > 0) { int x = atoi(cm); if (x < 1000) x = 1000; if (x > 10000) x = 10000; g_cushion_ms = x; } }   /* adaptive RAISED tier */
+    /* PTV_CUSHION_MS parse moved to resolve_cushions() (0.9.18 M1) */
     if (getenv("PTV_NO_GENLOCK")) g_genlock = 0; /* v0.9.0: revert to free-run nominal pacing (+ old 350ms prime) = byte-identical */
     if (getenv("PTV_WUCR")) {                    /* occupancy-ρ video pacing (EMA-filtered + ±1f deadband, gain-6/±6%) + buf/rho readout. AVLOCK KEPT ON: ρ bounds house_skew so AVLOCK's audio-follow is harmless in steady state and keeps A/V matched through unavoidable dups. FLL still computes srcppm for comparison. */
         g_wucr = 1;
@@ -6092,13 +6171,12 @@ int main(int argc, char **argv)
     { const char *rm = getenv("PTV_H0_REANCHOR_MS"); if (rm && atoi(rm) > 0) g_h0_reanchor_ms = atoi(rm); }
     if (getenv("PTV_AF_NO_PLL")) g_af_pll = 0;              /* A/B: pure discrete drop/pad (no smooth nudge) */
     if (getenv("PTV_AF_NO_ANCHOR")) g_af_anchor = 0;        /* A/B: revert B1 → pre-B1 free-running counter */
-    { const char *pe = getenv("PTV_PREROLL_MS"); if (pe) { int v = atoi(pe); if (v < 0) v = 0; if (v > 30000) v = 30000; g_preroll_ms = v; g_preroll_set = 1; } }  /* §13: startup cushion target (ms), bounded 0-30s */
-    { const char *vq = getenv("PTV_VIDEOQ"); if (vq && atoi(vq) > 0) g_videoq = atoi(vq); }   /* video_q depth (startup-burst absorb) */
-    { const char *cm = getenv("PTV_CUSHION_MAX_MS"); if (cm && atoi(cm) > 0) g_cushion_max_ms = atoi(cm); }  /* v0.9.14: AUTO-BANK ceiling (default 12000) */
-    { const char *bd = getenv("PTV_BANK_DECAY_S"); if (bd && atoi(bd) > 0) g_bank_decay_us = (int64_t)atoi(bd) * 1000000; }  /* v0.9.14: quiet time before bank retires (test hook; default 6h) */
+    /* PTV_PREROLL_MS / PTV_VIDEOQ / PTV_CUSHION_MAX_MS / PTV_BANK_DECAY_S parses moved to resolve_cushions() (0.9.18 M1) */
     if (getenv("PTV_NO_AUTOBANK")) g_autobank = 0;   /* v0.9.14: revert to advisor-only (manual PTV_PREROLL_MS recipe) */
     if (getenv("PTV_NO_CLOCKFOLLOW")) g_clockfollow = 0;   /* v0.9.15: never follow a large source-clock offset (buffers pin + resampler churns on such sources) */
     if (getenv("PTV_NO_DECIMATE")) g_decimate = 0;         /* v0.9.15.2: keep pop-per-tick even for >house-rate sources (frame_q pins on surplus) */
+    /* PTV_FRAMEQ stays HERE (not resolve_cushions()): the multiview hold.q alloc consumes
+     * g_frameq_cap before resolve_cushions() runs in transcode() setup (0.9.18 M1). */
     { const char *fq = getenv("PTV_FRAMEQ"); if (fq && atoi(fq) > 0) { int v = atoi(fq); if (v < PTV_FRAME_QDEPTH) v = PTV_FRAME_QDEPTH; if (v > 1024) v = 1024; g_frameq_cap = v; } }   /* frame_q (decode->output) capacity; raise + deep PTV_PREROLL_MS to absorb an ad-break decode-rate dip (AWE) */
     {   /* 0.9.16.5 postmortem guard: a frame_q deeper than the NVENC registration cache makes every
          * frame past the cache evict+re-register = 2 RM WRITE ioctls/frame/rung — at fleet scale that
@@ -6115,18 +6193,12 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_PULLDOWN"))  g_pulldown = 0;    /* v0.9.11: revert telecine-aware emit (film segments back to dup-fill) */
     if (getenv("PTV_NO_MV_EXACTTICK")) g_mv_exacttick = 0;  /* v0.9.12: revert mv measurement axes to integer tick (re-enables the enforced ~10ppm mosaic drift) */
     if (getenv("PTV_NO_RESIDENCE")) g_mv_residence = 0;     /* v0.9.13: revert to one-pop-per-tick (rate-mismatched slots batch dups + fast-forward after starvation) */
-    if (g_genlock && !g_preroll_set) g_preroll_ms = 1000;  /* v0.9.1: default the single-input prime to ~1s (frame_q cushion) — smooths decode-rate dips while video+gate-hold stays under the 3s gate cap (cap scaling stays dormant). Deep video_q prime + cap-scale remain available for explicit high PTV_PREROLL_MS (bursty Fintech-class). PTV_PREROLL_MS overrides, PTV_NO_GENLOCK reverts to 350. */
-    if (g_preroll_ms > 1600) g_delivery_cap_us += (int64_t)g_preroll_ms * 1000;  /* v0.9.0: the deep input prime delays VIDEO ~g_preroll_ms; the §7.5a gate holds audio+copy to match (it IS the audio-side of the whole-stream delay), so size its cap to the prime — else it force-releases and audio leaks ahead (TruBLU dlvforced). Explicit PTV_DELIVERY_CAP_MS (below) overrides. */
-    if (g_preroll_ms > 1600) g_delivery_maxq = FFMAX(g_delivery_maxq, (int)(g_delivery_cap_us / 1000000 * 256));  /* v0.9.0: the deeper hold needs more FIFO nodes (≤ cap_s × Σ stream pkt-rates); without this a multi-audio channel (2 transcoded + copied AC-3) hits the maxq backstop and back-pressure-stalls before the cap. Explicit PTV_DELIVERY_MAXQ (below) overrides. */
-    /* §13: a cushion deeper than frame_q (~1.6s) is carried by video_q -> size it to hold the
-     * backlog (packets ~= preroll_ms x <=60fps + margin), bounded. Default 350ms -> no change. */
-    if (g_preroll_ms > 1600) { int need = (int)((int64_t)g_preroll_ms * 60 / 1000) + 64; if (need > 2048) need = 2048; if (g_videoq < need) g_videoq = need; g_aq_cap = PTV_AQ_PREROLL; }  /* deep prime: also raise the pre-h0 audio ring (default stays 256 = byte-identical) */
+    /* genlock preroll default + the three deep-prime side-cars moved to resolve_cushions() (0.9.18 M1) */
     if (getenv("PTV_KEEP_CORRUPT")) g_discardcorrupt = 0;   /* keep AV_PKT_FLAG_CORRUPT video packets (don't +discardcorrupt) */
     if (getenv("PTV_NO_DELIVERY")) g_delivery = 0;          /* §7.5a: disable the A/V delivery-alignment gate (audio sent direct = v0.6.23) */
     if (getenv("PTV_DELIVERY_MV")) g_delivery_mv = 1;       /* pre-0.9.12.1 opt-in — now the default; kept as a harmless no-op for existing configs */
     if (getenv("PTV_NO_DELIVERY_MV")) g_delivery_mv = 0;    /* v0.9.12.1: revert multiview to ungated wire staging (sync_check-visible audio lead) */
-    { const char *dc = getenv("PTV_DELIVERY_CAP_MS"); if (dc && atoi(dc) > 0) g_delivery_cap_us = (int64_t)atoi(dc) * 1000; }  /* force-release ceiling (A0 ≈1.5–2s) */
-    { const char *dq = getenv("PTV_DELIVERY_MAXQ");   if (dq && atoi(dq) > 0) g_delivery_maxq = atoi(dq); }                    /* hold-FIFO size backstop */
+    /* PTV_DELIVERY_CAP_MS / PTV_DELIVERY_MAXQ override parses moved to resolve_cushions() (0.9.18 M1) */
     if (getenv("PTV_AVSYNC_PROBE")) g_avsync_probe = 1;    /* Phase A: read-only [PTV-AVSYNC2] real A/V offset */
     { const char *am = getenv("PTV_AF_ACQUIRE_MS"); if (am && atoi(am) > 0) g_af_acquire_us = atoi(am) * 1000; }
     { const char *rr = getenv("PTV_AF_RATE_MS_S");  if (rr && atoi(rr) > 0) g_af_rate_us = atoi(rr) * 1000; }
