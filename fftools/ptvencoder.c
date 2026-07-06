@@ -946,6 +946,124 @@ static int vring_lookup(VOutRing *r, int64_t want_src, int64_t *out_v, int64_t *
     return found ? 0 : -1;
 }
 
+/* 0.9.18 M3 — CushionRt: the runtime COORDINATION home for cushion escalation (map §1.3).
+ * Holds the per-run wiring every escalation event needs (the per-rung delivery gates, the
+ * master tick, the adaptive tier targets) plus the mutex that makes cushion_escalate() the
+ * single serialized writer of every escalation-dependent store. The escalation DATA itself
+ * (g_bank_us / g_bank_pkts / g_delivery_cap_us / g_delivery_maxq) stays in the globals
+ * above — the hot-path readers (master blocking-push arming, dlv_drain cap loads, the
+ * stats lines, the WUCR bank top-up floor) keep reading the same relaxed atomics
+ * unchanged; moving the data home is a later step.
+ * Registration: gate[]/n_gate/tick_dur_us are set in transcode() setup right after
+ * dlv_init(), before any thread starts. base_sp/raised_sp/cur_sp are set by the MASTER
+ * output thread at startup (they are per-run locals derived from the resolved preroll +
+ * tick there); cur_sp is thereafter mutated ONLY inside cushion_escalate() on the
+ * master's own GROW/SHRINK calls, so the master's unlocked trigger/stats reads are
+ * same-thread-ordered and race-free (the demux-side BANK events never touch the tier
+ * fields). */
+typedef enum { CUSHION_GROW, CUSHION_SHRINK, BANK_ESCALATE, BANK_RETIRE } CushionEvent;
+typedef struct CushionRt {
+    DlvGate        *gate[PTV_MAX_RUNG]; /* per-rung delivery gate (NULL = delivery off) */
+    int             n_gate;
+    int64_t         tick_dur_us;        /* master video tick (us) */
+    int             base_sp;            /* adaptive tier: BASE frame_q target (ticks) */
+    int             raised_sp;          /* adaptive tier: RAISED frame_q target (ticks) */
+    int             cur_sp;             /* adaptive tier: current target (escalate-owned) */
+    int64_t         bank_advise_us;     /* v0.9.14: rate-limit for the at-ceiling advisory */
+    pthread_mutex_t lock;               /* cold path: events are seconds-to-hours apart */
+} CushionRt;
+static CushionRt g_curt = { .lock = PTHREAD_MUTEX_INITIALIZER };
+
+/* 0.9.18 M3 — cushion_escalate(): the single entry point for all four cushion-escalation
+ * writers (pure code motion: same stores in the same order, same log lines, now under one
+ * mutex). Callers keep their TRIGGER logic in place — the master output thread fires
+ * CUSHION_GROW/SHRINK, the demux thread fires BANK_ESCALATE/RETIRE; two threads, hence
+ * the lock. Both call sites hold no other lock, and this body takes none besides
+ * rt->lock (relaxed atomics + gate cap_us atomic stores + av_log only). Per-event args:
+ *   CUSHION_GROW:   a0 = wall gap since the previous starvation episode (us, log only),
+ *                   a1 = the just-ended episode duration (us, log only)
+ *   CUSHION_SHRINK: args unused
+ *   BANK_ESCALATE:  a0 = worst observed stall (us), a1 = now (wall us, advisory limiter)
+ *   BANK_RETIRE:    args unused
+ * NOTE (map §3.5, deliberate): GROW/SHRINK do NOT touch the live gate->cap_us — exactly
+ * as before this motion (only the BANK arms rewrite the gates). Closing that gap is M5,
+ * a behavior change with its own fixture; when it lands it is the same rt->gate loop the
+ * BANK arms already run. */
+static void cushion_escalate(CushionEvent ev, int64_t a0, int64_t a1)
+{
+    CushionRt *rt = &g_curt;
+    pthread_mutex_lock(&rt->lock);
+    switch (ev) {
+    case CUSHION_GROW: {
+        rt->cur_sp = rt->raised_sp;                        /* GROW: 2nd episode within 60min; fill is lazy (gentle zone) */
+        int64_t add = (int64_t)(rt->raised_sp - rt->base_sp) * rt->tick_dur_us;  /* audio gate rides the deeper video hold */
+        int64_t nc  = atomic_fetch_add_explicit(&g_delivery_cap_us, add, memory_order_relaxed) + add;
+        g_delivery_maxq = FFMAX(g_delivery_maxq, (int)(nc / 1000000 * 256));
+        av_log(NULL, AV_LOG_INFO,
+               "[PTV-CUSHION] target %d->%d frames (~%dms): 2 starvations within %lldmin (last %lldms)\n",
+               rt->base_sp, rt->raised_sp, (int)((int64_t)rt->raised_sp * rt->tick_dur_us / 1000),
+               (long long)(a0 / 60000000), (long long)(a1 / 1000));
+        break;
+    }
+    case CUSHION_SHRINK:
+        rt->cur_sp = rt->base_sp;                          /* SHRINK: 6h with zero starvations; drains at ppm scale */
+        /* v0.9.16.2: symmetric restore of the gate base — GROW added exactly this much;
+         * without it, daily grow/shrink cycles RATCHET the stall force-release ceiling
+         * ~+(raised−base) ticks per cycle FOREVER (months → minutes of held audio on a
+         * real video wedge). maxq stays as a high-water backstop (RAM materializes only
+         * while actually holding, and the restored cap bounds that duration). */
+        atomic_fetch_sub_explicit(&g_delivery_cap_us,
+            (int64_t)(rt->raised_sp - rt->base_sp) * rt->tick_dur_us, memory_order_relaxed);
+        av_log(NULL, AV_LOG_INFO, "[PTV-CUSHION] target back to %d frames (quiet 6h)\n", rt->base_sp);
+        break;
+    case BANK_ESCALATE: {
+        int64_t worst_us = a0, now = a1;
+        int64_t want_us = worst_us * 3 / 2;
+        int64_t ceil_us = g_cp.bank_ceil_us;
+        int64_t cur     = atomic_load_explicit(&g_bank_us, memory_order_relaxed);
+        int     pkts, r;
+        if (want_us > ceil_us) {
+            want_us = ceil_us;
+            /* at the ceiling AND still short: the one case left for a human — surface it, rate-limited */
+            if (worst_us * 12 / 10 > ceil_us && now - rt->bank_advise_us > 60000000) {
+                rt->bank_advise_us = now;
+                av_log(NULL, AV_LOG_WARNING,
+                       "[PTV-CUSHION] BANK at its %llds ceiling but the worst stall is %.1fs — stalls this size are "
+                       "an upstream incident; raising PTV_CUSHION_MAX_MS is a conscious latency trade.\n",
+                       (long long)(g_cushion_max_ms / 1000), worst_us / 1e6);
+            }
+        }
+        if (want_us <= cur + 500000)                    /* hysteresis: gap jitter must not re-log identical escalations */
+            break;
+        pkts = (int)(want_us / 1000000 * 35) + 64;      /* ~35 pkt/s + margin (the advisor's proven sizing) */
+        if (pkts > g_cp.videoq_pkts - 32) pkts = g_cp.videoq_pkts - 32;
+        atomic_store_explicit(&g_bank_us, want_us, memory_order_relaxed);
+        atomic_store_explicit(&g_bank_pkts, pkts, memory_order_relaxed);
+        for (r = 0; r < rt->n_gate; r++)                /* audio gate rides the deeper hold (waits out long stalls) */
+            if (rt->gate[r])
+                atomic_store_explicit(&rt->gate[r]->cap_us, g_delivery_cap_us + want_us, memory_order_relaxed);
+        av_log(NULL, AV_LOG_WARNING,
+               "[PTV-CUSHION] BANK escalated to %.1fs (worst stall %.1fs x1.5, ceiling %llds): stall latency is now "
+               "RETAINED as a compressed video_q bank — self-heals within a stall cycle, no restart needed\n",
+               want_us / 1e6, worst_us / 1e6, (long long)(g_cushion_max_ms / 1000));
+        break;
+    }
+    case BANK_RETIRE: {
+        int r2;
+        atomic_store_explicit(&g_bank_us, 0, memory_order_relaxed);
+        atomic_store_explicit(&g_bank_pkts, 0, memory_order_relaxed);
+        for (r2 = 0; r2 < rt->n_gate; r2++)
+            if (rt->gate[r2])
+                atomic_store_explicit(&rt->gate[r2]->cap_us, g_delivery_cap_us, memory_order_relaxed);
+        av_log(NULL, AV_LOG_INFO,
+               "[PTV-CUSHION] BANK retired after %llds without qualifying stalls; banked latency drains via catch-up\n",
+               (long long)(g_bank_decay_us / 1000000));
+        break;
+    }
+    }
+    pthread_mutex_unlock(&rt->lock);
+}
+
 /* Multiview per-input jitter buffer: decode pushes each frame onto `q`; the
  * compositor pops ONE per house tick (absorbing bursty decode delivery, exactly
  * like the single-input frame_q) and dup-holds its last frame when `q` underruns,
@@ -1601,10 +1719,17 @@ static void *output_thread(void *arg)
         /* v0.9.10 adaptive cushion (master only): two discrete frame_q targets, lazy transitions. */
         int base_sp   = n_prime > 2 ? n_prime : 4;                    /* safety floor = the resolved preroll */
         int raised_sp = (v->tick_dur_us > 0) ? (int)(g_cp.cushion_raised_us / v->tick_dur_us) : base_sp;
-        int cur_sp    = base_sp;
         int64_t ep_last_us = 0, ep_prev_us = 0;                       /* starvation-episode wall times (grow gate) */
         if (raised_sp > g_cp.frameq_cap - 8) raised_sp = g_cp.frameq_cap - 8;
         if (raised_sp < base_sp) raised_sp = base_sp;                 /* explicit deep preroll >= cushion -> adaptive no-op */
+        if (v->is_master) {                                           /* 0.9.18 M3: register the adaptive tier with the
+                                                                       * escalation runtime — cushion_escalate() owns
+                                                                       * cur_sp from here (mutated only by the master's
+                                                                       * own GROW/SHRINK calls, so the unlocked reads
+                                                                       * below are same-thread-ordered) */
+            g_curt.base_sp = base_sp; g_curt.raised_sp = raised_sp;
+            g_curt.cur_sp  = base_sp;
+        }
         /* v0.9.11 pulldown state: 1-frame lookahead + film-mode detector (see g_pulldown comment) */
         AVFrame *nextf = NULL;
         int next_have = 0, film_arm = 0, held_extra = 0;
@@ -1738,28 +1863,14 @@ static void *output_thread(void *arg)
                     ep_agg_cnt = 0; ep_agg_t0 = nw;
                 }
                 if (g_adapt_cushion && !v->passthrough) {
+                    /* 0.9.18 M3: trigger conditions stay here; the write bodies (tier store,
+                     * cap delta, maxq, log) moved verbatim to cushion_escalate(). */
                     if (ep > 0) {                                     /* a >=200ms starvation episode just ended */
                         ep_prev_us = ep_last_us; ep_last_us = nw;
-                        if (cur_sp < raised_sp && ep_prev_us && nw - ep_prev_us < 3600LL * 1000000) {
-                            cur_sp = raised_sp;                        /* GROW: 2nd episode within 60min; fill is lazy (gentle zone) */
-                            int64_t add = (int64_t)(raised_sp - base_sp) * v->tick_dur_us;  /* audio gate rides the deeper video hold */
-                            int64_t nc  = atomic_fetch_add_explicit(&g_delivery_cap_us, add, memory_order_relaxed) + add;
-                            g_delivery_maxq = FFMAX(g_delivery_maxq, (int)(nc / 1000000 * 256));
-                            av_log(NULL, AV_LOG_INFO,
-                                   "[PTV-CUSHION] target %d->%d frames (~%dms): 2 starvations within %lldmin (last %lldms)\n",
-                                   base_sp, raised_sp, (int)((int64_t)raised_sp * v->tick_dur_us / 1000),
-                                   (long long)((nw - ep_prev_us) / 60000000), (long long)(ep / 1000));
-                        }
-                    } else if (cur_sp > base_sp && ep_last_us && nw - ep_last_us > 6LL * 3600 * 1000000) {
-                        cur_sp = base_sp;                              /* SHRINK: 6h with zero starvations; drains at ppm scale */
-                        /* v0.9.16.2: symmetric restore of the gate base — GROW added exactly this much;
-                         * without it, daily grow/shrink cycles RATCHET the stall force-release ceiling
-                         * ~+(raised−base) ticks per cycle FOREVER (months → minutes of held audio on a
-                         * real video wedge). maxq stays as a high-water backstop (RAM materializes only
-                         * while actually holding, and the restored cap bounds that duration). */
-                        atomic_fetch_sub_explicit(&g_delivery_cap_us,
-                            (int64_t)(raised_sp - base_sp) * v->tick_dur_us, memory_order_relaxed);
-                        av_log(NULL, AV_LOG_INFO, "[PTV-CUSHION] target back to %d frames (quiet 6h)\n", base_sp);
+                        if (g_curt.cur_sp < raised_sp && ep_prev_us && nw - ep_prev_us < 3600LL * 1000000)
+                            cushion_escalate(CUSHION_GROW, nw - ep_prev_us, ep);
+                    } else if (g_curt.cur_sp > base_sp && ep_last_us && nw - ep_last_us > 6LL * 3600 * 1000000) {
+                        cushion_escalate(CUSHION_SHRINK, 0, 0);
                     }
                 }
             }
@@ -1775,11 +1886,12 @@ static void *output_thread(void *arg)
                  * Master computes; all rungs apply g_rho_corr_ppm identically. */
                 if (v->is_master) {
                     /* 0.9.18 R2: the ladder body moved verbatim to house_rate_corr_ppm() above;
-                     * cur_sp = adaptive tier target (base preroll unless grown). Master computes;
-                     * all rungs apply the published g_rho_corr_ppm identically. */
+                     * g_curt.cur_sp = adaptive tier target (base preroll unless grown; M3 moved it
+                     * into the escalation runtime). Master computes; all rungs apply the published
+                     * g_rho_corr_ppm identically. */
                     int occ = av_thread_message_queue_nb_elems(v->frame_q);
                     atomic_store_explicit(&g_rho_corr_ppm,
-                        house_rate_corr_ppm(&g_hr, occ, cur_sp, base_sp, v->tick_dur_us),
+                        house_rate_corr_ppm(&g_hr, occ, g_curt.cur_sp, base_sp, v->tick_dur_us),
                         memory_order_relaxed);
                 }
                 int64_t corr = atomic_load_explicit(&g_rho_corr_ppm, memory_order_relaxed);
@@ -1888,7 +2000,7 @@ static void *output_thread(void *arg)
                     int64_t hs   = v->house_skew ? *v->house_skew : 0;   /* W1 check: must stay ≈0 (ρ genlock → dups→0 → AVLOCK has nothing to inject) */
                     snprintf(wu, sizeof wu, " wucr_buf=%df/%lldms wucr_rho=%+lldppm hs=%+lldms cushion=%dms fqhw=%d",
                              occ, (long long)(occ * v->tick_dur_us / 1000), (long long)(-corr), (long long)(hs / 1000),
-                             (int)((int64_t)cur_sp * v->tick_dur_us / 1000),  /* -corr = recovered source dev (+=faster); cushion = adaptive tier target */
+                             (int)((int64_t)g_curt.cur_sp * v->tick_dur_us / 1000),  /* -corr = recovered source dev (+=faster); cushion = adaptive tier target */
                              atomic_load_explicit(&g_fq_hw, memory_order_relaxed));
                 }
                 char bk[48] = "";                                    /* v0.9.14 AUTO-BANK: actual/target — actual = TOTAL
@@ -3061,7 +3173,7 @@ typedef struct DemuxArgs {
     int                   by_gap_cnt;       /* completed gaps >=1.5s in the window */
     int                   autobank;         /* v0.9.14: runtime bank escalation armed for this input (single-input live) */
     int64_t               by_bank_last_q;   /* v0.9.14: wall time of the last QUALIFYING stall (decay reference) */
-    int64_t               by_bank_advise_us;/* v0.9.14: rate-limit for the at-ceiling advisory */
+                                            /* (by_bank_advise_us moved to CushionRt.bank_advise_us — 0.9.18 M3) */
     int64_t               vcorrupt;       /* video packets flagged AV_PKT_FLAG_CORRUPT (discarded if g_discardcorrupt) */
 } DemuxArgs;
 
@@ -3944,38 +4056,14 @@ end:
  * video_q instead of draining — the channel self-heals within a stall cycle or two. Idempotent:
  * the target only ever rises (decay handles the way down); every qualifying stall refreshes the
  * decay reference. Runs in the demux thread; readers are the decode pushes (g_bank_pkts) and the
- * gate drains (cap_us) — all relaxed atomics, no ordering needed (advisory values). */
+ * gate drains (cap_us) — all relaxed atomics, no ordering needed (advisory values).
+ * 0.9.18 M3: the write body (target computation + ceiling advisory + stores + gate rewrite +
+ * log) moved verbatim to cushion_escalate(BANK_ESCALATE); the demux-side decay bookkeeping
+ * stays here. */
 static void ptv_autobank_escalate(DemuxArgs *d, int64_t worst_us, int64_t now)
 {
-    int64_t want_us = worst_us * 3 / 2;
-    int64_t ceil_us = g_cp.bank_ceil_us;
-    int64_t cur     = atomic_load_explicit(&g_bank_us, memory_order_relaxed);
-    int     pkts, r;
     d->by_bank_last_q = now;
-    if (want_us > ceil_us) {
-        want_us = ceil_us;
-        /* at the ceiling AND still short: the one case left for a human — surface it, rate-limited */
-        if (worst_us * 12 / 10 > ceil_us && now - d->by_bank_advise_us > 60000000) {
-            d->by_bank_advise_us = now;
-            av_log(NULL, AV_LOG_WARNING,
-                   "[PTV-CUSHION] BANK at its %llds ceiling but the worst stall is %.1fs — stalls this size are "
-                   "an upstream incident; raising PTV_CUSHION_MAX_MS is a conscious latency trade.\n",
-                   (long long)(g_cushion_max_ms / 1000), worst_us / 1e6);
-        }
-    }
-    if (want_us <= cur + 500000)                    /* hysteresis: gap jitter must not re-log identical escalations */
-        return;
-    pkts = (int)(want_us / 1000000 * 35) + 64;      /* ~35 pkt/s + margin (the advisor's proven sizing) */
-    if (pkts > g_cp.videoq_pkts - 32) pkts = g_cp.videoq_pkts - 32;
-    atomic_store_explicit(&g_bank_us, want_us, memory_order_relaxed);
-    atomic_store_explicit(&g_bank_pkts, pkts, memory_order_relaxed);
-    for (r = 0; r < d->n_out; r++)                  /* audio gate rides the deeper hold (waits out long stalls) */
-        if (d->gate[r])
-            atomic_store_explicit(&d->gate[r]->cap_us, g_delivery_cap_us + want_us, memory_order_relaxed);
-    av_log(NULL, AV_LOG_WARNING,
-           "[PTV-CUSHION] BANK escalated to %.1fs (worst stall %.1fs x1.5, ceiling %llds): stall latency is now "
-           "RETAINED as a compressed video_q bank — self-heals within a stall cycle, no restart needed\n",
-           want_us / 1e6, worst_us / 1e6, (long long)(g_cushion_max_ms / 1000));
+    cushion_escalate(BANK_ESCALATE, worst_us, now);
 }
 
 /* v0.9.0 genlock estimator: recover the source frame rate as a SLIDING-window FLL. Each ~4s
@@ -4195,17 +4283,8 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                                (long long)(g_bank_decay_us / 1000000), d->by_gap_cnt);
                     if (d->autobank && d->by_bank_last_q &&
                         atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 &&
-                        bw - d->by_bank_last_q > g_cp.bank_decay_us) {
-                        int r2;
-                        atomic_store_explicit(&g_bank_us, 0, memory_order_relaxed);
-                        atomic_store_explicit(&g_bank_pkts, 0, memory_order_relaxed);
-                        for (r2 = 0; r2 < d->n_out; r2++)
-                            if (d->gate[r2])
-                                atomic_store_explicit(&d->gate[r2]->cap_us, g_delivery_cap_us, memory_order_relaxed);
-                        av_log(NULL, AV_LOG_INFO,
-                               "[PTV-CUSHION] BANK retired after %llds without qualifying stalls; banked latency drains via catch-up\n",
-                               (long long)(g_bank_decay_us / 1000000));
-                    }
+                        bw - d->by_bank_last_q > g_cp.bank_decay_us)
+                        cushion_escalate(BANK_RETIRE, 0, 0);   /* 0.9.18 M3: write body moved */
                     d->by_win_start = bw; d->by_gap_cnt = 0; d->by_max_gap = 0;
                 }
                 atomic_store_explicit(&g_vq_elems, av_thread_message_queue_nb_elems(d->video_q), memory_order_relaxed);
@@ -5444,6 +5523,14 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         for (r = 0; r < n_rung; r++)
             dlv_init(&rung[r].gate, rung[r].mux_q, g_cp.delivery_cap_us, maxq);
     }
+    /* 0.9.18 M3: register the per-rung gates + master tick with the escalation runtime —
+     * cushion_escalate() is now the single writer of every gate->cap_us rewrite. Before any
+     * thread starts; NULL gates when delivery is off, so the BANK arms skip them exactly as
+     * the demux-side d->gate wiring below does. */
+    g_curt.n_gate = n_rung;
+    for (r = 0; r < n_rung; r++)
+        g_curt.gate[r] = delivery_on ? &rung[r].gate : NULL;
+    g_curt.tick_dur_us = av_rescale(1000000, out_fps.den, out_fps.num);
 
     /* per-input decode side. single-input: inputs[0].dc already holds the graph
      * (fg/fsrc/fsink/filtering) + feeds the rung frame_q inline. multiview: each
