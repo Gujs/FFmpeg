@@ -39,7 +39,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "0.9.18.2"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "0.9.18.3"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 #define PTV_WD_DEADLINE_US (2 * (int64_t)AV_TIME_BASE)   /* watchdog stall threshold */
@@ -1007,23 +1007,49 @@ static void cushion_escalate(CushionEvent ev, int64_t a0, int64_t a1)
         int64_t add = (int64_t)(rt->raised_sp - rt->base_sp) * rt->tick_dur_us;  /* audio gate rides the deeper video hold */
         int64_t nc  = atomic_fetch_add_explicit(&g_delivery_cap_us, add, memory_order_relaxed) + add;
         g_delivery_maxq = FFMAX(g_delivery_maxq, (int)(nc / 1000000 * 256));
+        /* v0.9.18.3 M5 (plan §3.5): the raised cap must reach the LIVE gates — before this,
+         * it reached a gate only if a later BANK event happened to rewrite cap_us, so a
+         * RAISED-no-bank channel force-released held audio at the LEAN cap on a real video
+         * wedge (~3s early). Same write the BANK arms do: live base + armed bank margin. */
+        {
+            int64_t bw = atomic_load_explicit(&g_bank_us, memory_order_relaxed);
+            int r3;
+            for (r3 = 0; r3 < rt->n_gate; r3++)
+                if (rt->gate[r3])
+                    atomic_store_explicit(&rt->gate[r3]->cap_us, nc + bw, memory_order_relaxed);
+            if (g_diag)
+                av_log(NULL, AV_LOG_INFO, "[PTV-GATE] caps -> %.1fs (base %.1fs + bank %.1fs) on %d gates (GROW)\n",
+                       (nc + bw) / 1e6, nc / 1e6, bw / 1e6, rt->n_gate);
+        }
         av_log(NULL, AV_LOG_INFO,
                "[PTV-CUSHION] target %d->%d frames (~%dms): 2 starvations within %lldmin (last %lldms)\n",
                rt->base_sp, rt->raised_sp, (int)((int64_t)rt->raised_sp * rt->tick_dur_us / 1000),
                (long long)(a0 / 60000000), (long long)(a1 / 1000));
         break;
     }
-    case CUSHION_SHRINK:
+    case CUSHION_SHRINK: {
         rt->cur_sp = rt->base_sp;                          /* SHRINK: 6h with zero starvations; drains at ppm scale */
         /* v0.9.16.2: symmetric restore of the gate base — GROW added exactly this much;
          * without it, daily grow/shrink cycles RATCHET the stall force-release ceiling
          * ~+(raised−base) ticks per cycle FOREVER (months → minutes of held audio on a
          * real video wedge). maxq stays as a high-water backstop (RAM materializes only
          * while actually holding, and the restored cap bounds that duration). */
-        atomic_fetch_sub_explicit(&g_delivery_cap_us,
-            (int64_t)(rt->raised_sp - rt->base_sp) * rt->tick_dur_us, memory_order_relaxed);
+        int64_t nc2 = atomic_fetch_sub_explicit(&g_delivery_cap_us,
+            (int64_t)(rt->raised_sp - rt->base_sp) * rt->tick_dur_us, memory_order_relaxed)
+            - (int64_t)(rt->raised_sp - rt->base_sp) * rt->tick_dur_us;
+        {   /* v0.9.18.3 M5: symmetric — the restored (lean) cap reaches the live gates too */
+            int64_t bw2 = atomic_load_explicit(&g_bank_us, memory_order_relaxed);
+            int r4;
+            for (r4 = 0; r4 < rt->n_gate; r4++)
+                if (rt->gate[r4])
+                    atomic_store_explicit(&rt->gate[r4]->cap_us, nc2 + bw2, memory_order_relaxed);
+            if (g_diag)
+                av_log(NULL, AV_LOG_INFO, "[PTV-GATE] caps -> %.1fs (base %.1fs + bank %.1fs) on %d gates (SHRINK)\n",
+                       (nc2 + bw2) / 1e6, nc2 / 1e6, bw2 / 1e6, rt->n_gate);
+        }
         av_log(NULL, AV_LOG_INFO, "[PTV-CUSHION] target back to %d frames (quiet 6h)\n", rt->base_sp);
         break;
+    }
     case BANK_ESCALATE: {
         int64_t worst_us = a0, now = a1;
         int64_t want_us = worst_us * 3 / 2;
