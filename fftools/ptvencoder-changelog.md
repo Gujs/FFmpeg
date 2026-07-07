@@ -5,6 +5,24 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 0.9.18.3 (2026-07-07) — M5: cushion tier changes reach the live delivery gates
+
+The adaptive GROW/SHRINK arms raised/restored only the GLOBAL delivery cap; the per-rung
+gates latched their cap at init, so a RAISED-no-bank channel (5 of 56 on cor-3 at audit
+time) kept its gate at the LEAN cap — on a real video-encoder wedge it force-released held
+audio ~3s early (plan §3.5; the last of the "one queue forgot" class). GROW/SHRINK now run
+the same live gate-cap write the BANK arms have always done (live base + armed bank margin),
+inside cushion_escalate()'s mutex. New PTV_DIAG line [PTV-GATE] logs every gate-cap rewrite
+with its arithmetic.
+
+Gate: fixture shows the write composing correctly under GROW-with-armed-BANK
+(caps -> 15.3s = base 6.0 + bank 9.3 on the live gate); escalation-sequence fixture
+byte-identical to M3; the cap-respecting RELEASE path is unchanged code production-proven
+by every BANK escalation. A true encoder-only wedge is not reproducible host-side
+(process freeze ages all clocks together and the resumed encoder clears the stall before
+a drain observes it) — release-timing delta is expected to show as absent early
+dlvforced on wedges of RAISED channels in the fleet.
+
 ## 0.9.18.2 (2026-07-07) — M4: multiview primes with the resolved preroll
 
 The compositor re-read PTV_PREROLL_MS with a 350ms fallback that predated v0.9.1's genlock
