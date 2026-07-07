@@ -39,7 +39,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "0.9.18.3"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "0.9.18.4"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 #define PTV_WD_DEADLINE_US (2 * (int64_t)AV_TIME_BASE)   /* watchdog stall threshold */
@@ -476,6 +476,12 @@ typedef struct CushionPlan {
     int64_t  cushion_raised_us;    /* adaptive RAISED tier                 (g_cushion_ms*1000) */
     int64_t  bank_ceil_us;         /* AUTO-BANK ceiling                    (g_cushion_max_ms*1000) */
     int64_t  bank_decay_us;        /* quiet time before the bank retires   (g_bank_decay_us) */
+    int      vid_pps;              /* v0.9.18.4 M6: VIDEO packets/second = ceil(out_fps) — the ONE
+                                    * seconds->video_q-packets rate (was three constants: bank 35/s,
+                                    * side-car 60/s, deep-prime out_fps; a 50/59.94fps channel's bank
+                                    * was sized ~30-42% under its us target). AUDIO sizing keeps its
+                                    * own 50/s: that is an AAC frame rate (48kHz/1024 ~= 47/s), not
+                                    * a video rate — intentionally NOT unified. */
 } CushionPlan;
 static CushionPlan     g_cp;                          /* resolved once in transcode() setup, before threads start */
 static _Atomic int64_t g_rho_corr_ppm;               /* WUCR ρ: applied house-rate correction (ppm, corr>0 = house slower); ±6% clamp (±30% under re-prime) */
@@ -1069,7 +1075,10 @@ static void cushion_escalate(CushionEvent ev, int64_t a0, int64_t a1)
         }
         if (want_us <= cur + 500000)                    /* hysteresis: gap jitter must not re-log identical escalations */
             break;
-        pkts = (int)(want_us / 1000000 * 35) + 64;      /* ~35 pkt/s + margin (the advisor's proven sizing) */
+        pkts = (int)(want_us / 1000000 * g_cp.vid_pps) + 64;  /* v0.9.18.4 M6: video pkt/s from out_fps (was 35/s
+                                                               * ~= 29.97+margin — undersized the bank ~30-42%
+                                                               * on 50/59.94fps channels, so video_q clipped the
+                                                               * real bank below its us target) + margin */
         if (pkts > g_cp.videoq_pkts - 32) pkts = g_cp.videoq_pkts - 32;
         atomic_store_explicit(&g_bank_us, want_us, memory_order_relaxed);
         atomic_store_explicit(&g_bank_pkts, pkts, memory_order_relaxed);
@@ -4320,7 +4329,7 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                             int64_t need_ms = (d->by_max_gap * 3 / 2) / 1000;   /* 1.5x worst gap */
                             need_ms = ((need_ms + 999) / 1000) * 1000;
                             if (need_ms > 30000) need_ms = 30000;
-                            int vq = (int)(need_ms / 1000 * 35) + 64;           /* ~35 pkt/s at 29.97 + margin */
+                            int vq = (int)(need_ms / 1000 * g_cp.vid_pps) + 64; /* v0.9.18.4 M6: video pkt/s from out_fps */
                             av_log(NULL, AV_LOG_WARNING,
                                    "[PTV-BURSTY] video arrives in bursts: %d stalls >=1.5s in the last 60s "
                                    "(worst %.1fs). The frame cushion cannot ride gaps this size — this looks "
@@ -5031,10 +5040,23 @@ static void resolve_cushions(CushionPlan *cp, int live, int multiview,
     if (g_preroll_ms > 1600) g_delivery_cap_us += (int64_t)g_preroll_ms * 1000;  /* v0.9.0: the deep input prime delays VIDEO ~g_preroll_ms; the §7.5a gate holds audio+copy to match (it IS the audio-side of the whole-stream delay), so size its cap to the prime — else it force-releases and audio leaks ahead (TruBLU dlvforced). Explicit PTV_DELIVERY_CAP_MS (below) overrides. */
     if (g_preroll_ms > 1600) g_delivery_maxq = FFMAX(g_delivery_maxq, (int)(g_delivery_cap_us / 1000000 * 256));  /* v0.9.0: the deeper hold needs more FIFO nodes (≤ cap_s × Σ stream pkt-rates); without this a multi-audio channel (2 transcoded + copied AC-3) hits the maxq backstop and back-pressure-stalls before the cap. Explicit PTV_DELIVERY_MAXQ (below) overrides. */
     /* §13: a cushion deeper than frame_q (~1.6s) is carried by video_q -> size it to hold the
-     * backlog (packets ~= preroll_ms x <=60fps + margin), bounded. Default 350ms -> no change. */
-    if (g_preroll_ms > 1600) { int need = (int)((int64_t)g_preroll_ms * 60 / 1000) + 64; if (need > 2048) need = 2048; if (g_videoq < need) g_videoq = need; g_aq_cap = PTV_AQ_PREROLL; }  /* deep prime: also raise the pre-h0 audio ring (default stays 256 = byte-identical) */
+     * backlog (packets ~= preroll_ms x out_fps + margin), bounded. Default 350ms -> no change. */
+    if (g_preroll_ms > 1600) { int pps = out_fps.num > 0 && out_fps.den > 0 ? (int)((out_fps.num + out_fps.den - 1) / out_fps.den) : 60;  /* v0.9.18.4 M6: exact video pkt/s (was pessimistic 60/s) — mutually consistent with deep_prime_pkts' out_fps sizing */
+        int need = (int)((int64_t)g_preroll_ms * pps / 1000) + 64; if (need > 2048) need = 2048; if (g_videoq < need) g_videoq = need; g_aq_cap = PTV_AQ_PREROLL; }  /* deep prime: also raise the pre-h0 audio ring (default stays 256 = byte-identical) */
     { const char *dc = getenv("PTV_DELIVERY_CAP_MS"); if (dc && atoi(dc) > 0) g_delivery_cap_us = (int64_t)atoi(dc) * 1000; }  /* force-release ceiling (A0 ≈1.5–2s) */
     { const char *dq = getenv("PTV_DELIVERY_MAXQ");   if (dq && atoi(dq) > 0) g_delivery_maxq = atoi(dq); }                    /* hold-FIFO size backstop */
+    /* v0.9.18.4 M6: video_q must be able to HOLD the auto-bank ceiling. Measured (59.94 fixture,
+     * A/B): the default capacity (512 pkts = 8.5s @59.94 + ~2.7s frame_q ~= 11.2s) covers most
+     * escalations — the exposed corner is a 59.94fps channel banking at the FULL 12s ceiling
+     * (11.2 < 12; NTSC holds ~17s, never bound). Close the corner: live channels (the only ones
+     * that can bank) get capacity for ceiling x out_fps. Slots are pointers; memory materializes
+     * only while a bank actually holds (~5MB compressed at 3Mbps x 12s). */
+    if (live) {
+        int pps2 = out_fps.num > 0 && out_fps.den > 0 ? (int)((out_fps.num + out_fps.den - 1) / out_fps.den) : 60;
+        int bank_need = (int)(g_cushion_max_ms / 1000 * pps2) + 64;
+        if (bank_need > 2048) bank_need = 2048;
+        if (g_videoq < bank_need) g_videoq = bank_need;
+    }
 
     {
         /* §13: deep prime delays video ~preroll_ms, so audio must buffer that long without the
@@ -5066,6 +5088,8 @@ static void resolve_cushions(CushionPlan *cp, int live, int multiview,
         if (tgt > g_frameq_cap - 8) cp->deep_prime_pkts = tgt;
     }
     cp->deep_prime_budget_us = (int64_t)g_preroll_ms * 2000;   /* 2x preroll_ms, in us (decode start-delay budget) */
+    cp->vid_pps = out_fps.num > 0 && out_fps.den > 0
+                ? (int)((out_fps.num + out_fps.den - 1) / out_fps.den) : 60;  /* v0.9.18.4 M6; unknown rate -> pessimistic 60 */
 
     cp->preroll_ms        = g_preroll_ms;
     cp->videoq_pkts       = g_videoq;

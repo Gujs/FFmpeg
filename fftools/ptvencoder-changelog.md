@@ -5,6 +5,28 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 0.9.18.4 (2026-07-07) — M6: one video packet rate, derived from out_fps
+
+The seconds->video_q-packets conversions used three constants (bank 35/s, deep-preroll
+side-car 60/s, deep-prime out_fps). Now ONE rate: CushionPlan.vid_pps = ceil(out_fps).
+Audio sizing keeps its own 50/s — that is an AAC frame rate (48kHz/1024 ~= 47/s), not a
+video rate, intentionally not unified.
+
+MEASURED CORRECTION to the plan's premise (59.94fps fixture, A/B vs pre-M6): the old bank
+packet count is consumed as a BOOLEAN (arms blocking-push), so the 35/s value was inert;
+and default capacity (videoq 512 + frame_q) already holds ~11.2s @59.94 — both builds
+retained a 9.2s bank fine. The real fixes here: (a) the [PTV-BURSTY] advisor recipe now
+recommends a correct PTV_VIDEOQ for fast channels (was ~42% under at 59.94); (b) live
+channels' video_q is auto-sized to hold the FULL bank ceiling (closes the one exposed
+corner: 59.94fps at the 12s ceiling needed ~720+ pkts vs 512+frame_q ~= 11.2s); (c) the
+deep-preroll side-car uses the exact rate (was pessimistic 60/s — now mutually consistent
+with deep_prime's own sizing).
+
+Gate: 59.94 escalation fixture — new build retains 12.1s actual >= 9.2s target with the
+ceiling-sized queue, overshoot-retention drains at ppm scale as designed; regression
+tier-1 set identical; 29.97/25fps sizing arithmetic unchanged by construction
+(ceil(out_fps) reproduces the old effective numbers there).
+
 ## 0.9.18.3 (2026-07-07) — M5: cushion tier changes reach the live delivery gates
 
 The adaptive GROW/SHRINK arms raised/restored only the GLOBAL delivery cap; the per-rung
