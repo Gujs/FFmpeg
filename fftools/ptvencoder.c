@@ -39,7 +39,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "0.9.18.1"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "0.9.18.2"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 #define PTV_WD_DEADLINE_US (2 * (int64_t)AV_TIME_BASE)   /* watchdog stall threshold */
@@ -4563,8 +4563,12 @@ static void *compositor_thread(void *arg)
     int64_t rung_pts[PTV_MAX_RUNG] = {0};
     AVFrame *filt = av_frame_alloc();
     int64_t tick = 0, wall0 = 0;
-    const char *pe = getenv("PTV_PREROLL_MS");
-    int preroll_ms = pe ? atoi(pe) : 350;
+    /* v0.9.18.2 M4: use the RESOLVED preroll (CushionPlan) — this getenv re-read with a 350ms
+     * fallback predated v0.9.1's genlock default (1000ms) and was never updated, so plain mv
+     * invocations primed with roughly a THIRD of the intended startup cushion (plan §3.6).
+     * resolve_cushions() runs in transcode() before this thread starts; an explicit
+     * PTV_PREROLL_MS still wins exactly as before (it feeds the resolved value). */
+    int preroll_ms = g_cp.preroll_ms;
     int n_prime = (preroll_ms > 0 && c->tick_dur_us > 0) ? (int)((int64_t)preroll_ms * 1000 / c->tick_dur_us) : 0;
     int64_t diag_t0 = av_gettime_relative(), diag_last = diag_t0;
     int64_t stat_last = diag_t0, stat_prev = 0;
