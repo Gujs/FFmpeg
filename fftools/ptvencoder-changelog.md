@@ -5,6 +5,19 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 0.9.18.2 (2026-07-07) — M4: multiview primes with the resolved preroll
+
+The compositor re-read PTV_PREROLL_MS with a 350ms fallback that predated v0.9.1's genlock
+default (1000ms) — plain mv invocations primed with a third of the intended cushion (plan
+§3.6, the last un-resolved cushion consumer). Now reads CushionPlan's resolved value;
+explicit PTV_PREROLL_MS wins exactly as before.
+
+Fixture A/B (2x2 grid, 4 live UDP 25fps inputs, x264): old = one slot 5 startup starvation
+dups + slots born misaligned (sk -74/-53ms, permanent, and per-slot audio follows it);
+new = sv=0 all slots, sk=+0 all slots, dlvhold ~1.6->2.4s (deeper hold, by design).
+Composite dup= reads higher purely because aligned slots hold on the SAME tick (uniform
+cadence repeat) instead of staggered — slot-level content is identical-or-better.
+
 ## 0.9.18.1 (2026-07-06) — M7: cadence-evidence pulldown disarm (AWE clicking)
 
 Measured (test-results/pulldown-trap/ + cor-1/cor-3 log correlation): AWE's encoder emits
