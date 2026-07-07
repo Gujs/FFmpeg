@@ -5,6 +5,39 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 0.9.18.5 (2026-07-07) — sub-1s "no-owner band": shared-amount absorber owns it under LAYERA
+
+Fixes the In-Touch_+ audio-late accumulator (+620ms/3h, +1477ms/26h measured live; full
+root-cause: analysis/ptvencoder-intouch-desync-analysis.md). Under g_layera the demux
+absorber was skipped for ALL super-threshold (>80ms) jumps, but LAYERA itself only claims
+>1s — so a both-stream backward step in the 80ms..1s band had NO packet-layer owner:
+video became house_skew ratchet/decimation while AGLUE RELABEL-erased audio, and AVLOCK
+re-injected the video conversion into audio → the same source event actuated TWICE on
+audio = audio permanently late ~step-size per event. The skip is now scoped to jumps
+LAYERA will actually claim (>PTV_DISC_THRESHOLD_US, same comparison as
+ptv_disc_detect_jump); sub-1s falls through to the proven §5.A.2 shared-amount absorber,
+which erases the step identically on both streams before house clock/AGLUE/aresample see
+it. PTV_LAYERA_FULLSKIP=1 restores the old posture (A/B / rollback).
+
+Fold-ins: (a) ptv_disc_flush shifts stream_state[].last_dts_us by applied_offset — kills
+the phantom re-detect/flush (applied_offset=-0.000s + ~50ms hold) after every glue;
+(b) video_fwd_us stamped before the LAYERA skip so the audio gap discriminator's
+vcrossed signal is truthful under g_layera. Adversarial-review disclosures: (b) is
+outcome-invariant coupling, not zero coupling — when video crosses first in a
+whole-program splice, a later >1s audio forward jump's is_gap flips 1->0, but both
+routes end at absorb_done unabsorbed and LAYERA claims the glue either way (residual =
+log line + disturb_epoch bump source). PTV_LAYERA_FULLSKIP is NOT byte-equivalent to
+0.9.18.4: both fold-ins stay active under it (hygiene-only; the A/B arm restores the
+accumulator mechanism faithfully, but do not expect the phantom -0.000s flush lines to
+reappear). And sub-1s backward events now bump disturb_epoch (PLL re-acquire) via the
+restored absorber body — the proven g_layera=0 posture, previously silent under LAYERA.
+
+Gate: F1 fixture (both-stream −300ms steps, flash+beep ruler) — HEAD shows the exact
++301ms/event staircase, fixed build flat [−32,+30]ms; F4 (3× ~6s real wall stalls) —
+≥1s LAYERA path byte-identical per-event deltas vs HEAD, one flush per event (HEAD: 2,
+phantom); AGLUE regression (audio-only −300ms) — absorber owns it on the new default,
+RELABEL fires unchanged under FULLSKIP; regression tier-1 set identical.
+
 ## 0.9.18.4 (2026-07-07) — M6: one video packet rate, derived from out_fps
 
 The seconds->video_q-packets conversions used three constants (bank 35/s, deep-preroll

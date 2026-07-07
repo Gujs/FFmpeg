@@ -39,7 +39,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "0.9.18.4"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "0.9.18.5"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 #define PTV_WD_DEADLINE_US (2 * (int64_t)AV_TIME_BASE)   /* watchdog stall threshold */
@@ -143,6 +143,17 @@ static int64_t g_progoff_debounce_us = 1000000;   /* PTV_PROGOFF_DEBOUNCE_MS: co
  * unwrap_inj≈0 → fast channels that glue mis-muxed content accumulate the error). Supersedes
  * g_progoff_av when set. Re-aligns video if it crossed before audio within the debounce window. */
 static int     g_layera = 1;   /* v0.9.10: DEFAULT ON (proven production posture); PTV_NO_LAYERA reverts */
+/* 0.9.18.5 (In-Touch audio-late accumulator, analysis/ptvencoder-intouch-desync-analysis.md §4b):
+ * under g_layera the demux_unwrap absorber used to be skipped for ALL super-threshold jumps, but
+ * LAYERA itself only claims jumps >1s — the sub-1s band (80ms..1s backward) had NO packet-layer
+ * owner. A BOTH-STREAM backward step there was converted into house_skew ratchet/decimation on the
+ * video side while AGLUE RELABEL-erased the audio side, and AVLOCK re-injected the video conversion
+ * into audio → the same source event actuated TWICE on audio = audio permanently LATE by ~the step
+ * per event (measured +620ms/3h, +1477ms/26h on In-Touch_+; F1 fixture: +301ms/event staircase).
+ * The skip is now scoped to LAYERA's own band (>PTV_DISC_THRESHOLD_US, matching
+ * ptv_disc_detect_jump); sub-1s steps fall through to the proven §5.A.2 shared-amount absorber.
+ * PTV_LAYERA_FULLSKIP=1 restores the old full-skip posture (A/B / rollback). */
+static int     g_layera_fullskip = 0;
 static int64_t g_disc_viderr_sum;    /* PTV-FLUSHAV: running total of per-flush vid_err (source A/V misalignment absorbed at glues, us) — correlate its growth vs the oracle drift to test whether flushes leak into audio-behind */
 /* P2 §7.1 / stage 2b: after a detected source discontinuity, DROP video packets until the next keyframe
  * (IDR) before they reach the decoder — a splice starts a NEW timeline mid-GOP, so the P/B frames that
@@ -3715,9 +3726,18 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
     if (b->applied_offset != 0) {
         int s;
         for (s = 0; s < b->nb_streams && s < (int)d->ifmt->nb_streams; s++)
-            if (b->stream_state[s].has_new_base)
+            if (b->stream_state[s].has_new_base) {
                 d->wrap_off[s] += av_rescale_q(b->applied_offset, AV_TIME_BASE_Q,
                                                d->ifmt->streams[s]->time_base);
+                /* 0.9.18.5: shift the stale jump-detection continuity ref too. last_dts_us is
+                 * stored in the demux loop from the PRE-offset raw DTS of the last buffered
+                 * packet; once wrap_off above carries the applied offset, the next normal-path
+                 * packet arrives already-erased, so an unshifted ref re-triggered a phantom
+                 * detect→flush cycle (applied_offset=-0.000s + a ~50ms hold) after every glue.
+                 * See analysis/ptvencoder-intouch-desync-analysis.md §1.6 / §5 hygiene fix 1. */
+                if (b->stream_state[s].last_dts_us != AV_NOPTS_VALUE)
+                    b->stream_state[s].last_dts_us += b->applied_offset;
+            }
         d->prog_off += av_rescale_q(b->applied_offset, AV_TIME_BASE_Q, (AVRational){1, 90000});
     }
 
@@ -3914,14 +3934,33 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                     }
                     if (is_gap) goto absorb_done;
                     int64_t nowb = av_gettime_relative();
-                    if (g_layera) {
+                    /* 0.9.18.5 fold-in (log-truth only, no behavior coupling): record video forward
+                     * crossings BEFORE the LAYERA skip so the audio gap discriminator's `vcrossed`
+                     * signal works under g_layera too — it was only set inside the absorber body the
+                     * skip bypassed, so a whole-program stall was always classified (and logged) as
+                     * "audio GAP — NOT absorbed" even when LAYERA was about to erase it.
+                     * gap-fix: video forward crossing = whole-program-splice signal for the audio
+                     * gap discriminator. */
+                    if (ct == AVMEDIA_TYPE_VIDEO && delta > 0)
+                        d->video_fwd_us = wall_now;
+                    if (g_layera &&
+                        (g_layera_fullskip ||
+                         llabs(av_rescale_q(delta, st->time_base, AV_TIME_BASE_Q)) > PTV_DISC_THRESHOLD_US)) {
                         /* Layer A = the legacy-0004 buffer-classify-discard mechanism, which lives in
                          * demux_thread (ptv_disc_*): it BUFFERS dense V/A across the straddle, discards
                          * OLD-timeline packets, computes ONE audio-derived offset, and applies it at flush.
                          * So demux_unwrap must NOT also absorb this crossing into wrap_off/prog_off — that
                          * would double-rebase the kept packets. Skip the per-stream absorber entirely (the
                          * 33-bit wrap branches above still ran, which the buffer relies on); leave DUKF and
-                         * the disturb bump to the buffer/normal-path. (g_layera==0 path is unchanged.) */
+                         * the disturb bump to the buffer/normal-path. (g_layera==0 path is unchanged.)
+                         * 0.9.18.5: the skip is scoped to jumps LAYERA will actually claim
+                         * (>PTV_DISC_THRESHOLD_US = 1s, same comparison as ptv_disc_detect_jump). Sub-1s
+                         * steps fall through to the proven §5.A.2 shared-amount absorber below, so a
+                         * both-stream backward step in the 80ms..1s "no-owner band" is erased identically
+                         * on BOTH streams at the packet layer and house_skew/decimation/AGLUE/aresample
+                         * never see it (the In-Touch audio-late accumulator — see
+                         * analysis/ptvencoder-intouch-desync-analysis.md §4b/§5).
+                         * PTV_LAYERA_FULLSKIP=1 restores the unconditional skip. */
                         goto absorb_done;
                     } else if (g_progoff_av) {
                         /* §5.A.2 (adopt-on-crossing, SHARED first-crosser amount — PRESERVES source A/V, see g_layera). */
@@ -3932,7 +3971,7 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                     d->wrap_off[pkt->stream_index] -= adj;   /* per-stream rebase AT OWN CROSSING (audio-derived common offset when g_layera) */
                     if (ct == AVMEDIA_TYPE_VIDEO) {
                         d->prog_off -= adj;                  /* P2: sparse sub/data/SCTE ride this */
-                        if (delta > 0) d->video_fwd_us = wall_now;   /* gap-fix: video forward crossing = whole-program-splice signal for the audio gap discriminator */
+                        /* (video_fwd_us for the gap discriminator is stamped above, before the LAYERA skip — 0.9.18.5) */
                         /* P2 2b: arm drop-until-keyframe on VIDEO's own crossing (first-arm-only), ONLY on a LARGE jump. */
                         int64_t dukf_thresh = av_rescale(g_dukf_min_ms, st->time_base.den, (int64_t)st->time_base.num * 1000);
                         if (g_drop_until_kf && !d->drop_until_kf &&
@@ -6277,7 +6316,8 @@ static void ptv_print_log_legend(int full)
         "  clock-follow + cadence decimation are all ON — no env needed for the production posture.\n"
         "  Reverts: PTV_NO_WUCR · PTV_NO_LAYERA · PTV_NO_REPRIME · PTV_NO_ADAPTIVE · PTV_NO_AVLOCK ·\n"
         "  PTV_NO_DELIVERY_MV · PTV_NO_RESIDENCE · PTV_NO_AUTOBANK · PTV_NO_CLOCKFOLLOW ·\n"
-        "  PTV_NO_DECIMATE ·\n"
+        "  PTV_NO_DECIMATE · PTV_LAYERA_FULLSKIP (LAYERA skips the demux absorber for sub-1s steps\n"
+        "  again — restores the In-Touch audio-late accumulator; A/B only) ·\n"
         "  PTV_NO_EXACTTICK (re-enables the integer-tick ~10ppm NTSC lip-sync drift; A/B only) ·\n"
         "  PTV_NO_PULLDOWN (revert telecine-aware emit: film segments back to dup-fill + hs sawtooth)\n");
     av_log(NULL, AV_LOG_INFO,
@@ -6305,6 +6345,9 @@ int main(int argc, char **argv)
     if (getenv("PTV_REPRIME")) g_reprime = 1;     /* fast buffer re-prime after a glue (default ON since v0.9.10; kept for compat) */
     if (getenv("PTV_NO_REPRIME")) g_reprime = 0;
     if (getenv("PTV_NO_LAYERA"))  g_layera  = 0;  /* v0.9.10: WUCR/LAYERA/REPRIME are default-on; NO_* revert */
+    if (getenv("PTV_LAYERA_FULLSKIP")) g_layera_fullskip = 1;  /* 0.9.18.5 revert: LAYERA skips the demux absorber for ALL
+                                                                * super-threshold jumps again (restores the sub-1s no-owner
+                                                                * band = the In-Touch audio-late accumulator; A/B only) */
     if (getenv("PTV_NO_ADAPTIVE")) g_adapt_cushion = 0;   /* fixed preroll target (pre-0.9.10 behavior) */
     /* PTV_CUSHION_MS parse moved to resolve_cushions() (0.9.18 M1) */
     if (getenv("PTV_NO_GENLOCK")) g_genlock = 0; /* v0.9.0: revert to free-run nominal pacing (+ old 350ms prime) = byte-identical */
