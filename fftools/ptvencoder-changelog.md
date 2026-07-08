@@ -5,6 +5,23 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 0.9.18.6 (2026-07-08) — R3+R4: estimator/house-rate state into per-input/per-house structs
+
+Pure-motion refactor (no behavior change intended; this bump exists so the soak build is
+banner-distinguishable from 0.9.18.5). RateEstimator (incl. the former g_src_rate_*/g_cf_*
+atomics) now lives per-input in the Input struct; HouseRateState (rho servo, occ EMA,
+reprime state) is owned at transcode() scope and shared by the rung set via VideoCtx.hr —
+the same pattern as h0/house_skew. house_rate_corr_ppm() gains const RateEstimator*.
+All _Atomic types, orderings, seeds, and formulas moved verbatim; multiview semantics
+unchanged (estimator is only fed in single-input live mode). Closes the last file-split
+prerequisite.
+
+Gate: tier-1 fail-set identical; WUCR A/B rho trajectory + cf-lock schedule identical;
+escalation fixture event-sequence identical; deep-preroll fqhw plateau identical;
+adversarial review COMMIT-READY (byte-identical substantiated at every access site).
+Live gate = 24h cor-3/live-transcoder soak (cross-thread atomics moved — the one class
+where fixtures are weakest; watch wucr_rho/cf/async parity vs 0.9.18.5 baselines).
+
 ## 0.9.18.5 (2026-07-07) — sub-1s "no-owner band": shared-amount absorber owns it under LAYERA
 
 Fixes the In-Touch_+ audio-late accumulator (+620ms/3h, +1477ms/26h measured live; full
