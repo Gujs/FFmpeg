@@ -404,9 +404,10 @@ static _Atomic int64_t g_ch_vsrc_raw, g_ch_asrc_raw;   /* [PTV-CHAIN] PRE-unwrap
 /* v0.9.0 source-clock genlock: slave the single-input master output cadence to the recovered source
  * frame rate so the house clock stops drifting vs the channel (no growing output-slower lag), house_skew
  * → 0, and aresample is freed for honest A/V trim. The estimator (demux thread, post-unwrap video DTS vs
- * wall clock) publishes g_src_rate_q20 = content-µs per wall-µs in Q20 (1<<20 == declared nominal); the
- * master pacer scales its per-tick wall span by it. g_genlock_ok is true only for single-input live (the
- * multiview compositor is unaffected). PTV_NO_GENLOCK reverts to byte-identical free-run. */
+ * wall clock) publishes RateEstimator.src_rate_q20 = content-µs per wall-µs in Q20 (1<<20 == declared
+ * nominal); the master pacer scales its per-tick wall span by it. g_genlock_ok is true only for
+ * single-input live (the multiview compositor is unaffected). PTV_NO_GENLOCK reverts to byte-identical
+ * free-run. */
 static int             g_genlock = 1;
 static int             g_genlock_ok;                  /* runtime: single-input live (set at setup) */
 /* v0.9.15 CLOCK-FOLLOW: some real sources run their transport clock PERCENT-scale fast/slow
@@ -419,46 +420,50 @@ static int             g_genlock_ok;                  /* runtime: single-input l
  * soft ratio. Film-in-NTSC can never arm this (its DTS advance is realtime; the estimator
  * reads ~0). Single-input live only. PTV_NO_CLOCKFOLLOW reverts. */
 static int             g_clockfollow = 1;
-static _Atomic int64_t g_cf_rate_q20 = (1 << 20);     /* coarse source rate (content-us/wall-us, Q20) */
-static _Atomic int     g_cf_locked;                    /* 20 clean chunks (~60s) before the servo may follow */
-static _Atomic int64_t g_src_rate_q20 = (1 << 20);   /* recovered source rate (content-µs/wall-µs), Q20 */
-static _Atomic int     g_src_rate_locked;            /* 0 until the FLL trusts the estimate */
-/* 0.9.18 R1 (map: analysis/ptvencoder-0918-implementation-map.md §2): demux-side rate-sensing
- * state, hoisted verbatim from function-local statics in demux_dispatch. Conceptually one per
- * INPUT (today exactly one → a singleton); R3/R4 fold the published g_src/cf atomics in and
- * move the instance into the input wiring. Values below are the former statics' initializers. */
+/* 0.9.18 R1+R3/R4 (map: analysis/ptvencoder-0918-implementation-map.md §2): demux-side
+ * rate-sensing state, hoisted verbatim from function-local statics in demux_dispatch (R1),
+ * with the published rate atomics folded in (R3). One per INPUT — the instance lives in
+ * the Input struct (R4), wired to the demux (writer) and output threads (readers) at
+ * transcode() setup like h0/house_skew. Non-zero initializers are set in the per-input
+ * init loop (former statics'/globals' initializers, verbatim). */
 typedef struct RateEstimator {
     int64_t c0, w0, ema_q20;        /* tight-FLL sub-window anchor + rate EMA (Q20) */
     int_least64_t ep_prev;          /* disturbance epoch of the current sub-window */
     int     chunks;                 /* clean FLL chunks (lock at 8) */
     int64_t cf_ema_q20;             /* coarse clock-follow rate EMA (Q20) */
     int     cf_chunks, cf_wins, cf_la_acc, cf_la_tot, cf_frozen;
+    /* published outputs (demux thread writes, output threads read; relaxed atomics) */
+    _Atomic int64_t cf_rate_q20;    /* coarse source rate (content-us/wall-us, Q20) */
+    _Atomic int     cf_locked;      /* 20 clean chunks (~60s) before the servo may follow */
+    _Atomic int64_t src_rate_q20;   /* recovered source rate (content-µs/wall-µs), Q20 */
+    _Atomic int     src_rate_locked;/* 0 until the FLL trusts the estimate */
 } RateEstimator;
-static RateEstimator g_est = { .c0 = AV_NOPTS_VALUE, .ema_q20 = 1 << 20,
-                               .ep_prev = -1, .cf_ema_q20 = 1 << 20 };
-/* 0.9.18 R1: master-output-side house-rate actuation state (the ladder's memory). Starts with
- * the clock-follow latch; R3/R4 fold in occ_ema/reprime/rho as the ladder is extracted. */
+/* 0.9.18 R1+R3/R4: master-output-side house-rate actuation state (the ladder's memory).
+ * One per HOUSE CLOCK — the instance is a transcode()-scope struct shared by the rung set
+ * (master writes, all rungs apply rho_corr_ppm), wired via VideoCtx like h0/house_skew. */
 typedef struct HouseRateState {
     int cf_following;               /* clock-follow hysteresis latch (arm >5000, release <2000 ppm) */
+    int64_t occ_ema_milli;          /* WUCR: EMA-filtered master frame_q occupancy (milli-frames); master-thread only, non-atomic */
+    int     occ_ema_seeded;         /* WUCR: seed the EMA to the first occupancy sample so there is no startup-ramp transient */
+    int64_t reprime_start;          /* 0.9.10.1: wall time the CURRENT reprime engagement began (0 = idle). An
+                                     * engagement is hard-capped at 10s, then a 300s cooldown applies UNCONDITIONALLY
+                                     * — the 0.9.10 "continuing" clause let occupancy oscillating around the trigger
+                                     * re-arm forever (observed live: AWE film segments pinned the house at 0.77x). */
+    int64_t reprime_last_end;       /* wall time the last engagement ended (cooldown reference) */
+    _Atomic int64_t rho_corr_ppm;   /* WUCR ρ: applied house-rate correction (ppm, corr>0 = house slower); ±6% clamp (±30% under re-prime) */
 } HouseRateState;
-static HouseRateState g_hr;
 /* WUCR (W0): PTV_WUCR enables the occupancy-recovered house rate ρ — a type-2 PI loop on frame_q
  * fill, ±150ppm HARD clamp (physical crystal bound → runaway structurally impossible), burst-freeze
  * on super-physical fill slope. W0 drives ONLY the video pacer (per_tick) and surfaces buf/rho in
  * -stats next to srcppm for the go/no-go (ρ flat where the DTS-vs-wall FLL ran away). The FLL still
  * runs (srcppm computed for comparison) but does not pace. Audio coupling to ρ is W1.
- * Genlock remains the fallback pacer. g_rho_corr_ppm = the APPLIED correction (I+P),
+ * Genlock remains the fallback pacer. HouseRateState.rho_corr_ppm = the APPLIED correction (I+P),
  * one producer (master), all rungs apply it identically. */
 static int             g_wucr = 1;                   /* v0.9.10: DEFAULT ON (proven production posture); PTV_NO_WUCR reverts */
 static int             g_reprime = 1;                /* PTV_REPRIME: when a glue drains frame_q below half the BASE floor, slow the house HARD (≈0.77x)
                                                       * to refill fast → dups stop, house_skew stays bounded (the ±6% refill let it run to 7-15s overnight).
                                                       * Composes with WUCR (occupancy servo) + AVLOCK. v0.9.10: DEFAULT ON, rate-limited to one
-                                                      * engagement per 5min (PTV_NO_REPRIME reverts). */
-static int64_t         g_reprime_start;              /* 0.9.10.1: wall time the CURRENT reprime engagement began (0 = idle). An
-                                                      * engagement is hard-capped at 10s, then a 300s cooldown applies UNCONDITIONALLY
-                                                      * — the 0.9.10 "continuing" clause let occupancy oscillating around the trigger
-                                                      * re-arm forever (observed live: AWE film segments pinned the house at 0.77x). */
-static int64_t         g_reprime_last_end;           /* wall time the last engagement ended (cooldown reference) */
+                                                      * engagement per 5min (PTV_NO_REPRIME reverts). Engagement state lives in HouseRateState. */
 /* v0.9.10 ADAPTIVE CUSHION (PTV_NO_ADAPTIVE reverts to a fixed preroll target). Two discrete frame_q
  * targets, no continuous wander: BASE = the resolved preroll (~1s) and RAISED = g_cushion_ms (~4s).
  * GROW: two starvation episodes (frame_q empty >=200ms) within 60min -> RAISED (one-off glitches never
@@ -495,9 +500,6 @@ typedef struct CushionPlan {
                                     * a video rate — intentionally NOT unified. */
 } CushionPlan;
 static CushionPlan     g_cp;                          /* resolved once in transcode() setup, before threads start */
-static _Atomic int64_t g_rho_corr_ppm;               /* WUCR ρ: applied house-rate correction (ppm, corr>0 = house slower); ±6% clamp (±30% under re-prime) */
-static int64_t         g_occ_ema_milli;              /* WUCR: EMA-filtered master frame_q occupancy (milli-frames); master-thread only, non-atomic */
-static int             g_occ_ema_seeded;             /* WUCR: seed the EMA to the first occupancy sample so there is no startup-ramp transient */
 static _Atomic int     g_frameq_depth;               /* DIAG: master video frame_q occupancy (frames), published each tick for the discontinuity logs */
 /* PTV-EMPTY: edge-triggered per-queue starvation logger. Logs a refill line with the empty duration
  * for episodes >=200ms, plus (only when hb != NULL) a 5s chronic heartbeat while empty. Returns the
@@ -1170,6 +1172,8 @@ typedef struct VideoCtx {
     int64_t         *h0;             /* shared A/V input anchor (us) */
     pthread_mutex_t *h0_lock;
     int64_t         *house_skew;     /* master publishes house-vs-content skew (us) here */
+    RateEstimator   *est;            /* input 0's rate sensor (genlock fallback + cf/diag/stats reads) */
+    HouseRateState  *hr;             /* per-house actuation state: master computes+publishes rho, all rungs apply it */
     VOutRing        *vring;          /* A/V probe: single-input video output ring (PTV_AVSYNC_PROBE) */
     AVCodecContext  *venc;
     AVStream        *ost;
@@ -1579,11 +1583,11 @@ static int64_t content_index(VideoCtx *v, int64_t src_pts)
  * the master publishes and every rung applies. Priority order, unchanged:
  *   P-servo → reprime override → +1.5% sustained cap → hard ±6% clamp →
  *   gentle zone ±0.6% → bank top-up floor → clock-follow subtraction.
- * Inputs are the parameters plus the published estimator/bank atomics; the servo EMA
- * and reprime state machine still live in file-scope globals (R3/R4 fold them into
- * HouseRateState as the structs move per-house). Master thread only — non-reentrant. */
-static int64_t house_rate_corr_ppm(HouseRateState *hr, int occ, int sp,
-                                   int base_sp, int64_t tick_dur_us)
+ * Inputs are the parameters plus the published bank atomics; the servo EMA, reprime
+ * state machine and clock-follow latch live in *hr, the published estimator rates in
+ * *est (0.9.18 R3/R4). Master thread only — non-reentrant. */
+static int64_t house_rate_corr_ppm(HouseRateState *hr, const RateEstimator *est,
+                                   int occ, int sp, int base_sp, int64_t tick_dur_us)
 {
     /* PROPORTIONAL occupancy servo (v0.9.6). The earlier INTEGRAL servo (corr += K·err)
      * oscillated: the buffer is itself an integrator (ρ → consume-rate → ∫ → occupancy),
@@ -1598,9 +1602,9 @@ static int64_t house_rate_corr_ppm(HouseRateState *hr, int occ, int sp,
      * source). A light EMA gives fractional occ so ρ doesn't step on integer-frame
      * quantization; with P-control its lag is harmless. */
     int repriming = 0;
-    if (!g_occ_ema_seeded) { g_occ_ema_milli = (int64_t)occ * 1000; g_occ_ema_seeded = 1; }
-    g_occ_ema_milli += ((int64_t)occ * 1000 - g_occ_ema_milli) / 16;   /* EMA N=16 → smooth fractional occ */
-    int64_t err_milli = (int64_t)sp * 1000 - g_occ_ema_milli;          /* setpoint − occ (milli-frames) */
+    if (!hr->occ_ema_seeded) { hr->occ_ema_milli = (int64_t)occ * 1000; hr->occ_ema_seeded = 1; }
+    hr->occ_ema_milli += ((int64_t)occ * 1000 - hr->occ_ema_milli) / 16;   /* EMA N=16 → smooth fractional occ */
+    int64_t err_milli = (int64_t)sp * 1000 - hr->occ_ema_milli;          /* setpoint − occ (milli-frames) */
     int64_t corr = (err_milli * 500) / 1000;                           /* ρ = Kp·err, Kp=500 ppm/frame (PROPORTIONAL, no accumulation) */
     int64_t hi = 60000;                                            /* +6% normal positive clamp */
     if (g_reprime && occ <= (base_sp + 1) / 2) {                   /* RE-PRIME: drained below half the BASE floor (true starvation —
@@ -1611,17 +1615,17 @@ static int64_t house_rate_corr_ppm(HouseRateState *hr, int occ, int sp,
                                                                     * kept occ at the threshold → reprime pinned the house at 0.77x for
                                                                     * the whole segment → downstream underrun). */
         int64_t nw2 = av_gettime_relative();
-        if (g_reprime_start == 0 &&
-            (g_reprime_last_end == 0 || nw2 - g_reprime_last_end > 300LL * 1000000))
-            g_reprime_start = nw2;                                 /* begin a new engagement (cooldown clear) */
-        if (g_reprime_start && nw2 - g_reprime_start <= 10LL * 1000000) {
+        if (hr->reprime_start == 0 &&
+            (hr->reprime_last_end == 0 || nw2 - hr->reprime_last_end > 300LL * 1000000))
+            hr->reprime_start = nw2;                               /* begin a new engagement (cooldown clear) */
+        if (hr->reprime_start && nw2 - hr->reprime_start <= 10LL * 1000000) {
             corr = 300000; hi = 300000;                            /* ≈ house 0.77x, bounded to 10s */
             repriming = 1;
-        } else if (g_reprime_start) {
-            g_reprime_last_end = nw2; g_reprime_start = 0;         /* cap hit → end + cooldown */
+        } else if (hr->reprime_start) {
+            hr->reprime_last_end = nw2; hr->reprime_start = 0;     /* cap hit → end + cooldown */
         }
-    } else if (g_reprime_start) {
-        g_reprime_last_end = av_gettime_relative(); g_reprime_start = 0;   /* occ recovered → end + cooldown */
+    } else if (hr->reprime_start) {
+        hr->reprime_last_end = av_gettime_relative(); hr->reprime_start = 0;   /* occ recovered → end + cooldown */
     }
     if (!repriming && corr > 15000) corr = 15000;                  /* 0.9.10.1: sustained positive (slow-down) authority capped at 1.5%
                                                                     * — the proven pre-0.9.10 level (Kp x base_sp). The servo must never
@@ -1634,7 +1638,7 @@ static int64_t house_rate_corr_ppm(HouseRateState *hr, int occ, int sp,
      * an adaptive GROW fills lazily from the source's natural catch-up bursts and a
      * SHRINK drains at ppm scale, so tier transitions never jerk downstream delivery.
      * Full authority below the floor (real starvation) and under re-prime. */
-    if (g_adapt_cushion && !repriming && g_occ_ema_milli >= (int64_t)base_sp * 1000) {
+    if (g_adapt_cushion && !repriming && hr->occ_ema_milli >= (int64_t)base_sp * 1000) {
         if (corr >  6000) corr =  6000;
         if (corr < -6000) corr = -6000;
     }
@@ -1649,7 +1653,7 @@ static int64_t house_rate_corr_ppm(HouseRateState *hr, int occ, int sp,
          * (counting video_q alone would overshoot by frame_q's depth, ~5s) */
         int64_t have = ((int64_t)atomic_load_explicit(&g_vq_elems, memory_order_relaxed) + occ)
                        * tick_dur_us;
-        if (bt > 0 && !repriming && g_occ_ema_milli >= (int64_t)base_sp * 1000 &&
+        if (bt > 0 && !repriming && hr->occ_ema_milli >= (int64_t)base_sp * 1000 &&
             have < bt && corr < 6000)
             corr = 6000;
     }
@@ -1662,8 +1666,8 @@ static int64_t house_rate_corr_ppm(HouseRateState *hr, int occ, int sp,
      * clock WANDERS -700..-3400ppm and chattered arm/release across 3000 (~15/day);
      * sub-5000 offsets are handled fine unfollowed (WUCR + decimation, proven live),
      * so follow engages only for the genuinely-broken-clock class it was built for. */
-    if (g_clockfollow && atomic_load_explicit(&g_cf_locked, memory_order_relaxed)) {
-        int64_t cf_ppm = ((atomic_load_explicit(&g_cf_rate_q20, memory_order_relaxed)
+    if (g_clockfollow && atomic_load_explicit(&est->cf_locked, memory_order_relaxed)) {
+        int64_t cf_ppm = ((atomic_load_explicit(&est->cf_rate_q20, memory_order_relaxed)
                            - (1 << 20)) * 1000000) >> 20;
         /* v0.9.15.3: a BURSTY-classified channel (auto-bank armed) violates the coarse
          * estimator's smooth-delivery assumption — its clump windows alias into a bogus
@@ -1959,22 +1963,22 @@ static void *output_thread(void *arg)
                  * rate/Kp, e.g. +15ppm → ~+1.9 frames). A slow EMA smooths jitter AND delivery bursts (a
                  * burst moves occ_ema gradually, never spikes ρ). ±150ppm hard clamp = physical crystal
                  * bound → runaway impossible. Zero-steady-offset (PI + anti-windup) is the W1 refinement.
-                 * Master computes; all rungs apply g_rho_corr_ppm identically. */
+                 * Master computes; all rungs apply hr->rho_corr_ppm identically. */
                 if (v->is_master) {
                     /* 0.9.18 R2: the ladder body moved verbatim to house_rate_corr_ppm() above;
                      * g_curt.cur_sp = adaptive tier target (base preroll unless grown; M3 moved it
                      * into the escalation runtime). Master computes; all rungs apply the published
-                     * g_rho_corr_ppm identically. */
+                     * hr->rho_corr_ppm identically. */
                     int occ = av_thread_message_queue_nb_elems(v->frame_q);
-                    atomic_store_explicit(&g_rho_corr_ppm,
-                        house_rate_corr_ppm(&g_hr, occ, g_curt.cur_sp, base_sp, v->tick_dur_us),
+                    atomic_store_explicit(&v->hr->rho_corr_ppm,
+                        house_rate_corr_ppm(v->hr, v->est, occ, g_curt.cur_sp, base_sp, v->tick_dur_us),
                         memory_order_relaxed);
                 }
-                int64_t corr = atomic_load_explicit(&g_rho_corr_ppm, memory_order_relaxed);
+                int64_t corr = atomic_load_explicit(&v->hr->rho_corr_ppm, memory_order_relaxed);
                 per_tick = av_rescale(per_tick, 1000000, 1000000 - corr);
             } else if (g_genlock &&
-                atomic_load_explicit(&g_src_rate_locked, memory_order_relaxed)) {
-                int64_t rate = atomic_load_explicit(&g_src_rate_q20, memory_order_relaxed);
+                atomic_load_explicit(&v->est->src_rate_locked, memory_order_relaxed)) {
+                int64_t rate = atomic_load_explicit(&v->est->src_rate_q20, memory_order_relaxed);
                 if (rate > 0) per_tick = av_rescale(v->tick_dur_us, 1 << 20, rate);  /* source faster (rate>nominal) → shorter span → consume faster */
             }
             int64_t target = wall0 + gl_phase;
@@ -2038,11 +2042,11 @@ static void *output_thread(void *arg)
                     av_thread_message_queue_nb_elems(v->dbg_video_q),
                     av_thread_message_queue_nb_elems(v->frame_q),
                     av_thread_message_queue_nb_elems(v->mux_q),
-                    atomic_load_explicit(&g_src_rate_locked, memory_order_relaxed),
-                    (atomic_load_explicit(&g_src_rate_q20, memory_order_relaxed) - (1 << 20)) * 1e6 / (1 << 20),
-                    (double)(-atomic_load_explicit(&g_rho_corr_ppm, memory_order_relaxed)),
-                    (atomic_load_explicit(&g_cf_rate_q20, memory_order_relaxed) - (1 << 20)) * 1e6 / (1 << 20),
-                    atomic_load_explicit(&g_cf_locked, memory_order_relaxed));
+                    atomic_load_explicit(&v->est->src_rate_locked, memory_order_relaxed),
+                    (atomic_load_explicit(&v->est->src_rate_q20, memory_order_relaxed) - (1 << 20)) * 1e6 / (1 << 20),
+                    (double)(-atomic_load_explicit(&v->hr->rho_corr_ppm, memory_order_relaxed)),
+                    (atomic_load_explicit(&v->est->cf_rate_q20, memory_order_relaxed) - (1 << 20)) * 1e6 / (1 << 20),
+                    atomic_load_explicit(&v->est->cf_locked, memory_order_relaxed));
                 diag_last = nowd;
             }
         }
@@ -2072,7 +2076,7 @@ static void *output_thread(void *arg)
                 char wu[112] = "";                                   /* WUCR readout: buffer depth + recovered ρ (go/no-go vs srcppm) */
                 if (g_wucr) {
                     int occ = av_thread_message_queue_nb_elems(v->frame_q);
-                    int64_t corr = atomic_load_explicit(&g_rho_corr_ppm, memory_order_relaxed);
+                    int64_t corr = atomic_load_explicit(&v->hr->rho_corr_ppm, memory_order_relaxed);
                     int64_t hs   = v->house_skew ? *v->house_skew : 0;   /* W1 check: must stay ≈0 (ρ genlock → dups→0 → AVLOCK has nothing to inject) */
                     snprintf(wu, sizeof wu, " wucr_buf=%df/%lldms wucr_rho=%+lldppm hs=%+lldms cushion=%dms fqhw=%d",
                              occ, (long long)(occ * v->tick_dur_us / 1000), (long long)(-corr), (long long)(hs / 1000),
@@ -2091,9 +2095,9 @@ static void *output_thread(void *arg)
                 }
                 char cfs[56] = "";                                   /* v0.9.15.1 CLOCK-FOLLOW readout (shown when notable) */
                 {
-                    int64_t cq = atomic_load_explicit(&g_cf_rate_q20, memory_order_relaxed);
+                    int64_t cq = atomic_load_explicit(&v->est->cf_rate_q20, memory_order_relaxed);
                     int64_t cp = ((cq - (1 << 20)) * 1000000) >> 20;
-                    int     lk = atomic_load_explicit(&g_cf_locked, memory_order_relaxed);
+                    int     lk = atomic_load_explicit(&v->est->cf_locked, memory_order_relaxed);
                     int     n = 0;
                     if (lk || llabs(cp) > 500)
                         n = snprintf(cfs, sizeof cfs, " cf=%+lldppm%s", (long long)cp, lk ? "" : "?");
@@ -3221,6 +3225,7 @@ typedef struct DemuxArgs {
     pthread_mutex_t      *h0_lock;
     int64_t              *house_skew;     /* video's house-vs-content skew (us); copy rides it */
     _Atomic int_least64_t *disturb_epoch; /* B3: bump this input's disturbance epoch when the discont absorber fires */
+    RateEstimator        *est;            /* this input's rate sensor (0.9.18 R4; demux thread is the sole feeder) */
     int64_t              *wrap_off;       /* per input stream: cumulative 33-bit wrap offset (stream tb) */
     int64_t              *wrap_last;      /* per input stream: last RAW ts seen (wrap detection) */
     int64_t              *wrap_wall_last; /* per input stream: wall-clock (us) of this stream's last packet — gap-vs-splice discriminator */
@@ -4176,14 +4181,14 @@ static void ptv_autobank_escalate(DemuxArgs *d, int64_t worst_us, int64_t now)
  * Each sub-rate folds into an EMA (τ≈64 chunks×4s≈4-5min) that TRACKS slow drift (NOT a
  * latch-forever cumulative mean — crystal drift over a day must be followed), with a per-chunk
  * slew clamp (bounds d(rate)/dt, PCR-friendly) and a wild-chunk reject (±1%, so a glitched
- * window can't bias the rate). Single-input live only; published (global) to ALL rungs via
- * g_src_rate_q20; locks after ~8 chunks (~24s). A disturbance epoch bump (splice/wrap/gap)
+ * window can't bias the rate). Single-input live only; published to ALL rungs via
+ * e->src_rate_q20; locks after ~8 chunks (~24s). A disturbance epoch bump (splice/wrap/gap)
  * re-anchors the CURRENT sub-window (discards the partial, can't skew Σdc) but KEEPS the learned
  * rate+lock (the source's physical clock is continuous across a content splice). */
 /* 0.9.18 R2 (map §2.4): extracted verbatim from demux_dispatch. Feeds BOTH sensors —
  * the tight FLL (genlock) and the coarse clock-follow estimator — one video packet's
  * (content c_now, wall w_now, disturbance-epoch ep) sample at a time. Publishes via the
- * g_src_rate/g_cf atomics exactly as before (R3 folds them into the struct). Demux
+ * e->src_rate/cf atomics exactly as before (R3 folded them into the struct). Demux
  * thread only — non-reentrant. */
 static void rate_estimator_feed(RateEstimator *e, int64_t c_now, int64_t w_now,
                                 int_least64_t ep)
@@ -4223,8 +4228,8 @@ static void rate_estimator_feed(RateEstimator *e, int64_t c_now, int64_t w_now,
                                    "clump windows are not a clock measurement\n");
                         }
                         e->cf_ema_q20 = (1 << 20); e->cf_chunks = 0; e->cf_la_acc = e->cf_la_tot = 0;
-                        atomic_store_explicit(&g_cf_rate_q20, (int64_t)(1 << 20), memory_order_relaxed);
-                        atomic_store_explicit(&g_cf_locked, 0, memory_order_relaxed);
+                        atomic_store_explicit(&e->cf_rate_q20, (int64_t)(1 << 20), memory_order_relaxed);
+                        atomic_store_explicit(&e->cf_locked, 0, memory_order_relaxed);
                     } else {
                     e->cf_frozen = 0;
                     e->cf_wins++;
@@ -4232,9 +4237,9 @@ static void rate_estimator_feed(RateEstimator *e, int64_t c_now, int64_t w_now,
                         (e->cf_chunks < 20 || (r - e->cf_ema_q20 < cf_rej && e->cf_ema_q20 - r < cf_rej))) {
                         e->cf_ema_q20 += (r - e->cf_ema_q20) >> 4;      /* alpha 1/16, tau ~50s */
                         if (e->cf_chunks < 100000) e->cf_chunks++;
-                        atomic_store_explicit(&g_cf_rate_q20, e->cf_ema_q20, memory_order_relaxed);
+                        atomic_store_explicit(&e->cf_rate_q20, e->cf_ema_q20, memory_order_relaxed);
                         if (e->cf_chunks >= 20)
-                            atomic_store_explicit(&g_cf_locked, 1, memory_order_relaxed);
+                            atomic_store_explicit(&e->cf_locked, 1, memory_order_relaxed);
                         if (e->cf_chunks > 20) e->cf_la_acc++;
                     }
                     /* v0.9.15.3 stuck-latch unlock: post-lock, if the reject band throws away
@@ -4249,8 +4254,8 @@ static void rate_estimator_feed(RateEstimator *e, int64_t c_now, int64_t w_now,
                                    (long long)(((e->cf_ema_q20 - (1 << 20)) * 1000000) >> 20),
                                    e->cf_la_tot - e->cf_la_acc, e->cf_la_tot);
                             e->cf_ema_q20 = (1 << 20); e->cf_chunks = 0;
-                            atomic_store_explicit(&g_cf_rate_q20, (int64_t)(1 << 20), memory_order_relaxed);
-                            atomic_store_explicit(&g_cf_locked, 0, memory_order_relaxed);
+                            atomic_store_explicit(&e->cf_rate_q20, (int64_t)(1 << 20), memory_order_relaxed);
+                            atomic_store_explicit(&e->cf_locked, 0, memory_order_relaxed);
                         }
                         e->cf_la_acc = e->cf_la_tot = 0;
                     }
@@ -4260,7 +4265,7 @@ static void rate_estimator_feed(RateEstimator *e, int64_t c_now, int64_t w_now,
                      * this line becomes permanent chatter (~15-25/h, owner-flagged); the
                      * FOLLOW/release + unlatch events stay always-on and tell the real story. */
                     if (g_diag &&
-                        !atomic_load_explicit(&g_cf_locked, memory_order_relaxed) &&
+                        !atomic_load_explicit(&e->cf_locked, memory_order_relaxed) &&
                         e->cf_wins % 60 == 0)
                         av_log(NULL, AV_LOG_INFO,
                                "[PTV-CLOCK] estimator: %d/%d windows accepted, ema %+lldppm (lock needs 20)\n",
@@ -4290,10 +4295,10 @@ static void rate_estimator_feed(RateEstimator *e, int64_t c_now, int64_t w_now,
                         if (e->ema_q20 > emax) e->ema_q20 = emax;
                         else if (e->ema_q20 < emin) e->ema_q20 = emin;
                     }
-                    atomic_store_explicit(&g_src_rate_q20, e->ema_q20, memory_order_relaxed);
+                    atomic_store_explicit(&e->src_rate_q20, e->ema_q20, memory_order_relaxed);
                     if (e->chunks < 100000) e->chunks++;
                     if (e->chunks >= 8)                         /* ~24s+ of clean chunks → trust + apply */
-                        atomic_store_explicit(&g_src_rate_locked, 1, memory_order_relaxed);
+                        atomic_store_explicit(&e->src_rate_locked, 1, memory_order_relaxed);
                 }
             }
             e->c0 = c_now; e->w0 = w_now;                      /* slide to the next sub-window */
@@ -4398,7 +4403,7 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
             /* v0.9.0 genlock estimator + v0.9.15 coarse clock-follow — body moved verbatim
              * to rate_estimator_feed() above (0.9.18 R2). Single-input live only. */
             if (g_genlock && g_genlock_ok && out->dts != AV_NOPTS_VALUE)
-                rate_estimator_feed(&g_est,
+                rate_estimator_feed(d->est,
                     av_rescale_q(out->dts, d->ifmt->streams[d->vstream]->time_base, AV_TIME_BASE_Q),
                     av_gettime_relative(),
                     d->disturb_epoch ? atomic_load_explicit(d->disturb_epoch, memory_order_relaxed) : 0);
@@ -4527,6 +4532,8 @@ typedef struct Input {
     _Atomic int_least64_t house_disturb;     /* B3: per-input disturbance epoch — bumped on slate-return (compositor) AND
                                               * discont absorb (demux); TWO writer threads → atomic. The PLL's mid-run
                                               * acquire arms only when this advances (never on bare vlag noise). */
+    RateEstimator         est;               /* 0.9.18 R4: this input's demux-side rate sensor (FLL genlock +
+                                              * coarse clock-follow); non-zero fields seeded in the init loop */
     VideoHold             hold;              /* multiview: latest decoded frame for the compositor */
     int64_t              *wrap_off;          /* per stream: 33-bit wrap offset (stream tb) */
     int64_t              *wrap_last;         /* per stream: last RAW ts (wrap detection) */
@@ -5164,6 +5171,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
     Rung             rung[PTV_MAX_RUNG];
     Sel              sel[PTV_MAX_RUNG];
     CompositorCtx    comp;
+    HouseRateState   house_rate;               /* 0.9.18 R4: one per house clock, shared by the rung set (via VideoCtx.hr) */
     pthread_t        th_compositor, th_audio[PTV_MAX_AUDIO];
     int              started_compositor = 0;
     int              started_audio[PTV_MAX_AUDIO] = {0};
@@ -5189,10 +5197,17 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         n_rung = PTV_MAX_RUNG;
     }
     memset(inputs, 0, sizeof inputs); memset(as, 0, sizeof as); memset(rung, 0, sizeof rung);
-    memset(&comp, 0, sizeof comp);
+    memset(&comp, 0, sizeof comp); memset(&house_rate, 0, sizeof house_rate);
     for (k = 0; k < n_input; k++) {
         inputs[k].url = ins->groups[k].arg;
         inputs[k].h0  = AV_NOPTS_VALUE;
+        /* rate estimator: the former singleton's initializers, verbatim (rest is zero) */
+        inputs[k].est.c0 = AV_NOPTS_VALUE;
+        inputs[k].est.ema_q20 = 1 << 20;
+        inputs[k].est.ep_prev = -1;
+        inputs[k].est.cf_ema_q20 = 1 << 20;
+        inputs[k].est.src_rate_q20 = 1 << 20;
+        inputs[k].est.cf_rate_q20 = 1 << 20;
         pthread_mutex_init(&inputs[k].h0_lock, NULL);
         pthread_mutex_init(&inputs[k].hold.lock, NULL);
         pthread_mutex_init(&inputs[k].vring.lock, NULL);
@@ -5692,6 +5707,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         vc->live = live; vc->passthrough = multiview;
         vc->h0 = &inputs[0].h0; vc->h0_lock = &inputs[0].h0_lock;
         vc->house_skew = &inputs[0].house_skew;
+        vc->est = &inputs[0].est;                /* R4: rate sensor rides input 0's clock, like h0/house_skew */
+        vc->hr  = &house_rate;                   /* R4: house-rate actuation state, shared by the rung set */
         vc->vring = (!multiview && r == 0) ? &inputs[0].vring : NULL;  /* single-input: master rung feeds the A/V probe ring (multiview: compositor does) */
         vc->is_master = (r == 0);
         vc->dbg_video_q = inputs[0].video_q; vc->dbg_dec_frames = &inputs[0].dc.dec_frames; vc->dbg_vcorrupt = &inputs[0].dc.vcorrupt;
@@ -5721,6 +5738,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         d->vstream = inputs[kk].vstream; d->drop = is_net_url(inputs[kk].url); d->n_out = n_rung;
         d->h0 = &inputs[kk].h0; d->h0_lock = &inputs[kk].h0_lock; d->house_skew = &inputs[kk].house_skew;
         d->disturb_epoch = &inputs[kk].house_disturb;   /* B3: discont absorber arms the PLL mid-run re-acquire */
+        d->est = &inputs[kk].est;                       /* R4: this input's rate sensor (demux thread feeds it) */
         d->wrap_off = inputs[kk].wrap_off; d->wrap_last = inputs[kk].wrap_last;
         d->wrap_wall_last = inputs[kk].wrap_wall_last; d->video_fwd_us = 0;
         d->disc = g_layera ? &inputs[kk].disc : NULL;   /* legacy-0004 buffer (NULL when off) */
