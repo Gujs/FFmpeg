@@ -39,7 +39,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "0.9.18.6"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "0.9.18.7"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 #define PTV_WD_DEADLINE_US (2 * (int64_t)AV_TIME_BASE)   /* watchdog stall threshold */
@@ -80,7 +80,7 @@ static int     g_mv_residence = 1;
  * (continuous) audio = per-slot "audio behind video". This absorbs it the SAME way demux_unwrap
  * absorbs the 33-bit wrap (a per-stream offset that keeps the effective timeline continuous),
  * applied to video+audio+copy uniformly so they stay aligned and video stays smooth. On by
- * default; PTV_NO_DISCONT=1 reverts; PTV_DISCONT_MS sets the detect threshold (forward DTS jump
+ * default; PTV_NO_DISCONT=1 reverts; detect threshold internalized 0.9.18.7 (was PTV_DISCONT_MS; forward DTS jump
  * beyond it = a glitch to absorb). */
 static int     g_discont = 1;
 /* DIRECTIONAL discontinuity-absorber thresholds (v0.7.7, §5.A.1). The absorber re-bases a source
@@ -91,15 +91,15 @@ static int     g_discont = 1;
  * the true timeline → A/V stays aligned). BACKWARD jumps keep 80ms: a backward jump unabsorbed would
  * step aresample=async's input backward → audio STALL (the v0.6.23 / task#23 whole-channel outage) —
  * so backward MUST still absorb. (Real ad-splices are seconds, far above either threshold, and still
- * absorb in both directions.) PTV_DISCONT_MS sets forward; PTV_DISCONT_BACK_MS sets backward. */
-static int     g_discont_ms = 1000;       /* forward jump threshold */
-static int     g_discont_back_ms = 80;    /* backward jump threshold (keep small — anti-stall) */
+ * absorb in both directions.) thresholds internalized 0.9.18.7 (were PTV_DISCONT_MS forward / PTV_DISCONT_BACK_MS backward). */
+static int     g_discont_ms = 1000;       /* forward jump threshold (internalized 0.9.18.7; was PTV_DISCONT_MS) */
+static int     g_discont_back_ms = 80;    /* backward jump threshold (keep small — anti-stall) (internalized 0.9.18.7; was PTV_DISCONT_BACK_MS) */
 static int     g_gapdiscrim = 1;          /* gap-fix (2026-06-26): on a FORWARD audio jump, discriminate an audio-only source GAP
                                            * (video did NOT also cross + this stream was wall-absent ~the jump) from a whole-program
                                            * SPLICE. A GAP is NOT absorbed → aresample=async hard-pads silence → audio stays aligned
                                            * with the continuous video (fixes the AWE audio-gap → permanent A/V step). A SPLICE absorbs
                                            * as before. PTV_NO_GAPDISCRIM=1 reverts to unconditional forward absorb (old behaviour). */
-static int64_t g_gap_min_us = 700000;     /* min wall-absence (us) to call a forward audio jump a real GAP when video did not also cross */
+static int64_t g_gap_min_us = 700000;     /* min wall-absence (us) to call a forward audio jump a real GAP when video did not also cross (internalized 0.9.18.7; was PTV_GAP_MIN_MS) */
 static int64_t g_wrap_guard_us = 0;       /* v0.9.16.1: sparse-PID wrap-guard threshold override (us); 0 = half the wrap period (13.26h @90kHz). PTV_WRAP_GUARD_S, TEST ONLY */
 static int     g_aglue_ms = 60;           /* v0.9.16.3 [PTV-AGLUE]: audio label-step glue threshold (ms); a decoded-audio in-pts step
                                            * beyond this (either direction) gets an explicit RELABEL-vs-GAP verdict at audio_feed —
@@ -108,7 +108,7 @@ static int     g_aglue_ms = 60;           /* v0.9.16.3 [PTV-AGLUE]: audio label-
                                            * structurally erased by the house clock (the AWE-class lip-sync accumulator).
                                            * PTV_AGLUE_MS overrides; 0 disables (reverts to silent label-following). */
 static int     g_aglue_max_ms = 1000;     /* [PTV-AGLUE] cap (ms): steps above this are the >1s discontinuity layer's job
-                                           * (demux_unwrap/LAYERA) — the glue logs and stands aside. PTV_AGLUE_MAX_MS overrides.
+                                           * (demux_unwrap/LAYERA) — the glue logs and stands aside. Internalized 0.9.18.7 (was PTV_AGLUE_MAX_MS).
                                            * v0.9.17: 900→1000 to meet LAYERA's threshold exactly — the 900ms-1s sliver
                                            * previously had NO owner (aglue stood aside, LAYERA blind, aresample followed). */
 /* P2 §7.1 (hybrid): apply the program-level discontinuity offset (tracked from the dense VIDEO reference)
@@ -135,7 +135,7 @@ static int     g_prog_off = 1;
  * program-wide; a video-only BACKWARD jump 80ms-1s would shift audio spuriously (§5.B-reserved asymmetric
  * case; none on fleet — watch unwrap_inj per source). */
 static int     g_progoff_av = 1;
-static int64_t g_progoff_debounce_us = 1000000;   /* PTV_PROGOFF_DEBOUNCE_MS: coalesce a V/A straddle into one bump */
+static int64_t g_progoff_debounce_us = 1000000;   /* coalesce a V/A straddle into one bump (internalized 0.9.18.7; was PTV_PROGOFF_DEBOUNCE_MS) */
 /* Layer A (proven legacy 0004), PTV_LAYERA=1, default OFF. At a content glue (discontinuity) use ONE
  * AUDIO-derived offset for ALL dense streams: audio rebases seamlessly, video (and copy) ADOPT the
  * audio offset so video absorbs the residual via CFR dup/drop. This CORRECTS a source glue A/V
@@ -164,7 +164,7 @@ static int64_t g_disc_viderr_sum;    /* PTV-FLUSHAV: running total of per-flush 
  * (never re-stamp the escape deadline while already armed — the re-arm slide). Default ON; PTV_NO_DUKF=1
  * reverts (decode the post-splice burst, = v0.6.23). MULTI/SINGLE both (per-input demux state). */
 static int     g_drop_until_kf = 1;
-static int64_t g_dukf_escape_us = 5000000;   /* PTV_DUKF_ESCAPE_MS: force-resume if no IDR within this */
+static int64_t g_dukf_escape_us = 5000000;   /* force-resume if no IDR within this (internalized 0.9.18.7; was PTV_DUKF_ESCAPE_MS) */
 /* P2 2b (v0.7.3): arm drop-until-keyframe only on a LARGE jump (a real ad-splice), not on sub-second
  * jitter. (v0.7.7: the forward absorber threshold g_discont_ms is now 1000ms = g_dukf_min_ms, so the
  * +90ms forward jitter below no longer absorbs OR arms DUKF — it flows through. This comment predates
@@ -172,7 +172,7 @@ static int64_t g_dukf_escape_us = 5000000;   /* PTV_DUKF_ESCAPE_MS: force-resume
  * harmless timeline re-base — but DUKF *drops video to the next IDR*, so a sub-second blip (observed:
  * a +90ms VIDEO-ONLY jitter event on TruBLU, no audio pair → not a real splice) would needlessly drop
  * up to a GOP. Gate the video-drop on a separate, higher threshold (real splices on the box were
- * ≥120s; anything ≥~1s is a genuine timeline change). PTV_DUKF_MIN_MS overrides. */
+ * ≥120s; anything ≥~1s is a genuine timeline change). Internalized 0.9.18.7 (was PTV_DUKF_MIN_MS). */
 static int     g_dukf_min_ms = 1000;
 /* Multiview per-slot AUDIO-FOLLOW (Option A) — the per-slot A/V-sync fix. A mosaic's composite
  * video is forced onto a house-clock POSITION timeline (rung_pts; one shared frame can't be
@@ -197,9 +197,9 @@ static int     g_audio_follow = 1;
  * h0 forward (h0 += deficit) so the lag lands at a small POSITIVE value: the video display is
  * unchanged (same frame shown), the transcoded audio rides the same h0+house_skew so it stays
  * locked, and the copied audio now only needs to DELAY → correctable. MULTIVIEW ONLY (n_input>1);
- * PTV_NO_H0_REANCHOR=1 reverts; PTV_H0_REANCHOR_MS sets the trigger (default 120ms). */
+ * PTV_NO_H0_REANCHOR=1 reverts. */
 static int     g_h0_reanchor = 1;
-static int     g_h0_reanchor_ms = 120;
+static int     g_h0_reanchor_ms = 120;   /* trigger (ms); internalized 0.9.18.7 (was PTV_H0_REANCHOR_MS) */
 /* h0-AT-DISPLAY (multiview): anchor each slot's h0 to the first frame the COMPOSITOR actually DISPLAYS,
  * not the first frame the decoder produces. Under a deep startup prime the first-decoded frame is an
  * earlier/different content than the first-displayed one, so the old decode-thread anchor left the
@@ -222,15 +222,15 @@ static int     g_avsync_probe = 0;
  * residual + slow drift with a SMOOTH, rate-limited (≤g_af_rate_us/s, imperceptible) sub-sample PTS
  * nudge — no silence inserts, no content drops, no hops. Reuses the legacy 0007 PLL's rate-limited
  * actuator idea, per slot, driven by the directly-measured lag (no jump_comp). MULTIVIEW ONLY;
- * PTV_AF_NO_PLL=1 reverts to pure discrete; PTV_AF_ACQUIRE_MS / PTV_AF_RATE_MS_S tune. */
+ * PTV_AF_NO_PLL=1 reverts to pure discrete. */
 static int     g_af_pll = 1;
-static int     g_af_acquire_us = 100000;   /* gap above this → discrete drop/pad; at/below → smooth nudge */
+static int     g_af_acquire_us = 100000;   /* gap above this → discrete drop/pad; at/below → smooth nudge (internalized 0.9.18.7; was PTV_AF_ACQUIRE_MS) */
 static int     g_af_rate_us = 10000;       /* smooth follow/nudge rate ceiling, us per second. B2 (2026-06-21):
                                             * raised 2000→10000 so B1's content-anchored offset tracks a
                                             * source-slowness dup ramp in vlag (~6–8 ms/s) in near-real-time
                                             * instead of lagging ~100 s at 2 ms/s. 10 ms/s ≈ 1% (under the ~2%
                                             * audible budget) and only engages transiently while converging —
-                                            * steady-state step=gap is tiny. PTV_AF_RATE_MS_S overrides. */
+                                            * steady-state step=gap is tiny. Internalized 0.9.18.7 (was PTV_AF_RATE_MS_S). */
 /* Phase B (B1) — CONTENT-ANCHORED multiview audio. The pre-B1 multiview audio-follow emitted on a
  * FREE-RUNNING sample counter (af_next_pts), which faithfully banked aresample=async's STARTUP
  * over-production into a permanent per-slot audio-late offset (Phase A root cause: alag +400..+1252ms,
@@ -252,14 +252,14 @@ static int     g_af_anchor = 1;
  * audio ONLY; single-input + copy paths untouched. Default OFF for box A/B; PTV_AVSYNC_PLL=1 enables.
  * Sign proven: d(offset)/d(applied) < 0 ⇒ to raise a negative offset (audio late), advance (drop). */
 static int     g_avsync_pll = 1;             /* B3 closed-loop A/V controller DEFAULT-ON (v0.6.20, box-validated on cor-2 RAV + live-transcoder grids). PTV_NO_AVSYNC_PLL reverts to the open-loop B1 follow. Multiview transcoded audio only; single-input + copy paths byte-identical regardless. */
-static int     g_pll_ema_shift = 7;          /* EMA smoothing of the measured offset (τ≈2.7s @ ~47 afps). Raised 5→7 (v0.6.21): on jittery NTSC legs the measured offset has ±100–200ms noise that a τ≈0.7s EMA tracked → the acquire chased it; τ≈2.7s averages the zero-mean noise below the threshold so only the DC startup bank triggers an acquire. PTV_PLL_EMA_SHIFT overrides. */
-static int64_t g_pll_tau_us = 5000000;       /* integral track time-constant (us): step = ema*frame_us/τ */
-static int     g_pll_acquire_us = 40000;     /* |ema| above this = "large" → ACQUIRE one-shot; else TRACK. 40ms ≈ 2 audio frames: shrinks the dead band [gate 25ms, threshold] so a stable sub-100ms residual (TRACK is guard-limited on jittery sources) is snapped in by a whole-frame acquire instead of stranded. The flatness debounce (threshold/4 = 10ms) still rejects jitter. PTV_PLL_ACQUIRE_MS overrides. */
-static int     g_pll_acquire_n = 32;         /* debounce: N stable (large AND flat) readings before acquire; also the refractory */
-static int64_t g_pll_refractory_us = 12000000; /* v0.6.21: HARD refractory after an acquire (12s) — the backstop that breaks the self-excited limit cycle on jittery legs (the acquire's own drop/pad perturbs the next measurement → re-triggers; box: a2 thrashed ~1 acquire/7s, acq=92). Must exceed the thrash period; bounds acquires to ≤1/12s regardless of the noise spectrum. Was conflated with g_pll_acquire_n (32 frames ≈0.68s — far too short). PTV_PLL_REFRACTORY_MS overrides. */
+static int     g_pll_ema_shift = 7;          /* EMA smoothing of the measured offset (τ≈2.7s @ ~47 afps). Raised 5→7 (v0.6.21): on jittery NTSC legs the measured offset has ±100–200ms noise that a τ≈0.7s EMA tracked → the acquire chased it; τ≈2.7s averages the zero-mean noise below the threshold so only the DC startup bank triggers an acquire. Internalized 0.9.18.7 (was PTV_PLL_EMA_SHIFT). */
+static int64_t g_pll_tau_us = 5000000;       /* integral track time-constant (us): step = ema*frame_us/τ (internalized 0.9.18.7; was PTV_PLL_TAU_MS) */
+static int     g_pll_acquire_us = 40000;     /* |ema| above this = "large" → ACQUIRE one-shot; else TRACK. 40ms ≈ 2 audio frames: shrinks the dead band [gate 25ms, threshold] so a stable sub-100ms residual (TRACK is guard-limited on jittery sources) is snapped in by a whole-frame acquire instead of stranded. The flatness debounce (threshold/4 = 10ms) still rejects jitter. Internalized 0.9.18.7 (was PTV_PLL_ACQUIRE_MS). */
+static int     g_pll_acquire_n = 32;         /* debounce: N stable (large AND flat) readings before acquire; also the refractory (internalized 0.9.18.7; was PTV_PLL_ACQUIRE_N) */
+static int64_t g_pll_refractory_us = 12000000; /* v0.6.21: HARD refractory after an acquire (12s) — the backstop that breaks the self-excited limit cycle on jittery legs (the acquire's own drop/pad perturbs the next measurement → re-triggers; box: a2 thrashed ~1 acquire/7s, acq=92). Must exceed the thrash period; bounds acquires to ≤1/12s regardless of the noise spectrum. Was conflated with g_pll_acquire_n (32 frames ≈0.68s — far too short). Internalized 0.9.18.7 (was PTV_PLL_REFRACTORY_MS). */
 static int64_t g_pll_testnoise_us = 0;       /* TEST-ONLY (default off): inject a ±N ms square wave (flips ~every 3.2s) into the measured offset to REPRODUCE the box limit cycle locally (local sources are clean). PTV_PLL_TESTNOISE_MS sets it; never set in production. */
-static int     g_pll_noise_k = 3;            /* v0.6.22: NOISE-ADAPTIVE acquire threshold = max(g_pll_acquire_us, k·pll_dev). Clean legs (dev≈0) keep the 40ms; jittery legs raise the bar above their own offset jitter so steady-state noise can't re-fire the acquire (the 0.6.20/0.6.21 limit cycle). PTV_PLL_NOISE_K overrides; 0 disables (fixed threshold). */
-static int     g_pll_dev_shift = 9;          /* v0.6.22: EMA shift for pll_dev (τ≈11s) — slow so dev ramps AFTER the big startup bank is caught (dev≈0 → thr=40ms at t0 → bank acquires), then rises to the noise floor → steady-state quiet. PTV_PLL_DEV_SHIFT overrides. */
+static int     g_pll_noise_k = 3;            /* v0.6.22: NOISE-ADAPTIVE acquire threshold = max(g_pll_acquire_us, k·pll_dev). Clean legs (dev≈0) keep the 40ms; jittery legs raise the bar above their own offset jitter so steady-state noise can't re-fire the acquire (the 0.6.20/0.6.21 limit cycle). 0 disables (fixed threshold). Internalized 0.9.18.7 (was PTV_PLL_NOISE_K). */
+static int     g_pll_dev_shift = 9;          /* v0.6.22: EMA shift for pll_dev (τ≈11s) — slow so dev ramps AFTER the big startup bank is caught (dev≈0 → thr=40ms at t0 → bank acquires), then rises to the noise floor → steady-state quiet. Internalized 0.9.18.7 (was PTV_PLL_DEV_SHIFT). */
 /* demux→decode video queue depth. Raised 48→256 (Phase B #1): at startup the decoder's init window
  * (finding a keyframe, building up) produces nothing while the realtime source keeps filling video_q,
  * so the old 48-deep queue overflowed and dropped ~30 frames → a content GAP → the position-anchored
@@ -544,13 +544,13 @@ static int             g_genlock_guard = 1;
  * is to make the estimate ACCURATE so house_skew never accumulates. The 3s sub-window aliases bursty
  * delivery (→ ±1000ppm noise the EMA walks). A longer window averages the bursts out → the recovered
  * rate ≈ the true source rate → the house clock matches the source → house_skew stays ~0. Env-tunable;
- * DEFAULTS = the old 3s/shift-6 path (byte-identical) so this only engages when PTV_GENLOCK_WINDOW_MS is
+ * DEFAULTS = the old 3s/shift-6 path (byte-identical) so this only engages if the (internalized 0.9.18.7) window constant is
  * raised (the sandbox A/B turns it on; promote the default once validated). The slew clamp scales with
  * the window so the ppm/s slew rate is preserved. */
-static int64_t         g_gl_window_us  = 3000000;    /* PTV_GENLOCK_WINDOW_MS, default 3000 (3s) */
-static int             g_gl_ema_shift  = 6;          /* PTV_GENLOCK_EMA_SHIFT, default 6 (α≈1/64) */
-static int64_t         g_gl_max_q20    = 314;        /* PTV_GENLOCK_MAX_PPM, default 300ppm (≈314 in Q20) */
-static int64_t         g_gl_reject_q20 = 734;        /* PTV_GENLOCK_REJECT_PPM, default 700ppm (≈734 in Q20). KEEP ≥ 2×MAX:
+static int64_t         g_gl_window_us  = 3000000;    /* internalized 0.9.18.7 (was PTV_GENLOCK_WINDOW_MS): 3000ms */
+static int             g_gl_ema_shift  = 6;          /* internalized 0.9.18.7 (was PTV_GENLOCK_EMA_SHIFT): 6 (α≈1/64) */
+static int64_t         g_gl_max_q20    = 314;        /* internalized 0.9.18.7 (was PTV_GENLOCK_MAX_PPM): 300ppm (≈314 in Q20) */
+static int64_t         g_gl_reject_q20 = 734;        /* internalized 0.9.18.7 (was PTV_GENLOCK_REJECT_PPM): 700ppm (≈734 in Q20). KEEP ≥ 2×MAX:
                                                       * the reject is RELATIVE to the (bounded) estimate, so the band must span
                                                       * the full ±MAX envelope twice — else `ema` pinned at one bound could
                                                       * reject the windows pulling it to the opposite bound (a stuck zone). */
@@ -1186,6 +1186,7 @@ typedef struct VideoCtx {
     AVThreadMessageQueue *dbg_video_q;
     int64_t         *dbg_dec_frames, *dbg_vcorrupt;
     int64_t         *dbg_vdrop, *dbg_pcorrupt;       /* single-input stats: demux video_q drops + corrupt-pkt count */
+    int64_t         *dbg_disc_resid;                 /* 0.9.18.7: input-0 LAYERA hs-residue ledger (hsres= on the stats line) */
     /* counters */
     int64_t          framedrop, emitted, dup, pd;   /* pd = intentional cadence holds (telecine residence), split from dup (health alarm) */
     int64_t          decim;          /* v0.9.15.2: surplus frames decimated by content mapping (>house-rate source) */
@@ -2073,13 +2074,15 @@ static void *output_thread(void *arg)
                  * wucr_rho IS the source-ppm readout. size=/bitrate= dropped (CBR is configured; cumulative
                  * averages carry no signal). speed= (cumulative) replaced by instantaneous fps=. qdrop=
                  * dropped (PTV_DIAG demux line still carries it). */
-                char wu[112] = "";                                   /* WUCR readout: buffer depth + recovered ρ (go/no-go vs srcppm) */
+                char wu[144] = "";                                   /* WUCR readout: buffer depth + recovered ρ (go/no-go vs srcppm) */
                 if (g_wucr) {
                     int occ = av_thread_message_queue_nb_elems(v->frame_q);
                     int64_t corr = atomic_load_explicit(&v->hr->rho_corr_ppm, memory_order_relaxed);
                     int64_t hs   = v->house_skew ? *v->house_skew : 0;   /* W1 check: must stay ≈0 (ρ genlock → dups→0 → AVLOCK has nothing to inject) */
-                    snprintf(wu, sizeof wu, " wucr_buf=%df/%lldms wucr_rho=%+lldppm hs=%+lldms cushion=%dms fqhw=%d",
+                    int64_t hsr  = v->dbg_disc_resid ? *v->dbg_disc_resid : 0;   /* 0.9.18.7: LAYERA erase-residue ledger (reporting only) */
+                    snprintf(wu, sizeof wu, " wucr_buf=%df/%lldms wucr_rho=%+lldppm hs=%+lldms hsres=%+lldms cushion=%dms fqhw=%d",
                              occ, (long long)(occ * v->tick_dur_us / 1000), (long long)(-corr), (long long)(hs / 1000),
+                             (long long)(hsr / 1000),
                              (int)((int64_t)g_curt.cur_sp * v->tick_dur_us / 1000),  /* -corr = recovered source dev (+=faster); cushion = adaptive tier target */
                              atomic_load_explicit(&g_fq_hw, memory_order_relaxed));
                 }
@@ -2419,10 +2422,14 @@ static int audio_drain_fg(AudioState *a)
                             if (dq < 0) { a->pll_drop = (int)(-dq / frame_us); a->af_acq_drop_us += -dq; }  /* advance: drop content */
                             else        { a->pll_pad  = (int)( dq / frame_us); a->af_acq_pad_us  +=  dq; }   /* delay: pad silence */
                             a->pll_acq_count++;
-                            if (g_diag)
-                                av_log(NULL, AV_LOG_INFO, "[PTV-PLL] a%d(in%d) ACQUIRE %s %"PRId64"ms (ema→%"PRId64"ms applied=%"PRId64"ms #%d)\n",
-                                       a->dbg_k, a->dbg_in, dq < 0 ? "drop" : "pad", FFABS(dq) / 1000,
-                                       a->pll_ema / 1000, a->af_applied_us / 1000, a->pll_acq_count);
+                            /* 0.9.18.7: promoted PTV_DIAG→always-on WARNING. An ACQUIRE is a discrete
+                             * audio drop/pad (a bank snap, not a TRACK bleed) — rare in normal
+                             * operation (startup bank + real disturbances) and already hard
+                             * rate-limited by the 12s post-acquire refractory (≤1/12s per track by
+                             * construction), so no extra rate limit is added. */
+                            av_log(NULL, AV_LOG_WARNING, "[PTV-PLL] a%d(in%d) ACQUIRE %s %"PRId64"ms (ema→%"PRId64"ms applied=%"PRId64"ms #%d)\n",
+                                   a->dbg_k, a->dbg_in, dq < 0 ? "drop" : "pad", FFABS(dq) / 1000,
+                                   a->pll_ema / 1000, a->af_applied_us / 1000, a->pll_acq_count);
                         }
                         a->pll_refractory = (int)(g_pll_refractory_us / frame_us);  /* v0.6.21: HARD ~12s refractory (was g_pll_acquire_n ≈0.68s) — breaks the self-excited limit cycle */
                         a->pll_dbnc = 0; a->pll_dbnc_ref = a->pll_ema;
@@ -3243,6 +3250,14 @@ typedef struct DemuxArgs {
     int64_t               kf_arm_us;      /* P2 2b: wall time the drop was armed (first-arm-only escape deadline) */
     int64_t               kf_arm_vdrop;   /* DIAG: vdrop count when DUKF armed (→ per-event drop count at resume) */
     int64_t               vpkt, apkt, ppkt, vdrop, adrop, pdrop;
+    int64_t               disc_resid_us;   /* 0.9.18.7 hs-residue ledger (REPORTING ONLY, never read by control):
+                                            * Σ(−applied_offset) over LAYERA glue erases that shifted the VIDEO
+                                            * label stream. Every erase shifts all subsequent content labels by
+                                            * applied_offset, i.e. shifts the hs/sk reading by −applied_offset vs
+                                            * the raw source labels — a jump-to-live erase (applied_offset<0)
+                                            * parks the stall's dup-ratcheted skew in hs permanently. hs growing
+                                            * IN STEP with this ledger = erased-discontinuity bookkeeping, not
+                                            * retained buffer latency; hs growing with this flat = real hold. */
     /* v0.9.12 [PTV-BURSTY] advisor: detect HLS-burst-over-SRT delivery (video arrives in clumps
      * separated by multi-second stalls) and log a once-per-minute WARNING with the SIZED env
      * recipe (deep §13 packet prime). Detection = >=3 completed arrival gaps >=1.5s within 60s
@@ -3744,6 +3759,12 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
                     b->stream_state[s].last_dts_us += b->applied_offset;
             }
         d->prog_off += av_rescale_q(b->applied_offset, AV_TIME_BASE_Q, (AVRational){1, 90000});
+        /* 0.9.18.7 hs-residue ledger (logging only, no control consumer): this glue shifted the
+         * video label stream by applied_offset, so the hs/sk reading moves by −applied_offset
+         * relative to the raw source labels from here on. Counted only when VIDEO crossed
+         * (has_vid) — an audio-only partial glue leaves the video timeline (and hs) untouched. */
+        if (has_vid)
+            d->disc_resid_us += -b->applied_offset;
     }
 
     b->flushing = 0;
@@ -4640,6 +4661,10 @@ static void *compositor_thread(void *arg)
     int64_t  af_off[PTV_MAX_INPUT] = {0};     /* audio-follow: continuously-smoothed per-slot lag (EMA, us) */
     int64_t  af_t0[PTV_MAX_INPUT]  = {0};     /* tick+1 of this slot's first real frame (0 = unseeded) */
     int      h0_logged[PTV_MAX_INPUT] = {0};  /* P0 diag: one-shot PTV-H0 per slot at first display */
+    int64_t  r2_win_us[PTV_MAX_INPUT] = {0};  /* 0.9.18.7 [PTV-REANCHOR2] log rate-limit: window start (wall) */
+    int      r2_win_n[PTV_MAX_INPUT] = {0};   /*   lines printed this window */
+    int      r2_supp[PTV_MAX_INPUT] = {0};    /*   events suppressed this window */
+    int64_t  r2_supp_us[PTV_MAX_INPUT] = {0}; /*   net h0 shift suppressed this window (us) */
     int      done_in[PTV_MAX_INPUT] = {0};
     int64_t rung_pts[PTV_MAX_RUNG] = {0};
     AVFrame *filt = av_frame_alloc();
@@ -4887,10 +4912,30 @@ static void *compositor_thread(void *arg)
                         pthread_mutex_unlock(&c->inputs[k].h0_lock);
                         sk = mv_tick_us(c, tick) - (disp_src - h0k);   /* now ≈ +1 tick */
                         af_off[k] = sk;                            /* snap the audio-follow EMA to the floored lag */
-                        if (g_diag)
-                            av_log(NULL, AV_LOG_INFO,
-                                "[PTV-REANCHOR2] in%d tick=%"PRId64" video-ahead → h0 +%"PRId64"ms, lag→%"PRId64"ms\n",
-                                k, tick, shift / 1000, sk / 1000);
+                        /* 0.9.18.7: promoted PTV_DIAG→always-on WARNING, with the AGLUE-style log
+                         * rate limit. In LIVE mv a re-anchor is rare (a real video-ahead excursion),
+                         * but on an unpaced source (file mv, decoder outrunning the clock) it can
+                         * refire EVERY tick (~30/s measured) — the re-anchors still APPLY; only the
+                         * lines are capped: 4 per 10s window per slot, then one summary as it rolls. */
+                        {
+                            int64_t now_r2 = av_gettime_relative();
+                            if (now_r2 - r2_win_us[k] >= 10000000) {
+                                if (r2_supp[k])
+                                    av_log(NULL, AV_LOG_WARNING,
+                                        "[PTV-REANCHOR2] in%d %d more re-anchors (net h0 +%"PRId64"ms) suppressed in last 10s — unpaced/racing source, re-anchors still applied\n",
+                                        k, r2_supp[k], r2_supp_us[k] / 1000);
+                                r2_win_us[k] = now_r2; r2_win_n[k] = 0;
+                                r2_supp[k] = 0; r2_supp_us[k] = 0;
+                            }
+                            if (r2_win_n[k] < 4) {
+                                r2_win_n[k]++;
+                                av_log(NULL, AV_LOG_WARNING,
+                                    "[PTV-REANCHOR2] in%d tick=%"PRId64" video-ahead → h0 +%"PRId64"ms, lag→%"PRId64"ms\n",
+                                    k, tick, shift / 1000, sk / 1000);
+                            } else {
+                                r2_supp[k]++; r2_supp_us[k] += shift;
+                            }
+                        }
                     }
                     if (g_diag && !h0_logged[k]) {   /* P0: one-shot per slot at its first displayed frame */
                         h0_logged[k] = 1;
@@ -5006,14 +5051,18 @@ static void *compositor_thread(void *arg)
                     snprintf(dlv, sizeof dlv, " dlvhold=%"PRId64"ms dlvforced=%"PRId64,
                              atomic_load_explicit(&c->gate0->st_hold_us, memory_order_relaxed) / 1000,
                              atomic_load_explicit(&c->gate0->st_forced, memory_order_relaxed));
-                char ls[384]; int lp = 0;   /* per-slot: qdrop=input-q overflow, corrupt=demux+decode,
+                char ls[448]; int lp = 0;   /* per-slot: qdrop=input-q overflow, corrupt=demux+decode,
                                              * pd=cadence holds (NORMAL for a rate-mismatched slot),
-                                             * sv=starvation dups, sk=published audio skew */
-                for (k = 0; k < n && lp < (int)sizeof ls - 72; k++)
+                                             * sv=starvation dups, sk=published audio skew,
+                                             * skres=LAYERA erase-residue ledger (0.9.18.7, same
+                                             * accounting as single-input hsres= — the slot's sk
+                                             * measurement rides the same erased label stream) */
+                for (k = 0; k < n && lp < (int)sizeof ls - 88; k++)
                     lp += snprintf(ls + lp, sizeof ls - lp,
-                                   " in%d:qdrop=%"PRId64"/corrupt=%"PRId64"/pd=%"PRId64"/sv=%"PRId64"/sk=%+dms",
+                                   " in%d:qdrop=%"PRId64"/corrupt=%"PRId64"/pd=%"PRId64"/sv=%"PRId64"/sk=%+dms/skres=%+dms",
                                    k, c->inputs[k].da.vdrop, c->inputs[k].da.vcorrupt + c->inputs[k].dc.vcorrupt,
-                                   pd_cnt[k], sv_cnt[k], (int)(c->inputs[k].house_skew / 1000));
+                                   pd_cnt[k], sv_cnt[k], (int)(c->inputs[k].house_skew / 1000),
+                                   (int)(c->inputs[k].da.disc_resid_us / 1000));
                 av_log(NULL, AV_LOG_INFO,   /* v0.9.13 parity: size/bitrate/speed/genlock dropped (v0.9.10 single-input rationale) */
                     "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f dup=%"PRId64" drop=%"PRId64"%s%s\n",
                     c->emitted, fps, hh, mm, ss, c->dup, c->framedrop[0], dlv, ls);
@@ -5713,6 +5762,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         vc->is_master = (r == 0);
         vc->dbg_video_q = inputs[0].video_q; vc->dbg_dec_frames = &inputs[0].dc.dec_frames; vc->dbg_vcorrupt = &inputs[0].dc.vcorrupt;
         vc->dbg_vdrop = &inputs[0].da.vdrop; vc->dbg_pcorrupt = &inputs[0].da.vcorrupt;   /* stats: demux video_q drops + corrupt-pkt */
+        vc->dbg_disc_resid = &inputs[0].da.disc_resid_us;   /* 0.9.18.7: hsres= (LAYERA erase-residue ledger) */
         rung[r].ma.ofmt = rung[r].ofmt; rung[r].ma.mux_q = rung[r].mux_q;
         rung[r].ma.is_master = (r == 0);                        /* Φ1′: wire-DTS sensor on rung 0 only */
         rung[r].ma.n_producers = 1 + n_audio + n_copy_inputs;   /* video out + N audio + per-input copy fan */
@@ -6267,6 +6317,10 @@ static void ptv_print_log_legend(int full)
     av_log(NULL, AV_LOG_INFO,
         "  hs         house_skew: latency debt vs baseline (ms) — a feed stall steps it up, catch-up\n"
         "             drops bleed it back; A/V stays LOCKED throughout (this is delay, not lip-sync)\n"
+        "  hsres      (0.9.18.7) LAYERA erase-residue ledger (ms): cumulative label offset the glue\n"
+        "             erases injected into the hs reading. hs growing IN STEP with hsres = erased-\n"
+        "             discontinuity bookkeeping (e.g. jump-to-live parked the stall's dups), NOT\n"
+        "             held content; hs growing while hsres is flat = real retained latency\n"
         "  cushion    adaptive frame_q target: ~1s lean tier or ~4s raised tier ([PTV-CUSHION] logs\n"
         "             each transition: grows on 2 starvations/60min, shrinks after 6h quiet)\n"
         "  bank       (v0.9.14, shown when armed) AUTO-BANK actual/target ms: a bursty channel's\n"
@@ -6313,7 +6367,8 @@ static void ptv_print_log_legend(int full)
         "  inK:pd       cadence-residence holds (v0.9.13) — a 25fps slot in a 29.97 mosaic holds\n"
         "               every 6th tick BY DESIGN (~5/s is correct rate conversion, not a fault)\n"
         "  inK:sv       genuine starvation dups (frame was DUE but the jitter buffer was empty)\n"
-        "  inK:sk       published per-slot audio skew (ms) the slot's audio follows\n");
+        "  inK:sk       published per-slot audio skew (ms) the slot's audio follows\n"
+        "  inK:skres    (0.9.18.7) slot LAYERA erase-residue ledger (ms) — read like hsres= vs sk=\n");
     if (!full)
         return;
     av_log(NULL, AV_LOG_INFO,
@@ -6344,7 +6399,12 @@ static void ptv_print_log_legend(int full)
         "  frame_q capacity (default 160, [48,1024]) · PTV_PREROLL_MS=N startup cushion / base tier ·\n"
         "  PTV_DELIVERY_CAP_MS / PTV_DELIVERY_MAXQ delivery-gate sizing\n"
         "probes: PTV_DIAG=1 debug lines above · PTV_LOG_TS=1 prepend [timestamp] ·\n"
-        "  PTV_AVSYNC_PROBE=1 [PTV-AVSYNC2] decomposition of the live A/V controller\n");
+        "  PTV_AVSYNC_PROBE=1 [PTV-AVSYNC2] decomposition of the live A/V controller\n"
+        "internalized (0.9.18.7): 21 debug envs frozen at their production defaults and no longer\n"
+        "  read (GENLOCK_MAX_PPM/REJECT_PPM/WINDOW_MS/EMA_SHIFT, GAP_MIN_MS, AGLUE_MAX_MS,\n"
+        "  DISCONT_MS/_BACK_MS, PROGOFF_DEBOUNCE_MS, DUKF_ESCAPE_MS/_MIN_MS, H0_REANCHOR_MS,\n"
+        "  AF_ACQUIRE_MS/AF_RATE_MS_S, PLL_EMA_SHIFT/TAU_MS/ACQUIRE_MS/ACQUIRE_N/REFRACTORY_MS/\n"
+        "  NOISE_K/DEV_SHIFT) — setting them is now a silent no-op; see ptvencoder-changelog.md\n");
 }
 
 int main(int argc, char **argv)
@@ -6376,33 +6436,30 @@ int main(int argc, char **argv)
     }
     if (getenv("PTV_NO_WUCR")) g_wucr = 0;       /* v0.9.10: WUCR default-on; revert to genlock/free-run */
     if (getenv("PTV_NO_GENLOCK_GUARD")) g_genlock_guard = 0;  /* v0.9.4: revert to the unbounded ±1%-gate FLL (A/B the runaway) */
-    { const char *mp = getenv("PTV_GENLOCK_MAX_PPM");    if (mp && atoi(mp) > 0) g_gl_max_q20    = av_rescale(atoi(mp), 1 << 20, 1000000); }  /* abs bound on applied rate (default 300ppm) */
-    { const char *rp = getenv("PTV_GENLOCK_REJECT_PPM"); if (rp && atoi(rp) > 0) g_gl_reject_q20 = av_rescale(atoi(rp), 1 << 20, 1000000); }  /* relative outlier-reject band (default 700ppm) */
-    if (g_gl_reject_q20 < 2 * g_gl_max_q20) g_gl_reject_q20 = 2 * g_gl_max_q20;  /* invariant: reject must span ±MAX twice (no stuck zone) */
-    { const char *wm = getenv("PTV_GENLOCK_WINDOW_MS"); if (wm && atoi(wm) >= 1000) g_gl_window_us = (int64_t)atoi(wm) * 1000; }  /* phase-2a: longer baseline averages out burst-aliasing (default 3000=3s) */
-    { const char *es = getenv("PTV_GENLOCK_EMA_SHIFT"); if (es && atoi(es) >= 0 && atoi(es) <= 16) g_gl_ema_shift = atoi(es); }   /* faster EMA OK with a cleaner long window (default 6) */
+    /* 0.9.18.7: PTV_GENLOCK_MAX_PPM / PTV_GENLOCK_REJECT_PPM / PTV_GENLOCK_WINDOW_MS /
+     * PTV_GENLOCK_EMA_SHIFT internalized at the production defaults (300ppm / 700ppm / 3000ms / 6)
+     * — see the g_gl_* declarations. The reject >= 2*max invariant holds statically (734 >= 2*314). */
     if (getenv("PTV_NO_REANCHOR")) g_reanchor = 0;   /* keep stale dup skew across outages (A/B) */
     if (getenv("PTV_MV_CLAMP")) g_mv_clamp = 1;      /* opt-in: re-enable the (stutter-prone) content clamp */
     if (getenv("PTV_NO_DISCONT")) g_discont = 0;     /* A/B: don't absorb source PTS discontinuities */
     if (getenv("PTV_NO_GAPDISCRIM")) g_gapdiscrim = 0;   /* gap-fix A/B: revert to unconditional forward absorb (old desync-on-audio-gap behaviour) */
-    { const char *gm = getenv("PTV_GAP_MIN_MS"); if (gm && atoi(gm) > 0) g_gap_min_us = (int64_t)atoi(gm) * 1000; }  /* min wall-absence to call a forward audio jump a GAP */
+    /* 0.9.18.7: PTV_GAP_MIN_MS internalized (700ms — g_gap_min_us) */
     { const char *wg = getenv("PTV_WRAP_GUARD_S"); if (wg && atoi(wg) > 0) g_wrap_guard_us = (int64_t)atoi(wg) * 1000000; }  /* v0.9.16.1 wrap-guard threshold override (TEST ONLY) */
     if (getenv("PTV_NVENC_SERIALIZE")) g_nvenc_serialize = 1;  /* v0.9.16.5 scale fix B2 (opt-in): one process-wide mutex around video encoder calls — cuts concurrent NVIDIA RM-lock callers 6->1 per process */
     { const char *ag = getenv("PTV_AGLUE_MS");     if (ag) g_aglue_ms = atoi(ag); }          /* v0.9.16.3 label-step glue threshold; 0 disables */
-    { const char *ag = getenv("PTV_AGLUE_MAX_MS"); if (ag && atoi(ag) > 0) g_aglue_max_ms = atoi(ag); }
-    { const char *dm = getenv("PTV_DISCONT_MS"); if (dm && atoi(dm) > 0) g_discont_ms = atoi(dm); }            /* forward jump threshold */
-    { const char *dm = getenv("PTV_DISCONT_BACK_MS"); if (dm && atoi(dm) > 0) g_discont_back_ms = atoi(dm); }   /* backward jump threshold (anti-stall) */
+    /* 0.9.18.7: PTV_AGLUE_MAX_MS (1000ms) / PTV_DISCONT_MS (1000ms) / PTV_DISCONT_BACK_MS (80ms)
+     * internalized — see g_aglue_max_ms / g_discont_ms / g_discont_back_ms */
     if (getenv("PTV_NO_PROG_OFF")) g_prog_off = 0;   /* P2: A/B — sparse copied streams get 33-bit wrap only (v0.6.23) */
     if (getenv("PTV_PROGOFF_AV")) g_progoff_av = 1;     /* §5.A.2: explicit enable (redundant — default ON) */
     if (getenv("PTV_NO_PROGOFF_AV")) g_progoff_av = 0;  /* §5.A.2: A/B disable → legacy per-stream self-rebase */
-    { const char *db = getenv("PTV_PROGOFF_DEBOUNCE_MS"); if (db && atoi(db) > 0) g_progoff_debounce_us = (int64_t)atoi(db) * 1000; }
+    /* 0.9.18.7: PTV_PROGOFF_DEBOUNCE_MS internalized (1000ms — g_progoff_debounce_us) */
     if (getenv("PTV_NO_DUKF")) g_drop_until_kf = 0;  /* P2 2b: A/B — decode the post-splice corruption burst (v0.6.23) */
-    { const char *de = getenv("PTV_DUKF_ESCAPE_MS"); if (de && atoi(de) > 0) g_dukf_escape_us = (int64_t)atoi(de) * 1000; }
-    { const char *dm = getenv("PTV_DUKF_MIN_MS"); if (dm && atoi(dm) > 0) g_dukf_min_ms = atoi(dm); }  /* P2 2b: min jump to arm drop-until-keyframe */
+    /* 0.9.18.7: PTV_DUKF_ESCAPE_MS (5000ms) / PTV_DUKF_MIN_MS (1000ms) internalized —
+     * see g_dukf_escape_us / g_dukf_min_ms */
     if (getenv("PTV_NO_AUDIO_FOLLOW")) g_audio_follow = 0;  /* A/B: multiview audio uses old floored/capped async skew */
     if (getenv("PTV_NO_H0_REANCHOR")) g_h0_reanchor = 0;    /* A/B: don't floor per-slot lag (allow video-ahead) */
     if (getenv("PTV_NO_H0_AT_DISPLAY")) g_h0_at_display = 0; /* A/B: multiview anchors h0 at first DECODE, not first DISPLAY */
-    { const char *rm = getenv("PTV_H0_REANCHOR_MS"); if (rm && atoi(rm) > 0) g_h0_reanchor_ms = atoi(rm); }
+    /* 0.9.18.7: PTV_H0_REANCHOR_MS internalized (120ms — g_h0_reanchor_ms) */
     if (getenv("PTV_AF_NO_PLL")) g_af_pll = 0;              /* A/B: pure discrete drop/pad (no smooth nudge) */
     if (getenv("PTV_AF_NO_ANCHOR")) g_af_anchor = 0;        /* A/B: revert B1 → pre-B1 free-running counter */
     /* PTV_PREROLL_MS / PTV_VIDEOQ / PTV_CUSHION_MAX_MS / PTV_BANK_DECAY_S parses moved to resolve_cushions() (0.9.18 M1) */
@@ -6435,17 +6492,13 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_DELIVERY_MV")) g_delivery_mv = 0;    /* v0.9.12.1: revert multiview to ungated wire staging (sync_check-visible audio lead) */
     /* PTV_DELIVERY_CAP_MS / PTV_DELIVERY_MAXQ override parses moved to resolve_cushions() (0.9.18 M1) */
     if (getenv("PTV_AVSYNC_PROBE")) g_avsync_probe = 1;    /* Phase A: read-only [PTV-AVSYNC2] real A/V offset */
-    { const char *am = getenv("PTV_AF_ACQUIRE_MS"); if (am && atoi(am) > 0) g_af_acquire_us = atoi(am) * 1000; }
-    { const char *rr = getenv("PTV_AF_RATE_MS_S");  if (rr && atoi(rr) > 0) g_af_rate_us = atoi(rr) * 1000; }
+    /* 0.9.18.7: PTV_AF_ACQUIRE_MS (100ms) / PTV_AF_RATE_MS_S (10) internalized —
+     * see g_af_acquire_us / g_af_rate_us */
     if (getenv("PTV_NO_AVSYNC_PLL")) g_avsync_pll = 0;     /* B3 closed-loop is DEFAULT-ON (v0.6.20); this reverts to the open-loop B1 content-anchored follow. (PTV_AVSYNC_PLL=1 still honored implicitly = the default.) */
-    { const char *es = getenv("PTV_PLL_EMA_SHIFT");  if (es && atoi(es) >= 0) g_pll_ema_shift = atoi(es); }
-    { const char *tu = getenv("PTV_PLL_TAU_MS");     if (tu && atoi(tu) > 0) g_pll_tau_us = (int64_t)atoi(tu) * 1000; }
-    { const char *aq = getenv("PTV_PLL_ACQUIRE_MS"); if (aq && atoi(aq) > 0) g_pll_acquire_us = atoi(aq) * 1000; }
-    { const char *an = getenv("PTV_PLL_ACQUIRE_N");  if (an && atoi(an) > 0) g_pll_acquire_n = atoi(an); }
-    { const char *rf = getenv("PTV_PLL_REFRACTORY_MS"); if (rf && atoi(rf) > 0) g_pll_refractory_us = (int64_t)atoi(rf) * 1000; }  /* v0.6.21: hard post-acquire refractory */
+    /* 0.9.18.7: PTV_PLL_EMA_SHIFT (7) / PTV_PLL_TAU_MS (5000) / PTV_PLL_ACQUIRE_MS (40) /
+     * PTV_PLL_ACQUIRE_N (32) / PTV_PLL_REFRACTORY_MS (12000) / PTV_PLL_NOISE_K (3) /
+     * PTV_PLL_DEV_SHIFT (9) internalized — see the g_pll_* declarations */
     { const char *tn = getenv("PTV_PLL_TESTNOISE_MS");  if (tn && atoi(tn) > 0) g_pll_testnoise_us  = (int64_t)atoi(tn) * 1000; }  /* TEST-ONLY: inject ±N ms offset square wave */
-    { const char *nk = getenv("PTV_PLL_NOISE_K");    if (nk && atoi(nk) >= 0) g_pll_noise_k = atoi(nk); }   /* v0.6.22: noise-adaptive threshold gain (0 = fixed) */
-    { const char *ds = getenv("PTV_PLL_DEV_SHIFT");  if (ds && atoi(ds) > 0) g_pll_dev_shift = atoi(ds); }  /* v0.6.22: pll_dev EMA shift */
     { const char *s = getenv("PTV_SLOW_US"); g_slow = s ? atoi(s) : 0; }
     if (getenv("PTV_LOG_TS") && atoi(getenv("PTV_LOG_TS")))   /* native [timestamp] log prefix */
         av_log_set_callback(ptv_log_ts_callback);
