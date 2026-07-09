@@ -5,6 +5,70 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 0.9.18.7 (2026-07-09) — env tiering (21 internalized) + hs/hsres split + log promotions
+
+Logging/config-surface only — byte-identical control behavior is the gate; no control
+path reads anything new.
+
+(1) ENV TIERING (implementation-map PART 3): the 21 single-read debug envs that never
+moved off their defaults in production are internalized — getenv deleted, value frozen
+at the production default, static kept with an "internalized 0.9.18.7 (was PTV_X)"
+comment. Frozen: GENLOCK_MAX_PPM=300ppm(Q20 314) / GENLOCK_REJECT_PPM=700ppm(Q20 734;
+the reject>=2*max invariant now holds statically, 734>=628) / GENLOCK_WINDOW_MS=3000 /
+GENLOCK_EMA_SHIFT=6 / GAP_MIN_MS=700 / AGLUE_MAX_MS=1000 / DISCONT_MS=1000 /
+DISCONT_BACK_MS=80 / PROGOFF_DEBOUNCE_MS=1000 / DUKF_ESCAPE_MS=5000 / DUKF_MIN_MS=1000 /
+H0_REANCHOR_MS=120 / AF_ACQUIRE_MS=100 / AF_RATE_MS_S=10 / PLL_EMA_SHIFT=7 /
+PLL_TAU_MS=5000 / PLL_ACQUIRE_MS=40 / PLL_ACQUIRE_N=32 / PLL_REFRACTORY_MS=12000 /
+PLL_NOISE_K=3 / PLL_DEV_SHIFT=9. Setting any of them is now a silent no-op (channel
+configs that still export them are harmless by construction). NOT touched: all PTV_NO_*
+reverts, PTV_DIAG/PTV_LOG_TS, the 9 tuning knobs, compat no-ops, injectors
+(PTV_PLL_TESTNOISE_MS/PTV_WRAP_GUARD_S/PTV_SLOW_US/PTV_BANK_DECAY_S/PTV_AVSYNC_PROBE),
+PTV_AGLUE_MS, PTV_NVENC_SERIALIZE/REG_CAP, and the post-map reverts
+PTV_LAYERA_FULLSKIP / PTV_NO_CADDISARM.
+
+(2) hs/hsres SPLIT (reporting only): hs= conflated real retained latency with
+erased-discontinuity bookkeeping — a LAYERA jump-to-live erase makes the post-glue
+labels continuous, so the stall's dup-ratcheted skew never re-syncs and parks in hs
+permanently (In-Touch analysis). New ledger DemuxArgs.disc_resid_us =
+Σ(−applied_offset) over ptv_disc_flush erases that shifted the VIDEO label stream
+(has_vid only; audio-only partial glues excluded). Printed as an ADJACENT field
+(`hs=+Xms hsres=+Yms`), not as an hs sub-component: every erase shifts the hs reading
+by exactly −applied_offset vs raw labels, but "hs−hsres = real hold" is only valid for
+wall-tracking label streams (a label-repeating source, e.g. a loop seam, moves hsres
+without any hold change), so presenting Y inside hs would mislead. Read it by TREND:
+hs growing in step with hsres = erased-discontinuity residue; hs growing with hsres
+flat = real retained latency. hs itself is UNTOUCHED (same expression, same consumers —
+AVLOCK/copy-path still read *house_skew directly). Multiview gets the same treatment:
+per-slot sk= rides the same erased label stream (sk = mv_tick − (disp_src − h0)), so
+the slot line gains /skres= from the same per-input ledger.
+
+(3) LOG PROMOTIONS (rare events, PTV_DIAG→always-on WARNING): [PTV-REANCHOR2] (mv h0
+re-anchor) and [PTV-PLL] ACQUIRE (bank snap drop/pad — already hard rate-limited by
+the 12s post-acquire refractory, ≤1/12s per track by construction; no extra limit
+added). Message text unchanged. REANCHOR2 got the AGLUE-style rate limit (4 lines/10s
+per slot + suppressed-count summary): MEASURED on a file-source (unpaced) mv smoke it
+refires every tick (~30 lines/s, decoder outruns the house clock and each +1-tick
+landing is re-passed immediately) — live mv is paced so it stays rare there, but the
+promotion must not be able to flood; re-anchors still apply, only lines are capped.
+
+Legend: hsres=/skres= entries + internalized-envs note added; Reverts list unchanged
+(nothing on it was internalized). Docs: analysis/ptvencoder-usage.md env section notes
+the internalization.
+
+Gate: build clean, -version 0.9.18.7 @54b760ba5e; tier-1 fail set identical to
+baseline {t0_smoke, t1_audio_discont, t1_cc_extraction, t1_hw_reconfig}; 120s live UDP
+mirror A/B vs 0.9.18.6 (cinestar loop, x264 1-rung) — trajectories equivalent (async
+EMA decay −132→−38 new vs −131→−37 old-with-envs, dup=0, rho zero-mean, dlvhold
+~2.6s band), hsres= present; env-freeze A/B (old binary WITH PTV_DISCONT_MS=1000
+PTV_GENLOCK_WINDOW_MS=3000 PTV_PLL_TAU_MS=5000 vs new with no env) — identical
+trajectories; seam fixture (tsp --infinite native-PTS 30s sample → −29.984s
+backward jump per seam; NOTE: ffmpeg -stream_loop adds file duration per loop =
+CONTINUOUS ts, so send.sh alone produces NO seams) — new binary: 5 glues, hsres steps
+exactly −30016ms per glue (= −applied_offset), hs=+0 flat, dup=0; old binary same
+feed: hs=+0 flat = accounting untouched. mv smoke: skres= prints per slot; REANCHOR2
+limiter caps the file-mv flood (71 lines vs ~30/s unbounded, "146 more suppressed"
+summaries roll correctly).
+
 ## 0.9.18.6 (2026-07-08) — R3+R4: estimator/house-rate state into per-input/per-house structs
 
 Pure-motion refactor (no behavior change intended; this bump exists so the soak build is
