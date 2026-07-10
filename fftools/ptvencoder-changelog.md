@@ -5,6 +5,27 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 1.0-rc1 (2026-07-10) — file split (movement-only decomposition of ptvencoder.c)
+
+No behavior change — pure code movement (v1-cleanup-plan §7). The ~6.5k-line
+`fftools/ptvencoder.c` monolith is decomposed by thread-ownership domain into:
+`ptvencoder.h` (shared types + extern decls + cross-file prototypes),
+`ptvencoder_clock.c` (house clock / output_thread ladder, encode_push, the
+house-rate-correction ladder, content_index, ptv_empty_watch),
+`ptvencoder_demux.c` (demux thread, demux_unwrap, LAYERA ptv_disc_*, DUKF,
+SCTE-35 rebase, rate_estimator_feed, demux_dispatch), `ptvencoder_audio.c`
+(audio thread: feed/anchor/drain, AGLUE, AFMT rebuild, audio-follow/B3 PLL,
+build_audio_filter), `ptvencoder_mv.c` (compositor thread + slate/black
+helpers), `ptvencoder_gate.c` (delivery gate dlv_*, cushion_escalate/CushionRt,
+resolve_cushions, push_frame_q, watchdog_thread), `ptvencoder_legend.c` (help
+text + log legend); `ptvencoder.c` keeps main()/env parsing, decode_thread +
+filter-graph builders, transcode() wiring, mux_thread, plan resolution and the
+vring probe helpers. Every line moved verbatim; the only code deltas are
+`static ` keyword removals on symbols that became cross-file (extern'd in
+ptvencoder.h) and the removal of the now-redundant in-file build_audio_filter
+forward declaration. Build wires the new objects via `OBJS-ptvencoder` in
+fftools/Makefile. Pre-split state is tagged `v0.9.18.7-monolith`.
+
 ## 0.9.18.7 (2026-07-09) — env tiering (21 internalized) + hs/hsres split + log promotions
 
 Logging/config-surface only — byte-identical control behavior is the gate; no control

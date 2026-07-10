@@ -1,0 +1,629 @@
+#ifndef FFTOOLS_PTVENCODER_H
+#define FFTOOLS_PTVENCODER_H
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <time.h>
+
+#include "libavutil/avutil.h"
+#include "libavutil/log.h"
+#include "libavutil/opt.h"
+#include "libavutil/time.h"
+#include "libavutil/parseutils.h"
+#include "libavutil/mathematics.h"
+#include "libavutil/crc.h"
+#include "libavutil/bswap.h"
+#include "libavutil/samplefmt.h"
+#include "libavutil/pixdesc.h"
+#include "libavutil/channel_layout.h"
+#include "libavutil/audio_fifo.h"
+#include "libavutil/threadmessage.h"
+#include "libavutil/hwcontext.h"
+#include "libavformat/avformat.h"
+#include "libavcodec/avcodec.h"
+#include "libavfilter/avfilter.h"
+#include "libavfilter/buffersrc.h"
+#include "libavfilter/buffersink.h"
+#include "libswresample/swresample.h"
+
+#define PTV_QDEPTH      48     /* demux->decode packet queue (~1s jitter) */
+/* 0.9.18 R1+R3/R4 (map: analysis/ptvencoder-0918-implementation-map.md §2): demux-side
+ * rate-sensing state, hoisted verbatim from function-local statics in demux_dispatch (R1),
+ * with the published rate atomics folded in (R3). One per INPUT — the instance lives in
+ * the Input struct (R4), wired to the demux (writer) and output threads (readers) at
+ * transcode() setup like h0/house_skew. Non-zero initializers are set in the per-input
+ * init loop (former statics'/globals' initializers, verbatim). */
+typedef struct RateEstimator {
+    int64_t c0, w0, ema_q20;        /* tight-FLL sub-window anchor + rate EMA (Q20) */
+    int_least64_t ep_prev;          /* disturbance epoch of the current sub-window */
+    int     chunks;                 /* clean FLL chunks (lock at 8) */
+    int64_t cf_ema_q20;             /* coarse clock-follow rate EMA (Q20) */
+    int     cf_chunks, cf_wins, cf_la_acc, cf_la_tot, cf_frozen;
+    /* published outputs (demux thread writes, output threads read; relaxed atomics) */
+    _Atomic int64_t cf_rate_q20;    /* coarse source rate (content-us/wall-us, Q20) */
+    _Atomic int     cf_locked;      /* 20 clean chunks (~60s) before the servo may follow */
+    _Atomic int64_t src_rate_q20;   /* recovered source rate (content-µs/wall-µs), Q20 */
+    _Atomic int     src_rate_locked;/* 0 until the FLL trusts the estimate */
+} RateEstimator;
+/* 0.9.18 R1+R3/R4: master-output-side house-rate actuation state (the ladder's memory).
+ * One per HOUSE CLOCK — the instance is a transcode()-scope struct shared by the rung set
+ * (master writes, all rungs apply rho_corr_ppm), wired via VideoCtx like h0/house_skew. */
+typedef struct HouseRateState {
+    int cf_following;               /* clock-follow hysteresis latch (arm >5000, release <2000 ppm) */
+    int64_t occ_ema_milli;          /* WUCR: EMA-filtered master frame_q occupancy (milli-frames); master-thread only, non-atomic */
+    int     occ_ema_seeded;         /* WUCR: seed the EMA to the first occupancy sample so there is no startup-ramp transient */
+    int64_t reprime_start;          /* 0.9.10.1: wall time the CURRENT reprime engagement began (0 = idle). An
+                                     * engagement is hard-capped at 10s, then a 300s cooldown applies UNCONDITIONALLY
+                                     * — the 0.9.10 "continuing" clause let occupancy oscillating around the trigger
+                                     * re-arm forever (observed live: AWE film segments pinned the house at 0.77x). */
+    int64_t reprime_last_end;       /* wall time the last engagement ended (cooldown reference) */
+    _Atomic int64_t rho_corr_ppm;   /* WUCR ρ: applied house-rate correction (ppm, corr>0 = house slower); ±6% clamp (±30% under re-prime) */
+} HouseRateState;
+/* 0.9.18 M1 — CushionPlan: ALL cushion/queue sizing derived in ONE place (resolve_cushions()),
+ * in the units each value is consumed in. The g_* globals above stay authoritative for every
+ * consumer not yet repointed (mv compositor, BANK escalate/decay writes, adaptive GROW/SHRINK
+ * runtime stores, stats/log lines); resolve_cushions() assigns them AND mirrors them here. */
+typedef struct CushionPlan {
+    /* startup-resolved (env + genlock defaulting + deep-prime side-cars) */
+    int      preroll_ms;           /* resolved: env | genlock 1000 | 350   (replaces g_preroll_ms reads) */
+    int      videoq_pkts;          /* video_q capacity                     (g_videoq) */
+    int      frameq_cap;           /* per-rung frame_q capacity            (g_frameq_cap; parse stays in main()) */
+    int      audioq_pkts;          /* per-track audio_q capacity (live/deep rules folded in) */
+    int      aq_prehold;           /* pre-h0 audio ring depth              (g_aq_cap) */
+    int      deep_prime_pkts;      /* video_q startup bank; 0 = off        (single-input, from out_fps) */
+    int64_t  deep_prime_budget_us; /* decode start-delay budget (2x preroll) */
+    int64_t  delivery_cap_us;      /* gate force-release BASE (pre-bank)   (g_delivery_cap_us at init) */
+    int      delivery_maxq;        /* gate FIFO backstop                   (g_delivery_maxq) */
+    int64_t  cushion_raised_us;    /* adaptive RAISED tier                 (g_cushion_ms*1000) */
+    int64_t  bank_ceil_us;         /* AUTO-BANK ceiling                    (g_cushion_max_ms*1000) */
+    int64_t  bank_decay_us;        /* quiet time before the bank retires   (g_bank_decay_us) */
+    int      vid_pps;              /* v0.9.18.4 M6: VIDEO packets/second = ceil(out_fps) — the ONE
+                                    * seconds->video_q-packets rate (was three constants: bank 35/s,
+                                    * side-car 60/s, deep-prime out_fps; a 50/59.94fps channel's bank
+                                    * was sized ~30-42% under its us target). AUDIO sizing keeps its
+                                    * own 50/s: that is an AAC frame rate (48kHz/1024 ~= 47/s), not
+                                    * a video rate — intentionally NOT unified. */
+} CushionPlan;
+/* ===================== §7.5a delivery-alignment gate (P1) — per output rung =====================
+ * Dense near-zero-latency streams (transcoded audio + copied AC-3/MP2) are HELD here instead of
+ * going straight to mux_q; the rung's VIDEO encode_push publishes its newest emitted DTS and DRAINS
+ * every held packet whose DTS the video has reached — so audio/copy reach the muxer in lockstep with
+ * the (≈1s later) video for the SAME content, instead of ~1s ahead on the wire. PTS are NEVER
+ * modified — only WHEN a packet reaches the muxer. One drainer (the rung's video output thread),
+ * many enqueuers (N audio threads + the demux/copy thread); a small mutex guards the list. NO control
+ * loop — a deterministic release gate (NFR-SIMPLE). */
+typedef struct DlvNode {
+    AVPacket       *pkt;
+    int64_t         dts_us;     /* packet DTS on the (content − h0) µs axis (shared with video) */
+    int64_t         enq_us;     /* monotonic wall time enqueued (for the cap_us age release) */
+    struct DlvNode *next;
+} DlvNode;
+
+typedef struct DlvGate {
+    AVThreadMessageQueue *mux_q;        /* release target (this rung's muxer queue) */
+    pthread_mutex_t lock;
+    pthread_cond_t  space;              /* signalled when the drain frees a slot (blocking enqueuers wait) */
+    DlvNode        *head, *tail;
+    int             count, maxq;
+    int             closed;             /* video thread done → enqueuers fall through to a direct send */
+    int             inited;
+    _Atomic int64_t cap_us;     /* v0.9.14: runtime-adjustable (AUTO-BANK extends it so audio waits out long stalls) */
+    _Atomic int64_t v_enc_dts_hi;       /* newest video DTS the encoder has emitted (µs); INT64_MIN = none yet */
+    _Atomic int64_t v_hi_change_wc;     /* monotonic wall time v_enc_dts_hi last ADVANCED — stall detector:
+                                         * the cap force-release fires only when video is GENUINELY stuck
+                                         * (this hasn't moved within cap_us), NOT when the pipeline merely
+                                         * carries a long-but-healthy steady hold (preroll + audio-ahead +
+                                         * encoder latency ≈ a few s). Absolute-age cap mis-fired there. */
+    /* stats (NFR-OBS) */
+    _Atomic int64_t st_hold_us;         /* age of the oldest still-held packet at the last drain */
+    _Atomic int64_t st_forced;          /* cap_us-forced releases (encoder latency > cap) */
+    _Atomic int64_t st_dropped;         /* non-blocking copy drops on a full FIFO */
+} DlvGate;
+
+#define PTV_MAX_RUNG 8
+#define PTV_MAX_AUDIO 8    /* max transcoded audio output tracks (multi-language, multiview slots) */
+#define PTV_AQ_PREROLL 1024 /* per-track pre-h0 audio buffer (frames, ~21s @47fps): preserve a slot's audio head
+                            * while its video decodes its first frame (sets h0), instead of dropping
+                            * it (which made that slot's audio start ~h0-acquire-delay late). Bounded
+                            * ring (drop-oldest) so a never-arriving video can't grow it unboundedly. */
+#define PTV_MAX_INPUT 4    /* max composited inputs (multiview): 1 / 2 / 4 */
+#define PTV_MV_SKEW_CAP_US 250000   /* multiview per-slot audio skew cap (async budget) */
+
+/* A/V PLL redesign Phase A probe (PTV_AVSYNC_PROBE): per-input ring recording, for each DISTINCT
+ * video content the cell displayed, the output time it went out at — (abs source pts → out_v, both
+ * us). The audio drain pairs its emitted frame's source content against this ring to read the output
+ * time the VIDEO showed that SAME content (§3.2b), giving the real lip-sync offset out_v(C)−out_a(C).
+ * Written by the compositor (multiview) and the single-input output thread; read by audio_drain_fg.
+ * Single-producer/single-consumer; the small lock keeps a torn read out of the diagnostic. */
+#define PTV_VRING 512      /* distinct video contents kept (~10s @50fps; spans the V↔A content offset) */
+typedef struct VOutRing {
+    int64_t          src[PTV_VRING];   /* absolute source pts of the displayed content (us) */
+    int64_t          out[PTV_VRING];   /* output time that content was emitted at (us, output-PTS axis) */
+    int64_t          n;                /* total writes (monotonic); newest index = (n-1) % PTV_VRING */
+    pthread_mutex_t  lock;
+} VOutRing;
+/* 0.9.18 M3 — CushionRt: the runtime COORDINATION home for cushion escalation (map §1.3).
+ * Holds the per-run wiring every escalation event needs (the per-rung delivery gates, the
+ * master tick, the adaptive tier targets) plus the mutex that makes cushion_escalate() the
+ * single serialized writer of every escalation-dependent store. The escalation DATA itself
+ * (g_bank_us / g_bank_pkts / g_delivery_cap_us / g_delivery_maxq) stays in the globals
+ * above — the hot-path readers (master blocking-push arming, dlv_drain cap loads, the
+ * stats lines, the WUCR bank top-up floor) keep reading the same relaxed atomics
+ * unchanged; moving the data home is a later step.
+ * Registration: gate[]/n_gate/tick_dur_us are set in transcode() setup right after
+ * dlv_init(), before any thread starts. base_sp/raised_sp/cur_sp are set by the MASTER
+ * output thread at startup (they are per-run locals derived from the resolved preroll +
+ * tick there); cur_sp is thereafter mutated ONLY inside cushion_escalate() on the
+ * master's own GROW/SHRINK calls, so the master's unlocked trigger/stats reads are
+ * same-thread-ordered and race-free (the demux-side BANK events never touch the tier
+ * fields). */
+typedef enum { CUSHION_GROW, CUSHION_SHRINK, BANK_ESCALATE, BANK_RETIRE } CushionEvent;
+typedef struct CushionRt {
+    DlvGate        *gate[PTV_MAX_RUNG]; /* per-rung delivery gate (NULL = delivery off) */
+    int             n_gate;
+    int64_t         tick_dur_us;        /* master video tick (us) */
+    int             base_sp;            /* adaptive tier: BASE frame_q target (ticks) */
+    int             raised_sp;          /* adaptive tier: RAISED frame_q target (ticks) */
+    int             cur_sp;             /* adaptive tier: current target (escalate-owned) */
+    int64_t         bank_advise_us;     /* v0.9.14: rate-limit for the at-ceiling advisory */
+    pthread_mutex_t lock;               /* cold path: events are seconds-to-hours apart */
+} CushionRt;
+/* Multiview per-input jitter buffer: decode pushes each frame onto `q`; the
+ * compositor pops ONE per house tick (absorbing bursty decode delivery, exactly
+ * like the single-input frame_q) and dup-holds its last frame when `q` underruns,
+ * so a late/dead slot never stalls the mosaic. A depth-1 "latest only" hold
+ * instead would discard intra-burst frames -> massive dup/judder. */
+typedef struct VideoHold {
+    AVThreadMessageQueue *q;   /* decode -> compositor (AVFrame*) */
+    int64_t         framedrop; /* drop-oldest count when q overflows (live) */
+    pthread_mutex_t lock;      /* guards wall_us + eof */
+    int64_t         wall_us;   /* when a frame was last pushed (staleness -> slate) */
+    int             eof;       /* decode terminated for this input (terminal) */
+} VideoHold;
+
+/* Shared decode side of the ABR ladder (the ffmpeg model: decode the source
+ * ONCE, run it through one filter graph — a -filter_complex `split`, a single
+ * -filter:v chain, or none — and hand each rung its own frames via that rung's
+ * frame_q). One decoder + one graph feeding N independent outputs.
+ *
+ * Multiview: `hold` is set and `filtering` is 0 — the decode thread stages each
+ * frame into the per-input hold instead of running the graph; the compositor
+ * owns the (N-input) graph and the frame_q fan. */
+typedef struct DecodeCtx {
+    AVThreadMessageQueue *video_q;            /* demux -> decode (AVPacket*) */
+    AVCodecContext  *vdec;
+    AVRational       ist_tb;                  /* decoder pkt time_base */
+    int64_t         *h0;                      /* shared A/V input anchor (us) */
+    pthread_mutex_t *h0_lock;
+    int              live;
+    VideoHold       *hold;                    /* multiview: stage frames here (NULL = filter inline) */
+    /* filter graph: filtering -> N buffersinks (one per rung); else clone decode */
+    int              filtering;
+    AVFilterGraph   *fg;
+    AVFilterContext *fsrc;
+    int              n_rung;
+    AVFilterContext *fsink[PTV_MAX_RUNG];
+    AVThreadMessageQueue *frame_q[PTV_MAX_RUNG];
+    int64_t          framedrop[PTV_MAX_RUNG];
+    /* shared counters (the master output thread reports them) */
+    int64_t          dec_frames, vcorrupt;
+    int              deep_prime_packets;   /* §13: if >0, delay decode start until video_q banks this many packets (deep bursty-input cushion; single-input only) */
+} DecodeCtx;
+
+/* Per-rung output side: pop this rung's frame_q on the house clock, stamp the
+ * content-anchored PTS, encode, hand to this rung's mux_q. One per output. */
+typedef struct VideoCtx {
+    AVThreadMessageQueue *frame_q;   /* decode -> output  (AVFrame*)  */
+    AVThreadMessageQueue *mux_q;     /* output -> mux     (AVPacket*) */
+    DlvGate         *gate;           /* §7.5a delivery-alignment gate for this rung (NULL = disabled) */
+    AVRational       out_tb;         /* time_base of frames at this rung's sink (or ist_tb) */
+    int64_t         *h0;             /* shared A/V input anchor (us) */
+    pthread_mutex_t *h0_lock;
+    int64_t         *house_skew;     /* master publishes house-vs-content skew (us) here */
+    RateEstimator   *est;            /* input 0's rate sensor (genlock fallback + cf/diag/stats reads) */
+    HouseRateState  *hr;             /* per-house actuation state: master computes+publishes rho, all rungs apply it */
+    VOutRing        *vring;          /* A/V probe: single-input video output ring (PTV_AVSYNC_PROBE) */
+    AVCodecContext  *venc;
+    AVStream        *ost;
+    int64_t          tick_dur_us;
+    AVRational       out_fps;        /* exact output rate — EXACTTICK content-index stamping (v0.9.9) */
+    int              live;
+    int              passthrough;    /* multiview: compositor already paced+stamped; encode 1:1 */
+    int              is_master;      /* only the master rung prints stats/diag */
+    /* shared decode counters + queue, for the master's diag line */
+    AVThreadMessageQueue *dbg_video_q;
+    int64_t         *dbg_dec_frames, *dbg_vcorrupt;
+    int64_t         *dbg_vdrop, *dbg_pcorrupt;       /* single-input stats: demux video_q drops + corrupt-pkt count */
+    int64_t         *dbg_disc_resid;                 /* 0.9.18.7: input-0 LAYERA hs-residue ledger (hsres= on the stats line) */
+    /* counters */
+    int64_t          framedrop, emitted, dup, pd;   /* pd = intentional cadence holds (telecine residence), split from dup (health alarm) */
+    int64_t          decim;          /* v0.9.15.2: surplus frames decimated by content mapping (>house-rate source) */
+    /* watchdog */
+    int64_t          last_emit_us;
+    volatile int     output_done;
+    int              stalled;
+} VideoCtx;
+
+typedef struct AudioState {
+    AVThreadMessageQueue *audio_q;
+    AVThreadMessageQueue *mux_q[PTV_MAX_RUNG];   /* one per output muxer (fan-out) */
+    DlvGate              *gate[PTV_MAX_RUNG];    /* §7.5a: per-rung delivery gate (NULL = send direct) */
+    AVStream             *ost[PTV_MAX_RUNG];     /* audio out stream in each muxer */
+    int              n_out;
+    AVCodecContext  *dec;
+    AVCodecContext  *enc[PTV_MAX_RUNG];          /* one AAC encoder per rung (per-rung -b:a) */
+    AVRational       ist_tb;
+    SwrContext      *swr;                         /* no -af: plain resample to 48k stereo */
+    SwrContext      *fg_swr;                       /* -af path: the (async) aresample filter's internal SwrContext — swr_get_delay() = faithful resampler-slip sensor (PTS metrics are blind to it) */
+    int64_t          fg_swr_delay_max_ms;          /* running peak of swr_get_delay for observability */
+    AVFilterGraph   *afg;                         /* -af present: abuffer -> chain -> abuffersink */
+    AVFilterContext *afsrc, *afsink;
+    int              use_fg;
+    /* Audio input-format reconfig (ported from legacy 0003 fftools/ffmpeg_filter.c). The -af graph /
+     * swr is built once for the source's initial params; if the source then changes channel layout /
+     * rate / fmt mid-stream (e.g. stereo→mono at an ad-splice) abuffersrc rejects the frame
+     * ("Changing audio frame properties not supported") and the audio path wedges. We track the
+     * configured input params and rebuild for the new ones (output stays pinned to out_chl/48k →
+     * encoder keeps getting continuous stereo). Hysteresis ignores transient/corrupt single-frame
+     * flips at the splice boundary. */
+    const char      *fg_af;                /* the -af chain string (program-lifetime) for rebuilds */
+    int              fg_in_rate;           /* input params the active path is configured for */
+    enum AVSampleFormat fg_in_fmt;
+    AVChannelLayout  fg_in_chl;
+    int              afmt_pending_rate;    /* hysteresis: candidate new params */
+    enum AVSampleFormat afmt_pending_fmt;
+    AVChannelLayout  afmt_pending_chl;
+    int              afmt_stable;          /* consecutive frames seen at the candidate params */
+    AVAudioFifo     *fifo;
+    int              frame_size;
+    int              out_rate;
+    enum AVSampleFormat out_sfmt;
+    AVChannelLayout  out_chl;
+    int64_t         *h0;
+    pthread_mutex_t *h0_lock;
+    int64_t         *house_skew;    /* video's house-vs-content skew (us); -af audio rides it */
+    int64_t         *house_lag_true;/* PTV_DIAG: uncapped true video lag for the lip-sync err (NULL single-input → use house_skew) */
+    int              pts_set;
+    int64_t          next_pts;
+    int64_t          in_frames, out_frames;
+    /* PTV_DIAG audio-side probe (temporary): identify per-track A/V offset on real feeds */
+    int              dbg_k, dbg_in;
+    int64_t          dbg_first_out, dbg_diag_last;
+    int64_t          dbg_first_src, dbg_last_src;   /* source audio content span (us) for async-pad probe */
+    AVFrame         *aq_pending[PTV_AQ_PREROLL];     /* pre-h0 audio buffer (preserve head until video anchors) */
+    int              aq_npending;
+    /* Multiview AUDIO-FOLLOW (Option A): apply the compositor's per-slot offset deterministically.
+     * multiview=1 enables it (n_input>1). af_applied_us = the offset already applied; when the
+     * compositor's published offset changes by more than a frame, the delta becomes a one-time
+     * drop (advance audio: skip content) or pad (delay audio: insert silence), in output samples. */
+    int              multiview;
+    int64_t          af_applied_us;
+    int64_t          af_drop, af_pad;                /* pending one-time correction, in out_rate samples */
+    int              af_started;                     /* follow path: continuous output counter initialized */
+    int64_t          af_next_pts;                    /* follow path: continuous output pts (out_rate samples) */
+    int64_t          af_nudge_us;                    /* P1: smooth rate-limited PTS nudge (us), tracks residual+drift glitch-free */
+    int64_t          af_last_out;                    /* B1: last emitted output pts (samples) — monotonic guard vs backward opts */
+    int              af_out_set;                      /* B1: af_last_out valid */
+    int64_t          avsync_stat_last;               /* [PTV-AVSYNC] status: last print time (us) */
+    int64_t          async_stat_last, async_prev_bal; /* v0.9.2: aresample-work rate (g_async_ppm) state (primary track) */
+    int64_t          af_acq_drop_us, af_acq_pad_us;  /* cumulative discrete acquire work (us dropped / padded) */
+    /* A/V PLL redesign Phase A probe (PTV_AVSYNC_PROBE, read-only): real per-track A/V offset. */
+    VOutRing        *vring;                           /* video output ring for this track's source input */
+    int64_t          av_vlag_ema, av_alag_ema;        /* slow baselines of video_lag / audio_lag (us) */
+    int              av_seed;                         /* baselines seeded */
+    int64_t          av_probe_last;                   /* [PTV-AVSYNC2]: last print time (us) */
+    int64_t          av_offset_us, av_vlag_us, av_alag_us;  /* latest MEASURED A/V offset (always computed, for the always-on [PTV-AVSYNC] line) */
+    int              av_off_valid;                    /* a measurement has paired (else the status line prints offset=--) */
+    /* A/V PLL redesign Phase B3 — closed-loop two-regime controller on the measured av_offset_us (g_avsync_pll). */
+    int64_t          pll_ema;                         /* EMA of the measured offset (us) */
+    int64_t          pll_dev;                          /* v0.6.22: slow EMA of |off−ema| = the leg's offset jitter; raises the acquire threshold above the noise floor */
+    int              pll_seed;                        /* pll_ema seeded at the first valid measurement */
+    int              pll_dbnc;                        /* stability-debounce: consecutive large-AND-flat readings */
+    int64_t          pll_dbnc_ref;                    /* ema value when the debounce window started (flatness reference) */
+    int              pll_refractory;                  /* frames remaining before acquire may re-arm (bumpless-credit backstop) */
+    int              pll_acq_count;                   /* acquires fired this run (startup-k cap + gate assertion) */
+    int              pll_drop, pll_pad;               /* pending one-shot acquire: frames to drop (advance) / pad (delay), on the B1 base */
+    int64_t          pll_guard_fires;                 /* monotonic-guard activations (windup observability) */
+    /* v0.9.16.x lip-sync instrumentation (PTV_DIAG): where do audio label steps get eaten?
+     * [PTV-ASTEP] fires on any in-pts (pre-graph) or sink-pts (post-graph) discontinuity;
+     * [PTV-AFLOW] cumulative in/out sample counters — a graph CONTENT drop/pad shows as a
+     * step in (in−out), a TIMELINE adoption shows sink-pts absorbing the step with (in−out)
+     * unchanged. The pair discriminates what black-box runs could not. */
+    int64_t          dbg_in_us, dbg_in_dur_us;        /* last in-pts (us) + expected frame span */
+    int64_t          dbg_sink_us, dbg_sink_dur_us;    /* last sink-pts (us) + expected span */
+    int64_t          dbg_in_samp, dbg_out_samp;       /* cumulative samples fed / drained */
+    int64_t          dbg_flow_last_us;                /* [PTV-AFLOW] cadence */
+    /* v0.9.16.3 [PTV-AGLUE] — symmetric audio label-step glue (see audio_feed). State is in the
+     * RAW label domain (pre-glue, pre-AVLOCK) so LAYERA/house_skew actuation never looks like a
+     * source step. glue_off_us accumulates erased relabels and is added to every graph-input pts. */
+    int64_t          glue_off_us;                     /* cumulative relabel offset applied to input labels (us) */
+    int64_t          glue_raw_last_us;                /* last RAW in-pts (us); NOPTS until first frame */
+    int64_t          glue_raw_dur_us;                 /* its frame span (us) */
+    int64_t          glue_wall_last_us;               /* monotonic wall time of the previous fed frame */
+    int              glue_events;                     /* RELABEL verdicts this run */
+    int64_t          glue_log_win_us;                 /* 0.9.18: verdict-log rate-limit window start (wall) */
+    int              glue_log_win_n;                  /* verdict lines emitted this window */
+    int              glue_supp_n;                     /* verdicts suppressed this window (still applied) */
+    int64_t          glue_supp_net_us;                /* net label movement of the suppressed verdicts */
+    /* v0.9.16.3 [PTV-ANCHOR] — birth-relationship observability (Zimbo-class startup offsets). */
+    int              anchor_drop_pre;                 /* frames dropped because content preceded h0 */
+    int              anchor_drop_ring;                /* pre-h0 ring overflow drops (oldest evicted) */
+} AudioState;
+
+/* ---- demux + mux ---- */
+
+#define PTV_MAX_PASS 16
+typedef struct PassStream {
+    int        input;                 /* source input index (multiview); 0 single-input */
+    int        in_index;              /* input stream index being copied 1:1 (within that input) */
+    AVStream  *ost[PTV_MAX_RUNG];     /* output stream in each muxer (fan-out) */
+    AVRational in_tb;                 /* input/output time_base (copy: identical) */
+    int64_t    last_dts;              /* last emitted dts (monotonic guard; NOPTS until first) */
+    int        gated;                 /* §7.5a: dense copied AUDIO (AC-3/MP2) → route via the delivery
+                                       * gate; sparse subs/data/SCTE-35 bypass (their wire-arrival lead
+                                       * is a feature) */
+} PassStream;
+
+/* ---- legacy-0004 TS-discontinuity buffer (g_layera / PTV_LAYERA, default OFF) ----
+ * Faithful port of patches/legacy/0004-ts-discontinuity-buffering. At a content
+ * glue point the source interleaves OLD-timeline and NEW-timeline packets across
+ * the straddle. The default ptvencoder path (g_layera==0) self-rebases each dense
+ * stream's wrap_off at its own crossing and lets mis-glued OLD packets pass through.
+ * When g_layera is on we instead: detect the jump, BUFFER the dense V/A packets while
+ * both timelines are in flight, classify each held packet OLD/NEW, KEEP NEW / DISCARD
+ * OLD, compute one AUDIO-derived offset, apply it to every kept packet, and release
+ * in order. Sparse SUBTITLE/DATA (DVB-sub, SCTE-35) are NEVER buffered — they keep
+ * the existing prog_off path in demux_unwrap. All timestamps here are AV_TIME_BASE
+ * (us); the held packet already has demux_unwrap's 33-bit wrap correction applied. */
+#define PTV_DISC_CAPACITY        256
+#define PTV_DISC_THRESHOLD_US    (1 * AV_TIME_BASE)   /* 1s   jump threshold */
+#define PTV_DISC_TIMEOUT_US      (500 * 1000)         /* 500ms forced-flush timeout */
+#define PTV_DISC_TOL_US          (100 * 1000)         /* 100ms timeline classification tolerance */
+
+typedef struct PtvDiscPacket {
+    AVPacket *pkt;
+    int       stream_idx;
+    int64_t   raw_dts;     /* DTS before applied_offset (us); already 33-bit-unwrapped */
+    int       timeline;    /* 0=old, 1=new, -1=unknown */
+} PtvDiscPacket;
+
+typedef struct PtvDiscStreamState {
+    int64_t cumulative_ts_offset;  /* per-stream offset (us), diagnostic; persists across cycles */
+    int64_t last_sent_dts;         /* end of last packet sent for THIS stream (us); NOPTS until first */
+    int64_t last_dts_us;           /* last post-unwrap DTS seen (us) — jump-detection ref; persists */
+    int64_t old_timeline_base;     /* this stream's last DTS before jump (per-cycle) */
+    int64_t new_timeline_base;     /* this stream's first DTS in new timeline (per-cycle) */
+    int     has_old_base;
+    int     has_new_base;
+} PtvDiscStreamState;
+
+typedef struct PtvDiscBuf {
+    PtvDiscPacket     **packets;
+    int                 nb_packets;
+    int                 capacity;
+    int                 active;             /* 1 while buffering across a straddle */
+    int                 flushing;           /* 1 while flushing (suppress re-detection) */
+    int64_t             buffer_start_time;  /* wall clock (us) when buffering started */
+    int                 jump_detected;      /* 1 once any stream recorded bases this cycle */
+    uint8_t            *stream_transitioned;/* per-stream: 1 once it reached the new timeline */
+    int                 nb_streams;
+    PtvDiscStreamState *stream_state;
+    int64_t             applied_offset;     /* single offset (us, audio-derived) applied to ALL kept packets */
+    /* v0.9.13 [PTV-GLUE] running stats — the LAYERA-retirement decision data: vid_err = how much
+     * source A/V mis-mux each glue carried (what LAYERA corrects and the plain absorber would
+     * leak into audio). |err| persistently ~0 => the simpler absorber suffices. */
+    int64_t             glue_cnt;           /* glues with BOTH media measured */
+    int64_t             glue_partial;       /* flushes where only one media type crossed in the window */
+    int64_t             err_abs_sum_us;     /* Σ|vid_err| */
+    int64_t             err_abs_max_us;     /* max|vid_err| */
+    int64_t             err_gt100_cnt;      /* glues with |vid_err| > 100ms */
+} PtvDiscBuf;
+
+typedef struct DemuxArgs {
+    AVFormatContext      *ifmt;
+    AVThreadMessageQueue *video_q;
+    AVThreadMessageQueue *audio_q[PTV_MAX_AUDIO]; /* one per transcoded audio track */
+    AVThreadMessageQueue *mux_q[PTV_MAX_RUNG];   /* one per output muxer (fan-out) */
+    DlvGate              *gate[PTV_MAX_RUNG];    /* §7.5a: per-rung delivery gate (NULL = send direct) */
+    int                   n_out;
+    int                   vstream;
+    int                   astream[PTV_MAX_AUDIO]; /* input stream feeding each audio_q */
+    int                   n_audio;
+    int                   drop;          /* non-blocking + drop on full (network input) */
+    PassStream           *pass;          /* copy-passthrough: extra audio, subs, data */
+    int                   n_pass;
+    int64_t              *h0;             /* house origin (us); copy ts rebased onto it */
+    pthread_mutex_t      *h0_lock;
+    int64_t              *house_skew;     /* video's house-vs-content skew (us); copy rides it */
+    _Atomic int_least64_t *disturb_epoch; /* B3: bump this input's disturbance epoch when the discont absorber fires */
+    RateEstimator        *est;            /* this input's rate sensor (0.9.18 R4; demux thread is the sole feeder) */
+    int64_t              *wrap_off;       /* per input stream: cumulative 33-bit wrap offset (stream tb) */
+    int64_t              *wrap_last;      /* per input stream: last RAW ts seen (wrap detection) */
+    int64_t              *wrap_wall_last; /* per input stream: wall-clock (us) of this stream's last packet — gap-vs-splice discriminator */
+    PtvDiscBuf           *disc;           /* legacy-0004 buffer-classify-discard (g_layera only; NULL otherwise) */
+    int64_t               video_fwd_us;   /* wall-clock (us) of the last VIDEO forward-discontinuity crossing (whole-program-splice indicator) */
+    int64_t               prog_off;       /* P2 (§7.1): program-level discontinuity offset (90kHz, detected on the
+                                           * DENSE video reference) applied to SPARSE copied streams (sub/data/SCTE)
+                                           * which don't self-rebase — keeps them aligned to video across an ad-break
+                                           * PTS jump instead of orphaned/vanishing. V/A keep per-stream self-rebase.
+                                           * §5.A.2 (g_progoff_av): dense V/A self-rebase by the SHARED first-crosser amount. */
+    int64_t               splice_adj;       /* §5.A.2: the first-crosser's discontinuity adj for the current splice */
+    int64_t               splice_adj_us;    /* §5.A.2: wall-clock when splice_adj was set (debounce; 0 = never) */
+    int64_t               splice_ref_v;     /* Layer A: video's own adj if it crossed THIS splice before audio (0 = none) → audio re-aligns video to its reference when it crosses */
+    int                   drop_until_kf;  /* P2 2b: armed on a video discontinuity → drop video until the next IDR */
+    int64_t               kf_arm_us;      /* P2 2b: wall time the drop was armed (first-arm-only escape deadline) */
+    int64_t               kf_arm_vdrop;   /* DIAG: vdrop count when DUKF armed (→ per-event drop count at resume) */
+    int64_t               vpkt, apkt, ppkt, vdrop, adrop, pdrop;
+    int64_t               disc_resid_us;   /* 0.9.18.7 hs-residue ledger (REPORTING ONLY, never read by control):
+                                            * Σ(−applied_offset) over LAYERA glue erases that shifted the VIDEO
+                                            * label stream. Every erase shifts all subsequent content labels by
+                                            * applied_offset, i.e. shifts the hs/sk reading by −applied_offset vs
+                                            * the raw source labels — a jump-to-live erase (applied_offset<0)
+                                            * parks the stall's dup-ratcheted skew in hs permanently. hs growing
+                                            * IN STEP with this ledger = erased-discontinuity bookkeeping, not
+                                            * retained buffer latency; hs growing with this flat = real hold. */
+    /* v0.9.12 [PTV-BURSTY] advisor: detect HLS-burst-over-SRT delivery (video arrives in clumps
+     * separated by multi-second stalls) and log a once-per-minute WARNING with the SIZED env
+     * recipe (deep §13 packet prime). Detection = >=3 completed arrival gaps >=1.5s within 60s
+     * (a periodic burst pattern — a single outage is 1 gap and never trips it). Silent when
+     * PTV_PREROLL_MS already covers the observed gap (correctly configured channel). */
+    int64_t               by_last_v_wall;   /* wall time of the previous video packet */
+    int64_t               by_win_start;     /* rolling 60s window start */
+    int64_t               by_max_gap;       /* max arrival gap in the window (us) */
+    int                   by_gap_cnt;       /* completed gaps >=1.5s in the window */
+    int                   autobank;         /* v0.9.14: runtime bank escalation armed for this input (single-input live) */
+    int64_t               by_bank_last_q;   /* v0.9.14: wall time of the last QUALIFYING stall (decay reference) */
+                                            /* (by_bank_advise_us moved to CushionRt.bank_advise_us — 0.9.18 M3) */
+    int64_t               vcorrupt;       /* video packets flagged AV_PKT_FLAG_CORRUPT (discarded if g_discardcorrupt) */
+} DemuxArgs;
+
+/* One source input. Single-input uses inputs[0]; multiview uses 1/2/4. Each has
+ * its own demuxer + video decoder + clock anchor (h0) + wrap state; multiview
+ * decode stages into `hold` for the compositor instead of filtering inline. */
+typedef struct Input {
+    const char           *url;
+    AVFormatContext      *ifmt;
+    int                   vstream;
+    const AVCodec        *vdecoder;
+    AVCodecContext       *vdec;
+    AVStream             *vist;
+    AVRational            ist_tb;
+    AVThreadMessageQueue *video_q;           /* demux -> decode */
+    int64_t               h0;                /* this input's A/V anchor (us); decode sets it */
+    pthread_mutex_t       h0_lock;
+    int64_t               house_skew;        /* compositor publishes; this input's audio/copy ride it */
+    int64_t               house_lag_true;     /* PTV_DIAG: compositor publishes the UNCAPPED signed video lag
+                                               * (output−content) for the lip-sync probe; = house_skew unless the
+                                               * 250ms cap / non-decreasing floor clips it (multiview only) */
+    VOutRing              vring;             /* A/V probe: this input's (displayed content → out_v) ring */
+    _Atomic int_least64_t house_disturb;     /* B3: per-input disturbance epoch — bumped on slate-return (compositor) AND
+                                              * discont absorb (demux); TWO writer threads → atomic. The PLL's mid-run
+                                              * acquire arms only when this advances (never on bare vlag noise). */
+    RateEstimator         est;               /* 0.9.18 R4: this input's demux-side rate sensor (FLL genlock +
+                                              * coarse clock-follow); non-zero fields seeded in the init loop */
+    VideoHold             hold;              /* multiview: latest decoded frame for the compositor */
+    int64_t              *wrap_off;          /* per stream: 33-bit wrap offset (stream tb) */
+    int64_t              *wrap_last;         /* per stream: last RAW ts (wrap detection) */
+    int64_t              *wrap_wall_last;    /* per stream: wall-clock (us) of last packet (gap-vs-splice discriminator) */
+    PtvDiscBuf            disc;              /* legacy-0004 buffer-classify-discard state (used only when g_layera) */
+    DecodeCtx             dc;
+    DemuxArgs             da;
+    pthread_t             th_demux, th_decode;
+    int                   started_demux, started_decode;
+    int                   open_ret;          /* parallel-open result */
+} Input;
+
+/* Multiview compositor = the video house clock. Samples each input's hold at
+ * each tick, feeds the N buffersrcs, pulls each rung's composited frame, and
+ * publishes per-input house_skew. (Single-input never uses this — decode feeds
+ * the graph inline and the per-rung output_thread is the house clock.) */
+typedef struct CompositorCtx {
+    Input                *inputs;
+    int                   n_input;
+    AVFilterGraph        *fg;
+    AVFilterContext      *fsrc[PTV_MAX_INPUT];
+    int                   n_rung;
+    AVFilterContext      *fsink[PTV_MAX_RUNG];
+    AVThreadMessageQueue *frame_q[PTV_MAX_RUNG];
+    int64_t               framedrop[PTV_MAX_RUNG];
+    int64_t               tick_dur_us;       /* 1/out_fps in us (INTEGER — pacing fallback only since v0.9.12) */
+    AVRational            out_fps;           /* exact output rate — MV-EXACTTICK measurement axis (v0.9.12) */
+    int                   live;
+    int64_t               slate_after_us;    /* stale hold -> black cell (0 = never) */
+    /* stats (compositor is the cadence owner in multiview) */
+    int64_t               emitted, dup;
+    struct DlvGate       *gate0;              /* rung-0 delivery gate for the stats readout (NULL = ungated) */
+} CompositorCtx;
+
+
+/* ==== cross-file globals (defined in ptvencoder.c unless noted) ==== */
+extern int     g_diag;
+extern int     g_avlock;
+extern int     g_reanchor;
+extern int     g_mv_clamp;
+extern int     g_mv_residence;
+extern int     g_discont;
+extern int     g_gapdiscrim;
+extern int64_t g_wrap_guard_us;
+extern int     g_aglue_ms;
+extern int     g_prog_off;
+extern int     g_progoff_av;
+extern int     g_layera;
+extern int     g_layera_fullskip;
+extern int     g_drop_until_kf;
+extern int     g_audio_follow;
+extern int     g_h0_reanchor;
+extern int     g_h0_at_display;
+extern int     g_avsync_probe;
+extern int     g_af_pll;
+extern int     g_af_anchor;
+extern int     g_avsync_pll;
+extern int64_t g_pll_testnoise_us;
+extern int64_t g_cushion_max_ms;
+extern int64_t g_bank_decay_us;
+extern _Atomic int     g_bank_pkts;
+extern _Atomic int64_t g_bank_us;
+extern _Atomic int     g_vq_elems;
+extern _Atomic int     g_fq_hw;
+extern int     g_exacttick;
+extern int     g_mv_exacttick;
+extern int     g_decimate;
+extern int     g_pulldown;
+extern int     g_cad_disarm;
+extern int     g_frameq_cap;
+extern int     g_preroll_ms;
+extern int     g_discardcorrupt;
+extern _Atomic int64_t g_muxed;
+extern int     g_stats;
+extern _Atomic int64_t g_ch_vsrc, g_ch_asrc, g_ch_vout_src, g_ch_aout_src;
+extern _Atomic int64_t g_ch_vsrc_raw, g_ch_asrc_raw;
+extern int     g_genlock;
+extern int     g_genlock_ok;
+extern int     g_clockfollow;
+extern int     g_wucr;
+extern int     g_reprime;
+extern int     g_adapt_cushion;
+extern CushionPlan g_cp;                 /* defined in ptvencoder_gate.c */
+extern _Atomic int     g_frameq_depth;
+extern int     g_genlock_guard;
+extern _Atomic int64_t g_async_ppm;
+extern int64_t g_stats_period_us;
+extern int     g_slow;
+extern int     g_nvenc_serialize;        /* defined in ptvencoder_clock.c */
+extern CushionRt g_curt;                 /* defined in ptvencoder_gate.c */
+
+/* ==== cross-file functions ==== */
+/* ptvencoder_gate.c */
+void dlv_init(DlvGate *g, AVThreadMessageQueue *mux_q, int64_t cap_us, int maxq);
+void dlv_publish_video(DlvGate *g, int64_t dts_us);
+void dlv_enqueue(DlvGate *g, AVPacket *pkt, int64_t dts_us, int block);
+void dlv_drain(DlvGate *g);
+void dlv_flush_all(DlvGate *g);
+void dlv_destroy(DlvGate *g);
+void cushion_escalate(CushionEvent ev, int64_t a0, int64_t a1);
+void push_frame_q(AVThreadMessageQueue *q, int live, int64_t *framedrop, AVFrame *out);
+void resolve_cushions(CushionPlan *cp, int live, int multiview,
+                      AVRational out_fps, int n_audio);
+void *watchdog_thread(void *arg);
+/* ptvencoder_clock.c */
+void *output_thread(void *arg);
+/* ptvencoder_audio.c */
+void *audio_thread(void *arg);
+int build_audio_filter(AudioState *a, AVCodecContext *adec, AVRational tb,
+                       const char *af, enum AVSampleFormat out_fmt);
+/* ptvencoder_demux.c */
+void *demux_thread(void *arg);
+int ptv_disc_init(PtvDiscBuf *b, int capacity, int nb_streams);
+void ptv_disc_free(PtvDiscBuf *b);
+/* ptvencoder_mv.c */
+void *compositor_thread(void *arg);
+/* ptvencoder_legend.c */
+void ptv_print_log_legend(int full);
+/* ptvencoder.c */
+void vring_put(VOutRing *r, int64_t src_us, int64_t out_us);
+int vring_lookup(VOutRing *r, int64_t want_src, int64_t *out_v, int64_t *matched_src);
+
+#endif /* FFTOOLS_PTVENCODER_H */
