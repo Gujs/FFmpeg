@@ -1,0 +1,208 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <time.h>
+
+#include "libavutil/avutil.h"
+#include "libavutil/log.h"
+#include "libavutil/opt.h"
+#include "libavutil/time.h"
+#include "libavutil/parseutils.h"
+#include "libavutil/mathematics.h"
+#include "libavutil/crc.h"
+#include "libavutil/bswap.h"
+#include "libavutil/samplefmt.h"
+#include "libavutil/pixdesc.h"
+#include "libavutil/channel_layout.h"
+#include "libavutil/audio_fifo.h"
+#include "libavutil/threadmessage.h"
+#include "libavutil/hwcontext.h"
+#include "libavformat/avformat.h"
+#include "libavcodec/avcodec.h"
+#include "libavfilter/avfilter.h"
+#include "libavfilter/buffersrc.h"
+#include "libavfilter/buffersink.h"
+#include "libswresample/swresample.h"
+
+#include "cmdutils.h"
+#include "ptvencoder.h"
+
+void show_help_default(const char *opt, const char *arg)
+{
+    av_log(NULL, AV_LOG_INFO,
+        "usage: ptvencoder [options] -i <input> [-i <input> ...] [out-opts] <output> [[out-opts] <output> ...]\n"
+        "\n"
+        "  inputs:\n"
+        "    -i <url>            input (file or udp://...). 1 input = single transcode;\n"
+        "                        2 or 4 inputs = multiview mosaic (requires -filter_complex).\n"
+        "  video:\n"
+        "    -vf <chain>         libavfilter chain for the (single) input, e.g. \"bwdif,scale=1280:720\"\n"
+        "    -filter_complex <g> mosaic graph for multiview ([0:v][1:v]hstack...[vN]) and/or ABR split\n"
+        "    -map [vN]|K:v       select this output's video (filter label or input stream)\n"
+        "    -c:v <name>         video encoder (default: h264_videotoolbox, fallback mpeg2video)\n"
+        "    -b:v / -r           video bitrate / output (house-clock) frame rate; default rate = source\n"
+        "  audio (per output stream N):\n"
+        "    -map K:a:n          add a transcoded audio track from input K\n"
+        "    -af / -filter:a:N   audio filtergraph (default aresample=async=1000)\n"
+        "    -c:a:N -b:a:N -ac:a:N   encoder / bitrate / channels per track\n"
+        "    -an                 no audio (suppresses auto-selected audio when no -map is given)\n"
+        "  passthrough / output:\n"
+        "    -map K:s|K:d -c copy   copy subtitle / data (incl. SCTE-35) streams through\n"
+        "    -metadata:s:<t>:N k=v   -disposition:<t>:N flags   per-stream metadata/disposition\n"
+        "    -f <mux>            output format (default: guessed; mpegts for udp://...)\n"
+        "    -stats_period <s>   progress-line interval (default 1)\n"
+        "    -log-legend         describe every log field/line (also printed once at startup), then exit\n"
+        "    -version, -h\n"
+        "\n"
+        "  Pacing is automatic: live (wall-clock) for net inputs, media-clock for files.\n"
+        "\n"
+        "  environment variables (the production posture is DEFAULT-ON — a plain invocation is correct):\n"
+        "   tuning:\n"
+        "    PTV_PREROLL_MS=N    startup cushion / adaptive base tier (default ~1000). Set DEEP (e.g.\n"
+        "                        12000) for HLS-burst-over-SRT sources — the [PTV-BURSTY] log warning\n"
+        "                        computes the right value per channel. >1600 also deep-primes video_q\n"
+        "                        packets + auto-sizes the audio delivery gate. Adds ~N ms latency.\n"
+        "    PTV_VIDEOQ=N        demux->decode packet-queue depth (default 256; raise with deep preroll)\n"
+        "    PTV_FRAMEQ=N        decode->output frame-buffer capacity (default 160, slots only)\n"
+        "    PTV_CUSHION_MS=N    adaptive cushion RAISED tier (default 4000, grows on repeated starvation)\n"
+        "    PTV_CUSHION_MAX_MS  AUTO-BANK ceiling (default 12000): bursty channels self-escalate a\n"
+        "                        compressed video_q bank to 1.5x their worst stall — no env needed\n"
+        "    PTV_DELIVERY_CAP_MS / PTV_DELIVERY_MAXQ   audio delivery-gate sizing (auto-sized normally)\n"
+        "   reverts (each disables one default-on mechanism; for A/B and rollback only):\n"
+        "    PTV_NO_WUCR         occupancy-servo house pacing      PTV_NO_LAYERA   glue/discontinuity buffer\n"
+        "    PTV_NO_REPRIME      fast post-glue buffer refill      PTV_NO_ADAPTIVE fixed (non-adaptive) cushion\n"
+        "    PTV_NO_EXACTTICK    exact-rational video stamping     PTV_NO_MV_EXACTTICK  mosaic measurement axes\n"
+        "    PTV_NO_PULLDOWN     telecine-aware film emit          PTV_NO_AVLOCK   audio house-lock\n"
+        "    PTV_NO_GENLOCK      source-rate estimator             PTV_NO_GAPDISCRIM audio gap-vs-splice\n"
+        "    PTV_NO_DELIVERY     audio delivery-alignment gate     PTV_NO_DELIVERY_MV ungated mosaics (pre-0.9.12.1)\n"
+        "    PTV_NO_RESIDENCE    mosaic per-slot source-rate cadence (pre-0.9.13 pop-per-tick)\n"
+        "    PTV_NO_AUTOBANK     runtime bursty-channel bank escalation (back to advisor-only)\n"
+        "    PTV_NO_CLOCKFOLLOW  following a large verified source-clock offset (>0.5%%; e.g. a fast relay)\n"
+        "   logging: PTV_DIAG=1 debug lines · PTV_LOG_TS=1 timestamp prefix · see -log-legend for probes\n");
+}
+
+/* v0.9.2 self-documenting log legend. full=0 (compact) describes the always-on `-stats` progress
+ * line and is printed once at startup below the banner, so every channel log explains itself;
+ * full=1 (via `-log-legend`, exits after) also documents the PTV_DIAG debug lines + env switches.
+ * Split into <1KiB av_log calls (the default log callback truncates a single line at 1024). */
+void ptv_print_log_legend(int full)
+{
+    av_log(NULL, AV_LOG_INFO,
+        "log legend — the always-on `-stats` progress line (one per -stats_period, default 1s):\n"
+        "  frame      output frames emitted so far (CFR count)\n"
+        "  fps        INSTANTANEOUS emit rate over the last interval — the 'alive right now' check\n"
+        "             (must sit at the output rate, e.g. 29.97; a current wedge shows here immediately)\n"
+        "  time       output media time HH:MM:SS.ss\n");
+    av_log(NULL, AV_LOG_INFO,
+        "  dup        frames REPEATED because content was missing or late (feed-health meter):\n"
+        "             steady trickle = source dropping frames upstream; bursts = delivery droughts\n"
+        "  pd         intentional cadence holds (v0.9.11 telecine-aware emit): during 23.976-film-in-\n"
+        "             29.97 segments a repeat_pict frame occupies its 2:3 residence — ~6/s during a\n"
+        "             movie is CORRECT pulldown, not a fault ([PTV-PULLDOWN] brackets film segments)\n"
+        "  drop       frames SKIPPED at frame_q overflow — the latency-drain meter: after a stall,\n"
+        "             drop= ticks up while hs= bleeds down (the debt repaid in skipped content)\n"
+        "  corrupt    corrupt packets discarded (demux + decode)\n"
+        "  async      aresample compensation RATE (ppm); ~0 = idle/healthy, large = resampler fighting\n");
+    av_log(NULL, AV_LOG_INFO,
+        "  dlvhold    (delivery gate) ms of audio HELD waiting for matching video (≈ encoder latency +\n"
+        "             cushion); normal ~1-2s, scales with the cushion\n"
+        "  dlvforced  (gate) packets force-released because video STALLED — MUST stay ~0\n"
+        "  wucr_buf   frame_q occupancy (frames/ms) — the jitter cushion fill vs cushion= target\n"
+        "  fqhw       deepest any frame queue has ever been (frames) — the CUDA pool high-water;\n"
+        "             this, not the cushion tier, sets the per-process VRAM footprint\n"
+        "  wucr_rho   applied house-rate offset (ppm) = recovered source-clock deviation (+ = source\n"
+        "             faster); pegged ±6000 = gentle-zone fill/drain in progress\n");
+    av_log(NULL, AV_LOG_INFO,
+        "  hs         house_skew: latency debt vs baseline (ms) — a feed stall steps it up, catch-up\n"
+        "             drops bleed it back; A/V stays LOCKED throughout (this is delay, not lip-sync)\n"
+        "  hsres      (0.9.18.7) LAYERA erase-residue ledger (ms): cumulative label offset the glue\n"
+        "             erases injected into the hs reading. hs growing IN STEP with hsres = erased-\n"
+        "             discontinuity bookkeeping (e.g. jump-to-live parked the stall's dups), NOT\n"
+        "             held content; hs growing while hsres is flat = real retained latency\n"
+        "  cushion    adaptive frame_q target: ~1s lean tier or ~4s raised tier ([PTV-CUSHION] logs\n"
+        "             each transition: grows on 2 starvations/60min, shrinks after 6h quiet)\n"
+        "  bank       (v0.9.14, shown when armed) AUTO-BANK actual/target ms: a bursty channel's\n"
+        "             self-escalated compressed video_q cushion (1.5x worst stall, cap 12s); fills\n"
+        "             from the stalls' own retained latency, retires after 6h quiet\n");
+    av_log(NULL, AV_LOG_INFO,
+        "  cf         (v0.9.15, shown when notable) coarse source-CLOCK estimate (ppm vs realtime,\n"
+        "             `?` = not yet locked ~60s). |cf|>5000 locked => output+PCR FOLLOW the source's\n"
+        "             true rate ([PTV-CLOCK] logs arm/release); frozen while BURSTY/bank is armed\n"
+        "             (clump delivery is not a clock measurement)\n"
+        "  decim      (v0.9.15.2, shown when >0) SURPLUS frames decimated: source delivers more real\n"
+        "             frames than its declared rate (e.g. ~25.4 fps declaring 25) — each skip is a\n"
+        "             content position already displayed, so perceived speed is always EXACTLY 1x;\n"
+        "             steady even accrual = correct (equals the surplus); never fires <=house-rate\n"
+        "  lip-sync   NOT self-reported (internal PES skew is blind to content↔PTS offset). Measure\n"
+        "             with the EXTERNAL oracle test-scripts/repro/drift-continuous.py.\n");
+    av_log(NULL, AV_LOG_INFO,
+        "discontinuity events (always-on since v0.9.13; were PTV_DIAG-only):\n"
+        "  [PTV-LAYERA]   jump = a >1s splice detected (buffering starts); flush = the glue applied\n"
+        "                 (vid_err = source A/V mis-mux this glue corrected)\n"
+        "  [PTV-GLUE]     running per-input mis-mux stats — the LAYERA-retirement decision line:\n"
+        "                 mean/max|err| ~0 over days => the simpler per-stream absorber suffices\n"
+        "  [PTV-DISCONT]  per-stream PTS jump absorbed / audio GAP left to aresample padding\n"
+        "  [PTV-AGLUE]    (v0.9.16.4) sub-1s audio label step verdict, by direction: BACKWARD\n"
+        "                 => RELABEL erased (content can't be negatively missing; closes the\n"
+        "                 audio-early accumulator where aresample silently dropped content);\n"
+        "                 FORWARD => GAP, aresample pads (upstream-cut gaps arrive flowing, so\n"
+        "                 wall-clock is no evidence — the v0.9.16.3 lesson). PTV_AGLUE_MS=0 off\n"
+        "  [PTV-ANCHOR]   (v0.9.16.3) birth A/V relationship: h0 (first video frame) + each\n"
+        "                 audio track's first_audio-h0 offset and pre-anchor drop counts — a\n"
+        "                 startup-structural lip-sync offset is visible HERE, not in drift\n");
+    av_log(NULL, AV_LOG_INFO,
+        "health events (always-on):\n"
+        "  [PTV-BURSTY]   per-minute delivery-stall status (count + worst gap + bank state) while a\n"
+        "                 channel is bursty-classified; also the auto-bank escalation advisor\n"
+        "  [PTV-CUSHION]  adaptive cushion tier moves + BANK escalations (target, sizing rationale)\n"
+        "  [PTV-CLOCK]    clock-follow arm/release (source clock offset FOLLOWED/back-in-range) +\n"
+        "                 estimator lifecycle (frozen on BURSTY, stuck-latch re-acquire, lock progress)\n"
+        "  [PTV-EMPTY]    frame_q starvation episodes >=2s (refill time; sub-2s aggregate per 60s)\n");
+    av_log(NULL, AV_LOG_INFO,
+        "multiview stats line — same head (frame/fps/time/dup/drop/dlvhold/dlvforced) + per slot:\n"
+        "  inK:qdrop    input-K video queue overflow drops (demux side)\n"
+        "  inK:corrupt  input-K corrupt packets (demux + decode)\n"
+        "  inK:pd       cadence-residence holds (v0.9.13) — a 25fps slot in a 29.97 mosaic holds\n"
+        "               every 6th tick BY DESIGN (~5/s is correct rate conversion, not a fault)\n"
+        "  inK:sv       genuine starvation dups (frame was DUE but the jitter buffer was empty)\n"
+        "  inK:sk       published per-slot audio skew (ms) the slot's audio follows\n"
+        "  inK:skres    (0.9.18.7) slot LAYERA erase-residue ledger (ms) — read like hsres= vs sk=\n");
+    if (!full)
+        return;
+    av_log(NULL, AV_LOG_INFO,
+        "\ndebug lines — set PTV_DIAG=1 to enable. These are internal CONTROLLER estimates: useful for\n"
+        "debugging the pipeline, but they do NOT track on-wire lip-sync (measure that with the oracle):\n"
+        "  [PTV-DIAG]     per-second engine state: dec/emitted/muxed, dup/framedrop, queue depths\n"
+        "                 vq (demux→decode) frameq (decode→output jitter) muxq (encode→mux), genlock+rate\n"
+        "  [PTV-AVSYNC]   per-track A/V controller telemetry: offset/lipsync estimate, vlag/alag,\n"
+        "                 house_skew, and (multiview) the A/V PLL integrator state\n"
+        "  [PTV-SWRDELAY] aresample internal buffer occupancy (a latency LEVEL; `async` is the RATE)\n");
+    av_log(NULL, AV_LOG_INFO,
+        "  [PTV-CHAIN]    A/V trace demux→output (rawA-V / srcA-V / unwrap_inj / outA-V) to localize\n"
+        "                 where an A/V offset enters\n"
+        "  [PTV-LIPSYNC]  per-track err = async_pad − video lag (internal estimate)\n"
+        "  [PTV-WATCHDOG] (always-on WARNING) the encoder stalled and stopped advancing\n"
+        "defaults (v0.9.15): WUCR occupancy pacing + LAYERA glue handling + REPRIME fast refill +\n"
+        "  ADAPTIVE cushion + delivery gate (single & mosaic) + cadence residence + AUTO-BANK +\n"
+        "  clock-follow + cadence decimation are all ON — no env needed for the production posture.\n"
+        "  Reverts: PTV_NO_WUCR · PTV_NO_LAYERA · PTV_NO_REPRIME · PTV_NO_ADAPTIVE · PTV_NO_AVLOCK ·\n"
+        "  PTV_NO_DELIVERY_MV · PTV_NO_RESIDENCE · PTV_NO_AUTOBANK · PTV_NO_CLOCKFOLLOW ·\n"
+        "  PTV_NO_DECIMATE · PTV_LAYERA_FULLSKIP (LAYERA skips the demux absorber for sub-1s steps\n"
+        "  again — restores the In-Touch audio-late accumulator; A/B only) ·\n"
+        "  PTV_NO_EXACTTICK (re-enables the integer-tick ~10ppm NTSC lip-sync drift; A/B only) ·\n"
+        "  PTV_NO_PULLDOWN (revert telecine-aware emit: film segments back to dup-fill + hs sawtooth)\n");
+    av_log(NULL, AV_LOG_INFO,
+        "tuning: PTV_CUSHION_MS=N adaptive raised tier (default 4000, [1000,10000]) · PTV_CUSHION_MAX_MS=N\n"
+        "  auto-bank ceiling (default 12000; beyond it = an upstream incident to surface) · PTV_FRAMEQ=N\n"
+        "  frame_q capacity (default 160, [48,1024]) · PTV_PREROLL_MS=N startup cushion / base tier ·\n"
+        "  PTV_DELIVERY_CAP_MS / PTV_DELIVERY_MAXQ delivery-gate sizing\n"
+        "probes: PTV_DIAG=1 debug lines above · PTV_LOG_TS=1 prepend [timestamp] ·\n"
+        "  PTV_AVSYNC_PROBE=1 [PTV-AVSYNC2] decomposition of the live A/V controller\n"
+        "internalized (0.9.18.7): 21 debug envs frozen at their production defaults and no longer\n"
+        "  read (GENLOCK_MAX_PPM/REJECT_PPM/WINDOW_MS/EMA_SHIFT, GAP_MIN_MS, AGLUE_MAX_MS,\n"
+        "  DISCONT_MS/_BACK_MS, PROGOFF_DEBOUNCE_MS, DUKF_ESCAPE_MS/_MIN_MS, H0_REANCHOR_MS,\n"
+        "  AF_ACQUIRE_MS/AF_RATE_MS_S, PLL_EMA_SHIFT/TAU_MS/ACQUIRE_MS/ACQUIRE_N/REFRACTORY_MS/\n"
+        "  NOISE_K/DEV_SHIFT) — setting them is now a silent no-op; see ptvencoder-changelog.md\n");
+}
