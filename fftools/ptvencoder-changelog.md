@@ -7,6 +7,24 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(4) REANCHOR2 DEBOUNCE (compositor_thread): the P2 h0-re-anchor's shift
+(−sk + tick) was computed from ONE instantaneous displayed-frame label, so a
+single corrupt PTS — one frame with a mangled PTS but intact DTS sails through
+the demux discontinuity layer (which watches DTS) — inflated the shift by its
+full excursion and displaced the whole slot's h0 (transient audio-early until
+the PLL healed). Now each slot keeps a 5-deep ring of its evaluated sk samples:
+fire only when ≥3 of the last 5 evaluated ticks (including the current one)
+held sk < −threshold, and size the shift from the MEDIAN of the qualifying
+samples; the ring re-debounces after each fire. A one-tick corrupt label is
+1-of-5 → ignored; a genuine video-ahead excursion persists across ticks and
+still re-anchors within 5 ticks. PTV_REANCHOR2_INSTANT=1 reverts to the
+single-sample fire. Gate: 2x1 live mv with one +2s-PTS-corrupted video frame
+(DTS intact) in in0 — rc fires "[PTV-REANCHOR2] in0 tick=971 video-ahead → h0
++2000ms" on the single frame; fixed ignores it (0 fires); genuine class
+(file-input unpaced mv, decoder outruns the house clock) still fires on both
+builds (rc 32+6-suppressed, fixed re-anchors within 5 ticks of each
+excursion); tier-1 identical.
+
 (3) ANCHOR HEAD-FILL (audio_anchor_and_feed): when the source's audio HEAD is
 missing at birth — first kept audio starts >200ms after h0, or the pre-h0 ring
 overflowed (kept head ≠ true head) — the output track's first packet sat at

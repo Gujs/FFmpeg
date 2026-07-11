@@ -573,6 +573,7 @@ extern int     g_layera_fullskip;
 extern int     g_drop_until_kf;
 extern int     g_audio_follow;
 extern int     g_h0_reanchor;
+extern int     g_reanchor2_instant;
 extern int     g_h0_at_display;
 extern int     g_avsync_probe;
 extern int     g_af_pll;

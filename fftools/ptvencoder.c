@@ -185,6 +185,11 @@ int     g_audio_follow = 1;
  * locked, and the copied audio now only needs to DELAY → correctable. MULTIVIEW ONLY (n_input>1);
  * PTV_NO_H0_REANCHOR=1 reverts. */
 int     g_h0_reanchor = 1;
+int     g_reanchor2_instant = 0;   /* 1.0.1 (PTV_REANCHOR2_INSTANT=1 reverts): REANCHOR2 fires only when ≥3 of the
+                                           * last 5 evaluated ticks held sk < −threshold, with the h0 shift sized from the
+                                           * MEDIAN qualifying sk — a single corrupt-PTS frame (DTS intact, so it passes
+                                           * the demux discontinuity layer) no longer inflates the shift by its full
+                                           * excursion (transient audio-early until the PLL healed). */
 /* h0-AT-DISPLAY (multiview): anchor each slot's h0 to the first frame the COMPOSITOR actually DISPLAYS,
  * not the first frame the decoder produces. Under a deep startup prime the first-decoded frame is an
  * earlier/different content than the first-displayed one, so the old decode-thread anchor left the
@@ -2069,6 +2074,7 @@ int main(int argc, char **argv)
      * see g_dukf_escape_us / g_dukf_min_ms */
     if (getenv("PTV_NO_AUDIO_FOLLOW")) g_audio_follow = 0;  /* A/B: multiview audio uses old floored/capped async skew */
     if (getenv("PTV_NO_H0_REANCHOR")) g_h0_reanchor = 0;    /* A/B: don't floor per-slot lag (allow video-ahead) */
+    if (getenv("PTV_REANCHOR2_INSTANT")) g_reanchor2_instant = 1;  /* 1.0.1: revert REANCHOR2 to single-sample fire (no 3-of-5 median debounce) */
     if (getenv("PTV_NO_H0_AT_DISPLAY")) g_h0_at_display = 0; /* A/B: multiview anchors h0 at first DECODE, not first DISPLAY */
     /* 0.9.18.7: PTV_H0_REANCHOR_MS internalized (120ms — g_h0_reanchor_ms) */
     if (getenv("PTV_AF_NO_PLL")) g_af_pll = 0;              /* A/B: pure discrete drop/pad (no smooth nudge) */

@@ -108,6 +108,9 @@ void *compositor_thread(void *arg)
     int      r2_win_n[PTV_MAX_INPUT] = {0};   /*   lines printed this window */
     int      r2_supp[PTV_MAX_INPUT] = {0};    /*   events suppressed this window */
     int64_t  r2_supp_us[PTV_MAX_INPUT] = {0}; /*   net h0 shift suppressed this window (us) */
+    int64_t  r2_skring[PTV_MAX_INPUT][5] = {{0}};  /* 1.0.1 REANCHOR2 debounce: last 5 evaluated sk samples per slot */
+    unsigned r2_cond[PTV_MAX_INPUT] = {0};    /*   bitmask: which of the last 5 evaluated ticks held sk < -thr */
+    int      r2_pos[PTV_MAX_INPUT] = {0};     /*   ring write position */
     int      done_in[PTV_MAX_INPUT] = {0};
     int64_t rung_pts[PTV_MAX_RUNG] = {0};
     AVFrame *filt = av_frame_alloc();
@@ -347,36 +350,73 @@ void *compositor_thread(void *arg)
                      * stays locked, and copied audio now only needs to DELAY → correctable. Fires only on
                      * a real video-ahead excursion (sk < −g_h0_reanchor_ms); gradual positive drift never
                      * triggers. MULTIVIEW ONLY; g_h0_reanchor gates it. */
-                    if (n > 1 && g_h0_reanchor &&
-                        sk < -(int64_t)g_h0_reanchor_ms * 1000) {
-                        int64_t shift = -sk + c->tick_dur_us;     /* bring sk from negative to +1 tick */
-                        pthread_mutex_lock(&c->inputs[k].h0_lock);
-                        c->inputs[k].h0 += shift; h0k = c->inputs[k].h0;
-                        pthread_mutex_unlock(&c->inputs[k].h0_lock);
-                        sk = mv_tick_us(c, tick) - (disp_src - h0k);   /* now ≈ +1 tick */
-                        af_off[k] = sk;                            /* snap the audio-follow EMA to the floored lag */
-                        /* 0.9.18.7: promoted PTV_DIAG→always-on WARNING, with the AGLUE-style log
-                         * rate limit. In LIVE mv a re-anchor is rare (a real video-ahead excursion),
-                         * but on an unpaced source (file mv, decoder outrunning the clock) it can
-                         * refire EVERY tick (~30/s measured) — the re-anchors still APPLY; only the
-                         * lines are capped: 4 per 10s window per slot, then one summary as it rolls. */
-                        {
-                            int64_t now_r2 = av_gettime_relative();
-                            if (now_r2 - r2_win_us[k] >= 10000000) {
-                                if (r2_supp[k])
-                                    av_log(NULL, AV_LOG_WARNING,
-                                        "[PTV-REANCHOR2] in%d %d more re-anchors (net h0 +%"PRId64"ms) suppressed in last 10s — unpaced/racing source, re-anchors still applied\n",
-                                        k, r2_supp[k], r2_supp_us[k] / 1000);
-                                r2_win_us[k] = now_r2; r2_win_n[k] = 0;
-                                r2_supp[k] = 0; r2_supp_us[k] = 0;
+                    if (n > 1 && g_h0_reanchor) {
+                        int cond = sk < -(int64_t)g_h0_reanchor_ms * 1000;
+                        int64_t sk_used = sk;
+                        int fire;
+                        if (g_reanchor2_instant)
+                            fire = cond;                          /* pre-1.0.1 single-sample fire */
+                        else {
+                            /* 1.0.1 DEBOUNCE: shift = −sk + tick was computed from ONE instantaneous
+                             * displayed-frame label, so a single corrupt PTS (one frame, DTS intact —
+                             * passes the demux layer) inflated the shift by its full excursion and
+                             * displaced the whole slot (transient audio-early until the PLL healed).
+                             * Keep the last 5 evaluated sk samples per slot; fire only when ≥3 of
+                             * them (including the current tick) held sk < −thr, and size the shift
+                             * from the MEDIAN of the qualifying samples — a one-tick corrupt label
+                             * is 1-of-5 (ignored), a real video-ahead excursion persists across
+                             * ticks and still re-anchors within 5 ticks. PTV_REANCHOR2_INSTANT=1
+                             * reverts. */
+                            int idx = r2_pos[k];
+                            r2_skring[k][idx] = sk;
+                            r2_cond[k] = ((r2_cond[k] << 1) | (cond ? 1 : 0)) & 0x1f;
+                            r2_pos[k] = (idx + 1) % 5;
+                            fire = cond && av_popcount(r2_cond[k]) >= 3;
+                            if (fire) {
+                                int64_t v[5];
+                                int m = 0, b, x, y;
+                                for (b = 0; b < 5; b++)
+                                    if (r2_cond[k] & (1u << b))
+                                        v[m++] = r2_skring[k][(idx - b + 5) % 5];
+                                for (x = 1; x < m; x++) {          /* insertion sort, m ≤ 5 */
+                                    int64_t tv = v[x];
+                                    for (y = x; y > 0 && v[y - 1] > tv; y--) v[y] = v[y - 1];
+                                    v[y] = tv;
+                                }
+                                sk_used = v[m / 2];               /* median of the qualifying samples */
+                                r2_cond[k] = 0;                   /* re-debounce after firing */
                             }
-                            if (r2_win_n[k] < 4) {
-                                r2_win_n[k]++;
-                                av_log(NULL, AV_LOG_WARNING,
-                                    "[PTV-REANCHOR2] in%d tick=%"PRId64" video-ahead → h0 +%"PRId64"ms, lag→%"PRId64"ms\n",
-                                    k, tick, shift / 1000, sk / 1000);
-                            } else {
-                                r2_supp[k]++; r2_supp_us[k] += shift;
+                        }
+                        if (fire) {
+                            int64_t shift = -sk_used + c->tick_dur_us; /* bring sk from negative to +1 tick */
+                            pthread_mutex_lock(&c->inputs[k].h0_lock);
+                            c->inputs[k].h0 += shift; h0k = c->inputs[k].h0;
+                            pthread_mutex_unlock(&c->inputs[k].h0_lock);
+                            sk = mv_tick_us(c, tick) - (disp_src - h0k);   /* now ≈ +1 tick (median-sized) */
+                            af_off[k] = sk;                            /* snap the audio-follow EMA to the floored lag */
+                            /* 0.9.18.7: promoted PTV_DIAG→always-on WARNING, with the AGLUE-style log
+                             * rate limit. In LIVE mv a re-anchor is rare (a real video-ahead excursion),
+                             * but on an unpaced source (file mv, decoder outrunning the clock) it can
+                             * refire EVERY tick (~30/s measured) — the re-anchors still APPLY; only the
+                             * lines are capped: 4 per 10s window per slot, then one summary as it rolls. */
+                            {
+                                int64_t now_r2 = av_gettime_relative();
+                                if (now_r2 - r2_win_us[k] >= 10000000) {
+                                    if (r2_supp[k])
+                                        av_log(NULL, AV_LOG_WARNING,
+                                            "[PTV-REANCHOR2] in%d %d more re-anchors (net h0 +%"PRId64"ms) suppressed in last 10s — unpaced/racing source, re-anchors still applied\n",
+                                            k, r2_supp[k], r2_supp_us[k] / 1000);
+                                    r2_win_us[k] = now_r2; r2_win_n[k] = 0;
+                                    r2_supp[k] = 0; r2_supp_us[k] = 0;
+                                }
+                                if (r2_win_n[k] < 4) {
+                                    r2_win_n[k]++;
+                                    av_log(NULL, AV_LOG_WARNING,
+                                        "[PTV-REANCHOR2] in%d tick=%"PRId64" video-ahead → h0 +%"PRId64"ms, lag→%"PRId64"ms\n",
+                                        k, tick, shift / 1000, sk / 1000);
+                                } else {
+                                    r2_supp[k]++; r2_supp_us[k] += shift;
+                                }
                             }
                         }
                     }
