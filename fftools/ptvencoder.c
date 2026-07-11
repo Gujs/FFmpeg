@@ -94,6 +94,12 @@ int     g_aglue_ms = 60;           /* v0.9.16.3 [PTV-AGLUE]: audio label-step gl
                                            * blind and aresample=async silently followed audio labels while video labels are
                                            * structurally erased by the house clock (the AWE-class lip-sync accumulator).
                                            * PTV_AGLUE_MS overrides; 0 disables (reverts to silent label-following). */
+int     g_anchor_headfill = 1;     /* 1.0.1 anchor head-fill (PTV_NO_ANCHOR_HEADFILL reverts): when the source's
+                                           * audio head is missing at birth (first kept audio >200ms after h0, or the
+                                           * pre-h0 ring overflowed), synthesize silence covering house 0 → first kept
+                                           * audio so the track's first packet sits at ~PTS 0 instead of first_audio−h0
+                                           * (RAV mv 2026-07-07: +2058ms first packet = app-visible audio-early on naive
+                                           * consumers). Capped at the pre-h0 ring's time span (~5.5s default). */
 int     g_adecwd = 1;              /* 1.0.1 audio decode-death watchdog (PTV_NO_ADECWD reverts): if audio packets
                                            * keep arriving but the decoder yields ZERO frames for 45s wall, reopen the
                                            * decoder from the stream's codecpar (Pure Flix 2026-07-08: one corrupt-PCE
@@ -2047,6 +2053,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_DISCONT")) g_discont = 0;     /* A/B: don't absorb source PTS discontinuities */
     if (getenv("PTV_NO_GAPDISCRIM")) g_gapdiscrim = 0;   /* gap-fix A/B: revert to unconditional forward absorb (old desync-on-audio-gap behaviour) */
     if (getenv("PTV_NO_ADECWD")) g_adecwd = 0;       /* 1.0.1: disable the audio decode-death watchdog (error TOLERANCE stays on) */
+    if (getenv("PTV_NO_ANCHOR_HEADFILL")) g_anchor_headfill = 0;   /* 1.0.1: revert to first-packet-at-first_audio−h0 birth */
     /* 0.9.18.7: PTV_GAP_MIN_MS internalized (700ms — g_gap_min_us) */
     { const char *wg = getenv("PTV_WRAP_GUARD_S"); if (wg && atoi(wg) > 0) g_wrap_guard_us = (int64_t)atoi(wg) * 1000000; }  /* v0.9.16.1 wrap-guard threshold override (TEST ONLY) */
     if (getenv("PTV_NVENC_SERIALIZE")) g_nvenc_serialize = 1;  /* v0.9.16.5 scale fix B2 (opt-in): one process-wide mutex around video encoder calls — cuts concurrent NVIDIA RM-lock callers 6->1 per process */

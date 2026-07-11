@@ -563,6 +563,7 @@ extern int     g_mv_residence;
 extern int     g_discont;
 extern int     g_gapdiscrim;
 extern int     g_adecwd;
+extern int     g_anchor_headfill;
 extern int64_t g_wrap_guard_us;
 extern int     g_aglue_ms;
 extern int     g_prog_off;

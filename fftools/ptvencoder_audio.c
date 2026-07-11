@@ -768,10 +768,28 @@ static int audio_anchor_and_feed(AudioState *a, AVFrame *frame, int64_t h0)
     if (ts == AV_NOPTS_VALUE) return 0;
     if (!a->pts_set) {
         int64_t house_us = av_rescale_q(ts, a->ist_tb, AV_TIME_BASE_Q) - h0;
+        int64_t fill_us  = 0;
         if (house_us < 0) { a->anchor_drop_pre++; return 0; }   /* audio precedes video anchor: drop */
-        a->next_pts = av_rescale(house_us, a->out_rate, 1000000);
+        /* 1.0.1 ANCHOR HEAD-FILL (PTV_NO_ANCHOR_HEADFILL=1 reverts): when the source's audio
+         * HEAD is missing (first kept audio starts >200ms after h0, or the pre-h0 ring
+         * overflowed so the kept head is not the true head), the track's first packet used
+         * to sit at PTS = first_audio − h0 — PTS-coherent, but first-packet-MISALIGNED for
+         * naive consumers (RAV mv 2026-07-07: +2058ms — the suspected app-visible
+         * audio-early). Synthesize silence covering house 0 → first_audio−h0 IN THE SOURCE
+         * DOMAIN (the first kept frame's rate/layout/format, labels stepping seamlessly into
+         * the real head) and push it through the normal feed path, so the encoder emits
+         * audio from ~PTS 0 and every downstream layer (graph, PLL, gates) sees an ordinary
+         * continuous track. Capped at the pre-h0 ring's own time span (~5.5s default) — the
+         * same bound the buffered-head path already lives under. */
+        if (g_anchor_headfill && (a->anchor_drop_ring > 0 || house_us > 200000) &&
+            frame->sample_rate > 0 && frame->nb_samples > 0) {
+            int64_t dur_us = av_rescale(frame->nb_samples, 1000000, frame->sample_rate);
+            int64_t cap_us = (int64_t)g_cp.aq_prehold * dur_us;   /* ring capacity in time */
+            fill_us = FFMIN(house_us, cap_us);
+        }
+        a->next_pts = av_rescale(house_us - fill_us, a->out_rate, 1000000);
         a->pts_set  = 1;
-        a->dbg_first_src = ts;
+        a->dbg_first_src = ts - av_rescale_q(fill_us, AV_TIME_BASE_Q, a->ist_tb);
         /* [PTV-ANCHOR] (v0.9.16.3, always-on) — the birth A/V relationship this track is built on.
          * house_us = first kept audio content − h0 (first video frame): the input-side head skew
          * the whole run inherits. A large value here (with clean internals after) is the
@@ -783,6 +801,34 @@ static int audio_anchor_and_feed(AudioState *a, AVFrame *frame, int64_t h0)
                "dropped_pre_h0=%d ring_dropped=%d\n",
                a->dbg_k, a->dbg_in, house_us / 1000, h0 / 1000,
                a->anchor_drop_pre, a->anchor_drop_ring);
+        if (fill_us > 0) {
+            int64_t dur_us = av_rescale(frame->nb_samples, 1000000, frame->sample_rate);
+            int     nfill  = (int)((fill_us + dur_us - 1) / dur_us), i;
+            int64_t src_us = av_rescale_q(ts, a->ist_tb, AV_TIME_BASE_Q);
+            int     ret    = 0;
+            av_log(NULL, AV_LOG_WARNING,
+                   "[PTV-ANCHOR] a%d(in%d) headfill %"PRId64"ms silence (house 0 → first kept audio; "
+                   "%d frames, cap %"PRId64"ms)\n",
+                   a->dbg_k, a->dbg_in, fill_us / 1000, nfill,
+                   (int64_t)g_cp.aq_prehold * dur_us / 1000);
+            for (i = nfill; i > 0 && ret >= 0; i--) {
+                AVFrame *s = av_frame_alloc();
+                if (!s) break;
+                s->nb_samples  = frame->nb_samples;
+                s->format      = frame->format;
+                s->sample_rate = frame->sample_rate;
+                av_channel_layout_copy(&s->ch_layout, &frame->ch_layout);
+                if (av_frame_get_buffer(s, 0) >= 0) {
+                    av_samples_set_silence(s->data, 0, s->nb_samples,
+                                           s->ch_layout.nb_channels, s->format);
+                    s->pts = s->best_effort_timestamp =
+                        av_rescale_q(src_us - i * dur_us, AV_TIME_BASE_Q, a->ist_tb);
+                    ret = audio_feed(a, s);
+                }
+                av_frame_free(&s);
+            }
+            if (ret < 0) return ret;
+        }
     }
     return audio_feed(a, frame);
 }

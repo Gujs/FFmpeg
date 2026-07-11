@@ -7,6 +7,27 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(3) ANCHOR HEAD-FILL (audio_anchor_and_feed): when the source's audio HEAD is
+missing at birth — first kept audio starts >200ms after h0, or the pre-h0 ring
+overflowed (kept head ≠ true head) — the output track's first packet sat at
+PTS = first_audio−h0: PTS-coherent but first-packet-MISALIGNED for naive
+consumers (RAV mv 2026-07-07: +2058ms, the suspected app-visible audio-early).
+Now the anchor synthesizes silence covering house 0 → first_audio−h0 in the
+SOURCE domain (first kept frame's rate/layout/format, labels stepping
+seamlessly into the real head) and pushes it through the normal feed path, so
+the encoder emits audio from ~PTS 0 and the graph/PLL/gates see an ordinary
+continuous track. Capped at the pre-h0 ring's own time span (aq_prehold ×
+frame-dur, ~5.5s default); one [PTV-ANCHOR] headfill line. next_pts and
+dbg_first_src are seeded at the FILL start so the swr path and the async-pad
+span accounting stay coherent. PTV_NO_ANCHOR_HEADFILL=1 reverts. Gate: source
+with the audio PID stripped for its first 3s — rc: output first audio packet
++2.699s after first video (ANCHOR first_audio-h0=+2720ms); fixed: first audio
+pkt 0.000 vs first video 0.011 ("headfill 2720ms silence, 128 frames, cap
+5461ms" logged) and the REAL content still starts at 2.732s (silencedetect) vs
+rc's 2.699s first packet = content↔PTS mapping unchanged within one frame
+quantum; PTV_NO_ANCHOR_HEADFILL=1 reproduces the rc birth exactly (+2.699s
+head gap, no headfill line). Tier-1 identical.
+
 (2) MV PLL ACQUIRE TICK-QUANTIZATION DEAD-BAND (audio_drain_fg B3 controller):
 the vlag half of the measured offset is quantized to the house video tick (the
 vring records first-display output times on tick boundaries), so at 25fps the
