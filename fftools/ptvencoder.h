@@ -351,6 +351,19 @@ typedef struct AudioState {
     /* v0.9.16.3 [PTV-ANCHOR] — birth-relationship observability (Zimbo-class startup offsets). */
     int              anchor_drop_pre;                 /* frames dropped because content preceded h0 */
     int              anchor_drop_ring;                /* pre-h0 ring overflow drops (oldest evicted) */
+    /* 1.0.1 [PTV-ADEC] decode-death tolerance + watchdog: hard decode errors are dropped
+     * (rate-limited WARNING) instead of killing the thread; if packets keep arriving but
+     * nothing decodes for 45s wall the decoder is reopened from ist->codecpar (anchor/pts
+     * state preserved — mid-run recovery, aresample absorbs the gap). PTV_NO_ADECWD gates
+     * only the reopen; the error tolerance is unconditional. */
+    AVStream        *ist;                             /* source stream (codecpar for the watchdog reopen) */
+    int64_t          dec_errs;                        /* hard decode errors tolerated (dropped) */
+    int              dec_reopens;                     /* watchdog decoder reopens this run */
+    int64_t          decerr_win_us;                   /* [PTV-ADEC] log rate-limit window start (wall) */
+    int              decerr_win_n;                    /* lines emitted this window */
+    int              decerr_supp;                     /* errors suppressed this window (still counted) */
+    int64_t          wd_frame_us;                     /* wall time of the last decoded frame (seeded at first packet) */
+    int64_t          wd_pkts;                         /* packets received since the last decoded frame */
 } AudioState;
 
 /* ---- demux + mux ---- */
@@ -547,6 +560,7 @@ extern int     g_mv_clamp;
 extern int     g_mv_residence;
 extern int     g_discont;
 extern int     g_gapdiscrim;
+extern int     g_adecwd;
 extern int64_t g_wrap_guard_us;
 extern int     g_aglue_ms;
 extern int     g_prog_off;

@@ -803,8 +803,83 @@ static int audio_push(AudioState *a, AVFrame *frame)
         if (ret < 0) return ret;
         return audio_anchor_and_feed(a, frame, h0);
     }
-    if (ts != AV_NOPTS_VALUE) a->dbg_last_src = ts;   /* probe: latest source audio pts */
+    if (ts == AV_NOPTS_VALUE) return 0;   /* 1.0.1: un-stamped frame (e.g. a garbage-tail decode next to a
+                                           * tolerated [PTV-ADEC] error) cannot be content-anchored; encoding
+                                           * it hands the muxer a timestamp-less packet = EINVAL mux wedge.
+                                           * Drop it — same rule the pre-anchor path applies. */
+    a->dbg_last_src = ts;                 /* probe: latest source audio pts */
     return audio_feed(a, frame);
+}
+
+/* 1.0.1 [PTV-ADEC] — tolerate a hard audio decode error: count it, log a rate-limited
+ * WARNING (AGLUE-style: 10 lines / 10s window, then one summary as the window rolls),
+ * drop the undecodable data and keep the thread alive. Before this, a hard error from
+ * avcodec_receive_frame was `goto done` = SILENT PERMANENT track death (Pure Flix
+ * 2026-07-08: one corrupt-PCE AAC event killed the track for 14h; video survives
+ * identical storms via concealment). send_packet hard errors were already swallowed —
+ * they now share this counter/log so a decode-error storm is visible either way. */
+static void adec_error(AudioState *a, int err)
+{
+    int64_t now = av_gettime_relative();
+    a->dec_errs++;
+    if (now - a->decerr_win_us >= 10000000) {
+        if (a->decerr_supp)
+            av_log(NULL, AV_LOG_WARNING,
+                   "[PTV-ADEC] a%d(in%d) %d more decode errors suppressed in last 10s (total %"PRId64")\n",
+                   a->dbg_k, a->dbg_in, a->decerr_supp, a->dec_errs);
+        a->decerr_win_us = now;
+        a->decerr_win_n  = 0;
+        a->decerr_supp   = 0;
+    }
+    if (a->decerr_win_n < 10) {
+        a->decerr_win_n++;
+        av_log(NULL, AV_LOG_WARNING,
+               "[PTV-ADEC] a%d(in%d) decode error (%s) — dropped, track continues (total %"PRId64")\n",
+               a->dbg_k, a->dbg_in, av_err2str(err), a->dec_errs);
+    } else
+        a->decerr_supp++;
+}
+
+#define PTV_ADECWD_US 45000000   /* decode-death watchdog: packets arriving but zero frames for 45s → reopen */
+
+/* 1.0.1 [PTV-ADECWD] — decode-death watchdog: the decoder has produced NOTHING for 45s
+ * while packets kept arriving = it is wedged in a state error tolerance alone cannot
+ * clear (Pure Flix corrupt-PCE class). Reconstruct it exactly as transcode() setup did
+ * (codecpar → context, pkt_timebase, open) and swap it in. The anchor/pts_set state is
+ * deliberately PRESERVED — this is mid-run recovery, the track's timeline continues and
+ * aresample absorbs the dead span as it does for a source gap. If the reopened decoder
+ * emits frames at different params than the configured path, the [PTV-AFMT]
+ * hysteresis+rebuild in audio_feed re-configures downstream (same machinery as a source
+ * format change). Swap only on successful open, so a failed reopen leaves the old
+ * context in place (never a NULL a->dec) and retries a window later. */
+static void adec_reopen(AudioState *a)
+{
+    const AVCodec *codec = a->dec ? a->dec->codec : NULL;
+    AVCodecContext *nd;
+
+    a->wd_frame_us = av_gettime_relative();   /* re-arm the window whatever happens below */
+    a->wd_pkts     = 0;
+    if (!codec || !a->ist)
+        return;
+    nd = avcodec_alloc_context3(codec);
+    if (!nd)
+        return;
+    avcodec_parameters_to_context(nd, a->ist->codecpar);
+    nd->pkt_timebase = a->ist->time_base;
+    if (avcodec_open2(nd, codec, NULL) < 0) {
+        avcodec_free_context(&nd);
+        av_log(NULL, AV_LOG_WARNING,
+               "[PTV-ADECWD] a%d(in%d) decoder reopen FAILED — keeping the old context, retrying in %ds\n",
+               a->dbg_k, a->dbg_in, (int)(PTV_ADECWD_US / 1000000));
+        return;
+    }
+    avcodec_free_context(&a->dec);
+    a->dec = nd;
+    a->dec_reopens++;
+    av_log(NULL, AV_LOG_WARNING,
+           "[PTV-ADECWD] a%d(in%d) no decoded frames for %ds with packets arriving — decoder reopened "
+           "(#%d, errs=%"PRId64"); anchor preserved, aresample absorbs the gap\n",
+           a->dbg_k, a->dbg_in, (int)(PTV_ADECWD_US / 1000000), a->dec_reopens, a->dec_errs);
 }
 
 void *audio_thread(void *arg)
@@ -819,16 +894,25 @@ void *audio_thread(void *arg)
     for (;;) {
         ret = av_thread_message_queue_recv(a->audio_q, &pkt, 0);
         if (ret < 0) break;
+        a->wd_pkts++;
+        if (!a->wd_frame_us) a->wd_frame_us = av_gettime_relative();   /* seed at first packet */
         ret = avcodec_send_packet(a->dec, pkt);
         av_packet_free(&pkt);
+        if (ret < 0 && ret != AVERROR(EAGAIN))   /* 1.0.1: decode errors surface here too (eager decode) — count/log them */
+            adec_error(a, ret);
         while (ret >= 0) {
             ret = avcodec_receive_frame(a->dec, frame);
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) { ret = 0; break; }
-            if (ret < 0) goto done;
+            if (ret < 0) { adec_error(a, ret); ret = 0; break; }   /* 1.0.1: drop + continue (was: silent thread death) */
+            a->wd_frame_us = av_gettime_relative();
+            a->wd_pkts     = 0;
             ret = audio_push(a, frame);
             av_frame_unref(frame);
             if (ret < 0) goto done;
         }
+        if (g_adecwd && a->wd_pkts > 0 &&
+            av_gettime_relative() - a->wd_frame_us > PTV_ADECWD_US)
+            adec_reopen(a);
     }
     /* flush decoder -> resampler/filtergraph -> encoder */
     avcodec_send_packet(a->dec, NULL);

@@ -94,6 +94,15 @@ int     g_aglue_ms = 60;           /* v0.9.16.3 [PTV-AGLUE]: audio label-step gl
                                            * blind and aresample=async silently followed audio labels while video labels are
                                            * structurally erased by the house clock (the AWE-class lip-sync accumulator).
                                            * PTV_AGLUE_MS overrides; 0 disables (reverts to silent label-following). */
+int     g_adecwd = 1;              /* 1.0.1 audio decode-death watchdog (PTV_NO_ADECWD reverts): if audio packets
+                                           * keep arriving but the decoder yields ZERO frames for 45s wall, reopen the
+                                           * decoder from the stream's codecpar (Pure Flix 2026-07-08: one corrupt-PCE
+                                           * AAC event wedged the decoder and killed the track for 14h while video
+                                           * survived identical storms via concealment). Anchor/pts state is PRESERVED —
+                                           * mid-run recovery, aresample absorbs the gap like a source gap. The hard-
+                                           * decode-error TOLERANCE in audio_thread (drop + [PTV-ADEC] + continue,
+                                           * instead of silent thread death) is unconditional — only the reopen is
+                                           * gated here. */
 /* P2 §7.1 (hybrid): apply the program-level discontinuity offset (tracked from the dense VIDEO reference)
  * to the SPARSE copied streams (DVB-sub/teletext, data, SCTE-35) that can't self-rebase — so an ad-break
  * PTS jump shifts them WITH the video instead of orphaning/vanishing them. Dense V/A (incl. copied AC-3)
@@ -1268,6 +1277,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         a->fifo       = av_audio_fifo_alloc(sfmt, 2, a->frame_size);
         if (!a->fifo) { ret = AVERROR(ENOMEM); goto end; }   /* used by the swr fallback path */
         a->ist_tb     = kist->time_base;
+        a->ist        = kist;          /* 1.0.1: codecpar source for the decode-death watchdog reopen */
         if (af && build_audio_filter(a, a->dec, kist->time_base, af, sfmt) < 0) {
             av_log(NULL, AV_LOG_WARNING, "audio track %d filtergraph failed; plain resample\n", k);
             avfilter_graph_free(&a->afg); a->use_fg = 0;
@@ -2034,6 +2044,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_MV_CLAMP")) g_mv_clamp = 1;      /* opt-in: re-enable the (stutter-prone) content clamp */
     if (getenv("PTV_NO_DISCONT")) g_discont = 0;     /* A/B: don't absorb source PTS discontinuities */
     if (getenv("PTV_NO_GAPDISCRIM")) g_gapdiscrim = 0;   /* gap-fix A/B: revert to unconditional forward absorb (old desync-on-audio-gap behaviour) */
+    if (getenv("PTV_NO_ADECWD")) g_adecwd = 0;       /* 1.0.1: disable the audio decode-death watchdog (error TOLERANCE stays on) */
     /* 0.9.18.7: PTV_GAP_MIN_MS internalized (700ms — g_gap_min_us) */
     { const char *wg = getenv("PTV_WRAP_GUARD_S"); if (wg && atoi(wg) > 0) g_wrap_guard_us = (int64_t)atoi(wg) * 1000000; }  /* v0.9.16.1 wrap-guard threshold override (TEST ONLY) */
     if (getenv("PTV_NVENC_SERIALIZE")) g_nvenc_serialize = 1;  /* v0.9.16.5 scale fix B2 (opt-in): one process-wide mutex around video encoder calls — cuts concurrent NVIDIA RM-lock callers 6->1 per process */

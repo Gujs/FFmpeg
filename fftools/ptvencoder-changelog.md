@@ -5,6 +5,40 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 1.0.1 (pending) — mv-audio robustness batch
+
+(1) AUDIO DECODE-DEATH TOLERANCE + WATCHDOG [PTV-ADEC]/[PTV-ADECWD] (branch
+audio-batch): a hard `avcodec_receive_frame` error in audio_thread was `goto done`
+= silent permanent track death (Pure Flix 2026-07-08: ONE corrupt-PCE AAC event
+killed the track for 14h; video survives identical storms via concealment).
+Now: (a) hard decode errors are TOLERATED unconditionally — dropped + counted
+(dec_errs) + AGLUE-style rate-limited WARNING (10 lines/10s + rolling summary);
+send_packet hard errors (where eager decode surfaces most single-frame AAC
+errors — previously swallowed silently) share the same counter/log. (b) decode-
+death WATCHDOG: packets arriving but ZERO decoded frames for 45s wall → reopen
+the decoder from ist->codecpar exactly as transcode() setup built it (swap only
+on successful open, retry next window on failure). Anchor/pts_set state is
+PRESERVED — mid-run recovery, the track's timeline continues, aresample absorbs
+the dead span like a source gap; if the reopened decoder emits different params
+the [PTV-AFMT] hysteresis+rebuild reconfigures downstream. PTV_NO_ADECWD=1
+disables the watchdog only. Also: audio_push now DROPS a decoded frame with no
+timestamp (garbage-tail decode next to a tolerated error) — un-stamped frames
+cannot be content-anchored and previously rode through the graph into a
+timestamp-less packet = mpegts non-monotonic-DTS EINVAL = mux-thread death =
+whole-rung wedge (measured on the first fixed-build gate run; rc never hit it
+only because the thread died at the first error). Gates (local UDP fixtures,
+cinestar-AAC 100s loop): (1) death: 6s glue-corrupt ADTS window (valid frame +
+garbage tail per packet → errors surface at receive_frame) — rc: audio 469
+pkts/10s until t≈26 then 0 FOREVER, zero log lines; fixed: 468-469 pkts/10s
+through the window and to end-of-run, 10 [PTV-ADEC] lines (rate-limit cap).
+(2) watchdog: 55s all-frames-corrupt window (errors at send, zero frames) —
+exactly one "[PTV-ADECWD] no decoded frames for 45s with packets arriving —
+decoder reopened (#1, errs=2114)", audio continuous; with PTV_NO_ADECWD=1 the
+same run logs ZERO ADECWD lines (revert verified). (3) AGLUE regression:
+audio-only −300ms label step @32s — buckets/verdicts identical rc vs fixed
+(the step is absorbed at the demux layer per 0.9.18.5; no AGLUE verdict on
+either build). Tier-1 fail set identical to baseline.
+
 ## 1.0-rc1 (2026-07-10) — file split (movement-only decomposition of ptvencoder.c)
 
 No behavior change — pure code movement (v1-cleanup-plan §7). The ~6.5k-line
