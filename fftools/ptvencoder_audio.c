@@ -178,6 +178,17 @@ static int audio_drain_fg(AudioState *a)
                      * while dev is still low. */
                     a->pll_dev += (FFABS(off - a->pll_ema) - a->pll_dev) >> g_pll_dev_shift;
                     int64_t thr = (int64_t)g_pll_acquire_us;
+                    /* 1.0.1: TICK-QUANTIZATION dead-band. vlag (the video half of the measured
+                     * offset) is quantized to the house video tick — the vring records first-
+                     * display output times on tick boundaries — so the measurement has an
+                     * irreducible ±1-tick quantum (40ms @25fps ≥ the 40ms base threshold): the
+                     * PLL hard-snapped on its own quantization noise (live grids: pad/drop
+                     * ~42ms alternating every 12-60s per slot, ~939-1511 ACQUIREs / 22h).
+                     * Floor the threshold at 1.5 ticks so a ±1-tick reading can never clear
+                     * it. tick_dur_us = the HOUSE tick, wired at setup — one clock for every
+                     * slot, the same axis the compositor measures each slot's vlag on. */
+                    if (a->tick_dur_us > 0 && 3 * a->tick_dur_us / 2 > thr)
+                        thr = 3 * a->tick_dur_us / 2;
                     if ((int64_t)g_pll_noise_k * a->pll_dev > thr) thr = (int64_t)g_pll_noise_k * a->pll_dev;
                     if (thr > 1500000) thr = 1500000;            /* cap the adaptive rise */
                     /* N7: stability-debounce — fire only when the EMA is LARGE *and* FLAT, so Δ is sized
@@ -196,7 +207,21 @@ static int audio_drain_fg(AudioState *a)
                     int may_acq = a->pll_refractory <= 0 &&
                                   FFABS(a->pll_ema) > thr &&
                                   a->pll_dbnc >= g_pll_acquire_n;
+                    /* 1.0.1: SUSTAINED-OFFSET requirement (PTV_ACQ_INSTANT=1 reverts to the old
+                     * single-window fire). One completed debounce window (32 large-AND-flat
+                     * readings ≈0.7s) is short enough that slow-moving quantization/EMA noise
+                     * can hold it once; require the offset to survive N=3 CONSECUTIVE windows
+                     * (≈2s continuously large) before snapping. The window counter resets the
+                     * moment |ema| falls back under the threshold, so noise excursions never
+                     * accumulate credit; the TRACK path below is untouched. */
+                    if (may_acq && !g_acq_instant && ++a->pll_acq_win < 3) {
+                        a->pll_dbnc = 0; a->pll_dbnc_ref = a->pll_ema;   /* start the next evaluation window */
+                        may_acq = 0;
+                    }
+                    if (FFABS(a->pll_ema) <= thr)
+                        a->pll_acq_win = 0;                               /* condition lapsed → windows no longer consecutive */
                     if (may_acq) {
+                        a->pll_acq_win = 0;
                         int64_t half = frame_us / 2;                        /* round to NEAREST whole frame (half away from 0) */
                         int64_t dq = ((a->pll_ema + (a->pll_ema < 0 ? -half : half)) / frame_us) * frame_us; /* → residual ≤ ½ frame (≈11ms), vs ≤1 frame for truncation */
                         if (dq != 0) {

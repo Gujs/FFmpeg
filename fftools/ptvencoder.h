@@ -324,6 +324,8 @@ typedef struct AudioState {
     int              pll_dbnc;                        /* stability-debounce: consecutive large-AND-flat readings */
     int64_t          pll_dbnc_ref;                    /* ema value when the debounce window started (flatness reference) */
     int              pll_refractory;                  /* frames remaining before acquire may re-arm (bumpless-credit backstop) */
+    int              pll_acq_win;                     /* 1.0.1: consecutive completed above-threshold debounce windows (fire at 3; PTV_ACQ_INSTANT reverts) */
+    int64_t          tick_dur_us;                     /* 1.0.1: house video tick (us) — the vlag measurement quantum; floors the ACQUIRE threshold at 1.5 ticks */
     int              pll_acq_count;                   /* acquires fired this run (startup-k cap + gate assertion) */
     int              pll_drop, pll_pad;               /* pending one-shot acquire: frames to drop (advance) / pad (delay), on the B1 base */
     int64_t          pll_guard_fires;                 /* monotonic-guard activations (windup observability) */
@@ -575,6 +577,7 @@ extern int     g_avsync_probe;
 extern int     g_af_pll;
 extern int     g_af_anchor;
 extern int     g_avsync_pll;
+extern int     g_acq_instant;
 extern int64_t g_pll_testnoise_us;
 extern int64_t g_cushion_max_ms;
 extern int64_t g_bank_decay_us;

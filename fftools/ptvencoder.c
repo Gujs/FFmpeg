@@ -224,6 +224,7 @@ int     g_af_anchor = 1;
  * audio ONLY; single-input + copy paths untouched. Default OFF for box A/B; PTV_AVSYNC_PLL=1 enables.
  * Sign proven: d(offset)/d(applied) < 0 ⇒ to raise a negative offset (audio late), advance (drop). */
 int     g_avsync_pll = 1;             /* B3 closed-loop A/V controller DEFAULT-ON (v0.6.20, box-validated on cor-2 RAV + live-transcoder grids). PTV_NO_AVSYNC_PLL reverts to the open-loop B1 follow. Multiview transcoded audio only; single-input + copy paths byte-identical regardless. */
+int     g_acq_instant = 0;            /* 1.0.1 (PTV_ACQ_INSTANT=1 reverts): ACQUIRE needs the |EMA offset| above threshold for 3 CONSECUTIVE debounce windows (and the threshold is floored at 1.5 house ticks) — the vlag measurement is tick-quantized, so the single-window fire snapped on its own quantization noise (live grids: ~939-1511 ACQUIREs/22h alternating ±42ms pad/drop). */
 int64_t g_pll_testnoise_us = 0;       /* TEST-ONLY (default off): inject a ±N ms square wave (flips ~every 3.2s) into the measured offset to REPRODUCE the box limit cycle locally (local sources are clean). PTV_PLL_TESTNOISE_MS sets it; never set in production. */
 /* v0.9.14 AUTO-BANK (the owner-agreed auto-cushion escalation, cap 12s). The 0.9.10 adaptive
  * cushion lives in frame_q (DECODED frames) and maxes at ~4s — structurally too shallow for
@@ -1502,6 +1503,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         as[k].af_applied_us = 0;
         as[k].dbg_k = k; as[k].dbg_in = asrc_in[k]; as[k].dbg_first_out = AV_NOPTS_VALUE;
         as[k].glue_raw_last_us = AV_NOPTS_VALUE;         /* [PTV-AGLUE] no continuity reference yet */
+        as[k].tick_dur_us = av_rescale(1000000, out_fps.den, out_fps.num);  /* 1.0.1: house tick = the PLL's vlag quantum (one house clock for all slots) */
         for (r = 0; r < n_rung; r++) {
             as[k].mux_q[r] = rung[r].mux_q;
             as[k].gate[r]  = delivery_on ? &rung[r].gate : NULL;   /* §7.5a: hold transcoded audio for the video front */
@@ -2097,6 +2099,7 @@ int main(int argc, char **argv)
     /* 0.9.18.7: PTV_AF_ACQUIRE_MS (100ms) / PTV_AF_RATE_MS_S (10) internalized —
      * see g_af_acquire_us / g_af_rate_us */
     if (getenv("PTV_NO_AVSYNC_PLL")) g_avsync_pll = 0;     /* B3 closed-loop is DEFAULT-ON (v0.6.20); this reverts to the open-loop B1 content-anchored follow. (PTV_AVSYNC_PLL=1 still honored implicitly = the default.) */
+    if (getenv("PTV_ACQ_INSTANT")) g_acq_instant = 1;      /* 1.0.1: revert ACQUIRE to single-window fire (no 3-consecutive-window sustain; the tick floor stays) */
     /* 0.9.18.7: PTV_PLL_EMA_SHIFT (7) / PTV_PLL_TAU_MS (5000) / PTV_PLL_ACQUIRE_MS (40) /
      * PTV_PLL_ACQUIRE_N (32) / PTV_PLL_REFRACTORY_MS (12000) / PTV_PLL_NOISE_K (3) /
      * PTV_PLL_DEV_SHIFT (9) internalized — see the g_pll_* declarations */

@@ -7,6 +7,24 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(2) MV PLL ACQUIRE TICK-QUANTIZATION DEAD-BAND (audio_drain_fg B3 controller):
+the vlag half of the measured offset is quantized to the house video tick (the
+vring records first-display output times on tick boundaries), so at 25fps the
+measurement quantum (40ms) EQUALS the base acquire threshold — the PLL
+hard-snapped on its own quantization noise, alternating ±42ms pad/drop every
+12-60s per slot (live grids on the rc run: ~939-1511 ACQUIREs per 22h). Fix:
+(a) acquire threshold floored at 1.5× the house tick (AudioState.tick_dur_us,
+wired at setup from out_fps — the house tick is global across slots, the same
+axis the compositor measures every slot's vlag on), so a ±1-tick reading can
+never clear it; (b) SUSTAINED-OFFSET requirement — fire only after the |EMA|
+stayed above threshold for 3 CONSECUTIVE completed debounce windows (~2s
+continuously large; the window counter resets the moment |ema| falls under
+the threshold). TRACK path untouched. PTV_ACQ_INSTANT=1 reverts to the
+single-window fire (the tick floor stays). Gate: 2x1 mv fixture, in1 through
+stall_send jitter (0.7s stall / 5s), 600s — see commit/report for rc-vs-fixed
+ACQUIRE counts; genuine-offset check (in0 sender killed 8s mid-run, real bank
+forms) still converges and the flash+beep tail reads aligned; tier-1 identical.
+
 (1) AUDIO DECODE-DEATH TOLERANCE + WATCHDOG [PTV-ADEC]/[PTV-ADECWD] (branch
 audio-batch): a hard `avcodec_receive_frame` error in audio_thread was `goto done`
 = silent permanent track death (Pure Flix 2026-07-08: ONE corrupt-PCE AAC event
