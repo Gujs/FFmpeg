@@ -580,6 +580,7 @@ extern int     g_af_pll;
 extern int     g_af_anchor;
 extern int     g_avsync_pll;
 extern int     g_acq_instant;
+extern int     g_pll_trackup;
 extern int64_t g_pll_testnoise_us;
 extern int64_t g_cushion_max_ms;
 extern int64_t g_bank_decay_us;

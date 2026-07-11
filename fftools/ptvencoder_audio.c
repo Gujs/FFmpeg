@@ -245,15 +245,31 @@ static int audio_drain_fg(AudioState *a)
                     } else {
                         /* TRACK — type-1 integral trim, rate-clamped, NO dead zone. Conditional-integration
                          * anti-windup: don't integrate while the monotonic guard would saturate (N3). */
-                        int64_t pre = opts + av_rescale(a->af_applied_us, a->out_rate, 1000000);
-                        if (!(a->af_out_set && pre < a->af_last_out + nb)) {
-                            int64_t step = a->pll_ema * frame_us / g_pll_tau_us;        /* integral: move ema/τ per frame */
-                            int64_t lim  = (int64_t)g_af_rate_us * nb / a->out_rate;    /* rate clamp (us) */
-                            if (lim < 1) lim = 1;
-                            if (step >  lim) step =  lim;
-                            if (step < -lim) step = -lim;
+                        int64_t pre  = opts + av_rescale(a->af_applied_us, a->out_rate, 1000000);
+                        int64_t step = a->pll_ema * frame_us / g_pll_tau_us;        /* integral: move ema/τ per frame */
+                        int64_t lim  = (int64_t)g_af_rate_us * nb / a->out_rate;    /* rate clamp (us) */
+                        if (lim < 1) lim = 1;
+                        if (step >  lim) step =  lim;
+                        if (step < -lim) step = -lim;
+                        /* 1.0.1 [PTV-TRACKUP] (PTV_NO_PLL_TRACKUP=1 reverts): DIRECTION-AWARE anti-windup.
+                         * The N3 check blocked BOTH signs while `want` sat below the dense line — but the
+                         * pin is an ABSORBING state: TRACK's first down-step leaves want one rate-step
+                         * (~213us; up to the re-anchor amount, 200-300ms, after an h0 re-anchor) under
+                         * af_last_out+nb, and since both sides advance at the same rate the deficit NEVER
+                         * decays, so the guard clamps every frame and TRACK is dead for the rest of the
+                         * run (measured: guard +1/frame from the first overshoot on, applied frozen
+                         * between fires). With the integrator dead, every later correction — including
+                         * slow vlag dup-ramps TRACK exists to absorb — fell to whole-frame ACQUIREs whose
+                         * ≤½-frame residual ±1-tick vlag quantization re-crossed the threshold from the
+                         * other side = the live grids' sustained alternating pad/drop limit cycle
+                         * (~41-44 ACQUIREs/h). A POSITIVE (delay-direction) step while pinned is not
+                         * windup: it repays the label deficit (a few frames at the rate clamp), output
+                         * labels respond, the loop closes. Negative steps while pinned stay blocked
+                         * (true windup — output cannot be advanced without dropping content; that
+                         * remains ACQUIRE's job). */
+                        if ((g_pll_trackup && step > 0) ||
+                            !(a->af_out_set && pre < a->af_last_out + nb))
                             a->af_applied_us += step;
-                        }
                     }
                     if (a->pll_refractory > 0) a->pll_refractory--;   /* ticks on every EMITTED (non-dropped) frame */
                     while (a->pll_pad > 0) {                  /* PAD: emit pending one-shot silence on THIS base before the real frame */

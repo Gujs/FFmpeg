@@ -7,6 +7,31 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(5) [PTV-TRACKUP] DIRECTION-AWARE TRACK ANTI-WINDUP (audio_drain_fg, B3 TRACK
+branch): the 1.0.1-pre1 grid soak showed item (2)'s dead-band killed the 42ms
+quantization-snap class but NOT the acquire rate (~41-44/h, strict pad/drop
+alternation at ±63ms, `applied` toggling one step forever). Local repro (2x1
+grid, PTV_AVSYNC_PROBE) localized the real cause upstream of the dead-band:
+the TRACK integrator's symmetric N3 anti-windup made the monotonic-guard pin
+an ABSORBING state — the first advance-direction step leaves `want` a
+sub-frame amount under the dense line af_last_out+nb, the deficit never decays
+(both sides advance at the same rate; measured guard +1/frame, 51k fires in
+20min), and TRACK is dead for the rest of the run, so every correction fell to
+whole-frame ACQUIREs whose ≤½-frame residual ±1-tick vlag quantization
+re-crossed the threshold from the opposite side = the limit cycle. Fix: allow
+POSITIVE (delay-direction) steps while pinned — they repay the label deficit
+and re-close the loop; negative steps stay blocked (true windup; advancing
+audio = content drops = ACQUIRE's job). PTV_NO_PLL_TRACKUP=1 reverts. Gates:
+jitter fixture 51→8 ACQUIREs/20min (falsification: fix binary + revert env →
+54, causal); item2 count suite 9→0; shifted-source flashbeep tail
++1848→+954ms; tier-1 = the 4 known legacy fails only. Soak note: acquire
+counts on disturbance-heavy channels may legitimately RISE (acquires now do
+real work); watch the alternation signature and guard growth (+1/frame = the
+bug, bounded bursts + plateaus = healthy). Known asymmetry by design:
+audio-early errors converge ~0 via TRACKUP; audio-late residuals can park in
+(−60ms, 0] (below the acquire tick floor, advance-TRACK blocked by the pin) —
+a stable −40ms on [PTV-AVSYNC] is the tradeoff, not a regression.
+
 (4) REANCHOR2 DEBOUNCE (compositor_thread): the P2 h0-re-anchor's shift
 (−sk + tick) was computed from ONE instantaneous displayed-frame label, so a
 single corrupt PTS — one frame with a mangled PTS but intact DTS sails through
