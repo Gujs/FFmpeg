@@ -413,6 +413,25 @@ typedef struct PassStream {
 #define PTV_DISC_THRESHOLD_US    (1 * AV_TIME_BASE)   /* 1s   jump threshold */
 #define PTV_DISC_TIMEOUT_US      (500 * 1000)         /* 500ms forced-flush timeout */
 #define PTV_DISC_TOL_US          (100 * 1000)         /* 100ms timeline classification tolerance */
+/* 1.0.1-pre4 shared-flush pairing window (wall us): dense flushes closer together than this
+ * belong to ONE source event, and every dense stream in the event shares the event's
+ * VIDEO-derived offset (see the decision tree in ptv_disc_flush). Sized for the live evidence
+ * (Curiosity 2026-07-13: video and audio crossed 0.6s apart -> two partial flushes ~0.6s apart
+ * after the 500ms buffer timeout) with wide margin, yet far below the spacing of independent
+ * jumps (few/hour worst case). A false pairing is benign by construction: the A-vs-V offset
+ * difference routes to the audio CONTENT path, which converges to the source's alignment. */
+#define PTV_PAIR_WINDOW_US       (5 * AV_TIME_BASE)
+/* Shared-flush equality band: a V-vs-A offset disagreement at or below this is flush BOOKKEEPING
+ * (duration-estimate overhang ~1 frame, trailing-OLD discard holes ~100-400ms of interleave), NOT
+ * a source A-vs-V jump difference — for those the production-proven audio-preferred butt-joint is
+ * kept BYTE-IDENTICAL (the TruBLU symmetric-rewind mandate: equal deltas ⇒ per-stream-identical
+ * behavior, log-line equality). The invariant holds in the band regardless — ONE offset is applied
+ * to all dense streams either way; the band only decides WHICH content machinery absorbs the
+ * bookkeeping residual (audio butt-joint, as today). Above the band the disagreement is a real
+ * asymmetric event (live cases: 1.0s, 30.8s): VIDEO defines the timeline and the difference goes
+ * to the audio content path. Half the LAYERA jump threshold, so a genuine >1s-delta pairing whose
+ * streams disagree by more than this always engages. */
+#define PTV_PAIR_EPS_US          (500 * 1000)
 
 typedef struct PtvDiscPacket {
     AVPacket *pkt;
@@ -429,6 +448,12 @@ typedef struct PtvDiscStreamState {
     int64_t new_timeline_base;     /* this stream's first DTS in new timeline (per-cycle) */
     int     has_old_base;
     int     has_new_base;
+    /* 1.0.1-pre4 shared flush: what offset this (audio) stream had applied at its flush within
+     * the current pairing window — read by a later video-crossing flush of the SAME event to
+     * retro-correct the stream onto the video-defined timeline. Persists across cycles; cleared
+     * when the pairing window closes. */
+    int64_t pair_applied_us;
+    int     pair_has;
 } PtvDiscStreamState;
 
 typedef struct PtvDiscBuf {
@@ -451,6 +476,11 @@ typedef struct PtvDiscBuf {
     int64_t             err_abs_sum_us;     /* Σ|vid_err| */
     int64_t             err_abs_max_us;     /* max|vid_err| */
     int64_t             err_gt100_cnt;      /* glues with |vid_err| > 100ms */
+    /* 1.0.1-pre4 shared flush: pairing-window state (persists ACROSS flush cycles — that is the
+     * point: the live failure was two partial flushes 0.6s apart, each erasing its own stream). */
+    int64_t             pair_start_us;      /* wall us of the event's first dense flush; 0 = no open event */
+    int                 pair_vid_defined;   /* 1 once VIDEO's crossing defined this event's timeline */
+    int64_t             pair_vid_off_us;    /* the video-defined shared offset (us) */
 } PtvDiscBuf;
 
 typedef struct DemuxArgs {
@@ -586,6 +616,7 @@ extern int     g_prog_off;
 extern int     g_progoff_av;
 extern int     g_layera;
 extern int     g_layera_fullskip;
+extern int     g_shared_flush;
 extern int     g_drop_until_kf;
 extern int     g_audio_follow;
 extern int     g_h0_reanchor;

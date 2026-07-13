@@ -40,7 +40,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.0.1-pre3"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.0.1-pre4"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -151,6 +151,25 @@ int     g_layera = 1;   /* v0.9.10: DEFAULT ON (proven production posture); PTV_
  * ptv_disc_detect_jump); sub-1s steps fall through to the proven §5.A.2 shared-amount absorber.
  * PTV_LAYERA_FULLSKIP=1 restores the old full-skip posture (A/B / rollback). */
 int     g_layera_fullskip = 0;
+/* 1.0.1-pre4 SHARED FLUSH (the LAYERA asymmetric-event invariant fix). THE INVARIANT
+ * (owner-mandated): after any input event, the output's A/V alignment must equal the source's
+ * post-event alignment — latency may be retained; relative A/V offset may never be. LAYERA's
+ * per-flush erase preserved that only when V and A jumped by the SAME amount in the SAME flush
+ * cycle; the Curiosity/PATRIOT 2026-07-13 provider playout jumps were ASYMMETRIC and crossed
+ * 0.6s apart (past the 500ms buffer timeout), so each stream's flush applied its OWN offset
+ * (vid −14.148s, aud −15.155s) and the ~1s A-vs-V jump difference was FROZEN into the output
+ * for 8.5h with every counter clean. Now dense flushes within PTV_PAIR_WINDOW_US share ONE
+ * offset — VIDEO's delta defines the timeline (video is the house-clock anchor; prog_off/SCTE
+ * ride the video timeline) — and the A-vs-V jump difference is NOT erased: it surfaces as an
+ * audio label step that the CONTENT machinery converges (AGLUE gap-pad within its cap;
+ * above it aresample=async hard pad/drop — bounded, and exactly what a stateless player
+ * shows). REDUCES to per-stream-identical (byte-identical logs) behavior when the deltas
+ * are equal: offset disagreement at or below PTV_PAIR_EPS_US (500ms) is flush bookkeeping
+ * (duration-estimate overhang, trailing-OLD discard holes), and there the production-proven
+ * audio-preferred butt-joint is kept exactly (TruBLU symmetric rewinds unchanged — the
+ * invariant holds in the band regardless, since ONE offset is applied either way).
+ * Decision tree at ptv_disc_flush. PTV_NO_SHARED_FLUSH=1 reverts to the per-stream erase. */
+int     g_shared_flush = 1;
 /* P2 §7.1 / stage 2b: after a detected source discontinuity, DROP video packets until the next keyframe
  * (IDR) before they reach the decoder — a splice starts a NEW timeline mid-GOP, so the P/B frames that
  * reference the missing IDR decode as a corruption burst (greyed/torn frames) that the house clock would
@@ -2042,6 +2061,9 @@ int main(int argc, char **argv)
     if (getenv("PTV_LAYERA_FULLSKIP")) g_layera_fullskip = 1;  /* 0.9.18.5 revert: LAYERA skips the demux absorber for ALL
                                                                 * super-threshold jumps again (restores the sub-1s no-owner
                                                                 * band = the In-Touch audio-late accumulator; A/B only) */
+    if (getenv("PTV_NO_SHARED_FLUSH")) g_shared_flush = 0;     /* 1.0.1-pre4 revert: LAYERA flushes erase per-stream again
+                                                                * (bakes the A-vs-V jump difference into the output on
+                                                                * asymmetric events — A/B / rollback only) */
     if (getenv("PTV_NO_ADAPTIVE")) g_adapt_cushion = 0;   /* fixed preroll target (pre-0.9.10 behavior) */
     /* PTV_CUSHION_MS parse moved to resolve_cushions() (0.9.18 M1) */
     if (getenv("PTV_NO_GENLOCK")) g_genlock = 0; /* v0.9.0: revert to free-run nominal pacing (+ old 350ms prime) = byte-identical */

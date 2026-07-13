@@ -7,6 +7,56 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(7) LAYERA SHARED FLUSH — asymmetric-event invariant fix (pre4;
+ptv_disc_flush). THE INVARIANT (owner-mandated): "after any input event, the
+output's A/V alignment must equal the source's post-event alignment. Latency
+may be retained; relative A/V offset may never be." A stateless player gets
+this for free; LAYERA's stateful per-flush erase preserved it only when video
+and audio jumped by the same amount in the same flush cycle. Live evidence
+(2026-07-13 01:01, Curiosity provider playout jump, two boxes at the same
+minute): Curiosity_Now/cor-1 — video jumped +14.181s, flush
+applied_offset=-14.148s (vid only); 0.6s later audio jumped +15.176s (past
+the 500ms buffer timeout, so the events did NOT pair), second flush
+applied_offset=-15.155s (aud only) — each stream erased its OWN jump and the
+~1.0s A-vs-V jump difference was FROZEN into the output for 8.5h,
+viewer-visible desync with every counter clean.
+PATRIOT-Curiosity_Channel/cor-2, same minute: audio +15.864s FORWARD, video
+−15.811s BACKWARD; flushes applied aud −15.832 / vid 0.000. Design: dense
+flushes within PTV_PAIR_WINDOW_US (5s) are ONE source event and every dense
+stream gets the event's VIDEO-derived offset (video is the house-clock
+anchor; prog_off/SCTE ride the video timeline) — one offset can never change
+relative A/V alignment. The A-vs-V jump difference is NOT erased: it
+surfaces as an audio label step routed to the existing CONTENT machinery
+(AGLUE gap-pad within its 1000ms cap; above the cap aresample=async hard
+pad/drop — bounded convergent, never another per-stream erase). Pairing
+covers all three orderings via a decision tree (documented at
+ptv_disc_flush): video-first (Curiosity — audio-only flush INHERITS the
+event's video offset), audio-first (PATRIOT class — audio flushes with a
+provisional own offset and is RETRO-CORRECTED onto the video timeline when
+video's flush arrives in the window), and same-cycle full flushes (audio
+shares video's applied offset directly). New [PTV-GLUE] "paired flush"
+ledger line logs the mismatch the shared offset avoided baking in
+(shared_offset= / av_mismatch= / -> audio content path), emitted exactly when
+the shared offset overrode a stream's own butt-joint. TruBLU-equivalence
+guarantee: offset disagreement ≤ PTV_PAIR_EPS_US (500ms) is flush BOOKKEEPING
+(duration-estimate overhang ~20ms, trailing-OLD discard holes ~100-400ms of
+interleave), not a source A-vs-V jump difference — in that band the
+production-proven audio-preferred butt-joint is kept byte-identical (equal
+deltas ⇒ per-stream-identical behavior, log-line equality; the invariant
+holds in the band regardless, since ONE offset is applied to all dense
+streams either way — the band only picks which content machinery absorbs the
+bookkeeping residual). Above the band (live cases: 1.0s, 30.8s) video defines
+the timeline. Sparse SUBTITLE/DATA/SCTE-35 keep the prog_off path untouched;
+scte35_rebase_pts_adjustment byte-identical. PTV_NO_SHARED_FLUSH=1 reverts
+to the per-stream erase. Gates (A/B vs pre3): invariant fixture (V+14s/A+15s
+0.6s apart, live-UDP single-input encode across the jump, pts-origin-corrected
+xcorr oracle) — pre3 bakes ≈+1s, pre4 ≤±60ms added desync; PATRIOT variant
+(A+15s fwd / V−15.8s back) same bar; audio-first ordering same bar; symmetric
++15s and TruBLU −900s/−30s rewinds — LAYERA jump/flush lines and hs/hsres
+log-equivalent to pre3, added desync ≈0 both binaries; pts-spacing flatness
+<1µs/frame outside the event bucket; item2 count+genuine at pre3 numbers;
+tier-1 = the known legacy fails only.
+
 (6) TRACK STEERS THROUGH THE RESAMPLER, NEVER LABELS (pre3; audio_drain_fg +
 audio_feed). Production proof (2026-07-13, live grids): the mv audio-follow
 PLL's TRACK integrator actuated by RE-STAMPING output labels (af_applied_us

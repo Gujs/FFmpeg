@@ -223,6 +223,22 @@ static void ptv_disc_reset(PtvDiscBuf *b)
     b->applied_offset    = 0;
 }
 
+/* 1.0.1-pre4 shared flush: close the pairing window — forget the event's video-defined offset
+ * and every stream's provisional applied offset. Called when the window expires or when a new
+ * video crossing starts a new event. (NOT part of ptv_disc_reset: pair state must survive the
+ * per-cycle reset — the whole point is pairing ACROSS flush cycles.) */
+static void ptv_disc_pair_reset(PtvDiscBuf *b)
+{
+    int i;
+    b->pair_start_us    = 0;
+    b->pair_vid_defined = 0;
+    b->pair_vid_off_us  = 0;
+    for (i = 0; i < b->nb_streams; i++) {
+        b->stream_state[i].pair_applied_us = 0;
+        b->stream_state[i].pair_has        = 0;
+    }
+}
+
 void ptv_disc_free(PtvDiscBuf *b)
 {
     if (!b || !b->packets)
@@ -390,6 +406,8 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
     int any_started = 0;
     int64_t vid_off = 0, aud_off = 0;
     int has_vid = 0, has_aud = 0;
+    int pair_first_vid = 0;      /* 1.0.1-pre4: this flush is the event's first VIDEO crossing */
+    int pair_inherit   = 0;      /* 1.0.1-pre4: audio-only flush adopted the event's video offset */
 
     if (b->nb_packets == 0) {
         ptv_disc_reset(b);
@@ -433,9 +451,10 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
         }
     }
 
-    /* Pick ONE offset for ALL streams (preserves A/V sync): prefer the audio
-     * stream's offset (audio gets seamless ts; video absorbs the residual via
-     * CFR dup/drop), fall back to video. */
+    /* Gather each media type's own offset. ONE of them is applied to ALL streams (one offset
+     * preserves relative A/V alignment): under the 1.0.1-pre4 shared flush VIDEO's offset
+     * defines the timeline (decision tree below); the pre-pre4 path preferred audio (audio
+     * seamless, video absorbs the residual via CFR dup/drop). */
     for (i = 0; i < b->nb_streams; i++) {
         AVStream *st;
         if (!b->stream_state[i].has_new_base)
@@ -447,8 +466,78 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
             aud_off = b->stream_state[i].cumulative_ts_offset; has_aud = 1;
         }
     }
-    if (has_aud)      b->applied_offset = aud_off;
-    else if (has_vid) b->applied_offset = vid_off;
+    /* 1.0.1-pre4 SHARED FLUSH decision tree (g_shared_flush; see the invariant note at its
+     * definition). Dense flushes within PTV_PAIR_WINDOW_US are ONE source event; every dense
+     * stream in the event gets the event's VIDEO-derived offset, so the output's post-event A/V
+     * alignment equals the source's (one offset never changes relative alignment). The A-vs-V
+     * jump difference is NOT erased — it surfaces as an audio label step handled by the CONTENT
+     * machinery (AGLUE gap-pad within its 1000ms cap; above it aresample=async hard pad/drop —
+     * bounded convergent, never another per-stream erase). Tree, per flush:
+     *   1. window expired (now − pair_start > PAIR_WIN)      → close it (independent events).
+     *   2. VIDEO crossed in this flush:
+     *      2a. video already defined an open event           → NEW event (close the old one).
+     *      2b. audio also crossed and |vid_off − aud_off| > PTV_PAIR_EPS_US (a REAL A-vs-V jump
+     *          difference, not bookkeeping — see the define) → applied = vid_off: video IS the
+     *          timeline (the house clock anchors on video, prog_off/SCTE ride the video
+     *          timeline, and a video label step would leak into audio via house_skew/AVLOCK —
+     *          the In-Touch double-actuation class); the mismatch surfaces as an audio label
+     *          step for the content machinery. Within the band (TruBLU symmetric rewinds, ad
+     *          breaks: equal deltas ⇒ the offsets agree to bookkeeping noise) → applied =
+     *          aud_off, BYTE-IDENTICAL to the per-stream path (the reduction mandate).
+     *      2c. video-only flush → applied = vid_off (same as per-stream).
+     *      2d. audio flushed EARLIER in this event with a provisional own offset (audio
+     *          crossed first — the PATRIOT ordering) → retro-correct it below (after the
+     *          persist block): shift its wrap_off/continuity refs by (event offset −
+     *          provisional) when they disagree beyond the band, putting it on the
+     *          video-defined timeline from now on; the shift itself is the audio label step
+     *          the content machinery converges.
+     *   3. AUDIO-only flush (video did not cross in this cycle):
+     *      3a. event offset already defined by video (video crossed first — the Curiosity
+     *          ordering, V and A 0.6s apart, past the 500ms buffer timeout) → INHERIT it when
+     *          it disagrees with aud_off beyond the band; within the band keep aud_off
+     *          (byte-identical seam handling for a symmetric event split across cycles).
+     *      3b. no video crossing yet → applied = aud_off (provisional pre-pre4 behavior; an
+     *          unpaired audio-only jump keeps today's semantics, and a paired one is
+     *          retro-corrected at video's flush, 2d).
+     * Every audio stream crossing in a flush records what it had applied (pair_applied_us)
+     * so 2d can compute its correction. PTV_NO_SHARED_FLUSH=1 restores the plain
+     * audio-preferred per-stream choice below. */
+    if (g_shared_flush && keep_timeline == 1) {
+        int64_t pnow = av_gettime_relative();
+        if (b->pair_start_us && pnow - b->pair_start_us > PTV_PAIR_WINDOW_US)
+            ptv_disc_pair_reset(b);                       /* 1: window expired */
+        if (has_vid) {
+            if (b->pair_vid_defined)
+                ptv_disc_pair_reset(b);                   /* 2a: a second video crossing = a new event */
+            if (!b->pair_start_us)
+                b->pair_start_us = pnow;
+            if (has_aud && llabs(vid_off - aud_off) <= PTV_PAIR_EPS_US)
+                b->applied_offset = aud_off;              /* 2b band: bookkeeping-equal — per-stream-identical */
+            else
+                b->applied_offset = vid_off;              /* 2b/2c: video defines the timeline */
+            b->pair_vid_defined = 1;
+            b->pair_vid_off_us  = b->applied_offset;      /* the event's shared offset */
+            pair_first_vid      = 1;                      /* 2d runs after the persist block */
+        } else if (has_aud) {
+            if (!b->pair_start_us)
+                b->pair_start_us = pnow;
+            if (b->pair_vid_defined &&
+                llabs(b->pair_vid_off_us - aud_off) > PTV_PAIR_EPS_US) {
+                b->applied_offset = b->pair_vid_off_us;   /* 3a: inherit the video-defined offset */
+                pair_inherit      = 1;
+            } else
+                b->applied_offset = aud_off;              /* 3a band / 3b: per-stream-identical */
+        }
+        for (i = 0; i < b->nb_streams && i < (int)d->ifmt->nb_streams; i++)
+            if (b->stream_state[i].has_new_base &&
+                d->ifmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                b->stream_state[i].pair_applied_us = b->applied_offset;
+                b->stream_state[i].pair_has        = 1;
+            }
+    } else {
+        if (has_aud)      b->applied_offset = aud_off;
+        else if (has_vid) b->applied_offset = vid_off;
+    }
     if (has_vid && has_aud) g_disc_viderr_sum += (vid_off - aud_off);   /* PTV-FLUSHAV: running total of source A/V misalignment absorbed at glues */
 
     av_log(NULL, AV_LOG_INFO,   /* v0.9.13: always-on (paired with the jump line above) */
@@ -478,6 +567,21 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
         av_log(NULL, AV_LOG_INFO,
                "[PTV-GLUE] partial flush (only %s crossed in the window) — mis-mux not measurable this glue (partial=%"PRId64")\n",
                has_vid ? "video" : "audio", b->glue_partial);
+    }
+    /* 1.0.1-pre4 [PTV-GLUE] paired-flush ledger: the A-vs-V mismatch the shared offset AVOIDED
+     * baking into the output (it routes to the audio content path instead — AGLUE/aresample).
+     * Logged exactly when the shared offset actually OVERRODE the stream's own butt-joint
+     * (disagreement above PTV_PAIR_EPS_US) — within the band behavior is per-stream-identical
+     * and the log stays identical too (the TruBLU log-equality mandate). */
+    if (g_shared_flush && keep_timeline == 1) {
+        int64_t mm = 0, so = 0;
+        int have = 0;
+        if (has_vid && has_aud)      { so = b->applied_offset; mm = b->applied_offset - aud_off; have = 1; }
+        else if (pair_inherit)       { so = b->applied_offset; mm = b->applied_offset - aud_off; have = 1; }
+        if (have && llabs(mm) > PTV_PAIR_EPS_US)
+            av_log(NULL, AV_LOG_INFO,
+                   "[PTV-GLUE] paired flush: shared_offset=%.3fs av_mismatch=%+.3fs -> audio content path\n",
+                   (double)so / AV_TIME_BASE, (double)mm / AV_TIME_BASE);
     }
     if (g_diag) ptv_qsnap(d, b, "at-flush");
 
@@ -550,6 +654,36 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
          * (has_vid) — an audio-only partial glue leaves the video timeline (and hs) untouched. */
         if (has_vid)
             d->disc_resid_us += -b->applied_offset;
+    }
+
+    /* 1.0.1-pre4 shared flush, tree 2d: this flush is the pairing window's FIRST video crossing
+     * and some audio stream(s) already flushed earlier in the window with a provisional
+     * audio-derived offset (audio's jump crossed the demuxer first). Re-base them onto the
+     * video-defined timeline: shift wrap_off by (vid_off − provisional) so every SUBSEQUENT
+     * packet rides the shared offset, and shift the LAYERA continuity refs by the same amount
+     * so the step cannot re-trigger a phantom detect→flush cycle (the 0.9.18.5 hygiene rule).
+     * The step this introduces in the audio label stream IS the A-vs-V mismatch, delivered to
+     * the content machinery (AGLUE/aresample) instead of being erased. prog_off is deliberately
+     * NOT touched: it follows the video timeline, which video's own persist above just moved. */
+    if (pair_first_vid) {
+        int s;
+        for (s = 0; s < b->nb_streams && s < (int)d->ifmt->nb_streams; s++) {
+            PtvDiscStreamState *ss = &b->stream_state[s];
+            int64_t corr;
+            if (!ss->pair_has || ss->has_new_base)
+                continue;                        /* only streams from EARLIER flushes of this event */
+            corr = b->pair_vid_off_us - ss->pair_applied_us;
+            ss->pair_applied_us = b->pair_vid_off_us;
+            if (llabs(corr) <= PTV_PAIR_EPS_US)
+                continue;                        /* within the equality band — no step worth taking */
+            d->wrap_off[s] += av_rescale_q(corr, AV_TIME_BASE_Q, d->ifmt->streams[s]->time_base);
+            if (ss->last_dts_us   != AV_NOPTS_VALUE) ss->last_dts_us   += corr;
+            if (ss->last_sent_dts != AV_NOPTS_VALUE) ss->last_sent_dts += corr;
+            av_log(NULL, AV_LOG_INFO,
+                   "[PTV-GLUE] paired flush (retro): stream %d re-based onto the video timeline: "
+                   "shared_offset=%.3fs av_mismatch=%+.3fs -> audio content path\n",
+                   s, (double)b->pair_vid_off_us / AV_TIME_BASE, (double)corr / AV_TIME_BASE);
+        }
     }
 
     b->flushing = 0;
