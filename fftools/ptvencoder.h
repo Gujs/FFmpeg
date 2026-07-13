@@ -428,9 +428,12 @@ typedef struct PassStream {
  * by construction" claim was falsified by review: an inherited offset costs an aresample
  * convergence PROPORTIONAL to the inherited-vs-own disagreement, i.e. UNBOUNDED, and the
  * fx-dbl re-inherit destroyed ~17s of audio): each stream can inherit/apply the event's offset
- * AT MOST ONCE per window (pair_has, checked at 3a) and the window CLOSES as soon as every
- * flowing dense audio stream has applied it — so an independent audio wobble AFTER the event
- * completes can never re-inherit a stale offset. What remains inherently ambiguous is a
+ * AT MOST ONCE PER FLUSH-CYCLE CROSSING SET (pair_has is checked per flush at 3a: a flush
+ * inherits if ANY crossing stream is unapplied and then applies to ALL crossing streams — an
+ * already-applied stream that crosses in the SAME 500ms cycle as a late leg can re-apply;
+ * review-2 F2, rare multi-audio coincidence, registered + aresample-converged when it happens)
+ * and the window CLOSES as soon as every flowing dense audio stream has applied it — so an
+ * independent audio wobble AFTER the event completes can never re-inherit a stale offset. What remains inherently ambiguous is a
  * video-only crossing followed by an INDEPENDENT first audio crossing inside the window: that
  * is indistinguishable from the genuine Curiosity ordering by construction, and the inherit
  * then costs an audible aresample convergence of the disagreement. The window/eps/pair_has
@@ -456,15 +459,21 @@ typedef struct PassStream {
  * what re-broke the invariant for backward mismatches in (-1000ms,-500ms) (mirror-signed
  * events: video jumping further forward than audio). Plain source backward steps carry no
  * registration and keep the 0.9.16.4 relabel-erase rule.
- *   TTL: AGLUE sees the seam within packet-queue latency (~1-2s); 10s is generous while keeping
- *   the value-match collision window (an unrelated source step of similar size arriving first)
- *   negligible. A stale registration expires silently.
+ *   TTL: must cover the audio pipeline's WORST-CASE demux->AGLUE residency, not the typical
+ *   1-2s packet-queue latency — under a deep prime / auto-bank the audio_q legally holds the
+ *   full bank ceiling (g_cushion_max_ms, 12s default, operator-raisable) plus the delivery-gate
+ *   hold, and the post-outage resume carrying the discontinuity is EXACTLY the joint-event case
+ *   this handshake exists for (review-2 F1: a 10s TTL expired mid-bank and fell back to the
+ *   relabel-erase, re-breaking the invariant). Sized like the delivery-maxq formula
+ *   (ptvencoder.c: delivery_cap + cushion_max + margin): 30s. The value-match collision window
+ *   this buys is still negligible (a collision needs an unrelated backward step of near-equal
+ *   >500ms magnitude on the same track inside the TTL). A stale registration expires silently.
  *   Match window is ASYMMETRIC around the registered value: flush-borne steps (same-cycle /
  *   inherit) arrive EXACT to within duration-estimate noise (measured -32..0ms), but a
  *   retro-corrected step rides the first normal-path packet after the flush and MERGES with the
  *   flush's own trailing-OLD discard hole, which is always FORWARD (measured +456ms on the
  *   ordering fixture) — hence [-LO, +HI] = [-250ms, +500ms] of the registered value. */
-#define PTV_PAIR_EXPECT_TTL_US   (10 * AV_TIME_BASE)
+#define PTV_PAIR_EXPECT_TTL_US   (30 * AV_TIME_BASE)
 #define PTV_PAIR_EXPECT_LO_US    (250 * 1000)
 #define PTV_PAIR_EXPECT_HI_US    (500 * 1000)
 
