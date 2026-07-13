@@ -27,8 +27,12 @@ stream gets the event's VIDEO-derived offset (video is the house-clock
 anchor; prog_off/SCTE ride the video timeline) — one offset can never change
 relative A/V alignment. The A-vs-V jump difference is NOT erased: it
 surfaces as an audio label step routed to the existing CONTENT machinery
-(AGLUE gap-pad within its 1000ms cap; above the cap aresample=async hard
-pad/drop — bounded convergent, never another per-stream erase). Pairing
+(pre5 correction — the pre4 text claimed "AGLUE gap-pad within its 1000ms
+cap", which was WRONG for backward steps: AGLUE relabel-ERASED those, the D1
+defect below; since pre5 the flush registers the step so AGLUE APPLIES it in
+every direction — forward = aresample pads, backward = aresample drops,
+above the AGLUE cap = aresample=async hard pad/drop — bounded convergent,
+never another per-stream erase). Pairing
 covers all three orderings via a decision tree (documented at
 ptv_disc_flush): video-first (Curiosity — audio-only flush INHERITS the
 event's video offset), audio-first (PATRIOT class — audio flushes with a
@@ -56,6 +60,68 @@ xcorr oracle) — pre3 bakes ≈+1s, pre4 ≤±60ms added desync; PATRIOT varian
 log-equivalent to pre3, added desync ≈0 both binaries; pts-spacing flatness
 <1µs/frame outside the event bucket; item2 count+genuine at pre3 numbers;
 tier-1 = the known legacy fails only.
+
+(7b) SHARED-FLUSH REVIEW-ROUND FIXES (pre5; ptv_disc_flush + audio_feed) —
+an adversarial review of pre4 CONFIRMED three defects empirically; all three
+fixed and re-gated A/B vs pre3:
+  D1 — mirror-signed mismatch erased by AGLUE (invariant still broken for
+  av_mismatch in (−1000ms,−500ms), video jumping FURTHER forward than audio):
+  the routed backward label step hit AGLUE's 0.9.16.4 relabel-ERASE and landed
+  audio on the pre3 butt-joint while the "paired flush" ledger claimed
+  success (fx-mir2: V+15.0s@125.3 / A+14.2s@126.1 → pre4 == pre3 == +760ms
+  baked). FIX = a demux→audio EXPECTED-STEP handshake: when a shared flush
+  routes a mismatch it REGISTERS the per-track step (value + 10s wall
+  deadline; _Atomic pair in Input, demux writes value-then-deadline release,
+  audio thread acquires — the house_skew/disturb_epoch publish idiom) via
+  ptv_pair_expect(); AGLUE consumes a matching arriving step (asymmetric
+  window [−250ms,+500ms]: flush-borne steps arrive exact to −32ms, a
+  retro-corrected step merges with the flush's forward discard hole, +456ms
+  measured) as a REAL alignment step — APPLIED, logged
+  "matches the shared-flush expected step ... APPLIED", never erased.
+  Unregistered (plain source) backward steps keep the erase rule
+  byte-identical; forward-path behavior unchanged (annotation only).
+  D2 — re-inherit hole, WORSE than pre3: decision 3a inherited
+  pair_vid_off_us even when the stream had ALREADY applied the event's offset
+  (pair_has recorded but never consulted; same hole reachable through 2d).
+  fx-dbl (mirror event + independent audio −2s wobble 2s later): pre4
+  inherited −14.980s for the wobble → −14.8s desync, ~17s of audio destroyed
+  (pre3: clean +2.0s butt-joint). FIX = pair_has is now CONSULTED: a crossing
+  set whose streams all already applied is a NEW INDEPENDENT event (3c —
+  plain butt-joint, pair state untouched); 2d retro-corrects only
+  pair_prov (provisional) streams, never finalized ones; and the pairing
+  window CLOSES as soon as video has defined the offset and every flowing
+  dense audio stream has applied it (completion close). The header's "false
+  pairing is benign by construction" claim was falsified and rewritten to the
+  actual guarantee: each stream applies an event's offset AT MOST ONCE per
+  window and a completed event cannot be paired with; the inherently
+  ambiguous case (video-only crossing + a first independent audio crossing
+  inside the 5s window) remains indistinguishable from the genuine Curiosity
+  ordering, and a false inherit there costs an audible aresample convergence
+  proportional to the disagreement.
+  D3 — prog_off double-bump on split-cycle events (pre-existing, exposed by
+  the split orderings): the flush persist added applied_offset to prog_off on
+  EVERY nonzero flush, including the audio-only inherit flush → SCTE-35/
+  DVB-sub timing moved ~2× the offset on split events. FIX = prog_off is
+  gated on has_vid (same gate as disc_resid_us): sparse rides the VIDEO/
+  program timeline and moves exactly once, at video's own flush; an
+  audio-only UNPAIRED event moves no video labels and now moves no sparse
+  timing either (the pre-pre4 audio-only bump was the same latent bug —
+  deliberately fixed unconditionally, i.e. also under PTV_NO_SHARED_FLUSH).
+  KNOWN BOUND (copy-only audio): a copy-passthrough audio stream (e.g. AC-3
+  -c copy) has no content machinery — a large BACKWARD routed correction on
+  such a stream compresses into the demux_pass monotonic-DTS clamp until real
+  time catches up (labels held, content squeezed against the clamp). Dense
+  transcoded tracks (the production posture for the primary audio) are
+  unaffected; documented as a bound, not fixed.
+  GATE-2b EQUIVALENCE, stated precisely: for symmetric events (TruBLU +15s /
+  −30s / −900s classes) pre5's APPLIED OFFSETS are byte-equal to pre3's
+  ([PTV-LAYERA] flush applied_offset= values); buffered-PACKET COUNTS in the
+  flush lines may differ by a few packets (wall-clock window jitter between
+  runs), which is run noise, not behavior. Re-gate results (A/B vs pre3
+  79e941d313, committed pre5 binary): see the commit message of the pre5
+  commit for the full matrix (fx-mir2 D1, fx-dbl D2, SCTE split-event D3,
+  gate-1/PATRIOT reproduction, audio-only event, plain −300ms backward step
+  erase intact, spacing/item2/tier-1).
 
 (6) TRACK STEERS THROUGH THE RESAMPLER, NEVER LABELS (pre3; audio_drain_fg +
 audio_feed). Production proof (2026-07-13, live grids): the mv audio-follow

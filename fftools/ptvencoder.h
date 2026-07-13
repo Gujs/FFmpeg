@@ -366,6 +366,12 @@ typedef struct AudioState {
     int              glue_log_win_n;                  /* verdict lines emitted this window */
     int              glue_supp_n;                     /* verdicts suppressed this window (still applied) */
     int64_t          glue_supp_net_us;                /* net label movement of the suppressed verdicts */
+    /* 1.0.1-pre5 shared-flush expected-step handshake (D1): registration slot this track reads.
+     * Demux thread writes (value first, deadline last, release); audio thread acquires the
+     * deadline then reads the value, and clears the deadline on consume/expiry. NULL = unwired.
+     * See PTV_PAIR_EXPECT_* in this header for semantics. */
+    _Atomic int_least64_t *glue_exp_step;             /* registered expected label step (us) */
+    _Atomic int_least64_t *glue_exp_dl;               /* wall-us deadline; 0 = no registration */
     /* v0.9.16.3 [PTV-ANCHOR] — birth-relationship observability (Zimbo-class startup offsets). */
     int              anchor_drop_pre;                 /* frames dropped because content preceded h0 */
     int              anchor_drop_ring;                /* pre-h0 ring overflow drops (oldest evicted) */
@@ -418,8 +424,18 @@ typedef struct PassStream {
  * VIDEO-derived offset (see the decision tree in ptv_disc_flush). Sized for the live evidence
  * (Curiosity 2026-07-13: video and audio crossed 0.6s apart -> two partial flushes ~0.6s apart
  * after the 500ms buffer timeout) with wide margin, yet far below the spacing of independent
- * jumps (few/hour worst case). A false pairing is benign by construction: the A-vs-V offset
- * difference routes to the audio CONTENT path, which converges to the source's alignment. */
+ * jumps (few/hour worst case). THE ACTUAL FALSE-PAIRING GUARANTEE (pre5 — the original "benign
+ * by construction" claim was falsified by review: an inherited offset costs an aresample
+ * convergence PROPORTIONAL to the inherited-vs-own disagreement, i.e. UNBOUNDED, and the
+ * fx-dbl re-inherit destroyed ~17s of audio): each stream can inherit/apply the event's offset
+ * AT MOST ONCE per window (pair_has, checked at 3a) and the window CLOSES as soon as every
+ * flowing dense audio stream has applied it — so an independent audio wobble AFTER the event
+ * completes can never re-inherit a stale offset. What remains inherently ambiguous is a
+ * video-only crossing followed by an INDEPENDENT first audio crossing inside the window: that
+ * is indistinguishable from the genuine Curiosity ordering by construction, and the inherit
+ * then costs an audible aresample convergence of the disagreement. The window/eps/pair_has
+ * checks bound WHEN a false pairing can happen (first application per stream per window),
+ * not its size. */
 #define PTV_PAIR_WINDOW_US       (5 * AV_TIME_BASE)
 /* Shared-flush equality band: a V-vs-A offset disagreement at or below this is flush BOOKKEEPING
  * (duration-estimate overhang ~1 frame, trailing-OLD discard holes ~100-400ms of interleave), NOT
@@ -432,6 +448,25 @@ typedef struct PassStream {
  * to the audio content path. Half the LAYERA jump threshold, so a genuine >1s-delta pairing whose
  * streams disagree by more than this always engages. */
 #define PTV_PAIR_EPS_US          (500 * 1000)
+/* 1.0.1-pre5 demux->audio expected-step handshake (the D1 fix): when a shared flush routes an
+ * A-vs-V mismatch to the audio content path, the demux thread REGISTERS the step it just put
+ * into that track's label stream (value + wall deadline, atomics — demux writes, audio thread
+ * reads). AGLUE consumes a matching arriving step as a REAL alignment step: it must be APPLIED
+ * (aresample converges content to the new labels), never relabel-ERASED — the erase is exactly
+ * what re-broke the invariant for backward mismatches in (-1000ms,-500ms) (mirror-signed
+ * events: video jumping further forward than audio). Plain source backward steps carry no
+ * registration and keep the 0.9.16.4 relabel-erase rule.
+ *   TTL: AGLUE sees the seam within packet-queue latency (~1-2s); 10s is generous while keeping
+ *   the value-match collision window (an unrelated source step of similar size arriving first)
+ *   negligible. A stale registration expires silently.
+ *   Match window is ASYMMETRIC around the registered value: flush-borne steps (same-cycle /
+ *   inherit) arrive EXACT to within duration-estimate noise (measured -32..0ms), but a
+ *   retro-corrected step rides the first normal-path packet after the flush and MERGES with the
+ *   flush's own trailing-OLD discard hole, which is always FORWARD (measured +456ms on the
+ *   ordering fixture) — hence [-LO, +HI] = [-250ms, +500ms] of the registered value. */
+#define PTV_PAIR_EXPECT_TTL_US   (10 * AV_TIME_BASE)
+#define PTV_PAIR_EXPECT_LO_US    (250 * 1000)
+#define PTV_PAIR_EXPECT_HI_US    (500 * 1000)
 
 typedef struct PtvDiscPacket {
     AVPacket *pkt;
@@ -448,12 +483,20 @@ typedef struct PtvDiscStreamState {
     int64_t new_timeline_base;     /* this stream's first DTS in new timeline (per-cycle) */
     int     has_old_base;
     int     has_new_base;
-    /* 1.0.1-pre4 shared flush: what offset this (audio) stream had applied at its flush within
-     * the current pairing window — read by a later video-crossing flush of the SAME event to
-     * retro-correct the stream onto the video-defined timeline. Persists across cycles; cleared
-     * when the pairing window closes. */
+    /* 1.0.1-pre4 shared flush (semantics tightened pre5 — the D2 re-inherit fix): what offset
+     * this (audio) stream applied within the current pairing window, and HOW:
+     *   pair_has  = 1 once the stream applied the event's FINAL offset (video-defined, or
+     *               band-equal to it). Consulted at 3a: a stream that already applied can NOT
+     *               inherit again — its next crossing is a new independent event (fx-dbl: the
+     *               -2s wobble 2s after a mirror event re-inherited -14.98s and destroyed ~17s
+     *               of audio). Also drives the completion close of the window.
+     *   pair_prov = 1 while the stream holds a PROVISIONAL own offset (audio crossed before
+     *               video defined the timeline) — the only state the video-crossing flush (2d)
+     *               retro-corrects. Cleared (-> pair_has) by the retro-correct.
+     * Persist across cycles; cleared when the pairing window closes. */
     int64_t pair_applied_us;
     int     pair_has;
+    int     pair_prov;
 } PtvDiscStreamState;
 
 typedef struct PtvDiscBuf {
@@ -493,6 +536,11 @@ typedef struct DemuxArgs {
     int                   vstream;
     int                   astream[PTV_MAX_AUDIO]; /* input stream feeding each audio_q */
     int                   n_audio;
+    /* 1.0.1-pre5 shared-flush expected-step handshake (D1): per transcoded track, the slot the
+     * flush registers into when it routes an A-vs-V mismatch to that track's content path
+     * (storage lives in Input; AudioState holds the read side). Indexed like audio_q/astream. */
+    _Atomic int_least64_t *aglue_exp_step[PTV_MAX_AUDIO];
+    _Atomic int_least64_t *aglue_exp_dl[PTV_MAX_AUDIO];
     int                   drop;          /* non-blocking + drop on full (network input) */
     PassStream           *pass;          /* copy-passthrough: extra audio, subs, data */
     int                   n_pass;
@@ -570,6 +618,12 @@ typedef struct Input {
     int64_t              *wrap_last;         /* per stream: last RAW ts (wrap detection) */
     int64_t              *wrap_wall_last;    /* per stream: wall-clock (us) of last packet (gap-vs-splice discriminator) */
     PtvDiscBuf            disc;              /* legacy-0004 buffer-classify-discard state (used only when g_layera) */
+    /* 1.0.1-pre5 shared-flush expected-step handshake storage (D1) — one slot per GLOBAL
+     * transcoded track index (only the tracks sourced from this input are wired). Demux thread
+     * writes, that track's audio thread reads (the house_skew/disturb_epoch publish idiom,
+     * hardened with atomics because value+deadline are a pair). Zero-init = no registration. */
+    _Atomic int_least64_t aglue_exp_step[PTV_MAX_AUDIO];
+    _Atomic int_least64_t aglue_exp_dl[PTV_MAX_AUDIO];
     DecodeCtx             dc;
     DemuxArgs             da;
     pthread_t             th_demux, th_decode;

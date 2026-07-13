@@ -694,7 +694,12 @@ static int audio_feed(AudioState *a, AVFrame *frame)
          * Steps above g_aglue_max_ms belong to the >1s discontinuity layer (demux_unwrap/
          * LAYERA) — log and stand aside. Detection runs on RAW labels BEFORE the AVLOCK
          * house_skew injection below, so LAYERA flushes / house_skew actuation never
-         * masquerade as source steps. */
+         * masquerade as source steps.
+         * 1.0.1-pre5 EXCEPTION (D1): a step the demux shared flush REGISTERED for this track
+         * (ptv_pair_expect) is not a source relabel — it is the A-vs-V jump difference the
+         * flush deliberately routed here. Backward-and-registered is APPLIED (labels kept,
+         * aresample drops content to converge onto the source's post-event alignment), never
+         * erased; unregistered steps keep the rules above unchanged. */
         if (g_aglue_ms > 0 && frame->pts != AV_NOPTS_VALUE) {
             int64_t raw_us = av_rescale_q(frame->pts, a->ist_tb, AV_TIME_BASE_Q);
             int64_t now_wc = av_gettime_relative();
@@ -702,10 +707,42 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                 int64_t step = raw_us - (a->glue_raw_last_us + a->glue_raw_dur_us);
                 if (llabs(step) > (int64_t)g_aglue_ms * 1000) {
                     int64_t wall_gap = now_wc - a->glue_wall_last_us;
+                    /* 1.0.1-pre5 (D1) shared-flush expected-step handshake: the demux flush
+                     * registered the A-vs-V mismatch it routed into THIS track's labels
+                     * (ptv_pair_expect). A matching arriving step is a REAL alignment step —
+                     * it must be APPLIED (aresample converges content onto the new labels),
+                     * never relabel-ERASED: erasing it re-bakes the mismatch the shared offset
+                     * existed to avoid (the fx-mir2 class, backward steps in (-1000,-500)ms).
+                     * Match = within [-PTV_PAIR_EXPECT_LO_US, +PTV_PAIR_EXPECT_HI_US] of the
+                     * registered value before the deadline (see ptvencoder.h for the window
+                     * rationale); consumed one-shot. Plain source steps (no registration, or
+                     * value/deadline miss) keep every pre-existing rule byte-identical. */
+                    int exp_hit = 0;
+                    int64_t exp_step = 0;
+                    if (a->glue_exp_dl) {
+                        int64_t dl = atomic_load_explicit(a->glue_exp_dl, memory_order_acquire);
+                        if (dl) {
+                            exp_step = atomic_load_explicit(a->glue_exp_step, memory_order_relaxed);
+                            if (now_wc <= dl &&
+                                step - exp_step >= -PTV_PAIR_EXPECT_LO_US &&
+                                step - exp_step <=  PTV_PAIR_EXPECT_HI_US) {
+                                atomic_store_explicit(a->glue_exp_dl, 0, memory_order_relaxed);  /* consumed */
+                                exp_hit = 1;
+                            } else if (now_wc > dl) {
+                                atomic_store_explicit(a->glue_exp_dl, 0, memory_order_relaxed);  /* expired */
+                            }
+                        }
+                    }
                     if (llabs(step) > (int64_t)g_aglue_max_ms * 1000) {
                         av_log(NULL, AV_LOG_WARNING,
-                               "[PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms above %dms cap — left to the discontinuity layer\n",
-                               a->dbg_k, a->dbg_in, step / 1000, g_aglue_max_ms);
+                               "[PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms above %dms cap — left to the discontinuity layer%s\n",
+                               a->dbg_k, a->dbg_in, step / 1000, g_aglue_max_ms,
+                               exp_hit ? " (matches the shared-flush expected step — aresample converges it)" : "");
+                    } else if (exp_hit) {
+                        av_log(NULL, AV_LOG_WARNING,
+                               "[PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms matches the shared-flush expected step %+"PRId64"ms "
+                               "— REAL A-vs-V alignment step, APPLIED (aresample converges; not erased)\n",
+                               a->dbg_k, a->dbg_in, step / 1000, exp_step / 1000);
                     } else {
                         /* 0.9.18: verdict-LOG rate limit. An Azorse-class label flood (source labels
                          * striding ~6x content = one verdict per frame, ~8 lines/s indefinitely) must

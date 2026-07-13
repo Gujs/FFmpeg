@@ -40,7 +40,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.0.1-pre4"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.0.1-pre5"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -161,9 +161,12 @@ int     g_layera_fullskip = 0;
  * for 8.5h with every counter clean. Now dense flushes within PTV_PAIR_WINDOW_US share ONE
  * offset — VIDEO's delta defines the timeline (video is the house-clock anchor; prog_off/SCTE
  * ride the video timeline) — and the A-vs-V jump difference is NOT erased: it surfaces as an
- * audio label step that the CONTENT machinery converges (AGLUE gap-pad within its cap;
- * above it aresample=async hard pad/drop — bounded, and exactly what a stateless player
- * shows). REDUCES to per-stream-identical (byte-identical logs) behavior when the deltas
+ * audio label step that the CONTENT machinery converges (pre5: the flush REGISTERS the step
+ * per track — ptv_pair_expect — so AGLUE APPLIES it in every direction: forward = aresample
+ * pads, backward = aresample drops, above the AGLUE cap = aresample=async hard pad/drop —
+ * bounded, and exactly what a stateless player shows; AGLUE's backward relabel-ERASE would
+ * otherwise re-bake sub-1s backward mismatches, the pre4 D1 defect). REDUCES to
+ * per-stream-identical (byte-identical logs) behavior when the deltas
  * are equal: offset disagreement at or below PTV_PAIR_EPS_US (500ms) is flush bookkeeping
  * (duration-estimate overhang, trailing-OLD discard holes), and there the production-proven
  * audio-preferred butt-joint is kept exactly (TruBLU symmetric rewinds unchanged — the
@@ -1534,6 +1537,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         as[k].af_applied_us = 0;
         as[k].dbg_k = k; as[k].dbg_in = asrc_in[k]; as[k].dbg_first_out = AV_NOPTS_VALUE;
         as[k].glue_raw_last_us = AV_NOPTS_VALUE;         /* [PTV-AGLUE] no continuity reference yet */
+        as[k].glue_exp_step = &inputs[asrc_in[k]].aglue_exp_step[k];   /* pre5 (D1): shared-flush expected-step slot */
+        as[k].glue_exp_dl   = &inputs[asrc_in[k]].aglue_exp_dl[k];
         as[k].acomp_exp_us = AV_NOPTS_VALUE;             /* [PTV-ACOMP] no expected-pts reference yet */
         as[k].tick_dur_us = av_rescale(1000000, out_fps.den, out_fps.num);  /* 1.0.1: house tick = the PLL's vlag quantum (one house clock for all slots) */
         for (r = 0; r < n_rung; r++) {
@@ -1558,7 +1563,12 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         }
         d->n_audio = 0;
         for (k = 0; k < n_audio; k++)
-            if (asrc_in[k] == kk) { d->audio_q[d->n_audio] = audio_q[k]; d->astream[d->n_audio] = asrc[k]; d->n_audio++; }
+            if (asrc_in[k] == kk) {
+                d->audio_q[d->n_audio] = audio_q[k]; d->astream[d->n_audio] = asrc[k];
+                d->aglue_exp_step[d->n_audio] = &inputs[kk].aglue_exp_step[k];   /* pre5 (D1): write side of the */
+                d->aglue_exp_dl[d->n_audio]   = &inputs[kk].aglue_exp_dl[k];     /* expected-step handshake      */
+                d->n_audio++;
+            }
     }
 
     av_log(NULL, AV_LOG_INFO,
