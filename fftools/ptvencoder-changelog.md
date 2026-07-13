@@ -7,6 +7,64 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(6) TRACK STEERS THROUGH THE RESAMPLER, NEVER LABELS (pre3; audio_drain_fg +
+audio_feed). Production proof (2026-07-13, live grids): the mv audio-follow
+PLL's TRACK integrator actuated by RE-STAMPING output labels (af_applied_us
+moved `want = opts + applied` every frame). The PCM stayed byte-clean, but the
+output AAC pts spacing stretched by +19..+158 ms/min during integration
+episodes — and PTS-honoring players chase that drift with their own rate
+correctors = clearly audible warble ("guitar-effect distortion",
+owner-confirmed at the exact drift-episode timestamps). rc builds (no TRACK)
+measure EXACTLY 21.333ms spacing forever; pre2 with PTV_NO_PLL_TRACKUP=1
+(TRACK dead) is also flat and owner-confirmed clean. Conclusion: label
+re-stamping is a FORBIDDEN actuator. pre3 ports the single-input AVLOCK
+mechanism to the mv TRACK: the rate-clamped integral trim accumulates into a
+per-track af_steer_us added to the pts of frames FED INTO the -af graph, so
+aresample=async realizes it as bounded sample insert/drop (10ms/s clamp, well
+under async=1000's ~20.8ms/s soft authority and far under min_hard_comp —
+inaudible), while output stamping stays `want = opts + af_applied_us` with
+af_applied_us changing ONLY at ACQUIREs (discrete, logged, rare): between
+acquires the label stream is perfectly uniform. The measurement loop removes
+the injected steer from the sink pts before vring pairing (like single-input
+removes house_skew), so it reads the TRUE post-steer offset;
+d(offset)/d(steer) = −1 (documented at the pairing site). The pre2
+[PTV-TRACKUP] direction-aware anti-windup is retired with the label actuator
+(TRACK no longer touches `want`, so the monotonic-guard pin cannot eat the
+integrator). PTV_NO_PLL_TRACKUP=1 now disables the steer-TRACK entirely
+(acquire-only, labels flat, zero steer) — the grids' current production mute
+keeps its exact meaning. (B) vlag bias audit — NO centering change shipped: the
+vring writer records first-display at the tick boundary (compositor
+`vring_put(..., mv_tick_us(c, tick))`), but the residence pop gate already
+centers display quantization around the due schedule (a frame pops at the
+first tick within HALF a tick of its due time: `hnow + half < res_due` holds
+it back, so display−due ∈ [−T/2, +T/2)), and h0-at-display zeroes the anchor
+frame's vlag exactly. Empirically (3 identical TRACK-muted clean 2x1 runs):
+the static offset is run-dependent (+16 / +50 / +60-70 ms), not a constant
++half-tick — it is anchor-phase + buffer-depth DC, i.e. REAL display latency
+the audio should (and now does) follow, plus slow ±1-tick quantization wander
+that the ACQUIRE tick floor (1.5 ticks) rejects and the steer trims as a
+bounded, sub-perceptual rate. (C)
+[PTV-ACOMP] visibility: always-on app-layer proxy for swr hard-compensation
+triggers — a graph-input pts step >25ms (post-AGLUE, post-AVLOCK/steer: the
+stream the resampler actually sees) logs `[PTV-ACOMP] aN(inN) input pts step
++Xms — swr hard compensation likely (click risk)`, rate-limited ~1/10s per
+track, with a cumulative per-track counter surfaced as acomp= on the PLL diag
+line. Gates (A/B vs pre2, 2x1 jitter grid): pts-spacing flatness 20min — pre3
+worst 30s-bucket mean dev +0.0005us/frame (startup bucket +0.95us from one
++1.4ms anchor-settle step, present in both builds) with the steer demonstrably
+active (a1 steer ramped to +1.2s following the stall-jitter vlag); pre2 =
+18/40 buckets on a0 and 40/40 on a1 over the 5us bar, worst +131us/frame ≈
++369ms/min stretch — the production warble signature reproduced and
+eliminated. Shifted-source (+300ms): converges via ACQUIRE + steer trim,
+output labels flat (worst bucket +0.95us), 0 clicks in the quiet-block scan
+(pre2 same fixture: 4 alternating pad/drop ACQUIREs + label stretch to
++69us/frame). item2 count 300s: 0 ACQUIREs (bar ≤9, no alternation). item2
+genuine: 8s-outage bank captured in 2 ACQUIREs, flashbeep tail median +0.3ms.
+tier-1 = the 4 known legacy fails only. ACOMP fixture (+50ms mid-stream audio
+pts step): fires exactly once at the step, silent on the clean sibling track
+and on clean smooth runs (the only organic firings were real AGLUE GAP
+loop-seam pads — correct).
+
 (5) [PTV-TRACKUP] DIRECTION-AWARE TRACK ANTI-WINDUP (audio_drain_fg, B3 TRACK
 branch): the 1.0.1-pre1 grid soak showed item (2)'s dead-band killed the 42ms
 quantization-snap class but NOT the acquire rate (~41-44/h, strict pad/drop

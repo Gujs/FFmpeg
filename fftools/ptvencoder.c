@@ -40,7 +40,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.0.1-pre2"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.0.1-pre3"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -236,7 +236,7 @@ int     g_af_anchor = 1;
  * Sign proven: d(offset)/d(applied) < 0 ⇒ to raise a negative offset (audio late), advance (drop). */
 int     g_avsync_pll = 1;             /* B3 closed-loop A/V controller DEFAULT-ON (v0.6.20, box-validated on cor-2 RAV + live-transcoder grids). PTV_NO_AVSYNC_PLL reverts to the open-loop B1 follow. Multiview transcoded audio only; single-input + copy paths byte-identical regardless. */
 int     g_acq_instant = 0;            /* 1.0.1 (PTV_ACQ_INSTANT=1 reverts): ACQUIRE needs the |EMA offset| above threshold for 3 CONSECUTIVE debounce windows (and the threshold is floored at 1.5 house ticks) — the vlag measurement is tick-quantized, so the single-window fire snapped on its own quantization noise (live grids: ~939-1511 ACQUIREs/22h alternating ±42ms pad/drop). */
-int     g_pll_trackup = 1;            /* 1.0.1 [PTV-TRACKUP] (PTV_NO_PLL_TRACKUP=1 reverts): direction-aware TRACK anti-windup — a positive (delay-direction) integral step is allowed while the output is pinned at the monotonic floor. The symmetric N3 block made the pin ABSORBING (the first down-step's sub-frame label deficit never decays, guard clamps every frame, integrator dead for the run) → all corrections fell to whole-frame ACQUIREs → the live grids' sustained alternating pad/drop limit cycle (~41-44/h). */
+int     g_pll_trackup = 1;            /* 1.0.1-pre3 (PTV_NO_PLL_TRACKUP=1 disables TRACK entirely = acquire-only, labels flat — the operators' production mute keeps its meaning): TRACK now steers through the RESAMPLER (af_steer_us into the graph-input pts, AVLOCK-style) instead of re-stamping output labels. pre2's label-TRACK stretched output AAC pts spacing up to +158ms/min during integration episodes → PTS-honoring players rate-chased it = audible warble (production 2026-07-13). The pre2 [PTV-TRACKUP] direction-aware anti-windup is retired with the label actuator. */
 int64_t g_pll_testnoise_us = 0;       /* TEST-ONLY (default off): inject a ±N ms square wave (flips ~every 3.2s) into the measured offset to REPRODUCE the box limit cycle locally (local sources are clean). PTV_PLL_TESTNOISE_MS sets it; never set in production. */
 /* v0.9.14 AUTO-BANK (the owner-agreed auto-cushion escalation, cap 12s). The 0.9.10 adaptive
  * cushion lives in frame_q (DECODED frames) and maxes at ~4s — structurally too shallow for
@@ -1515,6 +1515,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         as[k].af_applied_us = 0;
         as[k].dbg_k = k; as[k].dbg_in = asrc_in[k]; as[k].dbg_first_out = AV_NOPTS_VALUE;
         as[k].glue_raw_last_us = AV_NOPTS_VALUE;         /* [PTV-AGLUE] no continuity reference yet */
+        as[k].acomp_exp_us = AV_NOPTS_VALUE;             /* [PTV-ACOMP] no expected-pts reference yet */
         as[k].tick_dur_us = av_rescale(1000000, out_fps.den, out_fps.num);  /* 1.0.1: house tick = the PLL's vlag quantum (one house clock for all slots) */
         for (r = 0; r < n_rung; r++) {
             as[k].mux_q[r] = rung[r].mux_q;
@@ -2114,7 +2115,7 @@ int main(int argc, char **argv)
      * see g_af_acquire_us / g_af_rate_us */
     if (getenv("PTV_NO_AVSYNC_PLL")) g_avsync_pll = 0;     /* B3 closed-loop is DEFAULT-ON (v0.6.20); this reverts to the open-loop B1 content-anchored follow. (PTV_AVSYNC_PLL=1 still honored implicitly = the default.) */
     if (getenv("PTV_ACQ_INSTANT")) g_acq_instant = 1;      /* 1.0.1: revert ACQUIRE to single-window fire (no 3-consecutive-window sustain; the tick floor stays) */
-    if (getenv("PTV_NO_PLL_TRACKUP")) g_pll_trackup = 0;   /* 1.0.1: revert [PTV-TRACKUP] to the symmetric (both-signs-blocked) TRACK anti-windup */
+    if (getenv("PTV_NO_PLL_TRACKUP")) g_pll_trackup = 0;   /* 1.0.1-pre3: disable the steer-TRACK entirely (acquire-only; labels flat, no steer — the production mute) */
     /* 0.9.18.7: PTV_PLL_EMA_SHIFT (7) / PTV_PLL_TAU_MS (5000) / PTV_PLL_ACQUIRE_MS (40) /
      * PTV_PLL_ACQUIRE_N (32) / PTV_PLL_REFRACTORY_MS (12000) / PTV_PLL_NOISE_K (3) /
      * PTV_PLL_DEV_SHIFT (9) internalized — see the g_pll_* declarations */

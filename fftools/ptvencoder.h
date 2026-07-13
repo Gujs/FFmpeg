@@ -329,6 +329,22 @@ typedef struct AudioState {
     int              pll_acq_count;                   /* acquires fired this run (startup-k cap + gate assertion) */
     int              pll_drop, pll_pad;               /* pending one-shot acquire: frames to drop (advance) / pad (delay), on the B1 base */
     int64_t          pll_guard_fires;                 /* monotonic-guard activations (windup observability) */
+    /* 1.0.1-pre3 — TRACK steers through the RESAMPLER, never labels. af_steer_us is the
+     * accumulated integral trim, added to the pts of frames FED INTO the -af graph (the
+     * single-input AVLOCK injection style): aresample=async realizes it as bounded content
+     * stretch/squeeze (≤ async samples/s) while the OUTPUT label stream stays perfectly
+     * dense — label re-stamping is a forbidden actuator (production 2026-07-13: pre2's
+     * label-TRACK stretched output AAC pts spacing up to +158ms/min during integration
+     * episodes; PTS-honoring players chased the drift with their own rate correctors =
+     * audible warble). Written and read on the audio thread only (drain writes, feed reads). */
+    int64_t          af_steer_us;                     /* cumulative TRACK trim injected into graph-input pts (us) */
+    /* 1.0.1-pre3 [PTV-ACOMP] — app-layer proxy for swr hard-compensation triggers: a graph-
+     * input pts step beyond ~min_hard_comp is realized by aresample as an instantaneous
+     * sample insert/drop (click risk), invisibly. Track the expected next input pts and log
+     * (rate-limited) when the actual deviates. */
+    int64_t          acomp_exp_us;                    /* expected next graph-input pts (us); NOPTS until first frame */
+    int64_t          acomp_cnt;                       /* input pts steps >25ms seen (hard-comp proxy count) */
+    int64_t          acomp_log_us;                    /* log rate limit: last [PTV-ACOMP] line (wall) */
     /* v0.9.16.x lip-sync instrumentation (PTV_DIAG): where do audio label steps get eaten?
      * [PTV-ASTEP] fires on any in-pts (pre-graph) or sink-pts (post-graph) discontinuity;
      * [PTV-AFLOW] cumulative in/out sample counters — a graph CONTENT drop/pad shows as a

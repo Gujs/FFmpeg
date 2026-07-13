@@ -242,34 +242,31 @@ static int audio_drain_fg(AudioState *a)
                         a->pll_refractory = (int)(g_pll_refractory_us / frame_us);  /* v0.6.21: HARD ~12s refractory (was g_pll_acquire_n ≈0.68s) — breaks the self-excited limit cycle */
                         a->pll_dbnc = 0; a->pll_dbnc_ref = a->pll_ema;
                         if (a->pll_drop > 0) { a->pll_drop--; av_frame_unref(filt); continue; }  /* drop the current frame too */
-                    } else {
-                        /* TRACK — type-1 integral trim, rate-clamped, NO dead zone. Conditional-integration
-                         * anti-windup: don't integrate while the monotonic guard would saturate (N3). */
-                        int64_t pre  = opts + av_rescale(a->af_applied_us, a->out_rate, 1000000);
+                    } else if (g_pll_trackup) {
+                        /* TRACK — 1.0.1-pre3: RESAMPLER STEER, never labels. pre2's TRACK actuated by
+                         * re-stamping output labels (af_applied_us moved `want` every frame): the PCM
+                         * stayed byte-clean but the output AAC pts spacing stretched up to +158ms/min
+                         * during integration episodes, and PTS-honoring players chased that with their
+                         * own rate correctors = audible warble (owner-confirmed at the exact drift-
+                         * episode timestamps; rc builds with no TRACK measure EXACTLY 21.333ms spacing
+                         * forever). Label re-stamping is a forbidden actuator. Instead accumulate the
+                         * same rate-clamped integral trim into af_steer_us, which audio_feed adds to
+                         * the pts of frames FED INTO the -af graph (the single-input AVLOCK injection
+                         * style): aresample=async realizes it as bounded sample insert/drop (async=1000
+                         * → ≤20.8ms/s; our clamp is 10ms/s, safely below, and per-frame steps ~213us
+                         * stay far under min_hard_comp so only SOFT compensation runs — inaudible).
+                         * Output labels stay perfectly dense between ACQUIREs (af_applied_us now
+                         * changes ONLY there — discrete, logged, rare). The pre2 [PTV-TRACKUP]
+                         * anti-windup machinery is retired with the label actuator: TRACK no longer
+                         * touches `want`, so the monotonic-guard pin cannot eat the integrator.
+                         * PTV_NO_PLL_TRACKUP=1 now disables TRACK entirely (acquire-only — the
+                         * operators' current production mute keeps its meaning: labels flat, no steer). */
                         int64_t step = a->pll_ema * frame_us / g_pll_tau_us;        /* integral: move ema/τ per frame */
                         int64_t lim  = (int64_t)g_af_rate_us * nb / a->out_rate;    /* rate clamp (us) */
                         if (lim < 1) lim = 1;
                         if (step >  lim) step =  lim;
                         if (step < -lim) step = -lim;
-                        /* 1.0.1 [PTV-TRACKUP] (PTV_NO_PLL_TRACKUP=1 reverts): DIRECTION-AWARE anti-windup.
-                         * The N3 check blocked BOTH signs while `want` sat below the dense line — but the
-                         * pin is an ABSORBING state: TRACK's first down-step leaves want one rate-step
-                         * (~213us; up to the re-anchor amount, 200-300ms, after an h0 re-anchor) under
-                         * af_last_out+nb, and since both sides advance at the same rate the deficit NEVER
-                         * decays, so the guard clamps every frame and TRACK is dead for the rest of the
-                         * run (measured: guard +1/frame from the first overshoot on, applied frozen
-                         * between fires). With the integrator dead, every later correction — including
-                         * slow vlag dup-ramps TRACK exists to absorb — fell to whole-frame ACQUIREs whose
-                         * ≤½-frame residual ±1-tick vlag quantization re-crossed the threshold from the
-                         * other side = the live grids' sustained alternating pad/drop limit cycle
-                         * (~41-44 ACQUIREs/h). A POSITIVE (delay-direction) step while pinned is not
-                         * windup: it repays the label deficit (a few frames at the rate clamp), output
-                         * labels respond, the loop closes. Negative steps while pinned stay blocked
-                         * (true windup — output cannot be advanced without dropping content; that
-                         * remains ACQUIRE's job). */
-                        if ((g_pll_trackup && step > 0) ||
-                            !(a->af_out_set && pre < a->af_last_out + nb))
-                            a->af_applied_us += step;
+                        a->af_steer_us += step;
                     }
                     if (a->pll_refractory > 0) a->pll_refractory--;   /* ticks on every EMITTED (non-dropped) frame */
                     while (a->pll_pad > 0) {                  /* PAD: emit pending one-shot silence on THIS base before the real frame */
@@ -390,9 +387,19 @@ static int audio_drain_fg(AudioState *a)
                 int64_t out_v, msrc;
                 /* single-input injects house_skew into the graph INPUT → the buffersink pts carries it;
                  * remove it to recover the true source content for the video pairing. Multiview
-                 * audio-follow feeds content-aligned input (no injection) → use src_abs_us directly. */
+                 * audio-follow (pre3) injects af_steer_us the same way — remove that too, so the
+                 * measurement reads the TRUE post-steer offset instead of pairing against a content
+                 * value already shifted by the actuator.
+                 * LOOP SIGN (pre3 steer): out_a(true content C) = (C + steer_realized) − h0 + applied,
+                 * so alag = steer_realized + applied and offset = vlag − alag ⇒ d(offset)/d(steer) = −1
+                 * (same convention as the old label `applied`: steer += (+offset·frame/τ) drives the
+                 * measured offset → 0). During a steer transient the sink labels lag the commanded
+                 * value by the pending (unrealized) part — bounded by the 10ms/s rate clamp vs the
+                 * resampler's 20.8ms/s authority, so the pairing error decays within a second. */
                 if (!(a->multiview && g_audio_follow) && a->house_skew)
                     content -= *a->house_skew;
+                else if (a->multiview && g_audio_follow && g_avsync_pll)
+                    content -= a->af_steer_us;
                 if (vring_lookup(a->vring, content, &out_v, &msrc) == 0) {
                     int64_t vlag   = out_v    - (msrc    - h0_us);   /* video realized output − content (at msrc) */
                     int64_t alag   = out_a_us - (content - h0_us);   /* audio realized output − content (at content) */
@@ -481,11 +488,12 @@ static int audio_drain_fg(AudioState *a)
                     if (mv && g_avsync_pll)  /* B3 closed loop: measured offset + integrator state + acquire/guard counts */
                         av_log(NULL, AV_LOG_INFO,
                             "[PTV-AVSYNC] a%d(in%d) lipsync=%+"PRId64"ms | offset=%s (vlag=%+"PRId64"ms alag=%+"PRId64"ms) "
-                            "pll[ema=%+"PRId64"ms dev=%"PRId64"ms applied=%+"PRId64"ms acq=%d guard=%"PRId64" drop=%"PRId64"ms pad=%"PRId64"ms]"
+                            "pll[ema=%+"PRId64"ms dev=%"PRId64"ms applied=%+"PRId64"ms steer=%+"PRId64"ms acq=%d guard=%"PRId64" drop=%"PRId64"ms pad=%"PRId64"ms acomp=%"PRId64"]"
                             "  [offset<0 = audio late]\n",
                             a->dbg_k, a->dbg_in, lshead / 1000, m, a->av_vlag_us / 1000, a->av_alag_us / 1000,
-                            a->pll_ema / 1000, a->pll_dev / 1000, a->af_applied_us / 1000, a->pll_acq_count, a->pll_guard_fires,
-                            a->af_acq_drop_us / 1000, a->af_acq_pad_us / 1000);
+                            a->pll_ema / 1000, a->pll_dev / 1000, a->af_applied_us / 1000, a->af_steer_us / 1000,
+                            a->pll_acq_count, a->pll_guard_fires,
+                            a->af_acq_drop_us / 1000, a->af_acq_pad_us / 1000, a->acomp_cnt);
                     else if (mv)         /* multiview (open-loop B1): lip-sync + measured offset + the per-slot actuator state */
                         av_log(NULL, AV_LOG_INFO,
                             "[PTV-AVSYNC] a%d(in%d) lipsync=%+"PRId64"ms | offset=%s (vlag=%+"PRId64"ms alag=%+"PRId64"ms) "
@@ -744,6 +752,37 @@ static int audio_feed(AudioState *a, AVFrame *frame)
         if (g_avlock && a->house_skew && !(a->multiview && g_audio_follow) && frame->pts != AV_NOPTS_VALUE) {
             int64_t sk = *a->house_skew;
             if (sk) frame->pts += av_rescale_q(sk, AV_TIME_BASE_Q, a->ist_tb);
+        }
+        /* 1.0.1-pre3: multiview audio-follow PLL — inject TRACK's accumulated steer into the
+         * graph-input pts (the AVLOCK style above), so aresample=async realizes the trim as
+         * bounded content stretch/squeeze while output labels stay dense. Written by the same
+         * thread in audio_drain_fg (≤ ~213us/frame, rate-clamped), so the input pts stream
+         * stays strictly monotonic (frame spacing ~21333us dwarfs any per-frame steer delta)
+         * and never trips min_hard_comp on its own. */
+        if (a->multiview && g_audio_follow && g_avsync_pll && a->af_steer_us &&
+            frame->pts != AV_NOPTS_VALUE)
+            frame->pts += av_rescale_q(a->af_steer_us, AV_TIME_BASE_Q, a->ist_tb);
+        /* 1.0.1-pre3 [PTV-ACOMP] — swr hard-compensation proxy (always-on, log rate-limited to
+         * ~1/10s per track). aresample=async realizes a graph-input pts step beyond
+         * min_hard_comp (~30ms in the production chain) as an INSTANTANEOUS sample insert/drop
+         * — a click risk with zero log lines of its own. Detect it at the graph door: track the
+         * expected next input pts (last pts + frame duration) and flag any ~25ms+ instantaneous
+         * deviation of the stream the resampler actually sees (post-AGLUE, post-AVLOCK/steer —
+         * a house_skew or LAYERA step that reaches swr counts, by design). */
+        if (frame->pts != AV_NOPTS_VALUE) {
+            int64_t inus = av_rescale_q(frame->pts, a->ist_tb, AV_TIME_BASE_Q);
+            if (a->acomp_exp_us != AV_NOPTS_VALUE && llabs(inus - a->acomp_exp_us) > 25000) {
+                int64_t nowc = av_gettime_relative();
+                a->acomp_cnt++;
+                if (a->acomp_log_us == 0 || nowc - a->acomp_log_us >= 10000000) {
+                    a->acomp_log_us = nowc;
+                    av_log(NULL, AV_LOG_WARNING,
+                           "[PTV-ACOMP] a%d(in%d) input pts step %+"PRId64"ms — swr hard compensation likely (click risk) (total %"PRId64")\n",
+                           a->dbg_k, a->dbg_in, (inus - a->acomp_exp_us) / 1000, a->acomp_cnt);
+                }
+            }
+            a->acomp_exp_us = inus + (frame->sample_rate > 0 ?
+                av_rescale(frame->nb_samples, 1000000, frame->sample_rate) : 0);
         }
         if (g_diag && frame->pts != AV_NOPTS_VALUE) {   /* [PTV-ASTEP] pre-graph label-step detector */
             int64_t inus = av_rescale_q(frame->pts, a->ist_tb, AV_TIME_BASE_Q);

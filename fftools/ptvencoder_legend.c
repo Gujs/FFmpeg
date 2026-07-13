@@ -151,7 +151,10 @@ void ptv_print_log_legend(int full)
         "                 wall-clock is no evidence — the v0.9.16.3 lesson). PTV_AGLUE_MS=0 off\n"
         "  [PTV-ANCHOR]   (v0.9.16.3) birth A/V relationship: h0 (first video frame) + each\n"
         "                 audio track's first_audio-h0 offset and pre-anchor drop counts — a\n"
-        "                 startup-structural lip-sync offset is visible HERE, not in drift\n");
+        "                 startup-structural lip-sync offset is visible HERE, not in drift\n"
+        "  [PTV-ACOMP]    (1.0.1-pre3) graph-input audio pts step >25ms — aresample will hard-\n"
+        "                 compensate (instantaneous sample insert/drop, click risk); rate-limited\n"
+        "                 ~1/10s per track, cumulative count on the PLL diag line (acomp=)\n");
     av_log(NULL, AV_LOG_INFO,
         "health events (always-on):\n"
         "  [PTV-BURSTY]   per-minute delivery-stall status (count + worst gap + bank state) while a\n"
