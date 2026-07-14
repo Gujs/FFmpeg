@@ -7,6 +7,38 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(7c) LAYERA PARTNER-CROSSING DETECT — the escaped-step defect (pre6; demux
+loop). Live evidence (cor-3, 2026-07-14): JLTV — video +6.033s jump detected,
+video-only partial flush (applied −6.000); the partner AUDIO step (+6.5s)
+arriving at the window close NEVER produced a jump line — it escaped the
+discontinuity layer entirely, fell through AGLUE's >1000ms cap ("left to the
+discontinuity layer", which never took it) and hit aresample as a raw ~8s
+input-pts hard pad; measured output video−audio label spread +42.9s.
+Azorse_TV same day, same shape (V −39.4s back / A +7.1s fwd → +467ms
+audio-early). Mechanism, fixture-reproduced (fx-wclose = V−6.02s@115 /
+A+6.02s@115.35 over live UDP — the exact live signature: one jump line,
+"partial flush (only video crossed)", "[PTV-AGLUE] +6596ms above 1000ms cap",
+no second jump line, −6.0s added desync by silencedetect landmark
+accounting): a >1s jump on a SECOND stream arriving while the disc buffer is
+ACTIVE gets no detection (the !b->active gate) and is left to classification,
+which borrows the first stream's bases; on a mirror/asymmetric event the
+partner's post-jump position lands NEARER THE OLD base → its stepped packets
+are misclassified OLD and DELETED, and the per-packet continuity-ref update
+(last_dts_us) has already advanced onto the stepped timeline → post-flush the
+step is invisible to detection FOREVER. FIX = while the buffer is active, a
+dense stream with no new base whose OWN delta exceeds the 1s threshold AND
+whose borrowed classification would NOT tag it NEW gets its own bases
+recorded via ptv_disc_detect_jump — its stepped packets then classify NEW,
+the stream transitions, and the flush handles the event as both-crossed
+(tree 2b: video defines the timeline, the mismatch registered for the audio
+content path). Gated on the would-be misclassification, so every ordering
+classification already handles (TruBLU symmetric rewinds, forward-forward
+pairs — δ-swept 350/400/420/435/450/520ms incl. AAC-audio variants, all
+detected) keeps byte-identical behavior AND log lines. fx-wclose after the
+fix: jump-on-stream-1 line, single both-crossed flush (+6.040), expected
+step +12.492s registered and AGLUE-matched, silencedetect-verified 12.492s
+pad, added desync −20ms (source post-event shift S=+12.04s carried exactly).
+
 (7) LAYERA SHARED FLUSH — asymmetric-event invariant fix (pre4;
 ptv_disc_flush). THE INVARIANT (owner-mandated): "after any input event, the
 output's A/V alignment must equal the source's post-event alignment. Latency

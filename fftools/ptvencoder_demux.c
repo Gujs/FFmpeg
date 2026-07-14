@@ -1117,6 +1117,25 @@ void *demux_thread(void *arg)
                     b->buffer_start_time = av_gettime_relative();
                     if (d->disturb_epoch)   /* a real content discontinuity → arm the PLL re-acquire */
                         atomic_fetch_add_explicit(d->disturb_epoch, 1, memory_order_relaxed);
+                } else if (b->active && sidx < b->nb_streams &&
+                           !b->stream_state[sidx].has_new_base &&
+                           ptv_disc_classify(b, sidx, raw_dts) != 1 &&
+                           ptv_disc_detect_jump(d, b, sidx, raw_dts, last_dts)) {
+                    /* 1.0.1-pre6 partner-crossing detect (the JLTV/Azorse escape): a >1s jump on a
+                     * SECOND stream arriving while the buffer is active was left to classification,
+                     * which borrows the FIRST stream's bases — on a mirror/asymmetric event the
+                     * partner's post-jump position lands nearer the OLD base, so its stepped packets
+                     * were tagged OLD and DELETED, the flush stayed video-only ("partial"), and the
+                     * last_dts_us update below had already advanced this stream's continuity ref onto
+                     * the stepped timeline — after the flush the step was INVISIBLE to detection
+                     * forever and hit AGLUE/aresample as a raw multi-second input-pts step (measured
+                     * -6.0s added desync on the wclose fixture). Detecting it here records the
+                     * stream's OWN bases (detect_jump), so its stepped packets classify NEW against
+                     * them, the stream transitions, and the flush treats the event as both-crossed
+                     * (tree 2b: video defines the timeline, the A-vs-V difference is registered for
+                     * the audio content path). Gated on the borrowed classification NOT already
+                     * returning NEW, so orderings classification handles today (TruBLU symmetric,
+                     * same-direction pairs) keep byte-identical behavior and log lines. */
                 }
                 if (sidx < b->nb_streams)
                     b->stream_state[sidx].last_dts_us = raw_dts;
