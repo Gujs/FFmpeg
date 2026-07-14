@@ -5,6 +5,19 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 1.0.0 (2026-07-14) — RELEASE (content-identical to 1.0-rc1; banner bump only)
+
+Release gate: one-week fleet soak of 1.0-rc1 on 4 production boxes (cor-1/2, glo-1/2,
+~538 encoder processes). Results: zero SIGSEGV/watchdog/OOM markers fleet-wide; RSS
+bounded (multiview ~1.4GB static, singles 400-640MB); desync-restart pressure in the
+soak week: cor-1 = 0, cor-2 (multiviews) = 1 total (down from 84-176/day pre-0.9.18.x),
+glo-1 ≈ 4/day, glo-2 ≈ 9/day across 135 channels each.
+
+Known limitation (documented, mitigated): asymmetric/partial input discontinuities can
+bake an A/V lip-sync offset until channel restart (LAYERA one-stream flush classes).
+Production mitigation: keep sync_check enabled. Fixes land on the 1.0.1 line (partner-
+step escape fix + residual-sync supervisor, analysis/ptvencoder-residual-sync-supervisor.md).
+
 ## 1.0-rc1 (2026-07-10) — file split (movement-only decomposition of ptvencoder.c)
 
 No behavior change — pure code movement (v1-cleanup-plan §7). The ~6.5k-line
