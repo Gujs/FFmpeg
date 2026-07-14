@@ -7,6 +7,35 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(7d) SHARED-FLUSH 3a INHERITS IN EVERY BAND — split-flush in-band bake
+(pre6; ptv_disc_flush). Live (Azorse_TV 2026-07-14 05:57): video-only flush
+applied −6.857; the audio-only flush 3s later applied its OWN −6.961 because
+the 104ms disagreement sat inside PTV_PAIR_EPS_US (3a band kept aud_off) —
+the split baked 104ms of relative A/V desync per event. In a SAME-cycle full
+flush a sub-band disagreement is bookkeeping (ONE offset either way,
+alignment preserved); in a SPLIT flush the audio-only cycle applies a SECOND
+offset, permanently erasing the trailing-OLD discard hole + the sub-band
+A-vs-V jump difference. FIX = 3a inherits pair_vid_off_us in EVERY band when
+a crossing stream has not yet applied the event's offset; the sub-band
+mismatch is REGISTERED for the content path (ptv_pair_expect) down to the
+AGLUE engagement floor (g_aglue_ms — below it the glue never examines the
+step and aresample=async soft-converges it unregistered; a registered
+micro-step could mis-consume an unrelated later step within the TTL).
+Same-cycle 2b band path untouched — both-crossed single-flush in-band
+behavior stays byte-identical (the TruBLU mandate); 3b/3c/2d unchanged.
+Gates (A/B pre-fix vs pre6, live-UDP dg-run + silencedetect landmark +
+xcorr oracle): fx-splitband (V+6.02@115 / A+6.22@117.5, offsets differ
+220ms in-band, cycles 2.4s apart) — pre5 baked −200ms (landmark: the
+source's +200ms audio-later shift erased), pre6 +20ms (inherit −6.000,
++220ms registered, AGLUE "matches the shared-flush expected step —
+APPLIED", landmark shows audio +220ms); fx-wc520 (interleave-lag split,
+452ms in-band) — pre5 −440ms added, pre6 +40ms; tb900/tb30 TruBLU split
+rewinds — vid/aud offsets agree exactly, applied values and log lines
+identical pre-fix vs pre6; fx-sym flush 1 (same-cycle band) byte-identical,
+flush 2 (split leg, copy-only AC-3) now carries the event offset −15.144;
+regression battery mir2/dbl/sym/tb900/tb30/aonly/b300 all at pre5 oracle
+numbers; 20.5-min clean-source soak zero flushes, stats flat.
+
 (7c) LAYERA PARTNER-CROSSING DETECT — the escaped-step defect (pre6; demux
 loop). Live evidence (cor-3, 2026-07-14): JLTV — video +6.033s jump detected,
 video-only partial flush (applied −6.000); the partner AUDIO step (+6.5s)

@@ -523,9 +523,11 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
      *   3. AUDIO-only flush (video did not cross in this cycle):
      *      3a. event offset already defined by video (video crossed first — the Curiosity
      *          ordering, V and A 0.6s apart, past the 500ms buffer timeout) → INHERIT it when
-     *          it disagrees with aud_off beyond the band AND some crossing stream has NOT yet
-     *          applied this event's offset (pair_has, the pre5 D2 fix); within the band keep
-     *          aud_off (byte-identical seam handling for a symmetric event split across cycles).
+     *          some crossing stream has NOT yet applied this event's offset (pair_has, the pre5
+     *          D2 fix) — pre6: in EVERY band. A split flush that kept aud_off for a sub-band
+     *          disagreement applied a second offset and BAKED the (vid−aud) residual as
+     *          permanent relative desync (Azorse 104ms/event); the sub-band mismatch is
+     *          registered for the content path instead (aglue floor — see the stamp block).
      *      3b. no video crossing yet → applied = aud_off (provisional pre-pre4 behavior; an
      *          unpaired audio-only jump keeps today's semantics, and a paired one is
      *          retro-corrected at video's flush, 2d).
@@ -565,18 +567,24 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
         } else if (has_aud) {
             if (!b->pair_start_us)
                 b->pair_start_us = pnow;
-            if (b->pair_vid_defined &&
-                llabs(b->pair_vid_off_us - aud_off) > PTV_PAIR_EPS_US) {
-                if (aud_unapplied) {
-                    b->applied_offset = b->pair_vid_off_us;   /* 3a: inherit the video-defined offset */
-                    pair_inherit      = 1;
-                    pair_stamp        = 1;
-                } else {
-                    b->applied_offset = aud_off;          /* 3c: independent event — butt-joint, no pair stamp */
-                }
+            if (b->pair_vid_defined && aud_unapplied) {
+                /* 3a: inherit the video-defined offset — 1.0.1-pre6: EVEN WITHIN the band. In a
+                 * SAME-cycle full flush a sub-band disagreement is bookkeeping and either offset
+                 * preserves alignment (ONE offset for all streams); but a SPLIT flush applies a
+                 * SECOND offset in this cycle, so keeping aud_off baked the (vid−aud) residual
+                 * (trailing-OLD discard hole + sub-band A-vs-V jump difference) into the output
+                 * as permanent relative desync (live: Azorse 104ms/event 2026-07-14; fixtures
+                 * fx-wc520 −440ms, fx-splitband −200ms). The sub-band mismatch is registered
+                 * below (aglue floor) so the audio content path converges it instead. */
+                b->applied_offset = b->pair_vid_off_us;
+                pair_inherit      = 1;
+                pair_stamp        = 1;
+            } else if (b->pair_vid_defined &&
+                       llabs(b->pair_vid_off_us - aud_off) > PTV_PAIR_EPS_US) {
+                b->applied_offset = aud_off;          /* 3c: independent event — butt-joint, no pair stamp */
             } else {
-                b->applied_offset = aud_off;              /* 3a band / 3b: per-stream-identical */
-                pair_stamp = b->pair_vid_defined ? 1 : 2; /* band = final (equal within band); no video yet = provisional */
+                b->applied_offset = aud_off;              /* 3a band re-cross / 3b: per-stream-identical */
+                pair_stamp = b->pair_vid_defined ? 1 : 2; /* band re-cross = final; no video yet = provisional */
             }
         }
         if (pair_stamp)
@@ -588,9 +596,16 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
                 if (pair_stamp == 1) {
                     /* pre5 (D1): the shared offset overrode this stream's own butt-joint by more
                      * than the band → its label stream now carries that step; register it so the
-                     * audio content path APPLIES it (aresample converges) instead of erasing. */
+                     * audio content path APPLIES it (aresample converges) instead of erasing.
+                     * pre6: a split-flush inherit (pair_inherit) registers SUB-band mismatches
+                     * too, down to the AGLUE engagement floor — below g_aglue_ms the glue never
+                     * examines the step and aresample=async soft-converges it unregistered
+                     * (registering there would only arm a stale expect that could mis-consume an
+                     * unrelated later step). Same-cycle full flushes (2b) keep the >EPS gate —
+                     * their sub-band residual stays on the byte-identical band path. */
                     int64_t mism = b->applied_offset - ss->cumulative_ts_offset;
-                    if (has_aud && llabs(mism) > PTV_PAIR_EPS_US)
+                    if (has_aud && (llabs(mism) > PTV_PAIR_EPS_US ||
+                                    (pair_inherit && llabs(mism) > (int64_t)g_aglue_ms * 1000)))
                         ptv_pair_expect(d, i, mism);
                     ss->pair_applied_us = b->applied_offset;
                     ss->pair_has        = 1;
