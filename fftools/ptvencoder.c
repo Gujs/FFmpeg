@@ -441,6 +441,15 @@ int64_t g_stats_period_us = 1000000;
 /* PTV_SLOW_US: inject N us of extra per-emitted-frame consumer cost, to model a
  * slow/blocking encoder on a box that has none. Stress knob, gated. */
 int     g_slow;
+/* PTV_SLOW_DEC_US (1.0.1-pre8): inject N us of extra per-video-packet DECODE cost — the
+ * faithful stand-in for a slow/contended NVDEC (the #32 wedge entry: decode falls behind →
+ * video_q fills → overflow policy engages). PTV_SLOW_US slows the OUTPUT thread, which the
+ * frame_q drop-oldest decouples from video_q, so it cannot exercise the demux overflow path.
+ * Optional PTV_SLOW_DEC_FROM_S / PTV_SLOW_DEC_FOR_S window the slowdown (seconds since
+ * process start) so a mid-run consumer-slowdown + release is reproducible without signals.
+ * Stress knob, gated; default off. */
+static int     g_slow_dec;
+static int64_t g_slow_dec_on_us, g_slow_dec_off_us;   /* absolute monotonic window; off=0 → forever */
 
 /* PTV_LOG_TS=1: prefix every log line with a local wall-clock timestamp
  * [YYYY-MM-DD HH:MM:SS.mmm], so production logs are self-dated natively
@@ -781,6 +790,11 @@ static void *decode_thread(void *arg)
     for (;;) {
         ret = av_thread_message_queue_recv(d->video_q, &pkt, 0);
         if (ret < 0) break;
+        if (g_slow_dec) {   /* 1.0.1-pre8 stress knob: model a slow/contended NVDEC (windowed) */
+            int64_t nws = av_gettime_relative();
+            if (nws >= g_slow_dec_on_us && (!g_slow_dec_off_us || nws < g_slow_dec_off_us))
+                av_usleep(g_slow_dec);
+        }
         ret = avcodec_send_packet(d->vdec, pkt);
         av_packet_free(&pkt);
         while (ret >= 0) {
@@ -2153,6 +2167,13 @@ int main(int argc, char **argv)
      * PTV_PLL_DEV_SHIFT (9) internalized — see the g_pll_* declarations */
     { const char *tn = getenv("PTV_PLL_TESTNOISE_MS");  if (tn && atoi(tn) > 0) g_pll_testnoise_us  = (int64_t)atoi(tn) * 1000; }  /* TEST-ONLY: inject ±N ms offset square wave */
     { const char *s = getenv("PTV_SLOW_US"); g_slow = s ? atoi(s) : 0; }
+    { const char *s = getenv("PTV_SLOW_DEC_US"); g_slow_dec = s ? atoi(s) : 0;   /* 1.0.1-pre8 stress knob (slow-NVDEC stand-in) */
+      if (g_slow_dec) {
+          const char *fr = getenv("PTV_SLOW_DEC_FROM_S"), *fo = getenv("PTV_SLOW_DEC_FOR_S");
+          int64_t nw0 = av_gettime_relative();
+          g_slow_dec_on_us  = nw0 + (fr ? (int64_t)atoi(fr) * 1000000 : 0);
+          g_slow_dec_off_us = fo ? g_slow_dec_on_us + (int64_t)atoi(fo) * 1000000 : 0;
+      } }
     if (getenv("PTV_LOG_TS") && atoi(getenv("PTV_LOG_TS")))   /* native [timestamp] log prefix */
         av_log_set_callback(ptv_log_ts_callback);
 
