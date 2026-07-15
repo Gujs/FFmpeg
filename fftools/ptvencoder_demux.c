@@ -1581,8 +1581,15 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
             if (g_qshed && d->drop) {
                 int64_t nw = av_gettime_relative();
                 if (d->vq_tail_drop) {
+                    /* Session-109 time escape (rr8 review defect 1): an intra-refresh / no-IDR
+                     * source (or GOP longer than the queue) never delivers the KEY this mode
+                     * waits for — without a deadline the demux stops sending FOREVER: permanent
+                     * freeze-frame with live audio. After g_dukf_escape_us without an IDR,
+                     * resume sending non-IDR packets (the decoder re-syncs on what arrives —
+                     * strictly better than freezing; identical to DUKF's escape semantics). */
+                    int esc = (nw - d->qshed_tail_arm_us > g_dukf_escape_us);
                     int r3 = AVERROR(EAGAIN);   /* non-key: never attempt (stay GOP-coherent) */
-                    if (out->flags & AV_PKT_FLAG_KEY)
+                    if ((out->flags & AV_PKT_FLAG_KEY) || esc)
                         r3 = av_thread_message_queue_send(d->video_q, &out,
                                                           AV_THREAD_MESSAGE_NONBLOCK);
                     if (r3 < 0 && r3 != AVERROR(EAGAIN)) {   /* queue closed → terminate like demux_send */
@@ -1590,7 +1597,12 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                         return r3;
                     }
                     if (r3 >= 0) {              /* IDR + space → clean GOP boundary re-entry */
-                        if (nw - d->qshed_log_us >= 5000000) {
+                        if (esc && !(out->flags & AV_PKT_FLAG_KEY))
+                            av_log(NULL, AV_LOG_WARNING,
+                                   "[PTV-QSHED] tail escape after %"PRId64"s without IDR — resuming "
+                                   "non-IDR (dropped %"PRId64" pkts this episode; total tail %"PRId64" pkts)\n",
+                                   g_dukf_escape_us / 1000000, d->qshed_tail_n, d->qshed_tail_tot);
+                        else if (nw - d->qshed_log_us >= 5000000) {
                             d->qshed_log_us = nw;
                             av_log(NULL, AV_LOG_WARNING,
                                    "[PTV-QSHED] video_q overflow: tail-dropped %"PRId64" pkts to the IDR "
@@ -1601,6 +1613,10 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                         d->qshed_tail_n = 0;
                         ret = 0;
                     } else {
+                        if (esc)                /* escaped but the queue is genuinely full again:
+                                                 * re-arm the deadline so every freeze episode
+                                                 * stays bounded by the escape, never a full GOP */
+                            d->qshed_tail_arm_us = nw;
                         if (d->vq_shed_req)
                             atomic_store_explicit(d->vq_shed_req, 1, memory_order_relaxed);
                         d->vdrop++; d->qshed_tail_n++; d->qshed_tail_tot++;
@@ -1615,6 +1631,7 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                         if (d->vq_shed_req)
                             atomic_store_explicit(d->vq_shed_req, 1, memory_order_relaxed);
                         d->vq_tail_drop = 1;
+                        d->qshed_tail_arm_us = nw;   /* arm the Session-109 escape deadline */
                         d->qshed_tail_n = 1; d->qshed_tail_tot++;
                         d->vdrop++;
                         atomic_store_explicit(&g_shed_wall, nw, memory_order_relaxed);

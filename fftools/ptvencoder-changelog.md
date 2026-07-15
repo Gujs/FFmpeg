@@ -109,6 +109,29 @@ catch-up path (ppm-scale + drop-oldest), minutes not seconds — deliberate
 FOLLOW-UP (out of scope this round, noted): the WUCR ±15000ppm sustained
 slow-down authority cap is structurally too small vs a consumer running
 ≥5% slow (rails during any wedge); revisit with its own fixture.
+REVIEW DEFECT 1 (rr8 adversarial review, fixture-proven; FIXED in the
+follow-up commit): the new vq_tail_drop mode exited ONLY on a KEY packet
+that fit — on a no-IDR source (intra-refresh / encoder-restart feeds, or
+any GOP longer than the ~13s queue) no IDR ever came: the demux never
+resumed sending, the decode thread blocked forever on the emptied video_q,
+and the [PTV-SELFHEAL] request was NEVER SERVED (the heal executor lives in
+that blocked thread) → permanent freeze-frame with live audio (noidr2
+fixture: pre8 dec frozen 214s, dup climbing 60/s; pre7 fully recovered).
+The Session-109 rule was in DUKF and the heal resume but not here. FIX:
+(1) vq_tail_drop carries the same g_dukf_escape_us time escape — no IDR
+within 5s of arming → resume sending non-IDR ("[PTV-QSHED] tail escape",
+deadline re-armed if the queue is genuinely full again, so freeze episodes
+are bounded by the escape, never a full GOP); (2) decode_thread recv is now
+a timed poll that serves a pending g_selfheal_req on the empty-queue path,
+so the heal stays reachable even when no packet ever arrives; (3) the
+heal's avcodec_flush_buffers is DEFERRED from request time to IDR-arrival
+(fixture-forced: flushing at request time destroyed h264 sync, and with no
+recovery point in the stream the decoder then consumed packets forever
+without emitting a frame — a permanent freeze the heal itself caused; the
+mid-GOP escape now resumes with the decoder deliberately unflushed, its
+established sync being the only one a no-IDR source will ever have.
+Observably identical on IDR-rich sources — no packet touches the decoder
+between request and IDR).
 
 (7e) LAYERA CONTINUING-STREAM KEEP — cycle-2 video deletion on split events +
 borrowed-base false crossing (pre7; ptv_disc_flush + demux loop). On every

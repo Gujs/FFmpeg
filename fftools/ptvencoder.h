@@ -599,6 +599,9 @@ typedef struct DemuxArgs {
      * next IDR, so the queue never carries a headless GOP (the #32 wedge fragmenter). */
     _Atomic int          *vq_shed_req;    /* -> Input.vq_shed_req (decode consumes) */
     int                   vq_tail_drop;   /* in tail drop-until-IDR mode */
+    int64_t               qshed_tail_arm_us; /* wall time the tail-drop armed — Session-109 time
+                                            * escape (g_dukf_escape_us): never wait forever for
+                                            * an IDR that never comes (intra-refresh sources) */
     int64_t               qshed_tail_n;   /* pkts dropped in the current tail episode */
     int64_t               qshed_tail_tot; /* cumulative tail-dropped pkts (log accounting) */
     int64_t               qshed_log_us;   /* [PTV-QSHED] demux-side log rate limit */

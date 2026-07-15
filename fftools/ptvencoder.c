@@ -869,14 +869,35 @@ static void *decode_thread(void *arg)
             }
         }
         if (!pkt) {
-            ret = av_thread_message_queue_recv(d->video_q, &pkt, 0);
+            /* Timed recv (rr8 review defect 1, heal reachability): the heal executor lives in
+             * THIS thread, so a pending g_selfheal_req must be servable even while video_q is
+             * empty — a blocking recv made the heal unreachable exactly when it was needed
+             * (demux wedged in tail-drop, queue drained → thread parked forever). Poll the
+             * queue and serve the request on the empty path; the resume-at-IDR (with its
+             * Session-109 escape) then runs instead of waiting for a packet that never
+             * comes. */
+            for (;;) {
+                ret = av_thread_message_queue_recv(d->video_q, &pkt, AV_THREAD_MESSAGE_NONBLOCK);
+                if (ret != AVERROR(EAGAIN)) break;              /* got a pkt, or queue closed */
+                if (g_selfheal && d->live && !d->hold &&
+                    atomic_exchange_explicit(&g_selfheal_req, 0, memory_order_relaxed)) {
+                    d->heal_dropkf = 1;
+                    d->heal_arm_us = av_gettime_relative();
+                    atomic_store_explicit(&g_shed_wall, d->heal_arm_us, memory_order_relaxed);
+                    av_log(NULL, AV_LOG_WARNING,
+                           "[PTV-SELFHEAL] re-prime (video_q empty): decoder resets at the "
+                           "next IDR\n");
+                }
+                av_usleep(5000);
+            }
             if (ret < 0) break;
         }
         /* 1.0.1-pre8 (c) SELF-HEAL RE-PRIME: the master output thread measured sustained
          * frame_q starvation with input flowing — the decode path is wedged on stale or
          * undecodable backlog. Do what a supervisor restart achieves, in-process: drop the
-         * whole queued backlog, reset the decoder, resume clean at the next IDR. Anchors
-         * (h0) and downstream state are preserved; aresample absorbs the content gap. */
+         * whole queued backlog and resume clean at the next IDR (the decoder reset is
+         * deferred to that IDR — see the heal_dropkf block). Anchors (h0) and downstream
+         * state are preserved; aresample absorbs the content gap. */
         if (g_selfheal && d->live && !d->hold &&
             atomic_exchange_explicit(&g_selfheal_req, 0, memory_order_relaxed)) {
             AVPacket *sp;
@@ -886,24 +907,34 @@ static void *decode_thread(void *arg)
                 av_packet_free(&sp);
                 flushed++;
             }
-            avcodec_flush_buffers(d->vdec);
             d->heal_dropkf = 1;
             d->heal_arm_us = av_gettime_relative();
             atomic_store_explicit(&g_shed_wall, d->heal_arm_us, memory_order_relaxed);
             atomic_fetch_add_explicit(&g_shed_cnt, flushed, memory_order_relaxed);
             av_log(NULL, AV_LOG_WARNING,
-                   "[PTV-SELFHEAL] re-prime: flushed %d queued video pkts + decoder state; "
-                   "resuming at the next IDR\n", flushed);
+                   "[PTV-SELFHEAL] re-prime: flushed %d queued video pkts; decoder resets at "
+                   "the next IDR\n", flushed);
             continue;
         }
         if (d->heal_dropkf) {                                    /* (c): clean resume boundary */
             if (pkt->flags & AV_PKT_FLAG_KEY) {
+                /* rr8 review defect 1: the decoder reset is DEFERRED to here — flushing at
+                 * heal-request time destroyed h264 sync, and on a source with no IDR /
+                 * recovery point the decoder then consumed packets forever without emitting
+                 * a frame (permanent freeze the heal itself caused). Resetting right before
+                 * the IDR decodes is observably identical on IDR-rich sources (no packet
+                 * touches the decoder in between) and keeps sync when the escape fires. */
+                avcodec_flush_buffers(d->vdec);
                 d->heal_dropkf = 0;
             } else if (av_gettime_relative() - d->heal_arm_us > 5000000) {
                 d->heal_dropkf = 0;                              /* Session-109 escape: no IDR within 5s
-                                                                  * → decode anyway, never freeze */
+                                                                  * → decode anyway, never freeze; the
+                                                                  * decoder is deliberately NOT flushed
+                                                                  * (its established sync is the only
+                                                                  * one a no-IDR source will ever have) */
                 av_log(NULL, AV_LOG_WARNING,
-                       "[PTV-SELFHEAL] no IDR within 5s of the re-prime — resuming mid-GOP\n");
+                       "[PTV-SELFHEAL] no IDR within 5s of the re-prime — resuming mid-GOP "
+                       "(decoder kept unflushed)\n");
             } else {
                 av_packet_free(&pkt);
                 atomic_fetch_add_explicit(&g_shed_cnt, 1, memory_order_relaxed);
