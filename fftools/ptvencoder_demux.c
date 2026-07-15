@@ -1595,6 +1595,52 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
             /* 1.0.1-pre8: input-flowing signal for the (b)/(c) starvation-contradiction detectors
              * — a video packet reached the demux dispatch just now (clean-wire evidence). */
             atomic_store_explicit(&g_v_arrive_wc, av_gettime_relative(), memory_order_relaxed);
+            /* 1.0.1-pre10 (h) DEGRADED MODE (opt-in PTV_DEGRADED=1 — no-op otherwise): while a
+             * sustained decode deficit keeps QSHED full-cycling (entry armed below at the
+             * tail-arm site after a >=3min train), admission goes DEMAND-DRIVEN at the live
+             * edge: an arriving GOP is admitted only when the queued backlog is nearly
+             * consumed (video_q <= ~1s) — the queue depth IS the decode-throughput
+             * measurement, no estimator needed, and retained latency self-scales with the
+             * deficit (~2s of content / utilization) instead of accumulating. (The first
+             * modulus-K cut kept vq at 8s of content = 60s of DECODE TIME at a 12% box —
+             * hs grew +59s and audio, A/V-locked to that delay, overflowed at the demux door
+             * at ~40/s; the defaults churn keeps hs bounded 8-14s by head-shedding old
+             * content, which audio demonstrably rides.) All decisions happen at IDR
+             * boundaries only (admission never flips mid-GOP — the queue stays GOP-coherent);
+             * release = 60s of CONTINUOUS decode headroom (frame_q un-starved with vq
+             * shallow); re-entry needs a fresh 3min full-cycle train (hysteresis). */
+            if (g_degraded && d->drop && d->deg_active) {
+                int64_t dnw = av_gettime_relative();
+                if (out->flags & AV_PKT_FLAG_KEY) {
+                    int vqe = av_thread_message_queue_nb_elems(d->video_q);
+                    d->deg_admit = vqe <= g_cp.vid_pps;
+                    if (vqe < g_cp.videoq_pkts / 4 &&
+                        atomic_load_explicit(&g_frameq_depth, memory_order_relaxed) > 2) {
+                        if (!d->deg_head_ok_us) d->deg_head_ok_us = dnw;
+                        else if (dnw - d->deg_head_ok_us >= 60LL * 1000000) {
+                            d->deg_active = 0; d->deg_train_us = 0; d->deg_admit = 1;
+                            av_log(NULL, AV_LOG_WARNING,
+                                   "[PTV-DEGRADED] released: 60s of decode headroom — full admission "
+                                   "resumes at this IDR (%"PRId64" pkts dropped while degraded)\n",
+                                   d->deg_dropped);
+                        }
+                    } else
+                        d->deg_head_ok_us = 0;
+                }
+                if (d->deg_active && !d->deg_admit) {
+                    d->deg_dropped++;
+                    if (dnw - d->deg_log_us >= 30000000) {
+                        d->deg_log_us = dnw;
+                        av_log(NULL, AV_LOG_WARNING,
+                               "[PTV-DEGRADED] demand admission at the live edge (vq %d/%d; "
+                               "%"PRId64" pkts dropped total)\n",
+                               av_thread_message_queue_nb_elems(d->video_q),
+                               g_cp.videoq_pkts, d->deg_dropped);
+                    }
+                    av_packet_free(&out);
+                    return 0;
+                }
+            }
             /* 1.0.1-pre8 (a) GOP-COHERENT VIDEO OVERFLOW (the #32 wedge core fix). The old
              * policy tail-dropped the ARRIVING packet per-packet, MID-GOP, so under sustained
              * overflow ~70% of packets vanished at random and the decoder received GOP
@@ -1662,6 +1708,32 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                         d->qshed_tail_arm_us = nw;   /* arm the Session-109 escape deadline */
                         d->qshed_tail_n = 1; d->qshed_tail_tot++;
                         d->vdrop++;
+                        /* 1.0.1-pre10 (h): full-cycle train tracking for DEGRADED entry. Each
+                         * tail-arm is one full-cycle; cycles <=30s apart (measured median 6.2s)
+                         * form a train, and a >=3min train is a sustained capacity deficit the
+                         * shed/refill cycle cannot exit — enter every-Kth-GOP admission. A
+                         * full-cycle occurring WHILE degraded means K is still too generous. */
+                        if (g_degraded) {
+                            if (!d->deg_train_us || nw - d->deg_last_full_us > 30000000)
+                                d->deg_train_us = nw;
+                            d->deg_last_full_us = nw;
+                            if (!d->deg_active && nw - d->deg_train_us >= 180LL * 1000000) {
+                                d->deg_active = 1;
+                                d->deg_admit = 1; d->deg_head_ok_us = 0;
+                                /* live-edge start: flush the accumulated stale backlog via the
+                                 * pre8 re-prime (decode thread drops video_q + resumes at the
+                                 * next IDR = our next admitted GOP) — degraded playout must
+                                 * ride fresh content, not a 13s-old queue. */
+                                if (g_selfheal)
+                                    atomic_store_explicit(&g_selfheal_req, 1, memory_order_relaxed);
+                                av_log(NULL, AV_LOG_WARNING,
+                                       "[PTV-DEGRADED] entering: QSHED full-cycles persisted %"PRId64"s — "
+                                       "demand admission at the live edge until 60s of decode headroom; "
+                                       "backlog flush requested (PTV_DEGRADED=1 experiment lever)\n",
+                                       (nw - d->deg_train_us) / 1000000);
+                            } else if (d->deg_active)
+                                d->deg_head_ok_us = 0;   /* a full-cycle while degraded = no headroom */
+                        }
                         atomic_store_explicit(&g_shed_wall, nw, memory_order_relaxed);
                         atomic_fetch_add_explicit(&g_shed_cnt, 1, memory_order_relaxed);
                         if (nw - d->qshed_log_us >= 5000000) {

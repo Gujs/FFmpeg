@@ -7,6 +7,96 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(7h) BIRTH-ARMED CHURN — MODE RELEASE + CONSUMPTION RATE-SHAPE (pre10;
+ptvencoder_clock.c detector / ptvencoder_gate.c CUSHION_RELEASE /
+decode_thread governor / ptvencoder_demux.c degraded admission).
+WHY (pre10 Phase-A verdicts, local 4-instance birth-contention cells,
+p8deep = live depth): the live churner is a CAPACITY-DEFICIT LIMIT CYCLE
+armed at birth — video_q fills to exactly the live cap 784, [PTV-QSHED]
+full-cycles with median period 6.2s (live ~6s), frame_q starved 88-97% of
+samples, dup 52/s at depth. Every armed state releases either never
+(g_delivery_maxq, by design) or only on conditions the churn itself makes
+unreachable: the cushion tier arms at birth (~6s under contention) and its
+only release is 6h with ZERO starvation episodes — each cycle resets that
+clock, so post-recovery residue held cushion=2535ms + fqhw=160 + grown
+gate caps 12min after full recovery (in production: frame pool + NVENC
+surface registrations pinned at maximum forever, WUCR railed −15000ppm
+filling a target the deficit can never fill). And the post-shed catch-up
+decode path is UNGOVERNED (frame_q pushes are drop-oldest NONBLOCK, so
+backpressure vanishes exactly when it matters): measured catch-up dec p95
+2.2x realtime (133/s on a 59.94 channel) — N co-located churners
+burst-feed a shared device in phase (the owner's "feeding it with bursts"
+observation). Provenance: rc enters the SAME stuck state at identical
+aggregate cost but expresses it as per-packet mid-GOP shredding that at
+live depth also kills audio at the demux door (adrop 29.4/s = ~58% of
+audio packets, garbled slow-motion output) — the DO-NOT-REGRESS-TO
+baseline; pre8's whole-GOP expression keeps adrop 0 and honest frames.
+FOUR CHANGES (kill-switch each; ALL structurally inert on a healthy
+channel — byte-gate proven):
+(e) CUSHION RELEASE [PTV_NO_CUSHREL]: the pre8 (b)/(c) starvation
+contradiction (frame_q <=2 while input FLOWS, g_v_arrive_wc) applied to
+the adaptive TIER — holding a deeper fill target for a buffer the deficit
+can never fill. Held >=60s with the tier raised ->
+cushion_escalate(CUSHION_RELEASE): tier back to base + symmetric gate-cap
+restore (same stores as SHRINK), loud [PTV-CUSHREL], one release per
+firing with a 60s re-fire floor + 10min post-release GROW suppression (a
+persistent deficit would otherwise re-GROW seconds later and flap the
+pair once a minute). The timer forgives <=5s refill blips — the ~6s cycle
+refills frame_q ~1-2s per cycle, so demanding 60s CONTINUOUS starvation
+would be unreachable under exactly the symptom (starve fraction measured
+0.88-0.97). Input NOT flowing hard-resets the timer: a genuine
+stall/outage KEEPS its cushion (STOP/CONT gate).
+(f) GOVERNED CATCH-UP [PTV_NO_CATCHGOV]: deficit-recovery decode capped
+at 1.25x realtime — per-frame floor 4/5 of the master tick, the same
+currency WUCR governs the emit side with. Engaged ONLY while a
+self-shed/heal happened within 10min (g_shed_wall, never stamped on a
+clean channel) AND video_q holds >1s of backlog (vid_pps); disengage is
+by BACKLOG DRAIN, not the time window, so the window cannot expire
+mid-backlog into an ungoverned tail burst. Under contention the floor
+never binds (decode is slower than it); normal steady-state decode runs
+1.0x by supply and never sees a sleep. Max 13ms sleep per frame at packet
+boundaries keeps the pre8 heal executor reachable (rr8 defect-1 history).
+The shed itself stays — correct load-shedding; only its aftermath stops
+arriving as a device-max burst.
+(g) PHASE JITTER [PTV_NO_PHASEJIT]: deterministic per-PID +/-20%
+(g_jit_milli 800..1200, Knuth hash of getpid()) on the head-shed
+depth-gate margin (128 -> 102..153 pkts) and the SELFHEAL 5min re-fire
+(4-6min) — co-located instances cannot phase-lock their burst cycles.
+Thresholds are consulted only inside shed/heal paths: inert when nothing
+sheds.
+(h) DEGRADED MODE [opt-in PTV_DEGRADED=1, DEFAULT OFF]: >=3min of
+persistent QSHED full-cycles (train = tail-arms <=30s apart; median cycle
+6.2s) -> flush the stale backlog (selfheal re-prime) and go DEMAND-DRIVEN
+at the live edge: an arriving GOP is admitted only when video_q <= ~1s —
+the queue depth IS the decode-throughput measurement (no estimator), all
+decisions at IDR boundaries only (admission never flips mid-GOP), and
+retained latency self-scales with the deficit (~2s content/utilization)
+instead of accumulating. DESIGN ITERATION (fixture-measured, two rounds):
+modulus-K admission stopped the full-cycles but thereby stopped their
+latency-SHEDDING — vq parked at 8s of content = 60s of DECODE TIME on a
+12% box, hs grew +59s monotonic, and audio (A/V-locked to that delay)
+died at the demux door at ~40/s (the rc class); the defaults churn keeps
+hs bounded 8-14s by head-shedding old content and audio demonstrably
+rides that. Demand admission reproduces the churn's live-edge property
+without its cycle. 60s of CONTINUOUS decode headroom (frame_q un-starved
+with vq shallow) releases back to full admission at that IDR (re-entry
+needs a fresh 3min train — hysteresis). Loud [PTV-DEGRADED] enter/status/
+release. Default-off because the local repro cannot prove the production
+self-sustainment it targets (state-dependent NVENC/RM/VRAM per-frame
+cost) — it ships as the cor-3 experiment lever; byte-identical no-op with
+the env unset.
+GATES (pre10-cell.sh/pre10-sum.py fixtures + dg-run byte gate; numbers in
+the session report): G1 p8deep-equivalent churn cell — dup <=52/s, catch-up
+dec p95 <=1.3x realtime (was 2.2x), adrop 0, no sustained ~6s full-cycle
+train under contention beyond isolated sheds; G2 post-lift recovery <2min
+unchanged (dec settles 59.94, dup slope 0, vq drains); G3 release
+correctness — [PTV-CUSHREL] fires under a sustained contradiction
+(PTV_SLOW_DEC_US cell) and does NOT fire across a 90s sender STOP/CONT
+(cushion retained through a genuine stall); G4 clean-channel byte gate —
+fx-wcl350 pre9-vs-pre10 output BYTE-IDENTICAL (all four features
+structurally inert without a shed/starvation episode); G5 churn-cell
+demux adrop stays 0 (the rc 29/s door-kill class must never return).
+
 (7g) RESIDUAL LIP-SYNC SENSOR, PASSIVE (pre9; component 1 of the
 residual-sync supervisor — analysis/ptvencoder-residual-sync-supervisor.md).
 WHY: every desync class so far needed its own detector+glue, and one missed

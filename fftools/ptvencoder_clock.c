@@ -342,6 +342,8 @@ void *output_thread(void *arg)
         int64_t ep_last_us = 0, ep_prev_us = 0;                       /* starvation-episode wall times (grow gate) */
         int64_t rr_starve_since = 0, rr_last_rel = 0;                 /* 1.0.1-pre8 (b): ratchet-release detector state */
         int64_t sh_starve_since = 0, sh_last = 0;                     /* 1.0.1-pre8 (c): self-heal detector state */
+        int64_t cr_starve_since = 0, cr_ok_since = 0, cr_last_rel = 0;/* 1.0.1-pre10 (e): cushion-release detector state */
+        int64_t heal_refire_us = av_rescale(300000000, g_jit_milli, 1000); /* 1.0.1-pre10 (g): jittered SELFHEAL re-fire (4-6min per PID) */
         if (raised_sp > g_cp.frameq_cap - 8) raised_sp = g_cp.frameq_cap - 8;
         if (raised_sp < base_sp) raised_sp = base_sp;                 /* explicit deep preroll >= cushion -> adaptive no-op */
         if (v->is_master) {                                           /* 0.9.18 M3: register the adaptive tier with the
@@ -515,7 +517,13 @@ void *output_thread(void *arg)
                      * cap delta, maxq, log) moved verbatim to cushion_escalate(). */
                     if (ep > 0) {                                     /* a >=200ms starvation episode just ended */
                         ep_prev_us = ep_last_us; ep_last_us = nw;
-                        if (g_curt.cur_sp < raised_sp && ep_prev_us && nw - ep_prev_us < 3600LL * 1000000)
+                        /* 1.0.1-pre10 (e): 10min GROW suppression after a CUSHION_RELEASE —
+                         * under a persistent decode deficit the very next episode pair would
+                         * re-GROW seconds after the release and the pair would flap once a
+                         * minute; while the contradiction persists the tier belongs at base.
+                         * cr_last_rel stays 0 when PTV_NO_CUSHREL (condition unchanged). */
+                        if (g_curt.cur_sp < raised_sp && ep_prev_us && nw - ep_prev_us < 3600LL * 1000000 &&
+                            (!cr_last_rel || nw - cr_last_rel >= 600LL * 1000000))
                             cushion_escalate(CUSHION_GROW, nw - ep_prev_us, ep);
                     } else if (g_curt.cur_sp > base_sp && ep_last_us && nw - ep_last_us > 6LL * 3600 * 1000000) {
                         cushion_escalate(CUSHION_SHRINK, 0, 0);
@@ -533,10 +541,40 @@ void *output_thread(void *arg)
                  *       undecodable backlog: request the in-process re-prime (the decode
                  *       thread flushes video_q + decoder and resumes at the next IDR — what a
                  *       supervisor restart achieves without the restart); one attempt per 5min. */
-                if ((g_ratchrel || g_selfheal) && v->live && !v->passthrough) {
+                if ((g_ratchrel || g_selfheal || g_cushrel) && v->live && !v->passthrough) {
                     int fqd = av_thread_message_queue_nb_elems(v->frame_q);
                     int64_t arr = atomic_load_explicit(&g_v_arrive_wc, memory_order_relaxed);
                     int flowing = arr && (nw - arr) < 2000000;
+                    /* 1.0.1-pre10 (e) CUSHION RELEASE — the (b)/(c) contradiction applied to the
+                     * adaptive TIER: it armed at birth (2 episodes/60min — birth under contention
+                     * trips it in ~6s) and its only release is 6h of ZERO starvation episodes,
+                     * which the churn itself makes unreachable (Phase A: cushion=2535ms + fqhw=160
+                     * + grown caps still held 12min post-recovery; in production that pins the
+                     * frame pool + NVENC registration set at maximum forever). >=60s of the
+                     * contradiction with the tier raised -> step it back to base (CUSHION_RELEASE,
+                     * same stores as SHRINK). Unlike (b)/(c) this timer FORGIVES <=5s refill
+                     * blips: the ~6s shed cycle refills frame_q for ~1-2s every cycle (starved
+                     * fraction 0.88-0.97 measured), so a hard reset would make 60s continuous
+                     * unreachable under exactly the symptom this targets. A genuine outage
+                     * (input NOT flowing) hard-resets — a real stall keeps its cushion. */
+                    if (g_cushrel) {
+                        if (fqd <= 2 && flowing) {
+                            if (!cr_starve_since) cr_starve_since = nw;
+                            cr_ok_since = 0;
+                            if (nw - cr_starve_since >= 60LL * 1000000 &&
+                                g_curt.cur_sp > base_sp &&
+                                (!cr_last_rel || nw - cr_last_rel >= 60LL * 1000000)) {
+                                cr_last_rel = nw;
+                                cushion_escalate(CUSHION_RELEASE, nw - cr_starve_since, 0);
+                                cr_starve_since = 0;        /* a further step needs a fresh 60s */
+                            }
+                        } else if (!flowing) {
+                            cr_starve_since = 0; cr_ok_since = 0;   /* outage: keep the cushion */
+                        } else if (cr_starve_since) {       /* flowing + refilled: 5s blip forgiveness */
+                            if (!cr_ok_since) cr_ok_since = nw;
+                            else if (nw - cr_ok_since > 5000000) { cr_starve_since = 0; cr_ok_since = 0; }
+                        }
+                    }
                     if (fqd <= 2 && flowing) {
                         if (g_ratchrel) {
                             if (!rr_starve_since) rr_starve_since = nw;
@@ -550,7 +588,10 @@ void *output_thread(void *arg)
                         if (g_selfheal) {
                             if (!sh_starve_since) sh_starve_since = nw;
                             else if (nw - sh_starve_since >= 30000000 &&
-                                     (sh_last == 0 || nw - sh_last >= 300000000)) {
+                                     (sh_last == 0 || nw - sh_last >= heal_refire_us)) {   /* 1.0.1-pre10 (g): per-PID
+                                                                                            * jittered 5min re-fire —
+                                                                                            * co-located heal/refill
+                                                                                            * bursts de-phase */
                                 int64_t starved_s = (nw - sh_starve_since) / 1000000;
                                 sh_last = nw;
                                 sh_starve_since = nw;   /* a re-fire needs a fresh 30s of starvation */

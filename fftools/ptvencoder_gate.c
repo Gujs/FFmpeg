@@ -222,6 +222,7 @@ CushionRt g_curt = { .lock = PTHREAD_MUTEX_INITIALIZER };
  *   BANK_ESCALATE:  a0 = worst observed stall (us), a1 = now (wall us, advisory limiter)
  *   BANK_RETIRE:    args unused
  *   BANK_RELEASE:   a0 = starvation-contradiction duration (us, log only)
+ *   CUSHION_RELEASE: a0 = starvation-contradiction duration (us, log only)
  * NOTE (map §3.5, deliberate): GROW/SHRINK do NOT touch the live gate->cap_us — exactly
  * as before this motion (only the BANK arms rewrite the gates). Closing that gap is M5,
  * a behavior change with its own fixture; when it lands it is the same rt->gate loop the
@@ -277,6 +278,38 @@ void cushion_escalate(CushionEvent ev, int64_t a0, int64_t a1)
                        (nc2 + bw2) / 1e6, nc2 / 1e6, bw2 / 1e6, rt->n_gate);
         }
         av_log(NULL, AV_LOG_INFO, "[PTV-CUSHION] target back to %d frames (quiet 6h)\n", rt->base_sp);
+        break;
+    }
+    case CUSHION_RELEASE: {
+        /* 1.0.1-pre10 (e): the starvation contradiction (frame_q starved with input FLOWING,
+         * a0 = held duration) persisted >=60s while the tier was raised — holding a deeper
+         * fill target for a buffer the decode deficit can never fill is the same contradiction
+         * BANK_RELEASE answers, and the SHRINK release (6h of ZERO starvation episodes) is
+         * unreachable while churning (every episode resets its clock). Same stores as SHRINK
+         * (tier back to base + symmetric gate-cap restore), honest log. The caller guarantees
+         * input was flowing (a genuine stall/outage keeps its cushion) and applies a 10min
+         * post-release GROW suppression so the pair cannot flap once a minute under a
+         * persistent deficit. g_delivery_maxq stays (design backstop, RAM-only high-water). */
+        int64_t nc3, bw3;
+        int r6;
+        if (rt->cur_sp <= rt->base_sp)                     /* belt-and-braces: never double-restore */
+            break;
+        nc3 = atomic_fetch_sub_explicit(&g_delivery_cap_us,
+            (int64_t)(rt->raised_sp - rt->base_sp) * rt->tick_dur_us, memory_order_relaxed)
+            - (int64_t)(rt->raised_sp - rt->base_sp) * rt->tick_dur_us;
+        bw3 = atomic_load_explicit(&g_bank_us, memory_order_relaxed);
+        rt->cur_sp = rt->base_sp;
+        for (r6 = 0; r6 < rt->n_gate; r6++)
+            if (rt->gate[r6])
+                atomic_store_explicit(&rt->gate[r6]->cap_us, nc3 + bw3, memory_order_relaxed);
+        if (g_diag)
+            av_log(NULL, AV_LOG_INFO, "[PTV-GATE] caps -> %.1fs (base %.1fs + bank %.1fs) on %d gates (RELEASE)\n",
+                   (nc3 + bw3) / 1e6, nc3 / 1e6, bw3 / 1e6, rt->n_gate);
+        av_log(NULL, AV_LOG_WARNING,
+               "[PTV-CUSHREL] cushion released %d->%d frames: frame_q starved %.1fs with input "
+               "flowing while the raised tier held — contradiction; gate caps restored, next "
+               "GROW suppressed 10min (PTV_NO_CUSHREL disables)\n",
+               rt->raised_sp, rt->base_sp, a0 / 1e6);
         break;
     }
     case BANK_ESCALATE: {

@@ -204,7 +204,9 @@ typedef struct RsyncSense {
  * same-thread-ordered and race-free (the demux-side BANK events never touch the tier
  * fields). */
 typedef enum { CUSHION_GROW, CUSHION_SHRINK, BANK_ESCALATE, BANK_RETIRE,
-               BANK_RELEASE /* 1.0.1-pre8 (b): starvation-contradiction fast release */ } CushionEvent;
+               BANK_RELEASE,   /* 1.0.1-pre8 (b): starvation-contradiction fast release */
+               CUSHION_RELEASE /* 1.0.1-pre10 (e): tier release on the same contradiction —
+                                * the 6h zero-starvation SHRINK is unreachable while churning */ } CushionEvent;
 typedef struct CushionRt {
     DlvGate        *gate[PTV_MAX_RUNG]; /* per-rung delivery gate (NULL = delivery off) */
     int             n_gate;
@@ -657,6 +659,20 @@ typedef struct DemuxArgs {
     int64_t               qshed_tail_n;   /* pkts dropped in the current tail episode */
     int64_t               qshed_tail_tot; /* cumulative tail-dropped pkts (log accounting) */
     int64_t               qshed_log_us;   /* [PTV-QSHED] demux-side log rate limit */
+    /* 1.0.1-pre10 (h) DEGRADED MODE (opt-in PTV_DEGRADED=1): >=3min of persistent QSHED
+     * full-cycles -> DEMAND-DRIVEN GOP admission at the live edge (admit an arriving GOP
+     * only when video_q <= ~1s — the queue depth IS the throughput measurement; retained
+     * latency self-scales with the deficit instead of accumulating, which is what kept
+     * audio alive: A/V ride the same delay and the door buffers hold ~15s, not 60s);
+     * entry flushes the stale backlog (selfheal re-prime); release after 60s of continuous
+     * decode headroom (frame_q un-starved with vq shallow). */
+    int                   deg_active;       /* currently degrading admission */
+    int                   deg_admit;        /* current GOP is admitted (decided at its IDR) */
+    int64_t               deg_train_us;     /* start of the current full-cycle train (0 = none) */
+    int64_t               deg_last_full_us; /* last full-cycle arm (train continuity, 30s gap) */
+    int64_t               deg_head_ok_us;   /* headroom continuously since (0 = not in headroom) */
+    int64_t               deg_dropped;      /* total video pkts dropped by degraded admission */
+    int64_t               deg_log_us;       /* [PTV-DEGRADED] status rate limit */
     int64_t               vpkt, apkt, ppkt, vdrop, adrop, pdrop;
     int64_t               disc_resid_us;   /* 0.9.18.7 hs-residue ledger (REPORTING ONLY, never read by control):
                                             * Σ(−applied_offset) over LAYERA glue erases that shifted the VIDEO
@@ -817,6 +833,11 @@ extern _Atomic int64_t g_shed_wall;      /* (d) wall us of the last self-inflict
 extern _Atomic int64_t g_shed_cnt;       /* (d) cumulative self-shed pkts (video head+tail, audio drop-oldest) */
 extern int     g_nvenc_serialize;        /* defined in ptvencoder_clock.c */
 extern CushionRt g_curt;                 /* defined in ptvencoder_gate.c */
+/* 1.0.1-pre10 birth-armed churn fixes (defined in ptvencoder.c) */
+extern int     g_cushrel;                /* (e) cushion-tier release on starvation contradiction (PTV_NO_CUSHREL) */
+extern int     g_catchgov;               /* (f) governed deficit-recovery decode, 1.25x realtime (PTV_NO_CATCHGOV) */
+extern int     g_jit_milli;              /* (g) per-PID shed/heal phase jitter x1000 (800..1200; 1000 = PTV_NO_PHASEJIT) */
+extern int     g_degraded;               /* (h) opt-in sustained-deficit every-Kth-GOP admission (PTV_DEGRADED=1) */
 /* 1.0.1-pre9 residual sensor (defined in ptvencoder.c) */
 extern int        g_rsync_sense;         /* PASSIVE sensor on (PTV_RSYNC_SENSE=0 disables) */
 extern RsyncSense g_rsx;                 /* published sensor state (single-input, input 0) */

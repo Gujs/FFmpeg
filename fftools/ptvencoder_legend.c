@@ -125,7 +125,11 @@ void ptv_print_log_legend(int full)
         "             discontinuity bookkeeping (e.g. jump-to-live parked the stall's dups), NOT\n"
         "             held content; hs growing while hsres is flat = real retained latency\n"
         "  cushion    adaptive frame_q target: ~1s lean tier or ~4s raised tier ([PTV-CUSHION] logs\n"
-        "             each transition: grows on 2 starvations/60min, shrinks after 6h quiet)\n"
+        "             each transition: grows on 2 starvations/60min, shrinks after 6h quiet;\n"
+        "             1.0.1-pre10: [PTV-CUSHREL] releases a raised tier held against a starved-\n"
+        "             while-flowing contradiction, and deficit-recovery decode is GOVERNED to\n"
+        "             1.25x realtime while a shed episode's backlog drains — catch-up arrives as\n"
+        "             a paced trickle, not a device-max burst)\n"
         "  bank       (v0.9.14, shown when armed) AUTO-BANK actual/target ms: a bursty channel's\n"
         "             self-escalated compressed video_q cushion (1.5x worst stall, cap 12s); fills\n"
         "             from the stalls' own retained latency, retires after 6h quiet\n");
@@ -172,6 +176,10 @@ void ptv_print_log_legend(int full)
         "  [PTV-BURSTY]   per-minute delivery-stall status (count + worst gap + bank state) while a\n"
         "                 channel is bursty-classified; also the auto-bank escalation advisor\n"
         "  [PTV-CUSHION]  adaptive cushion tier moves + BANK escalations (target, sizing rationale)\n"
+        "  [PTV-CUSHREL]  (1.0.1-pre10) raised cushion tier released: frame_q starved >=60s with\n"
+        "                 input FLOWING while the tier held — the 6h zero-starvation release is\n"
+        "                 unreachable under churn; tier back to base, gate caps restored\n"
+        "                 (PTV_NO_CUSHREL disables; an input outage never triggers this)\n"
         "  [PTV-CLOCK]    clock-follow arm/release (source clock offset FOLLOWED/back-in-range) +\n"
         "                 estimator lifecycle (frozen on BURSTY, stuck-latch re-acquire, lock progress)\n"
         "  [PTV-EMPTY]    frame_q starvation episodes >=2s (refill time; sub-2s aggregate per 60s)\n");

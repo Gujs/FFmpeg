@@ -12,6 +12,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <time.h>
+#include <unistd.h>   /* getpid() — 1.0.1-pre10 (g) per-PID phase jitter */
 
 #include "libavutil/avutil.h"
 #include "libavutil/log.h"
@@ -40,7 +41,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.0.1-pre9"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.0.1-pre10"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -482,6 +483,45 @@ _Atomic int64_t g_v_arrive_wc;
  * own drops are never again misread as source burstiness. */
 _Atomic int64_t g_shed_wall;
 _Atomic int64_t g_shed_cnt;
+/* ==== 1.0.1-pre10 (7h) — BIRTH-ARMED CHURN: mode release + consumption rate-shape. Phase-A
+ * localization (pre10 verdicts): the live ~6s QSHED full-cycle churn is a capacity-deficit
+ * limit cycle whose armed states release either never (g_delivery_maxq) or only on conditions
+ * the churn itself makes unreachable (cushion tier: 6h of ZERO starvation — every cycle resets
+ * the clock), and whose post-shed catch-up decode runs UNGOVERNED (measured p95 2.2x realtime
+ * bursts; N co-located instances burst-feed a shared device in phase). ==== */
+/* (e) CUSHION RELEASE ON STARVATION-CONTRADICTION: the tier that armed at birth (2 starvation
+ * episodes in 60min — birth under contention trips it in ~6s) raises the frame_q target
+ * 59->152 and the gate caps +2.5s, and its only release is 6h with zero starvation episodes —
+ * unreachable while churning, so in production it pins the frame pool + NVENC registration
+ * set at maximum forever. Symmetric with pre8's BANK_RELEASE: when the starvation
+ * contradiction (frame_q <=2 with input FLOWING) has held >=60s and the tier is raised,
+ * step it back to base + restore the grown gate caps (CUSHION_RELEASE). Never fires when
+ * input is NOT flowing (a genuine stall/outage keeps its cushion). PTV_NO_CUSHREL reverts. */
+int     g_cushrel = 1;
+/* (f) GOVERNED CATCH-UP: the decode->frame_q submission path has no rate governance — after
+ * every shed/heal/starvation dip it runs at device max (frame_q pushes are drop-oldest
+ * NONBLOCK in live, so backpressure vanishes exactly when it matters). Cap deficit-recovery
+ * decode at 1.25x realtime (per-frame budget = 4/5 of the master tick — the same currency
+ * WUCR governs the emit side with). Engaged ONLY while a self-shed/heal happened within the
+ * last 10min AND video_q holds >1s of backlog: normal steady-state decode (1.0x by supply)
+ * and clean channels (g_shed_wall never stamped) are structurally untouched.
+ * PTV_NO_CATCHGOV reverts. */
+int     g_catchgov = 1;
+/* (g) PHASE JITTER: deterministic per-PID +/-20% jitter on the shed/heal cycle timings (the
+ * head-shed depth-gate margin + the SELFHEAL 5min re-fire) so N co-located instances cannot
+ * phase-lock their ~6s burst cycles on one shared device. 1000 = no jitter (PTV_NO_PHASEJIT). */
+int     g_jit_milli = 1000;
+/* (h) SUSTAINED-DEFICIT DEGRADED MODE (opt-in, PTV_DEGRADED=1 — the cor-3 experiment lever;
+ * the local repro cannot prove the production self-sustainment it targets): after >=3min of
+ * persistent QSHED full-cycles the demux flushes the stale backlog and goes DEMAND-DRIVEN:
+ * an arriving GOP is admitted only when video_q <= ~1s (the queue depth IS the throughput
+ * measurement) so consumption <= capacity, video_q stops cap-cycling, and retained latency
+ * self-scales with the deficit instead of accumulating (fixture-measured: modulus-K
+ * admission held 60s of decode-time depth and audio, A/V-locked to it, died at the demux
+ * door; demand admission keeps the delay in the ~15s class the defaults churn already
+ * proves audio rides). Releases after 60s of demonstrated decode headroom. Default OFF —
+ * a no-op (byte-identical) when the env is unset. */
+int     g_degraded = 0;
 /* 1.0.1-pre9 (7g) — PASSIVE residual lip-sync sensor (component 1 of the residual-sync
  * supervisor; full model at the RsyncSense declaration in ptvencoder.h). Writers: master
  * output thread (m_v), audio threads (m_a), demux thread (E ledgers). Readers: the stats
@@ -802,6 +842,7 @@ static void *decode_thread(void *arg)
     AVFrame  *frame = av_frame_alloc();
     AVFrame  *filt  = av_frame_alloc();
     int ret = 0, i;
+    int64_t gov_next_us = 0;   /* 1.0.1-pre10 (f): governed catch-up pacing anchor (0 = disengaged) */
 
     if (!frame || !filt)
         goto done;
@@ -838,8 +879,11 @@ static void *decode_thread(void *arg)
         if (g_qshed && d->live && d->vq_shed_req &&
             atomic_load_explicit(d->vq_shed_req, memory_order_relaxed)) {
             atomic_store_explicit(d->vq_shed_req, 0, memory_order_relaxed);
+            /* 1.0.1-pre10 (g): the 128-pkt stale-request margin carries the per-PID +/-20%
+             * jitter — co-located instances re-enter the shed at different depths, so their
+             * ~6s full-cycle trains cannot phase-lock on a shared device. */
             if (av_thread_message_queue_nb_elems(d->video_q) >=
-                FFMAX(g_cp.videoq_pkts / 2, g_cp.videoq_pkts - 128)) {
+                FFMAX(g_cp.videoq_pkts / 2, g_cp.videoq_pkts - 128 * g_jit_milli / 1000)) {
                 int shed_n = 0;
                 int64_t d0 = AV_NOPTS_VALUE, d1 = AV_NOPTS_VALUE;
                 for (;;) {
@@ -979,6 +1023,32 @@ static void *decode_thread(void *arg)
                     }
                     pthread_mutex_unlock(d->h0_lock);
                 }
+            }
+            /* 1.0.1-pre10 (f) GOVERNED CATCH-UP: pace deficit-recovery decode at 1.25x realtime
+             * (per-frame floor = 4/5 tick). Engaged ONLY while (i) a self-shed/heal happened
+             * within the last 10min (g_shed_wall — never stamped on a clean channel, so this
+             * path is structurally inert there) AND (ii) video_q still holds >1s of backlog
+             * (vid_pps): the shed stays (it is correct load-shedding), only its consumption
+             * aftermath stops arriving as a device-max burst (Phase-A measured p95 2.2x; N
+             * co-located churners burst-feed a shared device in phase). Under contention the
+             * floor never binds (decode is slower than it); the 13ms max sleep per frame keeps
+             * the heal executor reachable (it runs at packet boundaries). Disengages when the
+             * backlog is drained below 1s — the 10min window cannot expire mid-backlog into an
+             * ungoverned tail burst. PTV_NO_CATCHGOV reverts. */
+            if (g_catchgov && d->live) {
+                int64_t gnw = av_gettime_relative();
+                int64_t gsw = atomic_load_explicit(&g_shed_wall, memory_order_relaxed);
+                if (gsw && gnw - gsw < 600LL * 1000000 &&
+                    av_thread_message_queue_nb_elems(d->video_q) > g_cp.vid_pps &&
+                    g_curt.tick_dur_us > 0) {
+                    int64_t step = g_curt.tick_dur_us * 4 / 5;
+                    if (gov_next_us > gnw) {
+                        av_usleep((unsigned)(gov_next_us - gnw));
+                        gnw = gov_next_us;
+                    }
+                    gov_next_us = FFMAX(gnw, gov_next_us) + step;
+                } else
+                    gov_next_us = 0;
             }
             d->dec_frames++;
             if (d->hold) stage_hold(d->hold, d->live, frame);   /* multiview: compositor samples this */
@@ -2338,6 +2408,13 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_RATCHREL")) g_ratchrel = 0;   /* 1.0.1-pre8 (b): keep the 6h bank decay even under the starvation contradiction */
     if (getenv("PTV_NO_SELFHEAL")) g_selfheal = 0;   /* 1.0.1-pre8 (c): no internal re-prime on sustained starvation */
     { const char *rs = getenv("PTV_RSYNC_SENSE"); if (rs && !atoi(rs)) g_rsync_sense = 0; }  /* 1.0.1-pre9: passive residual sensor default ON; =0 disables */
+    if (getenv("PTV_NO_CUSHREL"))  g_cushrel  = 0;   /* 1.0.1-pre10 (e): keep the 6h zero-starvation cushion decay even under the contradiction */
+    if (getenv("PTV_NO_CATCHGOV")) g_catchgov = 0;   /* 1.0.1-pre10 (f): deficit-recovery decode back to device max (the 2.2x catch-up bursts) */
+    if (!getenv("PTV_NO_PHASEJIT")) {                /* 1.0.1-pre10 (g): per-PID +/-20% shed/heal cycle jitter (deterministic per PID) */
+        unsigned jh = (unsigned)getpid() * 2654435761u;   /* Knuth multiplicative hash — spreads adjacent PIDs */
+        g_jit_milli = 800 + (int)(jh % 401u);             /* 800..1200 = x0.8..x1.2 */
+    }
+    if (getenv("PTV_DEGRADED"))    g_degraded = 1;   /* 1.0.1-pre10 (h): opt-in sustained-deficit every-Kth-GOP admission */
     { const char *s = getenv("PTV_SLOW_US"); g_slow = s ? atoi(s) : 0; }
     { const char *s = getenv("PTV_SLOW_DEC_US"); g_slow_dec = s ? atoi(s) : 0;   /* 1.0.1-pre8 stress knob (slow-NVDEC stand-in) */
       if (g_slow_dec) {
