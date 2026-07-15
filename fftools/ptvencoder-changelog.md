@@ -73,6 +73,19 @@ LIVE SOAK MUST VALIDATE before the corrector round (the design doc's hard
 gate): sensor-vs-oracle SIGN and SLOPE agreement on (a) a clean channel,
 (b) a TruBLU rewind session, (c) a provoked escape/garbage episode. A
 sensor that disagrees with the oracle is discarded, not tuned around.
+KNOWN LIMITATION (adversarial review Defect 1, fixture-proven): the slip
+probe (audio.c drain) measures door-label head − sink head − swr_delay =
+the WHOLE -af graph's hold, so a buffering filter (loudnorm: +2914ms
+constant false audio-early; atempo, long lookaheads) biases R by its hold
+forever. Exposure today none — the exact production single-input chain
+aresample+acompressor+alimiter fixture-reads +0ms, and multiview (where
+grids run loudnorm) publishes no lipsync=. Legend carries the caveat; the
+structural fix (resampler-scoped slip probe) lands with the corrector
+round. Soak interpretation notes from review: (a) AWE-class sources whose
+labels lie read R=0 BY DESIGN (R = pipeline-ADDED desync only — the
+pts-spacing flatness gate stays mandatory, TRACKUP class invisible here);
+(b) EMA τ30s → alert only on multi-minute dwell; (c) parked slip <50ms is
+under the dead band (floor).
 
 (7f) #32 WEDGE — GOP-COHERENT VIDEO OVERFLOW + STARVATION-CONTRADICTION
 RECOVERY (pre8; demux_dispatch/decode_thread/output_thread/cushion_escalate).
