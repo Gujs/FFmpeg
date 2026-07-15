@@ -213,14 +213,15 @@ CushionRt g_curt = { .lock = PTHREAD_MUTEX_INITIALIZER };
 /* 0.9.18 M3 — cushion_escalate(): the single entry point for all four cushion-escalation
  * writers (pure code motion: same stores in the same order, same log lines, now under one
  * mutex). Callers keep their TRIGGER logic in place — the master output thread fires
- * CUSHION_GROW/SHRINK, the demux thread fires BANK_ESCALATE/RETIRE; two threads, hence
- * the lock. Both call sites hold no other lock, and this body takes none besides
+ * CUSHION_GROW/SHRINK (and, 1.0.1-pre8, BANK_RELEASE on the starvation contradiction),
+ * the demux thread fires BANK_ESCALATE/RETIRE; two threads, hence the lock. Both call sites hold no other lock, and this body takes none besides
  * rt->lock (relaxed atomics + gate cap_us atomic stores + av_log only). Per-event args:
  *   CUSHION_GROW:   a0 = wall gap since the previous starvation episode (us, log only),
  *                   a1 = the just-ended episode duration (us, log only)
  *   CUSHION_SHRINK: args unused
  *   BANK_ESCALATE:  a0 = worst observed stall (us), a1 = now (wall us, advisory limiter)
  *   BANK_RETIRE:    args unused
+ *   BANK_RELEASE:   a0 = starvation-contradiction duration (us, log only)
  * NOTE (map §3.5, deliberate): GROW/SHRINK do NOT touch the live gate->cap_us — exactly
  * as before this motion (only the BANK arms rewrite the gates). Closing that gap is M5,
  * a behavior change with its own fixture; when it lands it is the same rt->gate loop the
@@ -323,6 +324,29 @@ void cushion_escalate(CushionEvent ev, int64_t a0, int64_t a1)
         av_log(NULL, AV_LOG_INFO,
                "[PTV-CUSHION] BANK retired after %llds without qualifying stalls; banked latency drains via catch-up\n",
                (long long)(g_bank_decay_us / 1000000));
+        break;
+    }
+    case BANK_RELEASE: {
+        /* 1.0.1-pre8 (b): starvation contradiction — the master rung measured frame_q starved
+         * (a0 = duration, us) with input FLOWING while the bank held latency and the gates held
+         * audio for it. Holding latency for a buffer that is empty is a contradiction (the #32
+         * wedge/aftermath shape: dlvhold ratcheted 12-25s, wucr_buf ~0, clean wire) — release
+         * NOW instead of the 6h decay: same stores as BANK_RETIRE, honest log. The master
+         * rung's blocking push disarms with g_bank_pkts, so the retained latency drains via
+         * the normal catch-up path. Normal deep-bank operation (buffers full / input absent)
+         * never reaches here. */
+        int64_t held = atomic_load_explicit(&g_bank_us, memory_order_relaxed);
+        int r5;
+        atomic_store_explicit(&g_bank_us, 0, memory_order_relaxed);
+        atomic_store_explicit(&g_bank_pkts, 0, memory_order_relaxed);
+        for (r5 = 0; r5 < rt->n_gate; r5++)
+            if (rt->gate[r5])
+                atomic_store_explicit(&rt->gate[r5]->cap_us, g_delivery_cap_us, memory_order_relaxed);
+        av_log(NULL, AV_LOG_WARNING,
+               "[PTV-CUSHION] BANK released (was %.1fs): frame_q starved %.1fs with input flowing while "
+               "latency was held — contradiction; gate caps back to %.1fs, retained latency drains via "
+               "catch-up (PTV_NO_RATCHREL disables)\n",
+               held / 1e6, a0 / 1e6, g_delivery_cap_us / 1e6);
         break;
     }
     }

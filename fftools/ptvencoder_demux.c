@@ -1564,7 +1564,75 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                     av_rescale_q(out->dts, d->ifmt->streams[d->vstream]->time_base, AV_TIME_BASE_Q),
                     av_gettime_relative(),
                     d->disturb_epoch ? atomic_load_explicit(d->disturb_epoch, memory_order_relaxed) : 0);
-            ret = demux_send(d->video_q, out, d->drop, &d->vdrop);
+            /* 1.0.1-pre8: input-flowing signal for the (b)/(c) starvation-contradiction detectors
+             * — a video packet reached the demux dispatch just now (clean-wire evidence). */
+            atomic_store_explicit(&g_v_arrive_wc, av_gettime_relative(), memory_order_relaxed);
+            /* 1.0.1-pre8 (a) GOP-COHERENT VIDEO OVERFLOW (the #32 wedge core fix). The old
+             * policy tail-dropped the ARRIVING packet per-packet, MID-GOP, so under sustained
+             * overflow ~70% of packets vanished at random and the decoder received GOP
+             * fragments — it then ran at ~11% of realtime and the queue never drained: the
+             * drop policy fragmented its own input forever on a clean wire (live-proven,
+             * cor-3 2026-07-15). New policy, two coherent halves:
+             *   HEAD: request the decoder to flush the queue head to the next keyframe
+             *         boundary (whole oldest GOPs — only the consumer can pop the head);
+             *   TAIL: while full, drop the arriving stream to the next IDR that fits, so the
+             *         queue never holds a headless GOP.
+             * Every enqueued GOP stays contiguous and decodable. PTV_NO_QSHED reverts. */
+            if (g_qshed && d->drop) {
+                int64_t nw = av_gettime_relative();
+                if (d->vq_tail_drop) {
+                    int r3 = AVERROR(EAGAIN);   /* non-key: never attempt (stay GOP-coherent) */
+                    if (out->flags & AV_PKT_FLAG_KEY)
+                        r3 = av_thread_message_queue_send(d->video_q, &out,
+                                                          AV_THREAD_MESSAGE_NONBLOCK);
+                    if (r3 < 0 && r3 != AVERROR(EAGAIN)) {   /* queue closed → terminate like demux_send */
+                        av_packet_free(&out);
+                        return r3;
+                    }
+                    if (r3 >= 0) {              /* IDR + space → clean GOP boundary re-entry */
+                        if (nw - d->qshed_log_us >= 5000000) {
+                            d->qshed_log_us = nw;
+                            av_log(NULL, AV_LOG_WARNING,
+                                   "[PTV-QSHED] video_q overflow: tail-dropped %"PRId64" pkts to the IDR "
+                                   "boundary — enqueue resumed GOP-coherent (total tail %"PRId64" pkts)\n",
+                                   d->qshed_tail_n, d->qshed_tail_tot);
+                        }
+                        d->vq_tail_drop = 0;
+                        d->qshed_tail_n = 0;
+                        ret = 0;
+                    } else {
+                        if (d->vq_shed_req)
+                            atomic_store_explicit(d->vq_shed_req, 1, memory_order_relaxed);
+                        d->vdrop++; d->qshed_tail_n++; d->qshed_tail_tot++;
+                        atomic_store_explicit(&g_shed_wall, nw, memory_order_relaxed);
+                        atomic_fetch_add_explicit(&g_shed_cnt, 1, memory_order_relaxed);
+                        av_packet_free(&out);
+                        ret = 0;
+                    }
+                } else {
+                    ret = av_thread_message_queue_send(d->video_q, &out, AV_THREAD_MESSAGE_NONBLOCK);
+                    if (ret == AVERROR(EAGAIN)) {   /* full → GOP-coherent shed engages */
+                        if (d->vq_shed_req)
+                            atomic_store_explicit(d->vq_shed_req, 1, memory_order_relaxed);
+                        d->vq_tail_drop = 1;
+                        d->qshed_tail_n = 1; d->qshed_tail_tot++;
+                        d->vdrop++;
+                        atomic_store_explicit(&g_shed_wall, nw, memory_order_relaxed);
+                        atomic_fetch_add_explicit(&g_shed_cnt, 1, memory_order_relaxed);
+                        if (nw - d->qshed_log_us >= 5000000) {
+                            d->qshed_log_us = nw;
+                            av_log(NULL, AV_LOG_WARNING,
+                                   "[PTV-QSHED] video_q full (%d pkts) — shedding whole GOPs: head flush "
+                                   "requested from the decoder, arriving pkts dropped to the next IDR\n",
+                                   av_thread_message_queue_nb_elems(d->video_q));
+                        }
+                        av_packet_free(&out);
+                        ret = 0;
+                    } else if (ret < 0)
+                        av_packet_free(&out);       /* queue closed */
+                }
+            } else
+                ret = demux_send(d->video_q, out, d->drop, &d->vdrop);
         } else {
             /* Fan one source PID to every transcoded audio track on it (a clone
              * each), then hand the original to demux_pass (copy-passthrough; it
@@ -1579,7 +1647,29 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                 if (d->astream[k] != out->stream_index) continue;
                 if (!(c = av_packet_clone(out))) continue;
                 d->apkt++;
-                demux_send(d->audio_q[k], c, d->drop, &d->adrop);
+                /* 1.0.1-pre8 (a): audio overflow sheds whole frames OLDEST-first (audio frames
+                 * are independent — no GOP structure). The old drop-NEWEST pinned the stalest
+                 * content in the queue; keeping the freshest drains latency instead. */
+                if (g_qshed && d->drop) {
+                    int r2 = av_thread_message_queue_send(d->audio_q[k], &c, AV_THREAD_MESSAGE_NONBLOCK);
+                    if (r2 == AVERROR(EAGAIN)) {
+                        AVPacket *oldp;
+                        if (av_thread_message_queue_recv(d->audio_q[k], &oldp,
+                                                         AV_THREAD_MESSAGE_NONBLOCK) >= 0) {
+                            av_packet_free(&oldp);
+                            d->adrop++;
+                            atomic_store_explicit(&g_shed_wall, av_gettime_relative(), memory_order_relaxed);
+                            atomic_fetch_add_explicit(&g_shed_cnt, 1, memory_order_relaxed);
+                        }
+                        if (av_thread_message_queue_send(d->audio_q[k], &c,
+                                                         AV_THREAD_MESSAGE_NONBLOCK) < 0) {
+                            av_packet_free(&c);
+                            d->adrop++;
+                        }
+                    } else if (r2 < 0)
+                        av_packet_free(&c);
+                } else
+                    demux_send(d->audio_q[k], c, d->drop, &d->adrop);
             }
             ret = demux_pass(d, out);       /* copy fan + monotonic-DTS clamp; frees out */
         }

@@ -340,6 +340,8 @@ void *output_thread(void *arg)
         int base_sp   = n_prime > 2 ? n_prime : 4;                    /* safety floor = the resolved preroll */
         int raised_sp = (v->tick_dur_us > 0) ? (int)(g_cp.cushion_raised_us / v->tick_dur_us) : base_sp;
         int64_t ep_last_us = 0, ep_prev_us = 0;                       /* starvation-episode wall times (grow gate) */
+        int64_t rr_starve_since = 0, rr_last_rel = 0;                 /* 1.0.1-pre8 (b): ratchet-release detector state */
+        int64_t sh_starve_since = 0, sh_last = 0;                     /* 1.0.1-pre8 (c): self-heal detector state */
         if (raised_sp > g_cp.frameq_cap - 8) raised_sp = g_cp.frameq_cap - 8;
         if (raised_sp < base_sp) raised_sp = base_sp;                 /* explicit deep preroll >= cushion -> adaptive no-op */
         if (v->is_master) {                                           /* 0.9.18 M3: register the adaptive tier with the
@@ -513,6 +515,51 @@ void *output_thread(void *arg)
                             cushion_escalate(CUSHION_GROW, nw - ep_prev_us, ep);
                     } else if (g_curt.cur_sp > base_sp && ep_last_us && nw - ep_last_us > 6LL * 3600 * 1000000) {
                         cushion_escalate(CUSHION_SHRINK, 0, 0);
+                    }
+                }
+                /* 1.0.1-pre8 (b)+(c) — the #32 wedge starvation-contradiction detectors.
+                 * "Starved while input flows" is the contradiction state: frame_q pinned ≤2
+                 * frames while the demux keeps receiving video (clean wire). Normal deep-bank
+                 * operation never looks like this (a delivery gap means input is NOT flowing;
+                 * a catch-up refill means frame_q is NOT starved), so banks working as
+                 * designed are untouched.
+                 *   (b) ≥5s of it with an ARMED bank → release the ratchet (BANK_RELEASE)
+                 *       instead of the 6h decay; 60s re-fire limit.
+                 *   (c) ≥30s of it regardless of bank → the decode path is wedged on stale/
+                 *       undecodable backlog: request the in-process re-prime (the decode
+                 *       thread flushes video_q + decoder and resumes at the next IDR — what a
+                 *       supervisor restart achieves without the restart); one attempt per 5min. */
+                if ((g_ratchrel || g_selfheal) && v->live && !v->passthrough) {
+                    int fqd = av_thread_message_queue_nb_elems(v->frame_q);
+                    int64_t arr = atomic_load_explicit(&g_v_arrive_wc, memory_order_relaxed);
+                    int flowing = arr && (nw - arr) < 2000000;
+                    if (fqd <= 2 && flowing) {
+                        if (g_ratchrel) {
+                            if (!rr_starve_since) rr_starve_since = nw;
+                            else if (nw - rr_starve_since >= 5000000 &&
+                                     (rr_last_rel == 0 || nw - rr_last_rel >= 60000000) &&
+                                     atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0) {
+                                rr_last_rel = nw;
+                                cushion_escalate(BANK_RELEASE, nw - rr_starve_since, 0);
+                            }
+                        }
+                        if (g_selfheal) {
+                            if (!sh_starve_since) sh_starve_since = nw;
+                            else if (nw - sh_starve_since >= 30000000 &&
+                                     (sh_last == 0 || nw - sh_last >= 300000000)) {
+                                int64_t starved_s = (nw - sh_starve_since) / 1000000;
+                                sh_last = nw;
+                                sh_starve_since = nw;   /* a re-fire needs a fresh 30s of starvation */
+                                av_log(NULL, AV_LOG_WARNING,
+                                       "[PTV-SELFHEAL] frame_q starved %llds with input flowing — requesting "
+                                       "internal re-prime (flush video_q + decoder, resume at next IDR; "
+                                       "PTV_NO_SELFHEAL disables)\n", (long long)starved_s);
+                                atomic_store_explicit(&g_selfheal_req, 1, memory_order_relaxed);
+                            }
+                        }
+                    } else {
+                        rr_starve_since = 0;
+                        sh_starve_since = 0;
                     }
                 }
             }

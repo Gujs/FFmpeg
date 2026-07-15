@@ -160,7 +160,8 @@ typedef struct VOutRing {
  * master's own GROW/SHRINK calls, so the master's unlocked trigger/stats reads are
  * same-thread-ordered and race-free (the demux-side BANK events never touch the tier
  * fields). */
-typedef enum { CUSHION_GROW, CUSHION_SHRINK, BANK_ESCALATE, BANK_RETIRE } CushionEvent;
+typedef enum { CUSHION_GROW, CUSHION_SHRINK, BANK_ESCALATE, BANK_RETIRE,
+               BANK_RELEASE /* 1.0.1-pre8 (b): starvation-contradiction fast release */ } CushionEvent;
 typedef struct CushionRt {
     DlvGate        *gate[PTV_MAX_RUNG]; /* per-rung delivery gate (NULL = delivery off) */
     int             n_gate;
@@ -211,6 +212,15 @@ typedef struct DecodeCtx {
     /* shared counters (the master output thread reports them) */
     int64_t          dec_frames, vcorrupt;
     int              deep_prime_packets;   /* §13: if >0, delay decode start until video_q banks this many packets (deep bursty-input cushion; single-input only) */
+    /* 1.0.1-pre8 (a) GOP-coherent overflow: the decode side executes the head-GOP shed the
+     * demux requests on video_q overflow (only the consumer can pop the queue head). */
+    _Atomic int     *vq_shed_req;          /* -> Input.vq_shed_req (demux writes, decode consumes) */
+    int64_t          shed_pkts;            /* cumulative head-shed packets */
+    int64_t          shed_log_us;          /* [PTV-QSHED] decode-side log rate limit */
+    int              heal_dropkf;          /* 1.0.1-pre8 (c): post-re-prime drop-until-IDR */
+    int64_t          heal_arm_us;          /* (c): wall time the drop armed — 5s escape, the
+                                            * Session-109 kf-gate rule (long-GOP sources must
+                                            * not freeze waiting for an IDR that never comes) */
 } DecodeCtx;
 
 /* Per-rung output side: pop this rung's frame_q on the house clock, stamp the
@@ -388,6 +398,9 @@ typedef struct AudioState {
     int              decerr_supp;                     /* errors suppressed this window (still counted) */
     int64_t          wd_frame_us;                     /* wall time of the last decoded frame (seeded at first packet) */
     int64_t          wd_pkts;                         /* packets received since the last decoded frame */
+    int64_t          shed_mark;                       /* 1.0.1-pre8 (d): g_shed_cnt snapshot while no shed window is
+                                                       * open; " [self: N pkts shed]" = cnt_now − mark on AGLUE/ASTEP
+                                                       * lines within 5s of a self-inflicted queue drop */
 } AudioState;
 
 /* ---- demux + mux ---- */
@@ -581,6 +594,14 @@ typedef struct DemuxArgs {
     int                   drop_until_kf;  /* P2 2b: armed on a video discontinuity → drop video until the next IDR */
     int64_t               kf_arm_us;      /* P2 2b: wall time the drop was armed (first-arm-only escape deadline) */
     int64_t               kf_arm_vdrop;   /* DIAG: vdrop count when DUKF armed (→ per-event drop count at resume) */
+    /* 1.0.1-pre8 (a) GOP-coherent video overflow (QSHED): on a full video_q the demux
+     * requests a head-GOP flush from the decoder and TAIL-drops the arriving stream to the
+     * next IDR, so the queue never carries a headless GOP (the #32 wedge fragmenter). */
+    _Atomic int          *vq_shed_req;    /* -> Input.vq_shed_req (decode consumes) */
+    int                   vq_tail_drop;   /* in tail drop-until-IDR mode */
+    int64_t               qshed_tail_n;   /* pkts dropped in the current tail episode */
+    int64_t               qshed_tail_tot; /* cumulative tail-dropped pkts (log accounting) */
+    int64_t               qshed_log_us;   /* [PTV-QSHED] demux-side log rate limit */
     int64_t               vpkt, apkt, ppkt, vdrop, adrop, pdrop;
     int64_t               disc_resid_us;   /* 0.9.18.7 hs-residue ledger (REPORTING ONLY, never read by control):
                                             * Σ(−applied_offset) over LAYERA glue erases that shifted the VIDEO
@@ -640,6 +661,7 @@ typedef struct Input {
      * hardened with atomics because value+deadline are a pair). Zero-init = no registration. */
     _Atomic int_least64_t aglue_exp_step[PTV_MAX_AUDIO];
     _Atomic int_least64_t aglue_exp_dl[PTV_MAX_AUDIO];
+    _Atomic int           vq_shed_req;       /* 1.0.1-pre8 (a): per-input head-GOP shed request */
     DecodeCtx             dc;
     DemuxArgs             da;
     pthread_t             th_demux, th_decode;
@@ -729,6 +751,14 @@ extern int     g_genlock_guard;
 extern _Atomic int64_t g_async_ppm;
 extern int64_t g_stats_period_us;
 extern int     g_slow;
+/* 1.0.1-pre8 #32 wedge fixes (defined in ptvencoder.c) */
+extern int     g_qshed;                  /* (a) GOP-coherent video_q overflow (PTV_NO_QSHED reverts) */
+extern int     g_ratchrel;               /* (b) ratchet release on starvation contradiction (PTV_NO_RATCHREL) */
+extern int     g_selfheal;               /* (c) self-heal re-prime backstop (PTV_NO_SELFHEAL) */
+extern _Atomic int     g_selfheal_req;   /* (c) master output thread -> decode thread */
+extern _Atomic int64_t g_v_arrive_wc;    /* wall us of the last video pkt at the demux (input-flowing signal) */
+extern _Atomic int64_t g_shed_wall;      /* (d) wall us of the last self-inflicted queue drop */
+extern _Atomic int64_t g_shed_cnt;       /* (d) cumulative self-shed pkts (video head+tail, audio drop-oldest) */
 extern int     g_nvenc_serialize;        /* defined in ptvencoder_clock.c */
 extern CushionRt g_curt;                 /* defined in ptvencoder_gate.c */
 

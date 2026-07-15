@@ -46,6 +46,26 @@ static int     g_pll_acquire_n = 32;         /* debounce: N stable (large AND fl
 static int64_t g_pll_refractory_us = 12000000; /* v0.6.21: HARD refractory after an acquire (12s) — the backstop that breaks the self-excited limit cycle on jittery legs (the acquire's own drop/pad perturbs the next measurement → re-triggers; box: a2 thrashed ~1 acquire/7s, acq=92). Must exceed the thrash period; bounds acquires to ≤1/12s regardless of the noise spectrum. Was conflated with g_pll_acquire_n (32 frames ≈0.68s — far too short). Internalized 0.9.18.7 (was PTV_PLL_REFRACTORY_MS). */
 static int     g_pll_noise_k = 3;            /* v0.6.22: NOISE-ADAPTIVE acquire threshold = max(g_pll_acquire_us, k·pll_dev). Clean legs (dev≈0) keep the 40ms; jittery legs raise the bar above their own offset jitter so steady-state noise can't re-fire the acquire (the 0.6.20/0.6.21 limit cycle). 0 disables (fixed threshold). Internalized 0.9.18.7 (was PTV_PLL_NOISE_K). */
 static int     g_pll_dev_shift = 9;          /* v0.6.22: EMA shift for pll_dev (τ≈11s) — slow so dev ramps AFTER the big startup bank is caught (dev≈0 → thr=40ms at t0 → bank acquires), then rises to the noise floor → steady-state quiet. Internalized 0.9.18.7 (was PTV_PLL_DEV_SHIFT). */
+/* 1.0.1-pre8 (d) SELF-MADE-GAP LOG HONESTY: when the demux/decode shed packets in the recent
+ * window (video head/tail QSHED, audio drop-oldest — g_shed_wall/g_shed_cnt), the downstream
+ * AGLUE/ASTEP lines must say so, so our own drops are never again misread as source
+ * burstiness (the "bursty channel" taxonomy was self-portraiture — owner mandate). Returns ""
+ * outside a shed window (all pinned log-line shapes byte-identical when nothing was shed);
+ * inside the 5s window returns " [self: N pkts shed]" with N = sheds since this track's
+ * window opened (per-track mark refreshed while quiet). */
+static const char *ptv_self_shed_note(AudioState *a, char *buf, size_t sz)
+{
+    int64_t w = atomic_load_explicit(&g_shed_wall, memory_order_relaxed);
+    int64_t c = atomic_load_explicit(&g_shed_cnt, memory_order_relaxed);
+    if (!w || av_gettime_relative() - w > 5000000) {
+        a->shed_mark = c;
+        buf[0] = 0;
+        return buf;
+    }
+    snprintf(buf, sz, " [self: %lld pkts shed]", (long long)(c - a->shed_mark));
+    return buf;
+}
+
 /* ---- audio path (decode -> resample 48k stereo -> AAC -> mux) ---- */
 
 /* encode the SAME loudness-processed frame into each rung's own AAC encoder (so
@@ -122,10 +142,13 @@ static int audio_drain_fg(AudioState *a)
             if (a->dbg_k == 0)   /* [PTV-CHAIN] primary-audio source-content being emitted (us) */
                 atomic_store_explicit(&g_ch_aout_src, src_abs_us, memory_order_relaxed);
             if (g_diag) {   /* [PTV-ASTEP]/[PTV-AFLOW]: post-graph step detector + content-flow ledger */
-                if (a->dbg_sink_us && llabs(src_abs_us - (a->dbg_sink_us + a->dbg_sink_dur_us)) > 5000)
-                    av_log(NULL, AV_LOG_WARNING, "[PTV-ASTEP] sink-pts step %+lldms (sink=%lldus expect=%lldus)\n",
+                if (a->dbg_sink_us && llabs(src_abs_us - (a->dbg_sink_us + a->dbg_sink_dur_us)) > 5000) {
+                    char sn[48];
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-ASTEP] sink-pts step %+lldms (sink=%lldus expect=%lldus)%s\n",
                            (long long)((src_abs_us - a->dbg_sink_us - a->dbg_sink_dur_us) / 1000),
-                           (long long)src_abs_us, (long long)(a->dbg_sink_us + a->dbg_sink_dur_us));
+                           (long long)src_abs_us, (long long)(a->dbg_sink_us + a->dbg_sink_dur_us),
+                           ptv_self_shed_note(a, sn, sizeof sn));
+                }
                 a->dbg_sink_us = src_abs_us;
                 a->dbg_sink_dur_us = av_rescale(filt->nb_samples, 1000000, a->out_rate);
                 a->dbg_out_samp += filt->nb_samples;
@@ -700,6 +723,12 @@ static int audio_feed(AudioState *a, AVFrame *frame)
          * flush deliberately routed here. Backward-and-registered is APPLIED (labels kept,
          * aresample drops content to converge onto the source's post-event alignment), never
          * erased; unregistered steps keep the rules above unchanged. */
+        {   /* 1.0.1-pre8 (d): refresh the self-shed window mark once per frame while quiet, so
+             * the first annotated line after a shed counts only THIS window's sheds (two
+             * relaxed loads; output discarded). */
+            char snr[48];
+            ptv_self_shed_note(a, snr, sizeof snr);
+        }
         if (g_aglue_ms > 0 && frame->pts != AV_NOPTS_VALUE) {
             int64_t raw_us = av_rescale_q(frame->pts, a->ist_tb, AV_TIME_BASE_Q);
             int64_t now_wc = av_gettime_relative();
@@ -733,16 +762,19 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                             }
                         }
                     }
+                    char sn[48];   /* 1.0.1-pre8 (d): self-shed honesty note ("" when nothing shed) */
                     if (llabs(step) > (int64_t)g_aglue_max_ms * 1000) {
                         av_log(NULL, AV_LOG_WARNING,
-                               "[PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms above %dms cap — left to the discontinuity layer%s\n",
+                               "[PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms above %dms cap — left to the discontinuity layer%s%s\n",
                                a->dbg_k, a->dbg_in, step / 1000, g_aglue_max_ms,
-                               exp_hit ? " (matches the shared-flush expected step — aresample converges it)" : "");
+                               exp_hit ? " (matches the shared-flush expected step — aresample converges it)" : "",
+                               ptv_self_shed_note(a, sn, sizeof sn));
                     } else if (exp_hit) {
                         av_log(NULL, AV_LOG_WARNING,
                                "[PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms matches the shared-flush expected step %+"PRId64"ms "
-                               "— REAL A-vs-V alignment step, APPLIED (aresample converges; not erased)\n",
-                               a->dbg_k, a->dbg_in, step / 1000, exp_step / 1000);
+                               "— REAL A-vs-V alignment step, APPLIED (aresample converges; not erased)%s\n",
+                               a->dbg_k, a->dbg_in, step / 1000, exp_step / 1000,
+                               ptv_self_shed_note(a, sn, sizeof sn));
                     } else {
                         /* 0.9.18: verdict-LOG rate limit. An Azorse-class label flood (source labels
                          * striding ~6x content = one verdict per frame, ~8 lines/s indefinitely) must
@@ -765,16 +797,18 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                         if (step > 0) {
                             if (allow)
                                 av_log(NULL, AV_LOG_WARNING,
-                                       "[PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms (wall gap %"PRId64"ms) — GAP; aresample pads\n",
-                                       a->dbg_k, a->dbg_in, step / 1000, wall_gap / 1000);
+                                       "[PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms (wall gap %"PRId64"ms) — GAP; aresample pads%s\n",
+                                       a->dbg_k, a->dbg_in, step / 1000, wall_gap / 1000,
+                                       ptv_self_shed_note(a, sn, sizeof sn));
                         } else {
                             a->glue_off_us -= step;
                             a->glue_events++;
                             if (allow)
                                 av_log(NULL, AV_LOG_WARNING,
-                                       "[PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms (wall gap %"PRId64"ms) — backward RELABEL erased (glue total %+"PRId64"ms, event %d)\n",
+                                       "[PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms (wall gap %"PRId64"ms) — backward RELABEL erased (glue total %+"PRId64"ms, event %d)%s\n",
                                        a->dbg_k, a->dbg_in, step / 1000, wall_gap / 1000,
-                                       a->glue_off_us / 1000, a->glue_events);
+                                       a->glue_off_us / 1000, a->glue_events,
+                                       ptv_self_shed_note(a, sn, sizeof sn));
                         }
                     }
                 }
@@ -823,10 +857,13 @@ static int audio_feed(AudioState *a, AVFrame *frame)
         }
         if (g_diag && frame->pts != AV_NOPTS_VALUE) {   /* [PTV-ASTEP] pre-graph label-step detector */
             int64_t inus = av_rescale_q(frame->pts, a->ist_tb, AV_TIME_BASE_Q);
-            if (a->dbg_in_us && llabs(inus - (a->dbg_in_us + a->dbg_in_dur_us)) > 5000)
-                av_log(NULL, AV_LOG_WARNING, "[PTV-ASTEP] in-pts step %+lldms (in=%lldus expect=%lldus)\n",
+            if (a->dbg_in_us && llabs(inus - (a->dbg_in_us + a->dbg_in_dur_us)) > 5000) {
+                char sn[48];
+                av_log(NULL, AV_LOG_WARNING, "[PTV-ASTEP] in-pts step %+lldms (in=%lldus expect=%lldus)%s\n",
                        (long long)((inus - a->dbg_in_us - a->dbg_in_dur_us) / 1000),
-                       (long long)inus, (long long)(a->dbg_in_us + a->dbg_in_dur_us));
+                       (long long)inus, (long long)(a->dbg_in_us + a->dbg_in_dur_us),
+                       ptv_self_shed_note(a, sn, sizeof sn));
+            }
             a->dbg_in_us = inus;
             a->dbg_in_dur_us = frame->sample_rate > 0 ?
                 av_rescale(frame->nb_samples, 1000000, frame->sample_rate) : 0;

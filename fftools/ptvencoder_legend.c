@@ -80,6 +80,9 @@ void show_help_default(const char *opt, const char *arg)
         "    PTV_NO_RESIDENCE    mosaic per-slot source-rate cadence (pre-0.9.13 pop-per-tick)\n"
         "    PTV_NO_AUTOBANK     runtime bursty-channel bank escalation (back to advisor-only)\n"
         "    PTV_NO_CLOCKFOLLOW  following a large verified source-clock offset (>0.5%%; e.g. a fast relay)\n"
+        "    PTV_NO_QSHED        GOP-coherent video_q overflow shed (back to per-pkt tail-drop = the #32 wedge)\n"
+        "    PTV_NO_RATCHREL     bank/dlvhold release on the starved-while-flowing contradiction\n"
+        "    PTV_NO_SELFHEAL     internal re-prime backstop on sustained frame_q starvation\n"
         "   logging: PTV_DIAG=1 debug lines · PTV_LOG_TS=1 timestamp prefix · see -log-legend for probes\n");
 }
 

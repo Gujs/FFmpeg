@@ -40,7 +40,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.0.1-pre7"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.0.1-pre8"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -450,6 +450,38 @@ int     g_slow;
  * Stress knob, gated; default off. */
 static int     g_slow_dec;
 static int64_t g_slow_dec_on_us, g_slow_dec_off_us;   /* absolute monotonic window; off=0 → forever */
+/* ==== 1.0.1-pre8 — the #32 WEDGE fixes (live-proven mechanism, cor-3 2026-07-15): slow NVDEC
+ * (mass-restart GPU contention) → video_q fills to cap → the demux TAIL-DROPPED arriving video
+ * PER-PACKET, MID-GOP (~70%) → the decoder received GOP fragments and ran at ~11% of realtime →
+ * the queue never drained → the drop policy fragmented its own input FOREVER on a clean wire.
+ * Self-sustaining; also entered MID-RUN whenever the consumer fell behind long enough. ==== */
+/* (a) GOP-COHERENT VIDEO OVERFLOW (QSHED): when video_q must shed load, never drop random tail
+ * packets. The decoder head-sheds WHOLE GOPs (oldest first — drop from the head to the next
+ * keyframe, which then decodes) on the demux's overflow request, and the demux tail-drops the
+ * arriving stream to the next IDR while full — so the decoder ALWAYS receives contiguous,
+ * decodable GOPs and runs at full speed the instant it can consume: the fragmentation feedback
+ * loop is structurally impossible. Audio overflow sheds whole frames OLDEST-first (frames are
+ * independent; keeping the freshest drains latency instead of pinning it). PTV_NO_QSHED reverts. */
+int     g_qshed = 1;
+/* (b) RATCHET RELEASE ON STARVATION: a starved frame_q (≤2 frames for ≥5s) with an ARMED BANK
+ * while input IS flowing is a contradiction — holding gate latency for a buffer that is empty.
+ * Release the bank + delivery caps immediately (BANK_RELEASE) instead of the 6h decay; the
+ * retained latency then drains via the normal catch-up path (blocking push disarms). Normal
+ * deep-bank operation (bursty delivery, buffers full or input absent) is untouched — banks
+ * exist for that. PTV_NO_RATCHREL reverts. */
+int     g_ratchrel = 1;
+/* (c) SELF-HEAL RE-PRIME BACKSTOP: sustained frame_q starvation (≥30s) while input IS flowing
+ * means the decode path is wedged on stale/undecodable backlog — the decoder flushes video_q +
+ * its own state and resumes at the next IDR (what a supervisor restart achieves, in-process).
+ * Rate-limited to one attempt per 5min; loudly logged [PTV-SELFHEAL]. PTV_NO_SELFHEAL reverts. */
+int     g_selfheal = 1;
+_Atomic int     g_selfheal_req;
+_Atomic int64_t g_v_arrive_wc;
+/* (d) SELF-MADE-GAP LOG HONESTY: every self-inflicted queue drop (video head/tail shed, audio
+ * drop-oldest) stamps these; AGLUE/ASTEP lines within 5s carry " [self: N pkts shed]" so our
+ * own drops are never again misread as source burstiness. */
+_Atomic int64_t g_shed_wall;
+_Atomic int64_t g_shed_cnt;
 
 /* PTV_LOG_TS=1: prefix every log line with a local wall-clock timestamp
  * [YYYY-MM-DD HH:MM:SS.mmm], so production logs are self-dated natively
@@ -788,8 +820,96 @@ static void *decode_thread(void *arg)
                    (av_gettime_relative() - t0) / 1000000.0);
     }
     for (;;) {
-        ret = av_thread_message_queue_recv(d->video_q, &pkt, 0);
-        if (ret < 0) break;
+        pkt = NULL;
+        /* 1.0.1-pre8 (a) HEAD-GOP SHED: the demux flagged a video_q overflow. Only the consumer
+         * can pop the queue head, so the shed executes here: drop packets from the HEAD up to
+         * (not including) the next keyframe — the oldest whole GOP (or the un-decoded remainder
+         * of the GOP currently in progress) — and DECODE that keyframe. The decoder's input
+         * stays contiguous whole GOPs, so it runs at full speed the moment it can consume;
+         * repeated overflows re-arm the request one GOP at a time. Entry is depth-gated so a
+         * stale request after the pressure passed can never shed a healthy queue. */
+        if (g_qshed && d->live && d->vq_shed_req &&
+            atomic_load_explicit(d->vq_shed_req, memory_order_relaxed)) {
+            atomic_store_explicit(d->vq_shed_req, 0, memory_order_relaxed);
+            if (av_thread_message_queue_nb_elems(d->video_q) >=
+                FFMAX(g_cp.videoq_pkts / 2, g_cp.videoq_pkts - 128)) {
+                int shed_n = 0;
+                int64_t d0 = AV_NOPTS_VALUE, d1 = AV_NOPTS_VALUE;
+                for (;;) {
+                    AVPacket *sp;
+                    if (av_thread_message_queue_recv(d->video_q, &sp,
+                                                     AV_THREAD_MESSAGE_NONBLOCK) < 0)
+                        break;                                   /* drained — stop */
+                    if ((sp->flags & AV_PKT_FLAG_KEY) && shed_n > 0) {
+                        pkt = sp;                                /* GOP boundary: this key DECODES */
+                        break;
+                    }
+                    if (sp->dts != AV_NOPTS_VALUE) {
+                        if (d0 == AV_NOPTS_VALUE) d0 = sp->dts;
+                        d1 = sp->dts;
+                    }
+                    shed_n++;
+                    av_packet_free(&sp);
+                }
+                if (shed_n > 0) {
+                    int64_t nw = av_gettime_relative();
+                    int64_t span_ms = (d0 != AV_NOPTS_VALUE && d1 != AV_NOPTS_VALUE)
+                        ? av_rescale_q(d1 - d0, d->ist_tb, (AVRational){1, 1000}) : 0;
+                    d->shed_pkts += shed_n;
+                    atomic_store_explicit(&g_shed_wall, nw, memory_order_relaxed);
+                    atomic_fetch_add_explicit(&g_shed_cnt, shed_n, memory_order_relaxed);
+                    if (nw - d->shed_log_us >= 1000000) {        /* rate-limit; totals keep it honest */
+                        d->shed_log_us = nw;
+                        av_log(NULL, AV_LOG_WARNING,
+                               "[PTV-QSHED] video_q overflow: dropped GOP %d pkts (%"PRId64"ms) from the head — "
+                               "resuming at the next keyframe (total head-shed %"PRId64" pkts)\n",
+                               shed_n, span_ms, d->shed_pkts);
+                    }
+                }
+            }
+        }
+        if (!pkt) {
+            ret = av_thread_message_queue_recv(d->video_q, &pkt, 0);
+            if (ret < 0) break;
+        }
+        /* 1.0.1-pre8 (c) SELF-HEAL RE-PRIME: the master output thread measured sustained
+         * frame_q starvation with input flowing — the decode path is wedged on stale or
+         * undecodable backlog. Do what a supervisor restart achieves, in-process: drop the
+         * whole queued backlog, reset the decoder, resume clean at the next IDR. Anchors
+         * (h0) and downstream state are preserved; aresample absorbs the content gap. */
+        if (g_selfheal && d->live && !d->hold &&
+            atomic_exchange_explicit(&g_selfheal_req, 0, memory_order_relaxed)) {
+            AVPacket *sp;
+            int flushed = 1;                                     /* the packet in hand goes too */
+            av_packet_free(&pkt);
+            while (av_thread_message_queue_recv(d->video_q, &sp, AV_THREAD_MESSAGE_NONBLOCK) >= 0) {
+                av_packet_free(&sp);
+                flushed++;
+            }
+            avcodec_flush_buffers(d->vdec);
+            d->heal_dropkf = 1;
+            d->heal_arm_us = av_gettime_relative();
+            atomic_store_explicit(&g_shed_wall, d->heal_arm_us, memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_shed_cnt, flushed, memory_order_relaxed);
+            av_log(NULL, AV_LOG_WARNING,
+                   "[PTV-SELFHEAL] re-prime: flushed %d queued video pkts + decoder state; "
+                   "resuming at the next IDR\n", flushed);
+            continue;
+        }
+        if (d->heal_dropkf) {                                    /* (c): clean resume boundary */
+            if (pkt->flags & AV_PKT_FLAG_KEY) {
+                d->heal_dropkf = 0;
+            } else if (av_gettime_relative() - d->heal_arm_us > 5000000) {
+                d->heal_dropkf = 0;                              /* Session-109 escape: no IDR within 5s
+                                                                  * → decode anyway, never freeze */
+                av_log(NULL, AV_LOG_WARNING,
+                       "[PTV-SELFHEAL] no IDR within 5s of the re-prime — resuming mid-GOP\n");
+            } else {
+                av_packet_free(&pkt);
+                atomic_fetch_add_explicit(&g_shed_cnt, 1, memory_order_relaxed);
+                continue;
+            }
+        }
         if (g_slow_dec) {   /* 1.0.1-pre8 stress knob: model a slow/contended NVDEC (windowed) */
             int64_t nws = av_gettime_relative();
             if (nws >= g_slow_dec_on_us && (!g_slow_dec_off_us || nws < g_slow_dec_off_us))
@@ -1504,6 +1624,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         else { d->n_rung = n_rung; for (r = 0; r < n_rung; r++) d->frame_q[r] = rung[r].frame_q; }
         /* §13 deep startup cushion — target derivation moved to resolve_cushions() (0.9.18 M1) */
         d->deep_prime_packets = g_cp.deep_prime_pkts;
+        d->vq_shed_req = &inputs[k].vq_shed_req;   /* 1.0.1-pre8 (a): head-GOP shed request slot */
     }
 
     g_genlock_ok = (live && !multiview);             /* v0.9.0: genlock applies to single-input live only */
@@ -1570,6 +1691,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         d->wrap_off = inputs[kk].wrap_off; d->wrap_last = inputs[kk].wrap_last;
         d->wrap_wall_last = inputs[kk].wrap_wall_last; d->video_fwd_us = 0;
         d->disc = g_layera ? &inputs[kk].disc : NULL;   /* legacy-0004 buffer (NULL when off) */
+        d->vq_shed_req = &inputs[kk].vq_shed_req;       /* 1.0.1-pre8 (a): overflow -> request head-GOP shed */
         d->autobank = g_autobank && !multiview && live && is_net_url(inputs[kk].url);   /* v0.9.14: single-input live only */
         for (r = 0; r < n_rung; r++) {
             d->mux_q[r] = rung[r].mux_q;
@@ -2166,6 +2288,9 @@ int main(int argc, char **argv)
      * PTV_PLL_ACQUIRE_N (32) / PTV_PLL_REFRACTORY_MS (12000) / PTV_PLL_NOISE_K (3) /
      * PTV_PLL_DEV_SHIFT (9) internalized — see the g_pll_* declarations */
     { const char *tn = getenv("PTV_PLL_TESTNOISE_MS");  if (tn && atoi(tn) > 0) g_pll_testnoise_us  = (int64_t)atoi(tn) * 1000; }  /* TEST-ONLY: inject ±N ms offset square wave */
+    if (getenv("PTV_NO_QSHED"))    g_qshed    = 0;   /* 1.0.1-pre8 (a): revert to per-packet tail-drop on video_q overflow (the #32 fragmenter; A/B only) */
+    if (getenv("PTV_NO_RATCHREL")) g_ratchrel = 0;   /* 1.0.1-pre8 (b): keep the 6h bank decay even under the starvation contradiction */
+    if (getenv("PTV_NO_SELFHEAL")) g_selfheal = 0;   /* 1.0.1-pre8 (c): no internal re-prime on sustained starvation */
     { const char *s = getenv("PTV_SLOW_US"); g_slow = s ? atoi(s) : 0; }
     { const char *s = getenv("PTV_SLOW_DEC_US"); g_slow_dec = s ? atoi(s) : 0;   /* 1.0.1-pre8 stress knob (slow-NVDEC stand-in) */
       if (g_slow_dec) {

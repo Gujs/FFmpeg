@@ -7,6 +7,109 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(7f) #32 WEDGE — GOP-COHERENT VIDEO OVERFLOW + STARVATION-CONTRADICTION
+RECOVERY (pre8; demux_dispatch/decode_thread/output_thread/cushion_escalate).
+THE DEFECT (live-proven on cor-3 2026-07-15, owner-tcpdump-verified clean
+wire; the most severe known): slow NVDEC init (mass-restart GPU contention)
+→ video_q fills to cap (observed vq=664 pinned) → the demux TAIL-DROPPED
+arriving video PER-PACKET, MID-GOP (~70% dropped) → the decoder received GOP
+fragments and produced ~11% of realtime (5.6 pkt/s on a 50fps channel) → the
+queue never drained → the drop policy fragmented its own input FOREVER on a
+continuous wire. Self-sustaining; entry also mid-run whenever the consumer
+fell behind long enough (Newsmax2, 20min after a clean single restart).
+Escape only on a load lull, and even then the AUTO-BANK/delivery ratchet
+kept the channel up to ~92s behind live permanently (Daystar_esp). Version-
+independent — the tail-drop policy is ancient. Wedge signature: frameq=1
+pinned + vq at cap + rho railed −15000 + dlvhold ratcheted + vdrop climbing
++ tick-multiple ASTEP flood, all with clean input.
+LOCAL RULE-0 FIXTURE (new stress knob PTV_SLOW_DEC_US windowed per-packet
+decode cost — the faithful slow-NVDEC stand-in; PTV_SLOW_US slows the OUTPUT
+thread, which frame_q drop-oldest decouples from video_q): ntsc60 59.94fps
+g60 looping UDP, 40ms/pkt (32% consumption) for t=60..150s. PRE7 reproduced
+the full signature: vq pinned 782-784(cap), frameq 0-1 for one continuous
+87.3s starvation, vdrop 2893 climbing per-packet mid-GOP, dup ~40/s,
+rho −15000 railed, async +489k ppm, dlvhold 3.3→22.2s ratchet, hs +35.8s
+monotonic, 1463 ASTEP + 1047 ACOMP, ~556 in-window h264 fragment-decode
+errors; recovery only by a 48s content leap.
+FOUR FIXES (each with a kill-switch):
+(a) GOP-COHERENT OVERFLOW [PTV_NO_QSHED]: when video_q must shed, never
+drop random tail packets. Demux overflow → requests a HEAD flush from the
+decoder (only the consumer can pop the head): decode drops whole oldest
+GOPs — head to the next keyframe, which then decodes — one GOP per request,
+depth-gated against stale requests; meanwhile the demux TAIL-drops the
+arriving stream to the next IDR that fits, so the queue never holds a
+headless GOP. The decoder ALWAYS receives contiguous decodable GOPs → runs
+at full speed the instant it can consume → the fragmentation feedback loop
+is structurally impossible. Head-shed also drops OLDEST content first =
+overflow now DRAINS latency instead of pinning the stale head. Audio
+overflow sheds whole frames oldest-first (was drop-newest). All sheds are
+accounted: "[PTV-QSHED] video_q overflow: dropped GOP <n> pkts (<ms>ms)"
+(rate-limited, honest totals).
+(b) RATCHET RELEASE ON STARVATION [PTV_NO_RATCHREL]: frame_q ≤2 frames for
+≥5s while input IS flowing (new g_v_arrive_wc demux stamp) with an ARMED
+bank = holding gate latency for a buffer that is empty — a contradiction
+(the wedge/aftermath shape). cushion_escalate(BANK_RELEASE): bank + gate
+caps back to base immediately instead of the 6h decay; blocking push
+disarms, retained latency drains via the normal catch-up path. Normal
+deep-bank operation is untouched (a delivery gap = input NOT flowing; a
+catch-up refill = frame_q NOT starved).
+(c) SELF-HEAL RE-PRIME BACKSTOP [PTV_NO_SELFHEAL]: the same contradiction
+sustained ≥30s → the decode thread flushes video_q + its own state
+(avcodec_flush_buffers) and resumes at the next IDR — what a supervisor
+restart achieves, in-process, anchors preserved. Rate-limited 1/5min,
+loudly logged [PTV-SELFHEAL].
+(d) SELF-MADE-GAP LOG HONESTY: every self-inflicted drop stamps
+g_shed_wall/g_shed_cnt; AGLUE/ASTEP lines within 5s of one carry
+" [self: N pkts shed]" so our own drops are never again misread as source
+burstiness (the "bursty channel" taxonomy was self-portraiture — owner
+mandate). Log shapes byte-identical when nothing was shed.
+GATES (pre7 = 77e7410e61 + knob vs pre8, same fixture): in-window h264
+fragment errors 556→2 (only the identical 154-line tune-in burst remains);
+decoder input whole GOPs (QSHED head 1765 pkts + tail 384, fully accounted
+vs blind vdrop=2893); hs bounded sawtooth ≤13.4s vs +35.8s monotonic;
+dlvhold ≤14.9s sawtooth vs 22.2s pinned; ASTEP 655 vs 1463; adrop 0 vs 361.
+RECOVERY after release: dup slope→0 and frame_q refilled 157/160 by +7s,
+dlvhold 14.9→2.99s by +17s (→ baseline ~1.9s), retained latency +1.63s
+(cushion-scale) vs pre7's 48s content leap — full recovery ≤60s: PASS.
+BIRTH cell (bo birth, frozen 20s at spawn, 25fps): pre8 comes up clean with
+BOUNDED retained latency — one accounted head-GOP shed at CONT (61 pkts/
+1200ms), dlvhold 3.6→2.4s (baseline) by +5min vs pre7 5.2-5.9s still
+draining (~10min more to go). DBL cell (STOP 20/5/10 — the AUTO-BANK
+ratchet): pre7/pre8 SHAPE-IDENTICAL by design (bank 12s, dlvhold ~10.5s
+pinned, buffers FULL = no contradiction, (b) correctly silent) — normal
+deep-bank operation untouched. (b) cell (dbl-armed bank + slow-consumer
+window): pre8 "[PTV-CUSHION] BANK released (was 12.0s): frame_q starved
+5.0s with input flowing" at exactly 5.0s, caps back to 3.0s, dlvhold then
+DRAINS 10.5→5.5s and falling; pre7 REBUILDS the ratchet after the window
+(bank climbing back toward 12s, dlvhold rising — 6h decay the only out).
+(c)-alone cell (PTV_NO_QSHED+PTV_NO_RATCHREL, the slowdown fixture): the
+wedge re-forms exactly as pre7 (vdrop 2000, 495 fragment errors, hs to
++34.3s); [PTV-SELFHEAL] fires at 30s, flushes 783 pkts + decoder, resumes
+at IDR — hs collapses +12.0→+1.25s at the heal; full recovery post-window
+(dlvhold 22→2.9s). Rate limit 1/5min held. The heal is what a supervisor
+restart achieves, in-process. (Session-109 rule applied: the post-heal
+drop-until-IDR carries a 5s escape so long-GOP sources can never freeze.)
+REGRESSION BATTERY (14 fixtures vs the pre7 baselines, dg-run live-UDP +
+tsp regulate): wclose/sym/aonly/b300/tb900 (tb900 vs the valid rr7-p7
+baseline — the dg-tb900-p7 file was a truncated pre-event run) event-line
+IDENTICAL; splitband/mir2/dbl/tb30/wcl400/wc520/att-u900/att-b80 identical
+applied offsets, verdicts, vid_err values and line shapes with only
+buffer-cycle count jitter (flush pkts ±1-6; the mir2 GAP hole +456→+552ms
+= exactly 4 extra OLD mp2 frames × 24ms) — same class and magnitude as the
+pre7 A/A control (p7 vs rr7-p7: 64→70, +456→+576). fx-wcl350 full-file
+byte gate: fresh QUIET-BOX serial pre7-vs-pre8 A/B FULL-FILE BYTE-IDENTICAL (62,652,416 bytes; a first contended-box attempt was root-caused to the pre7 leg running concurrent with the soak — fps=1.7 stall, invalid A/B).
+20-min clean soak: dup=0, hs=+0, rho ppm-scale, zero QSHED/SELFHEAL/BANK
+events (3 identical +824ms source-label AGLUE GAPs = a known sample
+artifact, present on pre7 too; post-EOF starvation tail = input-ended
+artifact). NOTHING regressed — the new machinery is inert without
+overflow/starvation, and log shapes are byte-identical when nothing shed.
+FOLLOW-UP note: retained-latency drain after a release rides the normal
+catch-up path (ppm-scale + drop-oldest), minutes not seconds — deliberate
+(no viewer-visible fast-forward).
+FOLLOW-UP (out of scope this round, noted): the WUCR ±15000ppm sustained
+slow-down authority cap is structurally too small vs a consumer running
+≥5% slow (rails during any wedge); revisit with its own fixture.
+
 (7e) LAYERA CONTINUING-STREAM KEEP — cycle-2 video deletion on split events +
 borrowed-base false crossing (pre7; ptv_disc_flush + demux loop). On every
 split (two-cycle) discontinuity event, the second cycle's buffer holds ~500ms
