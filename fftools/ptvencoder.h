@@ -145,6 +145,49 @@ typedef struct VOutRing {
     int64_t          n;                /* total writes (monotonic); newest index = (n-1) % PTV_VRING */
     pthread_mutex_t  lock;
 } VOutRing;
+/* ===================== 1.0.1-pre9 — PASSIVE residual lip-sync SENSOR =====================
+ * Component 1 of the residual-sync supervisor (analysis/ptvencoder-residual-sync-supervisor.md).
+ * NON-BLIND by construction: each stream's SOURCE→OUTPUT content mapping is measured
+ * independently against the post-demux (post-glue) label domain, PLUS a per-stream ledger of
+ * every label EDIT the pipeline itself made, so any edit that shifts ONE stream's mapping
+ * shows up while shared source discontinuities cancel:
+ *   m_v = EMA[out_v − src_v]            (output thread, per emitted frame incl. dups —
+ *                                        the dup ratchet and label-followed jumps are REAL
+ *                                        presentation shifts and must be measured, not read
+ *                                        from house_skew, which is a control variable)
+ *   m_a = EMA[out_a − (sink_src − inj) − slip]
+ *                                       (audio drain, per emitted frame; inj = the label
+ *                                        offsets the audio thread itself injected at the graph
+ *                                        door = AGLUE glue_off + AVLOCK house_skew, so the
+ *                                        reference recovers the RAW post-demux label; slip =
+ *                                        the resampler's UN-REALIZED correction beyond a 50ms
+ *                                        dead band — the parked-slip class [PTV-SWRDELAY]
+ *                                        exists for, which label math alone cannot see)
+ *   E_s = per-stream demux label-edit ledger (µs): discontinuity self-rebase (§5.A.2 absorbs),
+ *         LAYERA flush applied_offset persists, pre5 retro-corrections. Pure 2^33 wraps are
+ *         EXCLUDED (always genuine, always shared; including them would spike R by 26.5h
+ *         during every A-before-V wrap straddle).
+ *   R = (m_v + E_v) − (m_a + E_a)       (+ = video presented later = audio EARLY, the
+ *                                        external oracle's convention; R = −(disc-oracle
+ *                                        "ADDED" which prints + = audio made later))
+ * Both m terms contain −h0 and both realized house retimings (AVLOCK) — those cancel in R:
+ * shared latency is NOT desync (the wedge/AUTO-BANK posture). What does NOT cancel: AGLUE
+ * relabel-erases (glue_off), per-stream-unequal demux rebases (E_v−E_a — the wrong-glue /
+ * partner-step-bake class), parked resampler slip, and any label-followed single-stream jump.
+ * PASSIVE: nothing consumes R — it feeds the stats line (`lipsync=`) and the [PTV-RSYNC]
+ * DIAG line only. The corrector is a later round, gated on this sensor matching the external
+ * oracle in a live soak. PTV_RSYNC_SENSE=0 disables. Single-input only (the mv compositor
+ * owns per-slot lineage; mv prints no lipsync= rather than garbage — n_a stays 0). */
+typedef struct RsyncSense {
+    _Atomic int64_t mv_ema;                 /* video EMA(out−src) µs (master rung writes) */
+    _Atomic int64_t mv_wall;                /* wall µs of the last video sample (freshness) */
+    _Atomic int64_t ev_us;                  /* video stream label-edit ledger E_v (µs, demux writes) */
+    _Atomic int64_t ma_ema[PTV_MAX_AUDIO];  /* per-track audio EMA (audio threads write) */
+    _Atomic int64_t ma_wall[PTV_MAX_AUDIO]; /* wall µs of the last audio sample */
+    _Atomic int64_t ea_us[PTV_MAX_AUDIO];   /* per-track audio stream ledger E_a (µs) */
+    int             n_a;                    /* transcoded tracks wired (0 = sensor unwired: multiview / no audio) */
+} RsyncSense;
+
 /* 0.9.18 M3 — CushionRt: the runtime COORDINATION home for cushion escalation (map §1.3).
  * Holds the per-run wiring every escalation event needs (the per-rung delivery gates, the
  * master tick, the adaptive tier targets) plus the mutex that makes cushion_escalate() the
@@ -401,6 +444,11 @@ typedef struct AudioState {
     int64_t          shed_mark;                       /* 1.0.1-pre8 (d): g_shed_cnt snapshot while no shed window is
                                                        * open; " [self: N pkts shed]" = cnt_now − mark on AGLUE/ASTEP
                                                        * lines within 5s of a self-inflicted queue drop */
+    /* 1.0.1-pre9 residual sensor (PASSIVE — see RsyncSense): audio-side content mapping. */
+    int64_t          rs_ma_ema;                       /* EMA of m_a = out − (sink_src − inj) − slip (µs) */
+    int              rs_ma_seed;                      /* EMA seeded at first sample */
+    int64_t          rs_slip_us;                      /* latest net (dead-banded) resampler slip (DIAG) */
+    int64_t          rs_log_last;                     /* [PTV-RSYNC] DIAG rate limit (wall µs) */
 } AudioState;
 
 /* ---- demux + mux ---- */
@@ -581,6 +629,10 @@ typedef struct DemuxArgs {
     int64_t              *wrap_off;       /* per input stream: cumulative 33-bit wrap offset (stream tb) */
     int64_t              *wrap_last;      /* per input stream: last RAW ts seen (wrap detection) */
     int64_t              *wrap_wall_last; /* per input stream: wall-clock (us) of this stream's last packet — gap-vs-splice discriminator */
+    int64_t              *edit_us;        /* 1.0.1-pre9 sensor: per-stream label-EDIT ledger (µs) — the
+                                           * non-wrap share of wrap_off (splice absorbs, LAYERA persists,
+                                           * retro-corrections); demux thread only, published via g_rsx */
+    int                   rsync_pub;      /* 1 = publish this input's ledger to g_rsx (single-input, input 0) */
     PtvDiscBuf           *disc;           /* legacy-0004 buffer-classify-discard (g_layera only; NULL otherwise) */
     int64_t               video_fwd_us;   /* wall-clock (us) of the last VIDEO forward-discontinuity crossing (whole-program-splice indicator) */
     int64_t               prog_off;       /* P2 (§7.1): program-level discontinuity offset (90kHz, detected on the
@@ -657,6 +709,7 @@ typedef struct Input {
     int64_t              *wrap_off;          /* per stream: 33-bit wrap offset (stream tb) */
     int64_t              *wrap_last;         /* per stream: last RAW ts (wrap detection) */
     int64_t              *wrap_wall_last;    /* per stream: wall-clock (us) of last packet (gap-vs-splice discriminator) */
+    int64_t              *edit_us;           /* pre9 sensor: per-stream label-edit ledger storage (µs) */
     PtvDiscBuf            disc;              /* legacy-0004 buffer-classify-discard state (used only when g_layera) */
     /* 1.0.1-pre5 shared-flush expected-step handshake storage (D1) — one slot per GLOBAL
      * transcoded track index (only the tracks sourced from this input are wired). Demux thread
@@ -764,6 +817,9 @@ extern _Atomic int64_t g_shed_wall;      /* (d) wall us of the last self-inflict
 extern _Atomic int64_t g_shed_cnt;       /* (d) cumulative self-shed pkts (video head+tail, audio drop-oldest) */
 extern int     g_nvenc_serialize;        /* defined in ptvencoder_clock.c */
 extern CushionRt g_curt;                 /* defined in ptvencoder_gate.c */
+/* 1.0.1-pre9 residual sensor (defined in ptvencoder.c) */
+extern int        g_rsync_sense;         /* PASSIVE sensor on (PTV_RSYNC_SENSE=0 disables) */
+extern RsyncSense g_rsx;                 /* published sensor state (single-input, input 0) */
 
 /* ==== cross-file functions ==== */
 /* ptvencoder_gate.c */

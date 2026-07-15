@@ -7,6 +7,73 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(7g) RESIDUAL LIP-SYNC SENSOR, PASSIVE (pre9; component 1 of the
+residual-sync supervisor — analysis/ptvencoder-residual-sync-supervisor.md).
+WHY: every desync class so far needed its own detector+glue, and one missed
+event bakes a permanent offset the internals cannot see (blind-sensor
+history: house-stamped-audio vs house-stamped-video cancels by
+construction; [PTV-LIPSYNC]'s async_pad accounting read −2986ms on a
+channel the oracle measured +24ms, Lindel 2026-07-15 — resampler ACTIVITY
+is not desync). This round ships the NON-BLIND sensor only — NO ACTUATION
+(grep-proven: every g_rsx read terminates in av_log/snprintf); the
+corrector is a later round, gated on this sensor matching the external
+oracle in a live soak.
+DESIGN (full model at the RsyncSense declaration in ptvencoder.h): each
+stream's source→output content mapping measured independently against the
+post-demux (post-glue) label domain + a per-stream ledger of every label
+EDIT the pipeline itself made:
+  m_v = EMA[out−src] per EMITTED frame (dups included — the dup ratchet is
+        a real presentation shift, MEASURED, not read back from house_skew,
+        a control variable); out on the exact-rational axis (the integer
+        tick would re-import the ~10ppm NTSC drift into the sensor);
+  m_a = EMA[out − (sink_src − inj) − slip]: inj = AGLUE glue_off + AVLOCK
+        house_skew (recovers the RAW post-demux label at the sink); slip =
+        the resampler's UN-REALIZED correction (door-label head − sink-
+        label head − swr_get_delay, 50ms dead band) — the parked-slip
+        class that label math alone is blind to ([PTV-SWRDELAY]'s reason);
+  E_s = per-stream demux label-edit ledger (discontinuity self-rebase,
+        LAYERA flush persists, pre5 retro-corrections; pure 2^33 wraps
+        EXCLUDED — always genuine+shared, and posting them would spike R
+        by the wrap period during every A-before-V wrap straddle);
+  R = (m_v+E_v) − (m_a+E_a), + = audio EARLY (= −(disc-oracle "ADDED",
+      which prints + = audio made later)).
+Shared source discontinuities and AVLOCK-realized retiming cancel (a glue
+that moves BOTH ledgers equally is latency, not desync — the wedge/
+AUTO-BANK posture); what shows: AGLUE relabel-erases (glue_off),
+per-stream-UNEQUAL demux rebases (the JLTV/Azorse wrong-glue bake class),
+parked resampler slip, and any label-followed single-stream jump.
+Aresample pads/drops that fill genuine label gaps are mapping-neutral by
+construction (label-referenced accounting, not span accounting).
+SURFACE: `lipsync=±Nms` on the stats line (a0:/a1: per track when
+multi-track; `--` when a side has not flowed for 3s — no stale anchors) +
+rate-limited [PTV-RSYNC] DIAG line (R + dm/ev/ea/glue/hs/slip components)
+under PTV_DIAG. Single-input only: multiview publishes NOTHING (n_a=0, mv
+stats line unchanged) rather than garbage — per-slot lineage belongs to
+the compositor, a later round. PTV_RSYNC_SENSE=0 disables.
+GATES (local dg-run/tsp harness; oracle = disc-oracle differential
+POST−PRE, instrument-constant-corrected; agreement bands ±20ms clean /
+±40ms events; detailed numbers in the session report):
+  (1) clean fx-smoke steady state: R vs oracle within ±20ms (including the
+      sample's own −13.98s LAYERA glue: ev=ea=−13980ms cancel exactly);
+  (2) baked offset: audio −300ms label shift (backward absorber erases →
+      E_a=+300ms) — R = −300ms-class, agrees with the oracle incl. sign;
+      +300ms forward control (AGLUE GAP-pads, faithful): both ~0;
+  (3) event neutrality fx-wclose / fx-splitband: R back within ±40ms after
+      the glue, no spurious drift during LAYERA buffering;
+  (4) wedge (PTV_SLOW_DEC_US window): R bounded and near 0 post recovery —
+      hs-injected pads are matched by the measured video ratchet;
+  (5) fx-wcl350 full-file BYTE gate pre8-vs-pre9 IDENTICAL (passive proof)
+      + battery spots line-identical modulo the new fields; 15-min soak
+      lipsync= flat near 0, CPU unchanged;
+  (6) sign proof: video −200ms label shift (absorber erases → E_v=+200ms →
+      video presented later) reads lipsync POSITIVE (+ = audio early).
+      (The forward +200ms variant is NOT a sign fixture: it passes the 1s
+      forward threshold unabsorbed = faithfully realized = added 0.)
+LIVE SOAK MUST VALIDATE before the corrector round (the design doc's hard
+gate): sensor-vs-oracle SIGN and SLOPE agreement on (a) a clean channel,
+(b) a TruBLU rewind session, (c) a provoked escape/garbage episode. A
+sensor that disagrees with the oracle is discarded, not tuned around.
+
 (7f) #32 WEDGE — GOP-COHERENT VIDEO OVERFLOW + STARVATION-CONTRADICTION
 RECOVERY (pre8; demux_dispatch/decode_thread/output_thread/cushion_escalate).
 THE DEFECT (live-proven on cor-3 2026-07-15, owner-tcpdump-verified clean

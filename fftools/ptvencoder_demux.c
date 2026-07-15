@@ -267,6 +267,30 @@ static void ptv_pair_expect(DemuxArgs *d, int stream_idx, int64_t step_us)
     }
 }
 
+/* 1.0.1-pre9 residual-sensor label-edit ledger (PASSIVE — see RsyncSense in ptvencoder.h):
+ * post every NON-WRAP label edit the demux makes to stream `s` (µs, the amount ADDED to the
+ * stream's labels). Callers: the discontinuity self-rebase (−adj), the LAYERA flush persist
+ * (+applied_offset), the pre5 retro-correct (+corr). Pure 2^33 wraps are deliberately NOT
+ * posted (always genuine + shared; posting them would spike R by the wrap period during every
+ * A-before-V wrap straddle). Demux thread only; published to g_rsx for the single wired input
+ * so the sensor's R sees per-stream-UNEQUAL edits (the wrong-glue bake class) while shared
+ * edits cancel. Ledger + publish are reporting-only — no control path reads them. */
+static void rsync_post_edit(DemuxArgs *d, int s, int64_t delta_us)
+{
+    int j;
+    if (!g_rsync_sense || !d->edit_us || s < 0 || s >= (int)d->ifmt->nb_streams)
+        return;
+    d->edit_us[s] += delta_us;
+    if (!d->rsync_pub)
+        return;
+    if (s == d->vstream)
+        atomic_store_explicit(&g_rsx.ev_us, d->edit_us[s], memory_order_relaxed);
+    else
+        for (j = 0; j < d->n_audio && j < PTV_MAX_AUDIO; j++)
+            if (d->astream[j] == s)
+                atomic_store_explicit(&g_rsx.ea_us[j], d->edit_us[s], memory_order_relaxed);
+}
+
 void ptv_disc_free(PtvDiscBuf *b)
 {
     if (!b || !b->packets)
@@ -785,6 +809,7 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
             if (b->stream_state[s].has_new_base) {
                 d->wrap_off[s] += av_rescale_q(b->applied_offset, AV_TIME_BASE_Q,
                                                d->ifmt->streams[s]->time_base);
+                rsync_post_edit(d, s, b->applied_offset);   /* pre9 sensor: LAYERA glue label edit */
                 /* 0.9.18.5: shift the stale jump-detection continuity ref too. last_dts_us is
                  * stored in the demux loop from the PRE-offset raw DTS of the last buffered
                  * packet; once wrap_off above carries the applied offset, the next normal-path
@@ -837,6 +862,7 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
             if (llabs(corr) <= PTV_PAIR_EPS_US)
                 continue;                        /* within the equality band — no step worth taking */
             d->wrap_off[s] += av_rescale_q(corr, AV_TIME_BASE_Q, d->ifmt->streams[s]->time_base);
+            rsync_post_edit(d, s, corr);                    /* pre9 sensor: retro-correct label edit */
             if (ss->last_dts_us   != AV_NOPTS_VALUE) ss->last_dts_us   += corr;
             if (ss->last_sent_dts != AV_NOPTS_VALUE) ss->last_sent_dts += corr;
             ptv_pair_expect(d, s, corr);         /* pre5 (D1): the content path must APPLY this step */
@@ -1094,6 +1120,8 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                         else { d->splice_adj = adj; d->splice_adj_us = nowb; }     /* first crosser sets the shared amount */
                     }
                     d->wrap_off[pkt->stream_index] -= adj;   /* per-stream rebase AT OWN CROSSING (audio-derived common offset when g_layera) */
+                    rsync_post_edit(d, pkt->stream_index,    /* pre9 sensor: a label EDIT (−adj added to this stream's labels) */
+                                    -av_rescale_q(adj, st->time_base, AV_TIME_BASE_Q));
                     if (ct == AVMEDIA_TYPE_VIDEO) {
                         d->prog_off -= adj;                  /* P2: sparse sub/data/SCTE ride this */
                         /* (video_fwd_us for the gap discriminator is stamped above, before the LAYERA skip — 0.9.18.5) */

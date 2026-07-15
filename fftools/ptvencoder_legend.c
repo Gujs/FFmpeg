@@ -138,8 +138,13 @@ void ptv_print_log_legend(int full)
         "             frames than its declared rate (e.g. ~25.4 fps declaring 25) — each skip is a\n"
         "             content position already displayed, so perceived speed is always EXACTLY 1x;\n"
         "             steady even accrual = correct (equals the surplus); never fires <=house-rate\n"
-        "  lip-sync   NOT self-reported (internal PES skew is blind to content↔PTS offset). Measure\n"
-        "             with the EXTERNAL oracle test-scripts/repro/drift-continuous.py.\n");
+        "  lipsync    (1.0.1-pre9, single-input) PASSIVE residual-sync sensor R (ms, + = audio\n"
+        "             EARLY): per-stream source→output content mapping difference (video EMA(out−src)\n"
+        "             + demux edit ledger vs audio ledger m_a) — sees relabel-erases, wrong glues and\n"
+        "             parked resampler slip; shared latency (hs) cancels. `--` = a side not flowing.\n"
+        "             UNVALIDATED vs the external oracle until the live soak passes; until then the\n"
+        "             oracle (test-scripts/repro/drift-continuous.py) stays ground truth.\n"
+        "             PTV_RSYNC_SENSE=0 disables. Components: [PTV-RSYNC] under PTV_DIAG.\n");
     av_log(NULL, AV_LOG_INFO,
         "discontinuity events (always-on since v0.9.13; were PTV_DIAG-only):\n"
         "  [PTV-LAYERA]   jump = a >1s splice detected (buffering starts); flush = the glue applied\n"
@@ -184,7 +189,10 @@ void ptv_print_log_legend(int full)
         "                 vq (demux→decode) frameq (decode→output jitter) muxq (encode→mux), genlock+rate\n"
         "  [PTV-AVSYNC]   per-track A/V controller telemetry: offset/lipsync estimate, vlag/alag,\n"
         "                 house_skew, and (multiview) the A/V PLL integrator state\n"
-        "  [PTV-SWRDELAY] aresample internal buffer occupancy (a latency LEVEL; `async` is the RATE)\n");
+        "  [PTV-SWRDELAY] aresample internal buffer occupancy (a latency LEVEL; `async` is the RATE)\n"
+        "  [PTV-RSYNC]    (1.0.1-pre9) residual-sensor components per track: R + dm(m_v−m_a) +\n"
+        "                 ev/ea (demux label-edit ledgers) + glue/hs (audio-injected offsets) +\n"
+        "                 slip (un-realized resampler correction). PASSIVE — nothing consumes R\n");
     av_log(NULL, AV_LOG_INFO,
         "  [PTV-CHAIN]    A/V trace demux→output (rawA-V / srcA-V / unwrap_inj / outA-V) to localize\n"
         "                 where an A/V offset enters\n"

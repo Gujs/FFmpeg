@@ -352,6 +352,10 @@ void *output_thread(void *arg)
             g_curt.base_sp = base_sp; g_curt.raised_sp = raised_sp;
             g_curt.cur_sp  = base_sp;
         }
+        /* 1.0.1-pre9 residual sensor: video-side EMA state (master rung; τ ≈ 30s of ticks) */
+        int64_t rs_mv_ema = 0, rs_mv_div = v->tick_dur_us > 0 ? 30000000 / v->tick_dur_us : 750;
+        int     rs_mv_seed = 0;
+        if (rs_mv_div < 8) rs_mv_div = 8;
         /* v0.9.11 pulldown state: 1-frame lookahead + film-mode detector (see g_pulldown comment) */
         AVFrame *nextf = NULL;
         int next_have = 0, film_arm = 0, held_extra = 0;
@@ -632,6 +636,22 @@ void *output_thread(void *arg)
              * audio drain can pair against it (single-input master rung only; multiview → compositor). */
             if (v->vring && fresh && content_vpts >= 0)
                 vring_put(v->vring, av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q), vpts * v->tick_dur_us);
+            /* 1.0.1-pre9 residual sensor (PASSIVE), video side: m_v = out − src per EMITTED
+             * frame — dups included (a dup presents old content later: that lateness is REAL
+             * and must be measured, not read back from house_skew, a control variable). out on
+             * the exact-rational axis (the mux pts axis; the integer tick would re-import the
+             * ~10ppm EXACTTICK drift into the sensor). EMA ≈ 30s of ticks. Single-input master
+             * rung only; multiview (passthrough) never reaches this block. */
+            if (g_rsync_sense && v->is_master && src_ts != AV_NOPTS_VALUE) {
+                int64_t out_us = v->out_fps.num > 0
+                    ? av_rescale(vpts, 1000000LL * v->out_fps.den, v->out_fps.num)
+                    : vpts * v->tick_dur_us;
+                int64_t m = out_us - av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q);
+                if (!rs_mv_seed) { rs_mv_ema = m; rs_mv_seed = 1; }
+                else rs_mv_ema += (m - rs_mv_ema) / rs_mv_div;
+                atomic_store_explicit(&g_rsx.mv_ema, rs_mv_ema, memory_order_relaxed);
+                atomic_store_explicit(&g_rsx.mv_wall, av_gettime_relative(), memory_order_relaxed);
+            }
         }
         ret = encode_push(v->mux_q, v->venc, v->ost, held, v->gate);   /* §7.5a: publish video front + release caught-up audio/copy */
         v->last_emit_us = av_gettime_relative();
@@ -715,12 +735,31 @@ void *output_thread(void *arg)
                     if (v->decim > 0)                                /* v0.9.15.2: surplus-cadence decimation count */
                         snprintf(cfs + n, sizeof cfs - n, " decim=%"PRId64, v->decim);
                 }
+                char rsl[24 + PTV_MAX_AUDIO * 16] = "";              /* pre9 residual sensor: lipsync= (+ = audio early) */
+                if (g_rsync_sense && g_rsx.n_a > 0) {
+                    int64_t mvw = atomic_load_explicit(&g_rsx.mv_wall, memory_order_relaxed);
+                    int64_t mv  = atomic_load_explicit(&g_rsx.mv_ema,  memory_order_relaxed)
+                                + atomic_load_explicit(&g_rsx.ev_us,   memory_order_relaxed);
+                    int     nn = snprintf(rsl, sizeof rsl, " lipsync=");
+                    for (int ki = 0; ki < g_rsx.n_a && nn < (int)sizeof rsl - 14; ki++) {
+                        int64_t maw = atomic_load_explicit(&g_rsx.ma_wall[ki], memory_order_relaxed);
+                        int fresh = mvw && maw && nows - mvw < 3000000 && nows - maw < 3000000;
+                        if (g_rsx.n_a > 1)
+                            nn += snprintf(rsl + nn, sizeof rsl - nn, "%sa%d:", ki ? "," : "", ki);
+                        if (fresh) {                                 /* R = (m_v+E_v) − (m_a+E_a); stale side → -- (no stale anchors) */
+                            int64_t ma = atomic_load_explicit(&g_rsx.ma_ema[ki], memory_order_relaxed)
+                                       + atomic_load_explicit(&g_rsx.ea_us[ki],  memory_order_relaxed);
+                            nn += snprintf(rsl + nn, sizeof rsl - nn, "%+lldms", (long long)((mv - ma) / 1000));
+                        } else
+                            nn += snprintf(rsl + nn, sizeof rsl - nn, "--");
+                    }
+                }
                 av_log(NULL, AV_LOG_INFO,
                     "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f "
                     "dup=%"PRId64" pd=%"PRId64" drop=%"PRId64" corrupt=%"PRId64" "
-                    "async=%+"PRId64"ppm%s%s%s%s\n",
+                    "async=%+"PRId64"ppm%s%s%s%s%s\n",
                     v->emitted, fps, hh, mm, ss,
-                    v->dup, v->pd, v->framedrop, cr, aw, dlv, wu, bk, cfs);
+                    v->dup, v->pd, v->framedrop, cr, aw, dlv, wu, bk, cfs, rsl);
                 stat_last = nows; stat_prev = v->emitted;
             }
         }

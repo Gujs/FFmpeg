@@ -40,7 +40,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.0.1-pre8"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.0.1-pre9"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -482,6 +482,13 @@ _Atomic int64_t g_v_arrive_wc;
  * own drops are never again misread as source burstiness. */
 _Atomic int64_t g_shed_wall;
 _Atomic int64_t g_shed_cnt;
+/* 1.0.1-pre9 (7g) — PASSIVE residual lip-sync sensor (component 1 of the residual-sync
+ * supervisor; full model at the RsyncSense declaration in ptvencoder.h). Writers: master
+ * output thread (m_v), audio threads (m_a), demux thread (E ledgers). Readers: the stats
+ * line (`lipsync=`) + [PTV-RSYNC] DIAG — NOTHING ELSE (no actuation; the corrector is a
+ * later round, gated on a live sensor-vs-oracle soak). PTV_RSYNC_SENSE=0 disables. */
+int        g_rsync_sense = 1;
+RsyncSense g_rsx;
 
 /* PTV_LOG_TS=1: prefix every log line with a local wall-clock timestamp
  * [YYYY-MM-DD HH:MM:SS.mmm], so production logs are self-dated natively
@@ -1243,7 +1250,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         inputs[k].wrap_off  = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].wrap_off));
         inputs[k].wrap_last = av_malloc_array(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].wrap_last));
         inputs[k].wrap_wall_last = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].wrap_wall_last)); /* 0 = no prev packet yet */
-        if (!inputs[k].wrap_off || !inputs[k].wrap_last || !inputs[k].wrap_wall_last) { ret = AVERROR(ENOMEM); goto end; }
+        inputs[k].edit_us   = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].edit_us));   /* pre9 sensor label-edit ledger */
+        if (!inputs[k].wrap_off || !inputs[k].wrap_last || !inputs[k].wrap_wall_last || !inputs[k].edit_us) { ret = AVERROR(ENOMEM); goto end; }
         for (si = 0; si < (int)inputs[k].ifmt->nb_streams; si++) inputs[k].wrap_last[si] = AV_NOPTS_VALUE;
         if (g_layera) {   /* legacy-0004 buffer-classify-discard state (only when enabled) */
             if ((ret = ptv_disc_init(&inputs[k].disc, PTV_DISC_CAPACITY,
@@ -1721,6 +1729,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         d->est = &inputs[kk].est;                       /* R4: this input's rate sensor (demux thread feeds it) */
         d->wrap_off = inputs[kk].wrap_off; d->wrap_last = inputs[kk].wrap_last;
         d->wrap_wall_last = inputs[kk].wrap_wall_last; d->video_fwd_us = 0;
+        d->edit_us = inputs[kk].edit_us;                /* pre9 sensor: per-stream label-edit ledger */
+        d->rsync_pub = (!multiview && kk == 0);         /* single-input: publish to g_rsx */
         d->disc = g_layera ? &inputs[kk].disc : NULL;   /* legacy-0004 buffer (NULL when off) */
         d->vq_shed_req = &inputs[kk].vq_shed_req;       /* 1.0.1-pre8 (a): overflow -> request head-GOP shed */
         d->autobank = g_autobank && !multiview && live && is_net_url(inputs[kk].url);   /* v0.9.14: single-input live only */
@@ -1737,6 +1747,10 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                 d->n_audio++;
             }
     }
+
+    /* pre9 sensor: wire the track count for the stats-line lipsync= field. Single-input only —
+     * multiview leaves n_a = 0, so the mv stats path prints no lipsync= (explicit, not garbage). */
+    g_rsx.n_a = multiview ? 0 : n_audio;
 
     av_log(NULL, AV_LOG_INFO,
         "ptvencoder: %s %d input(s) %d rung(s)  house %d/%d fps (%s)  v:%s->enc  a:%s  in:%s  pull-pipeline\n",
@@ -1872,6 +1886,7 @@ end:
         av_freep(&inputs[k].wrap_off);
         av_freep(&inputs[k].wrap_last);
         av_freep(&inputs[k].wrap_wall_last);
+        av_freep(&inputs[k].edit_us);
         ptv_disc_free(&inputs[k].disc);   /* legacy-0004 buffer (no-op if never inited) */
         if (inputs[k].ifmt) avformat_close_input(&inputs[k].ifmt);
         pthread_mutex_destroy(&inputs[k].h0_lock);
@@ -2322,6 +2337,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_QSHED"))    g_qshed    = 0;   /* 1.0.1-pre8 (a): revert to per-packet tail-drop on video_q overflow (the #32 fragmenter; A/B only) */
     if (getenv("PTV_NO_RATCHREL")) g_ratchrel = 0;   /* 1.0.1-pre8 (b): keep the 6h bank decay even under the starvation contradiction */
     if (getenv("PTV_NO_SELFHEAL")) g_selfheal = 0;   /* 1.0.1-pre8 (c): no internal re-prime on sustained starvation */
+    { const char *rs = getenv("PTV_RSYNC_SENSE"); if (rs && !atoi(rs)) g_rsync_sense = 0; }  /* 1.0.1-pre9: passive residual sensor default ON; =0 disables */
     { const char *s = getenv("PTV_SLOW_US"); g_slow = s ? atoi(s) : 0; }
     { const char *s = getenv("PTV_SLOW_DEC_US"); g_slow_dec = s ? atoi(s) : 0;   /* 1.0.1-pre8 stress knob (slow-NVDEC stand-in) */
       if (g_slow_dec) {

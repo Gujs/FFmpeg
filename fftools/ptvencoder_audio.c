@@ -390,6 +390,72 @@ static int audio_drain_fg(AudioState *a)
                 filt->pts = a->af_next_pts + ns; a->af_next_pts += nb;        /* continuous + smooth nudge */
             }
             /* ====================================================================================
+             * 1.0.1-pre9 residual sensor (PASSIVE), audio side — single-input only (filt->pts is
+             * still the untouched content-anchored opts here; the mv follow paths above re-stamp
+             * it and the mv compositor owns per-slot video lineage → mv publishes nothing).
+             *   m_a = out − (sink_src − inj) − slip
+             * inj recovers the RAW post-demux label from the sink label by removing what this
+             * thread itself injected at the graph door: AGLUE's cumulative relabel-erase
+             * (glue_off — a relabel-erased REAL step surfaces here as persistent R, the trap-1
+             * requirement) + AVLOCK's house_skew (whose REALIZED retiming is matched by the
+             * video side's measured dup ratchet → cancels in R = shared latency, not desync —
+             * the wedge/Lindel class where span accounting read −2986ms on a +24ms channel).
+             * slip = the resampler's UN-REALIZED correction: (door-label head) − (sink-label
+             * head) − (swr sample backlog). ≈0 when aresample=async has converged content onto
+             * its labels; parks at the un-taken correction when hard-comp wedges (the
+             * [PTV-SWRDELAY] class label math alone is blind to). 50ms dead band swallows the
+             * structural residue (buffersink partial frames, rate rounding) so steady state is
+             * exactly label-based. Pads/drops that fill GENUINE label gaps never appear in any
+             * term — label-referenced mapping is edit-neutral for them by construction (trap 2).
+             * ==================================================================================== */
+            if (g_rsync_sense && !a->multiview && a->use_fg &&
+                a->dbg_k < PTV_MAX_AUDIO && a->out_rate > 0) {
+                int64_t out_us = av_rescale(filt->pts, 1000000, a->out_rate);
+                int64_t hs     = (g_avlock && a->house_skew) ? *a->house_skew : 0;
+                int64_t inj    = a->glue_off_us + hs;
+                int64_t slip   = 0, m, nowr;
+                if (a->fg_swr && a->acomp_exp_us != AV_NOPTS_VALUE) {
+                    int64_t dur = av_rescale(filt->nb_samples, 1000000, a->out_rate);
+                    slip = a->acomp_exp_us - (src_abs_us + dur)
+                         - swr_get_delay(a->fg_swr, 1000000);
+                    if (slip > -50000 && slip < 50000) slip = 0;          /* dead band */
+                    else slip += slip > 0 ? -50000 : 50000;
+                }
+                a->rs_slip_us = slip;
+                m = out_us - (src_abs_us - inj) - slip;
+                if (!a->rs_ma_seed) { a->rs_ma_ema = m; a->rs_ma_seed = 1; }
+                else {
+                    int64_t dv = a->frame_size > 0                        /* EMA ≈ 30s of audio frames */
+                               ? 30LL * a->out_rate / a->frame_size : 1406;
+                    if (dv < 8) dv = 8;
+                    a->rs_ma_ema += (m - a->rs_ma_ema) / dv;
+                }
+                atomic_store_explicit(&g_rsx.ma_ema[a->dbg_k], a->rs_ma_ema, memory_order_relaxed);
+                nowr = av_gettime_relative();
+                atomic_store_explicit(&g_rsx.ma_wall[a->dbg_k], nowr, memory_order_relaxed);
+                if (g_diag && (a->rs_log_last == 0 ||
+                               nowr - a->rs_log_last >= g_stats_period_us)) {
+                    /* [PTV-RSYNC] components. dm = m_v − m_a (the shared −h0 cancels); the raw
+                     * EMAs are h0-offset and unreadable alone. R = dm + E_v − E_a. Not printed
+                     * until the video side has published (dm would be raw −h0-scale garbage). */
+                    int64_t mvw = atomic_load_explicit(&g_rsx.mv_wall, memory_order_relaxed);
+                    if (mvw) {
+                        int64_t mv = atomic_load_explicit(&g_rsx.mv_ema, memory_order_relaxed);
+                        int64_t ev = atomic_load_explicit(&g_rsx.ev_us,  memory_order_relaxed);
+                        int64_t ea = atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed);
+                        int64_t dm = mv - a->rs_ma_ema;
+                        a->rs_log_last = nowr;
+                        av_log(NULL, AV_LOG_INFO,
+                            "[PTV-RSYNC] a%d(in%d) R=%+"PRId64"ms%s dm=%+"PRId64"ms ev=%+"PRId64"ms ea=%+"PRId64"ms "
+                            "glue=%+"PRId64"ms hs=%+"PRId64"ms slip=%+"PRId64"ms  [+ = audio early; passive]\n",
+                            a->dbg_k, a->dbg_in, (dm + ev - ea) / 1000,
+                            (nowr - mvw < 3000000) ? "" : "(video-stale)",
+                            dm / 1000, ev / 1000, ea / 1000,
+                            a->glue_off_us / 1000, hs / 1000, slip / 1000);
+                    }
+                }
+            }
+            /* ====================================================================================
              * [PTV-AVSYNC2] — A/V PLL redesign Phase A READ-ONLY measurement probe
              *   (analysis/ptvencoder-avsync-pll-redesign-plan.md §3). Measures the REAL per-track
              *   lip-sync offset, NOT a proxy: for the source content C this emitted audio frame
