@@ -7,6 +7,73 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(7e) LAYERA CONTINUING-STREAM KEEP — cycle-2 video deletion on split events +
+borrowed-base false crossing (pre7; ptv_disc_flush + demux loop). On every
+split (two-cycle) discontinuity event, the second cycle's buffer holds ~500ms
+of packets from the OTHER, already-glued stream; ptv_disc_classify's
+borrowed-base fallback matched them against the jumping stream's bases, they
+landed OLD, and the flush DELETED them — measured (PTV_DISCDBG localization,
+fx-wcl400/fx-wc520 live-UDP): flush-2 discarded 25/31 CONTINUING VIDEO packets
+(0.5-0.6s), and because the deletion breaks the decoder reference chain the
+on-air picture loss ran to the next IDR — content-coverage instrument: 65 ref
+frames (2.6s) of post-seam content missing on wcl400, 52 (2.08s) on wc520 —
+a visible skip per split event (live: Azorse 2026-07-14 05:57 flush "160
+pkts: old=22 new=138", the 22 = continuing video). A/V sync was unharmed
+(house dup-fill + AVLOCK compensate) — picture continuity was the defect.
+FIX (a): at flush, an own-continuous packet (|delta vs own last_dts_us| <=
+1s at arrival, tracked per packet) of a stream with NO own bases this cycle
+is never classified against borrowed bases. It is KEPT ON ITS OWN TIMELINE
+AT OFFSET 0 (timeline 2 — exactly what the normal path would have dispatched)
+when the stream is already on the event's continuous timeline (video:
+pair_vid_defined; audio: pair_has/pair_prov) AND the cycle's trigger is a
+transcoded dense stream (vstream/astream); otherwise it keeps the legacy
+discard shape (timeline 0 — where legacy classification put it in every
+pinned fixture). Kept-continuing packets advance last_sent_dts without the
+applied offset; a separate "[PTV-LAYERA] flush kept N continuing pkt(s)"
+line reports them (the main flush-line format is pinned). Both narrowing
+gates are deliberate: no-pair-state streams keep the first-cycle video-only
+discard byte-identically (fx-att-u900/b80, the GAP-pad shape), and
+copy/unconsumed-triggered cycles (TruBLU rewinds: the AC-3 leg crossing
+~0.6s after video+audio already glued, fx-tb30 flush-2 old=47) keep
+production-proven behavior byte-identically per the TruBLU mandate —
+INCLUDING their continuing-stream discard, a known, deliberately retained
+cost this round.
+FIX (b), same mechanism (pre6 review residual 4): the demux-loop transition
+record (classify==1 -> record own bases + transitioned) is gated on
+!own_cont — a NON-jumping stream whose labels coincidentally land within the
+100ms tolerance of the partner's new base no longer "crosses" with fake own
+bases and off≈0, which had routed the full partner offset as an expected
+step (fx-att-rpt event 2 — a mirror pair: video +3.020 with a REAL mp2 jump
+−2.856 arriving ~380ms later; pre6's fake early all-transitioned flush is
+gone, the cycle runs to timeout and the audio's real jump joins it → pre7 =
+one both-crossed flush, applied −2.980, expect −5.548 registered and
+APPLIED; landmarks within 20ms of pre6, oracle within 1 bin — the fake
+crossing removed, the real one handled; adversarial-review-corrected
+description). A genuine crosser's first stepped packet has own_cont=0
+(>1s own delta, dts-based), so every real transition records exactly as
+before. SCOPE (review-corrected): the keep applies to ANY transcoded-
+triggered cycle inside the 5s pair window — including independent wobbles
+while another PID holds the window open (fx-dbl 3c wobble: old 39->12,
+kept 26) — not only strict two-cycle splits; verified strictly better at
+pre6 oracle values everywhere. Both fixes only under g_shared_flush
+(PTV_NO_SHARED_FLUSH reverts wholesale).
+Gates (pre6 = 3973c97cab vs pre7, live-UDP dg-run + tsp regulate):
+fx-wcl400/fx-wc520 — flush-2 "old=43 new=24" -> "old=18/12 new=24" + "kept
+25/31 continuing", applied offsets, +596/+452ms expect registration and
+AGLUE APPLIED lines byte-same as pre6; content coverage across the seam 65
+missing ref frames -> 0 (wcl400; review re-measured 57->0), 52 -> 40
+(wc520; the 40 = the source's own mid-GOP label-jump decode loss —
+review-verified a STRICT PREFIX of pre6's hole, no video deleted by pre7);
+oracle differential 0ms both (pre6 values). fx-att-rpt event 2 as above.
+Byte gates (pre6-vs-pre7): fx-wcl350 full-file BYTE-IDENTICAL; fx-tb30/
+fx-att-u900/fx-att-b80 gate on log-line/flush-shape equality (their A/A
+controls byte-differ per run — live house-clock anchoring; the pre6-review-
+established criterion). Regression battery
+wclose/splitband/mir2/dbl/sym/tb900/aonly/b300 at pre6 oracle numbers and
+line shapes (split-event flush lines gain the kept-continuing line and
+smaller old= counts — documented per fixture in the session notes).
+20.4-min clean-source soak: zero events, stats flat.
+
 (7d) SHARED-FLUSH 3a INHERITS IN EVERY BAND — split-flush in-band bake
 (pre6; ptv_disc_flush). Live (Azorse_TV 2026-07-14 05:57): video-only flush
 applied −6.857; the audio-only flush 3s later applied its OWN −6.961 because

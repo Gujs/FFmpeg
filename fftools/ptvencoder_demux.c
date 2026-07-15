@@ -187,6 +187,7 @@ int ptv_disc_init(PtvDiscBuf *b, int capacity, int nb_streams)
     }
     b->capacity   = capacity;
     b->nb_streams = nb_streams;
+    b->cycle_trigger = -1;
     for (i = 0; i < nb_streams; i++) {
         b->stream_state[i].cumulative_ts_offset = 0;
         b->stream_state[i].last_sent_dts        = AV_NOPTS_VALUE;
@@ -221,6 +222,7 @@ static void ptv_disc_reset(PtvDiscBuf *b)
     b->jump_detected     = 0;
     b->buffer_start_time = 0;
     b->applied_offset    = 0;
+    b->cycle_trigger     = -1;
 }
 
 /* 1.0.1-pre4 shared flush: close the pairing window — forget the event's video-defined offset
@@ -276,8 +278,10 @@ void ptv_disc_free(PtvDiscBuf *b)
     b->capacity = b->nb_streams = 0;
 }
 
-/* Clone pkt into the buffer with its raw (post-unwrap) DTS in us. */
-static int ptv_disc_add(PtvDiscBuf *b, AVPacket *pkt, int stream_idx, int64_t raw_dts)
+/* Clone pkt into the buffer with its raw (post-unwrap) DTS in us. own_cont = the
+ * packet was CONTINUOUS with its stream's own last_dts_us at arrival (pre7). */
+static int ptv_disc_add(PtvDiscBuf *b, AVPacket *pkt, int stream_idx, int64_t raw_dts,
+                        int own_cont)
 {
     PtvDiscPacket *dp;
     if (b->nb_packets >= b->capacity)
@@ -293,6 +297,7 @@ static int ptv_disc_add(PtvDiscBuf *b, AVPacket *pkt, int stream_idx, int64_t ra
     dp->stream_idx = stream_idx;
     dp->raw_dts    = raw_dts;
     dp->timeline   = -1;
+    dp->own_cont   = own_cont;
     b->packets[b->nb_packets++] = dp;
     return 0;
 }
@@ -421,6 +426,43 @@ static int ptv_disc_detect_jump(DemuxArgs *d, PtvDiscBuf *b, int stream_idx,
     return 1;
 }
 
+/* 1.0.1-pre7 continuing-stream keep: is `sidx` (own-continuous, no own bases this
+ * cycle) ALREADY on the event's continuous/flushed output timeline, in a cycle
+ * whose trigger we transcode? Then its buffered packets are KEPT AT OFFSET 0
+ * (timeline 2) instead of being classified against the trigger's borrowed bases —
+ * which is what deleted ~0.5s of continuing VIDEO per split (two-cycle) event
+ * (flush-2 of fx-wcl400/fx-wc520: 25 video pkts 67474.79..67475.27 tagged OLD =
+ * a visible picture skip; live: Azorse 2026-07-14 05:57 old=22/160). Deliberately
+ * NARROW, two gates:
+ *   - pair-state evidence only (video: the event's video crossing already applied
+ *     its offset — pair_vid_defined; audio: this stream applied/holds the event's
+ *     offset — pair_has/pair_prov). A stream with NO pair participation keeps the
+ *     legacy classify-and-discard shape, so a first-cycle video-only flush still
+ *     discards the not-yet-jumped audio tail byte-identically (fx-att-u900/b80,
+ *     the pinned GAP-pad shape).
+ *   - transcoded trigger only (vstream/astream). A cycle triggered by a
+ *     copy/unconsumed dense stream (TruBLU rewinds: the AC-3 leg crossing ~0.6s
+ *     after video+audio already glued — fx-tb30 flush-2) keeps today's
+ *     production-proven behavior byte-identically (the TruBLU mandate),
+ *     INCLUDING its continuing-stream discard — a known, deliberately retained
+ *     cost this round. */
+static int ptv_disc_cont_eligible(DemuxArgs *d, PtvDiscBuf *b, int sidx)
+{
+    int k, trig_transcoded;
+    PtvDiscStreamState *ss;
+    if (b->cycle_trigger < 0 || sidx >= (int)d->ifmt->nb_streams)
+        return 0;
+    trig_transcoded = b->cycle_trigger == d->vstream;
+    for (k = 0; k < d->n_audio && !trig_transcoded; k++)
+        trig_transcoded = d->astream[k] == b->cycle_trigger;
+    if (!trig_transcoded)
+        return 0;
+    if (d->ifmt->streams[sidx]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+        return b->pair_vid_defined;
+    ss = &b->stream_state[sidx];
+    return ss->pair_has || ss->pair_prov;
+}
+
 /* Flush: classify each held packet, KEEP NEW / DISCARD OLD, compute one
  * audio-derived applied_offset, apply it to all kept packets' pts+dts, and
  * release them in DTS order through demux_dispatch. Faithful to 0004's
@@ -429,6 +471,7 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
 {
     int i, ret = 0;
     int old_count = 0, new_count = 0, keep_timeline;
+    int cont_count = 0;          /* 1.0.1-pre7: continuing-stream packets kept at offset 0 */
     int any_started = 0;
     int64_t vid_off = 0, aud_off = 0;
     int has_vid = 0, has_aud = 0;
@@ -443,10 +486,24 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
 
     for (i = 0; i < b->nb_packets; i++) {
         PtvDiscPacket *dp = b->packets[i];
+        /* 1.0.1-pre7: an own-continuous packet of a stream that never crossed this cycle
+         * (no own bases) must NEVER be classified against another stream's borrowed bases
+         * — that is the split-event deletion defect AND (when its labels coincidentally
+         * land within the tolerance of the trigger's NEW base) the false-crossing defect.
+         * Eligible streams (already on the event's continuous timeline, transcoded-
+         * triggered cycle) are KEPT on their own timeline at offset 0 (timeline 2); the
+         * rest keep the legacy discard shape (timeline 0 — where legacy classification
+         * put them anyway in every pinned fixture). Only under the shared-flush pairing
+         * model (PTV_NO_SHARED_FLUSH reverts wholesale). */
+        if (g_shared_flush && dp->timeline < 0 && dp->own_cont &&
+            dp->stream_idx >= 0 && dp->stream_idx < b->nb_streams &&
+            !b->stream_state[dp->stream_idx].has_new_base)
+            dp->timeline = ptv_disc_cont_eligible(d, b, dp->stream_idx) ? 2 : 0;
         if (dp->timeline < 0)
             dp->timeline = ptv_disc_classify(b, dp->stream_idx, dp->raw_dts);
         if (dp->timeline == 0) old_count++;
         else if (dp->timeline == 1) new_count++;
+        else if (dp->timeline == 2) cont_count++;
     }
 
     qsort(b->packets, b->nb_packets, sizeof(PtvDiscPacket *), ptv_disc_compare);
@@ -628,6 +685,11 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
            (double)vid_off / AV_TIME_BASE, (double)aud_off / AV_TIME_BASE,
            (double)(vid_off - aud_off) / AV_TIME_BASE,
            (double)g_disc_viderr_sum / AV_TIME_BASE);
+    if (cont_count > 0)   /* 1.0.1-pre7: separate line — the main flush line format is pinned */
+        av_log(NULL, AV_LOG_INFO,
+               "[PTV-LAYERA] flush kept %d continuing pkt(s) on their own timeline (offset 0) "
+               "— streams already glued to this event, not classified against borrowed bases\n",
+               cont_count);
     /* v0.9.13 [PTV-GLUE] — the LAYERA-vs-absorber decision line: running per-input stats of the
      * source A/V mis-mux at glues. The LAST such line in a log answers "does LAYERA earn its
      * keep on this channel" at a glance (mean/max ~0 => plain absorber suffices). */
@@ -669,9 +731,9 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
     for (i = 0; i < b->nb_packets; i++) {
         PtvDiscPacket *dp = b->packets[i];
         AVStream *st;
-        int64_t pkt_off;
+        int64_t pkt_off, eff_off;
 
-        if (dp->timeline != keep_timeline && dp->timeline >= 0) {
+        if (dp->timeline != keep_timeline && (dp->timeline == 0 || dp->timeline == 1)) {
             av_packet_free(&dp->pkt);
             av_freep(&b->packets[i]);
             continue;
@@ -683,9 +745,13 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
         }
         st = d->ifmt->streams[dp->stream_idx];
 
-        /* Apply the single (audio-derived) offset to ALL kept packets in stream tb. */
-        if (b->applied_offset != 0) {
-            pkt_off = av_rescale_q(b->applied_offset, AV_TIME_BASE_Q, st->time_base);
+        /* Apply the single (audio-derived) offset to ALL kept packets in stream tb.
+         * pre7: continuing-stream packets (timeline 2) are already on the output
+         * timeline — they ride at offset 0, exactly as the normal path would have
+         * dispatched them had the buffer not been active. */
+        eff_off = dp->timeline == 2 ? 0 : b->applied_offset;
+        if (eff_off != 0) {
+            pkt_off = av_rescale_q(eff_off, AV_TIME_BASE_Q, st->time_base);
             if (dp->pkt->dts != AV_NOPTS_VALUE) dp->pkt->dts += pkt_off;
             if (dp->pkt->pts != AV_NOPTS_VALUE) dp->pkt->pts += pkt_off;
         }
@@ -694,7 +760,7 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
          * the next discontinuity cycle butts new content after it. */
         if (dp->stream_idx < b->nb_streams) {
             PtvDiscStreamState *ss = &b->stream_state[dp->stream_idx];
-            int64_t out_end = dp->raw_dts + b->applied_offset + ptv_disc_pkt_duration(st, dp->pkt);
+            int64_t out_end = dp->raw_dts + eff_off + ptv_disc_pkt_duration(st, dp->pkt);
             if (ss->last_sent_dts == AV_NOPTS_VALUE || out_end > ss->last_sent_dts)
                 ss->last_sent_dts = out_end;
         }
@@ -1126,9 +1192,16 @@ void *demux_thread(void *arg)
                                                    AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
                 int64_t last_dts = (sidx < b->nb_streams) ? b->stream_state[sidx].last_dts_us
                                                           : AV_NOPTS_VALUE;
+                /* 1.0.1-pre7: continuity of this packet with its OWN stream's timeline, judged
+                 * at arrival (before the last_dts_us update below). A stream whose packets stay
+                 * own-continuous through a buffer cycle never genuinely crossed — the flush must
+                 * not classify it against another stream's borrowed bases (see ptv_disc_flush). */
+                int own_cont = last_dts != AV_NOPTS_VALUE &&
+                               llabs(raw_dts - last_dts) <= PTV_DISC_THRESHOLD_US;
                 /* Arm buffering on a fresh jump. */
                 if (!b->active && ptv_disc_detect_jump(d, b, sidx, raw_dts, last_dts)) {
                     b->active = 1;
+                    b->cycle_trigger = sidx;
                     b->buffer_start_time = av_gettime_relative();
                     if (d->disturb_epoch)   /* a real content discontinuity → arm the PLL re-acquire */
                         atomic_fetch_add_explicit(d->disturb_epoch, 1, memory_order_relaxed);
@@ -1157,18 +1230,29 @@ void *demux_thread(void *arg)
 
                 if (b->active) {
                     int timeline;
-                    ret = ptv_disc_add(b, out, sidx, raw_dts);
+                    ret = ptv_disc_add(b, out, sidx, raw_dts, own_cont);
                     if (ret == AVERROR(ENOSPC)) {       /* buffer full → force flush, then re-add */
                         ret = ptv_disc_flush(d, b);
                         if (ret >= 0)
-                            ret = ptv_disc_add(b, out, sidx, raw_dts);
+                            ret = ptv_disc_add(b, out, sidx, raw_dts, own_cont);
                     }
                     av_packet_free(&out);               /* buffer holds its own clone */
                     if (ret < 0) break;
                     /* Mark transitioned + record this stream's bases if it didn't
-                     * trigger detection itself (faithful to 0004). */
+                     * trigger detection itself (faithful to 0004).
+                     * 1.0.1-pre7 borrowed-base false-crossing gate: a stream whose packet is
+                     * CONTINUOUS with its own last_dts_us never genuinely transitioned — a
+                     * borrowed-base classify==1 here is a coincidence (labels within the 100ms
+                     * tolerance of ANOTHER stream's new base) that recorded fake own bases with
+                     * offset ≈ 0 and routed the full partner offset as an expected step
+                     * (fx-att-rpt event 2, pre6 review residual 4). A genuine crosser's FIRST
+                     * stepped packet has own_cont=0 (>1s own delta), so real transitions —
+                     * detect-armed, rescue-detected, or borrowed-NEW — record exactly as before,
+                     * and its later stepped packets find has_new_base already set. Its buffered
+                     * own-continuous packets instead take the flush's own-continuity path
+                     * (kept at offset 0 when eligible, legacy discard otherwise). */
                     timeline = ptv_disc_classify(b, sidx, raw_dts);
-                    if (timeline == 1 && sidx < b->nb_streams) {
+                    if (timeline == 1 && sidx < b->nb_streams && !(g_shared_flush && own_cont)) {
                         PtvDiscStreamState *ss = &b->stream_state[sidx];
                         b->stream_transitioned[sidx] = 1;
                         if (!ss->has_new_base) {

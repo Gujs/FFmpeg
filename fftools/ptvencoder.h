@@ -481,7 +481,11 @@ typedef struct PtvDiscPacket {
     AVPacket *pkt;
     int       stream_idx;
     int64_t   raw_dts;     /* DTS before applied_offset (us); already 33-bit-unwrapped */
-    int       timeline;    /* 0=old, 1=new, -1=unknown */
+    int       timeline;    /* 0=old, 1=new, 2=continuing (own timeline, no offset), -1=unknown */
+    int       own_cont;    /* 1 = at arrival this packet was CONTINUOUS with its stream's own
+                            * last_dts_us (|delta| <= PTV_DISC_THRESHOLD_US) — 1.0.1-pre7: a
+                            * stream that never crossed this cycle keeps such packets on its
+                            * OWN timeline instead of borrowing the partner's bases */
 } PtvDiscPacket;
 
 typedef struct PtvDiscStreamState {
@@ -533,6 +537,9 @@ typedef struct PtvDiscBuf {
     int64_t             pair_start_us;      /* wall us of the event's first dense flush; 0 = no open event */
     int                 pair_vid_defined;   /* 1 once VIDEO's crossing defined this event's timeline */
     int64_t             pair_vid_off_us;    /* the video-defined shared offset (us) */
+    int                 cycle_trigger;      /* 1.0.1-pre7: stream whose detect ARMED this buffer cycle
+                                             * (-1 = none); scopes the continuing-stream keep (see
+                                             * ptv_disc_flush) to transcoded-triggered cycles */
 } PtvDiscBuf;
 
 typedef struct DemuxArgs {
