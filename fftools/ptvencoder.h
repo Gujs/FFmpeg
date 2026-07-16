@@ -266,6 +266,11 @@ typedef struct DecodeCtx {
     int64_t          heal_arm_us;          /* (c): wall time the drop armed — 5s escape, the
                                             * Session-109 kf-gate rule (long-GOP sources must
                                             * not freeze waiting for an IDR that never comes) */
+    /* 1.0.1-pre10 review fix (rr10 D1): the catch-up governor's rate currency is THIS
+     * INPUT's real rate — each decode thread (mv slot or single) paces by its own input. */
+    _Atomic int     *vin_pps;              /* -> DemuxArgs.vin_pps (demux-measured arrival pkts/s) */
+    int              in_pps_decl;          /* declared input rate, ceil(avg_frame_rate) — the
+                                            * warm-up clamp while the measurement settles; 0 = unknown */
 } DecodeCtx;
 
 /* Per-rung output side: pop this rung's frame_q on the house clock, stamp the
@@ -673,6 +678,15 @@ typedef struct DemuxArgs {
     int64_t               deg_head_ok_us;   /* headroom continuously since (0 = not in headroom) */
     int64_t               deg_dropped;      /* total video pkts dropped by degraded admission */
     int64_t               deg_log_us;       /* [PTV-DEGRADED] status rate limit */
+    /* 1.0.1-pre10 review fix (rr10 D1): per-input MEASURED video arrival rate — the catch-up
+     * governor's rate currency. A 4s window over demux_dispatch video-packet arrivals; any
+     * >1s arrival gap restarts the window (an outage boundary must never dilute the rate and
+     * under-cap the governed drain). Published as pkts/s (0 until the first clean window
+     * completes — the governor clamps to the declared header rate meanwhile). */
+    int64_t               vin_win_us;       /* measurement window start (0 = unstarted) */
+    int64_t               vin_last_us;      /* previous video-pkt arrival (gap guard) */
+    int                   vin_win_cnt;      /* video pkts since the window-start packet */
+    _Atomic int           vin_pps;          /* published measured arrival rate (pkts/s) */
     int64_t               vpkt, apkt, ppkt, vdrop, adrop, pdrop;
     int64_t               disc_resid_us;   /* 0.9.18.7 hs-residue ledger (REPORTING ONLY, never read by control):
                                             * Σ(−applied_offset) over LAYERA glue erases that shifted the VIDEO

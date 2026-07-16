@@ -1595,6 +1595,29 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
             /* 1.0.1-pre8: input-flowing signal for the (b)/(c) starvation-contradiction detectors
              * — a video packet reached the demux dispatch just now (clean-wire evidence). */
             atomic_store_explicit(&g_v_arrive_wc, av_gettime_relative(), memory_order_relaxed);
+            /* 1.0.1-pre10 review fix (rr10 D1): measure THIS input's video arrival rate — the
+             * catch-up governor's pacing currency (the master OUT tick was the wrong currency:
+             * any input whose pps exceeds 1.25x out-fps was governed below its own arrival
+             * rate and the governor manufactured a permanent shed cycle). 4s windows; a >1s
+             * arrival gap restarts the window so an outage can never dilute the measured rate
+             * (under-measuring is the dangerous direction — it would under-cap the drain). */
+            {
+                int64_t anw = av_gettime_relative();
+                if (!d->vin_win_us || anw - d->vin_last_us > 1000000) {
+                    d->vin_win_us = anw; d->vin_win_cnt = 0;   /* startup or a gap: fresh window */
+                } else {
+                    d->vin_win_cnt++;
+                    if (anw - d->vin_win_us >= 4000000) {
+                        atomic_store_explicit(&d->vin_pps,          /* round to nearest: a floor would
+                                                                     * under-cap low-fps inputs */
+                            (int)((d->vin_win_cnt * 1000000LL + (anw - d->vin_win_us) / 2) /
+                                  (anw - d->vin_win_us)),
+                            memory_order_relaxed);
+                        d->vin_win_us = anw; d->vin_win_cnt = 0;
+                    }
+                }
+                d->vin_last_us = anw;
+            }
             /* 1.0.1-pre10 (h) DEGRADED MODE (opt-in PTV_DEGRADED=1 — no-op otherwise): while a
              * sustained decode deficit keeps QSHED full-cycling (entry armed below at the
              * tail-arm site after a >=3min train), admission goes DEMAND-DRIVEN at the live
@@ -1723,7 +1746,13 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                                 /* live-edge start: flush the accumulated stale backlog via the
                                  * pre8 re-prime (decode thread drops video_q + resumes at the
                                  * next IDR = our next admitted GOP) — degraded playout must
-                                 * ride fresh content, not a 13s-old queue. */
+                                 * ride fresh content, not a 13s-old queue.
+                                 * rr10 advisory 4: with PTV_NO_SELFHEAL this flush is SKIPPED —
+                                 * degraded admission then rides the stale backlog until demand
+                                 * admission drains it (slower live-edge convergence, no wedge).
+                                 * Documented interaction, changelog (7h). Only the single-input
+                                 * decode thread consumes this request — PTV_DEGRADED is
+                                 * single-input only (rr10 D2, gated at transcode() setup). */
                                 if (g_selfheal)
                                     atomic_store_explicit(&g_selfheal_req, 1, memory_order_relaxed);
                                 av_log(NULL, AV_LOG_WARNING,

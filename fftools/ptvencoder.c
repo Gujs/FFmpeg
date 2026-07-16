@@ -1025,30 +1025,43 @@ static void *decode_thread(void *arg)
                 }
             }
             /* 1.0.1-pre10 (f) GOVERNED CATCH-UP: pace deficit-recovery decode at 1.25x realtime
-             * (per-frame floor = 4/5 tick). Engaged ONLY while (i) a self-shed/heal happened
-             * within the last 10min (g_shed_wall — never stamped on a clean channel, so this
-             * path is structurally inert there) AND (ii) video_q still holds >1s of backlog
-             * (vid_pps): the shed stays (it is correct load-shedding), only its consumption
-             * aftermath stops arriving as a device-max burst (Phase-A measured p95 2.2x; N
-             * co-located churners burst-feed a shared device in phase). Under contention the
-             * floor never binds (decode is slower than it); the 13ms max sleep per frame keeps
-             * the heal executor reachable (it runs at packet boundaries). Disengages when the
-             * backlog is drained below 1s — the 10min window cannot expire mid-backlog into an
-             * ungoverned tail burst. PTV_NO_CATCHGOV reverts. */
+             * (per-frame floor = 4/5 of THIS INPUT's tick). Engaged ONLY while (i) a
+             * self-shed/heal happened within the last 10min (g_shed_wall — never stamped on a
+             * clean channel, so this path is structurally inert there) AND (ii) video_q still
+             * holds >1s of INPUT backlog: the shed stays (it is correct load-shedding), only
+             * its consumption aftermath stops arriving as a device-max burst (Phase-A measured
+             * p95 2.2x; N co-located churners burst-feed a shared device in phase). Under
+             * contention the floor never binds (decode is slower than it); the max sleep per
+             * frame is <=0.8 of the input tick at any fps (13ms at 59.94, 32ms at 25), so the
+             * heal executor (it runs at packet boundaries) stays reachable. Disengages when
+             * the backlog is drained below 1s — the 10min window cannot expire mid-backlog
+             * into an ungoverned tail burst. PTV_NO_CATCHGOV reverts.
+             * rr10 review fix (D1): the rate currency is the INPUT's real rate, NOT the master
+             * output tick — an input whose pps exceeds 1.25x out-fps (mixed-fps mv slots,
+             * decimated single inputs at -r below source) was governed BELOW its own arrival
+             * rate, so vq re-capped, QSHED re-stamped g_shed_wall, and the governor itself
+             * manufactured a permanent shed cycle (rr10b-da fixture: 65 sheds still firing at
+             * t=300 vs pre9's 14 ceased at t=134; WUCR railed -14400ppm). Each decode thread
+             * (mv slot or single) paces by ITS OWN input: prefer the demux-measured arrival
+             * pps (4s gap-guarded window), clamp to the declared header rate while the
+             * measurement warms up. If NEITHER is available (VFR source at startup) fail
+             * OPEN — an ungoverned catch-up burst is transient and survivable; a governed
+             * wedge is permanent. */
             if (g_catchgov && d->live) {
                 int64_t gnw = av_gettime_relative();
                 int64_t gsw = atomic_load_explicit(&g_shed_wall, memory_order_relaxed);
-                if (gsw && gnw - gsw < 600LL * 1000000 &&
-                    av_thread_message_queue_nb_elems(d->video_q) > g_cp.vid_pps &&
-                    g_curt.tick_dur_us > 0) {
-                    int64_t step = g_curt.tick_dur_us * 4 / 5;
+                int gpps = d->vin_pps ? atomic_load_explicit(d->vin_pps, memory_order_relaxed) : 0;
+                if (gpps <= 0) gpps = d->in_pps_decl;   /* measurement warming up: declared rate */
+                if (gpps > 0 && gsw && gnw - gsw < 600LL * 1000000 &&
+                    av_thread_message_queue_nb_elems(d->video_q) > gpps) {
+                    int64_t step = 800000 / gpps;       /* 4/5 input tick = 1.25x INPUT realtime */
                     if (gov_next_us > gnw) {
                         av_usleep((unsigned)(gov_next_us - gnw));
                         gnw = gov_next_us;
                     }
                     gov_next_us = FFMAX(gnw, gov_next_us) + step;
                 } else
-                    gov_next_us = 0;
+                    gov_next_us = 0;                    /* incl. no usable rate: fail open, never wedge */
             }
             d->dec_frames++;
             if (d->hold) stage_hold(d->hold, d->live, frame);   /* multiview: compositor samples this */
@@ -1241,6 +1254,21 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
     if (multiview && !fcomplex) {
         av_log(NULL, AV_LOG_ERROR, "multiview (%d inputs) requires -filter_complex (mosaic graph)\n", n_input);
         return AVERROR(EINVAL);
+    }
+    if (g_degraded && multiview) {
+        /* rr10 review fix (D2): PTV_DEGRADED is SINGLE-INPUT ONLY. On multiview the entry's
+         * backlog flush (g_selfheal_req) has NO consumer — mv slot decode threads run with
+         * d->hold and never service the re-prime (decode_thread guards it with !d->hold), so
+         * the flag would sit armed forever and degraded admission would ride the stale
+         * backlog it was designed to shed. And the release headroom reads g_frameq_depth =
+         * the COMPOSITE frame_q, which the compositor keeps fed from held frames regardless
+         * of this slot's decode health — the wrong signal for slot decode headroom. Hard
+         * disable with a loud log; making mv-degraded work is a separate feature. */
+        g_degraded = 0;
+        av_log(NULL, AV_LOG_WARNING,
+               "[PTV-DEGRADED] PTV_DEGRADED is single-input only — disabled on multiview "
+               "(%d inputs): the entry flush has no decode-side consumer on mv slots and the "
+               "release signal is the composite frame_q\n", n_input);
     }
     if (n_rung > PTV_MAX_RUNG) {
         av_log(NULL, AV_LOG_WARNING, "%d outputs > max %d; using the first %d\n", n_rung, PTV_MAX_RUNG, PTV_MAX_RUNG);
@@ -1734,6 +1762,18 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         /* §13 deep startup cushion — target derivation moved to resolve_cushions() (0.9.18 M1) */
         d->deep_prime_packets = g_cp.deep_prime_pkts;
         d->vq_shed_req = &inputs[k].vq_shed_req;   /* 1.0.1-pre8 (a): head-GOP shed request slot */
+        /* rr10 review fix (D1): the catch-up governor's INPUT-rate currency — measured
+         * arrival pps (demux publishes) + the declared header rate as warm-up clamp.
+         * Prefer avg_frame_rate: r_frame_rate is the FIELD rate for interlaced sources
+         * (2x the packet rate = a loose cap, the fail-open direction) — the measurement
+         * takes over within ~4s either way. */
+        d->vin_pps = &inputs[k].da.vin_pps;
+        {
+            AVRational ifr = inputs[k].vist && inputs[k].vist->avg_frame_rate.num
+                           ? inputs[k].vist->avg_frame_rate
+                           : inputs[k].vist ? inputs[k].vist->r_frame_rate : (AVRational){0, 0};
+            d->in_pps_decl = (ifr.num > 0 && ifr.den > 0) ? (ifr.num + ifr.den - 1) / ifr.den : 0;
+        }
     }
 
     g_genlock_ok = (live && !multiview);             /* v0.9.0: genlock applies to single-input live only */
@@ -2413,6 +2453,9 @@ int main(int argc, char **argv)
     if (!getenv("PTV_NO_PHASEJIT")) {                /* 1.0.1-pre10 (g): per-PID +/-20% shed/heal cycle jitter (deterministic per PID) */
         unsigned jh = (unsigned)getpid() * 2654435761u;   /* Knuth multiplicative hash — spreads adjacent PIDs */
         g_jit_milli = 800 + (int)(jh % 401u);             /* 800..1200 = x0.8..x1.2 */
+        /* rr10 advisory 3: multiview slots within ONE process share this jitter value BY
+         * DESIGN — the target is de-phasing co-located INSTANCES on a shared device; slots
+         * inside one instance already de-phase through their independent input timing. */
     }
     if (getenv("PTV_DEGRADED"))    g_degraded = 1;   /* 1.0.1-pre10 (h): opt-in sustained-deficit every-Kth-GOP admission */
     { const char *s = getenv("PTV_SLOW_US"); g_slow = s ? atoi(s) : 0; }

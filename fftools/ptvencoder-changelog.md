@@ -47,15 +47,26 @@ would be unreachable under exactly the symptom (starve fraction measured
 0.88-0.97). Input NOT flowing hard-resets the timer: a genuine
 stall/outage KEEPS its cushion (STOP/CONT gate).
 (f) GOVERNED CATCH-UP [PTV_NO_CATCHGOV]: deficit-recovery decode capped
-at 1.25x realtime — per-frame floor 4/5 of the master tick, the same
-currency WUCR governs the emit side with. Engaged ONLY while a
+at 1.25x THE INPUT's realtime — per-frame floor 4/5 of the INPUT tick,
+each decode thread (mv slot or single) pacing by ITS OWN input's rate:
+the demux-measured arrival pps (4s gap-guarded window, published per
+input), clamped to the declared header rate while the measurement warms
+up; with NEITHER available (VFR at startup) the governor FAILS OPEN — an
+ungoverned burst is transient, a governed wedge is permanent. [rr10
+review fix D1: the first cut paced by the MASTER OUTPUT tick — any input
+whose pps exceeds 1.25x out-fps (mixed-fps mv slots, single inputs
+decimated by -r) was governed below its own arrival rate, vq re-capped,
+QSHED re-stamped g_shed_wall, and the governor manufactured a PERMANENT
+shed cycle (fixture: 65 sheds still firing at t=300 + WUCR railed
+-14400ppm vs pre9's 14 ceased at t=134).] Engaged ONLY while a
 self-shed/heal happened within 10min (g_shed_wall, never stamped on a
-clean channel) AND video_q holds >1s of backlog (vid_pps); disengage is
+clean channel) AND video_q holds >1s of INPUT backlog; disengage is
 by BACKLOG DRAIN, not the time window, so the window cannot expire
 mid-backlog into an ungoverned tail burst. Under contention the floor
 never binds (decode is slower than it); normal steady-state decode runs
-1.0x by supply and never sees a sleep. Max 13ms sleep per frame at packet
-boundaries keeps the pre8 heal executor reachable (rr8 defect-1 history).
+1.0x by supply and never sees a sleep. Max sleep per frame = 0.8 of the
+input tick at any fps (13ms at 59.94, 32ms at 25) at packet boundaries
+keeps the pre8 heal executor reachable (rr8 defect-1 history).
 The shed itself stays — correct load-shedding; only its aftermath stops
 arriving as a device-max burst.
 (g) PHASE JITTER [PTV_NO_PHASEJIT]: deterministic per-PID +/-20%
@@ -85,6 +96,21 @@ release. Default-off because the local repro cannot prove the production
 self-sustainment it targets (state-dependent NVENC/RM/VRAM per-frame
 cost) — it ships as the cor-3 experiment lever; byte-identical no-op with
 the env unset.
+DEGRADED SCOPE + KNOWN LIMITS (rr10 review round): SINGLE-INPUT ONLY
+[rr10 D2] — on multiview the entry's backlog flush (g_selfheal_req) has
+no decode-side consumer (mv slot decode runs with d->hold) and the
+release headroom reads the COMPOSITE frame_q, the wrong signal for a
+slot; PTV_DEGRADED=1 on a multiview invocation is hard-disabled with a
+loud [PTV-DEGRADED] startup WARNING. With PTV_NO_SELFHEAL set, the entry
+backlog flush is SKIPPED [rr10 advisory 4] — degraded admission then
+converges to the live edge only as demand admission drains the stale
+backlog (slower, no wedge). Entry is CALIBRATED TO ~6s GOP-shed cycles
+[rr10 advisory 1]: full-cycles more than 30s apart never form a train,
+so very-long-GOP channels (e.g. 24s-GOP mpeg2: cycles every 50-67s)
+never enter — the lever is a silent no-op there (scaling the train gap
+with GOP length is a possible later behavior change, not taken). Known
+pre-existing (not pre10): a mid-stream UDP join on long-GOP mpeg2 can
+take ~24s to the first sequence header at graph build (probe behavior).
 GATES (pre10-cell.sh/pre10-sum.py fixtures + dg-run byte gate; numbers in
 the session report): G1 p8deep-equivalent churn cell — dup <=52/s, catch-up
 dec p95 <=1.3x realtime (was 2.2x), adrop 0, no sustained ~6s full-cycle
@@ -96,6 +122,18 @@ correctness — [PTV-CUSHREL] fires under a sustained contradiction
 fx-wcl350 pre9-vs-pre10 output BYTE-IDENTICAL (all four features
 structurally inert without a shed/starvation episode); G5 churn-cell
 demux adrop stays 0 (the rc 29/s door-kill class must never return).
+rr10 FIX-ROUND RE-VALIDATION (input-rate currency + mv DEGRADED gate):
+R1 rr10b-da cell (59.94p in, -r 30000/1001 out, 60s slow-decode window)
+— fixed: 7 full-cycles all in-window, tail ZERO sheds, head-shed 987
+pkts, dup frozen 257, no WUCR rail (rejected build: 65 sheds churning at
+t=300, railed -14400ppm; pre9: 14 ceased t=134); attribution leg
+PTV_NO_CATCHGOV=1 statistically identical (6/942/253). R2 production-
+mirror 4-input mosaic, slot0=59.94p: 21 full-cycles / head-shed 1305 vs
+pre9 26/1327 (rejected: 51/6233 churning). R3 churn cell reproduced (dup
+52.1-52.3, catch-up decP95 75-76, adrop 0, CUSHREL at 60.0s x4). R4 byte
+gate IDENTICAL (62652416 B). R5 90s STOP/CONT zero CUSHREL, cushion
+retained. R6 degraded single-input lifecycle intact + 2-input mv with
+PTV_DEGRADED=1 log-proven disabled at startup.
 
 (7g) RESIDUAL LIP-SYNC SENSOR, PASSIVE (pre9; component 1 of the
 residual-sync supervisor — analysis/ptvencoder-residual-sync-supervisor.md).

@@ -182,6 +182,10 @@ void ptv_print_log_legend(int full)
         "                 (PTV_NO_CUSHREL disables; an input outage never triggers this)\n"
         "  [PTV-CLOCK]    clock-follow arm/release (source clock offset FOLLOWED/back-in-range) +\n"
         "                 estimator lifecycle (frozen on BURSTY, stuck-latch re-acquire, lock progress)\n"
+        "  [PTV-DEGRADED] (1.0.1-pre10, opt-in PTV_DEGRADED=1, SINGLE-INPUT ONLY — hard-disabled\n"
+        "                 with a startup WARNING on multiview) sustained-deficit demand admission\n"
+        "                 enter/status/release; entry needs a >=3min train of QSHED full-cycles\n"
+        "                 <=30s apart (very-long-GOP channels never enter)\n"
         "  [PTV-EMPTY]    frame_q starvation episodes >=2s (refill time; sub-2s aggregate per 60s)\n");
     av_log(NULL, AV_LOG_INFO,
         "multiview stats line — same head (frame/fps/time/dup/drop/dlvhold/dlvforced) + per slot:\n"
