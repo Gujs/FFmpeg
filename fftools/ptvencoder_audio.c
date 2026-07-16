@@ -589,20 +589,23 @@ static int audio_drain_fg(AudioState *a)
                 else if (nowp - a->avsync_stat_last >= g_stats_period_us) {
                     int mv = a->multiview && g_audio_follow;
                     int64_t lag = a->house_skew ? *a->house_skew : 0;
-                    /* lipsync = the [PTV-LIPSYNC] err folded into the always-on line (the operator's
-                     * headline A/V number; no PTV_DIAG needed). It is the faithful pipeline-introduced
-                     * lip-sync error: the AUDIO's realized output-vs-content lag (async_pad = outspan −
-                     * content_span) minus the VIDEO's TRUE lag (lag_true). + = audio late. (`offset`
-                     * below is the independent vring-paired cross-check; lipsync>0 ≈ offset<0.) */
+                    /* avlag (1.0.1-pre13, was "lipsync=" — renamed so the lipsync= token appears ONLY
+                     * on the -stats progress line, whose sign convention is OPPOSITE; the collision
+                     * caused an oracle-analysis sign error 2026-07-16): the pipeline-introduced A/V
+                     * lag ESTIMATE on this DIAG line — the AUDIO's realized output-vs-content lag
+                     * (async_pad = outspan − content_span) minus the VIDEO's TRUE lag (lag_true).
+                     * CONVENTION HERE: avlag > 0 = audio LATE (stats-line lipsync= is + = audio
+                     * EARLY). (`offset` below is the independent vring-paired cross-check;
+                     * avlag>0 ≈ offset<0.) */
                     int64_t content_us = av_rescale_q(a->dbg_last_src - a->dbg_first_src, a->ist_tb, AV_TIME_BASE_Q);
                     int64_t outspan_us = a->out_frames * (int64_t)a->frame_size * 1000000 / a->out_rate;
                     int64_t lag_true   = a->house_lag_true ? *a->house_lag_true : lag;
                     int64_t lserr      = (outspan_us - content_us) - lag_true;   /* async_pad − lag_true */
                     /* v0.6.19: the async_pad span estimate (lserr) does NOT include the PLL's content
                      * drop/pad retiming (af_applied_us), so on a CONVERGED PLL slot it kept reporting the
-                     * bank the acquire already removed (lipsync ≈ applied) — reading "off" while the
+                     * bank the acquire already removed (avlag ≈ applied) — reading "off" while the
                      * faithful vring-paired offset was ~0. Headline the faithful measured offset when it
-                     * has paired (− because offset<0 = audio late ≡ lipsync>0 = audio late); fall back to
+                     * has paired (− because offset<0 = audio late ≡ avlag>0 = audio late); fall back to
                      * the span estimate only before the vring pairs (offset = --). */
                     int64_t lshead     = a->av_off_valid ? -a->av_offset_us : lserr;
                     char m[24];
@@ -610,7 +613,7 @@ static int audio_drain_fg(AudioState *a)
                     else                 snprintf(m, sizeof m, "--");
                     if (mv && g_avsync_pll)  /* B3 closed loop: measured offset + integrator state + acquire/guard counts */
                         av_log(NULL, AV_LOG_INFO,
-                            "[PTV-AVSYNC] a%d(in%d) lipsync=%+"PRId64"ms | offset=%s (vlag=%+"PRId64"ms alag=%+"PRId64"ms) "
+                            "[PTV-AVSYNC] a%d(in%d) avlag=%+"PRId64"ms | offset=%s (vlag=%+"PRId64"ms alag=%+"PRId64"ms) "
                             "pll[ema=%+"PRId64"ms dev=%"PRId64"ms applied=%+"PRId64"ms steer=%+"PRId64"ms acq=%d guard=%"PRId64" drop=%"PRId64"ms pad=%"PRId64"ms acomp=%"PRId64"]"
                             "  [offset<0 = audio late]\n",
                             a->dbg_k, a->dbg_in, lshead / 1000, m, a->av_vlag_us / 1000, a->av_alag_us / 1000,
@@ -619,16 +622,16 @@ static int audio_drain_fg(AudioState *a)
                             a->af_acq_drop_us / 1000, a->af_acq_pad_us / 1000, a->acomp_cnt);
                     else if (mv)         /* multiview (open-loop B1): lip-sync + measured offset + the per-slot actuator state */
                         av_log(NULL, AV_LOG_INFO,
-                            "[PTV-AVSYNC] a%d(in%d) lipsync=%+"PRId64"ms | offset=%s (vlag=%+"PRId64"ms alag=%+"PRId64"ms) "
+                            "[PTV-AVSYNC] a%d(in%d) avlag=%+"PRId64"ms | offset=%s (vlag=%+"PRId64"ms alag=%+"PRId64"ms) "
                             "house_skew=%+"PRId64"ms applied=%+"PRId64"ms trk=%+"PRId64"ms nudge=%+"PRId64"ms "
-                            "acq[drop=%"PRId64"ms pad=%"PRId64"ms]  [lipsync>0 / offset<0 = audio late]\n",
+                            "acq[drop=%"PRId64"ms pad=%"PRId64"ms]  [avlag>0 / offset<0 = audio late]\n",
                             a->dbg_k, a->dbg_in, lshead / 1000, m, a->av_vlag_us / 1000, a->av_alag_us / 1000,
                             lag / 1000, a->af_applied_us / 1000, (lag - a->af_applied_us) / 1000,
                             a->af_nudge_us / 1000, a->af_acq_drop_us / 1000, a->af_acq_pad_us / 1000);
                     else                 /* single-input: lip-sync + measured offset + house-clock lock state */
                         av_log(NULL, AV_LOG_INFO,
-                            "[PTV-AVSYNC] a%d(in%d) lipsync=%+"PRId64"ms | offset=%s (vlag=%+"PRId64"ms alag=%+"PRId64"ms) "
-                            "house_skew=%+"PRId64"ms  [lipsync>0 / offset<0 = audio late]\n",
+                            "[PTV-AVSYNC] a%d(in%d) avlag=%+"PRId64"ms | offset=%s (vlag=%+"PRId64"ms alag=%+"PRId64"ms) "
+                            "house_skew=%+"PRId64"ms  [avlag>0 / offset<0 = audio late]\n",
                             a->dbg_k, a->dbg_in, lshead / 1000, m, a->av_vlag_us / 1000, a->av_alag_us / 1000, lag / 1000);
                     /* FAITHFUL resampler-slip sensor (the one signal offset=/sync_check-D can't see).
                      * If swr_delay grows unbounded → the hard-comp (min_hard_comp) is NOT firing (AVLOCK

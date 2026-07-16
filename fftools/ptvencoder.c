@@ -41,7 +41,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.0.1-pre12"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.0.1-pre13"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -483,6 +483,7 @@ int     g_ratchrel = 1;
  * its own state and resumes at the next IDR (what a supervisor restart achieves, in-process).
  * Rate-limited to one attempt per 5min; loudly logged [PTV-SELFHEAL]. PTV_NO_SELFHEAL reverts. */
 int     g_selfheal = 1;
+int     g_vindbg;    /* TEMP pre13 diagnosis: PTV_VINDBG=1 traces the vin_pps window + governor */
 _Atomic int     g_selfheal_req;
 _Atomic int64_t g_v_arrive_wc;
 /* (d) SELF-MADE-GAP LOG HONESTY: every self-inflicted queue drop (video head/tail shed, audio
@@ -514,6 +515,14 @@ int     g_cushrel = 1;
  * and clean channels (g_shed_wall never stamped) are structurally untouched.
  * PTV_NO_CATCHGOV reverts. */
 int     g_catchgov = 1;
+/* 1.0.1-pre13 governor observability (Newsmax2 live defect, 2026-07-16 cor-3): the wedge —
+ * dec=6.6/s on a clean 59.94pps wire, vq pinned 725-784, dup 45/s, kill-switch A/B instant
+ * 60/s — was undiagnosable from logs because the DIAG t= line carried no gpps/engagement.
+ * Single-input decode publishes; the master DIAG t= line prints gpps=meas/decl gov=. */
+_Atomic int     g_gov_gpps;
+_Atomic int     g_gov_decl;
+_Atomic int     g_gov_on;
+_Atomic int64_t g_gov_slip;
 /* (g) PHASE JITTER: deterministic per-PID +/-20% jitter on the shed/heal cycle timings (the
  * head-shed depth-gate margin + the SELFHEAL 5min re-fire) so N co-located instances cannot
  * phase-lock their ~6s burst cycles on one shared device. 1000 = no jitter (PTV_NO_PHASEJIT). */
@@ -850,6 +859,8 @@ static void *decode_thread(void *arg)
     AVFrame  *filt  = av_frame_alloc();
     int ret = 0, i;
     int64_t gov_next_us = 0;   /* 1.0.1-pre10 (f): governed catch-up pacing anchor (0 = disengaged) */
+    int64_t gov_strike_win_us = 0, gov_holdoff_until_us = 0;   /* 1.0.1-pre13: oversleep strikes + fail-open holdoff */
+    int     gov_strikes = 0;
 
     if (!frame || !filt)
         goto done;
@@ -1057,18 +1068,83 @@ static void *decode_thread(void *arg)
             if (g_catchgov && d->live) {
                 int64_t gnw = av_gettime_relative();
                 int64_t gsw = atomic_load_explicit(&g_shed_wall, memory_order_relaxed);
-                int gpps = d->vin_pps ? atomic_load_explicit(d->vin_pps, memory_order_relaxed) : 0;
-                if (gpps <= 0) gpps = d->in_pps_decl;   /* measurement warming up: declared rate */
-                if (gpps > 0 && gsw && gnw - gsw < 600LL * 1000000 &&
+                int gpps  = d->vin_pps ? atomic_load_explicit(d->vin_pps, memory_order_relaxed) : 0;
+                int64_t gpw = d->vin_pps_wall ? atomic_load_explicit(d->vin_pps_wall, memory_order_relaxed) : 0;
+                /* 1.0.1-pre13 TRUST GATE (Newsmax2 live defect): govern ONLY on a measurement that is
+                 *   (a) >= the declared header rate — a measured rate BELOW declared is a BROKEN
+                 *       measurement, not a slow source (the wire is the ground truth the demux rides;
+                 *       a clean 59.94pps channel braked to 6.6 dec/s live because a wrong-but-nonzero
+                 *       gpps won over the declared clamp — the rr10 re-review A-1 residual). An FFMAX
+                 *       floor is NOT enough: declared itself can under-state the wire (29.97-with-
+                 *       fields on a 59.94 stream = a brake at 37.5pps). Below declared => DO NOT
+                 *       GOVERN: an ungoverned catch-up burst is transient and recoverable, a brake
+                 *       that under-paces the wire pins vq full and self-sustains (shed -> engage ->
+                 *       starve -> shed) until a human pulls the kill switch;
+                 *   (b) FRESH (<30s) — a droughty dispatch pattern stops publishes and a frozen value
+                 *       must not keep pacing;
+                 * and (c) not in the oversleep holdoff — if the pacing sleeps themselves overshoot
+                 *       (throttled/quantized wakeups), the realized brake is stronger than designed
+                 *       by an unbounded factor; 3 strikes in 10s fail OPEN for 60s. Warm-up
+                 *       (measured==0) no longer clamps to declared: it fails open too — the birth
+                 *       backlog burst is exactly the recoverable kind (live 04:21 flag-run birth). */
+                int trusted = gpps > 0 && gpps >= d->in_pps_decl &&
+                              gpw && gnw - gpw < 30LL * 1000000 &&
+                              gnw >= gov_holdoff_until_us;
+                if (!d->hold) {                        /* single-input: DIAG t= line telemetry */
+                    atomic_store_explicit(&g_gov_gpps, gpps, memory_order_relaxed);
+                    atomic_store_explicit(&g_gov_decl, d->in_pps_decl, memory_order_relaxed);
+                }
+                if (trusted && gsw && gnw - gsw < 600LL * 1000000 &&
                     av_thread_message_queue_nb_elems(d->video_q) > gpps) {
                     int64_t step = 800000 / gpps;       /* 4/5 input tick = 1.25x INPUT realtime */
+                    if (g_vindbg && !gov_next_us)
+                        av_log(NULL, AV_LOG_INFO, "[PTV-VINDBG] gov ENGAGE gpps=%d decl=%d step=%"PRId64"us vq=%d\n",
+                               gpps, d->in_pps_decl, step,
+                               av_thread_message_queue_nb_elems(d->video_q));
+                    if (!d->hold) atomic_store_explicit(&g_gov_on, 1, memory_order_relaxed);
                     if (gov_next_us > gnw) {
-                        av_usleep((unsigned)(gov_next_us - gnw));
-                        gnw = gov_next_us;
+                        int64_t want = gov_next_us - gnw, real;
+                        av_usleep((unsigned)want);
+                        real = av_gettime_relative();
+                        /* pre13 ACTUATOR SELF-CHECK: pacing is only as gentle as the sleeps are
+                         * honest. A strike = a sleep that WAS the pacing floor (want >= step/2 —
+                         * a tiny residual sleep while decode runs behind schedule is not a brake,
+                         * and its overshoot self-corrects via the FFMAX resync) waking >50ms late;
+                         * 3 strikes in a rolling 10s => the environment is stretching the brake
+                         * (cgroup throttle / scheduler starvation) — fail open 60s rather than
+                         * under-pace the wire. */
+                        if (want >= step / 2 && real - gnw > want + 50000) {
+                            if (real - gov_strike_win_us > 10LL * 1000000) {
+                                gov_strike_win_us = real;
+                                gov_strikes = 0;
+                            }
+                            atomic_fetch_add_explicit(&g_gov_slip, 1, memory_order_relaxed);
+                            if (++gov_strikes >= 3) {
+                                /* 60s, not longer: strikes only occur when decode is FAST but
+                                 * wakeups are slow (under real compute contention the floor never
+                                 * binds, so there is no sleep to strike on) — that is precisely
+                                 * the pathological throttled-wakeup case. If it persists, 3 fresh
+                                 * strikes re-arm within ~10s of re-engagement; if it passed, a
+                                 * healthy actuator must not stay ungoverned for long. */
+                                gov_holdoff_until_us = real + 60LL * 1000000;
+                                gov_strikes = 0;
+                                av_log(NULL, AV_LOG_WARNING,
+                                       "[PTV-CATCHGOV] pacing sleeps overshooting (wanted %"PRId64"ms, got %"PRId64"ms, "
+                                       "3 strikes in 10s) — governor fails OPEN for 60s (catch-up unpaced; "
+                                       "a stretched brake under-paces the wire and wedges)\n",
+                                       want / 1000, (real - gnw) / 1000);
+                            }
+                        }
+                        gnw = gov_next_us;              /* pace on the INTENDED schedule (rate-exact) */
                     }
                     gov_next_us = FFMAX(gnw, gov_next_us) + step;
-                } else
-                    gov_next_us = 0;                    /* incl. no usable rate: fail open, never wedge */
+                } else {
+                    if (g_vindbg && gov_next_us)
+                        av_log(NULL, AV_LOG_INFO, "[PTV-VINDBG] gov DISENGAGE gpps=%d trusted=%d vq=%d\n",
+                               gpps, trusted, av_thread_message_queue_nb_elems(d->video_q));
+                    if (!d->hold) atomic_store_explicit(&g_gov_on, 0, memory_order_relaxed);
+                    gov_next_us = 0;                    /* incl. untrusted rate: fail open, never wedge */
+                }
             }
             d->dec_frames++;
             if (d->hold) stage_hold(d->hold, d->live, frame);   /* multiview: compositor samples this */
@@ -1796,6 +1872,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
          * (2x the packet rate = a loose cap, the fail-open direction) — the measurement
          * takes over within ~4s either way. */
         d->vin_pps = &inputs[k].da.vin_pps;
+        d->vin_pps_wall = &inputs[k].da.vin_pps_wall;   /* pre13: publish-freshness gate */
         {
             AVRational ifr = inputs[k].vist && inputs[k].vist->avg_frame_rate.num
                            ? inputs[k].vist->avg_frame_rate
@@ -2383,6 +2460,7 @@ int main(int argc, char **argv)
     init_dynload();
     av_log_set_level(AV_LOG_INFO);
     g_diag = !!getenv("PTV_DIAG");
+    g_vindbg = !!getenv("PTV_VINDBG");   /* TEMP pre13 diagnosis probe */
     if (getenv("PTV_NO_AVLOCK")) g_avlock = 0;   /* revert to source-locked audio (drifts on dup) */
     if (getenv("PTV_LAYERA")) g_layera = 1;       /* legacy 0004: audio-derived common offset at glue points (corrects source A/V mis-mux) */
     if (getenv("PTV_REPRIME")) g_reprime = 1;     /* fast buffer re-prime after a glue (default ON since v0.9.10; kept for compat) */

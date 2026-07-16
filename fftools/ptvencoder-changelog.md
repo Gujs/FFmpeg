@@ -7,6 +7,54 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(7k) CATCH-UP GOVERNOR FAILS OPEN ON AN UNTRUSTED RATE MEASUREMENT —
+the Newsmax2 live defect (pre13; ptvencoder.c decode_thread governor +
+ptvencoder_demux.c vin publish stamp + DIAG t= line).
+WHY (live-proven, Newsmax2/cor-3 2026-07-16): pre11 restart-looped 4
+births 01:50→04:07; every run wedged within seconds — dec=6.6/s on a
+wire measured CLEAN (5.4Mb/s CBR 59.94pps, demux vpkt 60/s smooth all
+run, vdrop/vcorrupt 0 at onset), vq pinned 725-784, dup 45/s, QSHED
+churn + SELFHEAL every 5min re-stamping g_shed_wall so the governor
+never released. Kill-switch A/B decisive: PTV_NO_CATCHGOV=1 added to
+the channel env 04:20:13, the 04:21:11 restart of the SAME pre11
+binary was instantly clean (dec 60/s, dup=0, vq=0). The realized brake
+was ~160ms/frame ≈ 800000/gpps with gpps≈5 — a wrong-but-nonzero
+measurement outvoting the declared 60 (the rr10 re-review A-1
+residual, materialized), and NOTHING in the logs could show it: the
+DIAG line carried no gpps.
+FIX (three prongs, all fail-open):
+ (a) TRUST GATE: govern only when measured >= declared AND the publish
+     is FRESH (<30s, new vin_pps_wall stamp). Measured below declared
+     is a broken measurement, not a slow source — declared itself can
+     under-state the wire (29.97-with-fields on 59.94 = a 37.5pps
+     brake), so an FFMAX floor is NOT sufficient: below declared means
+     DO NOT GOVERN. An ungoverned catch-up burst is transient and
+     recoverable; a brake that under-paces the wire pins vq full and
+     self-sustains (shed → engage → starve → shed) until a human pulls
+     the kill switch. Warm-up (measured==0) now also fails open — the
+     birth backlog burst is exactly the recoverable kind.
+ (b) ACTUATOR SELF-CHECK: each governor sleep is measured; waking
+     >50ms late 3x in a rolling 10s (throttled/quantized wakeups =
+     brake stretched by an unbounded factor) fails open for 60s with
+     one [PTV-CATCHGOV] WARNING.
+ (c) OBSERVABILITY (the N5 gap): DIAG t= line now prints
+     gpps=measured/declared gov=engagement (+ govslip= strike count
+     when >0) — `dec ≪ gpps*1.25 with vq pinned and gov=1` is now a
+     log-diagnosable signature. PTV_VINDBG=1 traces the measurement
+     window (RESET/PUBLISH) and governor transitions for field debug.
+GATES: N1 3-phase fixture (declared=60 probe → genuine 8pps phase
+publishes 8 → 60pps duty-cycled so >1s gaps freeze the window + churn):
+pre12 reproduces the live signature (dec ~10/s vs 60pps wire, vq
+pinned, no recovery), pre13 fails open and recovers to input rate ±2%;
+N2 pre10 churn cell still binds (governance intact where measurement
+is healthy); N3 rr10b-da/mv fixtures unchanged; N4 byte gate vs pre12
+quiet-channel.
+ALSO (7k, logging): [PTV-AVSYNC] DIAG estimate renamed lipsync= →
+avlag= (avlag>0 = audio LATE) and [PTV-RSYNC] already prints R= — the
+lipsync= token now appears ONLY on the -stats progress line (pre11
+sensor, + = audio EARLY); the opposite-sign collision caused an
+oracle-analysis error 2026-07-16.
+
 (7j) SYMMETRIC DELIVERY GATE — hold EARLY VIDEO on the audio delivered
 high-water (pre12; ptvencoder_gate.c §7.5b + encode_push_inner hook).
 WHY (owner-demonstrated LIVE, AWE_Plus on cor-3, 2026-07-16): ffprobe of

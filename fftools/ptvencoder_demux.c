@@ -1604,6 +1604,9 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
             {
                 int64_t anw = av_gettime_relative();
                 if (!d->vin_win_us || anw - d->vin_last_us > 1000000) {
+                    if (g_vindbg && d->vin_win_us)
+                        av_log(NULL, AV_LOG_INFO, "[PTV-VINDBG] win RESET gap=%"PRId64"ms cnt=%d elapsed=%"PRId64"ms\n",
+                               (anw - d->vin_last_us) / 1000, d->vin_win_cnt, (anw - d->vin_win_us) / 1000);
                     d->vin_win_us = anw; d->vin_win_cnt = 0;   /* startup or a gap: fresh window */
                 } else {
                     d->vin_win_cnt++;
@@ -1613,6 +1616,14 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                             (int)((d->vin_win_cnt * 1000000LL + (anw - d->vin_win_us) / 2) /
                                   (anw - d->vin_win_us)),
                             memory_order_relaxed);
+                        atomic_store_explicit(&d->vin_pps_wall, anw, memory_order_relaxed);
+                        /* pre13: publish age gates trust — a droughty dispatch pattern (>1s gaps
+                         * more often than every 4s, e.g. a stalled/clumped source) stops publishes
+                         * entirely, and the governor must not keep pacing on a frozen value. */
+                        if (g_vindbg)
+                            av_log(NULL, AV_LOG_INFO, "[PTV-VINDBG] win PUBLISH pps=%d cnt=%d elapsed=%"PRId64"ms\n",
+                                   atomic_load_explicit(&d->vin_pps, memory_order_relaxed),
+                                   d->vin_win_cnt, (anw - d->vin_win_us) / 1000);
                         d->vin_win_us = anw; d->vin_win_cnt = 0;
                     }
                 }

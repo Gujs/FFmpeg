@@ -718,14 +718,25 @@ void *output_thread(void *arg)
         if (g_diag && v->is_master) {
             int64_t nowd = av_gettime_relative();
             if (nowd - diag_last >= 1000000) {
+                /* 1.0.1-pre13: gpps=measured/declared + gov= engagement on the headline DIAG —
+                 * the Newsmax2 wedge (dec ≪ fps with vq pinned) was blind without them; a
+                 * `gov=1` with dec far below gpps*1.25 is the governor-misbehaving signature.
+                 * govslip= (printed when >0) counts oversleep strikes (actuator overshoot). */
+                int64_t gslip = atomic_load_explicit(&g_gov_slip, memory_order_relaxed);
+                char gv[40] = "";
+                if (gslip > 0)
+                    snprintf(gv, sizeof gv, " govslip=%"PRId64, gslip);
                 av_log(NULL, AV_LOG_INFO,
                     "[PTV-DIAG] t=%.1fs dec=%"PRId64" vcorrupt=%"PRId64" emitted=%"PRId64
-                    " muxed=%"PRId64" dup=%"PRId64" pd=%"PRId64" framedrop=%"PRId64" vq=%d frameq=%d muxq=%d genlock=%d rate=%+.0fppm wucr_rho=%+.0fppm cf=%+.0fppm/%d\n",
+                    " muxed=%"PRId64" dup=%"PRId64" pd=%"PRId64" framedrop=%"PRId64" vq=%d frameq=%d muxq=%d gpps=%d/%d gov=%d%s genlock=%d rate=%+.0fppm wucr_rho=%+.0fppm cf=%+.0fppm/%d\n",
                     (nowd - diag_t0) / 1000000.0, *v->dbg_dec_frames, *v->dbg_vcorrupt, v->emitted,
                     g_muxed, v->dup, v->pd, v->framedrop,
                     av_thread_message_queue_nb_elems(v->dbg_video_q),
                     av_thread_message_queue_nb_elems(v->frame_q),
                     av_thread_message_queue_nb_elems(v->mux_q),
+                    atomic_load_explicit(&g_gov_gpps, memory_order_relaxed),
+                    atomic_load_explicit(&g_gov_decl, memory_order_relaxed),
+                    atomic_load_explicit(&g_gov_on, memory_order_relaxed), gv,
                     atomic_load_explicit(&v->est->src_rate_locked, memory_order_relaxed),
                     (atomic_load_explicit(&v->est->src_rate_q20, memory_order_relaxed) - (1 << 20)) * 1e6 / (1 << 20),
                     (double)(-atomic_load_explicit(&v->hr->rho_corr_ppm, memory_order_relaxed)),

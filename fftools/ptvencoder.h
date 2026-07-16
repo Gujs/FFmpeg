@@ -299,8 +299,11 @@ typedef struct DecodeCtx {
     /* 1.0.1-pre10 review fix (rr10 D1): the catch-up governor's rate currency is THIS
      * INPUT's real rate — each decode thread (mv slot or single) paces by its own input. */
     _Atomic int     *vin_pps;              /* -> DemuxArgs.vin_pps (demux-measured arrival pkts/s) */
+    _Atomic int64_t *vin_pps_wall;         /* -> DemuxArgs.vin_pps_wall (wall time of the last publish —
+                                            * 1.0.1-pre13: a stale value must never keep governing) */
     int              in_pps_decl;          /* declared input rate, ceil(avg_frame_rate) — the
-                                            * warm-up clamp while the measurement settles; 0 = unknown */
+                                            * pre13 trust floor: a measured rate BELOW this is broken,
+                                            * not a slow source (Newsmax2 live defect); 0 = unknown */
 } DecodeCtx;
 
 /* Per-rung output side: pop this rung's frame_q on the house clock, stamp the
@@ -713,11 +716,13 @@ typedef struct DemuxArgs {
      * governor's rate currency. A 4s window over demux_dispatch video-packet arrivals; any
      * >1s arrival gap restarts the window (an outage boundary must never dilute the rate and
      * under-cap the governed drain). Published as pkts/s (0 until the first clean window
-     * completes — the governor clamps to the declared header rate meanwhile). */
+     * completes). 1.0.1-pre13: the governor now TRUSTS a publish only when it is ≥ the
+     * declared rate AND fresh (<30s old, vin_pps_wall) — otherwise it fails OPEN. */
     int64_t               vin_win_us;       /* measurement window start (0 = unstarted) */
     int64_t               vin_last_us;      /* previous video-pkt arrival (gap guard) */
     int                   vin_win_cnt;      /* video pkts since the window-start packet */
     _Atomic int           vin_pps;          /* published measured arrival rate (pkts/s) */
+    _Atomic int64_t       vin_pps_wall;     /* wall time of that publish (0 = never) — staleness gate */
     int64_t               vpkt, apkt, ppkt, vdrop, adrop, pdrop;
     int64_t               disc_resid_us;   /* 0.9.18.7 hs-residue ledger (REPORTING ONLY, never read by control):
                                             * Σ(−applied_offset) over LAYERA glue erases that shifted the VIDEO
@@ -872,6 +877,7 @@ extern int     g_slow;
 extern int     g_qshed;                  /* (a) GOP-coherent video_q overflow (PTV_NO_QSHED reverts) */
 extern int     g_ratchrel;               /* (b) ratchet release on starvation contradiction (PTV_NO_RATCHREL) */
 extern int     g_selfheal;               /* (c) self-heal re-prime backstop (PTV_NO_SELFHEAL) */
+extern int     g_vindbg;                 /* TEMP pre13 diagnosis: vin_pps window + governor trace */
 extern _Atomic int     g_selfheal_req;   /* (c) master output thread -> decode thread */
 extern _Atomic int64_t g_v_arrive_wc;    /* wall us of the last video pkt at the demux (input-flowing signal) */
 extern _Atomic int64_t g_shed_wall;      /* (d) wall us of the last self-inflicted queue drop */
@@ -881,6 +887,12 @@ extern CushionRt g_curt;                 /* defined in ptvencoder_gate.c */
 /* 1.0.1-pre10 birth-armed churn fixes (defined in ptvencoder.c) */
 extern int     g_cushrel;                /* (e) cushion-tier release on starvation contradiction (PTV_NO_CUSHREL) */
 extern int     g_catchgov;               /* (f) governed deficit-recovery decode, 1.25x realtime (PTV_NO_CATCHGOV) */
+/* 1.0.1-pre13 catch-up governor observability (single-input decode publishes; DIAG t= line reads).
+ * The Newsmax2 wedge was undiagnosable from logs — dec ≪ fps with vq pinned had NO gpps trace. */
+extern _Atomic int     g_gov_gpps;       /* last measured arrival pps the governor saw (0 = none) */
+extern _Atomic int     g_gov_decl;       /* declared input pps (trust floor) */
+extern _Atomic int     g_gov_on;         /* 1 = governing (sleeps active), 0 = disengaged/fail-open */
+extern _Atomic int64_t g_gov_slip;       /* cumulative oversleep strikes (actuator overshooting) */
 extern int     g_jit_milli;              /* (g) per-PID shed/heal phase jitter x1000 (800..1200; 1000 = PTV_NO_PHASEJIT) */
 extern int     g_degraded;               /* (h) opt-in sustained-deficit every-Kth-GOP admission (PTV_DEGRADED=1) */
 /* 1.0.1-pre9 residual sensor (defined in ptvencoder.c) */
