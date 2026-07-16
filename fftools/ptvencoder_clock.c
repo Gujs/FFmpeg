@@ -104,12 +104,23 @@ static int encode_push_inner(AVThreadMessageQueue *mux_q, AVCodecContext *enc,
         {
             int64_t dts_us = gate && pkt->dts != AV_NOPTS_VALUE
                            ? av_rescale_q(pkt->dts, ost->time_base, AV_TIME_BASE_Q) : AV_NOPTS_VALUE;
-            ret = av_thread_message_queue_send(mux_q, &pkt, 0);   /* blocking; video bypasses the gate */
-            if (ret < 0) {
-                av_packet_free(&pkt);
-                return ret;                                       /* mux gone */
-            }
+            /* §7.5b invariant: publish the encoder front BEFORE the packet can be held — the
+             * audio gate's release key (v_enc_dts_hi) must never depend on video DELIVERY
+             * (see the symmetric-gate header in ptvencoder_gate.c). Timing-invisible when the
+             * video hold is off: the only v_enc_dts_hi reader is dlv_drain, which runs after
+             * this whole call. */
             if (gate && dts_us != AV_NOPTS_VALUE) dlv_publish_video(gate, dts_us);
+            if (gate && gate->v_on && dts_us != AV_NOPTS_VALUE) {
+                ret = dlv_video_deliver(gate, pkt, dts_us);       /* §7.5b: send now, or hold EARLY video */
+                if (ret < 0)
+                    return ret;                                   /* mux gone */
+            } else {
+                ret = av_thread_message_queue_send(mux_q, &pkt, 0);   /* blocking; video bypasses the gate */
+                if (ret < 0) {
+                    av_packet_free(&pkt);
+                    return ret;                                   /* mux gone */
+                }
+            }
         }
     }
 }
@@ -121,7 +132,10 @@ static int encode_push(AVThreadMessageQueue *mux_q, AVCodecContext *enc,
     if (g_nvenc_serialize) pthread_mutex_lock(&g_enc_serial_lock);
     ret = encode_push_inner(mux_q, enc, ost, frame, gate, &need_drain);
     if (g_nvenc_serialize) pthread_mutex_unlock(&g_enc_serial_lock);
-    if (need_drain && gate) dlv_drain(gate);
+    if (need_drain && gate) {
+        dlv_drain(gate);
+        dlv_video_drain(gate);   /* §7.5b: the drain above advanced a_dlv_dts_hi — release caught-up video */
+    }
     return ret;
 }
 
@@ -733,11 +747,22 @@ void *output_thread(void *arg)
                 int hh = (int)(secs / 3600), mm = ((int)secs % 3600) / 60;
                 double ss = secs - hh * 3600 - mm * 60;
                 int64_t cr = (v->dbg_pcorrupt ? *v->dbg_pcorrupt : 0) + (v->dbg_vcorrupt ? *v->dbg_vcorrupt : 0);  /* corrupt: demux + decode */
-                char dlv[64] = "";                                   /* §7.5a delivery gate: max hold + cap-forced releases */
-                if (v->gate)
-                    snprintf(dlv, sizeof dlv, " dlvhold=%"PRId64"ms dlvforced=%"PRId64,
+                char dlv[112] = "";                                  /* §7.5a delivery gate: max hold + cap-forced releases */
+                if (v->gate) {
+                    int dn = snprintf(dlv, sizeof dlv, " dlvhold=%"PRId64"ms dlvforced=%"PRId64,
                              atomic_load_explicit(&v->gate->st_hold_us, memory_order_relaxed) / 1000,
                              atomic_load_explicit(&v->gate->st_forced, memory_order_relaxed));
+                    if (v->gate->v_on && dn > 0 && dn < (int)sizeof dlv) {
+                        /* §7.5b symmetric gate: EARLY-VIDEO hold (≈ the audio path's wall
+                         * latency, e.g. loudnorm ~3s fill); vdlvforced only when the backstop
+                         * released (audio flowing but behind, or FIFO overflow) */
+                        int64_t vf = atomic_load_explicit(&v->gate->st_vforced, memory_order_relaxed);
+                        dn += snprintf(dlv + dn, sizeof dlv - dn, " vdlvhold=%"PRId64"ms",
+                                 atomic_load_explicit(&v->gate->st_vhold_us, memory_order_relaxed) / 1000);
+                        if (vf > 0 && dn > 0 && dn < (int)sizeof dlv)
+                            snprintf(dlv + dn, sizeof dlv - dn, " vdlvforced=%"PRId64, vf);
+                    }
+                }
                 int64_t aw = atomic_load_explicit(&g_async_ppm, memory_order_relaxed);  /* aresample work (ppm) */
                 /* v0.9.10 cleanup: genlock=/srcppm= dropped — WUCR (default) never paces via the FLL and
                  * wucr_rho IS the source-ppm readout. size=/bitrate= dropped (CBR is configured; cumulative

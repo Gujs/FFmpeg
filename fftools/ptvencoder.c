@@ -41,7 +41,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.0.1-pre11"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.0.1-pre12"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -360,6 +360,13 @@ int     g_discardcorrupt = 1;
  * multiview ungated (pre-0.9.12.1 wire staging). Offline (file out) always bypasses. */
 static int     g_delivery = 1;
 static int     g_delivery_mv = 1;             /* v0.9.12.1: gate multiview too (PTV_NO_DELIVERY_MV reverts) */
+/* §7.5b (1.0.1-pre12) SYMMETRIC delivery gate — the VIDEO side: hold EARLY VIDEO on the audio
+ * DELIVERED-DTS high-water, closing the mirror skew the §7.5a gate cannot touch (a buffering -af
+ * — the fleet loudnorm, ~3s analysis fill — delays audio in WALL time, so video leaves the mux
+ * seconds of content AHEAD; AWE_Plus live: video start 1134.03 vs audio 1131.69). Model, deadlock
+ * invariant and audio-death safety: see the §7.5b header in ptvencoder_gate.c. Single-input live
+ * with gated audio only; PTV_NO_VDELIVERY=1 reverts to the pre-pre12 wire. */
+static int     g_vdelivery = 1;
 /* Muxed-packet stats counters. Written by N mux threads (6-rung ABR) -> atomic to avoid a
  * data race / lost updates in the bitrate=/size= stat line. Stats-only; not on any hot path. */
 _Atomic int64_t g_muxed;
@@ -1740,6 +1747,27 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
              * the same sizing the deep-preroll path applies, computed automatically (v0.9.14.1) */
         for (r = 0; r < n_rung; r++)
             dlv_init(&rung[r].gate, rung[r].mux_q, g_cp.delivery_cap_us, maxq);
+        /* §7.5b (1.0.1-pre12) symmetric gate: arm the EARLY-VIDEO hold, keyed on the audio
+         * delivered high-water. Single-input only — multiview slots' audio share ONE gate per
+         * rung, so the high-water would key the hold to the LEAST-delayed slot (untested
+         * per-slot death semantics on top) — and only when the run HAS gated audio to key on
+         * (a transcoded track or dense copied AC-3/MP2): a no-audio channel must not pay the
+         * audio-death escape timeout at birth. PTV_NO_VDELIVERY=1 reverts. */
+        if (g_vdelivery) {
+            int have_gated_audio = n_audio > 0, gp;
+            for (gp = 0; gp < n_pass && !have_gated_audio; gp++)
+                if (pass[gp].gated) have_gated_audio = 1;
+            if (multiview)
+                av_log(NULL, AV_LOG_INFO,
+                       "[PTV-VDLV] early-video hold is single-input only — disabled on this mosaic "
+                       "(per-slot audio skews diverge on the shared per-rung gate)\n");
+            else if (!have_gated_audio)
+                av_log(NULL, AV_LOG_INFO,
+                       "[PTV-VDLV] no gated audio on this channel — early-video hold disabled\n");
+            else
+                for (r = 0; r < n_rung; r++)
+                    dlv_video_cfg(&rung[r].gate, PTV_VDLV_BAND_US, g_cp.vdlv_cap_us, g_cp.vdlv_maxq);
+        }
     }
     /* 0.9.18 M3: register the per-rung gates + master tick with the escalation runtime —
      * cushion_escalate() is now the single writer of every gate->cap_us rewrite. Before any
@@ -2431,6 +2459,7 @@ int main(int argc, char **argv)
     /* genlock preroll default + the three deep-prime side-cars moved to resolve_cushions() (0.9.18 M1) */
     if (getenv("PTV_KEEP_CORRUPT")) g_discardcorrupt = 0;   /* keep AV_PKT_FLAG_CORRUPT video packets (don't +discardcorrupt) */
     if (getenv("PTV_NO_DELIVERY")) g_delivery = 0;          /* §7.5a: disable the A/V delivery-alignment gate (audio sent direct = v0.6.23) */
+    if (getenv("PTV_NO_VDELIVERY")) g_vdelivery = 0;        /* §7.5b (pre12): disable the symmetric EARLY-VIDEO hold (video sent direct = pre11 wire) */
     if (getenv("PTV_DELIVERY_MV")) g_delivery_mv = 1;       /* pre-0.9.12.1 opt-in — now the default; kept as a harmless no-op for existing configs */
     if (getenv("PTV_NO_DELIVERY_MV")) g_delivery_mv = 0;    /* v0.9.12.1: revert multiview to ungated wire staging (sync_check-visible audio lead) */
     /* PTV_DELIVERY_CAP_MS / PTV_DELIVERY_MAXQ override parses moved to resolve_cushions() (0.9.18 M1) */

@@ -86,6 +86,9 @@ typedef struct CushionPlan {
                                     * was sized ~30-42% under its us target). AUDIO sizing keeps its
                                     * own 50/s: that is an AAC frame rate (48kHz/1024 ~= 47/s), not
                                     * a video rate — intentionally NOT unified. */
+    int64_t  vdlv_cap_us;          /* §7.5b video-hold escape/age backstop (PTV_VDELIVERY_CAP_MS, default 6s
+                                    * = the loudnorm ~3s audio-latency class with margin) */
+    int      vdlv_maxq;            /* §7.5b video hold FIFO backstop (vdlv_cap × vid_pps + margin) */
 } CushionPlan;
 /* ===================== §7.5a delivery-alignment gate (P1) — per output rung =====================
  * Dense near-zero-latency streams (transcoded audio + copied AC-3/MP2) are HELD here instead of
@@ -121,7 +124,28 @@ typedef struct DlvGate {
     _Atomic int64_t st_hold_us;         /* age of the oldest still-held packet at the last drain */
     _Atomic int64_t st_forced;          /* cap_us-forced releases (encoder latency > cap) */
     _Atomic int64_t st_dropped;         /* non-blocking copy drops on a full FIFO */
+    /* ---- §7.5b (1.0.1-pre12) SYMMETRIC gate: the video-side hold (see ptvencoder_gate.c
+     * header for the model + the deadlock invariant). vhead/vtail/vcount are touched ONLY by
+     * the rung's video output thread (deliver + drain + flush all run there) — no lock. ---- */
+    int             v_on;               /* video hold armed (single-input live + gated audio present) */
+    DlvNode        *vhead, *vtail;      /* held EARLY video, FIFO (video output thread only) */
+    int             vcount, vmaxq;      /* vmaxq: force-release-oldest backstop (never blocks, never drops) */
+    int64_t         v_band_us;          /* tolerance: video may run this far past a_dlv_dts_hi (PTV_VDLV_BAND_US) */
+    int64_t         v_cap_us;           /* audio-death escape + per-packet age backstop (PTV_VDELIVERY_CAP_MS) */
+    int             v_disarmed;         /* audio-death escape tripped → video flows direct until audio resumes */
+    int64_t         v_disarm_wc;        /* wall time of the disarm (re-arm when a_hi_change_wc passes it) */
+    _Atomic int64_t a_dlv_dts_hi;       /* newest audio/copy DTS DELIVERED to mux_q (µs); INT64_MIN = none yet */
+    _Atomic int64_t a_hi_change_wc;     /* wall time a_dlv_dts_hi last ADVANCED (escape/re-arm detector) */
+    _Atomic int64_t st_vhold_us;        /* stats vdlvhold=: age of the oldest held video at the last video drain */
+    _Atomic int64_t st_vforced;         /* backstop releases (vmaxq overflow + aged-while-audio-flowing) */
 } DlvGate;
+
+/* §7.5b tolerance band: a video packet may lead the audio DELIVERED high-water by this much
+ * before it is held. Must exceed one video tick + one audio frame (~60ms) so a healthy channel
+ * (audio waiting in the gate, a_hi tracking the video front within a tick) NEVER holds — and it
+ * is the steady wire skew a held (loudnorm-class) channel converges to, so keep it well under
+ * the ~2s sync_check class; 300ms also clears the muxer's 200ms max_interleave_delta. */
+#define PTV_VDLV_BAND_US 300000
 
 #define PTV_MAX_RUNG 8
 #define PTV_MAX_AUDIO 8    /* max transcoded audio output tracks (multi-language, multiview slots) */
@@ -871,6 +895,9 @@ void dlv_enqueue(DlvGate *g, AVPacket *pkt, int64_t dts_us, int block);
 void dlv_drain(DlvGate *g);
 void dlv_flush_all(DlvGate *g);
 void dlv_destroy(DlvGate *g);
+void dlv_video_cfg(DlvGate *g, int64_t band_us, int64_t cap_us, int vmaxq);   /* §7.5b: arm the video-side hold */
+int  dlv_video_deliver(DlvGate *g, AVPacket *pkt, int64_t dts_us);            /* §7.5b: video output thread only */
+void dlv_video_drain(DlvGate *g);                                             /* §7.5b: video output thread only */
 void cushion_escalate(CushionEvent ev, int64_t a0, int64_t a1);
 void push_frame_q(AVThreadMessageQueue *q, int live, int64_t *framedrop, AVFrame *out);
 void resolve_cushions(CushionPlan *cp, int live, int multiview,

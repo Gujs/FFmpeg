@@ -71,6 +71,202 @@ void dlv_init(DlvGate *g, AVThreadMessageQueue *mux_q, int64_t cap_us, int maxq)
     atomic_store(&g->st_hold_us, 0);
     atomic_store(&g->st_forced, 0);
     atomic_store(&g->st_dropped, 0);
+    /* §7.5b video side: OFF until dlv_video_cfg() arms it (single-input live + gated audio) */
+    g->v_on = 0;
+    g->vhead = g->vtail = NULL; g->vcount = 0; g->vmaxq = 512;
+    g->v_band_us = PTV_VDLV_BAND_US; g->v_cap_us = 6000000;
+    g->v_disarmed = 0; g->v_disarm_wc = 0;
+    atomic_store(&g->a_dlv_dts_hi, INT64_MIN);
+    atomic_store(&g->a_hi_change_wc, av_gettime_relative());   /* "delivered just now": birth isn't an audio death */
+    atomic_store(&g->st_vhold_us, 0);
+    atomic_store(&g->st_vforced, 0);
+}
+
+/* ===================== §7.5b (1.0.1-pre12) — SYMMETRIC delivery gate: the VIDEO side ==========
+ * The §7.5a gate above holds EARLY AUDIO for the video encoder front. Its mirror problem
+ * (owner-demonstrated live, AWE_Plus on cor-3, 2026-07-16): a buffering -af (the fleet-wide
+ * loudnorm chain, ~3s analysis fill) delays AUDIO ~3s in WALL time while preserving its labels,
+ * so at any wall instant the mux writes video PTS t next to audio PTS t−3s — ffprobe of the
+ * output read video start 1134.03 vs audio start 1131.69 (audio content ~2.3s OLDER than the
+ * concurrently-emitted video). Players are fine (PTS-aligned), but the WIRE is skewed:
+ * sync_check-class monitors (video_last − audio_last) trip, and downstream buffers must cover
+ * the gap. The audio-side gate has nothing to hold there — LATE audio is not queued anywhere;
+ * video simply leaves first.
+ * FIX: hold EARLY VIDEO, keyed on the AUDIO DELIVERED-DTS high-water (a_dlv_dts_hi — advanced
+ * whenever dlv_drain/dlv_flush_all actually hands an audio/copy packet to mux_q): a video
+ * packet whose DTS leads it by more than v_band_us queues here (FIFO, same DlvNode) until the
+ * audio catches up. MEASURED, not assumed: on a channel whose audio is NOT wall-late, the audio
+ * sits in the §7.5a gate AHEAD of the video front, so a_dlv_dts_hi tracks the front within a
+ * tick and video always passes the band check inline — zero added latency, byte-identical wire.
+ *
+ * DEADLOCK INVARIANT (the two gates cannot close a cycle):
+ *   - the AUDIO gate's release key is v_enc_dts_hi, published at ENCODE time
+ *     (dlv_publish_video runs BEFORE the video packet can be held) — audio release never
+ *     depends on video DELIVERY;
+ *   - the VIDEO hold's release key is a_dlv_dts_hi, which advances whenever audio is DELIVERED
+ *     — i.e. it depends only on v_enc_dts_hi + audio arrival, never on held video;
+ *   - the video hold NEVER blocks its thread (append + return; a vmaxq overflow force-releases
+ *     the OLDEST held packet — video is never dropped and never sleeps), so encoding always
+ *     progresses and v_enc_dts_hi keeps advancing while frames flow.
+ *   Chain: video encodes → v_enc_dts_hi advances → §7.5a delivers audio → a_dlv_dts_hi
+ *   advances → held video releases. If the shape ever changes, the priority is explicit:
+ *   the AUDIO gate yields — it must never gain a dependency on DELIVERED video.
+ *
+ * AUDIO-DEATH SAFETY (the make-or-break property): if a_dlv_dts_hi stops advancing for
+ * v_cap_us (default 6s ≈ 2× the loudnorm class; PTV_VDELIVERY_CAP_MS) while video is held,
+ * ALL held video flushes and the hold DISARMS (one WARNING) — an audio outage (dead track,
+ * Azorse-class undecodable phase, source lost audio) degrades to the pre-pre12 wire, never a
+ * frozen channel. It RE-ARMS (one INFO) when audio delivery advances again, and the hold then
+ * re-forms so the skew re-closes. A per-packet age backstop (enqueue age > v_cap_us, counted
+ * st_vforced) additionally releases through a flowing-but-permanently-behind audio path
+ * (JLTV-class label spread), clamping the added latency at ~v_cap_us instead of pinning the
+ * FIFO. All video-side state is single-threaded (the rung's video output thread) — no lock.
+ * Single-input only: multiview slots' audio share one gate per rung, so the high-water would
+ * key the hold to the LEAST-delayed slot — gated off at setup with a startup note.
+ * PTV_NO_VDELIVERY=1 kills the video side everywhere (pre11 wire behavior). */
+void dlv_video_cfg(DlvGate *g, int64_t band_us, int64_t cap_us, int vmaxq)
+{
+    g->v_band_us = band_us > 0 ? band_us : PTV_VDLV_BAND_US;
+    g->v_cap_us  = cap_us  > 0 ? cap_us  : 6000000;
+    g->vmaxq     = vmaxq   > 0 ? vmaxq   : 512;
+    g->v_on      = 1;
+}
+
+/* deliver ONE audio/copy packet to mux_q and advance the audio delivered high-water (§7.5b's
+ * release key). Takes ownership of *pkt. All callers run on the rung's video output thread
+ * (dlv_drain + dlv_flush_all), so a_dlv_dts_hi is single-writer; atomics only for the stats
+ * reader and style-consistency with v_enc_dts_hi. */
+static void dlv_deliver_audio(DlvGate *g, AVPacket *pkt, int64_t dts_us)
+{
+    if (av_thread_message_queue_send(g->mux_q, &pkt, 0) < 0)
+        av_packet_free(&pkt);
+    /* the high-water advances either way — content left the gate (muxer-gone is terminal) */
+    if (dts_us > atomic_load_explicit(&g->a_dlv_dts_hi, memory_order_relaxed)) {
+        atomic_store_explicit(&g->a_dlv_dts_hi, dts_us, memory_order_relaxed);
+        atomic_store_explicit(&g->a_hi_change_wc, av_gettime_relative(), memory_order_relaxed);
+    }
+}
+
+/* send one held/passing video packet to mux_q. Returns the send error (mux gone) so the inline
+ * caller can terminate the rung exactly as the pre-pre12 direct send did. */
+static int dlv_video_send(DlvGate *g, AVPacket *pkt)
+{
+    int ret = av_thread_message_queue_send(g->mux_q, &pkt, 0);
+    if (ret < 0)
+        av_packet_free(&pkt);
+    return ret;
+}
+
+/* §7.5b: route one just-encoded video packet — send now, or hold it as EARLY video. Takes
+ * ownership of pkt. Video output thread only. Returns <0 only on a dead mux_q (rung exit). */
+int dlv_video_deliver(DlvGate *g, AVPacket *pkt, int64_t dts_us)
+{
+    int64_t a_hi = atomic_load_explicit(&g->a_dlv_dts_hi, memory_order_relaxed);
+    DlvNode *n;
+
+    if (g->v_disarmed) {
+        /* audio-death escape latched: video flows direct (pre-pre12 wire). Re-arm only when
+         * audio DELIVERY has advanced again — a delivery that never advances the high-water
+         * (frozen labels) must not re-arm, or the hold/escape pair would flap every v_cap_us. */
+        if (atomic_load_explicit(&g->a_hi_change_wc, memory_order_relaxed) > g->v_disarm_wc) {
+            g->v_disarmed = 0;
+            av_log(NULL, AV_LOG_INFO,
+                   "[PTV-VDLV] audio delivery resumed — early-video hold re-armed\n");
+        } else
+            return dlv_video_send(g, pkt);
+    }
+
+    if (!g->vcount) {                       /* FIFO order: with anything held, a newer packet must queue */
+        int due;
+        if (a_hi != INT64_MIN)
+            due = dts_us <= a_hi + g->v_band_us;
+        else {
+            /* Nothing delivered yet (birth). If audio is already WAITING in the §7.5a gate
+             * (count > 0 — the normal birth: near-zero-latency audio held for this very video
+             * front), video must flow: it IS the release key, and the wire is not skewed.
+             * Only a still-silent audio path (loudnorm analysis fill / dead track) holds. */
+            pthread_mutex_lock(&g->lock);
+            due = g->count > 0;
+            pthread_mutex_unlock(&g->lock);
+        }
+        if (due)
+            return dlv_video_send(g, pkt);
+    }
+
+    n = av_mallocz(sizeof(*n));
+    if (!n)                                 /* OOM → degrade to unheld; never lose video */
+        return dlv_video_send(g, pkt);
+    n->pkt = pkt; n->dts_us = dts_us; n->enq_us = av_gettime_relative(); n->next = NULL;
+    if (g->vtail) g->vtail->next = n; else g->vhead = n;
+    g->vtail = n; g->vcount++;
+    if (g->vcount > g->vmaxq) {             /* backstop: force-release the OLDEST (never block/drop) */
+        DlvNode *h = g->vhead;
+        g->vhead = h->next;
+        if (!g->vhead) g->vtail = NULL;
+        g->vcount--;
+        atomic_fetch_add_explicit(&g->st_vforced, 1, memory_order_relaxed);
+        dlv_video_send(g, h->pkt);          /* send error is non-terminal here (drain semantics) */
+        av_free(h);
+    }
+    dlv_video_drain(g);                     /* audio may already cover part of the hold */
+    return 0;
+}
+
+/* §7.5b: release held video the audio delivery has caught up to (dts ≤ a_dlv_dts_hi + band),
+ * plus the aged backstop; run the audio-death escape. Called by the rung's video output thread
+ * after every dlv_drain (a_hi may have advanced) and from dlv_video_deliver. */
+void dlv_video_drain(DlvGate *g)
+{
+    int64_t now, a_hi, adv;
+    DlvNode *p;
+
+    if (!g->v_on || g->v_disarmed)
+        return;
+    if (!g->vcount) {
+        atomic_store_explicit(&g->st_vhold_us, 0, memory_order_relaxed);
+        return;
+    }
+    now  = av_gettime_relative();
+    a_hi = atomic_load_explicit(&g->a_dlv_dts_hi,   memory_order_relaxed);
+    adv  = atomic_load_explicit(&g->a_hi_change_wc, memory_order_relaxed);
+
+    if (now - adv > g->v_cap_us) {
+        /* AUDIO-DEATH ESCAPE: nothing delivered for v_cap_us while video is held and flowing.
+         * Release everything + disarm (one line) — degrade to the pre-pre12 wire, never a
+         * frozen channel. Re-arms in dlv_video_deliver when delivery advances again. */
+        int freed = g->vcount;
+        while ((p = g->vhead)) {
+            g->vhead = p->next;
+            dlv_video_send(g, p->pkt);
+            av_free(p);
+        }
+        g->vtail = NULL; g->vcount = 0;
+        g->v_disarmed = 1; g->v_disarm_wc = now;
+        atomic_store_explicit(&g->st_vhold_us, 0, memory_order_relaxed);
+        av_log(NULL, AV_LOG_WARNING,
+               "[PTV-VDLV] no audio delivered for %.1fs with video flowing — released %d held "
+               "video pkts, early-video hold DISARMED until audio delivery resumes "
+               "(PTV_NO_VDELIVERY=1 disables the hold entirely)\n",
+               (now - adv) / 1e6, freed);
+        return;
+    }
+
+    while ((p = g->vhead)) {
+        int due  = a_hi != INT64_MIN && p->dts_us <= a_hi + g->v_band_us;
+        int aged = (now - p->enq_us) > g->v_cap_us;   /* audio flowing but permanently behind (label spread):
+                                                       * clamp the added latency at ~v_cap_us */
+        if (!due && !aged)
+            break;
+        if (aged && !due)
+            atomic_fetch_add_explicit(&g->st_vforced, 1, memory_order_relaxed);
+        g->vhead = p->next;
+        if (!g->vhead) g->vtail = NULL;
+        g->vcount--;
+        dlv_video_send(g, p->pkt);
+        av_free(p);
+    }
+    atomic_store_explicit(&g->st_vhold_us,
+                          g->vhead ? now - g->vhead->enq_us : 0, memory_order_relaxed);
 }
 
 /* the video encode_push calls this after handing each video packet downstream */
@@ -170,8 +366,7 @@ void dlv_drain(DlvGate *g)
 
     for (p = out_head; p; ) {
         DlvNode *q = p->next;
-        if (av_thread_message_queue_send(g->mux_q, &p->pkt, 0) < 0)
-            av_packet_free(&p->pkt);
+        dlv_deliver_audio(g, p->pkt, p->dts_us);   /* §7.5b: each delivery advances a_dlv_dts_hi */
         av_free(p);
         p = q;
     }
@@ -182,6 +377,15 @@ void dlv_drain(DlvGate *g)
 void dlv_flush_all(DlvGate *g)
 {
     DlvNode *out_head, *p;
+    /* §7.5b first: the held EARLY video (this runs on the video thread — the only vhead
+     * toucher); the muxer's interleaver reorders it against the audio flushed below by DTS. */
+    while ((p = g->vhead)) {
+        g->vhead = p->next;
+        if (av_thread_message_queue_send(g->mux_q, &p->pkt, 0) < 0)
+            av_packet_free(&p->pkt);
+        av_free(p);
+    }
+    g->vtail = NULL; g->vcount = 0;
     pthread_mutex_lock(&g->lock);
     out_head = g->head;
     g->head = g->tail = NULL; g->count = 0;
@@ -190,8 +394,7 @@ void dlv_flush_all(DlvGate *g)
     pthread_mutex_unlock(&g->lock);
     for (p = out_head; p; ) {
         DlvNode *q = p->next;
-        if (av_thread_message_queue_send(g->mux_q, &p->pkt, 0) < 0)
-            av_packet_free(&p->pkt);
+        dlv_deliver_audio(g, p->pkt, p->dts_us);
         av_free(p);
         p = q;
     }
@@ -203,6 +406,8 @@ void dlv_destroy(DlvGate *g)
     if (!g->inited) return;
     for (p = g->head; p; ) { DlvNode *q = p->next; av_packet_free(&p->pkt); av_free(p); p = q; }
     g->head = g->tail = NULL; g->count = 0;
+    for (p = g->vhead; p; ) { DlvNode *q = p->next; av_packet_free(&p->pkt); av_free(p); p = q; }   /* §7.5b */
+    g->vhead = g->vtail = NULL; g->vcount = 0;
     pthread_cond_destroy(&g->space);
     pthread_mutex_destroy(&g->lock);
     g->inited = 0;
@@ -521,6 +726,17 @@ void resolve_cushions(CushionPlan *cp, int live, int multiview,
     cp->deep_prime_budget_us = (int64_t)g_preroll_ms * 2000;   /* 2x preroll_ms, in us (decode start-delay budget) */
     cp->vid_pps = out_fps.num > 0 && out_fps.den > 0
                 ? (int)((out_fps.num + out_fps.den - 1) / out_fps.den) : 60;  /* v0.9.18.4 M6; unknown rate -> pessimistic 60 */
+
+    /* §7.5b (1.0.1-pre12) video-side hold sizing. Cap default 6s = the loudnorm ~3s audio-latency
+     * class with margin (mirrors PTV_DELIVERY_CAP_MS practice: precise release must win before the
+     * backstop). FIFO backstop = cap × video pkt/s + margin, bounded — nodes are per-enqueue, so
+     * capacity is free; the packets themselves bound RSS at ~cap × rung bitrate (6s × 3.8Mbps top
+     * rung ≈ 2.9MB, ≈ 7MB across the 6-rung ladder at the ladder's summed ~9.7Mbps). */
+    cp->vdlv_cap_us = 6000000;
+    { const char *vc = getenv("PTV_VDELIVERY_CAP_MS"); if (vc && atoi(vc) > 0) cp->vdlv_cap_us = (int64_t)atoi(vc) * 1000; }
+    cp->vdlv_maxq = (int)(cp->vdlv_cap_us / 1000000 * cp->vid_pps) + 64;
+    if (cp->vdlv_maxq < 512)  cp->vdlv_maxq = 512;
+    if (cp->vdlv_maxq > 2048) cp->vdlv_maxq = 2048;
 
     cp->preroll_ms        = g_preroll_ms;
     cp->videoq_pkts       = g_videoq;

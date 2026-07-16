@@ -7,6 +7,72 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(7j) SYMMETRIC DELIVERY GATE — hold EARLY VIDEO on the audio delivered
+high-water (pre12; ptvencoder_gate.c §7.5b + encode_push_inner hook).
+WHY (owner-demonstrated LIVE, AWE_Plus on cor-3, 2026-07-16): ffprobe of
+the output read video start 1134.03 vs audio start 1131.69 — the mux
+emits audio content ~2.3s OLDER than the concurrently-emitted video.
+Cause: the fleet-wide loudnorm -af holds ~3s of audio inside its
+analysis buffer, so audio content exits the pipeline seconds after the
+same-PTS video already left. Players are fine (PTS-aligned) but the
+WIRE is skewed: sync_check-class monitors (video_last − audio_last)
+trip, and downstream buffers must cover the gap. The v0.7.0 gate is
+one-directional — it holds audio that is EARLY; late audio has nothing
+held for it, video simply leaves first.
+FIX: per rung, a video packet whose DTS leads a_dlv_dts_hi (the newest
+audio/copy DTS actually DELIVERED to that rung's mux_q — advanced by
+the §7.5a drain/flush send loops; copied AC-3/MP2 counts, sparse
+subs/SCTE-35 bypass as today) by more than 300ms (PTV_VDLV_BAND_US) is
+queued FIFO until audio catches up. MEASURED, not assumed: on a channel
+whose audio is not wall-late the audio waits in the §7.5a gate AHEAD of
+the video front, so a_hi tracks the front within a tick and video is
+never held — zero cost, byte-identical (fixture-proven). DEADLOCK
+INVARIANT (comment in ptvencoder_gate.c): audio releases on
+v_enc_dts_hi published at ENCODE time BEFORE the video packet can be
+held; video releases on audio DELIVERY; the video hold never blocks its
+thread (vmaxq overflow force-releases the OLDEST) — the cycle cannot
+close; if the shape ever changes, the audio gate yields.
+AUDIO-DEATH SAFETY (make-or-break, fixture-proven): if no audio is
+delivered for PTV_VDELIVERY_CAP_MS (6s ≈ 2× the loudnorm class) while
+video is held, ALL held video flushes and the hold DISARMS (one
+[PTV-VDLV] WARNING) — an audio outage degrades to the pre12-less wire,
+never a frozen channel; re-arms (one INFO) when delivery advances
+again. A per-packet age backstop (same 6s, counted vdlvforced=)
+releases through a flowing-but-permanently-behind audio path
+(JLTV-class label spread) so pre12 never chases an upstream label bug
+with unbounded latency. Sizing: hold FIFO = cap × out-fps + margin
+[512..2048] slots; RSS bound ≈ cap × rung bitrate (~2.9MB @3.8Mbps top
+rung). Single-input live with gated audio only: multiview slots share
+one gate per rung (the high-water would key to the least-delayed slot)
+— disabled with a startup note (pre10 D2 pattern); no-audio channels
+disabled (must not pay the escape timeout at birth). Stats: vdlvhold=
+(+ vdlvforced= when >0) + legend; lipsync=/lineage untouched (the hold
+changes delivery timing, not labels; fps=/watchdog count emitted-to-
+gate, so a birth hold shows normal fps).
+GATES (local, cinestar full-mux tsp replay + x264 rung): W1 loudnorm
+chain wire skew v−a median +1229ms (pre11) → −40ms (pre12), lipsync=
+−1ms both, dup=0, vdlvhold≈1.2s steady = the measured audio hold; W2
+plain chain 22MB output BYTE-IDENTICAL pre11↔pre12 (deterministic-join
+live UDP); W3 45s both-PIDs audio-death: escape fired once at +6s,
+fps never left 24.9–25.0 (video never froze), disarmed window clean,
+re-arm on resume — the post-resume +45s audio-early label spread is the
+KNOWN pre-existing #33 audio-only butt-joint (pre11 control identical:
+lipsync=+45s, wire +47s; pre12 clamps the wire to +41s = its 6s bound);
+W5 rewind seam (−305s shared backward jump, TruBLU class): LAYERA
+jump/flush/AGLUE lines line-for-line identical pre11↔pre12, lipsync=
+−6ms identical, and the gate re-closed the post-seam wire (+2059ms →
+−43ms); SCTE-35 fixture: demux/copy path identical pre11↔pre12 —
+NOTE the audio-batch branch itself cannot mux SCTE-35 (v2 0002 is not
+an ancestor here; stream lands as bin_data with no packets on BOTH
+binaries — pre-existing branch gap, unchanged by pre12, restored when
+0002 stacks on); W6 held ~150 pkts ≪ 512 maxq at the 6s bound, RSS
+pre12 127.6MB vs pre11 128.3MB. KNOWN SEMANTICS (deliberate, spec'd): a
+channel carrying a dense COPIED audio track anchors a_hi at the video
+front (the copy is delivered in lockstep), so the wire always has
+fresh audio beside video, but the -af-delayed TRANSCODED track still
+trails by its hold on such channels — same as pre11 (w1b: AC-3 copy
++8ms, AAC +1.9s). PTV_NO_VDELIVERY=1 reverts.
+
 (7i) RESAMPLER-SCOPED SLIP PROBE — buffering -af hold no longer biases
 lipsync= (pre11; ptvencoder_audio.c sensor + build_audio_filter).
 WHY (pre9 review Defect 1, shipped as known-limitation, FALSIFIED LIVE):
