@@ -7,6 +7,57 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(7i) RESAMPLER-SCOPED SLIP PROBE — buffering -af hold no longer biases
+lipsync= (pre11; ptvencoder_audio.c sensor + build_audio_filter).
+WHY (pre9 review Defect 1, shipped as known-limitation, FALSIFIED LIVE):
+the review accepted the bias because no production channel ran a
+buffering -af — then the owner re-enabled loudnorm FLEET-WIDE 2026-07-13
+(chain `aresample=async=1000:min_hard_comp=0.03,loudnorm=...,
+aresample=48000`) and genuine pre9 channels on cor-3 (Daystar, Mysteria,
+Newsmax2) read lipsync=+2913..+2919ms — exactly the fixture bias
+(+2914ms) — biasing the entire sensor soak.
+ROOT CAUSE: the pre9 slip term spanned the WHOLE -af graph (door label
+head `acomp_exp_us` − sink head − swr_get_delay), so any filter that
+BUFFERS content (loudnorm's ~3s analysis window) parked its hold in
+slip. But a passive filter's hold preserves labels — content comes out
+carrying the labels it went in with, the content→label mapping m_a is
+untouched — it is shared latency, not desync.
+FIX: scope the label-head pair to the async-aresample FILTER's own
+links: slip = (input-link label head) − (output-link label head) −
+swr_get_delay, via FilterLink.current_pts_us + the link frame/sample
+counters (libavfilter/filters.h, in-tree; all maintained by the generic
+consume path on every frame crossing a link). current_pts_us is the
+START of the last chunk CONSUMED off a link, so true heads are
+reconstructed symmetrically: head = start + avg consumed-chunk duration
+(sample_count_out/frame_count_out — exact for steady chunking: mp2
+1152-sample frames in, loudnorm's 100ms consume quantum out), and the
+output head additionally adds the QUEUED duration (sample_count_in −
+sample_count_out: produced-but-unconsumed frames sitting in the link
+fifo carry labels dense above the consumed head). Fixture-measured,
+both reconstructions matter vs the 50ms dead band: consumed-start
+labels alone left a false +26..+40ms residual through loudnorm (its
+100ms quantum vs the 24ms input frames) — with reconstruction the full
+production chain reads slip=+0, R=−1ms. The aresample AVFilterContext
+is captured alongside fg_swr at graph build (and cleared/re-found
+across AFMT rebuilds). Filters before OR after the resampler are now
+outside the probe, whatever the chain order; the boundary still sees
+exactly the parked-compensation class (labels diverging from target
+while the swr backlog stays flat = [PTV-SWRDELAY]'s reason to exist).
+50ms dead band unchanged.
+SCOPE NOTE (for the record, unchanged semantics): a rate-CHANGING -af
+(atempo) genuinely alters the content mapping; the sensor treats the
+user's -af chain as label-faithful and never measured that class — pre9
+read it as a bogus constant (its hold), pre11 reads 0. Out of scope by
+design, same as source-label lies (TRACKUP): R = pipeline-ADDED desync.
+GATES (dg-run/tsp harness, fresh build): L1 EXACT production loudnorm
+chain on a clean channel ≥10min: lipsync settles ±40ms of 0 (was
++2914); L2 injected −300ms label shift THROUGH loudnorm: R reads the
+injection ±40ms (the fix must not eat real desync); L3 aresample-only
+rr9 core gates (a300b/v200b/b70) identical to pre9/pre10 ±5ms; L4
+fx-wcl350 byte gate IDENTICAL (sensor stays passive); L5 stats/DIAG
+format unchanged; L6 CPU unchanged. Legend caveat replaced by the
+exclusion note; (7g)'s KNOWN LIMITATION is RESOLVED here.
+
 (7h) BIRTH-ARMED CHURN — MODE RELEASE + CONSUMPTION RATE-SHAPE (pre10;
 ptvencoder_clock.c detector / ptvencoder_gate.c CUSHION_RELEASE /
 decode_thread governor / ptvencoder_demux.c degraded admission).
@@ -201,15 +252,14 @@ LIVE SOAK MUST VALIDATE before the corrector round (the design doc's hard
 gate): sensor-vs-oracle SIGN and SLOPE agreement on (a) a clean channel,
 (b) a TruBLU rewind session, (c) a provoked escape/garbage episode. A
 sensor that disagrees with the oracle is discarded, not tuned around.
-KNOWN LIMITATION (adversarial review Defect 1, fixture-proven): the slip
-probe (audio.c drain) measures door-label head − sink head − swr_delay =
+KNOWN LIMITATION — RESOLVED in pre11 (7i) (adversarial review Defect 1,
+fixture-proven, then falsified live by the 2026-07-13 fleet-wide loudnorm
+re-enable: Daystar/Mysteria/Newsmax2 read +2913..+2919ms): the pre9 slip
+probe (audio.c drain) measured door-label head − sink head − swr_delay =
 the WHOLE -af graph's hold, so a buffering filter (loudnorm: +2914ms
-constant false audio-early; atempo, long lookaheads) biases R by its hold
-forever. Exposure today none — the exact production single-input chain
-aresample+acompressor+alimiter fixture-reads +0ms, and multiview (where
-grids run loudnorm) publishes no lipsync=. Legend carries the caveat; the
-structural fix (resampler-scoped slip probe) lands with the corrector
-round. Soak interpretation notes from review: (a) AWE-class sources whose
+constant false audio-early; long lookaheads) biased R by its hold
+forever. pre11 scopes the probe to the async-aresample filter boundary —
+see (7i). Soak interpretation notes from review: (a) AWE-class sources whose
 labels lie read R=0 BY DESIGN (R = pipeline-ADDED desync only — the
 pts-spacing flatness gate stays mandatory, TRACKUP class invisible here);
 (b) EMA τ30s → alert only on multi-minute dwell; (c) parked slip <50ms is

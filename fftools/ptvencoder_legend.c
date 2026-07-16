@@ -146,10 +146,9 @@ void ptv_print_log_legend(int full)
         "             EARLY): per-stream source→output content mapping difference (video EMA(out−src)\n"
         "             + demux edit ledger vs audio ledger m_a) — sees relabel-erases, wrong glues and\n"
         "             parked resampler slip; shared latency (hs) cancels. `--` = a side not flowing.\n"
-        "             CAVEAT: a buffering -af (loudnorm, atempo, long lookahead) biases R by its\n"
-        "             internal hold — reads as a constant false audio-early ~= the hold; the\n"
-        "             production chain aresample+acompressor+alimiter reads +0. Do not trust R\n"
-        "             under such filters until the slip probe is resampler-scoped.\n"
+        "             1.0.1-pre11: the slip probe is scoped to the async-aresample boundary — a\n"
+        "             buffering -af's hold (loudnorm ~3s) is label-preserving latency, EXCLUDED\n"
+        "             from R (the pre9 whole-graph probe read it as constant false audio-early).\n"
         "             UNVALIDATED vs the external oracle until the live soak passes; until then the\n"
         "             oracle (test-scripts/repro/drift-continuous.py) stays ground truth.\n"
         "             PTV_RSYNC_SENSE=0 disables. Components: [PTV-RSYNC] under PTV_DIAG.\n");

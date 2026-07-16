@@ -24,6 +24,7 @@
 #include "libavfilter/avfilter.h"
 #include "libavfilter/buffersrc.h"
 #include "libavfilter/buffersink.h"
+#include "libavfilter/filters.h"   /* 1.0.1-pre11: FilterLink.current_pts_us — resampler-boundary slip probe (in-tree build) */
 #include "libswresample/swresample.h"
 
 #include "ptvencoder.h"
@@ -400,13 +401,19 @@ static int audio_drain_fg(AudioState *a)
              * requirement) + AVLOCK's house_skew (whose REALIZED retiming is matched by the
              * video side's measured dup ratchet → cancels in R = shared latency, not desync —
              * the wedge/Lindel class where span accounting read −2986ms on a +24ms channel).
-             * slip = the resampler's UN-REALIZED correction: (door-label head) − (sink-label
-             * head) − (swr sample backlog). ≈0 when aresample=async has converged content onto
-             * its labels; parks at the un-taken correction when hard-comp wedges (the
-             * [PTV-SWRDELAY] class label math alone is blind to). 50ms dead band swallows the
-             * structural residue (buffersink partial frames, rate rounding) so steady state is
-             * exactly label-based. Pads/drops that fill GENUINE label gaps never appear in any
-             * term — label-referenced mapping is edit-neutral for them by construction (trap 2).
+             * slip = the resampler's UN-REALIZED correction, scoped (1.0.1-pre11) to the async
+             * aresample FILTER's own boundary: (label head at its input link) − (label head at
+             * its output link) − (swr sample backlog). ≈0 when aresample=async has converged
+             * content onto its labels; parks at the un-taken correction when hard-comp wedges
+             * (the [PTV-SWRDELAY] class label math alone is blind to). The pre9 probe spanned
+             * the WHOLE graph (door acomp_exp_us − sink head), so any buffering -af filter
+             * (loudnorm ~3s analysis window) parked its hold in slip = a constant false
+             * audio-early bias (+2914ms fixture/live class, Defect 1); a passive filter's hold
+             * preserves labels — it is shared latency, not desync — and must not appear here.
+             * 50ms dead band swallows the structural residue (frame-start vs head labels, rate
+             * rounding) so steady state is exactly label-based. Pads/drops that fill GENUINE
+             * label gaps never appear in any term — label-referenced mapping is edit-neutral
+             * for them by construction (trap 2).
              * ==================================================================================== */
             if (g_rsync_sense && !a->multiview && a->use_fg &&
                 a->dbg_k < PTV_MAX_AUDIO && a->out_rate > 0) {
@@ -414,12 +421,39 @@ static int audio_drain_fg(AudioState *a)
                 int64_t hs     = (g_avlock && a->house_skew) ? *a->house_skew : 0;
                 int64_t inj    = a->glue_off_us + hs;
                 int64_t slip   = 0, m, nowr;
-                if (a->fg_swr && a->acomp_exp_us != AV_NOPTS_VALUE) {
-                    int64_t dur = av_rescale(filt->nb_samples, 1000000, a->out_rate);
-                    slip = a->acomp_exp_us - (src_abs_us + dur)
-                         - swr_get_delay(a->fg_swr, 1000000);
-                    if (slip > -50000 && slip < 50000) slip = 0;          /* dead band */
-                    else slip += slip > 0 ? -50000 : 50000;
+                if (a->fg_swr && a->fg_swr_flt &&
+                    a->fg_swr_flt->nb_inputs > 0 && a->fg_swr_flt->nb_outputs > 0) {
+                    /* pre11: label HEADS at the aresample filter's OWN links (updated by the
+                     * generic consume path on every frame crossing them) — filters before or
+                     * after it (loudnorm etc.) hold content with labels intact, outside this
+                     * boundary, so their hold can no longer read as slip. current_pts_us is
+                     * the START of the last chunk CONSUMED off the link; reconstruct true
+                     * heads symmetrically (fixture-measured, both matter vs the 50ms band):
+                     *  in  head = start + avg consumed-chunk duration (counters are exact for
+                     *             steady chunking: mp2 1152; loudnorm's 100ms consume quantum)
+                     *  out head = start + avg chunk + QUEUED duration (produced-but-unconsumed
+                     *             frames sit in the link fifo with labels dense above the
+                     *             consumed head — sample_count_in − sample_count_out) */
+                    const FilterLink *fli = ff_filter_link(a->fg_swr_flt->inputs[0]);
+                    const FilterLink *flo = ff_filter_link(a->fg_swr_flt->outputs[0]);
+                    int irate = a->fg_swr_flt->inputs[0]->sample_rate;
+                    int orate = a->fg_swr_flt->outputs[0]->sample_rate;
+                    if (fli->current_pts_us != AV_NOPTS_VALUE &&
+                        flo->current_pts_us != AV_NOPTS_VALUE &&
+                        irate > 0 && orate > 0 &&
+                        fli->frame_count_out > 0 && flo->frame_count_out > 0) {
+                        int64_t ihead = fli->current_pts_us
+                                      + av_rescale(fli->sample_count_out / fli->frame_count_out,
+                                                   1000000, irate);
+                        int64_t ohead = flo->current_pts_us
+                                      + av_rescale(flo->sample_count_out / flo->frame_count_out,
+                                                   1000000, orate)
+                                      + av_rescale(flo->sample_count_in - flo->sample_count_out,
+                                                   1000000, orate);
+                        slip = ihead - ohead - swr_get_delay(a->fg_swr, 1000000);
+                        if (slip > -50000 && slip < 50000) slip = 0;      /* dead band */
+                        else slip += slip > 0 ? -50000 : 50000;
+                    }
                 }
                 a->rs_slip_us = slip;
                 m = out_us - (src_abs_us - inj) - slip;
@@ -715,7 +749,7 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                    frame->sample_rate, av_get_sample_fmt_name(frame->format), nchl,
                    a->afmt_stable, tchl);
             a->afmt_stable = 0;
-            if (a->afg) { avfilter_graph_free(&a->afg); a->afsrc = a->afsink = NULL; a->fg_swr = NULL; }
+            if (a->afg) { avfilter_graph_free(&a->afg); a->afsrc = a->afsink = NULL; a->fg_swr = NULL; a->fg_swr_flt = NULL; }
             a->use_fg = 0;
             /* v0.9.17.1: rebuild the -af graph whenever the chain exists — INCLUDING for a track
              * whose startup init failed outright (Azorse: source in an undecodable-AAC phase at
@@ -1248,6 +1282,7 @@ int build_audio_filter(AudioState *a, AVCodecContext *adec, AVRational tb,
      * are structurally blind to a sub-resampler slip, so this is the one number that sees it.
      * Prefer the aresample whose swr has async set (the explicit -af one), fall back to the first. */
     a->fg_swr = NULL;
+    a->fg_swr_flt = NULL;
     for (unsigned i = 0; i < a->afg->nb_filters; i++) {
         AVFilterContext *fc = a->afg->filters[i];
         if (fc && fc->filter && !strcmp(fc->filter->name, "aresample") && fc->priv) {
@@ -1255,7 +1290,7 @@ int build_audio_filter(AudioState *a, AVCodecContext *adec, AVRational tb,
             if (cand) {
                 int64_t as = 0;
                 av_opt_get_int(cand, "async", 0, &as);
-                if (!a->fg_swr || as) a->fg_swr = cand;
+                if (!a->fg_swr || as) { a->fg_swr = cand; a->fg_swr_flt = fc; }
                 if (as) break;
             }
         }

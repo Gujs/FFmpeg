@@ -162,7 +162,13 @@ typedef struct VOutRing {
  *                                        reference recovers the RAW post-demux label; slip =
  *                                        the resampler's UN-REALIZED correction beyond a 50ms
  *                                        dead band — the parked-slip class [PTV-SWRDELAY]
- *                                        exists for, which label math alone cannot see)
+ *                                        exists for, which label math alone cannot see.
+ *                                        1.0.1-pre11: slip is scoped to the async-aresample
+ *                                        FILTER boundary (its own in/out link label heads −
+ *                                        swr_get_delay), NOT the whole -af graph — a buffering
+ *                                        filter's hold (loudnorm ~3s) preserves labels, so it
+ *                                        is latency, not slip; the pre9 whole-graph probe read
+ *                                        it as a constant false audio-early = the hold)
  *   E_s = per-stream demux label-edit ledger (µs): discontinuity self-rebase (§5.A.2 absorbs),
  *         LAYERA flush applied_offset persists, pre5 retro-corrections. Pure 2^33 wraps are
  *         EXCLUDED (always genuine, always shared; including them would spike R by 26.5h
@@ -318,6 +324,7 @@ typedef struct AudioState {
     AVRational       ist_tb;
     SwrContext      *swr;                         /* no -af: plain resample to 48k stereo */
     SwrContext      *fg_swr;                       /* -af path: the (async) aresample filter's internal SwrContext — swr_get_delay() = faithful resampler-slip sensor (PTS metrics are blind to it) */
+    AVFilterContext *fg_swr_flt;                   /* 1.0.1-pre11: the aresample AVFilterContext owning fg_swr — its own in/out links scope the slip probe to the RESAMPLER boundary (a buffering -af's hold must not read as slip) */
     int64_t          fg_swr_delay_max_ms;          /* running peak of swr_get_delay for observability */
     AVFilterGraph   *afg;                         /* -af present: abuffer -> chain -> abuffersink */
     AVFilterContext *afsrc, *afsink;
