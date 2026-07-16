@@ -1867,10 +1867,12 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         d->deep_prime_packets = g_cp.deep_prime_pkts;
         d->vq_shed_req = &inputs[k].vq_shed_req;   /* 1.0.1-pre8 (a): head-GOP shed request slot */
         /* rr10 review fix (D1): the catch-up governor's INPUT-rate currency — measured
-         * arrival pps (demux publishes) + the declared header rate as warm-up clamp.
-         * Prefer avg_frame_rate: r_frame_rate is the FIELD rate for interlaced sources
-         * (2x the packet rate = a loose cap, the fail-open direction) — the measurement
-         * takes over within ~4s either way. */
+         * arrival pps (demux publishes) + the declared header rate.
+         * Prefer avg_frame_rate. CAUTION (pre13 semantics): declared is now the TRUST
+         * FLOOR (govern only when measured >= declared), so an OVERSTATED declared is a
+         * standing trust veto — r_frame_rate's FIELD rate (2x packets, when
+         * avg_frame_rate is missing on interlaced) silently disables governance on such
+         * channels (DIAG shows gpps=M/D gov=0 with M ~= D/2). Fail-open = safe. */
         d->vin_pps = &inputs[k].da.vin_pps;
         d->vin_pps_wall = &inputs[k].da.vin_pps_wall;   /* pre13: publish-freshness gate */
         {
