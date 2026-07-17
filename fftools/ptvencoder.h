@@ -218,6 +218,53 @@ typedef struct RsyncSense {
     int             n_a;                    /* transcoded tracks wired (0 = sensor unwired: multiview / no audio) */
 } RsyncSense;
 
+/* ===================== 1.0.1-pre14 — residual-sync CORRECTOR =====================
+ * Component 2 of the residual-sync supervisor (analysis/ptvencoder-corrector-design.md —
+ * the normative spec; §ref in comments below are ITS sections). The actuation half of the
+ * pre9/pre11 sensor: when input is healthy and the per-track residual R (the stats-line
+ * `lipsync=`, + = audio EARLY) dwells outside a dead band, steer it to zero through the
+ * resampler — the pre3 graph-door steer-bus actuator (§5), rate-clamped to 2ms/s. A trim
+ * loop, NOT a controller: authority is deliberately too small to paper over a structural
+ * glue failure (§6 damage bound, owner-approved caps: 5s/engagement, 10s lifetime).
+ * MV-NORMATIVE (§8): one CorrState per (input-slot, audio-track), embedded in AudioState;
+ * the corrector consumes R only through the rsync_track_R() accessor (slot 0 hard-wired
+ * today; the mv sensor port re-shapes RsyncSense behind it). DEFAULT OFF — opt-in
+ * PTV_RSYNC_CORR=1 per channel; PTV_NO_RSYNC_CORR=1 kills it outright (§6/§7).
+ * All state below is owned by that track's audio thread; cross-thread visibility goes
+ * through the g_corr_* published atomics only. */
+enum {
+    PTV_CORR_OFF = 0,      /* not opted in (or killed): no state machine, corr_us stays 0 */
+    PTV_CORR_ARMED,        /* enabled, |R| inside the engage band (or no valid reading yet) */
+    PTV_CORR_DWELL,        /* |R| > engage band — accumulating the 5min stable dwell (§4.3) */
+    PTV_CORR_ENGAGED,      /* steering: proportional R/30s, slew-clamped 2ms/s (§4) */
+    PTV_CORR_PARKED,       /* converged (|R|≤20ms held 60s): corr_us RETAINED, integration off */
+    PTV_CORR_DISARMED      /* auto-disarm (§6): re-arm only via a fresh full dwell */
+};
+typedef struct CorrState {          /* all owned by that track's audio thread (§4) */
+    int64_t corr_us;                /* cumulative applied trim (µs) — the steer-bus term */
+    int     state;                  /* PTV_CORR_* */
+    int64_t dwell_start_wc;         /* wall µs |R| first exceeded the engage band */
+    int64_t dwell_r0;               /* R at dwell start (stability reference, §4.3) */
+    int64_t ev_snap, ea_snap;       /* ledger snapshots at dwell start (event detect, §4.4) */
+    int64_t epoch_snap;             /* input disturb_epoch snapshot */
+    int     glue_snap, acq_snap;    /* glue_events / pll_acq_count snapshots */
+    int     afmt_snap, reopen_snap; /* AFMT rebuilds / ADECWD reopens snapshots */
+    int64_t bank_snap;              /* g_bank_us snapshot (armed-and-filling detect) */
+    int64_t hs_snap;                /* house_skew at dwell start (|Δhs|<50ms freeze) */
+    int64_t engage_r0;              /* R at engage (overshoot + convergence logging) */
+    int64_t engaged_corr0;          /* corr_us at engage (per-engagement 5s authority) */
+    int64_t engage_wc;              /* wall µs of the engage (PARK line duration) */
+    int64_t park_wc;                /* wall µs |R| first inside the 20ms target band */
+    int64_t implaus_wc;             /* wall µs R first read implausible (>5s) */
+    int64_t last_event_wc;          /* wall µs of the last event hit (3min quiet + engaged 60s re-quiet) */
+    int64_t slip_bad_wc;            /* wall µs rs_slip_us went nonzero while ENGAGED (60s → disarm) */
+    int64_t rst_win_wc;             /* event-storm window start (≥3 counted dwell resets / 10min) */
+    int     rst_cnt;                /* counted dwell resets in the window */
+    int64_t holdoff_wc;             /* re-arm holdoff after a storm disarm (wall µs) */
+    int64_t log_wc;                 /* HOLD-line rate limit (state-change lines are not limited) */
+    int64_t diag_wc;                /* PTV_DIAG 30s progress-line rate limit while engaged */
+} CorrState;
+
 /* 0.9.18 M3 — CushionRt: the runtime COORDINATION home for cushion escalation (map §1.3).
  * Holds the per-run wiring every escalation event needs (the per-rung delivery gates, the
  * master tick, the adaptive tier targets) plus the mutex that makes cushion_escalate() the
@@ -490,6 +537,16 @@ typedef struct AudioState {
     int              rs_ma_seed;                      /* EMA seeded at first sample */
     int64_t          rs_slip_us;                      /* latest net (dead-banded) resampler slip (DIAG) */
     int64_t          rs_log_last;                     /* [PTV-RSYNC] DIAG rate limit (wall µs) */
+    /* 1.0.1-pre14 residual-sync corrector (see CorrState above; design doc §4/§8). The two
+     * pointers wire this track's EVENT feeds (owned by its input slot): the disturbance epoch
+     * (demux/compositor bump it) and the LAYERA buffer-active flag (plain int, demux-thread
+     * written — read here ADVISORY only: a torn/late read merely delays an engage by one
+     * evaluation, never corrupts state). afmt_rebuilds counts [PTV-AFMT] path rebuilds — a
+     * rebuild is an event (§4.4). */
+    CorrState        corr;
+    _Atomic int_least64_t *corr_epoch;                /* -> Input.house_disturb (event feed) */
+    int             *corr_layera_active;              /* -> Input.disc.active (g_layera only; NULL = off) */
+    int              afmt_rebuilds;                   /* [PTV-AFMT] rebuild count (corrector event feed) */
 } AudioState;
 
 /* ---- demux + mux ---- */
@@ -898,6 +955,22 @@ extern int     g_degraded;               /* (h) opt-in sustained-deficit every-K
 /* 1.0.1-pre9 residual sensor (defined in ptvencoder.c) */
 extern int        g_rsync_sense;         /* PASSIVE sensor on (PTV_RSYNC_SENSE=0 disables) */
 extern RsyncSense g_rsx;                 /* published sensor state (single-input, input 0) */
+/* 1.0.1-pre14 residual-sync corrector (defined in ptvencoder.c; design doc §6/§7) */
+extern int     g_rsync_corr;             /* DEFAULT OFF; PTV_RSYNC_CORR=1 opts in, PTV_NO_RSYNC_CORR kills */
+extern int64_t g_rscorr_engage_us;       /* engage dead band (80ms default; PTV_RSCORR_ENGAGE_MS) */
+extern int64_t g_rscorr_dwell_us;        /* stable-dwell length (300s; PTV_RSCORR_DWELL_S — TEST ONLY) */
+extern int64_t g_rscorr_quiet_us;        /* trailing event-free window (180s; PTV_RSCORR_QUIET_S — TEST ONLY) */
+extern int64_t g_rscorr_slew_us_s;       /* slew clamp, µs of trim per wall second (2000; PTV_RSCORR_SLEW — TEST ONLY) */
+/* published cross-thread state (audio thread writes; stats line + master stale-track watchdog
+ * read; the watchdog may CAS ENGAGED/DWELL→DISARMED when the track itself stopped emitting —
+ * the one transition the owning thread cannot log, see rscorr_* in ptvencoder_audio.c) */
+extern _Atomic int64_t g_corr_pub[PTV_MAX_AUDIO];        /* cumulative corr_us per track */
+extern _Atomic int     g_corr_state_pub[PTV_MAX_AUDIO];  /* PTV_CORR_* per track */
+extern _Atomic int     g_corr_disarm_req[PTV_MAX_AUDIO]; /* master watchdog → audio thread (silent sync) */
+/* per-rung wire-send watermark (§3, owner-approved "build it"): wall µs of the last SUCCESSFUL
+ * av_interleaved_write_frame on that rung — the only liveness signal that is actually the wire
+ * (the Newsmax2 dead rung read calm on every label-domain signal). One relaxed store per packet. */
+extern _Atomic int64_t g_mux_sent_wc[PTV_MAX_RUNG];
 
 /* ==== cross-file functions ==== */
 /* ptvencoder_gate.c */

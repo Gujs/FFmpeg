@@ -162,9 +162,16 @@ void ptv_print_log_legend(int full)
         "             1.0.1-pre11: the slip probe is scoped to the async-aresample boundary — a\n"
         "             buffering -af's hold (loudnorm ~3s) is label-preserving latency, EXCLUDED\n"
         "             from R (the pre9 whole-graph probe read it as constant false audio-early).\n"
-        "             UNVALIDATED vs the external oracle until the live soak passes; until then the\n"
-        "             oracle (test-scripts/repro/drift-continuous.py) stays ground truth.\n"
-        "             PTV_RSYNC_SENSE=0 disables. Components: [PTV-RSYNC] under PTV_DIAG.\n");
+        "             Soak-CERTIFIED vs the external oracle 2026-07-16 (Δ12-21ms on real excursions,\n"
+        "             both signs human-verified, NTSC 24h flat) — the corrector's gate condition.\n"
+        "             PTV_RSYNC_SENSE=0 disables. Components: [PTV-RSYNC] under PTV_DIAG.\n"
+        "  corr       (1.0.1-pre14, only when PTV_RSYNC_CORR=1 and nonzero/engaged) residual-sync\n"
+        "             CORRECTOR cumulative resampler trim (ms; `*` = actively integrating). The\n"
+        "             actuation half of the supervisor: when the sensor's R dwells outside ±80ms\n"
+        "             for 5min stable + 3min event-free with ALL rungs' wire provably moving, it\n"
+        "             steers R→0 through aresample (≤2ms/s; park |R|≤20ms; authority 5s/engagement,\n"
+        "             10s lifetime → hard disarm). [PTV-RSCORR] logs every state change\n"
+        "             (arm/ENGAGE/PARK/HOLD/DISARM). analysis/ptvencoder-corrector-design.md.\n");
     av_log(NULL, AV_LOG_INFO,
         "discontinuity events (always-on since v0.9.13; were PTV_DIAG-only):\n"
         "  [PTV-LAYERA]   jump = a >1s splice detected (buffering starts); flush = the glue applied\n"
@@ -241,7 +248,9 @@ void ptv_print_log_legend(int full)
         "  PTV_NO_DECIMATE · PTV_LAYERA_FULLSKIP (LAYERA skips the demux absorber for sub-1s steps\n"
         "  again — restores the In-Touch audio-late accumulator; A/B only) ·\n"
         "  PTV_NO_EXACTTICK (re-enables the integer-tick ~10ppm NTSC lip-sync drift; A/B only) ·\n"
-        "  PTV_NO_PULLDOWN (revert telecine-aware emit: film segments back to dup-fill + hs sawtooth)\n");
+        "  PTV_NO_PULLDOWN (revert telecine-aware emit: film segments back to dup-fill + hs sawtooth) ·\n"
+        "  PTV_RSYNC_CORR=1 residual-sync corrector OPT-IN (1.0.1-pre14; DEFAULT OFF — the phase-1\n"
+        "  deploy posture) · PTV_NO_RSYNC_CORR=1 corrector kill switch (wins over the opt-in; kept forever)\n");
     av_log(NULL, AV_LOG_INFO,
         "tuning: PTV_CUSHION_MS=N adaptive raised tier (default 4000, [1000,10000]) · PTV_CUSHION_MAX_MS=N\n"
         "  auto-bank ceiling (default 12000; beyond it = an upstream incident to surface) · PTV_FRAMEQ=N\n"

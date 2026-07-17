@@ -41,7 +41,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.0.1-pre13"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.0.1-pre14"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -545,6 +545,22 @@ int     g_degraded = 0;
  * later round, gated on a live sensor-vs-oracle soak). PTV_RSYNC_SENSE=0 disables. */
 int        g_rsync_sense = 1;
 RsyncSense g_rsx;
+/* 1.0.1-pre14 — residual-sync CORRECTOR (component 2; analysis/ptvencoder-corrector-design.md).
+ * The actuation half: a per-track, dwell-gated, slew-clamped (2ms/s) resampler steer on the
+ * certified pre9/pre11 sensor, injected at the graph door on the steer bus (§5). DEFAULT OFF —
+ * first-deploy posture is per-channel opt-in (PTV_RSYNC_CORR=1); PTV_NO_RSYNC_CORR=1 is the
+ * permanent kill switch; sensor off implies corrector off. State machine + control law live in
+ * ptvencoder_audio.c (rscorr_*); the stats line prints corr= and the master output thread runs
+ * the stale-track disarm watchdog (ptvencoder_clock.c). */
+int     g_rsync_corr      = 0;
+int64_t g_rscorr_engage_us = 80000;      /* §4.2: 80ms engage dead band (supervisor start value) */
+int64_t g_rscorr_dwell_us  = 300000000;  /* §4.3: 5min stable dwell */
+int64_t g_rscorr_quiet_us  = 180000000;  /* §4.4: 3min trailing event-free window */
+int64_t g_rscorr_slew_us_s = 2000;       /* §4: 2ms/s slew clamp (1/5 of pre3's TRACK clamp) */
+_Atomic int64_t g_corr_pub[PTV_MAX_AUDIO];
+_Atomic int     g_corr_state_pub[PTV_MAX_AUDIO];
+_Atomic int     g_corr_disarm_req[PTV_MAX_AUDIO];
+_Atomic int64_t g_mux_sent_wc[PTV_MAX_RUNG];
 
 /* PTV_LOG_TS=1: prefix every log line with a local wall-clock timestamp
  * [YYYY-MM-DD HH:MM:SS.mmm], so production logs are self-dated natively
@@ -1190,6 +1206,7 @@ typedef struct MuxArgs {
     int                   n_producers;
     int                   err;
     int                   is_master;                  /* Φ1′: rung 0 — compute the wire-DTS sensor here only */
+    int                   rung;                       /* pre14: index into g_mux_sent_wc (wire-send watermark) */
 } MuxArgs;
 
 static void *mux_thread(void *arg)
@@ -1219,6 +1236,11 @@ static void *mux_thread(void *arg)
         }
         av_packet_free(&pkt);
         if (ret < 0) { m->err = ret; break; }
+        /* pre14 (§3, owner call 3): per-rung wire-send watermark — stamped ONLY after a
+         * SUCCESSFUL interleaved write, so a stalled/backed-up muxer (the Newsmax2 dead
+         * rung, invisible to every label-domain signal) goes stale within seconds. The
+         * corrector's delivery-liveness gate treats this as the primary signal. */
+        atomic_store_explicit(&g_mux_sent_wc[m->rung], av_gettime_relative(), memory_order_relaxed);
         g_muxed++;
     }
     av_thread_message_queue_set_err_send(m->mux_q, AVERROR_EOF);   /* unblock producers (SENDERS) */
@@ -1916,6 +1938,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         vc->dbg_disc_resid = &inputs[0].da.disc_resid_us;   /* 0.9.18.7: hsres= (LAYERA erase-residue ledger) */
         rung[r].ma.ofmt = rung[r].ofmt; rung[r].ma.mux_q = rung[r].mux_q;
         rung[r].ma.is_master = (r == 0);                        /* Φ1′: wire-DTS sensor on rung 0 only */
+        rung[r].ma.rung = r;                                    /* pre14: g_mux_sent_wc slot (wire watermark) */
         rung[r].ma.n_producers = 1 + n_audio + n_copy_inputs;   /* video out + N audio + per-input copy fan */
     }
     for (k = 0; k < n_audio; k++) {              /* per-track audio: source from its input's clock */
@@ -1930,6 +1953,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         as[k].glue_raw_last_us = AV_NOPTS_VALUE;         /* [PTV-AGLUE] no continuity reference yet */
         as[k].glue_exp_step = &inputs[asrc_in[k]].aglue_exp_step[k];   /* pre5 (D1): shared-flush expected-step slot */
         as[k].glue_exp_dl   = &inputs[asrc_in[k]].aglue_exp_dl[k];
+        as[k].corr_epoch    = &inputs[asrc_in[k]].house_disturb;       /* pre14: corrector event feeds (its input slot) */
+        as[k].corr_layera_active = g_layera ? &inputs[asrc_in[k]].disc.active : NULL;
         as[k].acomp_exp_us = AV_NOPTS_VALUE;             /* [PTV-ACOMP] no expected-pts reference yet */
         as[k].tick_dur_us = av_rescale(1000000, out_fps.den, out_fps.num);  /* 1.0.1: house tick = the PLL's vlag quantum (one house clock for all slots) */
         for (r = 0; r < n_rung; r++) {
@@ -2557,6 +2582,19 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_RATCHREL")) g_ratchrel = 0;   /* 1.0.1-pre8 (b): keep the 6h bank decay even under the starvation contradiction */
     if (getenv("PTV_NO_SELFHEAL")) g_selfheal = 0;   /* 1.0.1-pre8 (c): no internal re-prime on sustained starvation */
     { const char *rs = getenv("PTV_RSYNC_SENSE"); if (rs && !atoi(rs)) g_rsync_sense = 0; }  /* 1.0.1-pre9: passive residual sensor default ON; =0 disables */
+    /* 1.0.1-pre14 residual-sync corrector: DEFAULT OFF — PTV_RSYNC_CORR=1 opts a channel in
+     * (the phase-1 deploy posture, design doc §7); PTV_NO_RSYNC_CORR=1 is the permanent kill
+     * switch and wins over the opt-in; sensor off implies corrector off (it is the only input). */
+    { const char *rc = getenv("PTV_RSYNC_CORR"); if (rc && atoi(rc)) g_rsync_corr = 1; }
+    if (getenv("PTV_NO_RSYNC_CORR") || !g_rsync_sense) g_rsync_corr = 0;
+    /* TEST-ONLY overrides (PTV_WRAP_GUARD_S precedent): shorten the dwell/quiet windows or move
+     * the band/slew so the F-gate fixtures can exercise storm/authority paths in bounded wall
+     * time. NEVER set in production — the 5min/3min/80ms/2ms/s defaults are the owner-approved
+     * §4/§6 numbers. */
+    { const char *s = getenv("PTV_RSCORR_ENGAGE_MS"); if (s && atoi(s) > 0) g_rscorr_engage_us = (int64_t)atoi(s) * 1000; }
+    { const char *s = getenv("PTV_RSCORR_DWELL_S");   if (s && atoi(s) > 0) g_rscorr_dwell_us  = (int64_t)atoi(s) * 1000000; }
+    { const char *s = getenv("PTV_RSCORR_QUIET_S");   if (s && atoi(s) > 0) g_rscorr_quiet_us  = (int64_t)atoi(s) * 1000000; }
+    { const char *s = getenv("PTV_RSCORR_SLEW");      if (s && atoi(s) > 0) g_rscorr_slew_us_s = atoi(s); }
     if (getenv("PTV_NO_CUSHREL"))  g_cushrel  = 0;   /* 1.0.1-pre10 (e): keep the 6h zero-starvation cushion decay even under the contradiction */
     if (getenv("PTV_NO_CATCHGOV")) g_catchgov = 0;   /* 1.0.1-pre10 (f): deficit-recovery decode back to device max (the 2.2x catch-up bursts) */
     if (!getenv("PTV_NO_PHASEJIT")) {                /* 1.0.1-pre10 (g): per-PID +/-20% shed/heal cycle jitter (deterministic per PID) */

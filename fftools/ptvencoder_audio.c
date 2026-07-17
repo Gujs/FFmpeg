@@ -122,6 +122,412 @@ static int audio_drain_fifo(AudioState *a)
     return 0;
 }
 
+/* ===================== 1.0.1-pre14 — residual-sync CORRECTOR =====================
+ * Component 2 of the residual-sync supervisor; NORMATIVE DESIGN =
+ * analysis/ptvencoder-corrector-design.md (§ refs below are its sections). Everything here
+ * runs on the owning track's audio thread, once per EMITTED audio frame, immediately after
+ * the pre9 sensor publishes that frame's m_a — so R is always current when consumed.
+ *
+ * SENSOR CONTRACT (§2): the corrector consumes EXACTLY ONE signal — the per-track residual
+ *   R = (m_v + E_v) − (m_a + E_a)   (µs; + = audio EARLY, the external oracle's convention)
+ * read from the g_rsx atomics through rsync_track_R() below. It must NEVER read `avlag=`
+ * ([PTV-AVSYNC]), `[PTV-LIPSYNC] err=`, `[PTV-CHAIN] introduced=`, `async_pad`, or any other
+ * internal estimate — those are control-domain proxies with their own (opposite) sign
+ * conventions; the pre13 avlag rename exists because that collision already caused one
+ * oracle-analysis error. Actuation sign law: injecting +corr at the graph door delays audio
+ * content → raises m_a → dR/dcorr = −1.
+ *
+ * ACTUATOR (§4/§5): the pre3 steer bus at the audio_feed graph door — corr_us joins
+ * glue_off + house_skew + af_steer_us as a fourth linearly-summed term, realized by
+ * aresample=async as bounded SOFT compensation (per-frame steps ~43µs at 21.3ms frames,
+ * three orders under ACOMP's 25ms click threshold). Renounced actuators, permanently:
+ * output drop/pad (B4), output label re-stamping (pre3/TRACKUP warble), per-stream packet
+ * offsets (standing owner ban). Anti-windup is structural (§4): (a) corr_us enters the
+ * sensor's inj term so R feeds back only the REALIZED trim, (b) integration freezes while
+ * the slip probe reads nonzero (resampler behind = pushing harder is windup by definition),
+ * (c) any engage-condition loss freezes integration the same frame; corr_us is the only
+ * state and it never holds more than realized-or-in-flight trim. */
+
+/* §2 accessor (MV-NORMATIVE §8.3): track k's residual, pairing its audio terms with its
+ * INPUT SLOT's video terms. Today g_rsx carries one video term (single input) and the slot
+ * is hard-wired 0; the mv sensor port re-shapes RsyncSense to per-slot video ledgers keyed
+ * by AudioState.dbg_in — nothing in the corrector changes when that lands. */
+typedef struct RsyncTrackR { int valid; int64_t R_us, mv_wall, ma_wall; } RsyncTrackR;
+/* TEST-ONLY (PTV_RSCORR_TESTWALK, µs/s; PTV_PLL_TESTNOISE_MS precedent): add a linearly
+ * walking offset to the R the CORRECTOR reads (the sensor/stats stay untouched) — the
+ * "maximally lying-but-plausible sensor" of §6's damage bound, the only way to exercise the
+ * per-engagement authority cap in bounded wall time (a real R never walks: label-faithful
+ * drift reads R=0 by design). Never set in production. */
+static int64_t g_rscorr_testwalk_us_s = 0, g_rscorr_testwalk_t0 = 0;
+static RsyncTrackR rsync_track_R(const AudioState *a, int64_t now)
+{
+    RsyncTrackR r = { 0, 0, 0, 0 };
+    int k = a->dbg_k;
+    if (k < 0 || k >= PTV_MAX_AUDIO || !a->rs_ma_seed)
+        return r;
+    r.mv_wall = atomic_load_explicit(&g_rsx.mv_wall, memory_order_relaxed);
+    r.ma_wall = atomic_load_explicit(&g_rsx.ma_wall[k], memory_order_relaxed);
+    /* freshness (§2): a side that has not flowed for 3s is stale ("--" on the stats line)
+     * — no reading, the corrector holds/disarms. */
+    if (!r.mv_wall || !r.ma_wall || now - r.mv_wall > 3000000 || now - r.ma_wall > 3000000)
+        return r;
+    r.R_us = (atomic_load_explicit(&g_rsx.mv_ema, memory_order_relaxed)
+            + atomic_load_explicit(&g_rsx.ev_us,  memory_order_relaxed))
+           - (a->rs_ma_ema
+            + atomic_load_explicit(&g_rsx.ea_us[k], memory_order_relaxed));
+    if (g_rscorr_testwalk_us_s == 0) {
+        const char *tw = getenv("PTV_RSCORR_TESTWALK");
+        const char *ta = getenv("PTV_RSCORR_TESTWALK_AT_S");
+        g_rscorr_testwalk_us_s = (tw && atoi(tw)) ? atoi(tw) : -1;   /* -1 = parsed, off */
+        /* PTV_RSCORR_TESTWALK_AT_S delays the walk's onset — the cap is only reachable
+         * through MID-ENGAGEMENT drift (§6): a walk from birth is correctly rejected by the
+         * dwell stability bound and can never engage (verified, first fixture round). */
+        g_rscorr_testwalk_t0 = now + (ta ? (int64_t)atoi(ta) * 1000000 : 0);
+    }
+    if (g_rscorr_testwalk_us_s > 0 && now > g_rscorr_testwalk_t0)
+        r.R_us += av_rescale(now - g_rscorr_testwalk_t0, g_rscorr_testwalk_us_s, 1000000);
+    r.valid = 1;
+    return r;
+}
+
+/* §3 delivery-liveness gate: actuation requires the wire to be provably moving on EVERY
+ * rung AND the steered track's input to be flowing — one dead rung holds the corrector for
+ * the whole channel (the steer is upstream of the per-rung fan-out, and a dead rung is
+ * exactly the state in which R has been shown to lie: Newsmax2 read a serene +174ms with
+ * rung 6000 dead). Signals per rung: g_mux_sent_wc (the wire itself — PRIMARY, §9.3
+ * owner-approved) + DlvGate a_hi/v_hi_change_wc watermarks + mux_q depth below half
+ * capacity (a backed-up mux_q = the muxer/socket is not draining). Gate NULL
+ * (PTV_NO_DELIVERY / no-audio) → the watermark + depth checks remain. Per-input (N=1
+ * today, mv wires per-input later): the demux video-arrival watermark g_v_arrive_wc;
+ * the track's own ma_wall freshness is already in the §2 sensor validity. */
+static const char *rscorr_delivery_dead(AudioState *a, int64_t now)
+{
+    int i;
+    int64_t arr = atomic_load_explicit(&g_v_arrive_wc, memory_order_relaxed);
+    if (!arr || now - arr > 5000000)
+        return "input not flowing";
+    for (i = 0; i < a->n_out; i++) {
+        int64_t ms = atomic_load_explicit(&g_mux_sent_wc[i], memory_order_relaxed);
+        if (!ms || now - ms > 5000000)
+            return "rung wire stale";
+        if (a->mux_q[i] &&
+            av_thread_message_queue_nb_elems(a->mux_q[i]) > PTV_QDEPTH / 2)
+            return "mux_q backed up";
+        if (a->gate[i]) {
+            int64_t ah = atomic_load_explicit(&a->gate[i]->a_hi_change_wc, memory_order_relaxed);
+            int64_t vh = atomic_load_explicit(&a->gate[i]->v_hi_change_wc, memory_order_relaxed);
+            if (!ah || now - ah > 5000000) return "audio delivery stale";
+            if (!vh || now - vh > 5000000) return "video encode stale";
+        }
+    }
+    return NULL;
+}
+
+/* §4.4 event-EDGE detector: any pipeline event that touches this track's label lineage,
+ * detected as a snapshot delta and CONSUMED (snapshots advance) so one event fires once.
+ * Returns the reason string, or NULL. */
+static const char *rscorr_event_edge(AudioState *a)
+{
+    CorrState *c = &a->corr;
+    int64_t v;
+    v = a->corr_epoch ? atomic_load_explicit(a->corr_epoch, memory_order_relaxed) : 0;
+    if (v != c->epoch_snap) { c->epoch_snap = v; return "disturb_epoch"; }
+    if (a->glue_events != c->glue_snap) { c->glue_snap = a->glue_events; return "aglue"; }
+    if (a->pll_acq_count != c->acq_snap) { c->acq_snap = a->pll_acq_count; return "pll-acquire"; }
+    if (a->afmt_rebuilds != c->afmt_snap) { c->afmt_snap = a->afmt_rebuilds; return "afmt-rebuild"; }
+    if (a->dec_reopens != c->reopen_snap) { c->reopen_snap = a->dec_reopens; return "adecwd-reopen"; }
+    v = atomic_load_explicit(&g_rsx.ev_us, memory_order_relaxed);
+    if (v != c->ev_snap) { c->ev_snap = v; return "E_v ledger"; }
+    v = atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed);
+    if (v != c->ea_snap) { c->ea_snap = v; return "E_a ledger"; }
+    v = atomic_load_explicit(&g_bank_us, memory_order_relaxed);
+    if (v != c->bank_snap) { c->bank_snap = v; return "bank change"; }
+    if (a->house_skew) {
+        v = *a->house_skew;
+        if (llabs(v - c->hs_snap) >= 50000) { c->hs_snap = v; return "hs step"; }
+    }
+    return NULL;
+}
+
+/* §4.4 event-ACTIVE detector: conditions that must be INACTIVE across the whole quiet
+ * window (returned every call while they hold; no state consumed). */
+static const char *rscorr_event_active(AudioState *a, int64_t now)
+{
+    int64_t v;
+    if (a->glue_exp_dl) {
+        /* outstanding = registered AND not yet expired. The slot's deadline is only zeroed
+         * by the AGLUE consume/expire path when a matching step ARRIVES; a registration
+         * whose step never arrives sits expired in the slot indefinitely (fixture F8 round
+         * 1: it wedged the corrector in permanent HOLD). Expiry is a wall-clock compare —
+         * no store, the AGLUE path stays the only writer. */
+        int64_t dl = atomic_load_explicit(a->glue_exp_dl, memory_order_relaxed);
+        if (dl != 0 && now <= dl)
+            return "pair-expect outstanding";
+    }
+    if (a->corr_layera_active && *a->corr_layera_active)   /* advisory read (demux-written int) */
+        return "layera buffering";
+    if (atomic_load_explicit(&g_gov_on, memory_order_relaxed))
+        return "catch-up governor";
+    v = atomic_load_explicit(&g_shed_wall, memory_order_relaxed);
+    if (v && now - v < g_rscorr_quiet_us)
+        return "recent self-shed";
+    return NULL;
+}
+
+/* re-anchor the dwell (fresh 5min) and re-snapshot every event feed */
+static void rscorr_dwell_reset(AudioState *a, int64_t now, int64_t R)
+{
+    CorrState *c = &a->corr;
+    c->dwell_start_wc = now;
+    c->dwell_r0       = R;
+    c->epoch_snap  = a->corr_epoch ? atomic_load_explicit(a->corr_epoch, memory_order_relaxed) : 0;
+    c->glue_snap   = a->glue_events;
+    c->acq_snap    = a->pll_acq_count;
+    c->afmt_snap   = a->afmt_rebuilds;
+    c->reopen_snap = a->dec_reopens;
+    c->ev_snap     = atomic_load_explicit(&g_rsx.ev_us, memory_order_relaxed);
+    c->ea_snap     = atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed);
+    c->bank_snap   = atomic_load_explicit(&g_bank_us, memory_order_relaxed);
+    c->hs_snap     = a->house_skew ? *a->house_skew : 0;
+}
+
+/* §6 event-storm accounting: ≥3 COUNTED dwell resets within 10min → disarm ("stop
+ * oscillating on a churny channel"). A reset is counted only when ≥10s of dwell had
+ * accumulated — continuous churn never accumulates dwell (so it neither engages NOR
+ * trips the storm; the dwell alone already holds it), while a channel that repeatedly
+ * builds real quiet stretches and loses them to fresh events is exactly the oscillation
+ * the storm disarm exists for. (Deviation note: the doc does not define the counting
+ * granularity; without this floor every churn frame would count and any churny channel
+ * would disarm instantly and permanently.) Returns 1 when the storm threshold tripped. */
+static int rscorr_storm_count(AudioState *a, int64_t now, int64_t accum_us)
+{
+    CorrState *c = &a->corr;
+    if (accum_us < 10000000)
+        return 0;
+    if (!c->rst_win_wc || now - c->rst_win_wc > 600000000) {
+        c->rst_win_wc = now;
+        c->rst_cnt    = 1;
+        return 0;
+    }
+    return ++c->rst_cnt >= 3;
+}
+
+static void rscorr_disarm(AudioState *a, int64_t now, const char *why, int is_error)
+{
+    CorrState *c = &a->corr;
+    av_log(NULL, is_error ? AV_LOG_ERROR : AV_LOG_WARNING,
+           "[PTV-RSCORR] a%d(in%d) DISARM (%s) corr held %+"PRId64"ms  [+ = audio early]\n",
+           a->dbg_k, a->dbg_in, why, c->corr_us / 1000);
+    c->state    = PTV_CORR_DISARMED;
+    c->park_wc  = 0;
+    c->slip_bad_wc = 0;
+    /* every disarm carries a re-arm holdoff (60s; the storm path raises it to 10min at its
+     * call site) — without one, a persisting disarm condition (e.g. implausible R) flapped
+     * DISARM→re-arm per frame (first fixture round). The holdoff also makes the re-arm line
+     * mean something: "recovered" = the condition stayed clear for the whole holdoff. */
+    if (c->holdoff_wc < now + 60000000)
+        c->holdoff_wc = now + 60000000;
+}
+
+/* §4 control law + state machine, one call per EMITTED audio frame (f_us = its duration).
+ * R/valid come from rsync_track_R() computed by the caller right after the sensor publish. */
+static void rscorr_update(AudioState *a, RsyncTrackR *r, int64_t f_us, int64_t now)
+{
+    CorrState *c = &a->corr;
+    const char *dead, *ev;
+    int64_t R = r->R_us;
+
+    if (!g_rsync_corr)
+        return;
+
+    /* master stale-track watchdog handoff (ptvencoder_clock.c): the one disarm the owning
+     * thread cannot log itself (it was blocked — no frames). Sync silently; the line is out. */
+    if (atomic_exchange_explicit(&g_corr_disarm_req[a->dbg_k], 0, memory_order_relaxed) &&
+        (c->state == PTV_CORR_DWELL || c->state == PTV_CORR_ENGAGED)) {
+        c->state = PTV_CORR_DISARMED;
+        c->holdoff_wc = now + 60000000;   /* same universal re-arm holdoff as rscorr_disarm() */
+    }
+
+    if (c->state == PTV_CORR_OFF) {
+        c->state = PTV_CORR_ARMED;
+        av_log(NULL, AV_LOG_INFO,
+               "[PTV-RSCORR] a%d(in%d) armed (opt-in; engage band %"PRId64"ms, dwell %"PRId64"s + %"PRId64"s quiet, "
+               "slew %"PRId64"ms/s)  [+ = audio early]\n",
+               a->dbg_k, a->dbg_in, g_rscorr_engage_us / 1000, g_rscorr_dwell_us / 1000000,
+               g_rscorr_quiet_us / 1000000, g_rscorr_slew_us_s / 1000);
+    }
+
+    /* §6 implausibility tracker (log-only territory per the supervisor: an R this large is
+     * a broken sensor, not a residual) */
+    if (r->valid && llabs(R) > 5000000) {
+        if (!c->implaus_wc) c->implaus_wc = now;
+    } else
+        c->implaus_wc = 0;
+
+    dead = rscorr_delivery_dead(a, now);
+
+    switch (c->state) {
+    case PTV_CORR_ARMED:
+        if (r->valid && !dead && llabs(R) > g_rscorr_engage_us) {
+            c->state = PTV_CORR_DWELL;
+            rscorr_dwell_reset(a, now, R);
+            c->last_event_wc = 0;
+        }
+        break;
+
+    case PTV_CORR_DWELL: {
+        int64_t accum = now - c->dwell_start_wc;
+        if (!r->valid || dead) {
+            /* liveness/sensor loss is an event for the CONTINUOUS-across-dwell rule (§3);
+             * fall back to ARMED — the dwell restarts from scratch when conditions return. */
+            if (rscorr_storm_count(a, now, accum)) { rscorr_disarm(a, now, "event storm", 0); c->holdoff_wc = now + 600000000; break; }
+            if (now - c->log_wc >= 10000000) {
+                c->log_wc = now;
+                av_log(NULL, AV_LOG_INFO, "[PTV-RSCORR] a%d(in%d) HOLD (event: %s) dwell reset  [+ = audio early]\n",
+                       a->dbg_k, a->dbg_in, dead ? dead : "sensor stale");
+            }
+            c->state = PTV_CORR_ARMED;
+            break;
+        }
+        if (llabs(R) <= g_rscorr_engage_us) { c->state = PTV_CORR_ARMED; break; }   /* condition lapsed, silent */
+        if (c->implaus_wc && now - c->implaus_wc >= 5000000) { rscorr_disarm(a, now, "R implausible (>5s)", 0); break; }
+        ev = rscorr_event_edge(a);
+        if (!ev) ev = rscorr_event_active(a, now);
+        if (ev) {
+            if (rscorr_storm_count(a, now, accum)) { rscorr_disarm(a, now, "event storm", 0); c->holdoff_wc = now + 600000000; break; }
+            rscorr_dwell_reset(a, now, R);
+            c->last_event_wc = now;
+            if (now - c->log_wc >= 10000000) {
+                c->log_wc = now;
+                av_log(NULL, AV_LOG_INFO, "[PTV-RSCORR] a%d(in%d) HOLD (event: %s) dwell reset  [+ = audio early]\n",
+                       a->dbg_k, a->dbg_in, ev);
+            }
+            break;
+        }
+        /* §4.3 stability, enforced continuously: a decaying EMA transient moves >4x this
+         * bound inside the window (STOP/CONT −1150→−15, wedge −810→−58) and keeps
+         * re-anchoring the dwell — transients are CORRECT readings, never actuated. */
+        if (llabs(R - c->dwell_r0) >= FFMAX(40000, llabs(R) / 4)) {
+            c->dwell_start_wc = now;   /* silent re-anchor (not an event: no HOLD, no storm count) */
+            c->dwell_r0 = R;
+            break;
+        }
+        if (accum >= g_rscorr_dwell_us &&
+            (!c->last_event_wc || now - c->last_event_wc >= g_rscorr_quiet_us)) {
+            c->state         = PTV_CORR_ENGAGED;
+            c->engage_r0     = R;
+            c->engaged_corr0 = c->corr_us;
+            c->engage_wc     = now;
+            c->park_wc       = 0;
+            c->slip_bad_wc   = 0;
+            av_log(NULL, AV_LOG_WARNING,
+                   "[PTV-RSCORR] a%d(in%d) ENGAGE R=%+"PRId64"ms (dwell %"PRId64"s quiet) → steering  [+ = audio early]\n",
+                   a->dbg_k, a->dbg_in, R / 1000, accum / 1000000);
+        }
+        break;
+    }
+
+    case PTV_CORR_ENGAGED: {
+        int frozen = 0;
+        if (!r->valid) { rscorr_disarm(a, now, "sensor stale", 0); break; }
+        if (dead)      { rscorr_disarm(a, now, dead, 0); break; }
+        if (c->implaus_wc && now - c->implaus_wc >= 5000000) { rscorr_disarm(a, now, "R implausible (>5s)", 0); break; }
+        ev = rscorr_event_edge(a);
+        if (ev) {
+            /* §4 anti-windup (c): an event freezes integration the same frame; resume only
+             * after 60s of re-quiet. Storm accounting applies (an engaged track being hit
+             * by repeated events is the same oscillation risk). */
+            c->last_event_wc = now;
+            if (rscorr_storm_count(a, now, 60000000)) { rscorr_disarm(a, now, "event storm", 0); c->holdoff_wc = now + 600000000; break; }
+            if (now - c->log_wc >= 10000000) {
+                c->log_wc = now;
+                av_log(NULL, AV_LOG_INFO, "[PTV-RSCORR] a%d(in%d) HOLD (event: %s) steer frozen  [+ = audio early]\n",
+                       a->dbg_k, a->dbg_in, ev);
+            }
+        } else if (rscorr_event_active(a, now))
+            c->last_event_wc = now;
+        if (c->last_event_wc && now - c->last_event_wc < 60000000)
+            frozen = 1;
+        /* §4 anti-windup (b): the resampler is behind (slip parked outside its dead band) —
+         * pushing harder is windup by definition; >60s of it engaged = not realizing → disarm. */
+        if (a->rs_slip_us != 0) {
+            if (!c->slip_bad_wc) c->slip_bad_wc = now;
+            else if (now - c->slip_bad_wc > 60000000) { rscorr_disarm(a, now, "resampler slip parked ≠0", 0); break; }
+            frozen = 1;
+        } else
+            c->slip_bad_wc = 0;
+        if (!frozen) {
+            /* §4 steer law: proportional R/τ (τ=30s), slew-clamped, per emitted frame.
+             * dR/dcorr = −1: +R (audio early) → +step → audio content delayed → R → 0. */
+            int64_t rate = R / 30;                                   /* µs of trim per second */
+            int64_t step;
+            if (rate >  g_rscorr_slew_us_s) rate =  g_rscorr_slew_us_s;
+            if (rate < -g_rscorr_slew_us_s) rate = -g_rscorr_slew_us_s;
+            step = rate * f_us / 1000000;
+            c->corr_us += step;
+            if (llabs(c->corr_us - c->engaged_corr0) > 5000000) {    /* §6 per-engagement authority */
+                c->corr_us = c->engaged_corr0 + (c->corr_us > c->engaged_corr0 ? 5000000 : -5000000);
+                rscorr_disarm(a, now, "per-engagement authority cap (5s)", 1);
+                break;
+            }
+            if (llabs(c->corr_us) > 10000000) {                      /* §6 lifetime authority */
+                c->corr_us = c->corr_us > 0 ? 10000000 : -10000000;
+                rscorr_disarm(a, now, "lifetime authority cap (10s)", 1);
+                break;
+            }
+        }
+        /* §4 convergence: |R| ≤ 20ms sustained 60s → PARK, corr_us RETAINED (it is an
+         * accumulated content alignment; decaying it would re-open the offset). */
+        if (llabs(R) <= 20000) {
+            if (!c->park_wc) c->park_wc = now;
+            else if (now - c->park_wc >= 60000000) {
+                c->state = PTV_CORR_PARKED;
+                av_log(NULL, AV_LOG_WARNING,
+                       "[PTV-RSCORR] a%d(in%d) PARK R=%+"PRId64"→%+"PRId64"ms corr=%+"PRId64"ms in %"PRId64"s  [+ = audio early]\n",
+                       a->dbg_k, a->dbg_in, c->engage_r0 / 1000, R / 1000,
+                       (c->corr_us - c->engaged_corr0) / 1000, (now - c->engage_wc) / 1000000);
+                break;
+            }
+        } else
+            c->park_wc = 0;
+        if (g_diag && now - c->diag_wc >= 30000000) {
+            c->diag_wc = now;
+            av_log(NULL, AV_LOG_INFO,
+                   "[PTV-RSCORR] a%d(in%d) steering R=%+"PRId64"ms corr=%+"PRId64"ms slip=%+"PRId64"ms%s  [+ = audio early]\n",
+                   a->dbg_k, a->dbg_in, R / 1000, c->corr_us / 1000, a->rs_slip_us / 1000,
+                   frozen ? " (frozen)" : "");
+        }
+        break;
+    }
+
+    case PTV_CORR_PARKED:
+        /* re-engagement requires a FRESH full dwell (§4) */
+        if (r->valid && !dead && llabs(R) > g_rscorr_engage_us) {
+            c->state = PTV_CORR_DWELL;
+            rscorr_dwell_reset(a, now, R);
+            c->last_event_wc = 0;
+        }
+        break;
+
+    case PTV_CORR_DISARMED:
+        if (c->holdoff_wc && now < c->holdoff_wc)
+            break;
+        if (c->implaus_wc)          /* R still implausible = the disarm condition persists: */
+            break;                  /* stay silently disarmed (no re-arm flap) */
+        if (r->valid && !dead) {
+            c->state = PTV_CORR_ARMED;
+            c->holdoff_wc = 0;
+            av_log(NULL, AV_LOG_INFO,
+                   "[PTV-RSCORR] a%d(in%d) re-armed (recovered; fresh full dwell required)  [+ = audio early]\n",
+                   a->dbg_k, a->dbg_in);
+        }
+        break;
+    }
+
+    atomic_store_explicit(&g_corr_pub[a->dbg_k], c->corr_us, memory_order_relaxed);
+    atomic_store_explicit(&g_corr_state_pub[a->dbg_k], c->state, memory_order_relaxed);
+}
+
 /* -af path: drain the filtergraph's (fixed-size) output frames straight to the
  * per-rung encoders, stamping each with ITS OWN filter PTS rebased onto the house
  * anchor h0 (in out_rate sample units). This HONORS aresample=async's correction
@@ -419,7 +825,12 @@ static int audio_drain_fg(AudioState *a)
                 a->dbg_k < PTV_MAX_AUDIO && a->out_rate > 0) {
                 int64_t out_us = av_rescale(filt->pts, 1000000, a->out_rate);
                 int64_t hs     = (g_avlock && a->house_skew) ? *a->house_skew : 0;
-                int64_t inj    = a->glue_off_us + hs;
+                /* pre14 (§5 bus rule 3): corr_us joins inj — the sensor recovers the RAW
+                 * post-demux label by removing the FULL bus sum this thread injected at the
+                 * graph door, so R moves label-deterministically with the trim (the AVLOCK
+                 * accounting pattern; NOT self-blinding — the corrector is supposed to see
+                 * its own correction land, and the external oracle stays the ground truth). */
+                int64_t inj    = a->glue_off_us + hs + a->corr.corr_us;
                 int64_t slip   = 0, m, nowr;
                 if (a->fg_swr && a->fg_swr_flt &&
                     a->fg_swr_flt->nb_inputs > 0 && a->fg_swr_flt->nb_outputs > 0) {
@@ -467,6 +878,13 @@ static int audio_drain_fg(AudioState *a)
                 atomic_store_explicit(&g_rsx.ma_ema[a->dbg_k], a->rs_ma_ema, memory_order_relaxed);
                 nowr = av_gettime_relative();
                 atomic_store_explicit(&g_rsx.ma_wall[a->dbg_k], nowr, memory_order_relaxed);
+                /* pre14 corrector: one evaluation per emitted frame, immediately after this
+                 * frame's m_a publish (R is current, and rs_slip_us above is this frame's). */
+                {
+                    RsyncTrackR rr = rsync_track_R(a, nowr);
+                    rscorr_update(a, &rr,
+                                  av_rescale(filt->nb_samples, 1000000, a->out_rate), nowr);
+                }
                 if (g_diag && (a->rs_log_last == 0 ||
                                nowr - a->rs_log_last >= g_stats_period_us)) {
                     /* [PTV-RSYNC] components. dm = m_v − m_a (the shared −h0 cancels); the raw
@@ -519,10 +937,13 @@ static int audio_drain_fg(AudioState *a)
                  * measured offset → 0). During a steer transient the sink labels lag the commanded
                  * value by the pending (unrealized) part — bounded by the 10ms/s rate clamp vs the
                  * resampler's 20.8ms/s authority, so the pairing error decays within a second. */
+                /* pre14 (§5 bus rule 2): corr_us joins the actuator-term subtraction in every
+                 * measurement loop that reads sink labels (glue_off stays un-subtracted, as
+                 * today: glue is the label-truth judgment, not an actuator). */
                 if (!(a->multiview && g_audio_follow) && a->house_skew)
-                    content -= *a->house_skew;
+                    content -= *a->house_skew + a->corr.corr_us;
                 else if (a->multiview && g_audio_follow && g_avsync_pll)
-                    content -= a->af_steer_us;
+                    content -= a->af_steer_us + a->corr.corr_us;
                 if (vring_lookup(a->vring, content, &out_v, &msrc) == 0) {
                     int64_t vlag   = out_v    - (msrc    - h0_us);   /* video realized output − content (at msrc) */
                     int64_t alag   = out_a_us - (content - h0_us);   /* audio realized output − content (at content) */
@@ -770,6 +1191,7 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                                     &a->dec->ch_layout, a->dec->sample_fmt, a->dec->sample_rate, 0, NULL);
                 if (a->swr) swr_init(a->swr);
             }
+            a->afmt_rebuilds++;                    /* pre14: an AFMT rebuild is a corrector event (§4.4) */
             a->fg_in_rate = a->dec->sample_rate;   /* the path is now configured for these */
             a->fg_in_fmt  = a->dec->sample_fmt;
             av_channel_layout_uninit(&a->fg_in_chl);
@@ -936,6 +1358,14 @@ static int audio_feed(AudioState *a, AVFrame *frame)
         if (a->multiview && g_audio_follow && g_avsync_pll && a->af_steer_us &&
             frame->pts != AV_NOPTS_VALUE)
             frame->pts += av_rescale_q(a->af_steer_us, AV_TIME_BASE_Q, a->ist_tb);
+        /* 1.0.1-pre14 steer bus (§5 rule 1): the corrector's cumulative trim, injected at the
+         * SAME single graph-door site as glue_off/house_skew/af_steer_us — aresample=async
+         * realizes it as bounded SOFT compensation (rate-clamped 2ms/s upstream in
+         * rscorr_update; per-frame deltas ~43µs, three orders under min_hard_comp — the
+         * ACOMP proxy below monitors the summed stream and is the click tripwire for any
+         * mis-sized bus term). corr_us==0 (default-off / parked-at-zero) skips = byte-inert. */
+        if (a->corr.corr_us && frame->pts != AV_NOPTS_VALUE)
+            frame->pts += av_rescale_q(a->corr.corr_us, AV_TIME_BASE_Q, a->ist_tb);
         /* 1.0.1-pre3 [PTV-ACOMP] — swr hard-compensation proxy (always-on, log rate-limited to
          * ~1/10s per track). aresample=async realizes a graph-input pts step beyond
          * min_hard_comp (~30ms in the production chain) as an INSTANTANEOUS sample insert/drop

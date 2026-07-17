@@ -346,6 +346,7 @@ void *output_thread(void *arg)
                           ? (int)((int64_t)preroll_ms * 1000 / v->tick_dur_us) : 0;
         int primed;
         int64_t eq_vq_s = 0, eq_fq_s = 0, eq_fq_h = 0, eq_mq_s = 0;  /* PTV-EMPTY per-queue empty-since (+ frame_q heartbeat) state */
+        int64_t corr_wd_last = 0;   /* pre14: stale-track corrector watchdog rate limit (1s) */
         int64_t ep_agg_cnt = 0, ep_agg_min = 0, ep_agg_max = 0, ep_agg_t0 = 0;  /* 0.9.10.1: frame_q sub-2s episode aggregator (60s summary) */
         if (n_prime > g_cp.frameq_cap - 8) n_prime = g_cp.frameq_cap - 8;
         if (n_prime < 0) n_prime = 0;
@@ -525,6 +526,32 @@ void *output_thread(void *arg)
                            (long long)ep_agg_cnt, (long long)((nw - ep_agg_t0) / 1000000),
                            (long long)(ep_agg_min / 1000), (long long)(ep_agg_max / 1000));
                     ep_agg_cnt = 0; ep_agg_t0 = nw;
+                }
+                /* pre14 corrector stale-track watchdog: a DWELL/ENGAGED track whose audio
+                 * thread stopped emitting (ma_wall stale >5s — source-audio death, the pre12
+                 * W3 class) can neither steer NOR log its own disarm (its thread is blocked
+                 * in recv). Integration is inherently frozen (no frames), so this is purely
+                 * the §6 one-line disarm + published-state sync: CAS the published state to
+                 * DISARMED (the CAS guarantees exactly one line even if the track resumes
+                 * mid-check) and hand the owning thread a silent disarm_req to consume. */
+                if (g_rsync_corr && nw - corr_wd_last >= 1000000) {
+                    int kc;
+                    corr_wd_last = nw;
+                    for (kc = 0; kc < g_rsx.n_a; kc++) {
+                        int st = atomic_load_explicit(&g_corr_state_pub[kc], memory_order_relaxed);
+                        if (st == PTV_CORR_DWELL || st == PTV_CORR_ENGAGED) {
+                            int64_t maw = atomic_load_explicit(&g_rsx.ma_wall[kc], memory_order_relaxed);
+                            if (maw && nw - maw > 5000000 &&
+                                atomic_compare_exchange_strong_explicit(&g_corr_state_pub[kc], &st,
+                                        PTV_CORR_DISARMED, memory_order_relaxed, memory_order_relaxed)) {
+                                atomic_store_explicit(&g_corr_disarm_req[kc], 1, memory_order_relaxed);
+                                av_log(NULL, AV_LOG_WARNING,
+                                       "[PTV-RSCORR] a%d DISARM (track stopped emitting — sensor stale) "
+                                       "corr held %+"PRId64"ms  [+ = audio early]\n",
+                                       kc, atomic_load_explicit(&g_corr_pub[kc], memory_order_relaxed) / 1000);
+                            }
+                        }
+                    }
                 }
                 if (g_adapt_cushion && !v->passthrough) {
                     /* 0.9.18 M3: trigger conditions stay here; the write bodies (tier store,
@@ -831,12 +858,33 @@ void *output_thread(void *arg)
                             nn += snprintf(rsl + nn, sizeof rsl - nn, "--");
                     }
                 }
+                char crs[10 + PTV_MAX_AUDIO * 20] = "";              /* pre14 corrector: corr= (cumulative trim; * = integrating) */
+                if (g_rsync_corr && g_rsx.n_a > 0) {
+                    /* absent while every track sits at corr==0 un-engaged — the quiet-channel
+                     * stats line is unchanged (§6). */
+                    int any = 0, ki;
+                    for (ki = 0; ki < g_rsx.n_a; ki++)
+                        if (atomic_load_explicit(&g_corr_pub[ki], memory_order_relaxed) != 0 ||
+                            atomic_load_explicit(&g_corr_state_pub[ki], memory_order_relaxed) == PTV_CORR_ENGAGED)
+                            any = 1;
+                    if (any) {
+                        int nn = snprintf(crs, sizeof crs, " corr=");
+                        for (ki = 0; ki < g_rsx.n_a && nn > 0 && nn < (int)sizeof crs - 18; ki++) {
+                            int64_t cu = atomic_load_explicit(&g_corr_pub[ki], memory_order_relaxed);
+                            int     st = atomic_load_explicit(&g_corr_state_pub[ki], memory_order_relaxed);
+                            if (g_rsx.n_a > 1)
+                                nn += snprintf(crs + nn, sizeof crs - nn, "%sa%d:", ki ? "," : "", ki);
+                            nn += snprintf(crs + nn, sizeof crs - nn, "%+lldms%s",
+                                           (long long)(cu / 1000), st == PTV_CORR_ENGAGED ? "*" : "");
+                        }
+                    }
+                }
                 av_log(NULL, AV_LOG_INFO,
                     "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f "
                     "dup=%"PRId64" pd=%"PRId64" drop=%"PRId64" corrupt=%"PRId64" "
-                    "async=%+"PRId64"ppm%s%s%s%s%s\n",
+                    "async=%+"PRId64"ppm%s%s%s%s%s%s\n",
                     v->emitted, fps, hh, mm, ss,
-                    v->dup, v->pd, v->framedrop, cr, aw, dlv, wu, bk, cfs, rsl);
+                    v->dup, v->pd, v->framedrop, cr, aw, dlv, wu, bk, cfs, rsl, crs);
                 stat_last = nows; stat_prev = v->emitted;
             }
         }

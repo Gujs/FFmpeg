@@ -7,6 +7,45 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(7l) RESIDUAL-SYNC CORRECTOR — pre14, the actuation half of the residual-sync
+supervisor (task #44, the owner's PLL lineage). NORMATIVE DESIGN =
+analysis/ptvencoder-corrector-design.md (owner-approved 2026-07-16 with §9
+resolutions folded in). Gated on the sensor soak CERTIFICATION (2026-07-16,
+cor-3): oracle agreement Δ12–21ms on real excursions, human-verified in both
+signs, NTSC 24h flatness 0/0/0.
+WHAT: when input is healthy and the certified pre9/pre11 sensor's per-track R
+(`lipsync=`, + = audio early) dwells outside an 80ms dead band for 5min stable
++ 3min event-free with delivery provably live, steer R→0 through the resampler
+— the pre3 graph-door steer bus gains a fourth term (corr_us), proportional
+R/30s slew-clamped to 2ms/s, PARK at |R|≤20ms held 60s (trim retained). A trim
+safety net under the fast event path (the AGLUE/LAYERA escape-bake class:
+JLTV +42.9s, Azorse +467ms), NOT a controller — authority is deliberately too
+small to paper over a glue failure (per-engagement 5s, lifetime 10s → hard
+DISARM+ERROR; a leaked >authority bake grinding at 2ms/s and logging loudly IS
+the escalation signal).
+STRUCTURE (MV-NORMATIVE): CorrState per (input-slot, audio-track) in
+AudioState; R consumed only through the rsync_track_R() accessor (slot 0
+hard-wired today); corr_us joins the sensor's inj term and every sink-label
+measurement subtraction (anti-windup is structural — R feeds back only
+realized trim, integration freezes while the slip probe reads ≠0).
+DELIVERY-LIVENESS (§3): NEW per-rung g_mux_sent_wc wire-send watermark (one
+relaxed store per successful av_interleaved_write_frame — the Newsmax2
+dead-rung answer, owner-approved "build it") + DlvGate a_hi/v_hi watermarks +
+mux_q depth; ALL rungs AND the input must be live across the whole dwell.
+CONTAINMENT: DEFAULT OFF — opt-in PTV_RSYNC_CORR=1 per channel; kill
+PTV_NO_RSYNC_CORR=1 (wins; kept forever); sensor off implies corrector off.
+Auto-disarm on sensor stale (incl. a master-side stale-track watchdog for the
+one disarm the blocked audio thread cannot log), delivery death, event storm
+(≥3 counted dwell resets/10min → 10min holdoff), implausible R (>5s sustained
+5s), parked slip ≠0 >60s engaged, authority caps. One [PTV-RSCORR] line per
+state change; stats field corr=±Nms (absent on a quiet channel).
+GATES (fixture, this session): F1 +300ms-class bake converges (oracle-
+confirmed on the wire, zero clicks, pts-spacing flat); F2 mirror sign; F3
+byte-inert (default-off AND opt-in-parked); F4 kill-switch parity; F5 dwell
+immunity (STOP/CONT + rewind seam + loudnorm); F6 delivery-death disarm/
+re-arm; F7 authority disarm; F8 event-storm disarm; F9 WUCR/cadence/gate-skew
+non-coupling. Numbers in the pre14 session notes.
+
 (7k) CATCH-UP GOVERNOR FAILS OPEN ON AN UNTRUSTED RATE MEASUREMENT —
 the Newsmax2 live defect (pre13; ptvencoder.c decode_thread governor +
 ptvencoder_demux.c vin publish stamp + DIAG t= line).
