@@ -351,7 +351,7 @@ static void rscorr_update(AudioState *a, RsyncTrackR *r, int64_t f_us, int64_t n
     if (c->state == PTV_CORR_OFF) {
         c->state = PTV_CORR_ARMED;
         av_log(NULL, AV_LOG_INFO,
-               "[PTV-RSCORR] a%d(in%d) armed (opt-in; engage band %"PRId64"ms, dwell %"PRId64"s + %"PRId64"s quiet, "
+               "[PTV-RSCORR] a%d(in%d) armed (engage band %"PRId64"ms, dwell %"PRId64"s + %"PRId64"s quiet, "
                "slew %"PRId64"ms/s)  [+ = audio early]\n",
                a->dbg_k, a->dbg_in, g_rscorr_engage_us / 1000, g_rscorr_dwell_us / 1000000,
                g_rscorr_quiet_us / 1000000, g_rscorr_slew_us_s / 1000);

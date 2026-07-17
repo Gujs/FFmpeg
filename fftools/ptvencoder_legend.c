@@ -165,7 +165,7 @@ void ptv_print_log_legend(int full)
         "             Soak-CERTIFIED vs the external oracle 2026-07-16 (Δ12-21ms on real excursions,\n"
         "             both signs human-verified, NTSC 24h flat) — the corrector's gate condition.\n"
         "             PTV_RSYNC_SENSE=0 disables. Components: [PTV-RSYNC] under PTV_DIAG.\n"
-        "  corr       (1.0.1-pre14, only when PTV_RSYNC_CORR=1 and nonzero/engaged) residual-sync\n"
+        "  corr       (1.0.1-pre14, only when nonzero/engaged) residual-sync\n"
         "             CORRECTOR cumulative resampler trim (ms; `*` = actively integrating). The\n"
         "             actuation half of the supervisor: when the sensor's R dwells outside ±80ms\n"
         "             for 5min stable + 3min event-free with ALL rungs' wire provably moving, it\n"
@@ -249,8 +249,8 @@ void ptv_print_log_legend(int full)
         "  again — restores the In-Touch audio-late accumulator; A/B only) ·\n"
         "  PTV_NO_EXACTTICK (re-enables the integer-tick ~10ppm NTSC lip-sync drift; A/B only) ·\n"
         "  PTV_NO_PULLDOWN (revert telecine-aware emit: film segments back to dup-fill + hs sawtooth) ·\n"
-        "  PTV_RSYNC_CORR=1 residual-sync corrector OPT-IN (1.0.1-pre14; DEFAULT OFF — the phase-1\n"
-        "  deploy posture) · PTV_NO_RSYNC_CORR=1 corrector kill switch (wins over the opt-in; kept forever)\n");
+        "  PTV_NO_RSYNC_CORR (residual-sync corrector off; 1.0.1-pre14, DEFAULT ON — parked and\n"
+        "  byte-inert on a healthy channel; kill switch kept forever)\n");
     av_log(NULL, AV_LOG_INFO,
         "tuning: PTV_CUSHION_MS=N adaptive raised tier (default 4000, [1000,10000]) · PTV_CUSHION_MAX_MS=N\n"
         "  auto-bank ceiling (default 12000; beyond it = an upstream incident to surface) · PTV_FRAMEQ=N\n"

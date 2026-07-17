@@ -228,8 +228,8 @@ typedef struct RsyncSense {
  * glue failure (§6 damage bound, owner-approved caps: 5s/engagement, 10s lifetime).
  * MV-NORMATIVE (§8): one CorrState per (input-slot, audio-track), embedded in AudioState;
  * the corrector consumes R only through the rsync_track_R() accessor (slot 0 hard-wired
- * today; the mv sensor port re-shapes RsyncSense behind it). DEFAULT OFF — opt-in
- * PTV_RSYNC_CORR=1 per channel; PTV_NO_RSYNC_CORR=1 kills it outright (§6/§7).
+ * today; the mv sensor port re-shapes RsyncSense behind it). DEFAULT ON (owner-directed
+ * 2026-07-17); PTV_NO_RSYNC_CORR=1 kills it outright (§6/§7).
  * All state below is owned by that track's audio thread; cross-thread visibility goes
  * through the g_corr_* published atomics only. */
 enum {
@@ -956,7 +956,7 @@ extern int     g_degraded;               /* (h) opt-in sustained-deficit every-K
 extern int        g_rsync_sense;         /* PASSIVE sensor on (PTV_RSYNC_SENSE=0 disables) */
 extern RsyncSense g_rsx;                 /* published sensor state (single-input, input 0) */
 /* 1.0.1-pre14 residual-sync corrector (defined in ptvencoder.c; design doc §6/§7) */
-extern int     g_rsync_corr;             /* DEFAULT OFF; PTV_RSYNC_CORR=1 opts in, PTV_NO_RSYNC_CORR kills */
+extern int     g_rsync_corr;             /* DEFAULT ON; PTV_NO_RSYNC_CORR=1 kills */
 extern int64_t g_rscorr_engage_us;       /* engage dead band (80ms default; PTV_RSCORR_ENGAGE_MS) */
 extern int64_t g_rscorr_dwell_us;        /* stable-dwell length (300s; PTV_RSCORR_DWELL_S — TEST ONLY) */
 extern int64_t g_rscorr_quiet_us;        /* trailing event-free window (180s; PTV_RSCORR_QUIET_S — TEST ONLY) */

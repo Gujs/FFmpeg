@@ -547,12 +547,12 @@ int        g_rsync_sense = 1;
 RsyncSense g_rsx;
 /* 1.0.1-pre14 — residual-sync CORRECTOR (component 2; analysis/ptvencoder-corrector-design.md).
  * The actuation half: a per-track, dwell-gated, slew-clamped (2ms/s) resampler steer on the
- * certified pre9/pre11 sensor, injected at the graph door on the steer bus (§5). DEFAULT OFF —
- * first-deploy posture is per-channel opt-in (PTV_RSYNC_CORR=1); PTV_NO_RSYNC_CORR=1 is the
- * permanent kill switch; sensor off implies corrector off. State machine + control law live in
- * ptvencoder_audio.c (rscorr_*); the stats line prints corr= and the master output thread runs
- * the stale-track disarm watchdog (ptvencoder_clock.c). */
-int     g_rsync_corr      = 0;
+ * certified pre9/pre11 sensor, injected at the graph door on the steer bus (§5). DEFAULT ON
+ * (owner-directed 2026-07-17: every channel runs it, parked and byte-inert when healthy);
+ * PTV_NO_RSYNC_CORR=1 is the permanent kill switch; sensor off implies corrector off. State
+ * machine + control law live in ptvencoder_audio.c (rscorr_*); the stats line prints corr= and
+ * the master output thread runs the stale-track disarm watchdog (ptvencoder_clock.c). */
+int     g_rsync_corr      = 1;
 int64_t g_rscorr_engage_us = 80000;      /* §4.2: 80ms engage dead band (supervisor start value) */
 int64_t g_rscorr_dwell_us  = 300000000;  /* §4.3: 5min stable dwell */
 int64_t g_rscorr_quiet_us  = 180000000;  /* §4.4: 3min trailing event-free window */
@@ -2582,10 +2582,9 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_RATCHREL")) g_ratchrel = 0;   /* 1.0.1-pre8 (b): keep the 6h bank decay even under the starvation contradiction */
     if (getenv("PTV_NO_SELFHEAL")) g_selfheal = 0;   /* 1.0.1-pre8 (c): no internal re-prime on sustained starvation */
     { const char *rs = getenv("PTV_RSYNC_SENSE"); if (rs && !atoi(rs)) g_rsync_sense = 0; }  /* 1.0.1-pre9: passive residual sensor default ON; =0 disables */
-    /* 1.0.1-pre14 residual-sync corrector: DEFAULT OFF — PTV_RSYNC_CORR=1 opts a channel in
-     * (the phase-1 deploy posture, design doc §7); PTV_NO_RSYNC_CORR=1 is the permanent kill
-     * switch and wins over the opt-in; sensor off implies corrector off (it is the only input). */
-    { const char *rc = getenv("PTV_RSYNC_CORR"); if (rc && atoi(rc)) g_rsync_corr = 1; }
+    /* 1.0.1-pre14 residual-sync corrector: DEFAULT ON (owner-directed 2026-07-17 — parked and
+     * byte-inert on a healthy channel, so every channel runs it unmodified); PTV_NO_RSYNC_CORR=1
+     * is the permanent kill switch; sensor off implies corrector off (it is the only input). */
     if (getenv("PTV_NO_RSYNC_CORR") || !g_rsync_sense) g_rsync_corr = 0;
     /* TEST-ONLY overrides (PTV_WRAP_GUARD_S precedent): shorten the dwell/quiet windows or move
      * the band/slew so the F-gate fixtures can exercise storm/authority paths in bounded wall

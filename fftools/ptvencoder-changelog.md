@@ -32,19 +32,27 @@ DELIVERY-LIVENESS (§3): NEW per-rung g_mux_sent_wc wire-send watermark (one
 relaxed store per successful av_interleaved_write_frame — the Newsmax2
 dead-rung answer, owner-approved "build it") + DlvGate a_hi/v_hi watermarks +
 mux_q depth; ALL rungs AND the input must be live across the whole dwell.
-CONTAINMENT: DEFAULT OFF — opt-in PTV_RSYNC_CORR=1 per channel; kill
-PTV_NO_RSYNC_CORR=1 (wins; kept forever); sensor off implies corrector off.
+CONTAINMENT: DEFAULT ON (owner-directed 2026-07-17: every channel runs it
+unmodified — parked and byte-inert when healthy, "it should work if channel
+needs it or not"); kill PTV_NO_RSYNC_CORR=1 (kept forever); sensor off implies
+corrector off.
 Auto-disarm on sensor stale (incl. a master-side stale-track watchdog for the
 one disarm the blocked audio thread cannot log), delivery death, event storm
 (≥3 counted dwell resets/10min → 10min holdoff), implausible R (>5s sustained
 5s), parked slip ≠0 >60s engaged, authority caps. One [PTV-RSCORR] line per
 state change; stats field corr=±Nms (absent on a quiet channel).
 GATES (fixture, this session): F1 +300ms-class bake converges (oracle-
-confirmed on the wire, zero clicks, pts-spacing flat); F2 mirror sign; F3
-byte-inert (default-off AND opt-in-parked); F4 kill-switch parity; F5 dwell
-immunity (STOP/CONT + rewind seam + loudnorm); F6 delivery-death disarm/
-re-arm; F7 authority disarm; F8 event-storm disarm; F9 WUCR/cadence/gate-skew
-non-coupling. Numbers in the pre14 session notes.
+confirmed on the wire, zero clicks on a real quiet-passage fixture,
+pts-spacing flat); F2 mirror sign; F3 byte-inert armed-parked (healthy
+content: audio ES byte-identical corrector on/off; per-track isolation —
+clean sibling track untouched at byte level); F4 kill-switch parity (full ES
+identity incl. video on the event fixture); F5 dwell immunity (STOP/CONT +
+rewind seam + loudnorm); F6 delivery-death disarm/re-arm; F7 authority
+disarm; F8 event-storm disarm; F9 WUCR/cadence/gate-skew non-coupling.
+Independently reproduced + extended by the adversarial review (13 cells,
+MERGE-READY): direction flip, pad-then-erase pair, 4.6s butt-jointed gap
+(chase CORRECT — oracle +33ms tail), 9s event train byte-identical, 905s
+clean channel silent under load. Numbers in the pre14 session notes.
 
 (7k) CATCH-UP GOVERNOR FAILS OPEN ON AN UNTRUSTED RATE MEASUREMENT —
 the Newsmax2 live defect (pre13; ptvencoder.c decode_thread governor +
