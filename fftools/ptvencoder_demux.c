@@ -510,7 +510,13 @@ static void ptv_glue_h_feed(PtvDiscStreamState *ss, int64_t raw_dts, int64_t las
     ss->h_wall_acc += d_wall;
     if (ss->h_wall_acc >= 3000000) {                      /* close a sub-window */
         int64_t r = ss->h_dts_acc * 1024 / ss->h_wall_acc;
-        if (llabs(r - 1024) > 512)
+        /* rr15 R3: WILD is DIRECTIONAL — a label FLOOD strides labels ahead of wall
+         * (r ≫ 1); a benign sub-2s delivery stall reads r < 1 (x/(x+stall) ≈ 0.4-0.5)
+         * and must NOT arm the flood-recency window (fx-rr15-a1b2: two 1.6s stalls armed
+         * it and a genuine Curiosity-ordering event 30-40s later — <3 new-base packets
+         * by construction — was REFUSED on a channel whose H read a healthy 0.98). Only
+         * flood-direction wildness (r > 1.5) is refuse evidence. */
+        if (r > 1024 + 512)
             ss->h_wild_wc = wall_now;                     /* flood-recency signal (§2.3 F2) */
         if (ss->h_wins == 0) ss->h_ema_q10 = r;
         else                 ss->h_ema_q10 += (r - ss->h_ema_q10) / 8;
@@ -1218,17 +1224,23 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                              * graph door where AGLUE GAP-pads it (PATRIOT-proven path for multi-second
                              * forward steps). last_sent_dts is deliberately left alone (it advances as
                              * the resumed packets dispatch). EXTRA GUARD beyond the discriminator: the
-                             * VIDEO stream must be wall-FRESH (flowing through the audio gap) — after a
+                             * VIDEO stream must have FLOWED DURING the audio's absence — after a
                              * whole-program outage whose first post-resume packet is AUDIO, video_fwd_us
                              * is stale and the discriminator mis-reads the program splice as an audio
                              * gap; propagating there would split the event one-sidedly (video leg
-                             * flush-erased, audio leg padded = +gap desync). Video-fresh ⇒ genuinely
-                             * audio-only. Byte-identical everywhere the discriminator doesn't fire. */
+                             * flush-erased, audio leg padded = +gap desync). rr15 R1: a flat ≤2s
+                             * freshness bound was NOT that test — in a whole-program stall ≤2s video's
+                             * last packet is exactly stall-old and passed it (fx-rr15-a2: 1.59s stall,
+                             * +2.6s jump, audio-first resume → one-sided −2.6s bake). A genuinely
+                             * audio-only gap has video_last ≪ wall_gap; a whole-program stall has
+                             * video_last ≈ wall_gap: require video_last ≤ min(2s, wall_gap/2).
+                             * Byte-identical everywhere the discriminator doesn't fire. */
                             if (g_glueclass && g_layera && d->disc &&
                                 pkt->stream_index < d->disc->nb_streams &&
                                 d->vstream >= 0 &&
                                 d->wrap_wall_last[d->vstream] > 0 &&
-                                wall_now - d->wrap_wall_last[d->vstream] <= 2000000) {
+                                wall_now - d->wrap_wall_last[d->vstream] <=
+                                    FFMIN((int64_t)2000000, wall_gap / 2)) {
                                 d->disc->stream_state[pkt->stream_index].last_dts_us =
                                     av_rescale_q(raw + d->wrap_off[pkt->stream_index],
                                                  st->time_base, AV_TIME_BASE_Q);
@@ -1729,8 +1741,6 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                         if (fs) {
                             fs->stream_index = out->stream_index;
                             fs->flags |= PTV_PKT_FLAG_NBS_FILL;
-                            atomic_store_explicit(&g_nbs_fill_st[d->aglobal[k]], 1,
-                                                  memory_order_relaxed);
                             if (av_thread_message_queue_send(d->audio_q[k], &fs,
                                                              AV_THREAD_MESSAGE_NONBLOCK) < 0)
                                 av_packet_free(&fs);   /* queue full/closed — no fill needed/possible */

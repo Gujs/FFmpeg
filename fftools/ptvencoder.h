@@ -585,10 +585,13 @@ typedef struct AudioState {
     /* §3 NBS starvation fill: track is living on synthesized silence while the demux discards
      * an undecodable source phase (opt-in PTV_NBS_FILL=1). nbs_feeding marks frames audio_feed
      * receives FROM the fill itself (they must not consume the resume classification). */
-    int              nbs_fill_active;                 /* fill phase open (mirrors g_nbs_fill_st) */
+    int              nbs_fill_active;                 /* fill phase open */
     int              nbs_feeding;                     /* inside nbs_fill_quantum's feed loop */
-    int              nbs_resume;                      /* first REAL frame after a fill phase (one-shot) */
     int              nbs_fills;                       /* quanta synthesized this run (observability) */
+    int64_t          nbs_last_wall_us;                /* rr15 F9: wall of the previous quantum (elapsed base) */
+    int64_t          nbs_carry_us;                    /* rr15 F9: sub-frame remainder carried between quanta */
+    int64_t          glue_cad_us;                     /* rr15 R2: EMA of nonzero fed-frame wall gaps (PES-burst
+                                                       * period) — the E3 cadence baseline for the pad-ledger gate */
 } AudioState;
 
 /* ---- demux + mux ---- */
@@ -1048,7 +1051,6 @@ extern _Atomic int64_t g_acorrupt;                        /* total corrupt-disca
 extern _Atomic int64_t g_adec_frame_wc[PTV_MAX_AUDIO];    /* wall µs of track k's last DECODED frame (audio
                                                            * thread stamps; demux reads = the E6 starvation
                                                            * discriminator: packets arrive, nothing decodes) */
-extern _Atomic int     g_nbs_fill_st[PTV_MAX_AUDIO];      /* 1 = track k in a fill phase (demux sets, audio clears) */
 extern _Atomic int64_t g_pad_pub_step[PTV_MAX_AUDIO];     /* newest OPEN pad-ledger entry per track (audio thread */
 extern _Atomic int64_t g_pad_pub_wc[PTV_MAX_AUDIO];       /* publishes; demux absorber reads — advisory) */
 

@@ -562,12 +562,13 @@ _Atomic int     g_corr_state_pub[PTV_MAX_AUDIO];
 _Atomic int     g_corr_disarm_req[PTV_MAX_AUDIO];
 _Atomic int64_t g_mux_sent_wc[PTV_MAX_RUNG];
 /* 1.0.1-pre15 — glue classification #33 (analysis/ptvencoder-33-glue-classification.md).
- * One revert switch for the whole classifier: PTV_NO_GLUECLASS=1 restores pre14 behavior
- * wholesale (§2.2 pad-cancel + tripwire, §2.3 refuse, §2.5 gap-verdict propagation, late
- * pair-expect matching, and the §3 fill owner). The (c) acorrupt counter/[PTV-ADISC] log is
- * UNCONDITIONAL (observability, byte-inert). The §3 silence-fill is additionally OPT-IN
- * (PTV_NBS_FILL=1 — owner call 2026-07-18: observability first fleet-wide, fill second;
- * NBS phases are currently restart-cured, not silent-failing). */
+ * One revert switch for the whole classifier: PTV_NO_GLUECLASS=1 restores pre14 WIRE
+ * behavior wholesale (§2.2 pad-cancel + tripwire, §2.3 refuse, §2.5 gap-verdict propagation,
+ * late pair-expect matching, and the §3 fill owner) — NOT full log parity: the DUKF
+ * resume/escape promotion and the (c) acorrupt counter/[PTV-ADISC]/acor= observability stay
+ * UNCONDITIONAL (owner-sanctioned, byte-inert; rr15 F7). The §3 silence-fill is additionally
+ * OPT-IN (PTV_NBS_FILL=1 — owner call 2026-07-18: observability first fleet-wide, fill
+ * second; NBS phases are currently restart-cured, not silent-failing). */
 int     g_glueclass = 1;
 int     g_nbs_fill  = 0;
 int     g_glue_htol = 5;                       /* §2.3 |H−1| tolerance, % (fixture-tuned, G4) */
@@ -575,7 +576,6 @@ int64_t g_pair_ttl_us = PTV_PAIR_EXPECT_TTL_US;
 int64_t g_nbs_quantum_us = 100000;             /* fill quantum: 100ms of silence per sentinel */
 _Atomic int64_t g_acorrupt;
 _Atomic int64_t g_adec_frame_wc[PTV_MAX_AUDIO];
-_Atomic int     g_nbs_fill_st[PTV_MAX_AUDIO];
 _Atomic int64_t g_pad_pub_step[PTV_MAX_AUDIO];
 _Atomic int64_t g_pad_pub_wc[PTV_MAX_AUDIO];
 

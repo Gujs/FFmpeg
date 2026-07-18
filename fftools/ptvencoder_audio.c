@@ -1307,8 +1307,8 @@ static int audio_feed(AudioState *a, AVFrame *frame)
             int fill_resumed = 0;   /* 1.0.1-pre15 §3: first REAL frame after an NBS fill phase */
             if (g_glueclass && a->nbs_fill_active && !a->nbs_feeding) {
                 a->nbs_fill_active = 0;
-                if (a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO)
-                    atomic_store_explicit(&g_nbs_fill_st[a->dbg_k], 0, memory_order_relaxed);
+                a->nbs_last_wall_us = 0;
+                a->nbs_carry_us     = 0;
                 fill_resumed = 1;
                 av_log(NULL, AV_LOG_WARNING,
                        "[PTV-ADISC] a%d(in%d) real frames resumed — silence-fill released after "
@@ -1458,10 +1458,20 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                             a->pend_comp_us = step;
                             a->pend_comp_wc = now_wc;
                         }
-                        if (step > 0 && !exp_hit) {
+                        if (step > 0 && !exp_hit &&
+                            wall_gap < step / 2 + FFMAX(a->glue_cad_us, 40000)) {
                             /* E5 pad ledger: an open GAP-pad awaiting a possible return leg (3a).
                              * Registered (flush-routed) forward steps are alignment, not gaps —
-                             * they never enter the ledger. */
+                             * they never enter the ledger. rr15 R2: neither do E3-CORROBORATED
+                             * REAL-gap pads — silence that filled genuinely missing time shifted
+                             * nothing, so there is no round trip to unwind, and cancelling against
+                             * such a pad deletes real content (fx-rr15-a3: a real 400ms gap's pad +
+                             * a coincidentally-sized In-Touch both-stream backward relabel deleted
+                             * 405ms = re-opened the 0.9.16.4 audio-early accumulator). Real gap ⇒
+                             * this frame was wall-ABSENT ≈ the step on top of the normal arrival
+                             * cadence (PES-burst period, EMA'd below); a relabel/flood pad arrives
+                             * FLOWING (wall_gap ≈ one cadence ≪ step/2 + cadence). Only the
+                             * flowing (splice-suspect, b1/Azorse-class) pads are candidates. */
                             int slot = a->pad_led_n % PTV_GLUE_PAD_LED;
                             a->pad_led_us[slot] = step;
                             a->pad_led_wc[slot] = now_wc;
@@ -1476,6 +1486,17 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                                    "[PTV-AGLUE] a%d(in%d) %+"PRId64"s audio content convergence in flight "
                                    "(>10s) — unbounded by mandate; verify source alignment if unexpected\n",
                                    a->dbg_k, a->dbg_in, step / AV_TIME_BASE);
+                    }
+                } else if (g_glueclass) {
+                    /* rr15 R2: quiet frame — track the normal ARRIVAL CADENCE (EMA of nonzero
+                     * wall gaps between fed frames = the PES-burst period; intra-burst frames
+                     * arrive within µs and are skipped so the EMA reads the burst period, not
+                     * the frame duration). This is the E3 baseline the pad-ledger gate above
+                     * subtracts: a real gap's wall absence rides ON TOP of one cadence. */
+                    int64_t wg = now_wc - a->glue_wall_last_us;
+                    if (wg > 5000 && wg < 2000000) {
+                        if (!a->glue_cad_us) a->glue_cad_us = wg;
+                        else                 a->glue_cad_us += (wg - a->glue_cad_us) / 8;
                     }
                 }
             }
@@ -1767,7 +1788,7 @@ static void adec_reopen(AudioState *a)
  * until real frames arrive — the 0.9.17.1 AFMT retry owns that; upstream problem). */
 static void nbs_fill_quantum(AudioState *a)
 {
-    int64_t dur_us, base;
+    int64_t dur_us, base, now, want_us;
     int n, i, ret = 0;
 
     if (!g_glueclass || !a->pts_set || !a->use_fg ||
@@ -1775,6 +1796,8 @@ static void nbs_fill_quantum(AudioState *a)
         return;
     if (!a->nbs_fill_active) {
         a->nbs_fill_active = 1;
+        a->nbs_last_wall_us = 0;
+        a->nbs_carry_us     = 0;
         av_log(NULL, AV_LOG_WARNING,
                "[PTV-ADISC] a%d(in%d) silence-fill ENGAGED — demux is corrupt-discarding this "
                "track's packets with nothing decoding; synthesizing dense silence until real "
@@ -1784,9 +1807,23 @@ static void nbs_fill_quantum(AudioState *a)
     dur_us = av_rescale(1024, 1000000, a->fg_in_rate);
     if (dur_us <= 0)
         return;
-    n = (int)(g_nbs_quantum_us / dur_us);
-    if (n < 1)
-        n = 1;
+    /* rr15 F9: synthesize the WALL time actually elapsed since the previous quantum,
+     * carrying the sub-frame remainder — int(quantum/frame) per sentinel under-filled
+     * 30-37% (sentinel cadence = first corrupt pkt ≥quantum, not exactly quantum; mp2
+     * PES 120ms vs the 100ms quantum), leaving a +14.5s resume step after a 40s phase.
+     * Clamped so a sentinel drought can never dump a burst. */
+    now     = av_gettime_relative();
+    want_us = (a->nbs_last_wall_us ? now - a->nbs_last_wall_us : g_nbs_quantum_us)
+            + a->nbs_carry_us;
+    a->nbs_last_wall_us = now;
+    if (want_us > 2000000)
+        want_us = 2000000;
+    n = (int)(want_us / dur_us);
+    a->nbs_carry_us = want_us - (int64_t)n * dur_us;
+    if (n < 1) {
+        a->nbs_fills++;
+        return;                      /* remainder carried to the next sentinel */
+    }
     base = a->glue_raw_last_us + a->glue_raw_dur_us;
     a->nbs_feeding = 1;
     for (i = 0; i < n && ret >= 0; i++) {

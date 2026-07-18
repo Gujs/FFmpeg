@@ -82,6 +82,39 @@ shift — the synthesis completes the resampler's own label-declared
 compensation (slip→0 makes the sensor self-consistent), and a ledger post
 would permanently offset R by the synthesized amount on a path expected never
 to fire forward. Revisit if G7-class syntheses ever fire in production.
+(Adversarial review rr15 BLESSED this and the other three declared
+deviations.)
+rr15 FIX ROUND (same pre15, second commit) — three CONFIRMED reject-grade
+findings, all wire-reproduced by the reviewer, fixed and re-gated:
+R1: the §2.5 video-fresh guard was a flat ≤2s bound — a whole-program
+relabel delivered with a 1.3-2s stall and an AUDIO-first resume passed it
+(video's last packet is exactly stall-old) → one-sided split, −2.6s bake
+(fx-rr15-a2). Fixed: video must have flowed DURING the audio's absence —
+video_last ≤ min(2s, wall_gap/2).
+R2: the E5 pad ledger appended EVERY unregistered forward pad, including
+E3-corroborated REAL-gap pads, which have nothing to unwind — a
+coincidentally-sized both-stream backward relabel (In-Touch shape) then
+"cancelled" against one and deleted 405ms of real content (fx-rr15-a3, the
+AWE fleet class). Fixed: only FLOWING (splice-suspect) pads enter the ledger
+— gate on wall_gap < step/2 + arrival-cadence EMA (new glue_cad_us: EMA of
+nonzero fed-frame wall gaps = the PES-burst period; a real gap's absence
+rides on top of one cadence).
+R3: the F2 secondary refuse rule (<3-packet base during a wild window)
+fired on HEALTHY channels — a benign sub-2s delivery stall closes one H
+window at r≈0.47 = WILD, and a genuine Curiosity-ordering event 30-40s
+later was REFUSED (−747ms baked, fx-rr15-a1b2). Fixed: WILD is DIRECTIONAL
+— only flood-direction wildness (r > 1.5) arms the flood-recency window;
+stalls read r < 1 and no longer count. (The primary EMA rule was verified
+SOUND at the margin — 3.5-4% wobble still routes.)
+F9: the NBS fill under-filled 30-37% (int-truncated 4-frame quantum vs the
+≥100ms+jitter sentinel cadence) → +14.5s resume step after a 40s phase.
+Fixed: synthesize the wall time actually elapsed since the previous quantum
+with sub-frame remainder carry (clamped 2s/quantum).
+Cosmetics folded: dead nbs_resume field and the never-read g_nbs_fill_st
+atomics removed; the PTV_NO_GLUECLASS wire-vs-log-parity caveat documented
+(F7). rr15 advisories F4 (tripwire realized-check is optimistic; fails open
+to pre14) and F5 (~−2%/event H bias at flood cadence only) accepted as
+known bounds, no code change this round.
 supervisor (task #44, the owner's PLL lineage). NORMATIVE DESIGN =
 analysis/ptvencoder-corrector-design.md (owner-approved 2026-07-16 with §9
 resolutions folded in). Gated on the sensor soak CERTIFICATION (2026-07-16,
