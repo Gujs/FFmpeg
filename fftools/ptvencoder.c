@@ -41,7 +41,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.0.1-pre14"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.0.1-pre15"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -561,6 +561,23 @@ _Atomic int64_t g_corr_pub[PTV_MAX_AUDIO];
 _Atomic int     g_corr_state_pub[PTV_MAX_AUDIO];
 _Atomic int     g_corr_disarm_req[PTV_MAX_AUDIO];
 _Atomic int64_t g_mux_sent_wc[PTV_MAX_RUNG];
+/* 1.0.1-pre15 — glue classification #33 (analysis/ptvencoder-33-glue-classification.md).
+ * One revert switch for the whole classifier: PTV_NO_GLUECLASS=1 restores pre14 behavior
+ * wholesale (§2.2 pad-cancel + tripwire, §2.3 refuse, §2.5 gap-verdict propagation, late
+ * pair-expect matching, and the §3 fill owner). The (c) acorrupt counter/[PTV-ADISC] log is
+ * UNCONDITIONAL (observability, byte-inert). The §3 silence-fill is additionally OPT-IN
+ * (PTV_NBS_FILL=1 — owner call 2026-07-18: observability first fleet-wide, fill second;
+ * NBS phases are currently restart-cured, not silent-failing). */
+int     g_glueclass = 1;
+int     g_nbs_fill  = 0;
+int     g_glue_htol = 5;                       /* §2.3 |H−1| tolerance, % (fixture-tuned, G4) */
+int64_t g_pair_ttl_us = PTV_PAIR_EXPECT_TTL_US;
+int64_t g_nbs_quantum_us = 100000;             /* fill quantum: 100ms of silence per sentinel */
+_Atomic int64_t g_acorrupt;
+_Atomic int64_t g_adec_frame_wc[PTV_MAX_AUDIO];
+_Atomic int     g_nbs_fill_st[PTV_MAX_AUDIO];
+_Atomic int64_t g_pad_pub_step[PTV_MAX_AUDIO];
+_Atomic int64_t g_pad_pub_wc[PTV_MAX_AUDIO];
 
 /* PTV_LOG_TS=1: prefix every log line with a local wall-clock timestamp
  * [YYYY-MM-DD HH:MM:SS.mmm], so production logs are self-dated natively
@@ -1986,6 +2003,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                 d->audio_q[d->n_audio] = audio_q[k]; d->astream[d->n_audio] = asrc[k];
                 d->aglue_exp_step[d->n_audio] = &inputs[kk].aglue_exp_step[k];   /* pre5 (D1): write side of the */
                 d->aglue_exp_dl[d->n_audio]   = &inputs[kk].aglue_exp_dl[k];     /* expected-step handshake      */
+                d->aglobal[d->n_audio] = k;   /* pre15: global track index — keys the per-track
+                                               * published atomics (pad ledger, decode watermark, fill) */
                 d->n_audio++;
             }
     }
@@ -2586,6 +2605,14 @@ int main(int argc, char **argv)
      * byte-inert on a healthy channel, so every channel runs it unmodified); PTV_NO_RSYNC_CORR=1
      * is the permanent kill switch; sensor off implies corrector off (it is the only input). */
     if (getenv("PTV_NO_RSYNC_CORR") || !g_rsync_sense) g_rsync_corr = 0;
+    /* 1.0.1-pre15 glue classification (#33): one revert for the whole classifier. The §3
+     * silence-fill is OPT-IN on top (observability-first rollout, owner call); the acorrupt
+     * counters/[PTV-ADISC] stay on under every switch (unconditional observability). */
+    if (getenv("PTV_NO_GLUECLASS")) g_glueclass = 0;
+    if (getenv("PTV_NBS_FILL") && g_glueclass) g_nbs_fill = 1;
+    { const char *s = getenv("PTV_GLUE_HTOL_PCT");     if (s && atoi(s) > 0) g_glue_htol = atoi(s); }             /* tuning knob (G4) */
+    { const char *s = getenv("PTV_PAIR_EXPECT_TTL_US");if (s && atoll(s) > 0) g_pair_ttl_us = atoll(s); }          /* TEST ONLY (G6) */
+    { const char *s = getenv("PTV_NBS_QUANTUM_MS");    if (s && atoi(s) > 0) g_nbs_quantum_us = (int64_t)atoi(s) * 1000; }  /* TEST ONLY (G8) */
     /* TEST-ONLY overrides (PTV_WRAP_GUARD_S precedent): shorten the dwell/quiet windows or move
      * the band/slew so the F-gate fixtures can exercise storm/authority paths in bounded wall
      * time. NEVER set in production — the 5min/3min/80ms/2ms/s defaults are the owner-approved

@@ -156,6 +156,28 @@ typedef struct DlvGate {
 #define PTV_MAX_INPUT 4    /* max composited inputs (multiview): 1 / 2 / 4 */
 #define PTV_MV_SKEW_CAP_US 250000   /* multiview per-slot audio skew cap (async budget) */
 
+/* ===================== 1.0.1-pre15 — glue classification (#33) =====================
+ * NORMATIVE DESIGN = analysis/ptvencoder-33-glue-classification.md (§refs below are its
+ * sections). Classification/routing fixes on the pre4–pre7 glue machinery — the flush tree,
+ * AGLUE verdicts, pair-expect handshake and absorber all stay; what changes is which OWNER
+ * each event class routes to. One revert switch: PTV_NO_GLUECLASS=1 (g_glueclass).
+ *   E5 pad ledger: per track, the last N applied GAP-pads {step_us, wall_us} not yet
+ *   cancelled (written at the forward GAP verdict, consumed by §2.2 rule 3a — a backward
+ *   step matching a recent pad is the pad's RETURN leg and must be APPLIED (aresample drops
+ *   the pad's inserted silence), never relabel-erased: the rr14-A3 b1 round-trip bake).
+ *   The NEWEST open entry is also published per track (atomics below) so the demux §5.A.2
+ *   absorber can decline to erase the return leg at the packet layer (where sub-1s backward
+ *   steps are normally absorbed before AGLUE ever sees them). Match rule (both sites):
+ *   |step + pad| <= max(80ms, pad/4), pad younger than the TTL. */
+#define PTV_GLUE_PAD_LED     4
+#define PTV_GLUE_PAD_TTL_US  (120LL * AV_TIME_BASE)
+/* NBS silence-fill sentinel (§3): a zero-size AVPacket carrying this PRIVATE flag bit on a
+ * track's audio_q tells the audio thread to synthesize one quantum of silence at the track's
+ * expected next graph-door pts (demux-side corrupt-discard starvation — the thread itself is
+ * blocked on recv and cannot self-detect). Bit chosen above libavcodec's AV_PKT_FLAG_* space;
+ * never leaves the process. */
+#define PTV_PKT_FLAG_NBS_FILL (1 << 16)
+
 /* A/V PLL redesign Phase A probe (PTV_AVSYNC_PROBE): per-input ring recording, for each DISTINCT
  * video content the cell displayed, the output time it went out at — (abs source pts → out_v, both
  * us). The audio drain pairs its emitted frame's source content against this ring to read the output
@@ -547,6 +569,26 @@ typedef struct AudioState {
     _Atomic int_least64_t *corr_epoch;                /* -> Input.house_disturb (event feed) */
     int             *corr_layera_active;              /* -> Input.disc.active (g_layera only; NULL = off) */
     int              afmt_rebuilds;                   /* [PTV-AFMT] rebuild count (corrector event feed) */
+    /* 1.0.1-pre15 glue classification (#33; g_glueclass) — all owned by this track's audio
+     * thread. E5 pad ledger (see the PTV_GLUE_PAD_* block): open GAP-pads awaiting a possible
+     * return leg; 0 = consumed/empty slot. */
+    int64_t          pad_led_us[PTV_GLUE_PAD_LED];    /* pad size (us, >0) per slot */
+    int64_t          pad_led_wc[PTV_GLUE_PAD_LED];    /* wall us the pad was verdicted */
+    int              pad_led_n;                       /* ring cursor (monotonic) */
+    /* §2.4 realization tripwire: the last GAP/FLUSH-APPLY verdict's step, awaiting the
+     * resampler's hard comp (instantaneous by design). Checked against the pre11 slip probe
+     * ~2s after arming; a parked slip means the pad/drop was NOT realized — synthesize the
+     * remainder at the swr boundary (inject_silence/drop_output) instead of shipping on faith. */
+    int64_t          pend_comp_us;                    /* outstanding verdict step (us); 0 = none */
+    int64_t          pend_comp_wc;                    /* wall us the verdict armed */
+    int64_t          tw_synth_cnt;                    /* tripwire syntheses fired (observability) */
+    /* §3 NBS starvation fill: track is living on synthesized silence while the demux discards
+     * an undecodable source phase (opt-in PTV_NBS_FILL=1). nbs_feeding marks frames audio_feed
+     * receives FROM the fill itself (they must not consume the resume classification). */
+    int              nbs_fill_active;                 /* fill phase open (mirrors g_nbs_fill_st) */
+    int              nbs_feeding;                     /* inside nbs_fill_quantum's feed loop */
+    int              nbs_resume;                      /* first REAL frame after a fill phase (one-shot) */
+    int              nbs_fills;                       /* quanta synthesized this run (observability) */
 } AudioState;
 
 /* ---- demux + mux ---- */
@@ -636,6 +678,7 @@ typedef struct PassStream {
 #define PTV_PAIR_EXPECT_LO_US    (250 * 1000)
 #define PTV_PAIR_EXPECT_HI_US    (500 * 1000)
 
+
 typedef struct PtvDiscPacket {
     AVPacket *pkt;
     int       stream_idx;
@@ -669,6 +712,18 @@ typedef struct PtvDiscStreamState {
     int64_t pair_applied_us;
     int     pair_has;
     int     pair_prov;
+    /* 1.0.1-pre15 E4 label health H (#33 §2.1; g_glueclass): demux-side windowed EMA of
+     * Δdts/Δwall over the trailing ~30s, EXCLUDING buffered/flush windows and per-packet
+     * jumps (those are events, not rate evidence). Healthy ≈ 1.0 ±5% (Q10: 1024 = 1.0);
+     * a label-flood source (Azorse: labels stride ~6x content) reads H >> 1. Consulted by
+     * the §2.3 refuse gate before a flush routes a mismatch to the content path — evidence
+     * QUALITY, not magnitude (PATRIOT's 30.8s was real; Azorse's 31.078s was noise). */
+    int64_t h_prev_wall;           /* wall us of this stream's previous dense packet */
+    int64_t h_dts_acc, h_wall_acc; /* open sub-window accumulators (us) */
+    int64_t h_ema_q10;             /* windowed-rate EMA, Q10 (0 until first window) */
+    int     h_wins;                /* closed windows folded into the EMA */
+    int64_t h_wild_wc;             /* wall us of the last WILD window (|r-1| > 50%) — the
+                                    * flood-recency signal for the <3-packet base rule */
 } PtvDiscStreamState;
 
 typedef struct PtvDiscBuf {
@@ -716,6 +771,17 @@ typedef struct DemuxArgs {
      * (storage lives in Input; AudioState holds the read side). Indexed like audio_q/astream. */
     _Atomic int_least64_t *aglue_exp_step[PTV_MAX_AUDIO];
     _Atomic int_least64_t *aglue_exp_dl[PTV_MAX_AUDIO];
+    int                   aglobal[PTV_MAX_AUDIO];     /* 1.0.1-pre15: GLOBAL track index (dbg_k) of
+                                                       * local track j — keys the per-track published
+                                                       * atomics (pad ledger, decode watermark, fill) */
+    /* 1.0.1-pre15 §3 (NBS) manifestation (c): the corrupt-discard site counted per TRACK
+     * (video already had vcorrupt). Unconditional observability — even under
+     * PTV_NO_GLUECLASS. [PTV-ADISC] log window is per track. */
+    int64_t               acorrupt[PTV_MAX_AUDIO];    /* corrupt-flagged audio pkts discarded */
+    int64_t               adisc_win_us[PTV_MAX_AUDIO];/* [PTV-ADISC] 10s log window start */
+    int64_t               adisc_win_n[PTV_MAX_AUDIO]; /* discards in the open window */
+    int64_t               nbs_last_fill_us[PTV_MAX_AUDIO]; /* last FILL sentinel sent (quantum pace) */
+    int64_t               glue_refuse_cnt;            /* §2.3 F2 refuse ledger (per input) */
     int                   drop;          /* non-blocking + drop on full (network input) */
     PassStream           *pass;          /* copy-passthrough: extra audio, subs, data */
     int                   n_pass;
@@ -971,6 +1037,20 @@ extern _Atomic int     g_corr_disarm_req[PTV_MAX_AUDIO]; /* master watchdog → 
  * av_interleaved_write_frame on that rung — the only liveness signal that is actually the wire
  * (the Newsmax2 dead rung read calm on every label-domain signal). One relaxed store per packet. */
 extern _Atomic int64_t g_mux_sent_wc[PTV_MAX_RUNG];
+/* 1.0.1-pre15 glue classification #33 (defined in ptvencoder.c; design doc
+ * analysis/ptvencoder-33-glue-classification.md) */
+extern int     g_glueclass;              /* the whole classifier; PTV_NO_GLUECLASS=1 reverts wholesale */
+extern int     g_nbs_fill;               /* §3 starvation silence-fill — OPT-IN (PTV_NBS_FILL=1; owner Q2) */
+extern int     g_glue_htol;              /* §2.3 label-health tolerance, percent (5; PTV_GLUE_HTOL_PCT — TEST/tuning) */
+extern int64_t g_pair_ttl_us;            /* pair-expect TTL (30s; PTV_PAIR_EXPECT_TTL_US — TEST ONLY, G6) */
+extern int64_t g_nbs_quantum_us;         /* fill quantum (100ms; PTV_NBS_QUANTUM_MS — TEST ONLY, G8) */
+extern _Atomic int64_t g_acorrupt;                        /* total corrupt-discarded AUDIO pkts (acor= stats) */
+extern _Atomic int64_t g_adec_frame_wc[PTV_MAX_AUDIO];    /* wall µs of track k's last DECODED frame (audio
+                                                           * thread stamps; demux reads = the E6 starvation
+                                                           * discriminator: packets arrive, nothing decodes) */
+extern _Atomic int     g_nbs_fill_st[PTV_MAX_AUDIO];      /* 1 = track k in a fill phase (demux sets, audio clears) */
+extern _Atomic int64_t g_pad_pub_step[PTV_MAX_AUDIO];     /* newest OPEN pad-ledger entry per track (audio thread */
+extern _Atomic int64_t g_pad_pub_wc[PTV_MAX_AUDIO];       /* publishes; demux absorber reads — advisory) */
 
 /* ==== cross-file functions ==== */
 /* ptvencoder_gate.c */

@@ -266,6 +266,8 @@ static const char *rscorr_event_active(AudioState *a, int64_t now)
     }
     if (a->corr_layera_active && *a->corr_layera_active)   /* advisory read (demux-written int) */
         return "layera buffering";
+    if (a->nbs_fill_active)   /* pre15 §5 rule 2: R is synthetic-flat on a filled track — never engage */
+        return "nbs silence-fill";
     if (atomic_load_explicit(&g_gov_on, memory_order_relaxed))
         return "catch-up governor";
     v = atomic_load_explicit(&g_shed_wall, memory_order_relaxed);
@@ -867,6 +869,33 @@ static int audio_drain_fg(AudioState *a)
                     }
                 }
                 a->rs_slip_us = slip;
+                /* 1.0.1-pre15 §2.4 realization tripwire (#33): a GAP/FLUSH-APPLY verdict armed
+                 * pend_comp_us; hard comp (min_hard_comp=0.03 in the prod chain) realizes it
+                 * INSTANTLY, so a slip still parked near the verdict size 2s later means the
+                 * resampler did NOT take the pad/drop — synthesize the parked remainder at the
+                 * swr boundary ourselves (the resampler's own compensation primitives, not a
+                 * second actuator) instead of shipping on faith. Expected NEVER to fire on
+                 * forward steps (PATRIOT-proven); it is the G7 witness for backward >1s drops. */
+                if (g_glueclass && a->pend_comp_us) {
+                    if (llabs(slip) <= llabs(a->pend_comp_us) / 10) {
+                        a->pend_comp_us = 0;                       /* realized */
+                    } else if (av_gettime_relative() - a->pend_comp_wc > 2000000) {
+                        int irate = a->fg_swr_flt ? a->fg_swr_flt->inputs[0]->sample_rate : 0;
+                        int orate = a->fg_swr_flt ? a->fg_swr_flt->outputs[0]->sample_rate : 0;
+                        if (a->fg_swr && slip > 0 && irate > 0)
+                            swr_inject_silence(a->fg_swr, (int)av_rescale(slip, irate, 1000000));
+                        else if (a->fg_swr && slip < 0 && orate > 0)
+                            swr_drop_output(a->fg_swr, (int)av_rescale(-slip, orate, 1000000));
+                        a->tw_synth_cnt++;
+                        a->glue_events++;                          /* corrector freeze (§5 rule 4) */
+                        av_log(NULL, AV_LOG_WARNING,
+                               "[PTV-AGLUE] a%d(in%d) verdict %+"PRId64"ms NOT realized by the resampler "
+                               "within 2s (slip parked %+"PRId64"ms) — synthesized at the swr boundary (#%"PRId64")\n",
+                               a->dbg_k, a->dbg_in, a->pend_comp_us / 1000, slip / 1000,
+                               a->tw_synth_cnt);
+                        a->pend_comp_us = 0;
+                    }
+                }
                 m = out_us - (src_abs_us - inj) - slip;
                 if (!a->rs_ma_seed) { a->rs_ma_ema = m; a->rs_ma_seed = 1; }
                 else {
@@ -1130,6 +1159,24 @@ static int audio_drain_fg(AudioState *a)
  * corrupt single-frame flip at a splice boundary doesn't trigger a spurious reconfig (legacy 0003). */
 #define PTV_AFMT_HYSTERESIS 5
 
+/* 1.0.1-pre15 #33 (g_glueclass): publish this track's NEWEST still-open pad-ledger entry so
+ * the demux §5.A.2 absorber can decline to erase a matching backward return leg at the packet
+ * layer (advisory — AGLUE's own ledger scan is the authoritative match). Audio thread only. */
+static void ptv_pad_pub(AudioState *a)
+{
+    int pi, best = -1;
+    if (a->dbg_k < 0 || a->dbg_k >= PTV_MAX_AUDIO)
+        return;
+    for (pi = 0; pi < PTV_GLUE_PAD_LED; pi++)
+        if (a->pad_led_us[pi] > 0 &&
+            (best < 0 || a->pad_led_wc[pi] > a->pad_led_wc[best]))
+            best = pi;
+    atomic_store_explicit(&g_pad_pub_wc[a->dbg_k],
+                          best >= 0 ? a->pad_led_wc[best] : 0, memory_order_relaxed);
+    atomic_store_explicit(&g_pad_pub_step[a->dbg_k],
+                          best >= 0 ? a->pad_led_us[best] : 0, memory_order_release);
+}
+
 
 /* Feed one h0-anchored decoded audio frame into the -af graph (or swr fallback). */
 static int audio_feed(AudioState *a, AVFrame *frame)
@@ -1257,6 +1304,17 @@ static int audio_feed(AudioState *a, AVFrame *frame)
         if (g_aglue_ms > 0 && frame->pts != AV_NOPTS_VALUE) {
             int64_t raw_us = av_rescale_q(frame->pts, a->ist_tb, AV_TIME_BASE_Q);
             int64_t now_wc = av_gettime_relative();
+            int fill_resumed = 0;   /* 1.0.1-pre15 §3: first REAL frame after an NBS fill phase */
+            if (g_glueclass && a->nbs_fill_active && !a->nbs_feeding) {
+                a->nbs_fill_active = 0;
+                if (a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO)
+                    atomic_store_explicit(&g_nbs_fill_st[a->dbg_k], 0, memory_order_relaxed);
+                fill_resumed = 1;
+                av_log(NULL, AV_LOG_WARNING,
+                       "[PTV-ADISC] a%d(in%d) real frames resumed — silence-fill released after "
+                       "%d quanta; resume step classified below\n",
+                       a->dbg_k, a->dbg_in, a->nbs_fills);
+            }
             if (a->glue_raw_last_us != AV_NOPTS_VALUE) {
                 int64_t step = raw_us - (a->glue_raw_last_us + a->glue_raw_dur_us);
                 if (llabs(step) > (int64_t)g_aglue_ms * 1000) {
@@ -1271,34 +1329,86 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                      * registered value before the deadline (see ptvencoder.h for the window
                      * rationale); consumed one-shot. Plain source steps (no registration, or
                      * value/deadline miss) keep every pre-existing rule byte-identical. */
-                    int exp_hit = 0;
+                    int exp_hit = 0, exp_late = 0;
                     int64_t exp_step = 0;
                     if (a->glue_exp_dl) {
                         int64_t dl = atomic_load_explicit(a->glue_exp_dl, memory_order_acquire);
                         if (dl) {
+                            int vmatch;
                             exp_step = atomic_load_explicit(a->glue_exp_step, memory_order_relaxed);
-                            if (now_wc <= dl &&
-                                step - exp_step >= -PTV_PAIR_EXPECT_LO_US &&
-                                step - exp_step <=  PTV_PAIR_EXPECT_HI_US) {
+                            vmatch = step - exp_step >= -PTV_PAIR_EXPECT_LO_US &&
+                                     step - exp_step <=  PTV_PAIR_EXPECT_HI_US;
+                            if (now_wc <= dl && vmatch) {
                                 atomic_store_explicit(a->glue_exp_dl, 0, memory_order_relaxed);  /* consumed */
                                 exp_hit = 1;
                             } else if (now_wc > dl) {
-                                atomic_store_explicit(a->glue_exp_dl, 0, memory_order_relaxed);  /* expired */
+                                /* 1.0.1-pre15 (#33 b3): a VALUE match after the TTL is still the
+                                 * flush-routed step — a deep bank can legally hold it past any
+                                 * fixed TTL (review-2 F1), and falling back to the relabel-erase
+                                 * re-bakes the mismatch (the D1 defect, flushless at the point of
+                                 * damage). The value window (±[-250,+500]ms of a >500ms step) is
+                                 * the real collision guard; consume late, say so. */
+                                if (g_glueclass && vmatch) {
+                                    atomic_store_explicit(a->glue_exp_dl, 0, memory_order_relaxed);
+                                    exp_hit = exp_late = 1;
+                                } else
+                                    atomic_store_explicit(a->glue_exp_dl, 0, memory_order_relaxed);  /* expired */
+                            }
+                        }
+                    }
+                    /* 1.0.1-pre15 §2.2 rule 3a (#33, closes b1): an UNREGISTERED backward step
+                     * matching a recent still-open GAP-pad is the pad's RETURN leg — APPLYING it
+                     * (aresample drops = unwinds the pad's inserted silence) is the round-trip
+                     * cancel; erasing it bakes the pad (rr14 A3: +150/−150 = REAL −150ms). A
+                     * coincidental independent relabel of matching size converges to the same
+                     * content end-state through the drop (doc §2.6 risk note; G11). */
+                    int pad_cancel = 0;
+                    int64_t pc_pad = 0;
+                    if (g_glueclass && !exp_hit && step < 0 && !fill_resumed) {
+                        int pi;
+                        for (pi = 0; pi < PTV_GLUE_PAD_LED; pi++) {
+                            int64_t p = a->pad_led_us[pi];
+                            if (p > 0 && now_wc - a->pad_led_wc[pi] <= PTV_GLUE_PAD_TTL_US &&
+                                llabs(step + p) <= FFMAX(80000, p / 4)) {
+                                a->pad_led_us[pi] = 0;   /* consumed */
+                                ptv_pad_pub(a);
+                                pad_cancel = 1;
+                                pc_pad = p;
+                                break;
                             }
                         }
                     }
                     char sn[48];   /* 1.0.1-pre8 (d): self-shed honesty note ("" when nothing shed) */
                     if (llabs(step) > (int64_t)g_aglue_max_ms * 1000) {
                         av_log(NULL, AV_LOG_WARNING,
-                               "[PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms above %dms cap — left to the discontinuity layer%s%s\n",
+                               "[PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms above %dms cap — left to the discontinuity layer%s%s%s%s\n",
                                a->dbg_k, a->dbg_in, step / 1000, g_aglue_max_ms,
                                exp_hit ? " (matches the shared-flush expected step — aresample converges it)" : "",
+                               exp_late ? " [late match — TTL had expired]" : "",
+                               pad_cancel ? " (cancels an open GAP-pad — round-trip; aresample drops)" : "",
                                ptv_self_shed_note(a, sn, sizeof sn));
                     } else if (exp_hit) {
                         av_log(NULL, AV_LOG_WARNING,
                                "[PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms matches the shared-flush expected step %+"PRId64"ms "
-                               "— REAL A-vs-V alignment step, APPLIED (aresample converges; not erased)%s\n",
+                               "— REAL A-vs-V alignment step, APPLIED (aresample converges; not erased)%s%s\n",
                                a->dbg_k, a->dbg_in, step / 1000, exp_step / 1000,
+                               exp_late ? " [late match — TTL had expired]" : "",
+                               ptv_self_shed_note(a, sn, sizeof sn));
+                    } else if (pad_cancel) {
+                        a->glue_events++;   /* corrector freeze set (§5 rule 3) */
+                        av_log(NULL, AV_LOG_WARNING,
+                               "[PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms — pad round-trip cancelled "
+                               "(open GAP-pad +%"PRId64"ms): APPLIED, aresample drops the pad's inserted "
+                               "silence (not erased)%s\n",
+                               a->dbg_k, a->dbg_in, step / 1000, pc_pad / 1000,
+                               ptv_self_shed_note(a, sn, sizeof sn));
+                    } else if (fill_resumed && step < 0) {
+                        /* §3 resume-anchor: the overlap is OUR OWN synthesized silence — dropping
+                         * it is free; erasing would relabel real content onto the fill. */
+                        av_log(NULL, AV_LOG_WARNING,
+                               "[PTV-AGLUE] a%d(in%d) fill-resume overlap %+"PRId64"ms — synthesized "
+                               "region dropped (aresample), not erased%s\n",
+                               a->dbg_k, a->dbg_in, step / 1000,
                                ptv_self_shed_note(a, sn, sizeof sn));
                     } else {
                         /* 0.9.18: verdict-LOG rate limit. An Azorse-class label flood (source labels
@@ -1335,6 +1445,37 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                                        a->glue_off_us / 1000, a->glue_events,
                                        ptv_self_shed_note(a, sn, sizeof sn));
                         }
+                    }
+                    /* 1.0.1-pre15 #33 verdict bookkeeping (every branch above except the
+                     * backward RELABEL erase left the step IN the labels for aresample to
+                     * converge — GAP-pad, FLUSH-APPLY, pad-cancel, above-cap stand-aside): */
+                    if (g_glueclass) {
+                        int erased_here = step < 0 && !exp_hit && !pad_cancel && !fill_resumed &&
+                                          llabs(step) <= (int64_t)g_aglue_max_ms * 1000;
+                        if (!erased_here) {
+                            /* §2.4 realization tripwire: hard comp is instantaneous by design —
+                             * checked against the pre11 slip probe ~2s from now (audio_drain_fg). */
+                            a->pend_comp_us = step;
+                            a->pend_comp_wc = now_wc;
+                        }
+                        if (step > 0 && !exp_hit) {
+                            /* E5 pad ledger: an open GAP-pad awaiting a possible return leg (3a).
+                             * Registered (flush-routed) forward steps are alignment, not gaps —
+                             * they never enter the ledger. */
+                            int slot = a->pad_led_n % PTV_GLUE_PAD_LED;
+                            a->pad_led_us[slot] = step;
+                            a->pad_led_wc[slot] = now_wc;
+                            a->pad_led_n++;
+                            ptv_pad_pub(a);
+                        }
+                        if (!erased_here && llabs(step) > 10 * AV_TIME_BASE)
+                            /* owner call 2026-07-18 (Q5): >10s convergences on healthy sources stay
+                             * UNBOUNDED (invariant mandate — PATRIOT 30.8s is locked in), with an
+                             * operator alert as the only escalation. */
+                            av_log(NULL, AV_LOG_ERROR,
+                                   "[PTV-AGLUE] a%d(in%d) %+"PRId64"s audio content convergence in flight "
+                                   "(>10s) — unbounded by mandate; verify source alignment if unexpected\n",
+                                   a->dbg_k, a->dbg_in, step / AV_TIME_BASE);
                     }
                 }
             }
@@ -1615,6 +1756,60 @@ static void adec_reopen(AudioState *a)
            a->dbg_k, a->dbg_in, (int)(PTV_ADECWD_US / 1000000), a->dec_reopens, a->dec_errs);
 }
 
+/* 1.0.1-pre15 #33 §3 (g_glueclass + PTV_NBS_FILL, opt-in): synthesize ONE quantum of stamped
+ * silence at this track's expected next graph-door position. Triggered by a FILL sentinel from
+ * the demux thread — the only thread alive during a corrupt-discard starvation phase (this
+ * thread is otherwise blocked on recv). Frames are built in the ACTIVE input configuration
+ * (fg_in_*) and pushed through the normal audio_feed path, so AGLUE sees a dense continuation,
+ * AFMT sees unchanged params, output labels stay dense and house-aligned, encoders/mux/gates
+ * stay alive and the sensor keeps a valid ≈0 reading (instead of the −8..−13.5s label-walk).
+ * Pre-anchor / graph-less / unstamped tracks skip (a track BORN into a broken phase stays dead
+ * until real frames arrive — the 0.9.17.1 AFMT retry owns that; upstream problem). */
+static void nbs_fill_quantum(AudioState *a)
+{
+    int64_t dur_us, base;
+    int n, i, ret = 0;
+
+    if (!g_glueclass || !a->pts_set || !a->use_fg ||
+        a->glue_raw_last_us == AV_NOPTS_VALUE || a->fg_in_rate <= 0)
+        return;
+    if (!a->nbs_fill_active) {
+        a->nbs_fill_active = 1;
+        av_log(NULL, AV_LOG_WARNING,
+               "[PTV-ADISC] a%d(in%d) silence-fill ENGAGED — demux is corrupt-discarding this "
+               "track's packets with nothing decoding; synthesizing dense silence until real "
+               "frames resume\n",
+               a->dbg_k, a->dbg_in);
+    }
+    dur_us = av_rescale(1024, 1000000, a->fg_in_rate);
+    if (dur_us <= 0)
+        return;
+    n = (int)(g_nbs_quantum_us / dur_us);
+    if (n < 1)
+        n = 1;
+    base = a->glue_raw_last_us + a->glue_raw_dur_us;
+    a->nbs_feeding = 1;
+    for (i = 0; i < n && ret >= 0; i++) {
+        AVFrame *s = av_frame_alloc();
+        if (!s)
+            break;
+        s->nb_samples  = 1024;
+        s->format      = a->fg_in_fmt;
+        s->sample_rate = a->fg_in_rate;
+        av_channel_layout_copy(&s->ch_layout, &a->fg_in_chl);
+        if (av_frame_get_buffer(s, 0) >= 0) {
+            av_samples_set_silence(s->extended_data, 0, s->nb_samples,
+                                   s->ch_layout.nb_channels, s->format);
+            s->pts = s->best_effort_timestamp =
+                av_rescale_q(base + i * dur_us, AV_TIME_BASE_Q, a->ist_tb);
+            ret = audio_feed(a, s);
+        }
+        av_frame_free(&s);
+    }
+    a->nbs_feeding = 0;
+    a->nbs_fills++;
+}
+
 void *audio_thread(void *arg)
 {
     AudioState *a = arg;
@@ -1627,6 +1822,14 @@ void *audio_thread(void *arg)
     for (;;) {
         ret = av_thread_message_queue_recv(a->audio_q, &pkt, 0);
         if (ret < 0) break;
+        if (pkt && (pkt->flags & PTV_PKT_FLAG_NBS_FILL)) {
+            /* pre15 §3 FILL sentinel — NOT a packet: must not feed the decoder and must not
+             * advance wd_pkts (ADECWD would read "packets arriving, nothing decodes" and churn
+             * a reopen every 45s of a fill phase). */
+            av_packet_free(&pkt);
+            nbs_fill_quantum(a);
+            continue;
+        }
         a->wd_pkts++;
         if (!a->wd_frame_us) a->wd_frame_us = av_gettime_relative();   /* seed at first packet */
         ret = avcodec_send_packet(a->dec, pkt);
@@ -1639,6 +1842,9 @@ void *audio_thread(void *arg)
             if (ret < 0) { adec_error(a, ret); ret = 0; break; }   /* 1.0.1: drop + continue (was: silent thread death) */
             a->wd_frame_us = av_gettime_relative();
             a->wd_pkts     = 0;
+            if (a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO)   /* pre15 E6: demux-visible decode watermark (NBS discriminator) */
+                atomic_store_explicit(&g_adec_frame_wc[a->dbg_k], a->wd_frame_us,
+                                      memory_order_relaxed);
             ret = audio_push(a, frame);
             av_frame_unref(frame);
             if (ret < 0) goto done;

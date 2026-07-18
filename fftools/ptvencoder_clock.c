@@ -858,6 +858,13 @@ void *output_thread(void *arg)
                             nn += snprintf(rsl + nn, sizeof rsl - nn, "--");
                     }
                 }
+                char aco[24] = "";                                   /* pre15 #33: corrupt-discarded AUDIO pkts (NBS phase
+                                                                      * visibility; absent while zero — clean line unchanged) */
+                {
+                    int64_t ac = atomic_load_explicit(&g_acorrupt, memory_order_relaxed);
+                    if (ac > 0)
+                        snprintf(aco, sizeof aco, " acor=%lld", (long long)ac);
+                }
                 char crs[10 + PTV_MAX_AUDIO * 20] = "";              /* pre14 corrector: corr= (cumulative trim; * = integrating) */
                 if (g_rsync_corr && g_rsx.n_a > 0) {
                     /* absent while every track sits at corr==0 un-engaged — the quiet-channel
@@ -882,9 +889,9 @@ void *output_thread(void *arg)
                 av_log(NULL, AV_LOG_INFO,
                     "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f "
                     "dup=%"PRId64" pd=%"PRId64" drop=%"PRId64" corrupt=%"PRId64" "
-                    "async=%+"PRId64"ppm%s%s%s%s%s%s\n",
+                    "async=%+"PRId64"ppm%s%s%s%s%s%s%s\n",
                     v->emitted, fps, hh, mm, ss,
-                    v->dup, v->pd, v->framedrop, cr, aw, dlv, wu, bk, cfs, rsl, crs);
+                    v->dup, v->pd, v->framedrop, cr, aw, dlv, wu, bk, cfs, aco, rsl, crs);
                 stat_last = nows; stat_prev = v->emitted;
             }
         }

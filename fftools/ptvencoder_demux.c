@@ -258,7 +258,7 @@ static void ptv_pair_expect(DemuxArgs *d, int stream_idx, int64_t step_us)
             continue;
         atomic_store_explicit(d->aglue_exp_step[j], step_us, memory_order_relaxed);
         atomic_store_explicit(d->aglue_exp_dl[j],
-                              av_gettime_relative() + PTV_PAIR_EXPECT_TTL_US,
+                              av_gettime_relative() + g_pair_ttl_us,
                               memory_order_release);
         av_log(NULL, AV_LOG_INFO,
                "[PTV-GLUE] paired flush: expected audio label step %+.3fs registered for a%d "
@@ -487,6 +487,68 @@ static int ptv_disc_cont_eligible(DemuxArgs *d, PtvDiscBuf *b, int sidx)
     return ss->pair_has || ss->pair_prov;
 }
 
+/* 1.0.1-pre15 E4 label health H (#33 §2.1): fold one dense packet into its stream's
+ * Δdts/Δwall windowed EMA (state in PtvDiscStreamState — see its declaration). Called from
+ * the demux thread's dense block only, OUTSIDE buffered/flush windows; per-packet jumps
+ * (|Δdts| > 500ms) and stalls (Δwall > 2s) are events, not rate evidence, and are skipped
+ * (the sub-window re-anchors). ~3s sub-windows, EMA α=1/8 → trailing ~30s. */
+static void ptv_glue_h_feed(PtvDiscStreamState *ss, int64_t raw_dts, int64_t last_dts,
+                            int64_t wall_now)
+{
+    int64_t d_wall = ss->h_prev_wall ? wall_now - ss->h_prev_wall : 3000000;
+    ss->h_prev_wall = wall_now;
+    if (last_dts == AV_NOPTS_VALUE)
+        return;
+    if (llabs(raw_dts - last_dts) > 500000 || d_wall > 2000000) {
+        ss->h_dts_acc = ss->h_wall_acc = 0;               /* event/seed: re-anchor the sub-window */
+        return;
+    }
+    /* d_wall == 0 is REAL: a whole parsed PES burst (several frames) returns from
+     * av_read_frame within one microsecond — their Δdts must still accumulate (dropping
+     * them under-read H to ~0.55 on an ordinary capture, first fixture round). */
+    ss->h_dts_acc  += raw_dts - last_dts;
+    ss->h_wall_acc += d_wall;
+    if (ss->h_wall_acc >= 3000000) {                      /* close a sub-window */
+        int64_t r = ss->h_dts_acc * 1024 / ss->h_wall_acc;
+        if (llabs(r - 1024) > 512)
+            ss->h_wild_wc = wall_now;                     /* flood-recency signal (§2.3 F2) */
+        if (ss->h_wins == 0) ss->h_ema_q10 = r;
+        else                 ss->h_ema_q10 += (r - ss->h_ema_q10) / 8;
+        if (ss->h_wins < 100000) ss->h_wins++;
+        if (getenv("PTV_GLUE_HDBG"))                      /* TEST-ONLY window trace (G4/G5 tuning) */
+            av_log(NULL, AV_LOG_INFO, "[PTV-HDBG] win r=%.3f dts=%.3fs wall=%.3fs ema=%.3f wins=%d\n",
+                   (double)r / 1024.0, (double)ss->h_dts_acc / 1e6,
+                   (double)ss->h_wall_acc / 1e6, (double)ss->h_ema_q10 / 1024.0, ss->h_wins);
+        ss->h_dts_acc = ss->h_wall_acc = 0;
+    }
+}
+
+/* §2.3 F2 refuse gate: is stream `s`'s label evidence too poor to trust a routed mismatch?
+ * Unhealthy H (|H−1| beyond the tolerance, ≥5 closed windows of evidence) — the Azorse
+ * label-flood discriminator — OR a fresh WILD window with the crossing's new base resting on
+ * fewer than 3 buffered packets (thin evidence during a flood). Healthy/unknown H trusts the
+ * tree (F1) — PATRIOT lives there. */
+static int ptv_glue_refuse_h(PtvDiscBuf *b, int s, int64_t wall_now)
+{
+    PtvDiscStreamState *ss;
+    if (s < 0 || s >= b->nb_streams)
+        return 0;
+    ss = &b->stream_state[s];
+    if (ss->h_wins >= 5 &&
+        llabs(ss->h_ema_q10 - 1024) > (int64_t)1024 * g_glue_htol / 100)
+        return 1;
+    if (ss->h_wild_wc && wall_now - ss->h_wild_wc <= 60000000) {
+        int i, npkt = 0;
+        for (i = 0; i < b->nb_packets; i++)
+            if (b->packets[i] && b->packets[i]->stream_idx == s &&
+                b->packets[i]->timeline == 1)
+                npkt++;
+        if (npkt < 3)
+            return 1;
+    }
+    return 0;
+}
+
 /* Flush: classify each held packet, KEEP NEW / DISCARD OLD, compute one
  * audio-derived applied_offset, apply it to all kept packets' pts+dts, and
  * release them in DTS order through demux_dispatch. Faithful to 0004's
@@ -501,6 +563,7 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
     int has_vid = 0, has_aud = 0;
     int pair_first_vid = 0;      /* 1.0.1-pre4: this flush is the event's first VIDEO crossing */
     int pair_inherit   = 0;      /* 1.0.1-pre4: audio-only flush adopted the event's video offset */
+    int refused        = 0;      /* 1.0.1-pre15 §2.3 F2: mismatch refused — per-stream butt-joint */
 
     if (b->nb_packets == 0) {
         ptv_disc_reset(b);
@@ -668,13 +731,47 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
                 pair_stamp = b->pair_vid_defined ? 1 : 2; /* band re-cross = final; no video yet = provisional */
             }
         }
+        /* 1.0.1-pre15 §2.3 F2 (#33): before ROUTING a mismatch to the content path, check the
+         * evidence QUALITY of the audio labels it was computed from — magnitude cannot
+         * discriminate (PATRIOT's 30.8s was REAL; Azorse's +31.078s was label-flood noise
+         * faithfully executed as a ~31s silence pad). Unhealthy label health H (or a thin new
+         * base during a flood window) → REFUSE: do NOT register; apply PER-STREAM OWN offsets
+         * (the pre-pre4 butt-joint, production-proven on exactly this source class), one loud
+         * line, refuse ledger + disturb_epoch bump (corrector freeze set, §5). Healthy H (F1)
+         * routes exactly as pre14. */
+        if (g_glueclass && pair_stamp == 1 && has_aud)
+            for (i = 0; i < b->nb_streams && i < (int)d->ifmt->nb_streams; i++) {
+                PtvDiscStreamState *ss = &b->stream_state[i];
+                int64_t mism;
+                if (!ss->has_new_base ||
+                    d->ifmt->streams[i]->codecpar->codec_type != AVMEDIA_TYPE_AUDIO)
+                    continue;
+                mism = b->applied_offset - ss->cumulative_ts_offset;
+                if (llabs(mism) > PTV_PAIR_EPS_US && ptv_glue_refuse_h(b, i, pnow)) {
+                    refused = 1;
+                    d->glue_refuse_cnt++;
+                    if (d->disturb_epoch)
+                        atomic_fetch_add_explicit(d->disturb_epoch, 1, memory_order_relaxed);
+                    av_log(NULL, AV_LOG_WARNING,
+                           "[PTV-GLUE] REFUSED mismatch %+.3fs (label health %.2f, refuse #%"PRId64") "
+                           "— per-stream butt-joint, residual left to sensor/corrector\n",
+                           (double)mism / AV_TIME_BASE,
+                           (double)ss->h_ema_q10 / 1024.0, d->glue_refuse_cnt);
+                }
+            }
         if (pair_stamp)
             for (i = 0; i < b->nb_streams && i < (int)d->ifmt->nb_streams; i++) {
                 PtvDiscStreamState *ss = &b->stream_state[i];
                 if (!ss->has_new_base ||
                     d->ifmt->streams[i]->codecpar->codec_type != AVMEDIA_TYPE_AUDIO)
                     continue;
-                if (pair_stamp == 1) {
+                if (refused) {
+                    /* F2: the stream keeps its OWN butt-joint offset; no registration. pair_has
+                     * closes its leg of the event so a later flood crossing cannot re-inherit. */
+                    ss->pair_applied_us = ss->cumulative_ts_offset;
+                    ss->pair_has        = 1;
+                    ss->pair_prov       = 0;
+                } else if (pair_stamp == 1) {
                     /* pre5 (D1): the shared offset overrode this stream's own butt-joint by more
                      * than the band → its label stream now carries that step; register it so the
                      * audio content path APPLIES it (aresample converges) instead of erasing.
@@ -745,7 +842,7 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
         int have = 0;
         if (has_vid && has_aud)      { so = b->applied_offset; mm = b->applied_offset - aud_off; have = 1; }
         else if (pair_inherit)       { so = b->applied_offset; mm = b->applied_offset - aud_off; have = 1; }
-        if (have && llabs(mm) > PTV_PAIR_EPS_US)
+        if (have && !refused && llabs(mm) > PTV_PAIR_EPS_US)   /* pre15: a REFUSED mismatch was NOT routed */
             av_log(NULL, AV_LOG_INFO,
                    "[PTV-GLUE] paired flush: shared_offset=%.3fs av_mismatch=%+.3fs -> audio content path\n",
                    (double)so / AV_TIME_BASE, (double)mm / AV_TIME_BASE);
@@ -774,6 +871,13 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
          * timeline — they ride at offset 0, exactly as the normal path would have
          * dispatched them had the buffer not been active. */
         eff_off = dp->timeline == 2 ? 0 : b->applied_offset;
+        /* pre15 §2.3 F2: a REFUSED flush butt-joints each crossing AUDIO stream with its OWN
+         * offset (video keeps the tree's choice, which equals its own when it crossed). */
+        if (refused && dp->timeline != 2 &&
+            dp->stream_idx < b->nb_streams &&
+            b->stream_state[dp->stream_idx].has_new_base &&
+            st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+            eff_off = b->stream_state[dp->stream_idx].cumulative_ts_offset;
         if (eff_off != 0) {
             pkt_off = av_rescale_q(eff_off, AV_TIME_BASE_Q, st->time_base);
             if (dp->pkt->dts != AV_NOPTS_VALUE) dp->pkt->dts += pkt_off;
@@ -803,13 +907,21 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
      * ts (e.g. audio +1175s rebased, then the very next packet at the raw 10s) → a huge
      * BACKWARD jump → aresample chokes → audio dies (sync_check "no audio"). Faithful to
      * 0004, which applies its per-stream offset to every subsequent packet, not just buffered. */
-    if (b->applied_offset != 0) {
+    if (b->applied_offset != 0 || refused) {
         int s;
         for (s = 0; s < b->nb_streams && s < (int)d->ifmt->nb_streams; s++)
             if (b->stream_state[s].has_new_base) {
-                d->wrap_off[s] += av_rescale_q(b->applied_offset, AV_TIME_BASE_Q,
+                /* pre15 §2.3 F2: a refused flush persists each crossing AUDIO stream's OWN
+                 * butt-joint offset (matching what the release loop applied above). */
+                int64_t po = b->applied_offset;
+                if (refused &&
+                    d->ifmt->streams[s]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+                    po = b->stream_state[s].cumulative_ts_offset;
+                if (!po)
+                    continue;
+                d->wrap_off[s] += av_rescale_q(po, AV_TIME_BASE_Q,
                                                d->ifmt->streams[s]->time_base);
-                rsync_post_edit(d, s, b->applied_offset);   /* pre9 sensor: LAYERA glue label edit */
+                rsync_post_edit(d, s, po);   /* pre9 sensor: LAYERA glue label edit */
                 /* 0.9.18.5: shift the stale jump-detection continuity ref too. last_dts_us is
                  * stored in the demux loop from the PRE-offset raw DTS of the last buffered
                  * packet; once wrap_off above carries the applied offset, the next normal-path
@@ -817,7 +929,7 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
                  * detect→flush cycle (applied_offset=-0.000s + a ~50ms hold) after every glue.
                  * See analysis/ptvencoder-intouch-desync-analysis.md §1.6 / §5 hygiene fix 1. */
                 if (b->stream_state[s].last_dts_us != AV_NOPTS_VALUE)
-                    b->stream_state[s].last_dts_us += b->applied_offset;
+                    b->stream_state[s].last_dts_us += po;
             }
         /* pre5 (D3): prog_off moves ONLY when this flush moved the VIDEO labels (has_vid, the
          * same gate as disc_resid_us below). Sparse sub/data/SCTE-35 ride the VIDEO/program
@@ -861,6 +973,20 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
             ss->pair_has        = 1;             /* now on the event's final offset */
             if (llabs(corr) <= PTV_PAIR_EPS_US)
                 continue;                        /* within the equality band — no step worth taking */
+            /* pre15 §2.3 F2 (retro leg): same unbounded-`corr` exposure as 2b when the
+             * provisional offset was computed from lying labels — refuse leaves the stream
+             * on its provisional own butt-joint (no shift, no registration). */
+            if (g_glueclass && ptv_glue_refuse_h(b, s, av_gettime_relative())) {
+                d->glue_refuse_cnt++;
+                if (d->disturb_epoch)
+                    atomic_fetch_add_explicit(d->disturb_epoch, 1, memory_order_relaxed);
+                av_log(NULL, AV_LOG_WARNING,
+                       "[PTV-GLUE] REFUSED retro mismatch %+.3fs (label health %.2f, refuse #%"PRId64") "
+                       "— stream %d keeps its provisional butt-joint\n",
+                       (double)corr / AV_TIME_BASE,
+                       (double)ss->h_ema_q10 / 1024.0, d->glue_refuse_cnt, s);
+                continue;
+            }
             d->wrap_off[s] += av_rescale_q(corr, AV_TIME_BASE_Q, d->ifmt->streams[s]->time_base);
             rsync_post_edit(d, s, corr);                    /* pre9 sensor: retro-correct label edit */
             if (ss->last_dts_us   != AV_NOPTS_VALUE) ss->last_dts_us   += corr;
@@ -1081,6 +1207,65 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                             av_log(NULL, AV_LOG_INFO,   /* v0.9.13: always-on — a real source audio dropout, rare + meaningful */
                                    "[PTV-DISCONT] stream %d: %+"PRId64"ms audio GAP — NOT absorbed (aresample pads; wall_gap=%"PRId64"ms)\n",
                                    pkt->stream_index, av_rescale_q(delta, st->time_base, (AVRational){1,1000}), wall_gap / 1000);
+                            /* 1.0.1-pre15 §2.5 gap-verdict propagation (#33, the (d) fix): the verdict
+                             * above was invisible to LAYERA — the disc-buffer block runs after this on
+                             * the same packet, sees the same >1s step against stream_state[].last_dts_us,
+                             * arms, and its flush tree 3b BUTT-JOINTS the gap this discriminator just
+                             * preserved (fixture: 8s audio-PID-null → oracle +7986ms audio-EARLY; the
+                             * rr14-A4 4.6s bake is the same chain). Advance the buffer's continuity ref
+                             * to this packet's post-unwrap position so ptv_disc_detect_jump sees no jump:
+                             * no cycle arms, no flush, no butt-joint — the labels carry the gap to the
+                             * graph door where AGLUE GAP-pads it (PATRIOT-proven path for multi-second
+                             * forward steps). last_sent_dts is deliberately left alone (it advances as
+                             * the resumed packets dispatch). EXTRA GUARD beyond the discriminator: the
+                             * VIDEO stream must be wall-FRESH (flowing through the audio gap) — after a
+                             * whole-program outage whose first post-resume packet is AUDIO, video_fwd_us
+                             * is stale and the discriminator mis-reads the program splice as an audio
+                             * gap; propagating there would split the event one-sidedly (video leg
+                             * flush-erased, audio leg padded = +gap desync). Video-fresh ⇒ genuinely
+                             * audio-only. Byte-identical everywhere the discriminator doesn't fire. */
+                            if (g_glueclass && g_layera && d->disc &&
+                                pkt->stream_index < d->disc->nb_streams &&
+                                d->vstream >= 0 &&
+                                d->wrap_wall_last[d->vstream] > 0 &&
+                                wall_now - d->wrap_wall_last[d->vstream] <= 2000000) {
+                                d->disc->stream_state[pkt->stream_index].last_dts_us =
+                                    av_rescale_q(raw + d->wrap_off[pkt->stream_index],
+                                                 st->time_base, AV_TIME_BASE_Q);
+                                av_log(NULL, AV_LOG_INFO,
+                                       "[PTV-DISCONT] stream %d: GAP verdict propagated to the disc buffer "
+                                       "— no LAYERA cycle for this gap (labels carry it; AGLUE pads)\n",
+                                       pkt->stream_index);
+                            }
+                        }
+                    }
+                    /* 1.0.1-pre15 §2.2-3a packet-layer leg (#33, the b1 fix): a backward AUDIO step
+                     * matching a recent still-open GAP-pad on that track is the pad's RETURN leg.
+                     * The §5.A.2 absorber would relabel-erase it here (backward >80ms), permanently
+                     * baking the pad's inserted silence (rr14 A3: +150ms pad + −150ms erase = REAL
+                     * −150ms bake, zero flush lines). Decline to absorb — the step flows to AGLUE,
+                     * whose pad-ledger match APPLIES it (aresample drops the synthesized silence =
+                     * the round-trip cancels). Published-newest-entry read is ADVISORY: a stale hit
+                     * only skips one absorb and AGLUE then falls back to today's erase. In-Touch
+                     * both-stream backward steps carry no matching open pad → absorb unchanged. */
+                    if (g_glueclass && !is_gap && delta < 0 && ct == AVMEDIA_TYPE_AUDIO) {
+                        int64_t step_us = av_rescale_q(delta, st->time_base, AV_TIME_BASE_Q);
+                        int j2;
+                        for (j2 = 0; j2 < d->n_audio; j2++) {
+                            int64_t p, pw;
+                            if (d->astream[j2] != pkt->stream_index)
+                                continue;
+                            p  = atomic_load_explicit(&g_pad_pub_step[d->aglobal[j2]], memory_order_acquire);
+                            pw = atomic_load_explicit(&g_pad_pub_wc[d->aglobal[j2]],   memory_order_relaxed);
+                            if (p > 0 && wall_now - pw <= PTV_GLUE_PAD_TTL_US &&
+                                llabs(step_us + p) <= FFMAX(80000, p / 4)) {
+                                av_log(NULL, AV_LOG_INFO,
+                                       "[PTV-DISCONT] stream %d: %+"PRId64"ms backward step matches an open "
+                                       "GAP-pad (+%"PRId64"ms) — NOT absorbed (pad round-trip; AGLUE applies)\n",
+                                       pkt->stream_index, step_us / 1000, p / 1000);
+                                is_gap = 1;   /* reuse the no-absorb exit; wrap_off untouched */
+                                break;
+                            }
                         }
                     }
                     if (is_gap) goto absorb_done;
@@ -1226,6 +1411,11 @@ void *demux_thread(void *arg)
                  * not classify it against another stream's borrowed bases (see ptv_disc_flush). */
                 int own_cont = last_dts != AV_NOPTS_VALUE &&
                                llabs(raw_dts - last_dts) <= PTV_DISC_THRESHOLD_US;
+                /* 1.0.1-pre15 E4 (#33): fold this packet into the stream's label-health EMA —
+                 * quiet path only (buffered/flush windows excluded by design, §2.1). */
+                if (g_glueclass && !b->active && !b->flushing && sidx < b->nb_streams)
+                    ptv_glue_h_feed(&b->stream_state[sidx], raw_dts, last_dts,
+                                    av_gettime_relative());
                 /* Arm buffering on a fresh jump. */
                 if (!b->active && ptv_disc_detect_jump(d, b, sidx, raw_dts, last_dts)) {
                     b->active = 1;
@@ -1500,6 +1690,56 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
          * frame, like a dropped one, becomes a content gap the position-anchored composite leaps
          * across → desync. PTV_KEEP_CORRUPT=1 disables (lets the decoder try to use them). */
         if (out->stream_index == d->vstream) d->vcorrupt++;
+        else {
+            /* 1.0.1-pre15 #33 §3 (NBS manifestation (c)): audio was discarded here SILENTLY,
+             * UNCOUNTED — the track's thread blocks on recv (no recovery logic can run), ADECWD
+             * is structurally blind (wd_pkts never advances), the sensor label-walks and the
+             * corrector refuses: restart-only. Part 1 (UNCONDITIONAL, even under
+             * PTV_NO_GLUECLASS): count per track + rate-limited [PTV-ADISC] + acor= stats.
+             * Part 2 (g_glueclass + OPT-IN PTV_NBS_FILL): while the track's packets keep
+             * arriving-and-discarding but nothing has decoded for >2s and video is alive, send
+             * one FILL sentinel per quantum — the audio thread synthesizes stamped silence at
+             * the expected next graph-door pts, so labels stay dense, delivery stays alive and
+             * the sensor keeps a valid ≈0 reading instead of a label-walk. */
+            int k;
+            for (k = 0; k < d->n_audio; k++) {
+                int64_t nw;
+                if (d->astream[k] != out->stream_index)
+                    continue;
+                nw = av_gettime_relative();
+                d->acorrupt[k]++;
+                atomic_fetch_add_explicit(&g_acorrupt, 1, memory_order_relaxed);
+                if (nw - d->adisc_win_us[k] >= 10000000) {
+                    if (d->adisc_win_n[k])
+                        av_log(NULL, AV_LOG_WARNING,
+                               "[PTV-ADISC] a%d corrupt-discard %"PRId64" pkts in last 10s — source "
+                               "undecodable phase (total %"PRId64")\n",
+                               d->aglobal[k], d->adisc_win_n[k], d->acorrupt[k]);
+                    d->adisc_win_us[k] = nw;
+                    d->adisc_win_n[k]  = 0;
+                }
+                d->adisc_win_n[k]++;
+                if (g_glueclass && g_nbs_fill &&
+                    nw - d->nbs_last_fill_us[k] >= g_nbs_quantum_us) {
+                    int64_t fw = atomic_load_explicit(&g_adec_frame_wc[d->aglobal[k]],
+                                                      memory_order_relaxed);
+                    int64_t va = atomic_load_explicit(&g_v_arrive_wc, memory_order_relaxed);
+                    if (fw && nw - fw > 2000000 && va && nw - va < 5000000) {
+                        AVPacket *fs = av_packet_alloc();
+                        if (fs) {
+                            fs->stream_index = out->stream_index;
+                            fs->flags |= PTV_PKT_FLAG_NBS_FILL;
+                            atomic_store_explicit(&g_nbs_fill_st[d->aglobal[k]], 1,
+                                                  memory_order_relaxed);
+                            if (av_thread_message_queue_send(d->audio_q[k], &fs,
+                                                             AV_THREAD_MESSAGE_NONBLOCK) < 0)
+                                av_packet_free(&fs);   /* queue full/closed — no fill needed/possible */
+                        }
+                        d->nbs_last_fill_us[k] = nw;
+                    }
+                }
+            }
+        }
         av_packet_free(&out);
         return 0;
     }
@@ -1507,13 +1747,18 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
             if (d->drop_until_kf) {   /* P2 2b: post-splice → drop video until the next IDR (bounded by the escape) */
                 if (out->flags & AV_PKT_FLAG_KEY) {
                     d->drop_until_kf = 0;                                  /* IDR → clean resume; send it */
-                    if (g_diag) av_log(NULL, AV_LOG_INFO,
+                    /* 1.0.1-pre15 #33 (b4, owner call 2026-07-18): DUKF's post-splice content
+                     * drop is ACCEPTED as a bounded (≤GOP) known cost, but it gets always-on
+                     * one-line observability — it was g_diag-only, a candidate contributor to
+                     * small flushless bakes that never showed in fleet logs. Rare by
+                     * construction (arms only on ≥1s video jumps). */
+                    av_log(NULL, AV_LOG_INFO,
                         "[PTV-DUKF] resume at keyframe — dropped %"PRId64" video frames over %"PRId64"ms; frame_q now %d (it drained while video was paused)\n",
                         d->vdrop - d->kf_arm_vdrop, (av_gettime_relative() - d->kf_arm_us)/1000,
                         atomic_load_explicit(&g_frameq_depth, memory_order_relaxed));
                 } else if (av_gettime_relative() - d->kf_arm_us > g_dukf_escape_us) {
                     d->drop_until_kf = 0;                                  /* escape: no IDR in time → don't freeze */
-                    if (g_diag) av_log(NULL, AV_LOG_WARNING,
+                    av_log(NULL, AV_LOG_WARNING,   /* pre15: always-on (see the resume line above) */
                         "[PTV-DUKF] escape — no IDR within %"PRId64"ms; dropped %"PRId64" video frames; frame_q now %d\n",
                         g_dukf_escape_us/1000, d->vdrop - d->kf_arm_vdrop,
                         atomic_load_explicit(&g_frameq_depth, memory_order_relaxed));

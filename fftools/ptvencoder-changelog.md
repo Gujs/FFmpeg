@@ -7,7 +7,81 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
-(7l) RESIDUAL-SYNC CORRECTOR — pre14, the actuation half of the residual-sync
+(7m) GLUE CLASSIFICATION — pre15, task #33. NORMATIVE DESIGN =
+analysis/ptvencoder-33-glue-classification.md (owner-approved 2026-07-18 with
+all five §7 questions resolved to the doc's recommendations). A
+classification/ROUTING fix on the existing pre4–pre7 glue machinery — the
+flush decision tree, AGLUE verdicts, pair-expect handshake and absorber all
+stay; what changes is which OWNER each one-sided audio-glue event class routes
+to. One revert: PTV_NO_GLUECLASS=1 (wholesale). The five closures:
+(d) GAP-VERDICT PROPAGATION (§2.5, demux_unwrap): the gap discriminator's
+verdict was invisible to LAYERA — the disc buffer saw the same >1s step,
+armed, and its flush BUTT-JOINTED the gap the discriminator just preserved
+(fixture: 8s audio-PID-null → oracle +7986ms audio-EARLY; rr14-A4's 4.6s bake
+= same chain). Now an audio-only, wall-absent, VIDEO-FRESH gap also advances
+the disc buffer's continuity ref: no cycle, no flush — labels carry the gap
+to AGLUE, which pads (PATRIOT-proven path). Video-fresh guard: after a
+whole-program outage whose first resumed packet is audio, video's wall ref is
+stale too → no propagation → today's LAYERA shape (fx-att-u900/b80 pinned).
+(b1) PAD ROUND-TRIP CANCEL (§2.2 rule 3a, E5 pad ledger): every unregistered
+forward GAP verdict opens a ledger entry {step,wall} (4 slots, 120s TTL); a
+backward step matching an open pad (|step+pad| ≤ max(80ms, pad/4)) is the
+pad's RETURN leg → APPLIED (aresample drops the pad's inserted silence),
+never relabel-erased (rr14 A3: +150/−150 pair left a REAL −150ms bake). The
+newest open entry is published per track so the demux §5.A.2 absorber (which
+otherwise erases sub-1s backward steps before AGLUE sees them — the actual A3
+erase site) declines the return leg and lets it flow to AGLUE's match.
+(b3) LATE PAIR-EXPECT MATCH: a registered step whose TTL expired still
+consumes on a VALUE match (±[-250,+500]ms of a >500ms step is the real
+collision guard; a deep bank legally out-lives any fixed TTL — review-2 F1).
+PTV_PAIR_EXPECT_TTL_US env override (TEST ONLY, G6).
+(a) EVIDENCE-QUALITY REFUSE (§2.3, ptv_disc_flush): NEW per-dense-stream
+label-health H = windowed EMA of Δdts/Δwall over ~30s (quiet path only;
+healthy ≈ 1.0 ±5%, PTV_GLUE_HTOL_PCT tunes). Before a flush routes a >500ms
+A-vs-V mismatch to the content path (2b/3a stamp + 2d retro), unhealthy H (or
+a <3-packet new base during a fresh wild window) → REFUSE: per-stream OWN
+butt-joints (the pre-pre4 posture, owner call Q1), loud [PTV-GLUE] REFUSED
+line, refuse ledger + disturb_epoch bump (corrector freeze). Magnitude cannot
+discriminate — PATRIOT's 30.8s was REAL (healthy H routes it unchanged);
+Azorse's +31.078s was flood noise faithfully executed as a ~31s pad.
+§2.4 REALIZATION TRIPWIRE: every non-erase verdict (GAP-pad / FLUSH-APPLY /
+pad-cancel / above-cap stand-aside) arms pend_comp; if the pre11 slip probe
+still parks near the verdict size 2s later (hard comp is instantaneous by
+design — expected NEVER on forward, the G7 witness for backward >1s drops),
+synthesize the parked remainder at the swr boundary (swr_inject_silence /
+swr_drop_output — the resampler's own primitives, not a second actuator) +
+WARNING + glue_events bump (corrector freeze). Steps >10s get an operator
+ALERT line but stay UNBOUNDED (invariant mandate, owner call Q5).
+(c) NBS STARVATION — §3: the demux corrupt-discard dropped every
+corrupt-flagged packet on ALL streams but counted video only; a corrupted
+audio phase (~46 pkt/s, Azorse broken-7.1-AAC class) starved the track
+SILENTLY upstream of audio_q (thread blocked in recv; ADECWD structurally
+blind — wd_pkts never advances; restart-only). Part 1 UNCONDITIONAL (even
+under the kill): per-track acorrupt counter + rate-limited [PTV-ADISC] line +
+acor= stats field. Part 2 OPT-IN (PTV_NBS_FILL=1, owner call Q2 —
+observability first): while the track's packets arrive-and-discard with
+nothing decoded >2s and video alive, the demux sends a FILL sentinel per
+quantum (zero-size flagged pkt on audio_q — never counted as a packet, so
+ADECWD cannot churn); the audio thread synthesizes stamped silence at the
+expected next graph-door pts (labels dense, delivery alive, sensor valid ≈0,
+corrector held off via the fill_active freeze). First real frame = resume
+anchor: forward remainder GAP-pads; backward overlap is dropped (our own
+synthesized silence — never erased). Tracks BORN into a broken phase stay
+dead until real frames arrive (0.9.17.1 AFMT retry owns that).
+(b4) DUKF observability (owner call Q3: accept + log): the resume/escape
+drop-count lines promoted PTV_DIAG → always-on (arms only on ≥1s video jumps
+— rare); no compensation this round.
+CORRECTOR HANDOFF (§5): refuse → disturb_epoch; fill_active → event-active
+"nbs silence-fill" (R is synthetic-flat on a filled track); pad-cancel and
+tripwire synthesis → glue_events. Structural ownership of gap-shaped events,
+pad round-trips, healthy-source routed mismatches and starvation phases moves
+to the glue; the corrector keeps external/unknowable residuals only.
+DEVIATION from the doc (flagged): §5 rule 4 asks the tripwire synthesis to
+post an E_a ledger edit; implemented as a glue_events freeze WITHOUT the R
+shift — the synthesis completes the resampler's own label-declared
+compensation (slip→0 makes the sensor self-consistent), and a ledger post
+would permanently offset R by the synthesized amount on a path expected never
+to fire forward. Revisit if G7-class syntheses ever fire in production.
 supervisor (task #44, the owner's PLL lineage). NORMATIVE DESIGN =
 analysis/ptvencoder-corrector-design.md (owner-approved 2026-07-16 with §9
 resolutions folded in). Gated on the sensor soak CERTIFICATION (2026-07-16,
