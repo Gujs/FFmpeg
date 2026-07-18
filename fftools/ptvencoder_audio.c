@@ -916,6 +916,24 @@ static int audio_drain_fg(AudioState *a)
                     if (llabs(slip) <= llabs(a->pend_comp_us) / 10) {
                         a->pend_comp_us = 0;                       /* realized */
                     } else if (av_gettime_relative() - a->pend_comp_wc > 2000000) {
+                        /* pre16 #47-B (Fashion 2026-07-18): AUTHORITY CLAMP. The tripwire had
+                         * none — a +11594s verdict parked slip at +8798s and the synthesis
+                         * injected ~2800s at the swr, pinning the channel at async for hours.
+                         * A parked slip beyond PTV_GLUE_TW_CAP_US (2s — the tripwire deadline
+                         * itself; every legitimate hard-comp verdict realizes instantly and
+                         * the largest real one ever seen is PATRIOT's 30.8s, which realized)
+                         * is evidence of upstream chaos, NOT something to actuate: NO
+                         * synthesis, one ERROR line, corrector freeze, verdict retired. */
+                        if (llabs(slip) > PTV_GLUE_TW_CAP_US) {
+                            a->glue_events++;                      /* corrector freeze (§5) */
+                            av_log(NULL, AV_LOG_ERROR,
+                                   "[PTV-AGLUE] a%d(in%d) verdict %+"PRId64"ms NOT realized (slip parked "
+                                   "%+"PRId64"ms) — BEYOND the %ds tripwire authority: refusing to "
+                                   "synthesize (upstream label chaos; residual to sensor/corrector)\n",
+                                   a->dbg_k, a->dbg_in, a->pend_comp_us / 1000, slip / 1000,
+                                   (int)(PTV_GLUE_TW_CAP_US / AV_TIME_BASE));
+                            a->pend_comp_us = 0;
+                        } else {
                         int irate = a->fg_swr_flt ? a->fg_swr_flt->inputs[0]->sample_rate : 0;
                         int orate = a->fg_swr_flt ? a->fg_swr_flt->outputs[0]->sample_rate : 0;
                         if (a->fg_swr && slip > 0 && irate > 0)
@@ -930,6 +948,7 @@ static int audio_drain_fg(AudioState *a)
                                a->dbg_k, a->dbg_in, a->pend_comp_us / 1000, slip / 1000,
                                a->tw_synth_cnt);
                         a->pend_comp_us = 0;
+                        }
                     }
                 }
                 m = out_us - (src_abs_us - inj) - slip;

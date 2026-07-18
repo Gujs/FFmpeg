@@ -171,6 +171,16 @@ typedef struct DlvGate {
  *   |step + pad| <= max(80ms, pad/4), pad younger than the TTL. */
 #define PTV_GLUE_PAD_LED     4
 #define PTV_GLUE_PAD_TTL_US  (120LL * AV_TIME_BASE)
+/* 1.0.1-pre16 #47 (Fashion 2026-07-18): sanity bounds the two live incidents demanded.
+ * MAX_ROUTE: a flush mismatch beyond this is REFUSED regardless of label health — source
+ * A/V misalignment beyond ~2min has no content-alignment reality (largest REAL routed
+ * mismatch ever observed: PATRIOT +30.8s; Fashion's ±11594s opposite-jump pair computed a
+ * +23188s "mismatch" and pre15 routed it to the resampler). TW_CAP: the §2.4 tripwire may
+ * synthesize at most this much at the swr boundary; a parked slip beyond it is upstream
+ * chaos, not something to actuate (Fashion: tripwire synthesized ~2800s and pinned the
+ * channel at async for hours). */
+#define PTV_GLUE_MAX_ROUTE_US (120LL * AV_TIME_BASE)
+#define PTV_GLUE_TW_CAP_US    (2LL * AV_TIME_BASE)
 /* NBS silence-fill sentinel (§3): a zero-size AVPacket carrying this PRIVATE flag bit on a
  * track's audio_q tells the audio thread to synthesize one quantum of silence at the track's
  * expected next graph-door pts (demux-side corrupt-discard starvation — the thread itself is
@@ -789,6 +799,8 @@ typedef struct PtvDiscBuf {
     int                 cycle_trigger;      /* 1.0.1-pre7: stream whose detect ARMED this buffer cycle
                                              * (-1 = none); scopes the continuing-stream keep (see
                                              * ptv_disc_flush) to transcoded-triggered cycles */
+    int                 partial_ext;        /* 1.0.1-pre16 #47-C: this cycle already got its ONE
+                                             * 500ms partial-hold extension (sibling-jump wait) */
 } PtvDiscBuf;
 
 typedef struct DemuxArgs {
@@ -817,6 +829,16 @@ typedef struct DemuxArgs {
     int64_t               adisc_win_n[PTV_MAX_AUDIO]; /* discards in the open window */
     int64_t               nbs_last_fill_us[PTV_MAX_AUDIO]; /* last FILL sentinel sent (quantum pace) */
     int64_t               glue_refuse_cnt;            /* §2.3 F2 refuse ledger (per input) */
+    /* 1.0.1-pre16 #47-A: per-stream snapshot of d->vpkt at this stream's last packet — at a
+     * gap verdict, (d->vpkt − gap_vsnap[stream]) = video packets that arrived DURING the gap.
+     * The R1 freshness guard measured video's AGE at verdict time, which cannot distinguish
+     * "video flowed through the gap" from "video resumed 2ms earlier" (TWN incident). */
+    int64_t              *gap_vsnap;
+    /* 1.0.1-pre16 #47-C: last KNOWN jump per media type (0=video 1=audio): magnitude + wall.
+     * Stamped at LAYERA jump detects and audio GAP verdicts; consulted before a PARTIAL flush
+     * releases one-sided (the sibling's matching jump = evidence the event is two-legged). */
+    int64_t               sib_jump_us[2];
+    int64_t               sib_jump_wall[2];
     int                   drop;          /* non-blocking + drop on full (network input) */
     PassStream           *pass;          /* copy-passthrough: extra audio, subs, data */
     int                   n_pass;
@@ -938,6 +960,7 @@ typedef struct Input {
     int64_t              *wrap_last;         /* per stream: last RAW ts (wrap detection) */
     int64_t              *wrap_wall_last;    /* per stream: wall-clock (us) of last packet (gap-vs-splice discriminator) */
     int64_t              *edit_us;           /* pre9 sensor: per-stream label-edit ledger storage (µs) */
+    int64_t              *gap_vsnap;         /* 1.0.1-pre16 #47-A: per-stream d->vpkt snapshot storage */
     PtvDiscBuf            disc;              /* legacy-0004 buffer-classify-discard state (used only when g_layera) */
     /* 1.0.1-pre5 shared-flush expected-step handshake storage (D1) — one slot per GLOBAL
      * transcoded track index (only the tracks sourced from this input are wired). Demux thread

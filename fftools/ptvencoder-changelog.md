@@ -7,6 +7,59 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(7o) GLUE CLASSIFICATION LIVE-INCIDENT FIXES — pre16, task #47. Two deployed-
+pre15 incidents (The_Word_Network/cor-3, Fashion/live-transcoder 2026-07-18)
+exposed three defects in (7m)'s classifier; all three fixed, incident shapes
+fixture-reproduced and flipped, glueclass + pre16 gates re-run.
+DEFECT A (TWN, ordinary/high-incidence): the rr15 §2.5 propagation guard
+tested video's packet AGE at verdict time (≤ min(2s, wall_gap/2)) — after a
+whole-program 10s outage where video resumed 2ms BEFORE audio, video's own
+resume packet satisfied it → GAP mis-verdict propagated → audio LAYERA leg
+killed → video's +10s jump flushed PARTIAL one-sided → R=−10s baked flat
+(corrector correctly disarmed implausible). Fixed: propagation now requires
+video to have PROGRESSED THROUGH the gap — ≥ one video packet per 80ms of
+gap (min 3) arrived since the audio stream's last packet (new per-stream
+gap_vsnap of the demux vpkt counter), plus the 2s liveness belt. A
+whole-program outage yields ~0-5 resume packets and falls through to the
+shared LAYERA flush (the pre14 path, which handles it perfectly), in EITHER
+resume order.
+DEFECT B (Fashion, exotic/catastrophic): the §2.4 tripwire had NO authority
+clamp — an insane routed verdict (+11594s, see C) parked slip at +8798s and
+the tripwire synthesized ~2800s at the swr boundary, pinning the channel at
+async for hours. Fixed: synthesis authority = PTV_GLUE_TW_CAP_US (2s — every
+legitimate hard-comp verdict realizes instantly; the largest real one ever
+routed, PATRIOT 30.8s, realized); beyond it: NO synthesis, one ERROR line,
+corrector freeze, verdict retired.
+DEFECT C (common root): the PARTIAL flush release applied a one-sided
+re-base with no classification — manifestation (a)'s partial=1 path, never
+reached by (7m)'s rules. Two-part fix, both evidence-based and fail-safe to
+pre14:
+ C1 ROUTE CAP: a flush mismatch beyond PTV_GLUE_MAX_ROUTE_US (120s) is
+ REFUSED (per-stream butt-joint + loud line) regardless of label health —
+ Fashion's opposite ±11594s jumps computed a +23188s "mismatch"; magnitude
+ IS decisive out there (no source A/V misalignment reality exceeds minutes;
+ 4x headroom over PATRIOT). Applied at the 2b/3a routing pre-scan and the
+ 2d retro leg.
+ C2 PARTIAL HOLD (brief option (i), bounded): when a flush would release
+ with only one media type crossed, offset > EPS, and the MISSING sibling
+ type shows a KNOWN jump of matching magnitude within the pairing window
+ (new per-input LAYERA-detect + gap-verdict stamps) that has NOT yet
+ participated in the event window, hold the cycle ONE extra 500ms so the
+ sibling leg can cross into the same cycle and the flush runs SHARED. If it
+ still doesn't cross: release as pre14 + loud WARNING. Option (ii)
+ (retro-apply to the sibling) was REJECTED as unsafe — the sibling's jumped
+ packets may already have dispatched, so a retroactive wrap_off shift
+ injects a second opposite step at the graph door; option (iii) reduces to
+ today's release for a leg that never crossed. The hold is inert on every
+ pinned partial fixture (gate-1/tb30: the sibling already participated —
+ pair_vid_defined / pair_has short-circuits).
+Gates: FX-TWN (10s whole-program outage, video-first resume by ~25ms) now
+shared-flushes identically to pre14, no propagation, no partial one-sided
+re-base; FX-FASHION (opposite ±11594s double jump, video to negative dts)
+refuses the route (cap), no tripwire synthesis, both legs butt-jointed,
+oracle tail ≈0; G1/G2 genuine gaps still propagate; glueclass G9 locked set
++ G10 byte gates re-run green vs pre16.
+
 (7n) MULTIVIEW SENSOR PORT — pre16, task #45 items 1+2. NORMATIVE DESIGN =
 analysis/ptvencoder-mv-sensor-port.md (owner-approved 2026-07-18 with all
 five §11 questions resolved to the doc's recommendations). Every

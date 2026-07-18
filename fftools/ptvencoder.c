@@ -1483,7 +1483,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         inputs[k].wrap_last = av_malloc_array(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].wrap_last));
         inputs[k].wrap_wall_last = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].wrap_wall_last)); /* 0 = no prev packet yet */
         inputs[k].edit_us   = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].edit_us));   /* pre9 sensor label-edit ledger */
-        if (!inputs[k].wrap_off || !inputs[k].wrap_last || !inputs[k].wrap_wall_last || !inputs[k].edit_us) { ret = AVERROR(ENOMEM); goto end; }
+        inputs[k].gap_vsnap = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].gap_vsnap)); /* pre16 #47-A: vpkt snapshots */
+        if (!inputs[k].wrap_off || !inputs[k].wrap_last || !inputs[k].wrap_wall_last || !inputs[k].edit_us || !inputs[k].gap_vsnap) { ret = AVERROR(ENOMEM); goto end; }
         for (si = 0; si < (int)inputs[k].ifmt->nb_streams; si++) inputs[k].wrap_last[si] = AV_NOPTS_VALUE;
         if (g_layera) {   /* legacy-0004 buffer-classify-discard state (only when enabled) */
             if ((ret = ptv_disc_init(&inputs[k].disc, PTV_DISC_CAPACITY,
@@ -2009,6 +2010,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         d->wrap_off = inputs[kk].wrap_off; d->wrap_last = inputs[kk].wrap_last;
         d->wrap_wall_last = inputs[kk].wrap_wall_last; d->video_fwd_us = 0;
         d->edit_us = inputs[kk].edit_us;                /* pre9 sensor: per-stream label-edit ledger */
+        d->gap_vsnap = inputs[kk].gap_vsnap;            /* pre16 #47-A: per-stream vpkt snapshots */
         d->rsync_slot = kk;                             /* pre16: EVERY input publishes its ledgers to g_rsx,
                                                          * video keyed by this slot (was single-input-only) */
         d->shed_wall = &inputs[kk].shed_wall;           /* pre16: per-input self-shed stamp */
@@ -2185,6 +2187,7 @@ end:
         av_freep(&inputs[k].wrap_last);
         av_freep(&inputs[k].wrap_wall_last);
         av_freep(&inputs[k].edit_us);
+        av_freep(&inputs[k].gap_vsnap);
         ptv_disc_free(&inputs[k].disc);   /* legacy-0004 buffer (no-op if never inited) */
         if (inputs[k].ifmt) avformat_close_input(&inputs[k].ifmt);
         pthread_mutex_destroy(&inputs[k].h0_lock);

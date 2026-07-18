@@ -223,6 +223,7 @@ static void ptv_disc_reset(PtvDiscBuf *b)
     b->buffer_start_time = 0;
     b->applied_offset    = 0;
     b->cycle_trigger     = -1;
+    b->partial_ext       = 0;   /* pre16 #47-C: per-cycle hold extension */
 }
 
 /* 1.0.1-pre4 shared flush: close the pairing window — forget the event's video-defined offset
@@ -447,6 +448,14 @@ static int ptv_disc_detect_jump(DemuxArgs *d, PtvDiscBuf *b, int stream_idx,
         ss->has_new_base = 1;
     }
     b->jump_detected = 1;
+    if (stream_idx >= 0 && stream_idx < (int)d->ifmt->nb_streams) {
+        /* pre16 #47-C: remember the last KNOWN jump per media type — the partial-release
+         * hold consults it (a matching sibling jump = evidence the event is two-legged). */
+        int ct = d->ifmt->streams[stream_idx]->codecpar->codec_type;
+        int mi = ct == AVMEDIA_TYPE_VIDEO ? 0 : 1;
+        d->sib_jump_us[mi]   = delta;
+        d->sib_jump_wall[mi] = av_gettime_relative();
+    }
     av_log(NULL, AV_LOG_INFO,   /* v0.9.13: always-on — a glue is rare (few/hour worst case) and operators need it in the log */
            "[PTV-LAYERA] jump on stream %d: %.3fs -> %.3fs (delta=%.3fs) — buffering\n",
            stream_idx, (double)last_dts / AV_TIME_BASE,
@@ -558,6 +567,70 @@ static int ptv_glue_refuse_h(PtvDiscBuf *b, int s, int64_t wall_now)
             return 1;
     }
     return 0;
+}
+
+/* 1.0.1-pre16 #47-C (TWN/Fashion 2026-07-18): a PARTIAL flush (only one media type
+ * crossed) applies a one-sided re-base with NO classification — manifestation (a)'s
+ * partial=1 path, the one shape the pre15 flush rules never reached. When the MISSING
+ * sibling type showed a KNOWN jump of matching magnitude within the pairing window
+ * (LAYERA detect / gap-verdict stamps) and has NOT yet participated in this event window,
+ * hold the cycle ONE extra 500ms so the sibling leg can cross into the SAME cycle and the
+ * flush runs SHARED (option (i) of the #47 brief — bounded wait; (ii) retro-applying the
+ * offset to the sibling is unsafe because its jumped packets may already have dispatched,
+ * and (iii) reduces to today's release for a leg that never crossed). If the sibling still
+ * does not cross, the release proceeds as pre14 with a loud line. Returns 1 = hold. */
+static int ptv_disc_partial_hold(DemuxArgs *d, PtvDiscBuf *b)
+{
+    int i, has_v = 0, has_a = 0, sib, trig;
+    int64_t own, sj, sw, now;
+    PtvDiscStreamState *ts;
+
+    if (!g_glueclass || !g_shared_flush || b->partial_ext || b->nb_packets == 0)
+        return 0;
+    for (i = 0; i < b->nb_streams && i < (int)d->ifmt->nb_streams; i++) {
+        if (!b->stream_state[i].has_new_base)
+            continue;
+        if (d->ifmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+            has_v = 1;
+        else if (d->ifmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+            has_a = 1;
+    }
+    if (has_v == has_a)
+        return 0;                               /* shared (or empty) — not a partial */
+    sib  = has_v ? 1 : 0;                       /* the missing media type */
+    trig = b->cycle_trigger;
+    if (trig < 0 || trig >= b->nb_streams)
+        return 0;
+    ts = &b->stream_state[trig];
+    if (!ts->has_new_base || ts->last_sent_dts == AV_NOPTS_VALUE)
+        return 0;
+    own = ts->last_sent_dts - ts->new_timeline_base;   /* the would-be one-sided offset */
+    if (llabs(own) <= PTV_PAIR_EPS_US)
+        return 0;                               /* bookkeeping-scale — release as today */
+    now = av_gettime_relative();
+    sj = d->sib_jump_us[sib];
+    sw = d->sib_jump_wall[sib];
+    if (!sw || now - sw > PTV_PAIR_WINDOW_US)
+        return 0;                               /* no recent sibling jump known */
+    if (llabs(llabs(sj) - llabs(own)) > FFMAX(2 * PTV_PAIR_EPS_US, llabs(own) / 4))
+        return 0;                               /* magnitudes unrelated — independent events */
+    if (sib == 0) {
+        if (b->pair_vid_defined)
+            return 0;                           /* video already defined this event (pre5 pairing owns it) */
+    } else {
+        for (i = 0; i < b->nb_streams && i < (int)d->ifmt->nb_streams; i++)
+            if (d->ifmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
+                (b->stream_state[i].pair_has || b->stream_state[i].pair_prov))
+                return 0;                       /* an audio leg already applied this window */
+    }
+    b->partial_ext       = 1;
+    b->buffer_start_time = now;                 /* one more PTV_DISC_TIMEOUT_US */
+    av_log(NULL, AV_LOG_INFO,
+           "[PTV-GLUE] partial flush HELD — only %s crossed (offset %+.3fs) but a matching %s "
+           "jump (%+.3fs, %"PRId64"ms ago) is known; waiting one 500ms extension for its leg\n",
+           has_v ? "video" : "audio", (double)own / AV_TIME_BASE,
+           sib == 0 ? "video" : "audio", (double)sj / AV_TIME_BASE, (now - sw) / 1000);
+    return 1;
 }
 
 /* Flush: classify each held packet, KEEP NEW / DISCARD OLD, compute one
@@ -758,16 +831,22 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
                     d->ifmt->streams[i]->codecpar->codec_type != AVMEDIA_TYPE_AUDIO)
                     continue;
                 mism = b->applied_offset - ss->cumulative_ts_offset;
-                if (llabs(mism) > PTV_PAIR_EPS_US && ptv_glue_refuse_h(b, i, pnow)) {
+                /* pre16 #47-C1 (Fashion): a mismatch beyond the route cap is refused
+                 * REGARDLESS of label health — magnitude alone is decisive out there
+                 * (±11594s opposite jumps computed a +23188s "mismatch"; no source A/V
+                 * misalignment reality exceeds minutes; largest real route: PATRIOT 30.8s). */
+                if (llabs(mism) > PTV_PAIR_EPS_US &&
+                    (llabs(mism) > PTV_GLUE_MAX_ROUTE_US || ptv_glue_refuse_h(b, i, pnow))) {
                     refused = 1;
                     d->glue_refuse_cnt++;
                     if (d->disturb_epoch)
                         atomic_fetch_add_explicit(d->disturb_epoch, 1, memory_order_relaxed);
                     av_log(NULL, AV_LOG_WARNING,
-                           "[PTV-GLUE] REFUSED mismatch %+.3fs (label health %.2f, refuse #%"PRId64") "
+                           "[PTV-GLUE] REFUSED mismatch %+.3fs (label health %.2f, refuse #%"PRId64")%s "
                            "— per-stream butt-joint, residual left to sensor/corrector\n",
                            (double)mism / AV_TIME_BASE,
-                           (double)ss->h_ema_q10 / 1024.0, d->glue_refuse_cnt);
+                           (double)ss->h_ema_q10 / 1024.0, d->glue_refuse_cnt,
+                           llabs(mism) > PTV_GLUE_MAX_ROUTE_US ? " [beyond the 120s route cap]" : "");
                 }
             }
         if (pair_stamp)
@@ -842,6 +921,10 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
         av_log(NULL, AV_LOG_INFO,
                "[PTV-GLUE] partial flush (only %s crossed in the window) — mis-mux not measurable this glue (partial=%"PRId64")\n",
                has_vid ? "video" : "audio", b->glue_partial);
+        if (g_glueclass && b->partial_ext)
+            av_log(NULL, AV_LOG_WARNING,
+                   "[PTV-GLUE] partial release despite a known matching sibling jump — its leg never "
+                   "crossed within the extension; one-sided by timeout (residual to sensor/corrector)\n");
     }
     /* 1.0.1-pre4 [PTV-GLUE] paired-flush ledger: the A-vs-V mismatch the shared offset AVOIDED
      * baking into the output (it routes to the audio content path instead — AGLUE/aresample).
@@ -987,7 +1070,9 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
             /* pre15 §2.3 F2 (retro leg): same unbounded-`corr` exposure as 2b when the
              * provisional offset was computed from lying labels — refuse leaves the stream
              * on its provisional own butt-joint (no shift, no registration). */
-            if (g_glueclass && ptv_glue_refuse_h(b, s, av_gettime_relative())) {
+            if (g_glueclass &&
+                (llabs(corr) > PTV_GLUE_MAX_ROUTE_US ||          /* #47-C1 route cap */
+                 ptv_glue_refuse_h(b, s, av_gettime_relative()))) {
                 d->glue_refuse_cnt++;
                 if (d->disturb_epoch)
                     atomic_fetch_add_explicit(d->disturb_epoch, 1, memory_order_relaxed);
@@ -1213,6 +1298,8 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                         int vcrossed = d->video_fwd_us && (wall_now - d->video_fwd_us <= g_progoff_debounce_us);
                         if (!vcrossed && wall_gap >= FFMAX(g_gap_min_us, jump_us / 2)) {
                             is_gap = 1;
+                            d->sib_jump_us[1]   = jump_us;   /* pre16 #47-C: a gap is a known audio jump */
+                            d->sib_jump_wall[1] = wall_now;
                             if (d->disturb_epoch)   /* audio dropout is a disturbance (freeze rate-recovery / arm re-acquire) */
                                 atomic_fetch_add_explicit(d->disturb_epoch, 1, memory_order_relaxed);
                             av_log(NULL, AV_LOG_INFO,   /* v0.9.13: always-on — a real source audio dropout, rare + meaningful */
@@ -1244,8 +1331,21 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                                 pkt->stream_index < d->disc->nb_streams &&
                                 d->vstream >= 0 &&
                                 d->wrap_wall_last[d->vstream] > 0 &&
-                                wall_now - d->wrap_wall_last[d->vstream] <=
-                                    FFMIN((int64_t)2000000, wall_gap / 2)) {
+                                wall_now - d->wrap_wall_last[d->vstream] <= 2000000 &&
+                                /* #47-A (TWN 2026-07-18): the rr15 min(2s, wall_gap/2)
+                                 * freshness bound measured video's AGE at verdict time and
+                                 * was satisfied when video RESUMED 2ms before audio after a
+                                 * whole-program outage (one-sided −10s bake, corrector
+                                 * correctly disarmed implausible). The real test is that
+                                 * video PROGRESSED DURING the gap: require ≥ one video
+                                 * packet per 80ms of gap (≈ half the slowest frame rate) to
+                                 * have arrived since this audio stream's last packet. A
+                                 * whole-program outage yields ~0-5 resume packets and falls
+                                 * through to the shared LAYERA flush (the pre14 path, which
+                                 * handles it perfectly). */
+                                d->gap_vsnap &&
+                                d->vpkt - d->gap_vsnap[pkt->stream_index] >=
+                                    FFMAX((int64_t)3, wall_gap / 80000)) {
                                 d->disc->stream_state[pkt->stream_index].last_dts_us =
                                     av_rescale_q(raw + d->wrap_off[pkt->stream_index],
                                                  st->time_base, AV_TIME_BASE_Q);
@@ -1349,6 +1449,8 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
         }
         d->wrap_last[pkt->stream_index] = raw;
         d->wrap_wall_last[pkt->stream_index] = wall_now;   /* gap-fix: per-stream packet arrival wall-clock */
+        if (d->gap_vsnap)                                  /* pre16 #47-A: video-progress ref for the gap guard */
+            d->gap_vsnap[pkt->stream_index] = d->vpkt;
     }
     off = d->wrap_off[pkt->stream_index];   /* 33-bit mask + per-stream discontinuity self-rebase (dense V/A) */
     /* P2 §7.1: sparse copied streams (DVB-sub/teletext, data, SCTE-35) skip the per-stream absorber (their
@@ -1500,8 +1602,10 @@ void *demux_thread(void *arg)
                         }
                     }
                     if (ptv_disc_all_transitioned(d, b) || ptv_disc_timeout(b)) {
-                        ret = ptv_disc_flush(d, b);
-                        if (ret < 0) break;
+                        if (!ptv_disc_partial_hold(d, b)) {   /* pre16 #47-C: bounded sibling wait */
+                            ret = ptv_disc_flush(d, b);
+                            if (ret < 0) break;
+                        }
                     }
                     continue;                           /* don't dispatch now — held/released by flush */
                 }
