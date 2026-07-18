@@ -224,10 +224,11 @@ void ptv_print_log_legend(int full)
         "  [PTV-EMPTY]    frame_q starvation episodes >=2s (refill time; sub-2s aggregate per 60s)\n");
     av_log(NULL, AV_LOG_INFO,
         "multiview stats line — same head (frame/fps/time/dup/drop/dlvhold/dlvforced) + per slot:\n"
-        "  lipsync=aK:  (1.0.1-pre16, ALWAYS-ON) per-track sensor R, video term = the track's OWN\n"
-        "               slot (same sensor/sign as single-input: + = audio EARLY); `--` = that slot\n"
-        "               slated / not flowing — itself the outage signal. corr= absent: the mv\n"
-        "               corrector is HELD OFF this pre (sensor-first observation soak)\n"
+        "  inK:lipsync  (1.0.1-pre16.1, ALWAYS-ON, inside each inK: group) that slot's sensor R\n"
+        "               (same sensor/sign as single-input: + = audio EARLY; multi-track slots\n"
+        "               joined '|'); `--` = the slot slated / not flowing — itself the outage\n"
+        "               signal; absent = the input has no sensed audio track. corr= absent: the\n"
+        "               mv corrector is HELD OFF this pre (sensor-first observation soak)\n"
         "  acor         (when >0) corrupt-discarded audio pkts, GLOBAL sum — per-track detail on\n"
         "               the [PTV-ADISC]/NBS log lines\n"
         "  inK:qdrop    input-K video queue overflow drops (demux side)\n"
@@ -312,6 +313,40 @@ void ptv_stats_lipsync(char *buf, size_t size, int64_t now_us, int force_idx)
         if (force_idx || g_rsx.n_a > 1)
             nn += snprintf(buf + nn, size - nn, "%sa%d:", ki ? "," : "", ki);
         if (fresh) {                                 /* R = (m_v+E_v) − (m_a+E_a); stale side → -- (no stale anchors) */
+            int64_t mv = atomic_load_explicit(&g_rsx.mv_ema[in], memory_order_relaxed)
+                       + atomic_load_explicit(&g_rsx.ev_us[in],  memory_order_relaxed);
+            int64_t ma = atomic_load_explicit(&g_rsx.ma_ema[ki], memory_order_relaxed)
+                       + atomic_load_explicit(&g_rsx.ea_us[ki],  memory_order_relaxed);
+            nn += snprintf(buf + nn, size - nn, "%+lldms", (long long)((mv - ma) / 1000));
+        } else
+            nn += snprintf(buf + nn, size - nn, "--");
+    }
+}
+
+/* 1.0.1-pre16.1 (owner-directed): per-INPUT lipsync fragment for the mv line's inN: groups —
+ * the mv stats line already carries per-input segments, so the sensor reading belongs inside
+ * them rather than in a separate combined token. Emits this input's track reading(s) (same R
+ * arithmetic as ptv_stats_lipsync; multi-track slots joined with '|'), `--` when a side is
+ * stale (the outage signal), empty when the input has no sensed audio track. */
+void ptv_stats_lipsync_in(char *buf, size_t size, int64_t now_us, int in)
+{
+    int nn = 0, ki, first = 1;
+    buf[0] = 0;
+    if (!g_rsync_sense || g_rsx.n_a <= 0 || in < 0 || in >= PTV_MAX_INPUT)
+        return;
+    for (ki = 0; ki < g_rsx.n_a && nn < (int)size - 12; ki++) {
+        int     kin = (g_rsx.a_in[ki] >= 0 && g_rsx.a_in[ki] < PTV_MAX_INPUT) ? g_rsx.a_in[ki] : 0;
+        int64_t mvw, maw;
+        int     fresh;
+        if (kin != in)
+            continue;
+        mvw   = atomic_load_explicit(&g_rsx.mv_wall[in], memory_order_relaxed);
+        maw   = atomic_load_explicit(&g_rsx.ma_wall[ki], memory_order_relaxed);
+        fresh = mvw && maw && now_us - mvw < 3000000 && now_us - maw < 3000000;
+        if (!first)
+            nn += snprintf(buf + nn, size - nn, "|");
+        first = 0;
+        if (fresh) {                                 /* R = (m_v+E_v) − (m_a+E_a), as ptv_stats_lipsync */
             int64_t mv = atomic_load_explicit(&g_rsx.mv_ema[in], memory_order_relaxed)
                        + atomic_load_explicit(&g_rsx.ev_us[in],  memory_order_relaxed);
             int64_t ma = atomic_load_explicit(&g_rsx.ma_ema[ki], memory_order_relaxed)

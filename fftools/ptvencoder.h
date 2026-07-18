@@ -1163,6 +1163,7 @@ void ptv_print_log_legend(int full);
  * always prints the aK: prefix; 0 keeps the pre9 n_a>1 rule (single-input token-identical).
  * Both write "" when the field is absent. */
 void ptv_stats_lipsync(char *buf, size_t size, int64_t now_us, int force_idx);
+void ptv_stats_lipsync_in(char *buf, size_t size, int64_t now_us, int in);
 void ptv_stats_corr(char *buf, size_t size);
 /* ptvencoder.c */
 void vring_put(VOutRing *r, int64_t src_us, int64_t out_us);

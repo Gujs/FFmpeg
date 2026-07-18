@@ -583,11 +583,10 @@ void *compositor_thread(void *arg)
                     if (ac > 0)
                         snprintf(aco, sizeof aco, " acor=%lld", (long long)ac);
                 }
-                char rsl[24 + PTV_MAX_AUDIO * 16];   /* pre16: per-slot residual sensor lipsync= — ALWAYS-ON on mv
-                                                      * (aK: prefix forced; `--` on a slated slot IS the outage
-                                                      * signal; the observation soak is the deliverable) */
-                ptv_stats_lipsync(rsl, sizeof rsl, nows, 1);
-                /* corr= deliberately NOT printed: the mv corrector is HELD OFF this pre
+                /* pre16.1 (owner-directed): the per-slot sensor reading rides INSIDE each inN:
+                 * group below (/lipsync=), not as a separate combined token — the mv line
+                 * already keys per input. `--` on a slated slot IS the outage signal.
+                 * corr= deliberately NOT printed: the mv corrector is HELD OFF this pre
                  * (rscorr_update hold) — the arming pre adds ptv_stats_corr here. */
                 char ls[448]; int lp = 0;   /* per-slot: qdrop=input-q overflow, corrupt=demux+decode,
                                              * pd=cadence holds (NORMAL for a rate-mismatched slot),
@@ -595,15 +594,20 @@ void *compositor_thread(void *arg)
                                              * skres=LAYERA erase-residue ledger (0.9.18.7, same
                                              * accounting as single-input hsres= — the slot's sk
                                              * measurement rides the same erased label stream) */
-                for (k = 0; k < n && lp < (int)sizeof ls - 88; k++)
+                for (k = 0; k < n && lp < (int)sizeof ls - 112; k++) {
+                    char lsin[40], lst[56] = "";
+                    ptv_stats_lipsync_in(lsin, sizeof lsin, nows, k);
+                    if (lsin[0])
+                        snprintf(lst, sizeof lst, "/lipsync=%s", lsin);
                     lp += snprintf(ls + lp, sizeof ls - lp,
-                                   " in%d:qdrop=%"PRId64"/corrupt=%"PRId64"/pd=%"PRId64"/sv=%"PRId64"/sk=%+dms/skres=%+dms",
+                                   " in%d:qdrop=%"PRId64"/corrupt=%"PRId64"/pd=%"PRId64"/sv=%"PRId64"/sk=%+dms/skres=%+dms%s",
                                    k, c->inputs[k].da.vdrop, c->inputs[k].da.vcorrupt + c->inputs[k].dc.vcorrupt,
                                    pd_cnt[k], sv_cnt[k], (int)(c->inputs[k].house_skew / 1000),
-                                   (int)(c->inputs[k].da.disc_resid_us / 1000));
+                                   (int)(c->inputs[k].da.disc_resid_us / 1000), lst);
+                }
                 av_log(NULL, AV_LOG_INFO,   /* v0.9.13 parity: size/bitrate/speed/genlock dropped (v0.9.10 single-input rationale) */
-                    "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f dup=%"PRId64" drop=%"PRId64"%s%s%s%s\n",
-                    c->emitted, fps, hh, mm, ss, c->dup, c->framedrop[0], dlv, aco, rsl, ls);
+                    "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f dup=%"PRId64" drop=%"PRId64"%s%s%s\n",
+                    c->emitted, fps, hh, mm, ss, c->dup, c->framedrop[0], dlv, aco, ls);
                 stat_last = nows; stat_prev = c->emitted;
             }
         }

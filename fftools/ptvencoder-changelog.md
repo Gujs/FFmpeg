@@ -60,6 +60,14 @@ refuses the route (cap), no tripwire synthesis, both legs butt-jointed,
 oracle tail ≈0; G1/G2 genuine gaps still propagate; glueclass G9 locked set
 + G10 byte gates re-run green vs pre16.
 
+(pre16.1) mv stats readability, owner-directed 2026-07-18: the per-slot sensor
+reading moved INSIDE each inK: group (`inK:.../lipsync=+10ms`) instead of the
+separate combined `lipsync=a0:...` token — the mv line already keys per input,
+so the reading belongs with the slot's other fields. New shared builder
+ptv_stats_lipsync_in() (same R arithmetic; multi-track slots joined '|';
+absent when the input has no sensed track). Single-input line untouched.
+Log-format-only change; no behavior delta.
+
 (7n) MULTIVIEW SENSOR PORT — pre16, task #45 items 1+2. NORMATIVE DESIGN =
 analysis/ptvencoder-mv-sensor-port.md (owner-approved 2026-07-18 with all
 five §11 questions resolved to the doc's recommendations). Every
