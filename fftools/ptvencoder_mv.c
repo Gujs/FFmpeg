@@ -113,6 +113,12 @@ void *compositor_thread(void *arg)
     int      r2_pos[PTV_MAX_INPUT] = {0};     /*   ring write position */
     int      done_in[PTV_MAX_INPUT] = {0};
     int64_t rung_pts[PTV_MAX_RUNG] = {0};
+    /* 1.0.1-pre16 mv sensor port: per-slot video-side EMA state (the compositor is the ONE
+     * writer of g_rsx.mv_ema/mv_wall[*] on mv — the single-input master-rung mirror). τ ≈ 30s
+     * of ticks, divisor verbatim from the single-input sensor (ptvencoder_clock.c). */
+    int64_t rs_mv_ema[PTV_MAX_INPUT] = {0};
+    int     rs_mv_seed[PTV_MAX_INPUT] = {0};
+    int64_t rs_mv_div;
     AVFrame *filt = av_frame_alloc();
     int64_t tick = 0, wall0 = 0;
     /* v0.9.18.2 M4: use the RESOLVED preroll (CushionPlan) — this getenv re-read with a 350ms
@@ -126,6 +132,8 @@ void *compositor_thread(void *arg)
     int64_t stat_last = diag_t0, stat_prev = 0;
 
     if (!filt) goto done;
+    rs_mv_div = c->tick_dur_us > 0 ? 30000000 / c->tick_dur_us : 750;
+    if (rs_mv_div < 8) rs_mv_div = 8;
     if (n_prime > g_frameq_cap - 8) n_prime = g_frameq_cap - 8;
     if (n_prime < 0) n_prime = 0;
     res_occ_tgt = n_prime > 4 ? n_prime : 4;   /* v0.9.13 servo target = the primed jitter depth,
@@ -340,6 +348,24 @@ void *compositor_thread(void *arg)
                 if (h0k != AV_NOPTS_VALUE && last[k]->pts != AV_NOPTS_VALUE) {
                     int64_t disp_src = av_rescale_q(last[k]->pts, c->inputs[k].ist_tb, AV_TIME_BASE_Q);
                     int64_t sk = mv_tick_us(c, tick) - (disp_src - h0k);
+                    /* 1.0.1-pre16 residual sensor (PASSIVE), per-slot video side: m_v[slot] =
+                     * out − disp_src per house TICK — dup-holds and residence holds included
+                     * (a dup presents old content later: disp_src frozen, out advances, m_v
+                     * grows — REAL presentation shift, the single-input dups-included rule).
+                     * out on the exact-rational axis (mv_tick_us — integer tick would re-import
+                     * the ~10ppm EXACTTICK drift). h0-free in FORM but ≈ −h0 at anchor time —
+                     * the audio side carries −h0 structurally, so the shared −h0 cancels in R
+                     * exactly as single-input. Published only while last[k] && !stale (the
+                     * enclosing block): a slated slot stops publishing → its tracks read `--`.
+                     * Measurement site = the DISPLAY site, not the pop site (a residence-held
+                     * frame is still the displayed content this tick). */
+                    if (g_rsync_sense) {
+                        int64_t m = mv_tick_us(c, tick) - disp_src;
+                        if (!rs_mv_seed[k]) { rs_mv_ema[k] = m; rs_mv_seed[k] = 1; }
+                        else rs_mv_ema[k] += (m - rs_mv_ema[k]) / rs_mv_div;
+                        atomic_store_explicit(&g_rsx.mv_ema[k], rs_mv_ema[k], memory_order_relaxed);
+                        atomic_store_explicit(&g_rsx.mv_wall[k], now_us, memory_order_relaxed);
+                    }
                     /* P2 — floor the per-slot lag to ≥0 by re-anchoring h0. A cell that leaps AHEAD of
                      * the house clock (sk very negative: −560ms on a 2x1, up to −2.5s on a 4-up, from an
                      * anomalous first decoded frame and/or a deep startup buffer prime) is physically
@@ -394,6 +420,15 @@ void *compositor_thread(void *arg)
                             pthread_mutex_unlock(&c->inputs[k].h0_lock);
                             sk = mv_tick_us(c, tick) - (disp_src - h0k);   /* now ≈ +1 tick (median-sized) */
                             af_off[k] = sk;                            /* snap the audio-follow EMA to the floored lag */
+                            /* 1.0.1-pre16: a REANCHOR2 h0 shift is a label-lineage disturbance for
+                             * this slot's tracks — bump the slot's disturbance epoch so the corrector
+                             * dwell resets (feed wired now, consumed by the ARMING pre). REUSES the
+                             * existing per-input house_disturb epoch (owner Q3, 2026-07-18): safe
+                             * because house_disturb is consumed ONLY by corrector snapshots
+                             * (rscorr_event_edge/dwell_reset) — the PLL acquire has been
+                             * event-ungated since v0.6.18 — and the mv corrector is HELD OFF this
+                             * pre, so the bump changes nothing until arming. */
+                            atomic_fetch_add_explicit(&c->inputs[k].house_disturb, 1, memory_order_relaxed);
                             /* 0.9.18.7: promoted PTV_DIAG→always-on WARNING, with the AGLUE-style log
                              * rate limit. In LIVE mv a re-anchor is rare (a real video-ahead excursion),
                              * but on an unpaced source (file mv, decoder outrunning the clock) it can
@@ -509,11 +544,17 @@ void *compositor_thread(void *arg)
                                    res_ema_us[k] / 1000.0, (res_due_us[k] - mv_tick_us(c, tick)) / 1000.0,
                                    pd_cnt[k], md_cnt[k]);
                 av_log(NULL, AV_LOG_INFO, "[PTV-RES] t=%"PRId64" tgt=%d%s\n", tick, res_occ_tgt, rb);
-                char db[448]; int dp = 0;
-                for (k = 0; k < n && dp < (int)sizeof db - 56; k++)
-                    dp += snprintf(db + dp, sizeof db - dp, " in%d:dec=%"PRId64"/skew=%dms/lag=%dms/holddrop=%"PRId64"/md=%"PRId64,
+                char db[512]; int dp = 0;
+                for (k = 0; k < n && dp < (int)sizeof db - 88; k++)
+                    dp += snprintf(db + dp, sizeof db - dp, " in%d:dec=%"PRId64"/skew=%dms/lag=%dms/holddrop=%"PRId64"/md=%"PRId64"/gpps=%d/%d/gov=%d",
                                    k, c->inputs[k].dc.dec_frames, (int)(skew_us[k] / 1000), (int)(lag_true_us[k] / 1000),
-                                   c->inputs[k].hold.framedrop, md_cnt[k]);   /* drop-oldest count: startup overflow = video-lead cause; md = residence decimation */
+                                   c->inputs[k].hold.framedrop, md_cnt[k],   /* drop-oldest count: startup overflow = video-lead cause; md = residence decimation */
+                                   /* pre16 rr13 blindness fix: the catch-up governor RAN on mv but said
+                                    * nothing — per-slot measured/declared pps + engagement (the single-
+                                    * input DIAG t= gpps=/gov= tokens, per slot) */
+                                   atomic_load_explicit(&c->inputs[k].gov_gpps, memory_order_relaxed),
+                                   atomic_load_explicit(&c->inputs[k].gov_decl, memory_order_relaxed),
+                                   atomic_load_explicit(&c->inputs[k].gov_on,   memory_order_relaxed));
                 av_log(NULL, AV_LOG_INFO,
                     "[PTV-DIAG] mv t=%.1fs emitted=%"PRId64" dup=%"PRId64" muxed=%"PRId64" frameq0=%d%s\n",
                     (nowd - diag_t0) / 1000000.0, c->emitted, c->dup, g_muxed,
@@ -534,6 +575,20 @@ void *compositor_thread(void *arg)
                     snprintf(dlv, sizeof dlv, " dlvhold=%"PRId64"ms dlvforced=%"PRId64,
                              atomic_load_explicit(&c->gate0->st_hold_us, memory_order_relaxed) / 1000,
                              atomic_load_explicit(&c->gate0->st_forced, memory_order_relaxed));
+                char aco[24] = "";                   /* pre15/pre16 #33: corrupt-discarded AUDIO pkts, GLOBAL sum
+                                                      * (owner Q — per-track detail stays on the [PTV-ADISC]/NBS
+                                                      * lines; absent while zero, clean line unchanged) */
+                {
+                    int64_t ac = atomic_load_explicit(&g_acorrupt, memory_order_relaxed);
+                    if (ac > 0)
+                        snprintf(aco, sizeof aco, " acor=%lld", (long long)ac);
+                }
+                char rsl[24 + PTV_MAX_AUDIO * 16];   /* pre16: per-slot residual sensor lipsync= — ALWAYS-ON on mv
+                                                      * (aK: prefix forced; `--` on a slated slot IS the outage
+                                                      * signal; the observation soak is the deliverable) */
+                ptv_stats_lipsync(rsl, sizeof rsl, nows, 1);
+                /* corr= deliberately NOT printed: the mv corrector is HELD OFF this pre
+                 * (rscorr_update hold) — the arming pre adds ptv_stats_corr here. */
                 char ls[448]; int lp = 0;   /* per-slot: qdrop=input-q overflow, corrupt=demux+decode,
                                              * pd=cadence holds (NORMAL for a rate-mismatched slot),
                                              * sv=starvation dups, sk=published audio skew,
@@ -547,8 +602,8 @@ void *compositor_thread(void *arg)
                                    pd_cnt[k], sv_cnt[k], (int)(c->inputs[k].house_skew / 1000),
                                    (int)(c->inputs[k].da.disc_resid_us / 1000));
                 av_log(NULL, AV_LOG_INFO,   /* v0.9.13 parity: size/bitrate/speed/genlock dropped (v0.9.10 single-input rationale) */
-                    "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f dup=%"PRId64" drop=%"PRId64"%s%s\n",
-                    c->emitted, fps, hh, mm, ss, c->dup, c->framedrop[0], dlv, ls);
+                    "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f dup=%"PRId64" drop=%"PRId64"%s%s%s%s\n",
+                    c->emitted, fps, hh, mm, ss, c->dup, c->framedrop[0], dlv, aco, rsl, ls);
                 stat_last = nows; stat_prev = c->emitted;
             }
         }

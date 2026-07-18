@@ -731,8 +731,11 @@ void *output_thread(void *arg)
                 int64_t m = out_us - av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q);
                 if (!rs_mv_seed) { rs_mv_ema = m; rs_mv_seed = 1; }
                 else rs_mv_ema += (m - rs_mv_ema) / rs_mv_div;
-                atomic_store_explicit(&g_rsx.mv_ema, rs_mv_ema, memory_order_relaxed);
-                atomic_store_explicit(&g_rsx.mv_wall, av_gettime_relative(), memory_order_relaxed);
+                /* pre16: slot 0 of the per-slot arrays — single input IS slot 0 (multiview
+                 * never reaches this block: passthrough rungs return above; the compositor
+                 * owns per-slot publication there). */
+                atomic_store_explicit(&g_rsx.mv_ema[0], rs_mv_ema, memory_order_relaxed);
+                atomic_store_explicit(&g_rsx.mv_wall[0], av_gettime_relative(), memory_order_relaxed);
             }
         }
         ret = encode_push(v->mux_q, v->venc, v->ost, held, v->gate);   /* §7.5a: publish video front + release caught-up audio/copy */
@@ -839,25 +842,9 @@ void *output_thread(void *arg)
                     if (v->decim > 0)                                /* v0.9.15.2: surplus-cadence decimation count */
                         snprintf(cfs + n, sizeof cfs - n, " decim=%"PRId64, v->decim);
                 }
-                char rsl[24 + PTV_MAX_AUDIO * 16] = "";              /* pre9 residual sensor: lipsync= (+ = audio early) */
-                if (g_rsync_sense && g_rsx.n_a > 0) {
-                    int64_t mvw = atomic_load_explicit(&g_rsx.mv_wall, memory_order_relaxed);
-                    int64_t mv  = atomic_load_explicit(&g_rsx.mv_ema,  memory_order_relaxed)
-                                + atomic_load_explicit(&g_rsx.ev_us,   memory_order_relaxed);
-                    int     nn = snprintf(rsl, sizeof rsl, " lipsync=");
-                    for (int ki = 0; ki < g_rsx.n_a && nn < (int)sizeof rsl - 14; ki++) {
-                        int64_t maw = atomic_load_explicit(&g_rsx.ma_wall[ki], memory_order_relaxed);
-                        int fresh = mvw && maw && nows - mvw < 3000000 && nows - maw < 3000000;
-                        if (g_rsx.n_a > 1)
-                            nn += snprintf(rsl + nn, sizeof rsl - nn, "%sa%d:", ki ? "," : "", ki);
-                        if (fresh) {                                 /* R = (m_v+E_v) − (m_a+E_a); stale side → -- (no stale anchors) */
-                            int64_t ma = atomic_load_explicit(&g_rsx.ma_ema[ki], memory_order_relaxed)
-                                       + atomic_load_explicit(&g_rsx.ea_us[ki],  memory_order_relaxed);
-                            nn += snprintf(rsl + nn, sizeof rsl - nn, "%+lldms", (long long)((mv - ma) / 1000));
-                        } else
-                            nn += snprintf(rsl + nn, sizeof rsl - nn, "--");
-                    }
-                }
+                char rsl[24 + PTV_MAX_AUDIO * 16];                   /* pre9 residual sensor: lipsync= (+ = audio early);
+                                                                      * pre16: shared per-slot builder (ptvencoder_legend.c) */
+                ptv_stats_lipsync(rsl, sizeof rsl, nows, 0);
                 char aco[24] = "";                                   /* pre15 #33: corrupt-discarded AUDIO pkts (NBS phase
                                                                       * visibility; absent while zero — clean line unchanged) */
                 {
@@ -865,27 +852,10 @@ void *output_thread(void *arg)
                     if (ac > 0)
                         snprintf(aco, sizeof aco, " acor=%lld", (long long)ac);
                 }
-                char crs[10 + PTV_MAX_AUDIO * 20] = "";              /* pre14 corrector: corr= (cumulative trim; * = integrating) */
-                if (g_rsync_corr && g_rsx.n_a > 0) {
-                    /* absent while every track sits at corr==0 un-engaged — the quiet-channel
-                     * stats line is unchanged (§6). */
-                    int any = 0, ki;
-                    for (ki = 0; ki < g_rsx.n_a; ki++)
-                        if (atomic_load_explicit(&g_corr_pub[ki], memory_order_relaxed) != 0 ||
-                            atomic_load_explicit(&g_corr_state_pub[ki], memory_order_relaxed) == PTV_CORR_ENGAGED)
-                            any = 1;
-                    if (any) {
-                        int nn = snprintf(crs, sizeof crs, " corr=");
-                        for (ki = 0; ki < g_rsx.n_a && nn > 0 && nn < (int)sizeof crs - 18; ki++) {
-                            int64_t cu = atomic_load_explicit(&g_corr_pub[ki], memory_order_relaxed);
-                            int     st = atomic_load_explicit(&g_corr_state_pub[ki], memory_order_relaxed);
-                            if (g_rsx.n_a > 1)
-                                nn += snprintf(crs + nn, sizeof crs - nn, "%sa%d:", ki ? "," : "", ki);
-                            nn += snprintf(crs + nn, sizeof crs - nn, "%+lldms%s",
-                                           (long long)(cu / 1000), st == PTV_CORR_ENGAGED ? "*" : "");
-                        }
-                    }
-                }
+                char crs[10 + PTV_MAX_AUDIO * 20];                   /* pre14 corrector: corr= (cumulative trim; * = integrating);
+                                                                      * pre16: shared builder — the mv printer gains it by
+                                                                      * calling this when the mv corrector hold is lifted */
+                ptv_stats_corr(crs, sizeof crs);
                 av_log(NULL, AV_LOG_INFO,
                     "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f "
                     "dup=%"PRId64" pd=%"PRId64" drop=%"PRId64" corrupt=%"PRId64" "

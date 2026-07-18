@@ -53,11 +53,15 @@ static int     g_pll_dev_shift = 9;          /* v0.6.22: EMA shift for pll_dev (
  * burstiness (the "bursty channel" taxonomy was self-portraiture — owner mandate). Returns ""
  * outside a shed window (all pinned log-line shapes byte-identical when nothing was shed);
  * inside the 5s window returns " [self: N pkts shed]" with N = sheds since this track's
- * window opened (per-track mark refreshed while quiet). */
+ * window opened (per-track mark refreshed while quiet). 1.0.1-pre16: reads THIS TRACK'S
+ * INPUT's shed stamp (Input.shed_wall/shed_cnt — identical to the globals on single input),
+ * so on mv slot B's shed no longer annotates slot A's AGLUE/ASTEP lines. */
 static const char *ptv_self_shed_note(AudioState *a, char *buf, size_t sz)
 {
-    int64_t w = atomic_load_explicit(&g_shed_wall, memory_order_relaxed);
-    int64_t c = atomic_load_explicit(&g_shed_cnt, memory_order_relaxed);
+    int64_t w = a->shed_wall ? atomic_load_explicit(a->shed_wall, memory_order_relaxed)
+                             : atomic_load_explicit(&g_shed_wall, memory_order_relaxed);
+    int64_t c = a->shed_cnt  ? atomic_load_explicit(a->shed_cnt, memory_order_relaxed)
+                             : atomic_load_explicit(&g_shed_cnt, memory_order_relaxed);
     if (!w || av_gettime_relative() - w > 5000000) {
         a->shed_mark = c;
         buf[0] = 0;
@@ -149,9 +153,9 @@ static int audio_drain_fifo(AudioState *a)
  * state and it never holds more than realized-or-in-flight trim. */
 
 /* §2 accessor (MV-NORMATIVE §8.3): track k's residual, pairing its audio terms with its
- * INPUT SLOT's video terms. Today g_rsx carries one video term (single input) and the slot
- * is hard-wired 0; the mv sensor port re-shapes RsyncSense to per-slot video ledgers keyed
- * by AudioState.dbg_in — nothing in the corrector changes when that lands. */
+ * INPUT SLOT's video terms. 1.0.1-pre16: g_rsx carries PER-SLOT video ledgers and the slot
+ * hard-wire died here — mv_wall/mv_ema/ev_us are read at a->dbg_in (identically slot 0 on
+ * single input). Nothing else in the corrector changed — exactly the §8.3 promise. */
 typedef struct RsyncTrackR { int valid; int64_t R_us, mv_wall, ma_wall; } RsyncTrackR;
 /* TEST-ONLY (PTV_RSCORR_TESTWALK, µs/s; PTV_PLL_TESTNOISE_MS precedent): add a linearly
  * walking offset to the R the CORRECTOR reads (the sensor/stats stay untouched) — the
@@ -162,17 +166,18 @@ static int64_t g_rscorr_testwalk_us_s = 0, g_rscorr_testwalk_t0 = 0;
 static RsyncTrackR rsync_track_R(const AudioState *a, int64_t now)
 {
     RsyncTrackR r = { 0, 0, 0, 0 };
-    int k = a->dbg_k;
-    if (k < 0 || k >= PTV_MAX_AUDIO || !a->rs_ma_seed)
+    int k = a->dbg_k, in = a->dbg_in;
+    if (k < 0 || k >= PTV_MAX_AUDIO || in < 0 || in >= PTV_MAX_INPUT || !a->rs_ma_seed)
         return r;
-    r.mv_wall = atomic_load_explicit(&g_rsx.mv_wall, memory_order_relaxed);
+    r.mv_wall = atomic_load_explicit(&g_rsx.mv_wall[in], memory_order_relaxed);
     r.ma_wall = atomic_load_explicit(&g_rsx.ma_wall[k], memory_order_relaxed);
     /* freshness (§2): a side that has not flowed for 3s is stale ("--" on the stats line)
-     * — no reading, the corrector holds/disarms. */
+     * — no reading, the corrector holds/disarms. Per slot: audio flowing over a slated
+     * cell = video-side stale = no reading (the single-input stale-anchor rule). */
     if (!r.mv_wall || !r.ma_wall || now - r.mv_wall > 3000000 || now - r.ma_wall > 3000000)
         return r;
-    r.R_us = (atomic_load_explicit(&g_rsx.mv_ema, memory_order_relaxed)
-            + atomic_load_explicit(&g_rsx.ev_us,  memory_order_relaxed))
+    r.R_us = (atomic_load_explicit(&g_rsx.mv_ema[in], memory_order_relaxed)
+            + atomic_load_explicit(&g_rsx.ev_us[in],  memory_order_relaxed))
            - (a->rs_ma_ema
             + atomic_load_explicit(&g_rsx.ea_us[k], memory_order_relaxed));
     if (g_rscorr_testwalk_us_s == 0) {
@@ -236,7 +241,7 @@ static const char *rscorr_event_edge(AudioState *a)
     if (a->pll_acq_count != c->acq_snap) { c->acq_snap = a->pll_acq_count; return "pll-acquire"; }
     if (a->afmt_rebuilds != c->afmt_snap) { c->afmt_snap = a->afmt_rebuilds; return "afmt-rebuild"; }
     if (a->dec_reopens != c->reopen_snap) { c->reopen_snap = a->dec_reopens; return "adecwd-reopen"; }
-    v = atomic_load_explicit(&g_rsx.ev_us, memory_order_relaxed);
+    v = atomic_load_explicit(&g_rsx.ev_us[a->dbg_in], memory_order_relaxed);   /* pre16: own slot's ledger */
     if (v != c->ev_snap) { c->ev_snap = v; return "E_v ledger"; }
     v = atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed);
     if (v != c->ea_snap) { c->ea_snap = v; return "E_a ledger"; }
@@ -268,9 +273,13 @@ static const char *rscorr_event_active(AudioState *a, int64_t now)
         return "layera buffering";
     if (a->nbs_fill_active)   /* pre15 §5 rule 2: R is synthetic-flat on a filled track — never engage */
         return "nbs silence-fill";
-    if (atomic_load_explicit(&g_gov_on, memory_order_relaxed))
+    /* pre16: per-input feeds — THIS track's input's governor flag + shed stamp (identical to
+     * the globals on single input; on mv slot B's shed/governor no longer freezes slot A). */
+    if (a->gov_on ? atomic_load_explicit(a->gov_on, memory_order_relaxed)
+                  : atomic_load_explicit(&g_gov_on, memory_order_relaxed))
         return "catch-up governor";
-    v = atomic_load_explicit(&g_shed_wall, memory_order_relaxed);
+    v = a->shed_wall ? atomic_load_explicit(a->shed_wall, memory_order_relaxed)
+                     : atomic_load_explicit(&g_shed_wall, memory_order_relaxed);
     if (v && now - v < g_rscorr_quiet_us)
         return "recent self-shed";
     return NULL;
@@ -287,7 +296,7 @@ static void rscorr_dwell_reset(AudioState *a, int64_t now, int64_t R)
     c->acq_snap    = a->pll_acq_count;
     c->afmt_snap   = a->afmt_rebuilds;
     c->reopen_snap = a->dec_reopens;
-    c->ev_snap     = atomic_load_explicit(&g_rsx.ev_us, memory_order_relaxed);
+    c->ev_snap     = atomic_load_explicit(&g_rsx.ev_us[a->dbg_in], memory_order_relaxed);   /* pre16: own slot */
     c->ea_snap     = atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed);
     c->bank_snap   = atomic_load_explicit(&g_bank_us, memory_order_relaxed);
     c->hs_snap     = a->house_skew ? *a->house_skew : 0;
@@ -338,6 +347,21 @@ static void rscorr_update(AudioState *a, RsyncTrackR *r, int64_t f_us, int64_t n
     CorrState *c = &a->corr;
     const char *dead, *ev;
     int64_t R = r->R_us;
+
+    /* 1.0.1-pre16 MV SENSOR PORT — THE CORRECTOR IS HELD OFF ON MULTIVIEW (mandatory this
+     * pre; analysis/ptvencoder-mv-sensor-port.md §6). Before the port, mv was inert only by
+     * ACCIDENT (rs_ma_seed never set — the sensor block was mv-gated); the port removes that
+     * accident, and without this hold the fleet-default-ON corrector would begin ACTUATING
+     * on grids the moment the sensor lands — actuation without a soak, violating the roadmap
+     * gate ("mv sensor observes for a soak period before mv actuation arms"). Consequences:
+     * CorrState stays PTV_CORR_OFF, corr_us stays 0 → the graph-door bus term and the
+     * sensor's inj term never fire → mv byte-inertness holds. REMOVAL SITE = the mv
+     * corrector-arm pre — which must ALSO re-home the ptvencoder_clock.c stale-track
+     * watchdog to the compositor (the passthrough rung loop returns before it on mv;
+     * acceptable only while this hold stands) and wire per-input liveness for
+     * g_v_arrive_wc + the rung wire watermarks (§8.4). */
+    if (a->multiview)
+        return;
 
     if (!g_rsync_corr)
         return;
@@ -799,9 +823,12 @@ static int audio_drain_fg(AudioState *a)
                 filt->pts = a->af_next_pts + ns; a->af_next_pts += nb;        /* continuous + smooth nudge */
             }
             /* ====================================================================================
-             * 1.0.1-pre9 residual sensor (PASSIVE), audio side — single-input only (filt->pts is
-             * still the untouched content-anchored opts here; the mv follow paths above re-stamp
-             * it and the mv compositor owns per-slot video lineage → mv publishes nothing).
+             * 1.0.1-pre9 residual sensor (PASSIVE), audio side. 1.0.1-pre16: live on MULTIVIEW
+             * too (the mv gate is gone) — the compositor publishes per-slot video lineage, so
+             * every (slot,track) gets the same certified sensor. filt->pts here is the emitted
+             * output label: the content-anchored opts on single input, the re-stamped `want` on
+             * the mv follow path — so out carries the B3 acquire drops/pads (af_applied_us),
+             * and inj mirrors the PATH-DEPENDENT graph-door bus (below), leaving R the RESIDUAL.
              *   m_a = out − (sink_src − inj) − slip
              * inj recovers the RAW post-demux label from the sink label by removing what this
              * thread itself injected at the graph door: AGLUE's cumulative relabel-erase
@@ -823,16 +850,25 @@ static int audio_drain_fg(AudioState *a)
              * label gaps never appear in any term — label-referenced mapping is edit-neutral
              * for them by construction (trap 2).
              * ==================================================================================== */
-            if (g_rsync_sense && !a->multiview && a->use_fg &&
+            if (g_rsync_sense && a->use_fg &&
                 a->dbg_k < PTV_MAX_AUDIO && a->out_rate > 0) {
                 int64_t out_us = av_rescale(filt->pts, 1000000, a->out_rate);
-                int64_t hs     = (g_avlock && a->house_skew) ? *a->house_skew : 0;
+                int64_t hs     = (!(a->multiview && g_audio_follow) && g_avlock && a->house_skew)
+                               ? *a->house_skew : 0;
                 /* pre14 (§5 bus rule 3): corr_us joins inj — the sensor recovers the RAW
                  * post-demux label by removing the FULL bus sum this thread injected at the
                  * graph door, so R moves label-deterministically with the trim (the AVLOCK
                  * accounting pattern; NOT self-blinding — the corrector is supposed to see
-                 * its own correction land, and the external oracle stays the ground truth). */
-                int64_t inj    = a->glue_off_us + hs + a->corr.corr_us;
+                 * its own correction land, and the external oracle stays the ground truth).
+                 * pre16: inj mirrors the PATH-DEPENDENT door bus exactly (the AVSYNC2
+                 * subtraction, §5 bus rule 2 site): single/non-follow injects house_skew
+                 * (AVLOCK, audio_feed) — the mv follow path injects af_steer_us instead
+                 * (pre3 steer); glue_off + corr are path-independent. Sign law preserved on
+                 * both paths: +corr at the door delays audio content ⇒ raises m_a ⇒
+                 * dR/dcorr = −1 (§2). */
+                int64_t inj    = a->glue_off_us + a->corr.corr_us + hs
+                               + ((a->multiview && g_audio_follow && g_avsync_pll)
+                                  ? a->af_steer_us : 0);
                 int64_t slip   = 0, m, nowr;
                 if (a->fg_swr && a->fg_swr_flt &&
                     a->fg_swr_flt->nb_inputs > 0 && a->fg_swr_flt->nb_outputs > 0) {
@@ -919,10 +955,10 @@ static int audio_drain_fg(AudioState *a)
                     /* [PTV-RSYNC] components. dm = m_v − m_a (the shared −h0 cancels); the raw
                      * EMAs are h0-offset and unreadable alone. R = dm + E_v − E_a. Not printed
                      * until the video side has published (dm would be raw −h0-scale garbage). */
-                    int64_t mvw = atomic_load_explicit(&g_rsx.mv_wall, memory_order_relaxed);
+                    int64_t mvw = atomic_load_explicit(&g_rsx.mv_wall[a->dbg_in], memory_order_relaxed);
                     if (mvw) {
-                        int64_t mv = atomic_load_explicit(&g_rsx.mv_ema, memory_order_relaxed);
-                        int64_t ev = atomic_load_explicit(&g_rsx.ev_us,  memory_order_relaxed);
+                        int64_t mv = atomic_load_explicit(&g_rsx.mv_ema[a->dbg_in], memory_order_relaxed);
+                        int64_t ev = atomic_load_explicit(&g_rsx.ev_us[a->dbg_in],  memory_order_relaxed);
                         int64_t ea = atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed);
                         int64_t dm = mv - a->rs_ma_ema;
                         a->rs_log_last = nowr;

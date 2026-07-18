@@ -155,16 +155,19 @@ void ptv_print_log_legend(int full)
         "             frames than its declared rate (e.g. ~25.4 fps declaring 25) — each skip is a\n"
         "             content position already displayed, so perceived speed is always EXACTLY 1x;\n"
         "             steady even accrual = correct (equals the surplus); never fires <=house-rate\n"
-        "  lipsync    (1.0.1-pre9, single-input) PASSIVE residual-sync sensor R (ms, + = audio\n"
-        "             EARLY): per-stream source→output content mapping difference (video EMA(out−src)\n"
-        "             + demux edit ledger vs audio ledger m_a) — sees relabel-erases, wrong glues and\n"
-        "             parked resampler slip; shared latency (hs) cancels. `--` = a side not flowing.\n"
-        "             1.0.1-pre11: the slip probe is scoped to the async-aresample boundary — a\n"
-        "             buffering -af's hold (loudnorm ~3s) is label-preserving latency, EXCLUDED\n"
-        "             from R (the pre9 whole-graph probe read it as constant false audio-early).\n"
+        "  lipsync    (1.0.1-pre9; per-slot on multiview since pre16) PASSIVE residual-sync sensor R\n"
+        "             (ms, + = audio EARLY): per-stream source→output content mapping difference\n"
+        "             (video EMA(out−src) + demux edit ledger vs audio ledger m_a) — sees\n"
+        "             relabel-erases, wrong glues and parked resampler slip; shared latency (hs)\n"
+        "             cancels. `--` = a side not flowing. On mv each track pairs against ITS OWN\n"
+        "             slot's video (aK: prefix always; track→slot map = the startup [PTV-RSYNC]\n"
+        "             tracks: line). 1.0.1-pre11: the slip probe is scoped to the async-aresample\n"
+        "             boundary — a buffering -af's hold (loudnorm ~3s) is label-preserving latency,\n"
+        "             EXCLUDED from R (the pre9 whole-graph probe read it as false audio-early).\n"
         "             Soak-CERTIFIED vs the external oracle 2026-07-16 (Δ12-21ms on real excursions,\n"
         "             both signs human-verified, NTSC 24h flat) — the corrector's gate condition.\n"
-        "             PTV_RSYNC_SENSE=0 disables. Components: [PTV-RSYNC] under PTV_DIAG.\n"
+        "             PTV_RSYNC_SENSE=0 disables the sensor AND the pre15 realization tripwire\n"
+        "             (both modes). Components: [PTV-RSYNC] under PTV_DIAG.\n"
         "  corr       (1.0.1-pre14, only when nonzero/engaged) residual-sync\n"
         "             CORRECTOR cumulative resampler trim (ms; `*` = actively integrating). The\n"
         "             actuation half of the supervisor: when the sensor's R dwells outside ±80ms\n"
@@ -221,6 +224,12 @@ void ptv_print_log_legend(int full)
         "  [PTV-EMPTY]    frame_q starvation episodes >=2s (refill time; sub-2s aggregate per 60s)\n");
     av_log(NULL, AV_LOG_INFO,
         "multiview stats line — same head (frame/fps/time/dup/drop/dlvhold/dlvforced) + per slot:\n"
+        "  lipsync=aK:  (1.0.1-pre16, ALWAYS-ON) per-track sensor R, video term = the track's OWN\n"
+        "               slot (same sensor/sign as single-input: + = audio EARLY); `--` = that slot\n"
+        "               slated / not flowing — itself the outage signal. corr= absent: the mv\n"
+        "               corrector is HELD OFF this pre (sensor-first observation soak)\n"
+        "  acor         (when >0) corrupt-discarded audio pkts, GLOBAL sum — per-track detail on\n"
+        "               the [PTV-ADISC]/NBS log lines\n"
         "  inK:qdrop    input-K video queue overflow drops (demux side)\n"
         "  inK:corrupt  input-K corrupt packets (demux + decode)\n"
         "  inK:pd       cadence-residence holds (v0.9.13) — a 25fps slot in a 29.97 mosaic holds\n"
@@ -238,7 +247,8 @@ void ptv_print_log_legend(int full)
         "                 1.0.1-pre13: gpps=measured/declared input pps + gov= catch-up governor\n"
         "                 engagement (+ govslip= oversleep strikes when >0) — dec ≪ gpps*1.25 with\n"
         "                 vq pinned and gov=1 is the governor-misbehaving signature, diagnosable\n"
-        "                 from logs alone (single-input; mv slots print 0/0)\n"
+        "                 from logs alone. 1.0.1-pre16: per-input — the mv [PTV-DIAG] mv per-slot\n"
+        "                 segment carries inK:.../gpps=M/D/gov=G (the governor ran blind on mv)\n"
         "  [PTV-AVSYNC]   per-track A/V controller telemetry: offset/avlag estimate, vlag/alag,\n"
         "                 house_skew, and (multiview) the A/V PLL integrator state. 1.0.1-pre13:\n"
         "                 the estimate is printed as avlag= (was lipsync= — SIGN IS OPPOSITE to\n"
@@ -276,4 +286,65 @@ void ptv_print_log_legend(int full)
         "  DISCONT_MS/_BACK_MS, PROGOFF_DEBOUNCE_MS, DUKF_ESCAPE_MS/_MIN_MS, H0_REANCHOR_MS,\n"
         "  AF_ACQUIRE_MS/AF_RATE_MS_S, PLL_EMA_SHIFT/TAU_MS/ACQUIRE_MS/ACQUIRE_N/REFRACTORY_MS/\n"
         "  NOISE_K/DEV_SHIFT) — setting them is now a silent no-op; see ptvencoder-changelog.md\n");
+}
+
+/* ===================== 1.0.1-pre16 shared stats-line builders =====================
+ * Used by BOTH stats printers: the single-input master rung (ptvencoder_clock.c) and the mv
+ * compositor (ptvencoder_mv.c). Byte-identical extraction of the pre9 lipsync= and pre14
+ * corr= builders — the only semantic change is the PER-SLOT video term: mv_ema/mv_wall/ev_us
+ * are read at the track's own input slot (g_rsx.a_in[ki]), which is identically 0 on single
+ * input (token-for-token the pre15 line). force_idx=1 (mv) always prints the aK: prefix —
+ * slots matter even with one track; 0 keeps the pre9 n_a>1 rule. Freshness is PER SIDE and
+ * per slot: a slated slot's mv_wall stales past 3s → its tracks read `--` (the outage
+ * signal), independent of every other slot. */
+void ptv_stats_lipsync(char *buf, size_t size, int64_t now_us, int force_idx)
+{
+    int nn, ki;
+    buf[0] = 0;
+    if (!g_rsync_sense || g_rsx.n_a <= 0)
+        return;
+    nn = snprintf(buf, size, " lipsync=");
+    for (ki = 0; ki < g_rsx.n_a && nn < (int)size - 14; ki++) {
+        int     in  = (g_rsx.a_in[ki] >= 0 && g_rsx.a_in[ki] < PTV_MAX_INPUT) ? g_rsx.a_in[ki] : 0;
+        int64_t mvw = atomic_load_explicit(&g_rsx.mv_wall[in], memory_order_relaxed);
+        int64_t maw = atomic_load_explicit(&g_rsx.ma_wall[ki], memory_order_relaxed);
+        int fresh = mvw && maw && now_us - mvw < 3000000 && now_us - maw < 3000000;
+        if (force_idx || g_rsx.n_a > 1)
+            nn += snprintf(buf + nn, size - nn, "%sa%d:", ki ? "," : "", ki);
+        if (fresh) {                                 /* R = (m_v+E_v) − (m_a+E_a); stale side → -- (no stale anchors) */
+            int64_t mv = atomic_load_explicit(&g_rsx.mv_ema[in], memory_order_relaxed)
+                       + atomic_load_explicit(&g_rsx.ev_us[in],  memory_order_relaxed);
+            int64_t ma = atomic_load_explicit(&g_rsx.ma_ema[ki], memory_order_relaxed)
+                       + atomic_load_explicit(&g_rsx.ea_us[ki],  memory_order_relaxed);
+            nn += snprintf(buf + nn, size - nn, "%+lldms", (long long)((mv - ma) / 1000));
+        } else
+            nn += snprintf(buf + nn, size - nn, "--");
+    }
+}
+
+/* corr= builder (pre14, moved verbatim). NOT called by the mv printer this pre — the mv
+ * corrector is HELD OFF (see rscorr_update); the arming pre gets the mv corr= column by
+ * adding the call. Absent while every track sits at corr==0 un-engaged — the quiet-channel
+ * stats line is unchanged (§6). */
+void ptv_stats_corr(char *buf, size_t size)
+{
+    int any = 0, ki, nn;
+    buf[0] = 0;
+    if (!g_rsync_corr || g_rsx.n_a <= 0)
+        return;
+    for (ki = 0; ki < g_rsx.n_a; ki++)
+        if (atomic_load_explicit(&g_corr_pub[ki], memory_order_relaxed) != 0 ||
+            atomic_load_explicit(&g_corr_state_pub[ki], memory_order_relaxed) == PTV_CORR_ENGAGED)
+            any = 1;
+    if (!any)
+        return;
+    nn = snprintf(buf, size, " corr=");
+    for (ki = 0; ki < g_rsx.n_a && nn > 0 && nn < (int)size - 18; ki++) {
+        int64_t cu = atomic_load_explicit(&g_corr_pub[ki], memory_order_relaxed);
+        int     st = atomic_load_explicit(&g_corr_state_pub[ki], memory_order_relaxed);
+        if (g_rsx.n_a > 1)
+            nn += snprintf(buf + nn, size - nn, "%sa%d:", ki ? "," : "", ki);
+        nn += snprintf(buf + nn, size - nn, "%+lldms%s",
+                       (long long)(cu / 1000), st == PTV_CORR_ENGAGED ? "*" : "");
+    }
 }

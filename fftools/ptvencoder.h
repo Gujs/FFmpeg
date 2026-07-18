@@ -204,7 +204,9 @@ typedef struct VOutRing {
  *   m_a = EMA[out_a − (sink_src − inj) − slip]
  *                                       (audio drain, per emitted frame; inj = the label
  *                                        offsets the audio thread itself injected at the graph
- *                                        door = AGLUE glue_off + AVLOCK house_skew, so the
+ *                                        door = AGLUE glue_off + corr + the PATH term (AVLOCK
+ *                                        house_skew on single/non-follow, af_steer_us on the
+ *                                        mv follow path — pre16 mirrors the door bus), so the
  *                                        reference recovers the RAW post-demux label; slip =
  *                                        the resampler's UN-REALIZED correction beyond a 50ms
  *                                        dead band — the parked-slip class [PTV-SWRDELAY]
@@ -227,17 +229,29 @@ typedef struct VOutRing {
  * relabel-erases (glue_off), per-stream-unequal demux rebases (E_v−E_a — the wrong-glue /
  * partner-step-bake class), parked resampler slip, and any label-followed single-stream jump.
  * PASSIVE: nothing consumes R — it feeds the stats line (`lipsync=`) and the [PTV-RSYNC]
- * DIAG line only. The corrector is a later round, gated on this sensor matching the external
- * oracle in a live soak. PTV_RSYNC_SENSE=0 disables. Single-input only (the mv compositor
- * owns per-slot lineage; mv prints no lipsync= rather than garbage — n_a stays 0). */
+ * DIAG line only. The corrector consumes R via rsync_track_R() (pre14; HELD OFF on mv this
+ * pre — see rscorr_update). PTV_RSYNC_SENSE=0 disables (sensor + slip probe + the pre15
+ * realization tripwire, both modes).
+ * 1.0.1-pre16 MV SENSOR PORT (analysis/ptvencoder-mv-sensor-port.md): the video half is
+ * PER-SLOT — mv_ema/mv_wall/ev_us are arrays keyed by input slot. Single writer per field,
+ * relaxed atomics, no locks: mv_ema/mv_wall[s] — ONE writer thread (the compositor on mv at
+ * the sk-measurement/display site, per house tick incl. dup/residence holds; the master
+ * output thread = slot 0 on single input); ev_us[s] — slot s's demux thread; ma_ema, ma_wall
+ * and ea_us[k] — track k's audio/demux threads (unchanged, GLOBAL track index). A slated slot stops
+ * publishing → mv_wall[s] stales past 3s → that slot's tracks read `--` (the single-input
+ * stale-anchor rule, per slot). R pairs track k's audio terms with its OWN slot's video
+ * terms inside rsync_track_R() — per-(slot,track) residuals, cross-slot independent. */
 typedef struct RsyncSense {
-    _Atomic int64_t mv_ema;                 /* video EMA(out−src) µs (master rung writes) */
-    _Atomic int64_t mv_wall;                /* wall µs of the last video sample (freshness) */
-    _Atomic int64_t ev_us;                  /* video stream label-edit ledger E_v (µs, demux writes) */
+    _Atomic int64_t mv_ema[PTV_MAX_INPUT];  /* per-slot video EMA(out−src) µs (compositor / master rung writes) */
+    _Atomic int64_t mv_wall[PTV_MAX_INPUT]; /* wall µs of the slot's last video sample (freshness) */
+    _Atomic int64_t ev_us[PTV_MAX_INPUT];   /* per-slot video label-edit ledger E_v (µs, slot's demux writes) */
     _Atomic int64_t ma_ema[PTV_MAX_AUDIO];  /* per-track audio EMA (audio threads write) */
     _Atomic int64_t ma_wall[PTV_MAX_AUDIO]; /* wall µs of the last audio sample */
     _Atomic int64_t ea_us[PTV_MAX_AUDIO];   /* per-track audio stream ledger E_a (µs) */
-    int             n_a;                    /* transcoded tracks wired (0 = sensor unwired: multiview / no audio) */
+    int             n_a;                    /* transcoded tracks wired (pre16: = n_audio ALWAYS, mv included) */
+    int             n_in;                   /* wired input slots (1 = single input) */
+    int             a_in[PTV_MAX_AUDIO];    /* track → input slot map (stats printers; plain int,
+                                             * set in transcode() before threads spawn) */
 } RsyncSense;
 
 /* ===================== 1.0.1-pre14 — residual-sync CORRECTOR =====================
@@ -249,9 +263,11 @@ typedef struct RsyncSense {
  * loop, NOT a controller: authority is deliberately too small to paper over a structural
  * glue failure (§6 damage bound, owner-approved caps: 5s/engagement, 10s lifetime).
  * MV-NORMATIVE (§8): one CorrState per (input-slot, audio-track), embedded in AudioState;
- * the corrector consumes R only through the rsync_track_R() accessor (slot 0 hard-wired
- * today; the mv sensor port re-shapes RsyncSense behind it). DEFAULT ON (owner-directed
- * 2026-07-17); PTV_NO_RSYNC_CORR=1 kills it outright (§6/§7).
+ * the corrector consumes R only through the rsync_track_R() accessor (pre16: per-slot video
+ * ledgers keyed by AudioState.dbg_in — the slot hard-wire died inside the accessor). ON MV
+ * THE CORRECTOR IS HELD OFF this pre (sensor-first soak; see the rscorr_update hold).
+ * DEFAULT ON single-input (owner-directed 2026-07-17); PTV_NO_RSYNC_CORR=1 kills it
+ * outright (§6/§7).
  * All state below is owned by that track's audio thread; cross-thread visibility goes
  * through the g_corr_* published atomics only. */
 enum {
@@ -373,6 +389,16 @@ typedef struct DecodeCtx {
     int              in_pps_decl;          /* declared input rate, ceil(avg_frame_rate) — the
                                             * pre13 trust floor: a measured rate BELOW this is broken,
                                             * not a slow source (Newsmax2 live defect); 0 = unknown */
+    /* 1.0.1-pre16: per-input published telemetry (→ Input fields). Governor gpps/decl/on
+     * were single globals gated !hold, so on mv the governor RAN but said nothing (rr13
+     * blindness); the globals remain as the input-0 alias for the single-input DIAG t= line
+     * (log-string-identical). Self-shed wall/cnt mirror g_shed_wall/g_shed_cnt per input so
+     * slot B's shed neither annotates slot A's AGLUE lines nor freezes slot A's corrector. */
+    _Atomic int     *gov_gpps;             /* -> Input.gov_gpps */
+    _Atomic int     *gov_decl;             /* -> Input.gov_decl */
+    _Atomic int     *gov_on;               /* -> Input.gov_on */
+    _Atomic int64_t *shed_wall;            /* -> Input.shed_wall */
+    _Atomic int64_t *shed_cnt;             /* -> Input.shed_cnt */
 } DecodeCtx;
 
 /* Per-rung output side: pop this rung's frame_q on the house clock, stamp the
@@ -569,6 +595,12 @@ typedef struct AudioState {
     _Atomic int_least64_t *corr_epoch;                /* -> Input.house_disturb (event feed) */
     int             *corr_layera_active;              /* -> Input.disc.active (g_layera only; NULL = off) */
     int              afmt_rebuilds;                   /* [PTV-AFMT] rebuild count (corrector event feed) */
+    /* 1.0.1-pre16: per-input event feeds (this track's OWN input slot; NULL → global
+     * fallback). Cross-slot independence: another slot's shed/governor must not annotate
+     * this track's AGLUE lines or freeze this track's corrector quiet window. */
+    _Atomic int64_t *shed_wall;                       /* -> Input.shed_wall (self-shed window) */
+    _Atomic int64_t *shed_cnt;                        /* -> Input.shed_cnt */
+    _Atomic int     *gov_on;                          /* -> Input.gov_on (catch-up governor engaged) */
     /* 1.0.1-pre15 glue classification (#33; g_glueclass) — all owned by this track's audio
      * thread. E5 pad ledger (see the PTV_GLUE_PAD_* block): open GAP-pads awaiting a possible
      * return leg; 0 = consumed/empty slot. */
@@ -799,7 +831,11 @@ typedef struct DemuxArgs {
     int64_t              *edit_us;        /* 1.0.1-pre9 sensor: per-stream label-EDIT ledger (µs) — the
                                            * non-wrap share of wrap_off (splice absorbs, LAYERA persists,
                                            * retro-corrections); demux thread only, published via g_rsx */
-    int                   rsync_pub;      /* 1 = publish this input's ledger to g_rsx (single-input, input 0) */
+    int                   rsync_slot;     /* pre16: this input's slot index — keys g_rsx.ev_us[] (video
+                                           * ledger publish; audio publishes by aglobal[j]). ALL inputs
+                                           * publish now (was rsync_pub, single-input input 0 only) */
+    _Atomic int64_t      *shed_wall;      /* pre16: -> Input.shed_wall (per-input self-shed stamp) */
+    _Atomic int64_t      *shed_cnt;       /* pre16: -> Input.shed_cnt */
     PtvDiscBuf           *disc;           /* legacy-0004 buffer-classify-discard (g_layera only; NULL otherwise) */
     int64_t               video_fwd_us;   /* wall-clock (us) of the last VIDEO forward-discontinuity crossing (whole-program-splice indicator) */
     int64_t               prog_off;       /* P2 (§7.1): program-level discontinuity offset (90kHz, detected on the
@@ -910,6 +946,15 @@ typedef struct Input {
     _Atomic int_least64_t aglue_exp_step[PTV_MAX_AUDIO];
     _Atomic int_least64_t aglue_exp_dl[PTV_MAX_AUDIO];
     _Atomic int           vq_shed_req;       /* 1.0.1-pre8 (a): per-input head-GOP shed request */
+    /* 1.0.1-pre16 per-input published telemetry (the globals g_shed_wall/g_shed_cnt and
+     * g_gov_* stay stamped as the any-input aggregate / input-0 single-input alias; these
+     * carry the SLOT-scoped copy for the per-track readers — AGLUE self-shed notes, the
+     * corrector's quiet window and governor feed, the mv DIAG per-slot gpps/gov segment). */
+    _Atomic int64_t       shed_wall;         /* wall µs of this input's last self-inflicted queue drop */
+    _Atomic int64_t       shed_cnt;          /* cumulative self-shed pkts on this input */
+    _Atomic int           gov_gpps;          /* catch-up governor: last measured arrival pps it saw */
+    _Atomic int           gov_decl;          /* declared input pps (trust floor) */
+    _Atomic int           gov_on;            /* 1 = governing this input's decode */
     DecodeCtx             dc;
     DemuxArgs             da;
     pthread_t             th_demux, th_decode;
@@ -1006,7 +1051,9 @@ extern int     g_selfheal;               /* (c) self-heal re-prime backstop (PTV
 extern int     g_vindbg;                 /* TEMP pre13 diagnosis: vin_pps window + governor trace */
 extern _Atomic int     g_selfheal_req;   /* (c) master output thread -> decode thread */
 extern _Atomic int64_t g_v_arrive_wc;    /* wall us of the last video pkt at the demux (input-flowing signal) */
-extern _Atomic int64_t g_shed_wall;      /* (d) wall us of the last self-inflicted queue drop */
+extern _Atomic int64_t g_shed_wall;      /* (d) wall us of the last self-inflicted queue drop (ANY input —
+                                          * pre16: per-track readers use Input.shed_wall; this aggregate
+                                          * stays for the catch-up governor + unwired fallback) */
 extern _Atomic int64_t g_shed_cnt;       /* (d) cumulative self-shed pkts (video head+tail, audio drop-oldest) */
 extern int     g_nvenc_serialize;        /* defined in ptvencoder_clock.c */
 extern CushionRt g_curt;                 /* defined in ptvencoder_gate.c */
@@ -1014,7 +1061,9 @@ extern CushionRt g_curt;                 /* defined in ptvencoder_gate.c */
 extern int     g_cushrel;                /* (e) cushion-tier release on starvation contradiction (PTV_NO_CUSHREL) */
 extern int     g_catchgov;               /* (f) governed deficit-recovery decode, 1.25x realtime (PTV_NO_CATCHGOV) */
 /* 1.0.1-pre13 catch-up governor observability (single-input decode publishes; DIAG t= line reads).
- * The Newsmax2 wedge was undiagnosable from logs — dec ≪ fps with vq pinned had NO gpps trace. */
+ * The Newsmax2 wedge was undiagnosable from logs — dec ≪ fps with vq pinned had NO gpps trace.
+ * pre16: these globals are the INPUT-0 SINGLE-INPUT ALIAS (log strings unchanged); the per-input
+ * truth lives in Input.gov_* (mv DIAG per-slot segment + the corrector's per-track feed). */
 extern _Atomic int     g_gov_gpps;       /* last measured arrival pps the governor saw (0 = none) */
 extern _Atomic int     g_gov_decl;       /* declared input pps (trust floor) */
 extern _Atomic int     g_gov_on;         /* 1 = governing (sleeps active), 0 = disengaged/fail-open */
@@ -1084,6 +1133,14 @@ void ptv_disc_free(PtvDiscBuf *b);
 void *compositor_thread(void *arg);
 /* ptvencoder_legend.c */
 void ptv_print_log_legend(int full);
+/* 1.0.1-pre16 shared stats-line builders (single-input master printer in ptvencoder_clock.c
+ * + the mv compositor printer in ptvencoder_mv.c). Byte-identical extraction of the pre9
+ * lipsync= / pre14 corr= builders; the only semantic change is the per-slot video term
+ * (g_rsx.mv_ema/mv_wall/ev_us keyed by g_rsx.a_in[ki] — identity 0 on single input). force_idx=1 (mv)
+ * always prints the aK: prefix; 0 keeps the pre9 n_a>1 rule (single-input token-identical).
+ * Both write "" when the field is absent. */
+void ptv_stats_lipsync(char *buf, size_t size, int64_t now_us, int force_idx);
+void ptv_stats_corr(char *buf, size_t size);
 /* ptvencoder.c */
 void vring_put(VOutRing *r, int64_t src_us, int64_t out_us);
 int vring_lookup(VOutRing *r, int64_t want_src, int64_t *out_v, int64_t *matched_src);

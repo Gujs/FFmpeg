@@ -7,6 +7,80 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(7n) MULTIVIEW SENSOR PORT — pre16, task #45 items 1+2. NORMATIVE DESIGN =
+analysis/ptvencoder-mv-sensor-port.md (owner-approved 2026-07-18 with all
+five §11 questions resolved to the doc's recommendations). Every
+(input-slot, audio-track) on a 2/4-up mosaic gets the SAME certified sensor
+single-input has — mv desync becomes measurable (#24 RAV/RSBN audio-early
+birth and #27 audio-only-outage resume misanchor become instrument-visible;
+this pre MEASURES them, fixes are later rounds). The one structural insight:
+the sensor's audio half was already per-(slot,track); only the video half was
+scalar and every mv block was an explicit `!multiview` gate. The port:
+(a) RsyncSense re-shape: mv_ema/mv_wall/ev_us become per-slot arrays
+(PTV_MAX_INPUT), + n_in + a_in[] track→slot map; single-writer-per-field
+relaxed atomics unchanged (compositor owns mv_*[k] on mv, master rung = slot
+0 on single input; slot's demux owns ev_us[s]). g_rsx.n_a = n_audio ALWAYS
+(was 0 on mv).
+(b) Compositor per-slot video publish at the sk-measurement/DISPLAY site:
+m_v[slot] = EMA[mv_tick_us(tick) − disp_src] per house tick, dup/residence
+holds included (single-input dups-included rule), exact-rational axis, τ≈30s
+divisor verbatim; published only while `last[k] && !stale` → a slated slot's
+tracks read `--` (freshness = the outage signal). REANCHOR2 excursions are
+MEASURED into m_v then cancelled through the h0-shifted audio side —
+residual mismatch is exactly what R must show (#24's suspected shape).
+(c) mv gates deleted: the audio sensor block + pre11 slip probe + pre15
+realization tripwire run on mv (one `!a->multiview` removed); `inj` now
+mirrors the PATH-DEPENDENT graph-door bus (single/non-follow: house_skew;
+mv follow: af_steer_us; glue+corr both paths) so R reads the residual and
+dR/dcorr=−1 holds per track on both paths. The tripwire is the sensor
+block's only non-passive resident on mv (deliberate — closes the row-22
+silent hole); PTV_RSYNC_SENSE=0 remains the kill for sensor+tripwire, both
+modes.
+(d) LATENT INDEX BUG FIX: demux ea_us publish keyed by DEMUX-LOCAL j
+(identity on single input; on mv input 1's first track posted into ea_us[0])
+→ g_rsx.ea_us[d->aglobal[j]]; every input now publishes (rsync_pub →
+rsync_slot).
+(e) CORRECTOR HELD OFF ON MV (mandatory, owner Q1): one-line
+`if (a->multiview) return;` at the top of rscorr_update() — before the port
+mv was inert only by accident (rs_ma_seed never set); without the hold the
+fleet-default-ON corrector would actuate on grids with no soak. CorrState
+stays OFF, corr_us stays 0 ⇒ bus term + inj term never fire ⇒ mv
+byte-inertness. Removal site = the mv corrector-arm pre, which must also
+re-home the clock.c stale-track watchdog to the compositor (unreachable on
+mv — passthrough rungs return early) and wire per-input liveness
+(g_v_arrive_wc + rung watermarks).
+(f) Stats/DIAG parity: lipsync=/corr= builders extracted to shared helpers
+(ptvencoder_legend.c; single-input line TOKEN-IDENTICAL — the video term
+indexes a_in[ki]≡0 there). mv stats line gains ALWAYS-ON per-slot
+`lipsync=a0:+3ms,a1:--,...` (aK: prefix forced; owner Q2) + `acor=` global
+sum (per-track detail stays on [PTV-ADISC]/NBS lines; owner Q5); corr=
+deliberately absent while the hold stands. Governor telemetry re-homed
+per-input (Input.gov_gpps/decl/on; globals stay as the input-0 alias —
+single-input DIAG t= string unchanged, owner Q4); mv [PTV-DIAG] per-slot
+segment gains /gpps=M/D/gov=G (the governor ran blind on mv, rr13).
+Startup `[PTV-RSYNC] tracks: a0→in0 …` map line (mv only).
+(g) Per-slot event feeds wired for the ARMING pre (consumed then, exercised
+by the sensor soak now): REANCHOR2 fires bump the slot's house_disturb epoch
+(REUSED, not a new atomic — owner Q3: house_disturb is consumed only by
+corrector snapshots, PLL acquire event-ungated since v0.6.18, so the bump is
+inert while the hold stands); g_shed_wall/g_shed_cnt re-homed per-input
+(Input.shed_wall/shed_cnt; globals stay stamped as the any-input aggregate
+for the catch-up governor) — AGLUE self-shed notes + the corrector's
+quiet-window/governor feeds read the track's OWN input, so slot B's
+shed/governor no longer annotates or freezes slot A. Corrector snapshots/
+event-edge read ev_us[dbg_in]. Remaining any-input smears (g_v_arrive_wc,
+rung wire watermarks) are explicitly the arming pre's §3 scope.
+Known floor: a 25-in-29.97 slot's residence sawtooth EMA-averages to a small
+stable offset (≤ ~half tick) — documented noise, far under the 80ms engage
+band; soak-verification item, not a defect. Gates run: MG-B1 single-input
+byte-identical to pre15 (audio ES+apts content-exact); MG-B2 mv rung outputs
+byte-identical PTV_RSYNC_SENSE=0 vs 1 on verdict-free fixtures; MG-B3
+corrector-hold proof under injected per-slot R (readings move, zero
+[PTV-RSCORR] activity); MG-1/2/3 per-slot independence + storm/glue
+isolation; MG-4 stats-line grammar (single-input token-identical); MG-5
+per-slot flash+beep oracle agreement; MG-6 #24/#27 shaped fixtures RENDERED
+by the instrument (measurement, no fix expected).
+
 (7m) GLUE CLASSIFICATION — pre15, task #33. NORMATIVE DESIGN =
 analysis/ptvencoder-33-glue-classification.md (owner-approved 2026-07-18 with
 all five §7 questions resolved to the doc's recommendations). A

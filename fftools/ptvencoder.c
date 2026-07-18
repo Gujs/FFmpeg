@@ -41,7 +41,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.0.1-pre15"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.0.1-pre16"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -960,6 +960,8 @@ static void *decode_thread(void *arg)
                     d->shed_pkts += shed_n;
                     atomic_store_explicit(&g_shed_wall, nw, memory_order_relaxed);
                     atomic_fetch_add_explicit(&g_shed_cnt, shed_n, memory_order_relaxed);
+                    if (d->shed_wall) atomic_store_explicit(d->shed_wall, nw, memory_order_relaxed);
+                    if (d->shed_cnt)  atomic_fetch_add_explicit(d->shed_cnt, shed_n, memory_order_relaxed);
                     if (nw - d->shed_log_us >= 1000000) {        /* rate-limit; totals keep it honest */
                         d->shed_log_us = nw;
                         av_log(NULL, AV_LOG_WARNING,
@@ -986,6 +988,7 @@ static void *decode_thread(void *arg)
                     d->heal_dropkf = 1;
                     d->heal_arm_us = av_gettime_relative();
                     atomic_store_explicit(&g_shed_wall, d->heal_arm_us, memory_order_relaxed);
+                    if (d->shed_wall) atomic_store_explicit(d->shed_wall, d->heal_arm_us, memory_order_relaxed);
                     av_log(NULL, AV_LOG_WARNING,
                            "[PTV-SELFHEAL] re-prime (video_q empty): decoder resets at the "
                            "next IDR\n");
@@ -1013,6 +1016,8 @@ static void *decode_thread(void *arg)
             d->heal_arm_us = av_gettime_relative();
             atomic_store_explicit(&g_shed_wall, d->heal_arm_us, memory_order_relaxed);
             atomic_fetch_add_explicit(&g_shed_cnt, flushed, memory_order_relaxed);
+            if (d->shed_wall) atomic_store_explicit(d->shed_wall, d->heal_arm_us, memory_order_relaxed);
+            if (d->shed_cnt)  atomic_fetch_add_explicit(d->shed_cnt, flushed, memory_order_relaxed);
             av_log(NULL, AV_LOG_WARNING,
                    "[PTV-SELFHEAL] re-prime: flushed %d queued video pkts; decoder resets at "
                    "the next IDR\n", flushed);
@@ -1040,6 +1045,7 @@ static void *decode_thread(void *arg)
             } else {
                 av_packet_free(&pkt);
                 atomic_fetch_add_explicit(&g_shed_cnt, 1, memory_order_relaxed);
+                if (d->shed_cnt) atomic_fetch_add_explicit(d->shed_cnt, 1, memory_order_relaxed);
                 continue;
             }
         }
@@ -1123,10 +1129,14 @@ static void *decode_thread(void *arg)
                 int trusted = gpps > 0 && gpps >= d->in_pps_decl &&
                               gpw && gnw - gpw < 30LL * 1000000 &&
                               gnw >= gov_holdoff_until_us;
-                if (!d->hold) {                        /* single-input: DIAG t= line telemetry */
+                if (!d->hold) {                        /* single-input: DIAG t= line telemetry (input-0 global alias, pre16) */
                     atomic_store_explicit(&g_gov_gpps, gpps, memory_order_relaxed);
                     atomic_store_explicit(&g_gov_decl, d->in_pps_decl, memory_order_relaxed);
                 }
+                /* pre16: per-input publish, ALL inputs — the governor RAN on mv but said
+                 * nothing (rr13 blindness); the mv DIAG per-slot segment reads these. */
+                if (d->gov_gpps) atomic_store_explicit(d->gov_gpps, gpps, memory_order_relaxed);
+                if (d->gov_decl) atomic_store_explicit(d->gov_decl, d->in_pps_decl, memory_order_relaxed);
                 if (trusted && gsw && gnw - gsw < 600LL * 1000000 &&
                     av_thread_message_queue_nb_elems(d->video_q) > gpps) {
                     int64_t step = 800000 / gpps;       /* 4/5 input tick = 1.25x INPUT realtime */
@@ -1135,6 +1145,7 @@ static void *decode_thread(void *arg)
                                gpps, d->in_pps_decl, step,
                                av_thread_message_queue_nb_elems(d->video_q));
                     if (!d->hold) atomic_store_explicit(&g_gov_on, 1, memory_order_relaxed);
+                    if (d->gov_on) atomic_store_explicit(d->gov_on, 1, memory_order_relaxed);   /* pre16: per-input */
                     if (gov_next_us > gnw) {
                         int64_t want = gov_next_us - gnw, real;
                         av_usleep((unsigned)want);
@@ -1176,6 +1187,7 @@ static void *decode_thread(void *arg)
                         av_log(NULL, AV_LOG_INFO, "[PTV-VINDBG] gov DISENGAGE gpps=%d trusted=%d vq=%d\n",
                                gpps, trusted, av_thread_message_queue_nb_elems(d->video_q));
                     if (!d->hold) atomic_store_explicit(&g_gov_on, 0, memory_order_relaxed);
+                    if (d->gov_on) atomic_store_explicit(d->gov_on, 0, memory_order_relaxed);   /* pre16: per-input */
                     gov_next_us = 0;                    /* incl. untrusted rate: fail open, never wedge */
                 }
             }
@@ -1914,6 +1926,11 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
          * channels (DIAG shows gpps=M/D gov=0 with M ~= D/2). Fail-open = safe. */
         d->vin_pps = &inputs[k].da.vin_pps;
         d->vin_pps_wall = &inputs[k].da.vin_pps_wall;   /* pre13: publish-freshness gate */
+        d->gov_gpps  = &inputs[k].gov_gpps;   /* pre16: per-input governor telemetry (mv DIAG + */
+        d->gov_decl  = &inputs[k].gov_decl;   /* corrector feed; globals stay the input-0 alias) */
+        d->gov_on    = &inputs[k].gov_on;
+        d->shed_wall = &inputs[k].shed_wall;  /* pre16: per-input self-shed stamp (row 14) */
+        d->shed_cnt  = &inputs[k].shed_cnt;
         {
             AVRational ifr = inputs[k].vist && inputs[k].vist->avg_frame_rate.num
                            ? inputs[k].vist->avg_frame_rate
@@ -1972,6 +1989,9 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         as[k].glue_exp_dl   = &inputs[asrc_in[k]].aglue_exp_dl[k];
         as[k].corr_epoch    = &inputs[asrc_in[k]].house_disturb;       /* pre14: corrector event feeds (its input slot) */
         as[k].corr_layera_active = g_layera ? &inputs[asrc_in[k]].disc.active : NULL;
+        as[k].shed_wall = &inputs[asrc_in[k]].shed_wall;   /* pre16: per-input self-shed window (AGLUE notes + */
+        as[k].shed_cnt  = &inputs[asrc_in[k]].shed_cnt;    /* corrector quiet) — slot B never smears slot A */
+        as[k].gov_on    = &inputs[asrc_in[k]].gov_on;      /* pre16: this track's OWN input's governor flag */
         as[k].acomp_exp_us = AV_NOPTS_VALUE;             /* [PTV-ACOMP] no expected-pts reference yet */
         as[k].tick_dur_us = av_rescale(1000000, out_fps.den, out_fps.num);  /* 1.0.1: house tick = the PLL's vlag quantum (one house clock for all slots) */
         for (r = 0; r < n_rung; r++) {
@@ -1989,7 +2009,10 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         d->wrap_off = inputs[kk].wrap_off; d->wrap_last = inputs[kk].wrap_last;
         d->wrap_wall_last = inputs[kk].wrap_wall_last; d->video_fwd_us = 0;
         d->edit_us = inputs[kk].edit_us;                /* pre9 sensor: per-stream label-edit ledger */
-        d->rsync_pub = (!multiview && kk == 0);         /* single-input: publish to g_rsx */
+        d->rsync_slot = kk;                             /* pre16: EVERY input publishes its ledgers to g_rsx,
+                                                         * video keyed by this slot (was single-input-only) */
+        d->shed_wall = &inputs[kk].shed_wall;           /* pre16: per-input self-shed stamp */
+        d->shed_cnt  = &inputs[kk].shed_cnt;
         d->disc = g_layera ? &inputs[kk].disc : NULL;   /* legacy-0004 buffer (NULL when off) */
         d->vq_shed_req = &inputs[kk].vq_shed_req;       /* 1.0.1-pre8 (a): overflow -> request head-GOP shed */
         d->autobank = g_autobank && !multiview && live && is_net_url(inputs[kk].url);   /* v0.9.14: single-input live only */
@@ -2009,9 +2032,23 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
             }
     }
 
-    /* pre9 sensor: wire the track count for the stats-line lipsync= field. Single-input only —
-     * multiview leaves n_a = 0, so the mv stats path prints no lipsync= (explicit, not garbage). */
-    g_rsx.n_a = multiview ? 0 : n_audio;
+    /* pre9 sensor track count / pre16 mv port: wired for BOTH modes now — the compositor
+     * publishes per-slot video lineage, so mv lipsync= is real per-(slot,track) data, not
+     * garbage. a_in[] is the track→slot map the shared stats builder keys the video term by
+     * (identically 0 on single input); plain ints, set before any thread spawns. */
+    g_rsx.n_a  = n_audio;
+    g_rsx.n_in = n_input;
+    for (k = 0; k < n_audio; k++)
+        g_rsx.a_in[k] = asrc_in[k];
+    if (multiview && g_rsync_sense && n_audio > 0) {
+        /* startup track→slot map (mv only — trivial on single input, whose log stays
+         * byte-identical to pre15): makes the always-on per-slot lipsync= self-describing. */
+        char tm[16 + PTV_MAX_AUDIO * 12];
+        int  tn = snprintf(tm, sizeof tm, "[PTV-RSYNC] tracks:");
+        for (k = 0; k < n_audio && tn > 0 && tn < (int)sizeof tm - 12; k++)
+            tn += snprintf(tm + tn, sizeof tm - tn, " a%d→in%d", k, asrc_in[k]);
+        av_log(NULL, AV_LOG_INFO, "%s\n", tm);
+    }
 
     av_log(NULL, AV_LOG_INFO,
         "ptvencoder: %s %d input(s) %d rung(s)  house %d/%d fps (%s)  v:%s->enc  a:%s  in:%s  pull-pipeline\n",

@@ -272,23 +272,28 @@ static void ptv_pair_expect(DemuxArgs *d, int stream_idx, int64_t step_us)
  * stream's labels). Callers: the discontinuity self-rebase (−adj), the LAYERA flush persist
  * (+applied_offset), the pre5 retro-correct (+corr). Pure 2^33 wraps are deliberately NOT
  * posted (always genuine + shared; posting them would spike R by the wrap period during every
- * A-before-V wrap straddle). Demux thread only; published to g_rsx for the single wired input
- * so the sensor's R sees per-stream-UNEQUAL edits (the wrong-glue bake class) while shared
- * edits cancel. Ledger + publish are reporting-only — no control path reads them. */
+ * A-before-V wrap straddle). Demux thread only; published to g_rsx (pre16: EVERY input —
+ * video keyed by this input's slot, audio by the GLOBAL track index) so the sensor's R sees
+ * per-stream-UNEQUAL edits (the wrong-glue bake class) while shared edits cancel, per slot,
+ * independently of every other slot. Ledger + publish are reporting-only — no control path
+ * reads them. */
 static void rsync_post_edit(DemuxArgs *d, int s, int64_t delta_us)
 {
     int j;
     if (!g_rsync_sense || !d->edit_us || s < 0 || s >= (int)d->ifmt->nb_streams)
         return;
     d->edit_us[s] += delta_us;
-    if (!d->rsync_pub)
-        return;
-    if (s == d->vstream)
-        atomic_store_explicit(&g_rsx.ev_us, d->edit_us[s], memory_order_relaxed);
-    else
+    if (s == d->vstream) {
+        if (d->rsync_slot >= 0 && d->rsync_slot < PTV_MAX_INPUT)
+            atomic_store_explicit(&g_rsx.ev_us[d->rsync_slot], d->edit_us[s], memory_order_relaxed);
+    } else
+        /* pre16 latent-bug fix: key by the GLOBAL track index d->aglobal[j], not the
+         * demux-LOCAL j (identity on single input; on mv input 1's first track would have
+         * posted into ea_us[0] and corrupted another slot's reading). */
         for (j = 0; j < d->n_audio && j < PTV_MAX_AUDIO; j++)
-            if (d->astream[j] == s)
-                atomic_store_explicit(&g_rsx.ea_us[j], d->edit_us[s], memory_order_relaxed);
+            if (d->astream[j] == s &&
+                d->aglobal[j] >= 0 && d->aglobal[j] < PTV_MAX_AUDIO)
+                atomic_store_explicit(&g_rsx.ea_us[d->aglobal[j]], d->edit_us[s], memory_order_relaxed);
 }
 
 void ptv_disc_free(PtvDiscBuf *b)
@@ -1985,6 +1990,8 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                         d->vdrop++; d->qshed_tail_n++; d->qshed_tail_tot++;
                         atomic_store_explicit(&g_shed_wall, nw, memory_order_relaxed);
                         atomic_fetch_add_explicit(&g_shed_cnt, 1, memory_order_relaxed);
+                        if (d->shed_wall) atomic_store_explicit(d->shed_wall, nw, memory_order_relaxed);
+                        if (d->shed_cnt)  atomic_fetch_add_explicit(d->shed_cnt, 1, memory_order_relaxed);
                         av_packet_free(&out);
                         ret = 0;
                     }
@@ -2031,6 +2038,8 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                         }
                         atomic_store_explicit(&g_shed_wall, nw, memory_order_relaxed);
                         atomic_fetch_add_explicit(&g_shed_cnt, 1, memory_order_relaxed);
+                        if (d->shed_wall) atomic_store_explicit(d->shed_wall, nw, memory_order_relaxed);
+                        if (d->shed_cnt)  atomic_fetch_add_explicit(d->shed_cnt, 1, memory_order_relaxed);
                         if (nw - d->qshed_log_us >= 5000000) {
                             d->qshed_log_us = nw;
                             av_log(NULL, AV_LOG_WARNING,
@@ -2072,6 +2081,8 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                             d->adrop++;
                             atomic_store_explicit(&g_shed_wall, av_gettime_relative(), memory_order_relaxed);
                             atomic_fetch_add_explicit(&g_shed_cnt, 1, memory_order_relaxed);
+                            if (d->shed_wall) atomic_store_explicit(d->shed_wall, av_gettime_relative(), memory_order_relaxed);
+                            if (d->shed_cnt)  atomic_fetch_add_explicit(d->shed_cnt, 1, memory_order_relaxed);
                         }
                         if (av_thread_message_queue_send(d->audio_q[k], &c,
                                                          AV_THREAD_MESSAGE_NONBLOCK) < 0) {
