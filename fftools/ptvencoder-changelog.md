@@ -38,6 +38,21 @@ pad AND the flush's relabel-erase. FIX (g_glueveto, three parts):
 KNOWN BOUND: a THIRD dense audio stream whose matching jump arrives flowing
 after the veto window gets its own cycle/erase (3-audio channels; no live
 precedent — noted for the record). PTV_NO_GLUEVETO=1 reverts all three.
+(B) CORRECTOR HS-TICK EVENT FILTER (task #51a; AWE dwell starvation, live
+2026-07-19). SYMPTOM: with a +2380ms flat bake standing, the corrector never
+completed a dwell — on pulldown/decim channels house_skew ticks ±1 video tick
+(~33ms) every 10-17s forever (bursty: tick trains for ~1-2min, then 1-5min
+quiet), each crossing of the cumulative-50ms edge reset the dwell and fed the
+storm counter → re-arm/storm-disarm limit cycle; the live shape was "nibble
++60ms per lucky quiet window, 10min holdoff between" (15:07 window: ENGAGE,
+corr +59ms in 30s, storm-disarm at 15:12:59). R measured flat +2380..+2384
+through every tick = the ticks are benign cadence noise, not lineage events.
+FIX: magnitude-filter the hs event EDGE — a step ≤ 1 tick + ¼ tick (~41ms at
+29.97, 50ms at 25fps; always < the 2-tick event bar) is absorbed into the
+snapshot silently (no dwell reset, no storm count); larger steps stay events.
+All other named events (LAYERA, verdicts, AGLUE, reopen, AFMT, glue, ledgers,
+bank) keep full event status; the §4.3 continuous R-stability re-anchor
+remains the actuation safety, untouched. PTV_NO_HSTICK_FILTER=1 reverts.
 
 (7p) MV COMPLETION PRE — pre17: sibling-slate sensor artifact fix + af-independent
 mv transport (task #48) + MV CORRECTOR ARM. Three work items; the corrector-arm

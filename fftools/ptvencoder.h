@@ -1227,6 +1227,7 @@ extern _Atomic int64_t g_pad_pub_step[PTV_MAX_AUDIO];     /* newest OPEN pad-led
 extern _Atomic int64_t g_pad_pub_wc[PTV_MAX_AUDIO];       /* publishes; demux absorber reads — advisory) */
 /* 1.0.1-pre18 #50 (defined in ptvencoder.c): gap-verdict/LAYERA one-remedy invariant */
 extern int     g_glueveto;               /* veto + inverse guard + E5 flush-relabel net; PTV_NO_GLUEVETO=1 reverts */
+extern int     g_hstick_filter;          /* #51a: ≤1-tick hs steps are not corrector events; PTV_NO_HSTICK_FILTER=1 reverts */
 extern _Atomic int64_t g_flush_relab_step[PTV_MAX_AUDIO]; /* last LAYERA-flush label shift per track (demux writes, */
 extern _Atomic int64_t g_flush_relab_wc[PTV_MAX_AUDIO];   /* step first / wall last-release; audio thread reads) */
 

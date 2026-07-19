@@ -267,7 +267,24 @@ static const char *rscorr_event_edge(AudioState *a)
     if (v != c->bank_snap) { c->bank_snap = v; return "bank change"; }
     if (a->house_skew) {
         v = *a->house_skew;
-        if (llabs(v - c->hs_snap) >= 50000) { c->hs_snap = v; return "hs step"; }
+        if (g_hstick_filter) {
+            /* 1.0.1-pre18 #51a (AWE dwell starvation, live 2026-07-19): on pulldown/decim
+             * channels hs ticks ±1 video tick every 10-17s FOREVER (a benign cadence
+             * artifact — R measured flat +2380..+2384 through every tick), and the old
+             * cumulative-50ms rule fired every couple of ticks → the dwell never
+             * accumulated (or, with bursty ticking, nibbled ~60ms per lucky quiet window
+             * between 10min storm holdoffs) and the corrector never engaged on a
+             * +2.38s bake. Magnitude-filter the EDGE: a step ≤ 1 tick + ¼ tick is NOT an
+             * event — absorb it into the snapshot silently (no dwell reset, no storm
+             * count). ≥2 ticks stays an event (the threshold is 1.25 ticks < 2 ticks).
+             * The §4.3 continuous R-stability guard remains the actuation safety for
+             * anything a tick-sized hs step actually does to R. All other named events
+             * keep full event status. PTV_NO_HSTICK_FILTER=1 reverts to the cumulative
+             * 50ms rule. */
+            int64_t tol = a->tick_dur_us > 0 ? a->tick_dur_us + a->tick_dur_us / 4 : 50000;
+            if (llabs(v - c->hs_snap) > tol) { c->hs_snap = v; return "hs step"; }
+            c->hs_snap = v;   /* tick-sized churn: rebase the reference, never accumulate */
+        } else if (llabs(v - c->hs_snap) >= 50000) { c->hs_snap = v; return "hs step"; }
     }
     return NULL;
 }

@@ -600,6 +600,11 @@ _Atomic int64_t g_pad_pub_wc[PTV_MAX_AUDIO];
 int     g_glueveto = 1;
 _Atomic int64_t g_flush_relab_step[PTV_MAX_AUDIO];  /* last LAYERA-flush label shift per track (µs) */
 _Atomic int64_t g_flush_relab_wc[PTV_MAX_AUDIO];    /* wall µs it was persisted (0 = never) */
+/* 1.0.1-pre18 #51a — corrector hs-tick event filter (AWE dwell starvation, live 2026-07-19):
+ * a ±1-video-tick house_skew step is pulldown/decim cadence noise, not a lineage event —
+ * it must neither reset the dwell nor count toward the storm (rscorr_event_edge).
+ * PTV_NO_HSTICK_FILTER=1 reverts to counting every cumulative-50ms hs move. */
+int     g_hstick_filter = 1;
 
 /* PTV_LOG_TS=1: prefix every log line with a local wall-clock timestamp
  * [YYYY-MM-DD HH:MM:SS.mmm], so production logs are self-dated natively
@@ -2699,6 +2704,7 @@ int main(int argc, char **argv)
      * counters/[PTV-ADISC] stay on under every switch (unconditional observability). */
     if (getenv("PTV_NO_GLUECLASS")) g_glueclass = 0;
     if (getenv("PTV_NO_GLUEVETO")) g_glueveto = 0;   /* 1.0.1-pre18 #50: gap-verdict-vs-LAYERA one-remedy invariant off */
+    if (getenv("PTV_NO_HSTICK_FILTER")) g_hstick_filter = 0;   /* 1.0.1-pre18 #51a: hs-tick steps count as corrector events again */
     if (getenv("PTV_NBS_FILL") && g_glueclass) g_nbs_fill = 1;
     { const char *s = getenv("PTV_GLUE_HTOL_PCT");     if (s && atoi(s) > 0) g_glue_htol = atoi(s); }             /* tuning knob (G4) */
     { const char *s = getenv("PTV_PAIR_EXPECT_TTL_US");if (s && atoll(s) > 0) g_pair_ttl_us = atoll(s); }          /* TEST ONLY (G6) */
