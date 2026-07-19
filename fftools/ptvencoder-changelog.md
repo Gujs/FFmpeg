@@ -87,7 +87,15 @@ the §7.5b audio-death escape/disarm stays keyed on the AGGREGATE
 a_hi_change_wc (fires only when ALL tracks are silent, unchanged). The
 pre17 (B2) cap auto-size now measures against the same slowest-live key, so
 the escape cap sizes to the slowest chain. Uniform-audio channels read a
-min == the old aggregate (byte-equal path). PTV_NO_PERSTREAM_WM=1 reverts.
+min == the old aggregate (byte-equal path). Gate (cinestar mixed rung, single
+loudnorm, local x264 cell): pre17 wire = AAC median +1080ms late / AC-3 +16ms;
+pre18 = AAC +240ms (in band) / AC-3 −760ms — the copy now LEADS by the
+latency spread, which is structural: §7.5a releases audio on the ENCODE front
+(a delivery-keyed audio hold would close the forbidden deadlock cycle), so
+the fastest stream leads once video waits for the slowest. Early copy is
+bufferable/benign; the defect was the late transcoded stream. Audio-death
+gate: AC-3 PID killed mid-run → no video stall (fps flat 25.x, zero
+watchdog), stale exclusion took it out of the key within 2s.
 (E) MV PLL ACQUIRE LIMIT CYCLE (task #49, pre-existing). SYMPTOM: on
 audio-erase-class corruption an mv slot re-anchors ±277ms every ~12s forever
 (audible warble until restart). ROOT CAUSE (code-confirmed): an erase-class

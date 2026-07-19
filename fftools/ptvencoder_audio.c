@@ -269,9 +269,13 @@ static int64_t rscorr_hs_read(AudioState *a)
             g_rscorr_tesths_amp = 0;   /* parsed, off */
     }
     if (g_rscorr_tesths_amp > 0) {
-        static const int tri[4] = { 0, 1, 2, 1 };
+        /* 6-level walk 0→1→2→3→2→1: per-step ±amp (1 tick, filtered by #51a), but the
+         * RANGE spans 3 amps so the pre18 cumulative-50ms rule fires from ANY snapshot
+         * level within ≤2 periods (a 4-level 0,1,2,1 triangle never fires when the dwell
+         * snapshots at the mid level — measured, first battery round). */
+        static const int tri[6] = { 0, 1, 2, 3, 2, 1 };
         v += g_rscorr_tesths_amp *
-             tri[(av_gettime_relative() / g_rscorr_tesths_per) & 3];
+             tri[(av_gettime_relative() / g_rscorr_tesths_per) % 6];
     }
     return v;
 }
