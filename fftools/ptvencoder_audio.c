@@ -163,6 +163,11 @@ typedef struct RsyncTrackR { int valid; int64_t R_us, mv_wall, ma_wall; } RsyncT
  * per-engagement authority cap in bounded wall time (a real R never walks: label-faithful
  * drift reads R=0 by design). Never set in production. */
 static int64_t g_rscorr_testwalk_us_s = 0, g_rscorr_testwalk_t0 = 0;
+/* pre17 fix round (F2): PTV_RSCORR_TESTWALK_CAP_MS saturates the walk — without it the
+ * linear-forever walk is cancelled by the steer at equal rate, R never re-enters the park
+ * band, and mv ENGAGE→PARK is structurally unreachable via TESTWALK (reviewer F2). A capped
+ * walk = a synthetic SETTLED bake the corrector can steer to 0 and PARK on. TEST-ONLY. */
+static int64_t g_rscorr_testwalk_cap_us = 0;
 static RsyncTrackR rsync_track_R(const AudioState *a, int64_t now)
 {
     RsyncTrackR r = { 0, 0, 0, 0 };
@@ -183,14 +188,20 @@ static RsyncTrackR rsync_track_R(const AudioState *a, int64_t now)
     if (g_rscorr_testwalk_us_s == 0) {
         const char *tw = getenv("PTV_RSCORR_TESTWALK");
         const char *ta = getenv("PTV_RSCORR_TESTWALK_AT_S");
+        const char *tc = getenv("PTV_RSCORR_TESTWALK_CAP_MS");
         g_rscorr_testwalk_us_s = (tw && atoi(tw)) ? atoi(tw) : -1;   /* -1 = parsed, off */
+        g_rscorr_testwalk_cap_us = (tc && atoi(tc) > 0) ? (int64_t)atoi(tc) * 1000 : 0;
         /* PTV_RSCORR_TESTWALK_AT_S delays the walk's onset — the cap is only reachable
          * through MID-ENGAGEMENT drift (§6): a walk from birth is correctly rejected by the
          * dwell stability bound and can never engage (verified, first fixture round). */
         g_rscorr_testwalk_t0 = now + (ta ? (int64_t)atoi(ta) * 1000000 : 0);
     }
-    if (g_rscorr_testwalk_us_s > 0 && now > g_rscorr_testwalk_t0)
-        r.R_us += av_rescale(now - g_rscorr_testwalk_t0, g_rscorr_testwalk_us_s, 1000000);
+    if (g_rscorr_testwalk_us_s > 0 && now > g_rscorr_testwalk_t0) {
+        int64_t w = av_rescale(now - g_rscorr_testwalk_t0, g_rscorr_testwalk_us_s, 1000000);
+        if (g_rscorr_testwalk_cap_us > 0 && w > g_rscorr_testwalk_cap_us)
+            w = g_rscorr_testwalk_cap_us;   /* F2: saturated walk = a steerable settled bake */
+        r.R_us += w;
+    }
     r.valid = 1;
     return r;
 }
@@ -984,6 +995,27 @@ static int audio_drain_fg(AudioState *a)
                                    a->dbg_k, a->dbg_in, a->pend_comp_us / 1000, slip / 1000,
                                    (int)(PTV_GLUE_TW_CAP_US / AV_TIME_BASE));
                             a->pend_comp_us = 0;
+                            /* 1.0.1-pre17 fix round (R3c, review-recommended): AGLUE PLAUSIBILITY
+                             * CEILING. A step the tripwire just REFUSED is one the resampler is
+                             * still PURSUING — aresample=async grinds at its maximum rate against
+                             * a label step that has no content reality (Fashion live: the +11594s
+                             * pursuit pinned the channel at async −73Mppm for hours after the
+                             * one-sided release). Stop the chase: RELABEL-erase the parked
+                             * remainder into glue_off (the butt-joint semantic — content
+                             * continues, the door labels rejoin the output timeline), one loud
+                             * line. glue_off is part of the sensor's inj, so R accounting stays
+                             * label-deterministic (identical to an AGLUE relabel verdict); the
+                             * erased residual is exactly what the sensor/corrector own from here.
+                             * PTV_NO_AGLUE_CEIL=1 reverts to the pursue-forever posture. */
+                            if (g_aglue_ceil) {
+                                a->glue_off_us -= slip;
+                                av_log(NULL, AV_LOG_ERROR,
+                                       "[PTV-AGLUE] a%d(in%d) plausibility ceiling: erased the refused "
+                                       "%+"PRId64"ms label pursuit at the graph door (glue_off now %+"PRId64"ms) "
+                                       "— channel stays watchable; residual owned by sensor/corrector "
+                                       "(PTV_NO_AGLUE_CEIL reverts)\n",
+                                       a->dbg_k, a->dbg_in, slip / 1000, a->glue_off_us / 1000);
+                            }
                         } else {
                         int irate = a->fg_swr_flt ? a->fg_swr_flt->inputs[0]->sample_rate : 0;
                         int orate = a->fg_swr_flt ? a->fg_swr_flt->outputs[0]->sample_rate : 0;
@@ -1860,13 +1892,15 @@ static void adec_reopen(AudioState *a)
 
     a->wd_frame_us = av_gettime_relative();   /* re-arm the window whatever happens below */
     a->wd_pkts     = 0;
-    if (!codec || !a->ist)
+    if (!codec || !a->ist_par)
         return;
     nd = avcodec_alloc_context3(codec);
     if (!nd)
         return;
-    avcodec_parameters_to_context(nd, a->ist->codecpar);
-    nd->pkt_timebase = a->ist->time_base;
+    /* pre17 R1: owned codecpar/timebase copies — the mv demux reopen may have closed the
+     * AVFormatContext an AVStream* would have pointed into. */
+    avcodec_parameters_to_context(nd, a->ist_par);
+    nd->pkt_timebase = a->ist_pkt_tb;
     if (avcodec_open2(nd, codec, NULL) < 0) {
         avcodec_free_context(&nd);
         av_log(NULL, AV_LOG_WARNING,

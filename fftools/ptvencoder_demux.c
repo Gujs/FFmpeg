@@ -223,7 +223,8 @@ static void ptv_disc_reset(PtvDiscBuf *b)
     b->buffer_start_time = 0;
     b->applied_offset    = 0;
     b->cycle_trigger     = -1;
-    b->partial_ext       = 0;   /* pre16 #47-C: per-cycle hold extension */
+    b->partial_ext       = 0;   /* pre16 #47-C / pre17 R3a: per-cycle hold-extension count */
+    b->cycle_open_us     = 0;
 }
 
 /* 1.0.1-pre4 shared flush: close the pairing window — forget the event's video-defined offset
@@ -579,22 +580,28 @@ static int ptv_glue_refuse_h(PtvDiscBuf *b, int s, int64_t wall_now)
  * offset to the sibling is unsafe because its jumped packets may already have dispatched,
  * and (iii) reduces to today's release for a leg that never crossed). If the sibling still
  * does not cross, the release proceeds as pre14 with a loud line. Returns 1 = hold.
- * HONESTY NOTE (rr16 ruling, kept per 1.0.1-pre17 review): in every fixture and live
- * shape examined, the sibling leg that WOULD convert the held cycle into a shared flush
- * either already participated (pair_vid_defined/pair_has short-circuits above) or arrives
- * on its own later cycle — the intended shared outcome has not been observed to be
- * REACHED via this hold. As shipped it is therefore FORENSIC-ONLY: it buys one 500ms
- * delay + the log line naming the matching sibling jump, and the release then proceeds
- * as pre14. Kept (not simplified away) because the hold is bounded, inert on all pinned
- * partial fixtures, and the log line has diagnostic value; if a future incident shows the
- * shared path taken, delete this note. */
+ * (The rr16 "forensic-only" honesty note is RETIRED by the pre17 fix round: with the
+ * corrupt-packet hoist keeping the bases honest and the extensions repeating up to the
+ * pairing window, the held cycle can now genuinely collect the sibling leg and flush
+ * SHARED — the Fashion-replay gate exercises exactly that path.) */
 static int ptv_disc_partial_hold(DemuxArgs *d, PtvDiscBuf *b)
 {
     int i, has_v = 0, has_a = 0, sib, trig;
     int64_t own, sj, sw, now;
     PtvDiscStreamState *ts;
 
-    if (!g_glueclass || !g_shared_flush || b->partial_ext || b->nb_packets == 0)
+    if (!g_glueclass || !g_shared_flush || b->nb_packets == 0)
+        return 0;
+    /* pre17 fix round (R3a, owner rule "hold until the sibling leg drains in"): the pre16
+     * one-shot 500ms extension released one-sided when the sibling leg took longer (the
+     * Fashion recurrence). Repeat extensions while the matching sibling jump is known and
+     * its leg still absent — bounded by the PAIRING WINDOW measured from cycle open (5s)
+     * and by buffer capacity (ENOSPC would force-flush anyway; stop 40 short so normal
+     * arrivals inside the last extension still fit). */
+    if (b->cycle_open_us &&
+        av_gettime_relative() - b->cycle_open_us >= PTV_PAIR_WINDOW_US)
+        return 0;
+    if (b->nb_packets >= b->capacity - 40)
         return 0;
     for (i = 0; i < b->nb_streams && i < (int)d->ifmt->nb_streams; i++) {
         if (!b->stream_state[i].has_new_base)
@@ -632,13 +639,15 @@ static int ptv_disc_partial_hold(DemuxArgs *d, PtvDiscBuf *b)
                 (b->stream_state[i].pair_has || b->stream_state[i].pair_prov))
                 return 0;                       /* an audio leg already applied this window */
     }
-    b->partial_ext       = 1;
+    b->partial_ext++;
     b->buffer_start_time = now;                 /* one more PTV_DISC_TIMEOUT_US */
     av_log(NULL, AV_LOG_INFO,
            "[PTV-GLUE] partial flush HELD — only %s crossed (offset %+.3fs) but a matching %s "
-           "jump (%+.3fs, %"PRId64"ms ago) is known; waiting one 500ms extension for its leg\n",
+           "jump (%+.3fs, %"PRId64"ms ago) is known; waiting 500ms extension #%d for its leg "
+           "(cap: %.1fs pairing window / %d pkts)\n",
            has_v ? "video" : "audio", (double)own / AV_TIME_BASE,
-           sib == 0 ? "video" : "audio", (double)sj / AV_TIME_BASE, (now - sw) / 1000);
+           sib == 0 ? "video" : "audio", (double)sj / AV_TIME_BASE, (now - sw) / 1000,
+           b->partial_ext, PTV_PAIR_WINDOW_US / 1e6, b->capacity - 40);
     return 1;
 }
 
@@ -1475,6 +1484,47 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
     }
 }
 
+/* 1.0.1-pre17 fix round (R1): reopen a live mv net input after a read error. Closes the dead
+ * context FIRST (its udp socket must release the port before the re-bind, or the stale
+ * circular-buffer reader keeps draining the datagrams), then open/find with a COPY of the
+ * original format opts, then validate the stream layout — the demux-side per-stream arrays
+ * (wrap/edit/disc) and every consumed index (vstream/astream/pass) were sized and resolved
+ * against the original layout, so a source that comes back RESHAPED must keep retrying, not
+ * dispatch mis-indexed packets. Returns 0 on success (d->ifmt swapped + published), <0 on a
+ * failed attempt (caller backs off and retries forever — owner mandate: everything
+ * auto-resumes after ANY outage). */
+static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const uint8_t *old_types)
+{
+    AVFormatContext *nf = NULL;
+    AVDictionary *o2 = NULL;
+    int r;
+    unsigned i;
+    av_dict_copy(&o2, d->reopen_opts, 0);
+    r = avformat_open_input(&nf, d->url, NULL, &o2);
+    av_dict_free(&o2);
+    if (r < 0)
+        return r;
+    r = avformat_find_stream_info(nf, NULL);
+    if (r < 0)
+        goto bad;
+    r = AVERROR(EINVAL);
+    if (nf->nb_streams != old_nb)
+        goto bad;
+    for (i = 0; i < old_nb; i++)
+        if ((uint8_t)nf->streams[i]->codecpar->codec_type != old_types[i])
+            goto bad;
+    d->ifmt = nf;
+    if (d->ifmt_home) *d->ifmt_home = nf;      /* teardown close target follows the swap */
+    d->reopen_cnt++;
+    av_log(NULL, AV_LOG_WARNING,
+           "[PTV-REOPEN] input '%s' re-opened after read failure (#%"PRId64") — resuming as a "
+           "fresh join (slate/recovery machinery downstream)\n", d->url, d->reopen_cnt);
+    return 0;
+bad:
+    avformat_close_input(&nf);
+    return r;
+}
+
 void *demux_thread(void *arg)
 {
     DemuxArgs *d = arg;
@@ -1484,7 +1534,42 @@ void *demux_thread(void *arg)
 
     if (!pkt)
         goto end;
-    while (av_read_frame(d->ifmt, pkt) >= 0) {
+    for (;;) {
+        if (av_read_frame(d->ifmt, pkt) < 0) {
+            /* pre17 R1: a live mv net input must NEVER EOF-latch its slot (rw_timeout expiry
+             * on a >=30min outage previously slated the cell forever AND held the corrector
+             * mosaic-wide via the slate mask). Reopen-retry with bounded backoff, forever;
+             * validation failures (source reshaped) keep retrying too. The old ctx keeps
+             * carrying the reads until a validated replacement lands. */
+            if (d->reopen) {
+                unsigned old_nb = d->ifmt->nb_streams, oi;
+                uint8_t old_types[64];
+                int64_t backoff = 1000000, rlog = 0;
+                if (old_nb > 64) old_nb = 64;      /* validation window (mpegts programs are small) */
+                for (oi = 0; oi < old_nb; oi++)
+                    old_types[oi] = (uint8_t)d->ifmt->streams[oi]->codecpar->codec_type;
+                /* Close the dead ctx BEFORE retrying: its udp socket (with the fifo reader
+                 * thread) stays bound otherwise and STEALS the datagrams from the re-bind —
+                 * measured: the reopen loop failed forever after the source resumed (r1 gate,
+                 * first round). We are in an outage; there is nothing left to read from it. */
+                avformat_close_input(&d->ifmt);
+                if (d->ifmt_home) *d->ifmt_home = NULL;
+                for (;;) {
+                    if (demux_reopen_once(d, old_nb, old_types) >= 0)
+                        break;
+                    if (!rlog || av_gettime_relative() - rlog > 30000000) {
+                        rlog = av_gettime_relative();
+                        av_log(NULL, AV_LOG_WARNING,
+                               "[PTV-REOPEN] input '%s' still down — retrying (backoff %.0fs)\n",
+                               d->url, backoff / 1e6);
+                    }
+                    av_usleep((unsigned)backoff);
+                    if (backoff < 5000000) backoff += 1000000;
+                }
+                continue;
+            }
+            break;
+        }
         if (g_diag) {
             int64_t now = av_gettime_relative();
             if (now - diag_last >= 1000000) {
@@ -1516,6 +1601,24 @@ void *demux_thread(void *arg)
                 atomic_store_explicit(&g_ch_vsrc_raw, av_rescale_q(out->pts, d->ifmt->streams[d->vstream]->time_base, AV_TIME_BASE_Q), memory_order_relaxed);
             else if (d->n_audio > 0 && out->stream_index == d->astream[0])
                 atomic_store_explicit(&g_ch_asrc_raw, av_rescale_q(out->pts, d->ifmt->streams[out->stream_index]->time_base, AV_TIME_BASE_Q), memory_order_relaxed);
+        }
+        /* 1.0.1-pre17 fix round (R3b, THE Fashion load-bearing fix): discard corrupt-flagged
+         * packets BEFORE demux_unwrap and the LAYERA machinery. The corrupt check used to
+         * live only in demux_dispatch — DOWNSTREAM of LAYERA — so a corrupt packet's garbage
+         * dts fed jump DETECTION, false BASE recording, sib_jump stamps, last_dts continuity
+         * refs and the wrap state before being thrown away. Fashion live (2026-07-18
+         * 20:05:45.733): a corrupt audio packet with a wrapped dts (7869470123 ≈ 87438s →
+         * post-unwrap −8005.7s = EXACTLY the video's post-jump domain) classified NEW against
+         * the video's fresh bases, recorded FALSE audio bases + transitioned the stream, and
+         * the 72ms-later "shared" flush rebased the UN-crossed audio +11594s — every
+         * downstream disaster (one-sided cycle B, permanent avoff +11594s, the −73Mppm
+         * pursuit) descends from that one poisoned classification. Bookkeeping must never
+         * learn from a packet the pipeline is about to discard. The demux_dispatch check
+         * stays as the belt for re-injected/other paths. */
+        if ((out->flags & AV_PKT_FLAG_CORRUPT) && g_discardcorrupt) {
+            ret = demux_dispatch(d, out);   /* dispatch = the existing counted discard path */
+            if (ret < 0) break;
+            continue;
         }
         demux_unwrap(d, out);               /* 33-bit source wrap -> monotonic extended ts (ONCE) */
 
@@ -1549,6 +1652,7 @@ void *demux_thread(void *arg)
                     b->active = 1;
                     b->cycle_trigger = sidx;
                     b->buffer_start_time = av_gettime_relative();
+                    b->cycle_open_us     = b->buffer_start_time;   /* pre17 R3a: extension cap base */
                     if (d->disturb_epoch)   /* a real content discontinuity → arm the PLL re-acquire */
                         atomic_fetch_add_explicit(d->disturb_epoch, 1, memory_order_relaxed);
                 } else if (b->active && sidx < b->nb_streams &&
@@ -1607,6 +1711,19 @@ void *demux_thread(void *arg)
                             if (!ss->has_old_base && last_dts != AV_NOPTS_VALUE) {
                                 ss->old_timeline_base = last_dts;
                                 ss->has_old_base = 1;
+                            }
+                            /* pre17 fix round (R3a): a SILENT borrowed-classify transition is
+                             * a KNOWN jump of this media type just like a detect — stamp the
+                             * #47-C sibling-jump evidence here too, or a later partial-hold
+                             * for the RETURN leg finds no matching sibling jump and releases
+                             * one-sided (fash-dj6 gate: the outbound video leg transitioned
+                             * silently, so its return's hold evidence was missing). */
+                            if (last_dts != AV_NOPTS_VALUE &&
+                                sidx < (int)d->ifmt->nb_streams) {
+                                int ctj = d->ifmt->streams[sidx]->codecpar->codec_type;
+                                int mij = ctj == AVMEDIA_TYPE_VIDEO ? 0 : 1;
+                                d->sib_jump_us[mij]   = raw_dts - last_dts;
+                                d->sib_jump_wall[mij] = av_gettime_relative();
                             }
                         }
                     }

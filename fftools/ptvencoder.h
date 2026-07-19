@@ -612,7 +612,12 @@ typedef struct AudioState {
      * nothing decodes for 45s wall the decoder is reopened from ist->codecpar (anchor/pts
      * state preserved — mid-run recovery, aresample absorbs the gap). PTV_NO_ADECWD gates
      * only the reopen; the error tolerance is unconditional. */
-    AVStream        *ist;                             /* source stream (codecpar for the watchdog reopen) */
+    /* 1.0.1-pre17 fix round (R1): OWNED COPIES of the source stream's decode params — the
+     * decode-death watchdog reopen must not dereference an AVStream* into an AVFormatContext
+     * the demux reopen-retry may have closed (the old ctx must be CLOSED, not leaked: its udp
+     * socket would otherwise keep draining the port the fresh open re-binds). */
+    AVCodecParameters *ist_par;                       /* copied codecpar (watchdog reopen source) */
+    AVRational       ist_pkt_tb;                      /* copied packet time_base */
     int64_t          dec_errs;                        /* hard decode errors tolerated (dropped) */
     int              dec_reopens;                     /* watchdog decoder reopens this run */
     int64_t          decerr_win_us;                   /* [PTV-ADEC] log rate-limit window start (wall) */
@@ -698,7 +703,12 @@ typedef struct PassStream {
  * in order. Sparse SUBTITLE/DATA (DVB-sub, SCTE-35) are NEVER buffered — they keep
  * the existing prog_off path in demux_unwrap. All timestamps here are AV_TIME_BASE
  * (us); the held packet already has demux_unwrap's 33-bit wrap correction applied. */
-#define PTV_DISC_CAPACITY        256
+#define PTV_DISC_CAPACITY        512   /* pre17 fix round (R3a): 256→512 — the bounded
+                                        * hold-until-drain may legally hold up to the 5s
+                                        * pairing window (Fashion ~77pkt/s ⇒ ~385 pkts;
+                                        * 256 would ENOSPC-force-flush at ~3.3s). Slots
+                                        * are pointers; RSS = held compressed packets,
+                                        * bounded by window × input bitrate. */
 #define PTV_DISC_THRESHOLD_US    (1 * AV_TIME_BASE)   /* 1s   jump threshold */
 #define PTV_DISC_TIMEOUT_US      (500 * 1000)         /* 500ms forced-flush timeout */
 #define PTV_DISC_TOL_US          (100 * 1000)         /* 100ms timeline classification tolerance */
@@ -836,8 +846,11 @@ typedef struct PtvDiscBuf {
     int                 cycle_trigger;      /* 1.0.1-pre7: stream whose detect ARMED this buffer cycle
                                              * (-1 = none); scopes the continuing-stream keep (see
                                              * ptv_disc_flush) to transcoded-triggered cycles */
-    int                 partial_ext;        /* 1.0.1-pre16 #47-C: this cycle already got its ONE
-                                             * 500ms partial-hold extension (sibling-jump wait) */
+    int                 partial_ext;        /* 1.0.1-pre16 #47-C / pre17 fix round (R3a): partial-hold
+                                             * extensions granted this cycle (was one-shot; now repeats
+                                             * while the sibling leg is missing, capped by the pairing
+                                             * window from cycle open + a capacity guard) */
+    int64_t             cycle_open_us;      /* pre17 R3a: wall µs this buffer cycle armed (extension cap base) */
 } PtvDiscBuf;
 
 typedef struct DemuxArgs {
@@ -896,6 +909,19 @@ typedef struct DemuxArgs {
     _Atomic int64_t      *shed_wall;      /* pre16: -> Input.shed_wall (per-input self-shed stamp) */
     _Atomic int64_t      *shed_cnt;       /* pre16: -> Input.shed_cnt */
     _Atomic int64_t      *v_arrive_wc;    /* pre17: -> Input.v_arrive_wc (per-input arrival watermark) */
+    /* 1.0.1-pre17 fix round (R1): live mv inputs RE-OPEN on any av_read_frame error instead of
+     * EOF-latching the slot forever (rw_timeout expiry = the >=30min-outage class; owner
+     * mandate: everything auto-resumes after ANY outage). The demux thread owns the swap:
+     * close the dead ctx (frees its udp socket so the re-bind actually receives), open url
+     * with a COPY of the original format opts, validate the stream layout (same count +
+     * consumed-stream codec types), publish the new ctx to *ifmt_home for teardown. Bounded
+     * backoff, retries forever; downstream sees the outage exactly like a <rw_timeout gap
+     * (slate -> recovery machinery, V10-proven). Single-input keeps EOF = channel end. */
+    const char           *url;            /* input url (reopen target) */
+    AVDictionary         *reopen_opts;    /* copy of the ORIGINAL open format_opts */
+    int                   reopen;         /* live && multiview && net input */
+    AVFormatContext     **ifmt_home;      /* -> Input.ifmt (teardown's close target follows the swap) */
+    int64_t               reopen_cnt;     /* successful reopens (log) */
     PtvDiscBuf           *disc;           /* legacy-0004 buffer-classify-discard (g_layera only; NULL otherwise) */
     int64_t               video_fwd_us;   /* wall-clock (us) of the last VIDEO forward-discontinuity crossing (whole-program-splice indicator) */
     int64_t               prog_off;       /* P2 (§7.1): program-level discontinuity offset (90kHz, detected on the
@@ -1056,6 +1082,7 @@ extern int     g_reanchor;
 extern int     g_mv_clamp;
 extern int     g_mv_residence;
 extern int     g_mv_birthtrim;
+extern int     g_aglue_ceil;
 extern int     g_discont;
 extern int     g_gapdiscrim;
 extern int     g_adecwd;

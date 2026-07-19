@@ -117,8 +117,62 @@ rscorr_update is removed. Arming prerequisites, all landed here:
    (epoch/shed/gov/LAYERA/pair-expect by dbg_in; REANCHOR2 bumps its slot's
    epoch — now live-consumed).
 (rider) per-input always-on `[PTV-RSYNC] inK R= ev= sk= occ= [SLATED]` summary,
-one compact line per input per stats period on mv (owner-floated; the soak
-forensics that used to need PTV_DIAG).
+one compact line per input on mv (owner-floated; the soak forensics that used
+to need PTV_DIAG). Fix round: throttled to one round per 30s (reviewer V6 —
+~11.5k lines/day on a 4-up instead of ~35k).
+
+(7p FIX ROUND, rr17 review 2026-07-19 — same banner, second commit):
+R1 MV INPUT EOF PERMANENCE (confirmed defect, owner-rejected behavior): any
+av_read_frame error (rw_timeout expiry = the >=30min-outage class) exited the
+demux thread permanently — slot slated forever, g_mv_slate_mask bit latched,
+corrector held mosaic-wide forever. Fix: live mv net inputs REOPEN-RETRY
+forever (bounded 1..5s backoff): close the dead ctx (its udp socket must
+release the port — a leaked socket's circular-buffer reader would steal the
+datagrams from the re-bind), reopen with a COPY of the original format opts,
+validate the stream layout (count + consumed-stream codec types) before
+swapping; resume rides the proven <rw_timeout recovery machinery (slate →
+recovery edge, re-seed, fresh dwell — V10). [PTV-REOPEN] lines. AudioState's
+AVStream* replaced by owned codecpar/timebase copies (the ADECWD reopen must
+not dereference a closed ctx). Single-input and file inputs keep EOF = end.
+R3 FASHION CLASS closed (three pieces):
+ (b) THE LOAD-BEARING FIX — corrupt-packet LAYERA poisoning: the corrupt
+ discard lived only in demux_dispatch, DOWNSTREAM of the LAYERA machinery, so
+ a corrupt packet's garbage dts fed jump detection, FALSE base recording,
+ sib_jump stamps and continuity refs before being thrown away. Fashion live
+ (20:05:45.733): a corrupt audio packet with a wrapped dts (7869470123 ≈
+ 87438s → post-unwrap −8005.7s = exactly the video's post-jump domain)
+ classified NEW against the video's fresh bases, transitioned the un-crossed
+ audio, and the 72ms flush rebased it +11594s — the one-sided cycle B, the
+ permanent avoff and the async grind all descend from that poisoned
+ classification. Fix: corrupt-flagged packets are discarded (counted, via the
+ existing dispatch path) BEFORE demux_unwrap/LAYERA. Replay fixture
+ fashion_dj4 (opposite ±11594.4s legs + TEI'd wrapped-dts poison packets)
+ reproduces the live signature on the unfixed build (poisoned cycle-A
+ "shared" flush aud=+11594.4 on un-crossed audio, avoff parked +72254s) and
+ reads clean post-fix.
+ (a) BOUNDED HOLD-UNTIL-DRAIN (owner rule): the pre16 one-shot 500ms partial
+ extension repeats while the matching sibling jump is known and its leg
+ absent, capped by the 5s pairing window from cycle open + a capacity guard;
+ PTV_DISC_CAPACITY 256→512 so the window is reachable (256 would ENOSPC-flush
+ at ~3.3s at Fashion's ~77pkt/s). Gate fashion_dj6 (return legs 1.3s apart):
+ pre-fix releases one-sided at the single extension; fixed build collects the
+ sibling leg into the SAME cycle → SHARED flush, avoff→~0.
+ (c) AGLUE PLAUSIBILITY CEILING (review-recommended): a label step the
+ tripwire REFUSED (parked slip > its 2s authority) is no longer pursued —
+ the parked remainder is relabel-erased into glue_off (butt-joint; sensor inj
+ accounting automatic), one ERROR line; the channel stays watchable instead
+ of grinding aresample at max rate forever (Fashion's −73Mppm for hours).
+ PTV_NO_AGLUE_CEIL=1 reverts.
+F2 PTV_RSCORR_TESTWALK_CAP_MS (TEST-ONLY): the walk saturates at the cap, so
+the corrector can steer the synthetic bake to 0 and PARK — the mv
+ENGAGE→steer→PARK happy path becomes demonstrable (TESTWALK alone is
+cancelled by the steer at equal rate and never re-enters the park band).
+ADVISORY closes: [PTV-RSYNC] inK throttled (above); cor-2 dlvhold=1361ms
+datum RECONCILED — cor-2's deployed /opt/scripts/ptvencoder.sh contains no
+loudnorm (rollout never reached it): cor-2 mosaics run the legacy chain
+(audio early → dlvhold ~1.4s), live-transcoder grids run loudnorm (audio
+wall-late → dlvhold 0). Both consistent with (B)'s mechanism; finding-2's
+"pre4/5/6 regression" theory stays falsified.
 
 (7o) GLUE CLASSIFICATION LIVE-INCIDENT FIXES — pre16, task #47. Two deployed-
 pre15 incidents (The_Word_Network/cor-3, Fashion/live-transcoder 2026-07-18)

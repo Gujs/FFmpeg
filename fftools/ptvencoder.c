@@ -73,7 +73,10 @@ int     g_mv_clamp = 0;
  * newest (clean 2:1 decimation instead of hold-queue overflow). A ≥75%-full hold queue
  * bypasses the gate (pressure valve vs a wrong rate estimate). PTV_NO_RESIDENCE reverts. */
 int     g_mv_residence = 1;
-int     g_mv_birthtrim = 1;   /* 1.0.1-pre17 (finding 1): mv birth-trim WINDOW — post-preroll backlog is
+int     g_mv_birthtrim = 1;
+int     g_aglue_ceil = 1;     /* 1.0.1-pre17 fix round (R3c): erase a tripwire-REFUSED label pursuit at the
+                               * graph door (butt-joint) instead of letting aresample grind at max rate
+                               * forever against an implausible step. PTV_NO_AGLUE_CEIL=1 reverts. */   /* 1.0.1-pre17 (finding 1): mv birth-trim WINDOW — post-preroll backlog is
                                * dropped-oldest silently for the first ~20s instead of being displayed as
                                * a servo-paced catch-up slide the audio follow cannot track (the restart-
                                * with-dead-slot 150-240ms audio-late transient). PTV_NO_MV_BIRTHTRIM=1 reverts. */
@@ -1447,6 +1450,10 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         int started[PTV_MAX_INPUT] = {0};
         for (k = 0; k < n_input; k++) {
             oa[k].in = &inputs[k]; oa[k].opts = &ins->groups[k].format_opts;
+            /* pre17 R1: keep a pristine copy of the open options — avformat_open_input
+             * consumes recognized entries, and the mv demux reopen-retry must reopen with
+             * the ORIGINAL set (rw_timeout, fifo, overrun_nonfatal, ...). */
+            av_dict_copy(&inputs[k].da.reopen_opts, ins->groups[k].format_opts, 0);
             if (pthread_create(&th[k], NULL, open_input_thread, &oa[k]) == 0) started[k] = 1;
             else { inputs[k].open_ret = AVERROR(errno); }
         }
@@ -1725,7 +1732,11 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         a->fifo       = av_audio_fifo_alloc(sfmt, 2, a->frame_size);
         if (!a->fifo) { ret = AVERROR(ENOMEM); goto end; }   /* used by the swr fallback path */
         a->ist_tb     = kist->time_base;
-        a->ist        = kist;          /* 1.0.1: codecpar source for the decode-death watchdog reopen */
+        /* pre17 R1: OWNED copies — the demux reopen closes the old AVFormatContext, so an
+         * AVStream* would dangle by the time the ADECWD watchdog reopen fires. */
+        a->ist_par    = avcodec_parameters_alloc();
+        if (a->ist_par) avcodec_parameters_copy(a->ist_par, kist->codecpar);
+        a->ist_pkt_tb = kist->time_base;
         if (af && build_audio_filter(a, a->dec, kist->time_base, af, sfmt) < 0) {
             av_log(NULL, AV_LOG_WARNING, "audio track %d filtergraph failed; plain resample\n", k);
             avfilter_graph_free(&a->afg); a->use_fg = 0;
@@ -2032,6 +2043,11 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         d->shed_wall = &inputs[kk].shed_wall;           /* pre16: per-input self-shed stamp */
         d->shed_cnt  = &inputs[kk].shed_cnt;
         d->v_arrive_wc = &inputs[kk].v_arrive_wc;       /* pre17: per-input arrival watermark (corrector §3) */
+        /* pre17 R1: mv live net inputs reopen-retry on read error (single-input keeps
+         * EOF = channel end, supervisor-owned; file inputs keep EOF = media end). */
+        d->url       = inputs[kk].url;
+        d->reopen    = live && multiview && is_net_url(inputs[kk].url);
+        d->ifmt_home = &inputs[kk].ifmt;
         d->disc = g_layera ? &inputs[kk].disc : NULL;   /* legacy-0004 buffer (NULL when off) */
         d->vq_shed_req = &inputs[kk].vq_shed_req;       /* 1.0.1-pre8 (a): overflow -> request head-GOP shed */
         d->autobank = g_autobank && !multiview && live && is_net_url(inputs[kk].url);   /* v0.9.14: single-input live only */
@@ -2193,6 +2209,7 @@ end:
         avfilter_graph_free(&as[k].afg);
         for (r = 0; r < n_rung; r++) avcodec_free_context(&as[k].enc[r]);
         avcodec_free_context(&as[k].dec);
+        avcodec_parameters_free(&as[k].ist_par);   /* pre17 R1: owned copy */
     }
     avfilter_graph_free(&fg);
     for (k = 0; k < n_input; k++) {
@@ -2205,6 +2222,7 @@ end:
         av_freep(&inputs[k].wrap_wall_last);
         av_freep(&inputs[k].edit_us);
         av_freep(&inputs[k].gap_vsnap);
+        av_dict_free(&inputs[k].da.reopen_opts);   /* pre17 R1 */
         ptv_disc_free(&inputs[k].disc);   /* legacy-0004 buffer (no-op if never inited) */
         if (inputs[k].ifmt) avformat_close_input(&inputs[k].ifmt);
         pthread_mutex_destroy(&inputs[k].h0_lock);
@@ -2638,6 +2656,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_MV_EXACTTICK")) g_mv_exacttick = 0;  /* v0.9.12: revert mv measurement axes to integer tick (re-enables the enforced ~10ppm mosaic drift) */
     if (getenv("PTV_NO_RESIDENCE")) g_mv_residence = 0;     /* v0.9.13: revert to one-pop-per-tick (rate-mismatched slots batch dups + fast-forward after starvation) */
     if (getenv("PTV_NO_MV_BIRTHTRIM")) g_mv_birthtrim = 0;  /* pre17: one-shot trim only (re-enables the birth catch-up slide) */
+    if (getenv("PTV_NO_AGLUE_CEIL"))   g_aglue_ceil = 0;     /* pre17 fix round: unbounded refused-step pursuit (pre-Fashion posture) */
     /* genlock preroll default + the three deep-prime side-cars moved to resolve_cushions() (0.9.18 M1) */
     if (getenv("PTV_KEEP_CORRUPT")) g_discardcorrupt = 0;   /* keep AV_PKT_FLAG_CORRUPT video packets (don't +discardcorrupt) */
     if (getenv("PTV_NO_DELIVERY")) g_delivery = 0;          /* §7.5a: disable the A/V delivery-alignment gate (audio sent direct = v0.6.23) */

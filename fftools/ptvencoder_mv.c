@@ -151,6 +151,7 @@ void *compositor_thread(void *arg)
     int64_t diag_t0 = av_gettime_relative(), diag_last = diag_t0;
     int64_t stat_last = diag_t0, stat_prev = 0;
     int64_t corr_wd_last = diag_t0;   /* 1.0.1-pre17: stale-track corrector watchdog rate limit (1s) */
+    int64_t rsync_in_last = 0;        /* fix round (V6): [PTV-RSYNC] inK summary throttle (30s) */
 
     if (!filt) goto done;
     /* 1.0.1-pre17: BIRTH slate-mask — every slot starts "slated" for the corrector (its cell
@@ -696,11 +697,14 @@ void *compositor_thread(void *arg)
                     "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f dup=%"PRId64" drop=%"PRId64"%s%s%s%s\n",
                     c->emitted, fps, hh, mm, ss, c->dup, c->framedrop[0], dlv, aco, ls, crs);
                 /* 1.0.1-pre17 (owner-floated): per-INPUT always-on [PTV-RSYNC] summary, ONE
-                 * compact line per input per stats period — the soak forensics that used to
-                 * need PTV_DIAG. R = this input's track reading(s) (same builder as the
-                 * stats token), ev = the slot's demux edit ledger, sk = published follow
-                 * skew, occ = jitter-buffer depth, SLATED while the cell is black. */
-                if (g_rsync_sense) {
+                 * compact line per input — the soak forensics that used to need PTV_DIAG.
+                 * R = this input's track reading(s) (same builder as the stats token), ev =
+                 * the slot's demux edit ledger, sk = published follow skew, occ = jitter-
+                 * buffer depth, SLATED while the cell is black. Fix round (reviewer V6):
+                 * THROTTLED to one round per 30s (~11.5k lines/day on a 4-up, vs ~35k
+                 * unthrottled at a 10s stats period) — readability kept, log budget bounded. */
+                if (g_rsync_sense && nows - rsync_in_last >= 30000000) {
+                    rsync_in_last = nows;
                     for (k = 0; k < n; k++) {
                         char rin[40];
                         ptv_stats_lipsync_in(rin, sizeof rin, nows, k);
