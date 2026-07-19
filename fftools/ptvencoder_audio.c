@@ -247,10 +247,13 @@ static const char *rscorr_delivery_dead(AudioState *a, int64_t now)
 }
 
 /* TEST-ONLY (1.0.1-pre18; PTV_RSCORR_TESTWALK precedent): PTV_RSCORR_TESTHS="amp_ms:period_s"
- * superimposes a 0↔amp square wave (flipping every period) on the house_skew value the
- * CORRECTOR's event detector reads — the bounded-wall-time stand-in for pulldown/decim
- * 1-tick hs churn (the #51a live class), exercising the hs-tick filter and the #51b
- * starvation ceiling without a production channel. The REAL house_skew (actuation,
+ * superimposes a TRIANGLE STAIRCASE (0→amp→2amp→amp→0→…, one ±amp step per period) on the
+ * house_skew value the CORRECTOR's event detector reads — the bounded-wall-time stand-in
+ * for pulldown/decim 1-tick hs churn (the #51a live class: hs WALKS in tick steps, so the
+ * cumulative pre18 rule fires every ~2 steps while each individual step stays ≤1 tick —
+ * a square wave cannot model that: no amplitude both crosses the old 50ms cumulative edge
+ * AND stays under the 1.25-tick per-step filter). Exercises the hs-tick filter and the
+ * #51b starvation ceiling without a production channel. The REAL house_skew (actuation,
  * sensors, AVLOCK) is untouched. Never set in production. */
 static int64_t g_rscorr_tesths_amp = -1, g_rscorr_tesths_per = 0;
 static int64_t rscorr_hs_read(AudioState *a)
@@ -265,9 +268,11 @@ static int64_t rscorr_hs_read(AudioState *a)
         } else
             g_rscorr_tesths_amp = 0;   /* parsed, off */
     }
-    if (g_rscorr_tesths_amp > 0 &&
-        (av_gettime_relative() / g_rscorr_tesths_per) & 1)
-        v += g_rscorr_tesths_amp;
+    if (g_rscorr_tesths_amp > 0) {
+        static const int tri[4] = { 0, 1, 2, 1 };
+        v += g_rscorr_tesths_amp *
+             tri[(av_gettime_relative() / g_rscorr_tesths_per) & 3];
+    }
     return v;
 }
 
