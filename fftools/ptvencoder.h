@@ -1156,6 +1156,7 @@ extern int     g_avsync_pll;
 extern int     g_acq_instant;
 extern int     g_pll_trackup;
 extern int64_t g_pll_testnoise_us;
+extern int     g_pll_testnoise_frames;   /* TEST-ONLY (#49 gate): square-wave half-period, frames (PTV_PLL_TESTNOISE_P) */
 extern int64_t g_cushion_max_ms;
 extern int64_t g_bank_decay_us;
 extern _Atomic int     g_bank_pkts;

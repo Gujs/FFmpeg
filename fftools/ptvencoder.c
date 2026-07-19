@@ -268,6 +268,7 @@ int     g_avsync_pll = 1;             /* B3 closed-loop A/V controller DEFAULT-O
 int     g_acq_instant = 0;            /* 1.0.1 (PTV_ACQ_INSTANT=1 reverts): ACQUIRE needs the |EMA offset| above threshold for 3 CONSECUTIVE debounce windows (and the threshold is floored at 1.5 house ticks) — the vlag measurement is tick-quantized, so the single-window fire snapped on its own quantization noise (live grids: ~939-1511 ACQUIREs/22h alternating ±42ms pad/drop). */
 int     g_pll_trackup = 1;            /* 1.0.1-pre3 (PTV_NO_PLL_TRACKUP=1 disables TRACK entirely = acquire-only, labels flat — the operators' production mute keeps its meaning): TRACK now steers through the RESAMPLER (af_steer_us into the graph-input pts, AVLOCK-style) instead of re-stamping output labels. pre2's label-TRACK stretched output AAC pts spacing up to +158ms/min during integration episodes → PTS-honoring players rate-chased it = audible warble (production 2026-07-13). The pre2 [PTV-TRACKUP] direction-aware anti-windup is retired with the label actuator. */
 int64_t g_pll_testnoise_us = 0;       /* TEST-ONLY (default off): inject a ±N ms square wave (flips ~every 3.2s) into the measured offset to REPRODUCE the box limit cycle locally (local sources are clean). PTV_PLL_TESTNOISE_MS sets it; never set in production. */
+int     g_pll_testnoise_frames = 330; /* TEST-ONLY (1.0.1-pre18, #49 gate): half-period in frames (PTV_PLL_TESTNOISE_P) — slow flips (~30s ≫ pll_dev τ) model the erase-class FLAT-step storm the 7s default cannot (dev adapts to fast flips) */
 /* v0.9.14 AUTO-BANK (the owner-agreed auto-cushion escalation, cap 12s). The 0.9.10 adaptive
  * cushion lives in frame_q (DECODED frames) and maxes at ~4s — structurally too shallow for
  * HLS-burst channels with 6-8s gaps (Unique_TV/ZOE class), whose fix has been a MANUAL deep
@@ -2712,6 +2713,7 @@ int main(int argc, char **argv)
      * PTV_PLL_ACQUIRE_N (32) / PTV_PLL_REFRACTORY_MS (12000) / PTV_PLL_NOISE_K (3) /
      * PTV_PLL_DEV_SHIFT (9) internalized — see the g_pll_* declarations */
     { const char *tn = getenv("PTV_PLL_TESTNOISE_MS");  if (tn && atoi(tn) > 0) g_pll_testnoise_us  = (int64_t)atoi(tn) * 1000; }  /* TEST-ONLY: inject ±N ms offset square wave */
+    { const char *tp = getenv("PTV_PLL_TESTNOISE_P");   if (tp && atoi(tp) > 0) g_pll_testnoise_frames = atoi(tp); }              /* TEST-ONLY (#49 gate): square-wave half-period, frames */
     if (getenv("PTV_NO_QSHED"))    g_qshed    = 0;   /* 1.0.1-pre8 (a): revert to per-packet tail-drop on video_q overflow (the #32 fragmenter; A/B only) */
     if (getenv("PTV_NO_RATCHREL")) g_ratchrel = 0;   /* 1.0.1-pre8 (b): keep the 6h bank decay even under the starvation contradiction */
     if (getenv("PTV_NO_SELFHEAL")) g_selfheal = 0;   /* 1.0.1-pre8 (c): no internal re-prime on sustained starvation */

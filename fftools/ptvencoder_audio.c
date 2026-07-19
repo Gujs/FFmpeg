@@ -767,8 +767,8 @@ static int audio_drain_fg(AudioState *a)
                 if (!a->af_started) { a->af_applied_us = 0; a->af_started = 1; }  /* seed 0 (house_skew is wrong-sign in the banked regime) */
                 if (a->av_off_valid) {
                     int64_t off = a->av_offset_us;           /* the FAITHFUL measured offset (vlag − alag) */
-                    if (g_pll_testnoise_us)                  /* TEST-ONLY: ±N square wave (~7s flip, matches the box thrash period; holds long enough to defeat the debounce like the real noise) to reproduce the box limit cycle locally */
-                        off += ((a->out_frames / 330) & 1) ? g_pll_testnoise_us : -g_pll_testnoise_us;
+                    if (g_pll_testnoise_us)                  /* TEST-ONLY: ±N square wave (default ~7s flip, matches the box thrash period; holds long enough to defeat the debounce like the real noise) to reproduce the box limit cycle locally. 1.0.1-pre18 (#49 gate): PTV_PLL_TESTNOISE_P sets the half-period in FRAMES — the erase-class storm is a FLAT step flipping SLOWER than pll_dev's τ (~11s), so the 7s default lets the noise-adaptive threshold tame it and the storm control never forms; ~30s flips model the live class. */
+                        off += ((a->out_frames / g_pll_testnoise_frames) & 1) ? g_pll_testnoise_us : -g_pll_testnoise_us;
                     if (!a->pll_seed) { a->pll_ema = off; a->pll_dbnc_ref = off; a->pll_seed = 1; }
                     else a->pll_ema += (off - a->pll_ema) >> g_pll_ema_shift;   /* smooth ±vlag jitter (N6: toward −∞, sub-ms, negligible) */
                     /* v0.6.22: NOISE-ADAPTIVE acquire threshold. Track the leg's offset jitter (slow EMA of
