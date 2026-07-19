@@ -619,6 +619,12 @@ int64_t g_rscorr_ceil_us = 900000000;
  * (loudnorm AAC + copied AC-3) stop depending on latency coincidence.
  * PTV_NO_PERSTREAM_WM=1 reverts to the aggregate key. */
 int     g_perstream_wm = 1;
+/* 1.0.1-pre18 #49 — mv PLL repeated-ACQUIRE backoff: erase-class corruption re-anchors a
+ * slot ±one flat step per 12s refractory forever (audible warble until restart) — the flat
+ * step defeats both the noise-adaptive threshold (it measures jitter, not flat flips) and
+ * the 3-window sustain (the step IS stable). Each ACQUIRE within 60s doubles the acquire
+ * threshold (decays back one level per acquire-free 60s). PTV_NO_ACQ_BACKOFF=1 reverts. */
+int     g_acq_backoff = 1;
 
 /* PTV_LOG_TS=1: prefix every log line with a local wall-clock timestamp
  * [YYYY-MM-DD HH:MM:SS.mmm], so production logs are self-dated natively
@@ -2723,6 +2729,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_RSCORR_CEIL")) g_rscorr_ceil = 0;       /* 1.0.1-pre18 #51b: no starvation-ceiling engage */
     { const char *s = getenv("PTV_RSCORR_CEIL_MIN"); if (s && atoi(s) > 0) g_rscorr_ceil_us = (int64_t)atoi(s) * 60000000; }  /* #51b ceiling, minutes */
     if (getenv("PTV_NO_PERSTREAM_WM")) g_perstream_wm = 0;     /* 1.0.1-pre18: §7.5b back to the aggregate (least-delayed) key */
+    if (getenv("PTV_NO_ACQ_BACKOFF")) g_acq_backoff = 0;       /* 1.0.1-pre18 #49: no repeated-ACQUIRE threshold backoff */
     if (getenv("PTV_NBS_FILL") && g_glueclass) g_nbs_fill = 1;
     { const char *s = getenv("PTV_GLUE_HTOL_PCT");     if (s && atoi(s) > 0) g_glue_htol = atoi(s); }             /* tuning knob (G4) */
     { const char *s = getenv("PTV_PAIR_EXPECT_TTL_US");if (s && atoll(s) > 0) g_pair_ttl_us = atoll(s); }          /* TEST ONLY (G6) */

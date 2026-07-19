@@ -88,6 +88,25 @@ a_hi_change_wc (fires only when ALL tracks are silent, unchanged). The
 pre17 (B2) cap auto-size now measures against the same slowest-live key, so
 the escape cap sizes to the slowest chain. Uniform-audio channels read a
 min == the old aggregate (byte-equal path). PTV_NO_PERSTREAM_WM=1 reverts.
+(E) MV PLL ACQUIRE LIMIT CYCLE (task #49, pre-existing). SYMPTOM: on
+audio-erase-class corruption an mv slot re-anchors ±277ms every ~12s forever
+(audible warble until restart). ROOT CAUSE (code-confirmed): an erase-class
+phase presents the PLL a FLAT ±step offset that FLIPS at each erase — flat
+defeats the v0.6.22 noise-adaptive threshold (pll_dev is an EMA of |off−ema|
+jitter; a flat step reads dev≈0) AND the 1.0.1 3-consecutive-window sustain
+(the step is genuinely stable >2s), so every flip is a textbook "stable large
+offset" and acquires at exactly the 12s refractory rate; each acquire's
+drop/pad is itself the next flip's perturbation. FIX: repeated-ACQUIRE
+BACKOFF — each ACQUIRE within a 60s window doubles the acquire threshold
+(level +1 per acquire, −1 per acquire-free 60s, cap ×32 under the existing
+1.5s absolute cap); after 2-3 storm acquires the bar outgrows the corruption
+step and the storm converges (TRACK, the refractory and the 1.5-tick floor
+untouched; a legitimate isolated acquire pays one doubling that decays within
+a minute). ACQUIRE line gains backoff=N. Mechanism fixture-gated (synthetic
+±300ms square-wave storm via PTV_PLL_TESTNOISE_MS on an mv pair) + clean-mv
+no-regression; LIVE ACCEPTANCE = the next Azorse-class erase event (a
+faithful local repro of the corruption class is impractical — declared per
+the brief). PTV_NO_ACQ_BACKOFF=1 reverts.
 
 (7p) MV COMPLETION PRE — pre17: sibling-slate sensor artifact fix + af-independent
 mv transport (task #48) + MV CORRECTOR ARM. Three work items; the corrector-arm

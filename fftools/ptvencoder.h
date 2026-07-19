@@ -578,6 +578,11 @@ typedef struct AudioState {
     int64_t          pll_dbnc_ref;                    /* ema value when the debounce window started (flatness reference) */
     int              pll_refractory;                  /* frames remaining before acquire may re-arm (bumpless-credit backstop) */
     int              pll_acq_win;                     /* 1.0.1: consecutive completed above-threshold debounce windows (fire at 3; PTV_ACQ_INSTANT reverts) */
+    int              acq_backoff;                     /* 1.0.1-pre18 #49: repeated-ACQUIRE backoff level (thr <<= level; +1 per
+                                                       * acquire, −1 per acquire-free 60s) — an erase-class corruption phase
+                                                       * re-anchors ±1 flat step per refractory forever (mv slot warble); the
+                                                       * doubled threshold outgrows the step and the storm converges */
+    int64_t          acq_last_wc;                     /* wall µs of the last ACQUIRE (backoff decay reference) */
     int64_t          tick_dur_us;                     /* 1.0.1: house video tick (us) — the vlag measurement quantum; floors the ACQUIRE threshold at 1.5 ticks */
     int              pll_acq_count;                   /* acquires fired this run (startup-k cap + gate assertion) */
     int              pll_drop, pll_pad;               /* pending one-shot acquire: frames to drop (advance) / pad (delay), on the B1 base */
@@ -1252,6 +1257,7 @@ extern int     g_hstick_filter;          /* #51a: ≤1-tick hs steps are not cor
 extern int     g_rscorr_ceil;            /* #51b: starvation-ceiling engage; PTV_NO_RSCORR_CEIL=1 reverts */
 extern int64_t g_rscorr_ceil_us;         /* #51b ceiling span (15min default; PTV_RSCORR_CEIL_MIN minutes) */
 extern int     g_perstream_wm;           /* §7.5b per-stream watermarks (slowest-live key); PTV_NO_PERSTREAM_WM=1 reverts */
+extern int     g_acq_backoff;            /* #49: repeated-ACQUIRE threshold backoff; PTV_NO_ACQ_BACKOFF=1 reverts */
 extern _Atomic int64_t g_flush_relab_step[PTV_MAX_AUDIO]; /* last LAYERA-flush label shift per track (demux writes, */
 extern _Atomic int64_t g_flush_relab_wc[PTV_MAX_AUDIO];   /* step first / wall last-release; audio thread reads) */
 

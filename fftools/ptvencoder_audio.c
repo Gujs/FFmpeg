@@ -758,6 +758,27 @@ static int audio_drain_fg(AudioState *a)
                         thr = 3 * a->tick_dur_us / 2;
                     if ((int64_t)g_pll_noise_k * a->pll_dev > thr) thr = (int64_t)g_pll_noise_k * a->pll_dev;
                     if (thr > 1500000) thr = 1500000;            /* cap the adaptive rise */
+                    /* 1.0.1-pre18 #49 REPEATED-ACQUIRE BACKOFF (g_acq_backoff): on audio-erase-
+                     * class corruption the measured offset is a FLAT ±step that flips at each
+                     * erase — flat defeats the noise-adaptive dev (it only sees jitter) AND the
+                     * 3-window sustain (the step is genuinely stable for >2s), so each flip
+                     * re-acquired at the refractory rate forever (mv live: ±277ms every ~12s,
+                     * slot warbles until restart). Each ACQUIRE inside a 60s window DOUBLES the
+                     * threshold (decays one level per acquire-free 60s, cap ×32 / 1.5s abs):
+                     * after 2-3 storm acquires the bar outgrows the corruption step and the
+                     * storm converges; a legitimate isolated acquire (startup bank, splice)
+                     * pays at most one doubling that decays within a minute. TRACK, the
+                     * refractory and the tick floor are untouched. PTV_NO_ACQ_BACKOFF reverts. */
+                    if (g_acq_backoff && a->acq_backoff > 0) {
+                        int lvl = a->acq_backoff -
+                                  (int)((av_gettime_relative() - a->acq_last_wc) / 60000000);
+                        if (lvl < 0) lvl = 0;
+                        a->acq_backoff = lvl;        /* decay applied at read */
+                        if (lvl > 0) {
+                            thr <<= lvl;
+                            if (thr > 1500000) thr = 1500000;
+                        }
+                    }
                     /* N7: stability-debounce — fire only when the EMA is LARGE *and* FLAT, so Δ is sized
                      * to the FROZEN bank, not one still forming. */
                     if (FFABS(a->pll_ema) > thr &&
@@ -812,9 +833,16 @@ static int audio_drain_fg(AudioState *a)
                              * operation (startup bank + real disturbances) and already hard
                              * rate-limited by the 12s post-acquire refractory (≤1/12s per track by
                              * construction), so no extra rate limit is added. */
-                            av_log(NULL, AV_LOG_WARNING, "[PTV-PLL] a%d(in%d) ACQUIRE %s %"PRId64"ms (ema→%"PRId64"ms applied=%"PRId64"ms #%d)\n",
+                            /* pre18 #49: an acquire inside the 60s window raises the backoff
+                             * (the read above already applied the decay for this frame). */
+                            if (g_acq_backoff) {
+                                if (a->acq_backoff < 5) a->acq_backoff++;
+                                a->acq_last_wc = av_gettime_relative();
+                            }
+                            av_log(NULL, AV_LOG_WARNING, "[PTV-PLL] a%d(in%d) ACQUIRE %s %"PRId64"ms (ema→%"PRId64"ms applied=%"PRId64"ms #%d backoff=%d)\n",
                                    a->dbg_k, a->dbg_in, dq < 0 ? "drop" : "pad", FFABS(dq) / 1000,
-                                   a->pll_ema / 1000, a->af_applied_us / 1000, a->pll_acq_count);
+                                   a->pll_ema / 1000, a->af_applied_us / 1000, a->pll_acq_count,
+                                   a->acq_backoff);
                         }
                         a->pll_refractory = (int)(g_pll_refractory_us / frame_us);  /* v0.6.21: HARD ~12s refractory (was g_pll_acquire_n ≈0.68s) — breaks the self-excited limit cycle */
                         a->pll_dbnc = 0; a->pll_dbnc_ref = a->pll_ema;
