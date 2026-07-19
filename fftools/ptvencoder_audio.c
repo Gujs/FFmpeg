@@ -246,6 +246,31 @@ static const char *rscorr_delivery_dead(AudioState *a, int64_t now)
     return NULL;
 }
 
+/* TEST-ONLY (1.0.1-pre18; PTV_RSCORR_TESTWALK precedent): PTV_RSCORR_TESTHS="amp_ms:period_s"
+ * superimposes a 0↔amp square wave (flipping every period) on the house_skew value the
+ * CORRECTOR's event detector reads — the bounded-wall-time stand-in for pulldown/decim
+ * 1-tick hs churn (the #51a live class), exercising the hs-tick filter and the #51b
+ * starvation ceiling without a production channel. The REAL house_skew (actuation,
+ * sensors, AVLOCK) is untouched. Never set in production. */
+static int64_t g_rscorr_tesths_amp = -1, g_rscorr_tesths_per = 0;
+static int64_t rscorr_hs_read(AudioState *a)
+{
+    int64_t v = a->house_skew ? *a->house_skew : 0;
+    if (g_rscorr_tesths_amp < 0) {
+        const char *s = getenv("PTV_RSCORR_TESTHS");
+        int amp_ms = 0, per_s = 15;
+        if (s && sscanf(s, "%d:%d", &amp_ms, &per_s) >= 1 && amp_ms > 0 && per_s > 0) {
+            g_rscorr_tesths_amp = (int64_t)amp_ms * 1000;
+            g_rscorr_tesths_per = (int64_t)per_s * 1000000;
+        } else
+            g_rscorr_tesths_amp = 0;   /* parsed, off */
+    }
+    if (g_rscorr_tesths_amp > 0 &&
+        (av_gettime_relative() / g_rscorr_tesths_per) & 1)
+        v += g_rscorr_tesths_amp;
+    return v;
+}
+
 /* §4.4 event-EDGE detector: any pipeline event that touches this track's label lineage,
  * detected as a snapshot delta and CONSUMED (snapshots advance) so one event fires once.
  * Returns the reason string, or NULL. */
@@ -266,7 +291,7 @@ static const char *rscorr_event_edge(AudioState *a)
     v = atomic_load_explicit(&g_bank_us, memory_order_relaxed);
     if (v != c->bank_snap) { c->bank_snap = v; return "bank change"; }
     if (a->house_skew) {
-        v = *a->house_skew;
+        v = rscorr_hs_read(a);
         if (g_hstick_filter) {
             /* 1.0.1-pre18 #51a (AWE dwell starvation, live 2026-07-19): on pulldown/decim
              * channels hs ticks ±1 video tick every 10-17s FOREVER (a benign cadence
@@ -343,7 +368,7 @@ static void rscorr_dwell_reset(AudioState *a, int64_t now, int64_t R)
     c->ev_snap     = atomic_load_explicit(&g_rsx.ev_us[a->dbg_in], memory_order_relaxed);   /* pre16: own slot */
     c->ea_snap     = atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed);
     c->bank_snap   = atomic_load_explicit(&g_bank_us, memory_order_relaxed);
-    c->hs_snap     = a->house_skew ? *a->house_skew : 0;
+    c->hs_snap     = rscorr_hs_read(a);
 }
 
 /* §6 event-storm accounting: ≥3 COUNTED dwell resets within 10min → disarm ("stop
