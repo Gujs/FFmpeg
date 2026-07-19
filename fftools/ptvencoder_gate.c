@@ -82,6 +82,7 @@ void dlv_init(DlvGate *g, AVThreadMessageQueue *mux_q, int64_t cap_us, int maxq)
     atomic_store(&g->a_hi_change_wc, av_gettime_relative());   /* "delivered just now": birth isn't an audio death */
     atomic_store(&g->st_vhold_us, 0);
     atomic_store(&g->st_vforced, 0);
+    g->as_n = 0;                        /* pre18: per-stream watermark table (first-delivery registration) */
 }
 
 /* ===================== §7.5b (1.0.1-pre12) — SYMMETRIC delivery gate: the VIDEO side ==========
@@ -143,13 +144,57 @@ void dlv_video_cfg(DlvGate *g, int64_t band_us, int64_t cap_us, int vmaxq)
  * reader and style-consistency with v_enc_dts_hi. */
 static void dlv_deliver_audio(DlvGate *g, AVPacket *pkt, int64_t dts_us)
 {
+    int sidx = pkt->stream_index;       /* read before the send consumes the packet */
+    int64_t now = av_gettime_relative();
     if (av_thread_message_queue_send(g->mux_q, &pkt, 0) < 0)
         av_packet_free(&pkt);
     /* the high-water advances either way — content left the gate (muxer-gone is terminal) */
     if (dts_us > atomic_load_explicit(&g->a_dlv_dts_hi, memory_order_relaxed)) {
         atomic_store_explicit(&g->a_dlv_dts_hi, dts_us, memory_order_relaxed);
-        atomic_store_explicit(&g->a_hi_change_wc, av_gettime_relative(), memory_order_relaxed);
+        atomic_store_explicit(&g->a_hi_change_wc, now, memory_order_relaxed);
     }
+    /* pre18 per-stream watermark (g_perstream_wm): register on first delivery, then track
+     * this stream's own high-water + freshness. Table overflow leaves the extra streams
+     * unregistered — they simply never constrain the hold (fail-open, like the kill). */
+    if (g_perstream_wm && sidx >= 0) {
+        int i;
+        for (i = 0; i < g->as_n; i++)
+            if (g->as_idx[i] == sidx) {
+                if (dts_us > g->as_hi[i]) g->as_hi[i] = dts_us;
+                g->as_wc[i] = now;
+                return;
+            }
+        if (g->as_n < PTV_DLV_MAX_AS) {
+            g->as_idx[g->as_n] = sidx;
+            g->as_hi[g->as_n]  = dts_us;
+            g->as_wc[g->as_n]  = now;
+            g->as_n++;
+        }
+    }
+}
+
+/* §7.5b release key (1.0.1-pre18, g_perstream_wm): the SLOWEST currently-LIVE gated audio
+ * stream's delivered high-water — the shared a_dlv_dts_hi is the LEAST-delayed stream's,
+ * which left a mixed rung's slower track (loudnorm'd AAC beside an AC-3 copy) riding the
+ * wire late by its whole chain latency (pre17 (B) KNOWN OPEN, measured +843ms..+6.6s).
+ * A stream silent >2s is STALE and excluded (a dead track must never hold video — that
+ * would recreate the audio-outage hold the §7.5b disarm exists for; the disarm itself
+ * stays keyed on the aggregate a_hi_change_wc = ALL tracks silent). No live registered
+ * stream (birth, or kill switch) → the aggregate, i.e. exactly the pre17 behavior. */
+static int64_t dlv_a_hi_key(DlvGate *g, int64_t now)
+{
+    int i, live = 0;
+    int64_t mn = INT64_MAX;
+    if (g_perstream_wm)
+        for (i = 0; i < g->as_n; i++) {
+            if (now - g->as_wc[i] > 2000000)
+                continue;
+            if (g->as_hi[i] < mn) mn = g->as_hi[i];
+            live++;
+        }
+    if (!live)
+        return atomic_load_explicit(&g->a_dlv_dts_hi, memory_order_relaxed);
+    return mn;
 }
 
 /* send one held/passing video packet to mux_q. Returns the send error (mux gone) so the inline
@@ -166,7 +211,7 @@ static int dlv_video_send(DlvGate *g, AVPacket *pkt)
  * ownership of pkt. Video output thread only. Returns <0 only on a dead mux_q (rung exit). */
 int dlv_video_deliver(DlvGate *g, AVPacket *pkt, int64_t dts_us)
 {
-    int64_t a_hi = atomic_load_explicit(&g->a_dlv_dts_hi, memory_order_relaxed);
+    int64_t a_hi = dlv_a_hi_key(g, av_gettime_relative());   /* pre18: slowest LIVE stream */
     DlvNode *n;
 
     if (g->v_disarmed) {
@@ -235,7 +280,7 @@ void dlv_video_drain(DlvGate *g)
     if (!g->v_on || g->v_disarmed)
         return;
     now  = av_gettime_relative();
-    a_hi = atomic_load_explicit(&g->a_dlv_dts_hi,   memory_order_relaxed);
+    a_hi = dlv_a_hi_key(g, now);        /* pre18: slowest LIVE stream (aggregate when none) */
     adv  = atomic_load_explicit(&g->a_hi_change_wc, memory_order_relaxed);
     /* 1.0.1-pre17 AUTO-SIZE (owner mandate: af-independence must never need per-channel
      * config): the escape/age cap tracks the MEASURED audio lateness. Sample the content

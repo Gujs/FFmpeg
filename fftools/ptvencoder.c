@@ -612,6 +612,13 @@ int     g_hstick_filter = 1;
  * block. PTV_NO_RSCORR_CEIL=1 reverts; PTV_RSCORR_CEIL_MIN (minutes, default 15) tunes. */
 int     g_rscorr_ceil = 1;
 int64_t g_rscorr_ceil_us = 900000000;
+/* 1.0.1-pre18 — per-stream delivery watermarks (pre17 (B) KNOWN OPEN, owner-approved; owner
+ * mandate: af-independent transport on single input AND mv): the §7.5b video hold keys on
+ * the SLOWEST currently-LIVE gated audio stream's delivered watermark, staleness-excluded
+ * (>2s silent = out), instead of the least-delayed aggregate high-water. Mixed rungs
+ * (loudnorm AAC + copied AC-3) stop depending on latency coincidence.
+ * PTV_NO_PERSTREAM_WM=1 reverts to the aggregate key. */
+int     g_perstream_wm = 1;
 
 /* PTV_LOG_TS=1: prefix every log line with a local wall-clock timestamp
  * [YYYY-MM-DD HH:MM:SS.mmm], so production logs are self-dated natively
@@ -1922,11 +1929,12 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
          * fleet loudnorm rollout (~3s one-pass analysis fill) made EVERY mv audio track
          * wall-late, so the §7.5a gate reads dlvhold=0 (nothing early to hold) and the grids'
          * wire carried video ~2-3s ahead of audio with labels intact — the exact single-input
-         * pre12 class, and mv had no closing mechanism. Slots share ONE gate per rung, so
-         * a_dlv_dts_hi keys the hold to the LEAST-delayed slot's audio: with the fleet-uniform
-         * loudness chain the per-slot latency spread is small, the residual skew is bounded by
-         * it, and a single dead slot cannot wedge video (any flowing track advances the
-         * high-water; the 6s audio-death escape needs ALL tracks silent). Armed only when the
+         * pre12 class, and mv had no closing mechanism. Slots share ONE gate per rung;
+         * 1.0.1-pre18 (g_perstream_wm): the hold keys on the SLOWEST currently-LIVE stream's
+         * per-stream delivered watermark (dlv_a_hi_key) instead of the least-delayed
+         * aggregate — a mixed rung (loudnorm AAC + AC-3 copy) aligns to its slowest track,
+         * and a stream silent >2s is excluded so a single dead slot/track still cannot wedge
+         * video (the 6s audio-death escape keeps needing ALL tracks silent). Armed only when the
          * run HAS gated audio to key on (a transcoded track or dense copied AC-3/MP2): a
          * no-audio channel must not pay the audio-death escape timeout at birth.
          * PTV_NO_VDELIVERY=1 reverts. */
@@ -2714,6 +2722,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_HSTICK_FILTER")) g_hstick_filter = 0;   /* 1.0.1-pre18 #51a: hs-tick steps count as corrector events again */
     if (getenv("PTV_NO_RSCORR_CEIL")) g_rscorr_ceil = 0;       /* 1.0.1-pre18 #51b: no starvation-ceiling engage */
     { const char *s = getenv("PTV_RSCORR_CEIL_MIN"); if (s && atoi(s) > 0) g_rscorr_ceil_us = (int64_t)atoi(s) * 60000000; }  /* #51b ceiling, minutes */
+    if (getenv("PTV_NO_PERSTREAM_WM")) g_perstream_wm = 0;     /* 1.0.1-pre18: §7.5b back to the aggregate (least-delayed) key */
     if (getenv("PTV_NBS_FILL") && g_glueclass) g_nbs_fill = 1;
     { const char *s = getenv("PTV_GLUE_HTOL_PCT");     if (s && atoi(s) > 0) g_glue_htol = atoi(s); }             /* tuning knob (G4) */
     { const char *s = getenv("PTV_PAIR_EXPECT_TTL_US");if (s && atoll(s) > 0) g_pair_ttl_us = atoll(s); }          /* TEST ONLY (G6) */

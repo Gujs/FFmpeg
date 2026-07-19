@@ -160,6 +160,20 @@ typedef struct DlvGate {
     _Atomic int64_t a_hi_change_wc;     /* wall time a_dlv_dts_hi last ADVANCED (escape/re-arm detector) */
     _Atomic int64_t st_vhold_us;        /* stats vdlvhold=: age of the oldest held video at the last video drain */
     _Atomic int64_t st_vforced;         /* backstop releases (vmaxq overflow + aged-while-audio-flowing) */
+    /* ---- 1.0.1-pre18 PER-STREAM delivered watermarks (g_perstream_wm; the pre17 (B)
+     * KNOWN OPEN, owner-approved): the shared a_dlv_dts_hi is the LEAST-delayed stream's
+     * high-water, so on a MIXED rung (loudnorm'd AAC ~3s late + copied AC-3 ~0s) the
+     * slower stream's wire alignment depended on latency coincidence. The video hold now
+     * keys on the MINIMUM watermark across currently-LIVE gated audio streams (per output
+     * stream_index); a stream with no delivery for >2s is stale and EXCLUDED, so a dead
+     * track can never hold video (the §7.5b disarm's audio-outage class stays keyed on
+     * the aggregate a_hi_change_wc). All fields video-output-thread-only (delivery and
+     * the video hold both run there) — no lock, plain fields. */
+#define PTV_DLV_MAX_AS 16
+    int             as_n;                   /* registered gated audio streams (first-delivery) */
+    int             as_idx[PTV_DLV_MAX_AS]; /* output stream_index per slot */
+    int64_t         as_hi[PTV_DLV_MAX_AS];  /* per-stream delivered-DTS high-water (µs) */
+    int64_t         as_wc[PTV_DLV_MAX_AS];  /* wall µs of that stream's last delivery (staleness) */
 } DlvGate;
 
 /* §7.5b auto-size ceiling (1.0.1-pre17): the measured-lateness cap growth stops here — an
@@ -1237,6 +1251,7 @@ extern int     g_glueveto;               /* veto + inverse guard + E5 flush-rela
 extern int     g_hstick_filter;          /* #51a: ≤1-tick hs steps are not corrector events; PTV_NO_HSTICK_FILTER=1 reverts */
 extern int     g_rscorr_ceil;            /* #51b: starvation-ceiling engage; PTV_NO_RSCORR_CEIL=1 reverts */
 extern int64_t g_rscorr_ceil_us;         /* #51b ceiling span (15min default; PTV_RSCORR_CEIL_MIN minutes) */
+extern int     g_perstream_wm;           /* §7.5b per-stream watermarks (slowest-live key); PTV_NO_PERSTREAM_WM=1 reverts */
 extern _Atomic int64_t g_flush_relab_step[PTV_MAX_AUDIO]; /* last LAYERA-flush label shift per track (demux writes, */
 extern _Atomic int64_t g_flush_relab_wc[PTV_MAX_AUDIO];   /* step first / wall last-release; audio thread reads) */
 

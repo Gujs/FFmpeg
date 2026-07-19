@@ -69,6 +69,25 @@ entry from a long DISARM would read accumulated deltas as instant events).
 Authority/park/disarm semantics of the ENGAGED state are unchanged — a
 ceiling engage steers under the same 5s/10s caps and freezes on the same
 events. PTV_NO_RSCORR_CEIL=1 reverts; PTV_RSCORR_CEIL_MIN (minutes) tunes.
+(D) PER-STREAM DELIVERY WATERMARKS (pre17 (B) KNOWN OPEN, owner-approved;
+owner mandate: af-independent transport, single input AND mv, auto-sized).
+SYMPTOM: on a MIXED rung (loudnorm'd transcoded AAC ~3s late + copied AC-3
+~0s) the §7.5b hold and its auto-size were keyed to the shared a_dlv_dts_hi
+= the LEAST-delayed stream, so the slower track rode the wire late by its
+whole chain latency (measured +843ms single-loudnorm, +6.6s triple; live
+Cinestar was clean only because video pipeline ≈ loudnorm latency —
+coincidence, not design). FIX: DlvGate tracks a per-output-stream delivered
+watermark (registered at first delivery, staleness-stamped per delivery);
+the video hold's release key (dlv_a_hi_key) is the MINIMUM across streams
+delivering within the last 2s — video waits for the SLOWEST LIVE audio
+stream, on single input and mv alike (mv slots share one gate per rung: the
+key becomes the slowest live slot). A stream silent >2s is EXCLUDED, so a
+dead AC-3 track (or dead mv slot) can never hold video beyond that window —
+the §7.5b audio-death escape/disarm stays keyed on the AGGREGATE
+a_hi_change_wc (fires only when ALL tracks are silent, unchanged). The
+pre17 (B2) cap auto-size now measures against the same slowest-live key, so
+the escape cap sizes to the slowest chain. Uniform-audio channels read a
+min == the old aggregate (byte-equal path). PTV_NO_PERSTREAM_WM=1 reverts.
 
 (7p) MV COMPLETION PRE — pre17: sibling-slate sensor artifact fix + af-independent
 mv transport (task #48) + MV CORRECTOR ARM. Three work items; the corrector-arm
