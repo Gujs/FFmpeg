@@ -50,6 +50,9 @@ through every tick = the ticks are benign cadence noise, not lineage events.
 FIX: magnitude-filter the hs event EDGE — a step ≤ 1 tick + ¼ tick (~41ms at
 29.97, 50ms at 25fps; always < the 2-tick event bar) is absorbed into the
 snapshot silently (no dwell reset, no storm count); larger steps stay events.
+(Not purely a relaxation: at 50fps the 1.25-tick bar = 25ms, so a 2-tick 40ms
+step is now an event where the old cumulative rule needed 50ms — intent-
+consistent, ≥2 ticks is always an event.)
 All other named events (LAYERA, verdicts, AGLUE, reopen, AFMT, glue, ledgers,
 bank) keep full event status; the §4.3 continuous R-stability re-anchor
 remains the actuation safety, untouched. PTV_NO_HSTICK_FILTER=1 reverts.
@@ -86,8 +89,12 @@ dead AC-3 track (or dead mv slot) can never hold video beyond that window —
 the §7.5b audio-death escape/disarm stays keyed on the AGGREGATE
 a_hi_change_wc (fires only when ALL tracks are silent, unchanged). The
 pre17 (B2) cap auto-size now measures against the same slowest-live key, so
-the escape cap sizes to the slowest chain. Uniform-audio channels read a
-min == the old aggregate (byte-equal path). Gate (cinestar mixed rung, single
+the escape cap sizes to the slowest chain. SINGLE-audio channels read a
+min over one stream == the old aggregate (identical code path; review-verified
+via mir2 content-exact). Multi-track UNIFORM channels change key max→min —
+bounded by the interleave phase (~one audio frame), benign but not byte-equal.
+>PTV_DLV_MAX_AS (16) gated audio streams: extras stay unkeyed = pre17 posture
+(fail-open). Gate (cinestar mixed rung, single
 loudnorm, local x264 cell): pre17 wire = AAC median +1080ms late / AC-3 +16ms;
 pre18 = AAC +240ms (in band) / AC-3 −760ms — the copy now LEADS by the
 latency spread, which is structural: §7.5a releases audio on the ENCODE front
