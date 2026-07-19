@@ -676,6 +676,9 @@ typedef struct AudioState {
     int64_t          nbs_carry_us;                    /* rr15 F9: sub-frame remainder carried between quanta */
     int64_t          glue_cad_us;                     /* rr15 R2: EMA of nonzero fed-frame wall gaps (PES-burst
                                                        * period) — the E3 cadence baseline for the pad-ledger gate */
+    int64_t          flush_relab_seen_wc;             /* 1.0.1-pre18 #50 (E5 net): last consumed/retired
+                                                       * g_flush_relab_wc value for this track (young
+                                                       * unmatched publishes stay pending and re-scan) */
 } AudioState;
 
 /* ---- demux + mux ---- */
@@ -769,6 +772,21 @@ typedef struct PassStream {
 #define PTV_PAIR_EXPECT_TTL_US   (30 * AV_TIME_BASE)
 #define PTV_PAIR_EXPECT_LO_US    (250 * 1000)
 #define PTV_PAIR_EXPECT_HI_US    (500 * 1000)
+/* 1.0.1-pre18 #50 (g_glueveto) — the one-remedy match keys. A gap verdict and a LAYERA
+ * cycle/flush describe the SAME source event when (a) they land within the WIN of each
+ * other (live: verdict 42ms after the arm, flush 520ms after — the arm-vs-verdict and
+ * flush-vs-verdict gaps are both bounded by the 500ms disc-buffer timeout + interleave),
+ * (b) the jump magnitudes agree within EPS (live: +2.421s jump vs +2.413s gap = 8ms), and
+ * (c) the jump's from/to positions lie in the SAME timeline domain as the gap's bracketing
+ * labels (DOM ≈ program interleave depth) — magnitude alone must not match a wrapped/
+ * corrupt-dts jump living in a different domain (the Fashion class). Two genuinely
+ * independent same-program events could still pass (a)+(c); the (b) conjunction inside a
+ * 500ms window is the discriminator there (independent similar-magnitude events within
+ * 500ms have no observed precedent; a wrong veto degrades to the pad-only posture, a
+ * wrong non-veto is today's double remedy). */
+#define PTV_GVETO_WIN_US   (500 * 1000)
+#define PTV_GVETO_EPS_US   (150 * 1000)
+#define PTV_GVETO_DOM_US   (2 * AV_TIME_BASE)
 
 
 typedef struct PtvDiscPacket {
@@ -851,6 +869,12 @@ typedef struct PtvDiscBuf {
                                              * while the sibling leg is missing, capped by the pairing
                                              * window from cycle open + a capacity guard) */
     int64_t             cycle_open_us;      /* pre17 R3a: wall µs this buffer cycle armed (extension cap base) */
+    /* 1.0.1-pre18 #50 (g_glueveto) inverse-guard evidence: the last flush that applied a
+     * nonzero offset to AUDIO labels — a gap verdict arriving just after it (matching
+     * magnitude + window) is the SAME source event already remedied, so the verdict is
+     * suppressed instead of double-applying (pad on top of the flush's relabel). */
+    int64_t             fl_wall;            /* wall µs of that flush (0 = never) */
+    int64_t             fl_delta_us;        /* the trigger stream's jump delta at that flush (µs) */
 } PtvDiscBuf;
 
 typedef struct DemuxArgs {
@@ -1201,6 +1225,10 @@ extern _Atomic int64_t g_adec_frame_wc[PTV_MAX_AUDIO];    /* wall µs of track k
                                                            * discriminator: packets arrive, nothing decodes) */
 extern _Atomic int64_t g_pad_pub_step[PTV_MAX_AUDIO];     /* newest OPEN pad-ledger entry per track (audio thread */
 extern _Atomic int64_t g_pad_pub_wc[PTV_MAX_AUDIO];       /* publishes; demux absorber reads — advisory) */
+/* 1.0.1-pre18 #50 (defined in ptvencoder.c): gap-verdict/LAYERA one-remedy invariant */
+extern int     g_glueveto;               /* veto + inverse guard + E5 flush-relabel net; PTV_NO_GLUEVETO=1 reverts */
+extern _Atomic int64_t g_flush_relab_step[PTV_MAX_AUDIO]; /* last LAYERA-flush label shift per track (demux writes, */
+extern _Atomic int64_t g_flush_relab_wc[PTV_MAX_AUDIO];   /* step first / wall last-release; audio thread reads) */
 
 /* ==== cross-file functions ==== */
 /* ptvencoder_gate.c */

@@ -1453,6 +1453,51 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                        "%d quanta; resume step classified below\n",
                        a->dbg_k, a->dbg_in, a->nbs_fills);
             }
+            /* 1.0.1-pre18 #50 (E5 net, g_glueveto): a LAYERA-flush relabel is INVISIBLE here —
+             * the labels arrive already-shifted, so a GAP-pad's RETURN leg consumed by a flush
+             * erase left the pad's inserted silence permanently baked (pad + erase = double
+             * application; the ledger only ever saw arriving label steps). The demux publishes
+             * each flush's per-track label shift; a shift matching an open pad IS that return
+             * leg, erased at the packet layer — counter-apply it at the graph door instead:
+             * glue_off_us -= pad steps the door labels back by the pad, aresample=async
+             * hard-drops the inserted silence, and the sensor's inj accounting rides glue_off
+             * exactly as for an arriving relabel verdict. A young publish that matches no open
+             * pad stays PENDING (the pad may still be in flight through audio_q) and re-scans
+             * per frame until the pad TTL retires it. */
+            if (g_glueveto && g_glueclass && a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO) {
+                int64_t fwc = atomic_load_explicit(&g_flush_relab_wc[a->dbg_k], memory_order_acquire);
+                if (fwc && fwc != a->flush_relab_seen_wc) {
+                    if (now_wc - fwc > PTV_GLUE_PAD_TTL_US)
+                        a->flush_relab_seen_wc = fwc;          /* stale: retire unmatched */
+                    else {
+                        int64_t fstep = atomic_load_explicit(&g_flush_relab_step[a->dbg_k],
+                                                             memory_order_relaxed);
+                        int pf;
+                        for (pf = 0; pf < PTV_GLUE_PAD_LED; pf++) {
+                            int64_t pp = a->pad_led_us[pf];
+                            if (pp > 0 && now_wc - a->pad_led_wc[pf] <= PTV_GLUE_PAD_TTL_US &&
+                                llabs(fstep - pp) <= FFMAX(80000, pp / 4)) {
+                                a->glue_off_us -= pp;
+                                a->pad_led_us[pf] = 0;         /* consumed */
+                                ptv_pad_pub(a);
+                                a->glue_events++;
+                                a->flush_relab_seen_wc = fwc;
+                                a->pend_comp_us = -pp;         /* §2.4 tripwire: the drop must realize */
+                                a->pend_comp_wc = now_wc;
+                                av_log(NULL, AV_LOG_WARNING,
+                                       "[PTV-AGLUE] a%d(in%d) LAYERA flush relabel %+"PRId64"ms matches an "
+                                       "open GAP-pad +%"PRId64"ms — the pad's return leg was erased at the "
+                                       "packet layer; counter-applied at the graph door (glue total "
+                                       "%+"PRId64"ms) so the pad's silence is dropped (PTV_NO_GLUEVETO "
+                                       "reverts)\n",
+                                       a->dbg_k, a->dbg_in, fstep / 1000, pp / 1000,
+                                       a->glue_off_us / 1000);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
             if (a->glue_raw_last_us != AV_NOPTS_VALUE) {
                 int64_t step = raw_us - (a->glue_raw_last_us + a->glue_raw_dur_us);
                 if (llabs(step) > (int64_t)g_aglue_ms * 1000) {

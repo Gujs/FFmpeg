@@ -7,6 +7,38 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(7q) LIVE-DEFECT BATCH — pre18: five items, one commit each, kill-switch each.
+(A) GAP-VERDICT vs LAYERA ONE-REMEDY INVARIANT (task #50; the AWE_Plus +2.38s live
+defect 2026-07-19 14:44). SYMPTOM: lipsync stepped to +2385ms flat at a source
+audio cut. ROOT CAUSE (live log sequence): stream-2's +2.421s jump armed a LAYERA
+cycle at t; stream-1's +2413ms audio GAP verdict landed at t+42ms (aresample pads,
+verdict propagated); the armed cycle flushed at t+520ms with applied_offset
+aud=−2.389/vid=0.000 — ONE source event (an upstream cut: flowing labels on one
+PID, wall absence on the other, the AWE shape) got BOTH remedies: the verdict's
+pad AND the flush's relabel-erase. FIX (g_glueveto, three parts):
+ 1. VETO: a gap verdict landing while a matching cycle is ARMED-but-unflushed
+ (magnitude within 150ms + armed within 500ms + the jump's from/to domain
+ brackets the gap's labels within 2s — a wrapped/corrupt-dts jump in a different
+ domain never matches, the Fashion class) DISBANDS the cycle: ptv_disc_cancel()
+ releases every buffered packet unrebased in DTS order (last_sent_dts advances
+ like the normal path), the jump stays in the labels on every stream, and each
+ stream's own content machinery pads it (the gap is the evidence the content is
+ genuinely missing — the pad is the right remedy everywhere). The gap stream's
+ own continuity ref advances too, so neither stream re-arms a cycle.
+ 2. INVERSE guard: a verdict landing within 500ms AFTER a matching flush is
+ SUPPRESSED (PtvDiscBuf.fl_wall/fl_delta_us stamped at every audio-moving flush)
+ — the step falls to the discontinuity layer, which erases it consistently with
+ the already-flushed sibling. One event, one remedy, in either ordering.
+ 3. E5 NET (second net for orderings the veto keys miss): LAYERA-flush label
+ shifts are published per track (g_flush_relab_step/wc); a shift matching an
+ OPEN pad-ledger entry is that pad's RETURN leg erased at the packet layer
+ (invisible to AGLUE — the labels arrive already-shifted) → counter-applied at
+ the graph door (glue_off_us −= pad; async hard-drops the inserted silence;
+ §2.4 tripwire armed on the drop; corrector glue_events freeze).
+KNOWN BOUND: a THIRD dense audio stream whose matching jump arrives flowing
+after the veto window gets its own cycle/erase (3-audio channels; no live
+precedent — noted for the record). PTV_NO_GLUEVETO=1 reverts all three.
+
 (7p) MV COMPLETION PRE — pre17: sibling-slate sensor artifact fix + af-independent
 mv transport (task #48) + MV CORRECTOR ARM. Three work items; the corrector-arm
 SHIP decision is soak-gated (grid soak verdict) — implemented and fixture-gated

@@ -651,6 +651,48 @@ static int ptv_disc_partial_hold(DemuxArgs *d, PtvDiscBuf *b)
     return 1;
 }
 
+/* 1.0.1-pre18 #50 (g_glueveto): DISBAND an armed-but-unflushed cycle whose trigger jump a
+ * gap verdict just identified as the SAME source event — release EVERY buffered packet at
+ * offset 0 in DTS order (no classification, no discard, no rebase: exactly what the normal
+ * path would have dispatched had the buffer never armed), so the jump stays IN the labels
+ * on every stream and the content machinery pads it (AGLUE GAP / aresample hard-pad above
+ * the cap; a copied stream carries the real gap on the wire). The live defect (AWE_Plus
+ * 2026-07-19 14:44): the cycle flushed 478ms after the verdict and butt-jointed the jump
+ * −2.389s on the crossing stream while the verdict's pad stood on the other — pad AND
+ * relabel-erase for one event = lipsync +2385ms flat. last_sent_dts advances like the
+ * normal path; bases/transition state reset; pair state untouched (nothing was applied).
+ * Dispatch errors mean a closed queue (shutdown) — swallowed like the flush tail does. */
+static void ptv_disc_cancel(DemuxArgs *d, PtvDiscBuf *b)
+{
+    int i;
+    if (b->nb_packets > 0)
+        qsort(b->packets, b->nb_packets, sizeof(PtvDiscPacket *), ptv_disc_compare);
+    b->flushing = 1;
+    for (i = 0; i < b->nb_packets; i++) {
+        PtvDiscPacket *dp = b->packets[i];
+        AVStream *st;
+        if (!dp)
+            continue;
+        if (dp->stream_idx < 0 || dp->stream_idx >= (int)d->ifmt->nb_streams) {
+            av_packet_free(&dp->pkt);
+            av_freep(&b->packets[i]);
+            continue;
+        }
+        st = d->ifmt->streams[dp->stream_idx];
+        if (dp->stream_idx < b->nb_streams) {
+            PtvDiscStreamState *ss = &b->stream_state[dp->stream_idx];
+            int64_t out_end = dp->raw_dts + ptv_disc_pkt_duration(st, dp->pkt);
+            if (ss->last_sent_dts == AV_NOPTS_VALUE || out_end > ss->last_sent_dts)
+                ss->last_sent_dts = out_end;
+        }
+        demux_dispatch(d, dp->pkt);          /* re-inject through the normal path; frees pkt */
+        dp->pkt = NULL;
+        av_freep(&b->packets[i]);
+    }
+    b->flushing = 0;
+    ptv_disc_reset(b);
+}
+
 /* Flush: classify each held packet, KEEP NEW / DISCARD OLD, compute one
  * audio-derived applied_offset, apply it to all kept packets' pts+dts, and
  * release them in DTS order through demux_dispatch. Faithful to 0004's
@@ -1034,6 +1076,25 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
                 d->wrap_off[s] += av_rescale_q(po, AV_TIME_BASE_Q,
                                                d->ifmt->streams[s]->time_base);
                 rsync_post_edit(d, s, po);   /* pre9 sensor: LAYERA glue label edit */
+                /* 1.0.1-pre18 #50 (E5 net, g_glueveto): publish this flush's label shift to
+                 * the stream's transcoded track(s). A shift that consumed an open GAP-pad's
+                 * RETURN leg is invisible to AGLUE (the labels arrive already-erased), so
+                 * the pad ledger could never cancel it — the audio thread matches this
+                 * publish against its open pads and counter-applies at the graph door.
+                 * Value first, wall last (release); the audio side acquires the wall. */
+                if (g_glueveto &&
+                    d->ifmt->streams[s]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                    int j3;
+                    for (j3 = 0; j3 < d->n_audio; j3++)
+                        if (d->astream[j3] == s &&
+                            d->aglobal[j3] >= 0 && d->aglobal[j3] < PTV_MAX_AUDIO) {
+                            atomic_store_explicit(&g_flush_relab_step[d->aglobal[j3]], po,
+                                                  memory_order_relaxed);
+                            atomic_store_explicit(&g_flush_relab_wc[d->aglobal[j3]],
+                                                  av_gettime_relative(),
+                                                  memory_order_release);
+                        }
+                }
                 /* 0.9.18.5: shift the stale jump-detection continuity ref too. last_dts_us is
                  * stored in the demux loop from the PRE-offset raw DTS of the last buffered
                  * packet; once wrap_off above carries the applied offset, the next normal-path
@@ -1130,6 +1191,19 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
                 open_aud = 1;
         if (!open_aud)
             ptv_disc_pair_reset(b);
+    }
+
+    /* 1.0.1-pre18 #50 (g_glueveto) inverse-guard evidence: this flush moved AUDIO labels —
+     * stamp the trigger's jump delta + wall so a gap verdict landing just after it (same
+     * source event, matching magnitude) is suppressed instead of pad-on-top-of-erase.
+     * Read before ptv_disc_reset clears the bases. */
+    if (g_glueveto && has_aud && b->applied_offset != 0 &&
+        b->cycle_trigger >= 0 && b->cycle_trigger < b->nb_streams) {
+        PtvDiscStreamState *ts2 = &b->stream_state[b->cycle_trigger];
+        if (ts2->has_old_base && ts2->has_new_base) {
+            b->fl_wall     = av_gettime_relative();
+            b->fl_delta_us = ts2->new_timeline_base - ts2->old_timeline_base;
+        }
     }
 
     b->flushing = 0;
@@ -1314,7 +1388,30 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                         int64_t wl       = d->wrap_wall_last[pkt->stream_index];
                         int64_t wall_gap = wl ? wall_now - wl : 0;   /* 0 = no prior packet (sentinel) → treat as flowing */
                         int vcrossed = d->video_fwd_us && (wall_now - d->video_fwd_us <= g_progoff_debounce_us);
-                        if (!vcrossed && wall_gap >= FFMAX(g_gap_min_us, jump_us / 2)) {
+                        int veto_supp = 0;
+                        /* 1.0.1-pre18 #50 INVERSE guard (g_glueveto): a matching LAYERA flush
+                         * already remedied this source event (butt-jointed the sibling's jump)
+                         * — a gap verdict now would pad ON TOP of that relabel (the double
+                         * remedy, mirror ordering). Suppress the verdict: the step falls to
+                         * the discontinuity layer, which erases it CONSISTENTLY with the
+                         * sibling. Match = magnitude within EPS inside the WIN window (see
+                         * PTV_GVETO_* in ptvencoder.h). */
+                        if (g_glueveto && g_layera && d->disc && !vcrossed &&
+                            wall_gap >= FFMAX(g_gap_min_us, jump_us / 2) &&
+                            d->disc->fl_wall &&
+                            wall_now - d->disc->fl_wall <= PTV_GVETO_WIN_US &&
+                            llabs(d->disc->fl_delta_us - jump_us) <= PTV_GVETO_EPS_US) {
+                            veto_supp = 1;
+                            av_log(NULL, AV_LOG_WARNING,
+                                   "[PTV-GLUE] stream %d: +%"PRId64"ms forward step matches the LAYERA "
+                                   "flush %"PRId64"ms ago (jump %+.3fs) — gap verdict SUPPRESSED "
+                                   "(one source event, one remedy; step left to the discontinuity "
+                                   "layer) (PTV_NO_GLUEVETO reverts)\n",
+                                   pkt->stream_index, jump_us / 1000,
+                                   (wall_now - d->disc->fl_wall) / 1000,
+                                   (double)d->disc->fl_delta_us / AV_TIME_BASE);
+                        }
+                        if (!vcrossed && !veto_supp && wall_gap >= FFMAX(g_gap_min_us, jump_us / 2)) {
                             is_gap = 1;
                             d->sib_jump_us[1]   = jump_us;   /* pre16 #47-C: a gap is a known audio jump */
                             d->sib_jump_wall[1] = wall_now;
@@ -1323,6 +1420,59 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                             av_log(NULL, AV_LOG_INFO,   /* v0.9.13: always-on — a real source audio dropout, rare + meaningful */
                                    "[PTV-DISCONT] stream %d: %+"PRId64"ms audio GAP — NOT absorbed (aresample pads; wall_gap=%"PRId64"ms)\n",
                                    pkt->stream_index, av_rescale_q(delta, st->time_base, (AVRational){1,1000}), wall_gap / 1000);
+                            /* 1.0.1-pre18 #50 VETO (g_glueveto): an ARMED-but-unflushed LAYERA
+                             * cycle whose trigger jump matches this gap is the SAME source
+                             * event seen twice — flowing labels on the sibling PID, wall
+                             * absence on this one (the AWE upstream-cut shape). Letting the
+                             * cycle flush would butt-joint (erase) the jump while this verdict
+                             * pads it: BOTH remedies for ONE event = the +2.38s live defect.
+                             * The gap is the evidence the content is genuinely MISSING, so the
+                             * pad is the right remedy on every stream: disband the cycle —
+                             * every buffered packet is released unrebased, the jump stays in
+                             * the labels, and each stream's own content machinery pads it
+                             * (AGLUE/aresample transcoded; copy carries the real gap). Match =
+                             * magnitude within EPS + armed within WIN + the jump's from/to
+                             * domain brackets this gap's labels (a wrapped/corrupt-dts jump in
+                             * a different domain must never match — Fashion class). */
+                            if (g_glueveto && g_layera && d->disc &&
+                                d->disc->active && !d->disc->flushing &&
+                                d->disc->cycle_trigger >= 0 &&
+                                d->disc->cycle_trigger < d->disc->nb_streams &&
+                                wall_now - d->disc->cycle_open_us <= PTV_GVETO_WIN_US) {
+                                PtvDiscBuf *vb = d->disc;
+                                PtvDiscStreamState *vt = &vb->stream_state[vb->cycle_trigger];
+                                if (vt->has_old_base && vt->has_new_base) {
+                                    int64_t tdelta  = vt->new_timeline_base - vt->old_timeline_base;
+                                    int64_t pre_us  = av_rescale_q(last + d->wrap_off[pkt->stream_index],
+                                                                   st->time_base, AV_TIME_BASE_Q);
+                                    int64_t post_us = pre_us + jump_us;
+                                    if (llabs(tdelta - jump_us) <= PTV_GVETO_EPS_US &&
+                                        llabs(vt->old_timeline_base - pre_us)  <= PTV_GVETO_DOM_US &&
+                                        llabs(vt->new_timeline_base - post_us) <= PTV_GVETO_DOM_US) {
+                                        av_log(NULL, AV_LOG_WARNING,
+                                               "[PTV-GLUE] gap verdict (+%"PRId64"ms, stream %d) matches the "
+                                               "armed cycle's stream-%d jump (%+.3fs, armed %"PRId64"ms ago) — "
+                                               "SAME source event: cycle DISBANDED, %d pkts released unrebased; "
+                                               "labels carry the jump, content path pads (PTV_NO_GLUEVETO "
+                                               "reverts)\n",
+                                               jump_us / 1000, pkt->stream_index, vb->cycle_trigger,
+                                               (double)tdelta / AV_TIME_BASE,
+                                               (wall_now - vb->cycle_open_us) / 1000, vb->nb_packets);
+                                        ptv_disc_cancel(d, vb);
+                                        /* the gap stream's OWN jump must not arm a fresh cycle
+                                         * either (the flush would erase what this verdict pads —
+                                         * the mirror divergence): advance its continuity ref to
+                                         * the post-jump position, exactly the §2.5 propagation
+                                         * action (which may re-run below, idempotently — its
+                                         * video-progress guard needn't hold for a match the veto
+                                         * already established as an audio-only same-event gap). */
+                                        if (pkt->stream_index < vb->nb_streams)
+                                            vb->stream_state[pkt->stream_index].last_dts_us =
+                                                av_rescale_q(raw + d->wrap_off[pkt->stream_index],
+                                                             st->time_base, AV_TIME_BASE_Q);
+                                    }
+                                }
+                            }
                             /* 1.0.1-pre15 §2.5 gap-verdict propagation (#33, the (d) fix): the verdict
                              * above was invisible to LAYERA — the disc-buffer block runs after this on
                              * the same packet, sees the same >1s step against stream_state[].last_dts_us,

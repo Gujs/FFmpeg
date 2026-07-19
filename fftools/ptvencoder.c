@@ -41,7 +41,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.0.1-pre17"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.0.1-pre18"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -588,6 +588,18 @@ _Atomic int64_t g_acorrupt;
 _Atomic int64_t g_adec_frame_wc[PTV_MAX_AUDIO];
 _Atomic int64_t g_pad_pub_step[PTV_MAX_AUDIO];
 _Atomic int64_t g_pad_pub_wc[PTV_MAX_AUDIO];
+/* 1.0.1-pre18 #50 — GAP-VERDICT vs LAYERA one-remedy invariant (the AWE_Plus +2.38s live
+ * defect 2026-07-19 14:44): one source event must get exactly ONE remedy. A gap verdict
+ * landing while a matching LAYERA cycle is armed-but-unflushed DISBANDS the cycle (labels
+ * carry the jump on every stream; AGLUE/aresample pads — the content really is missing);
+ * a verdict landing just AFTER a matching flush is SUPPRESSED (the flush already remedied
+ * the event; the jump goes to the discontinuity layer so both streams get the same remedy).
+ * Plus the E5 net: LAYERA-flush relabels are published per track (atomics below) so the
+ * pad round-trip ledger can cancel a pad whose return leg was erased at the packet layer.
+ * PTV_NO_GLUEVETO=1 reverts all three. */
+int     g_glueveto = 1;
+_Atomic int64_t g_flush_relab_step[PTV_MAX_AUDIO];  /* last LAYERA-flush label shift per track (µs) */
+_Atomic int64_t g_flush_relab_wc[PTV_MAX_AUDIO];    /* wall µs it was persisted (0 = never) */
 
 /* PTV_LOG_TS=1: prefix every log line with a local wall-clock timestamp
  * [YYYY-MM-DD HH:MM:SS.mmm], so production logs are self-dated natively
@@ -2686,6 +2698,7 @@ int main(int argc, char **argv)
      * silence-fill is OPT-IN on top (observability-first rollout, owner call); the acorrupt
      * counters/[PTV-ADISC] stay on under every switch (unconditional observability). */
     if (getenv("PTV_NO_GLUECLASS")) g_glueclass = 0;
+    if (getenv("PTV_NO_GLUEVETO")) g_glueveto = 0;   /* 1.0.1-pre18 #50: gap-verdict-vs-LAYERA one-remedy invariant off */
     if (getenv("PTV_NBS_FILL") && g_glueclass) g_nbs_fill = 1;
     { const char *s = getenv("PTV_GLUE_HTOL_PCT");     if (s && atoi(s) > 0) g_glue_htol = atoi(s); }             /* tuning knob (G4) */
     { const char *s = getenv("PTV_PAIR_EXPECT_TTL_US");if (s && atoll(s) > 0) g_pair_ttl_us = atoll(s); }          /* TEST ONLY (G6) */
