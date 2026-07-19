@@ -344,6 +344,13 @@ typedef struct CorrState {          /* all owned by that track's audio thread (�
     int64_t holdoff_wc;             /* re-arm holdoff after a storm disarm (wall µs) */
     int64_t log_wc;                 /* HOLD-line rate limit (state-change lines are not limited) */
     int64_t diag_wc;                /* PTV_DIAG 30s progress-line rate limit while engaged */
+    /* 1.0.1-pre18 #51b anti-starvation ceiling (the legacy-0007 PLL_HARD_CEILING/PLL_STUCK
+     * pattern): the starvation SPAN — how long R has stayed large (>engage band) AND flat
+     * (the §4.3 criterion vs starve_r0) with the sensor valid and delivery live, while the
+     * corrector could not complete a dwell (resets, storm holdoffs included — the span runs
+     * through ARMED/DWELL/DISARMED). Span ≥ the ceiling → ENGAGE anyway (rscorr_update). */
+    int64_t starve_wc;              /* span start (wall µs); 0 = no open span */
+    int64_t starve_r0;              /* R at span start (the whole-span flatness reference) */
 } CorrState;
 
 /* 0.9.18 M3 — CushionRt: the runtime COORDINATION home for cushion escalation (map §1.3).
@@ -1228,6 +1235,8 @@ extern _Atomic int64_t g_pad_pub_wc[PTV_MAX_AUDIO];       /* publishes; demux ab
 /* 1.0.1-pre18 #50 (defined in ptvencoder.c): gap-verdict/LAYERA one-remedy invariant */
 extern int     g_glueveto;               /* veto + inverse guard + E5 flush-relabel net; PTV_NO_GLUEVETO=1 reverts */
 extern int     g_hstick_filter;          /* #51a: ≤1-tick hs steps are not corrector events; PTV_NO_HSTICK_FILTER=1 reverts */
+extern int     g_rscorr_ceil;            /* #51b: starvation-ceiling engage; PTV_NO_RSCORR_CEIL=1 reverts */
+extern int64_t g_rscorr_ceil_us;         /* #51b ceiling span (15min default; PTV_RSCORR_CEIL_MIN minutes) */
 extern _Atomic int64_t g_flush_relab_step[PTV_MAX_AUDIO]; /* last LAYERA-flush label shift per track (demux writes, */
 extern _Atomic int64_t g_flush_relab_wc[PTV_MAX_AUDIO];   /* step first / wall last-release; audio thread reads) */
 

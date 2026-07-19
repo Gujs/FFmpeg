@@ -53,6 +53,22 @@ snapshot silently (no dwell reset, no storm count); larger steps stay events.
 All other named events (LAYERA, verdicts, AGLUE, reopen, AFMT, glue, ledgers,
 bank) keep full event status; the §4.3 continuous R-stability re-anchor
 remains the actuation safety, untouched. PTV_NO_HSTICK_FILTER=1 reverts.
+(C) ANTI-STARVATION CEILING (task #51b; the legacy-0007 PLL_HARD_CEILING 60min
++ PLL_STUCK |baseline|>2s & drift<50ms pattern, sized to the certified
+sensor). Recovery belt under (B): whatever event class churns, a channel whose
+R has stayed LARGE (>engage band) and FLAT (the §4.3 criterion against the
+span's own reference — live AWE: R +2374..+2385 over 28min qualifies) for
+≥15min total while the dwell never completed (resets and storm holdoffs
+INCLUDED — the span runs through ARMED/DWELL/DISARMED; the 10min storm holdoff
+deliberately does not block it) ENGAGES anyway with one WARNING line. The
+flatness requirement is load-bearing: any R move beyond max(40ms, R/4)
+restarts the span, so a genuinely churning R can never ceiling-engage.
+Sensor-invalid, delivery-dead and implausible R close the span (they still
+block). Event feeds are re-snapshotted at the ceiling engage (a stale-snapshot
+entry from a long DISARM would read accumulated deltas as instant events).
+Authority/park/disarm semantics of the ENGAGED state are unchanged — a
+ceiling engage steers under the same 5s/10s caps and freezes on the same
+events. PTV_NO_RSCORR_CEIL=1 reverts; PTV_RSCORR_CEIL_MIN (minutes) tunes.
 
 (7p) MV COMPLETION PRE — pre17: sibling-slate sensor artifact fix + af-independent
 mv transport (task #48) + MV CORRECTOR ARM. Three work items; the corrector-arm

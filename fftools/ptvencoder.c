@@ -605,6 +605,13 @@ _Atomic int64_t g_flush_relab_wc[PTV_MAX_AUDIO];    /* wall µs it was persisted
  * it must neither reset the dwell nor count toward the storm (rscorr_event_edge).
  * PTV_NO_HSTICK_FILTER=1 reverts to counting every cumulative-50ms hs move. */
 int     g_hstick_filter = 1;
+/* 1.0.1-pre18 #51b — corrector anti-starvation ceiling (legacy-0007 PLL_HARD_CEILING/
+ * PLL_STUCK lineage): R large + flat for ≥ the ceiling with the dwell never completing
+ * (event resets + storm holdoffs included) → ENGAGE anyway, one WARNING. Flatness is
+ * load-bearing (churning R never ceiling-engages); sensor-invalid/delivery-dead still
+ * block. PTV_NO_RSCORR_CEIL=1 reverts; PTV_RSCORR_CEIL_MIN (minutes, default 15) tunes. */
+int     g_rscorr_ceil = 1;
+int64_t g_rscorr_ceil_us = 900000000;
 
 /* PTV_LOG_TS=1: prefix every log line with a local wall-clock timestamp
  * [YYYY-MM-DD HH:MM:SS.mmm], so production logs are self-dated natively
@@ -2705,6 +2712,8 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_GLUECLASS")) g_glueclass = 0;
     if (getenv("PTV_NO_GLUEVETO")) g_glueveto = 0;   /* 1.0.1-pre18 #50: gap-verdict-vs-LAYERA one-remedy invariant off */
     if (getenv("PTV_NO_HSTICK_FILTER")) g_hstick_filter = 0;   /* 1.0.1-pre18 #51a: hs-tick steps count as corrector events again */
+    if (getenv("PTV_NO_RSCORR_CEIL")) g_rscorr_ceil = 0;       /* 1.0.1-pre18 #51b: no starvation-ceiling engage */
+    { const char *s = getenv("PTV_RSCORR_CEIL_MIN"); if (s && atoi(s) > 0) g_rscorr_ceil_us = (int64_t)atoi(s) * 60000000; }  /* #51b ceiling, minutes */
     if (getenv("PTV_NBS_FILL") && g_glueclass) g_nbs_fill = 1;
     { const char *s = getenv("PTV_GLUE_HTOL_PCT");     if (s && atoi(s) > 0) g_glue_htol = atoi(s); }             /* tuning knob (G4) */
     { const char *s = getenv("PTV_PAIR_EXPECT_TTL_US");if (s && atoll(s) > 0) g_pair_ttl_us = atoll(s); }          /* TEST ONLY (G6) */

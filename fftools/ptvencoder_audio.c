@@ -461,6 +461,48 @@ static void rscorr_update(AudioState *a, RsyncTrackR *r, int64_t f_us, int64_t n
 
     dead = rscorr_delivery_dead(a, now);
 
+    /* 1.0.1-pre18 #51b ANTI-STARVATION CEILING (the legacy-0007 PLL_HARD_CEILING 60min +
+     * PLL_STUCK |baseline|>2s & drift<50ms pattern, sized to the certified sensor): a channel
+     * whose R has stayed LARGE and FLAT for ≥ the ceiling while the corrector could never
+     * complete a dwell (event resets and storm holdoffs included — AWE live 2026-07-19: R
+     * flat +2374..+2385 over 28min of tick churn) ENGAGES anyway with one WARNING. The
+     * FLATNESS requirement is load-bearing: the span restarts whenever R moves beyond the
+     * §4.3 bound vs the span's own reference, so a genuinely churning R can never
+     * ceiling-engage. Sensor-invalid, delivery-dead and implausible R all CLOSE the span
+     * (they must keep blocking); the storm-disarm holdoff deliberately does NOT (that is
+     * the point of the ceiling). Runs in ARMED/DWELL/DISARMED; steering/parked states
+     * clear the span. PTV_NO_RSCORR_CEIL=1 reverts; PTV_RSCORR_CEIL_MIN tunes (15min). */
+    if (g_rscorr_ceil &&
+        (c->state == PTV_CORR_ARMED || c->state == PTV_CORR_DWELL ||
+         c->state == PTV_CORR_DISARMED)) {
+        if (!r->valid || dead || c->implaus_wc || llabs(R) <= g_rscorr_engage_us) {
+            c->starve_wc = 0;
+        } else if (!c->starve_wc ||
+                   llabs(R - c->starve_r0) >= FFMAX(40000, llabs(R) / 4)) {
+            c->starve_wc = now;      /* open — or churning R: restart from here */
+            c->starve_r0 = R;
+        } else if (now - c->starve_wc >= g_rscorr_ceil_us) {
+            /* re-snapshot every event feed first — entering ENGAGED from a long
+             * DISARM/holdoff would otherwise read the accumulated feed deltas as fresh
+             * events on the first evaluation (spurious freeze + storm credit). */
+            rscorr_dwell_reset(a, now, R);
+            c->state         = PTV_CORR_ENGAGED;
+            c->engage_r0     = R;
+            c->engaged_corr0 = c->corr_us;
+            c->engage_wc     = now;
+            c->park_wc       = 0;
+            c->slip_bad_wc   = 0;
+            c->holdoff_wc    = 0;
+            c->starve_wc     = 0;
+            av_log(NULL, AV_LOG_WARNING,
+                   "[PTV-RSCORR] a%d(in%d) ENGAGE (starvation ceiling %"PRId64"min: R large+flat "
+                   "the whole span, dwell never completed) R=%+"PRId64"ms → steering  "
+                   "[+ = audio early]\n",
+                   a->dbg_k, a->dbg_in, g_rscorr_ceil_us / 60000000, R / 1000);
+        }
+    } else if (c->state == PTV_CORR_ENGAGED || c->state == PTV_CORR_PARKED)
+        c->starve_wc = 0;
+
     switch (c->state) {
     case PTV_CORR_ARMED:
         if (r->valid && !dead && llabs(R) > g_rscorr_engage_us) {
