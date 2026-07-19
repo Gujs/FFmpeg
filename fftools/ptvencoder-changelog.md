@@ -134,6 +134,10 @@ swapping; resume rides the proven <rw_timeout recovery machinery (slate →
 recovery edge, re-seed, fresh dwell — V10). [PTV-REOPEN] lines. AudioState's
 AVStream* replaced by owned codecpar/timebase copies (the ADECWD reopen must
 not dereference a closed ctx). Single-input and file inputs keep EOF = end.
+SEMANTIC NOTE: a live mv NET input now NEVER exits on read error — an mv
+channel ends only by signal (the production posture: supervisord SIGTERM) or
+by file/single-input EOF. Fixture cells that relied on sender-EOF teardown of
+mv runs must timer-kill (the gates harness was updated accordingly).
 R3 FASHION CLASS closed (three pieces):
  (b) THE LOAD-BEARING FIX — corrupt-packet LAYERA poisoning: the corrupt
  discard lived only in demux_dispatch, DOWNSTREAM of the LAYERA machinery, so
