@@ -115,6 +115,35 @@ a minute). ACQUIRE line gains backoff=N. Mechanism fixture-gated (synthetic
 no-regression; LIVE ACCEPTANCE = the next Azorse-class erase event (a
 faithful local repro of the corruption class is impractical — declared per
 the brief). PTV_NO_ACQ_BACKOFF=1 reverts.
+(gates, 2026-07-19/20, all local x264/tsp cells) —
+(A) fx50-gapjump (flowing +2.421s jump arming LAYERA + wall-absent +2.421s
+gap 200ms later, the live ordering): pre17 = one-sided flush aud=−2.400 →
+lipsync a0:+2400ms flat (live signature reproduced); pre18 = cycle DISBANDED
+(armed 205ms ago), both steps padded, lipsync a0:+0ms a1:+0ms;
+PTV_NO_GLUEVETO=1 reproduces pre17 line-for-line (kill parity).
+(B) fx51-clean + TESTHS 1-tick walk + capped 300ms TESTWALK (test-scaled
+dwell 60s/quiet 30s): filter ON = zero hs-step holds, ENGAGE → PARK
+R +300→−16ms (corr +312ms in 230s) THROUGH the churn; kill-control = 3
+hs-holds → event-storm DISARM, corr +0ms, no engage in 480s (the live
+starvation shape); 2-tick (80ms) steps still reset the dwell (4 holds).
+(C) ceiling (CEIL_MIN=2 test-scaled) under unfiltered churn: fired at ~2min
+three times across the run (storm-disarms between; corr nibbled
+0→+60→+181ms, one WARNING each — under the production-default (B) filter
+this cycling does not arise, (B) parks instead); churning-R control
+(uncapped 50ms/s walk) NEVER ceiling-engaged (ended implausible-R disarm).
+(E) mv 2-up, ±300ms flat-step storm flipping every ~30s (TESTNOISE_P=1400):
+19 acquires (PTV_NO_ACQ_BACKOFF control) vs 12 (backoff, oscillating levels
+1-2) over 240s×2 tracks; clean mv pair 0 acquires on BOTH builds.
+LOCKED SET: fashion dj4/5/6 verdicts identical to the rr17 baselines
+(wall-jitter digits only); fx33 mir2 = full CONTENT-EXACT escmp MATCH
+(pre17 a1 == pre18 b3); tb30/g2/trublu-300s = content-exact (event
+sequences line-identical, per-half ES exact in cross pairs) — pre17 A/A
+itself is start-phase byte-nondeterministic on these replay fixtures
+(0/10 same-binary escmp matches on tb30), so byte-equality is judged only
+where A/A supports it, per the rr16/rr17 review precedent.
+TEST HOOKS added this pre (never set in production): PTV_RSCORR_TESTHS
+(triangle-staircase hs churn read only by the corrector's event detector)
+and PTV_PLL_TESTNOISE_P (TESTNOISE square-wave half-period, frames).
 
 (7p) MV COMPLETION PRE — pre17: sibling-slate sensor artifact fix + af-independent
 mv transport (task #48) + MV CORRECTOR ARM. Three work items; the corrector-arm
