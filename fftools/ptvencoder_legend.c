@@ -70,8 +70,9 @@ void show_help_default(const char *opt, const char *arg)
         "    PTV_CUSHION_MAX_MS  AUTO-BANK ceiling (default 12000): bursty channels self-escalate a\n"
         "                        compressed video_q bank to 1.5x their worst stall — no env needed\n"
         "    PTV_DELIVERY_CAP_MS / PTV_DELIVERY_MAXQ   audio delivery-gate sizing (auto-sized normally)\n"
-        "    PTV_VDELIVERY_CAP_MS  early-video hold bound + audio-death escape (default 6000; raise for\n"
-        "                        an audio chain buffering >~4s — the hold itself is measured, not sized)\n"
+        "    PTV_VDELIVERY_CAP_MS  early-video hold FLOOR + audio-death escape base (default 6000).\n"
+        "                        1.0.1-pre17: the live cap AUTO-SIZES to 1.5x the measured audio-chain\n"
+        "                        lateness (ceiling 12s) — no per-channel tuning needed; env = floor only\n"
         "   reverts (each disables one default-on mechanism; for A/B and rollback only):\n"
         "    PTV_NO_WUCR         occupancy-servo house pacing      PTV_NO_LAYERA   glue/discontinuity buffer\n"
         "    PTV_NO_REPRIME      fast post-glue buffer refill      PTV_NO_ADAPTIVE fixed (non-adaptive) cushion\n"
@@ -115,12 +116,18 @@ void ptv_print_log_legend(int full)
         "  dlvhold    (delivery gate) ms of audio HELD waiting for matching video (≈ encoder latency +\n"
         "             cushion); normal ~1-2s, scales with the cushion\n"
         "  dlvforced  (gate) packets force-released because video STALLED — MUST stay ~0\n"
-        "  vdlvhold   (§7.5b symmetric gate, pre12) ms of EARLY VIDEO held for audio delivery to catch\n"
-        "             up ≈ the audio path's WALL latency (loudnorm ~3s fill); 0 on channels whose audio\n"
-        "             is not late. [PTV-VDLV] logs the audio-death escape (video released + hold\n"
-        "             disarmed until audio resumes — an audio outage never freezes video)\n"
+        "  vdlvhold   (§7.5b symmetric gate, pre12; armed on MULTIVIEW too since pre17 — task #48:\n"
+        "             the fleet loudnorm chain made every mv audio track wall-late, video left ~2-3s\n"
+        "             early on the wire with labels intact) ms of EARLY VIDEO held for audio delivery\n"
+        "             to catch up ≈ the audio path's WALL latency (loudnorm ~3s fill); 0 on channels\n"
+        "             whose audio is not late. NOTE the metric flip on a buffering-af mv channel:\n"
+        "             dlvhold reads 0 (nothing early to hold) and vdlvhold ~1-3s — EXPECTED, the\n"
+        "             buffering moved to the video hold. [PTV-VDLV] logs the audio-death escape\n"
+        "             (video released + hold disarmed until audio resumes — an audio outage never\n"
+        "             freezes video) and the pre17 cap auto-size (1.5x measured lateness, ceil 12s)\n"
         "  vdlvforced (shown when >0) video released by the backstop: audio flowing but permanently\n"
-        "             behind (label spread) or hold-FIFO overflow — added latency clamped at ~6s\n"
+        "             behind (label spread) or hold-FIFO overflow — added latency clamped at the\n"
+        "             auto-sized cap (floor 6s / PTV_VDELIVERY_CAP_MS, ceiling 12s)\n"
         "  wucr_buf   frame_q occupancy (frames/ms) — the jitter cushion fill vs cushion= target\n"
         "  fqhw       deepest any frame queue has ever been (frames) — the CUDA pool high-water;\n"
         "             this, not the cushion tier, sets the per-process VRAM footprint\n"
@@ -227,8 +234,14 @@ void ptv_print_log_legend(int full)
         "  inK:lipsync  (1.0.1-pre16.1, ALWAYS-ON, inside each inK: group) that slot's sensor R\n"
         "               (same sensor/sign as single-input: + = audio EARLY; multi-track slots\n"
         "               joined '|'); `--` = the slot slated / not flowing — itself the outage\n"
-        "               signal; absent = the input has no sensed audio track. corr= absent: the\n"
-        "               mv corrector is HELD OFF this pre (sensor-first observation soak)\n"
+        "               signal; absent = the input has no sensed audio track\n"
+        "  corr         (1.0.1-pre17: the mv corrector is ARMED) per-track cumulative trim,\n"
+        "               aK:-prefixed (track→slot map = the startup [PTV-RSYNC] tracks: line);\n"
+        "               absent while quiet. While ANY slot is black-slated no track may engage\n"
+        "               ([PTV-RSCORR] HOLD 'sibling slate') — finding-1 defense-in-depth\n"
+        "  [PTV-RSYNC] inK  (pre17, always-on, one line per input per stats period) per-slot\n"
+        "               soak summary: R (as inK:lipsync), ev= slot edit ledger, sk= follow\n"
+        "               skew, occ= jitter depth, SLATED while black\n"
         "  acor         (when >0) corrupt-discarded audio pkts, GLOBAL sum — per-track detail on\n"
         "               the [PTV-ADISC]/NBS log lines\n"
         "  inK:qdrop    input-K video queue overflow drops (demux side)\n"
@@ -357,11 +370,11 @@ void ptv_stats_lipsync_in(char *buf, size_t size, int64_t now_us, int in)
     }
 }
 
-/* corr= builder (pre14, moved verbatim). NOT called by the mv printer this pre — the mv
- * corrector is HELD OFF (see rscorr_update); the arming pre gets the mv corr= column by
- * adding the call. Absent while every track sits at corr==0 un-engaged — the quiet-channel
- * stats line is unchanged (§6). */
-void ptv_stats_corr(char *buf, size_t size)
+/* corr= builder (pre14, moved verbatim). Called by BOTH printers since 1.0.1-pre17 (the mv
+ * corrector is armed): force_idx=1 (mv) always prints the aK: prefix — the track→slot map
+ * (startup [PTV-RSYNC] tracks: line) resolves aK to its input. Absent while every track
+ * sits at corr==0 un-engaged — the quiet-channel stats line is unchanged (§6). */
+void ptv_stats_corr(char *buf, size_t size, int force_idx)
 {
     int any = 0, ki, nn;
     buf[0] = 0;
@@ -377,7 +390,7 @@ void ptv_stats_corr(char *buf, size_t size)
     for (ki = 0; ki < g_rsx.n_a && nn > 0 && nn < (int)size - 18; ki++) {
         int64_t cu = atomic_load_explicit(&g_corr_pub[ki], memory_order_relaxed);
         int     st = atomic_load_explicit(&g_corr_state_pub[ki], memory_order_relaxed);
-        if (g_rsx.n_a > 1)
+        if (force_idx || g_rsx.n_a > 1)
             nn += snprintf(buf + nn, size - nn, "%sa%d:", ki ? "," : "", ki);
         nn += snprintf(buf + nn, size - nn, "%+lldms%s",
                        (long long)(cu / 1000), st == PTV_CORR_ENGAGED ? "*" : "");

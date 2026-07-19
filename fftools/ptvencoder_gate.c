@@ -75,6 +75,8 @@ void dlv_init(DlvGate *g, AVThreadMessageQueue *mux_q, int64_t cap_us, int maxq)
     g->v_on = 0;
     g->vhead = g->vtail = NULL; g->vcount = 0; g->vmaxq = 512;
     g->v_band_us = PTV_VDLV_BAND_US; g->v_cap_us = 6000000;
+    g->v_cap_base = 6000000; g->v_lat_ema = 0; g->v_lat_seed = 0; g->v_cap_log_wc = 0;
+    g->v_birth_flow = 0;
     g->v_disarmed = 0; g->v_disarm_wc = 0;
     atomic_store(&g->a_dlv_dts_hi, INT64_MIN);
     atomic_store(&g->a_hi_change_wc, av_gettime_relative());   /* "delivered just now": birth isn't an audio death */
@@ -126,10 +128,13 @@ void dlv_init(DlvGate *g, AVThreadMessageQueue *mux_q, int64_t cap_us, int maxq)
  * PTV_NO_VDELIVERY=1 kills the video side everywhere (pre11 wire behavior). */
 void dlv_video_cfg(DlvGate *g, int64_t band_us, int64_t cap_us, int vmaxq)
 {
-    g->v_band_us = band_us > 0 ? band_us : PTV_VDLV_BAND_US;
-    g->v_cap_us  = cap_us  > 0 ? cap_us  : 6000000;
-    g->vmaxq     = vmaxq   > 0 ? vmaxq   : 512;
-    g->v_on      = 1;
+    g->v_band_us  = band_us > 0 ? band_us : PTV_VDLV_BAND_US;
+    g->v_cap_us   = cap_us  > 0 ? cap_us  : 6000000;
+    g->v_cap_base = g->v_cap_us;   /* 1.0.1-pre17: the configured value is the FLOOR — the live
+                                    * cap auto-sizes to the measured audio lateness above it
+                                    * (dlv_video_drain), ceiling PTV_VDLV_CEIL_US */
+    g->vmaxq      = vmaxq   > 0 ? vmaxq   : 512;
+    g->v_on       = 1;
 }
 
 /* deliver ONE audio/copy packet to mux_q and advance the audio delivered high-water (§7.5b's
@@ -180,7 +185,14 @@ int dlv_video_deliver(DlvGate *g, AVPacket *pkt, int64_t dts_us)
         int due;
         if (a_hi != INT64_MIN)
             due = dts_us <= a_hi + g->v_band_us;
-        else {
+        else if (g->v_birth_flow) {
+            /* task #48 (mv): flow at birth unconditionally — mv audio anchors at first
+             * DISPLAY, so count==0 here is the NORMAL mv birth, and holding would unbound
+             * the encoder's startup race (held video bypasses mux_q backpressure) and flip
+             * healthy channels to dlvhold=0/vdlvhold≈1s. A wall-late audio path converges
+             * once its first delivery lands (one-time transient ≤ its fill time). */
+            due = 1;
+        } else {
             /* Nothing delivered yet (birth). If audio is already WAITING in the §7.5a gate
              * (count > 0 — the normal birth: near-zero-latency audio held for this very video
              * front), video must flow: it IS the release key, and the wire is not skewed.
@@ -222,13 +234,43 @@ void dlv_video_drain(DlvGate *g)
 
     if (!g->v_on || g->v_disarmed)
         return;
+    now  = av_gettime_relative();
+    a_hi = atomic_load_explicit(&g->a_dlv_dts_hi,   memory_order_relaxed);
+    adv  = atomic_load_explicit(&g->a_hi_change_wc, memory_order_relaxed);
+    /* 1.0.1-pre17 AUTO-SIZE (owner mandate: af-independence must never need per-channel
+     * config): the escape/age cap tracks the MEASURED audio lateness. Sample the content
+     * skew between the encoder front and the audio delivered high-water — at steady state
+     * (both streams realtime) that content skew IS the audio chain's wall lateness — but
+     * ONLY while audio is actively delivering (adv fresh <2s): an audio OUTAGE grows the
+     * skew without bound and must not inflate the escape timer (the outage response stays
+     * at the pre-outage cap). cap = clamp(base, 1.5×EMA, ceiling); EMA ÷256 per drain call
+     * (per encoded video pkt → τ ≈ 4-10s). Runs on the video output thread only. */
+    {
+        int64_t vhi = atomic_load_explicit(&g->v_enc_dts_hi, memory_order_relaxed);
+        if (vhi != INT64_MIN && a_hi != INT64_MIN && now - adv < 2000000) {
+            int64_t sk = vhi - a_hi;
+            int64_t want, ceil2 = FFMAX((int64_t)PTV_VDLV_CEIL_US, g->v_cap_base);
+            if (sk < 0) sk = 0;
+            if (!g->v_lat_seed) { g->v_lat_ema = sk; g->v_lat_seed = 1; }
+            else g->v_lat_ema += (sk - g->v_lat_ema) / 256;
+            want = g->v_lat_ema + g->v_lat_ema / 2;
+            if (want < g->v_cap_base) want = g->v_cap_base;
+            if (want > ceil2)         want = ceil2;
+            if (llabs(want - g->v_cap_us) > 1000000 && now - g->v_cap_log_wc > 60000000) {
+                g->v_cap_log_wc = now;
+                av_log(NULL, AV_LOG_INFO,
+                       "[PTV-VDLV] hold cap auto-sized %.1fs → %.1fs (measured audio lateness "
+                       "%.1fs ×1.5; floor %.1fs, ceiling %.1fs)\n",
+                       g->v_cap_us / 1e6, want / 1e6, g->v_lat_ema / 1e6,
+                       g->v_cap_base / 1e6, ceil2 / 1e6);
+            }
+            g->v_cap_us = want;
+        }
+    }
     if (!g->vcount) {
         atomic_store_explicit(&g->st_vhold_us, 0, memory_order_relaxed);
         return;
     }
-    now  = av_gettime_relative();
-    a_hi = atomic_load_explicit(&g->a_dlv_dts_hi,   memory_order_relaxed);
-    adv  = atomic_load_explicit(&g->a_hi_change_wc, memory_order_relaxed);
 
     if (now - adv > g->v_cap_us) {
         /* AUDIO-DEATH ESCAPE: nothing delivered for v_cap_us while video is held and flowing.

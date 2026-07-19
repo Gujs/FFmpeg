@@ -7,6 +7,119 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(7p) MV COMPLETION PRE — pre17: sibling-slate sensor artifact fix + af-independent
+mv transport (task #48) + MV CORRECTOR ARM. Three work items; the corrector-arm
+SHIP decision is soak-gated (grid soak verdict) — implemented and fixture-gated
+here, merge is the owner's call.
+(A) "SIBLING-SLATE SENSOR ARTIFACT" (grid soak finding 1, 2026-07-19,
+arm-blocker) — ROOT-CAUSED FROM THE BOX LOGS (Grid_2x2 00:25-01:10, PTV_DIAG
+was on) as something else entirely: the readings were TRUE and the slate was
+innocent. Measured sequence: (1) mid-slate readings were FLAT ±6ms (00:37-
+00:42 — a live 4-up with slot2 slated reads true); (2) sync_check then put the
+grid in a RESTART LOOP (00:42:31, 00:48:51, 01:00:58, 01:07:18 — ~6min apart);
+(3) EVERY restart-with-a-dead-slot birth banks the LIVE slots' backlog (the
+compositor preroll wait runs its full 3s timeout; the one-shot v0.9.13 trim
+fires, but the video_q compressed backlog re-decodes into hold.q right after —
+box: occ 25→110 within 10s of tick 0), the occupancy servo then drains the
+excess at its ±2% authority = a ~20ms/s content slide for ~3min (md decimation
+0.5/s, REANCHOR2 birth storm h0 +~1s in ticks 19-33), and the per-slot audio
+follow CANNOT track a 20ms/s slide (PLL acquires throttled 12s-refractory/
+~400ms steps + TRACK ≤10ms/s — box: acq #1..#12, applied −853→−2773ms over
+3min) → every live slot ran a REAL 150-240ms audio-late transient per restart
+([PTV-AVSYNC] offset −160ms concurs; the 00:46 oracle +69ms sampled AFTER
+convergence). The lipsync= token faithfully measured it; the restart loop made
+it look like a stable slate-correlated drift.
+FIX (three parts, at the cause + at the instrument):
+ 1. mv BIRTH-TRIM WINDOW — for the first ~20s the startup trim is a window,
+ not a one-shot: excess over the primed target is dropped-oldest SILENTLY
+ (never servo-slid at 20ms/s for minutes; the backlog is disposed of within
+ the join seconds). mv-only (single-input deep-prime/AUTO-BANK retention
+ untouched); PTV_NO_MV_BIRTHTRIM=1 reverts.
+ 2. m_v EMA RE-SEED on REANCHOR2 and on slate-recovery REANCHOR — an h0
+ re-anchor REDEFINES the slot's mapping baseline; blending pre-shift EMA
+ samples in is a stale reading (birth fixture: −185ms EMA-diluted ghost),
+ and re-seeding makes a GENUINE post-shift displacement (#24's shape) show
+ immediately, not masked.
+ 3. m_a EMA RE-SEED on a PLL ACQUIRE (the audio-side mirror: af_applied jump
+ + content drop/pad = a one-step mapping redefinition; without it R decayed
+ a stale −2.2s for ~2-3min after the acquire had already fixed reality).
+ The acquire remains a corrector dwell-reset event.
+Fixture (late-joining-slot 2x2 = the local restart-with-dead-slot): pre16.1
+reproduces the box signature exactly (REANCHOR2 storm, acquire cascade, R peak
+−139ms decaying ~6min, player-visible offset −100..−166ms STILL desynced at
++6min); pre17: backlog disposed in the 20s window, R honest and |R|<50ms
+within ~60s on the resident slots, player-visible offset ±5..30ms by ~2min.
+Mid-run slate cells (STOP 600s) read flat ±8ms on BOTH builds — per-slot
+independence was never broken; the soak's mid-slate readings were true.
+BELT (corrector, part of (C)): birth slate-mask — every slot starts masked
+until its first display (a NEVER-arrived slot previously never set the mask:
+`stale` requires last_fresh_us>0), so the finding-1 shape can never engage the
+corrector even unfixed. Mid-run slate cells (STOP 600s) read flat ±8ms on BOTH
+pre16.1 and pre17 — per-slot independence was never broken.
+(B) AF-INDEPENDENT MV TRANSPORT (task #48; owner mandate 2026-07-19: the wire's
+A/V interleave alignment must be invariant to any -af latency, on single AND
+multi input, auto-sized, never per-channel config): the §7.5b early-video hold
+is ARMED ON MULTIVIEW (fold of the t48-mv-vdlv fix branch). Root cause of the
+grids' dlvhold=0-since-07-13: the fleet loudnorm rollout (~3s one-pass fill)
+made every mv audio track wall-LATE — the §7.5a gate holds EARLY audio only, so
+it read dlvhold=0 (starved, working as designed) and the wire carried video
+~2-3s ahead of audio with labels intact; mv had no closing mechanism. Slots
+share ONE gate per rung: a_dlv_dts_hi keys the hold to the LEAST-delayed slot's
+audio (fleet-uniform loudness chain ⇒ small per-slot spread bounds the residual
+skew; a single dead slot cannot wedge video — any flowing track advances the
+high-water, the audio-death escape needs ALL tracks silent). v_birth_flow lets
+mv video flow at birth (mv audio anchors at first DISPLAY, so the §7.5a
+count==0 birth rule misfires there). mv stats line gains vdlvhold=/vdlvforced=.
+ACCEPTED METRIC FLIP (owner-decided): a buffering-af mv channel's buffering
+moves from the audio gate to the video hold — dlvhold reads 0 and vdlvhold
+~1-3s; wire, latency and RAM equivalent, but fleet dlvhold health dashboards
+change meaning on mv.
+(B2) VDLV CAP AUTO-SIZE (owner addition): PTV_VDELIVERY_CAP_MS (6s) was a
+per-channel tuning knob for >4s audio chains — mandate violation. The
+escape/age cap now AUTO-SIZES to 1.5× the measured audio-chain lateness
+(EMA of v_enc_dts_hi − a_dlv_dts_hi per video drain, sampled only while audio
+is actively delivering so an outage can never inflate the escape timer),
+floor = the env/6s default, ceiling 12s (PTV_VDLV_CEIL_US, the CUSHION_MAX
+philosophy). Env kept as override-floor only. [PTV-VDLV] logs resizes.
+Gate (uniform-audio, triple-loudnorm ~6.9s lateness, single input): pre16.1
+fixed cap = vdlvhold pinned 6.0s + vdlvforced storming + wire +635ms; pre17 =
+one birth escape/re-arm, cap auto-sized 6.0→10.3s, wire −40ms.
+KNOWN OPEN (surfaced by the mandate's own gate, PRE-EXISTING — pre16.1 reads
+identically): a rung with MIXED per-track lateness (loudnorm'd transcoded AAC
++ un-normalized copied AC-3) is STRUCTURALLY invisible to the §7.5b hold and
+to this auto-size — the shared per-rung a_dlv_dts_hi high-water is the
+LEAST-delayed stream (the AC-3 copy, +8ms aligned), so the AAC track rides
+the wire late by its net lateness (measured: +843ms single-loudnorm, +6.6s
+triple; identical on pre16.1). Closing it needs per-STREAM delivered
+high-waters keyed on the MINIMUM with staleness exclusion (else one dead
+track wedges video — the exact trade the mv arm avoids) — an owner design
+decision, deliberately NOT half-shipped here.
+(C) MV CORRECTOR ARM: the pre16 `if (a->multiview) return;` hold in
+rscorr_update is removed. Arming prerequisites, all landed here:
+ - per-INPUT delivery liveness (§3): rscorr_delivery_dead reads the steered
+   track's OWN input's arrival watermark (new Input.v_arrive_wc, stamped by
+   that input's demux; g_v_arrive_wc stays as the any-input aggregate for the
+   single-input starvation detectors). Rung-wire watermarks stay per-RUNG
+   deliberately — one dead rung anywhere holds the whole channel (§3 gate
+   rule), that is not an any-input smear.
+ - SIBLING-SLATE FREEZE (finding-1 defense-in-depth over the (A) sensor fix):
+   compositor maintains g_mv_slate_mask (bit per slot, set at slate onset /
+   cleared at recovery); rscorr_event_active returns "sibling slate" while any
+   bit is set — no mv track may engage during the exact condition (A) showed
+   can contaminate readings; recovery re-runs the 3min quiet window.
+ - stale-track watchdog re-homed: the pre14 body moved to
+   rscorr_stale_watchdog() (ptvencoder_audio.c), called by BOTH cadence owners
+   — single-input master rung (unchanged strings) and the mv compositor (1s),
+   where it never ran (passthrough rung loops return early; port-doc §6's
+   named prerequisite).
+ - mv stats line gains corr= (shared pre14 builder, aK: prefix forced; absent
+   while quiet); per-slot event edges already resolve per-slot since pre16
+   (epoch/shed/gov/LAYERA/pair-expect by dbg_in; REANCHOR2 bumps its slot's
+   epoch — now live-consumed).
+(rider) per-input always-on `[PTV-RSYNC] inK R= ev= sk= occ= [SLATED]` summary,
+one compact line per input per stats period on mv (owner-floated; the soak
+forensics that used to need PTV_DIAG).
+
 (7o) GLUE CLASSIFICATION LIVE-INCIDENT FIXES — pre16, task #47. Two deployed-
 pre15 incidents (The_Word_Network/cor-3, Fashion/live-transcoder 2026-07-18)
 exposed three defects in (7m)'s classifier; all three fixed, incident shapes

@@ -202,13 +202,20 @@ static RsyncTrackR rsync_track_R(const AudioState *a, int64_t now)
  * rung 6000 dead). Signals per rung: g_mux_sent_wc (the wire itself — PRIMARY, §9.3
  * owner-approved) + DlvGate a_hi/v_hi_change_wc watermarks + mux_q depth below half
  * capacity (a backed-up mux_q = the muxer/socket is not draining). Gate NULL
- * (PTV_NO_DELIVERY / no-audio) → the watermark + depth checks remain. Per-input (N=1
- * today, mv wires per-input later): the demux video-arrival watermark g_v_arrive_wc;
- * the track's own ma_wall freshness is already in the §2 sensor validity. */
+ * (PTV_NO_DELIVERY / no-audio) → the watermark + depth checks remain. Per-input
+ * (1.0.1-pre17, the §3 per-input wiring): the steered track's OWN input's arrival
+ * watermark (Input.v_arrive_wc; the g_v_arrive_wc any-input aggregate is the unwired
+ * fallback, identical on single input) — on mv a dead sibling must not read as "flowing"
+ * and, conversely, THIS input dying must hold this track even while siblings flow. The
+ * rung-wire watermarks stay per-RUNG deliberately (§3 gate rule: one dead rung anywhere
+ * holds the corrector for the whole channel — the steer is upstream of the rung fan-out).
+ * The track's own ma_wall freshness is already in the §2 sensor validity. */
 static const char *rscorr_delivery_dead(AudioState *a, int64_t now)
 {
     int i;
-    int64_t arr = atomic_load_explicit(&g_v_arrive_wc, memory_order_relaxed);
+    int64_t arr = a->v_arrive_wc
+                ? atomic_load_explicit(a->v_arrive_wc, memory_order_relaxed)
+                : atomic_load_explicit(&g_v_arrive_wc, memory_order_relaxed);
     if (!arr || now - arr > 5000000)
         return "input not flowing";
     for (i = 0; i < a->n_out; i++) {
@@ -273,6 +280,15 @@ static const char *rscorr_event_active(AudioState *a, int64_t now)
         return "layera buffering";
     if (a->nbs_fill_active)   /* pre15 §5 rule 2: R is synthetic-flat on a filled track — never engage */
         return "nbs silence-fill";
+    /* 1.0.1-pre17 sibling-slate condition (finding 1, grid soak 2026-07-19): while ANY mv
+     * slot is black-slated, NO track on the mosaic may engage — a sibling outage disturbs
+     * the shared compositor pacing, and the soak measured the healthy slots' readings
+     * drifting ~−150ms under exactly this condition (an artifact, fixed in the pre17
+     * sensor; this freeze is the §4.4 belt over that fix). The slated slot's own tracks
+     * are already held by `--` freshness; this extends the hold mosaic-wide. Clearing the
+     * slate re-runs the 3min quiet window before any engage. */
+    if (a->multiview && atomic_load_explicit(&g_mv_slate_mask, memory_order_relaxed))
+        return "sibling slate";
     /* pre16: per-input feeds — THIS track's input's governor flag + shed stamp (identical to
      * the globals on single input; on mv slot B's shed/governor no longer freezes slot A). */
     if (a->gov_on ? atomic_load_explicit(a->gov_on, memory_order_relaxed)
@@ -340,6 +356,38 @@ static void rscorr_disarm(AudioState *a, int64_t now, const char *why, int is_er
         c->holdoff_wc = now + 60000000;
 }
 
+/* pre14 corrector stale-track watchdog (1.0.1-pre17: moved here from the ptvencoder_clock.c
+ * master block, body unchanged, so BOTH cadence owners can run it — the mv passthrough rung
+ * loop returns before the single-input master block, so on mv it never ran; the compositor
+ * now calls it once per second, port-doc §6's named arming prerequisite). A DWELL/ENGAGED
+ * track whose audio thread stopped emitting (ma_wall stale >5s — source-audio death, the
+ * pre12 W3 class) can neither steer NOR log its own disarm (its thread is blocked in recv).
+ * Integration is inherently frozen (no frames), so this is purely the §6 one-line disarm +
+ * published-state sync: CAS the published state to DISARMED (exactly one line even if the
+ * track resumes mid-check) and hand the owning thread a silent disarm_req to consume.
+ * Callers rate-limit to ~1s. */
+void rscorr_stale_watchdog(int64_t now)
+{
+    int kc;
+    if (!g_rsync_corr)
+        return;
+    for (kc = 0; kc < g_rsx.n_a; kc++) {
+        int st = atomic_load_explicit(&g_corr_state_pub[kc], memory_order_relaxed);
+        if (st == PTV_CORR_DWELL || st == PTV_CORR_ENGAGED) {
+            int64_t maw = atomic_load_explicit(&g_rsx.ma_wall[kc], memory_order_relaxed);
+            if (maw && now - maw > 5000000 &&
+                atomic_compare_exchange_strong_explicit(&g_corr_state_pub[kc], &st,
+                        PTV_CORR_DISARMED, memory_order_relaxed, memory_order_relaxed)) {
+                atomic_store_explicit(&g_corr_disarm_req[kc], 1, memory_order_relaxed);
+                av_log(NULL, AV_LOG_WARNING,
+                       "[PTV-RSCORR] a%d DISARM (track stopped emitting — sensor stale) "
+                       "corr held %+"PRId64"ms  [+ = audio early]\n",
+                       kc, atomic_load_explicit(&g_corr_pub[kc], memory_order_relaxed) / 1000);
+            }
+        }
+    }
+}
+
 /* §4 control law + state machine, one call per EMITTED audio frame (f_us = its duration).
  * R/valid come from rsync_track_R() computed by the caller right after the sensor publish. */
 static void rscorr_update(AudioState *a, RsyncTrackR *r, int64_t f_us, int64_t now)
@@ -348,21 +396,14 @@ static void rscorr_update(AudioState *a, RsyncTrackR *r, int64_t f_us, int64_t n
     const char *dead, *ev;
     int64_t R = r->R_us;
 
-    /* 1.0.1-pre16 MV SENSOR PORT — THE CORRECTOR IS HELD OFF ON MULTIVIEW (mandatory this
-     * pre; analysis/ptvencoder-mv-sensor-port.md §6). Before the port, mv was inert only by
-     * ACCIDENT (rs_ma_seed never set — the sensor block was mv-gated); the port removes that
-     * accident, and without this hold the fleet-default-ON corrector would begin ACTUATING
-     * on grids the moment the sensor lands — actuation without a soak, violating the roadmap
-     * gate ("mv sensor observes for a soak period before mv actuation arms"). Consequences:
-     * CorrState stays PTV_CORR_OFF, corr_us stays 0 → the graph-door bus term and the
-     * sensor's inj term never fire → mv byte-inertness holds. REMOVAL SITE = the mv
-     * corrector-arm pre — which must ALSO re-home the ptvencoder_clock.c stale-track
-     * watchdog to the compositor (the passthrough rung loop returns before it on mv;
-     * acceptable only while this hold stands) and wire per-input liveness for
-     * g_v_arrive_wc + the rung wire watermarks (§8.4). */
-    if (a->multiview)
-        return;
-
+    /* 1.0.1-pre17: the pre16 `if (a->multiview) return;` sensor-first hold is REMOVED — the
+     * mv corrector is ARMED (mv-sensor-port §6's named removal site, after the observation
+     * soak + the finding-1 sibling-slate sensor artifact fix). The arming prerequisites all
+     * landed with this pre: per-INPUT liveness (rscorr_delivery_dead reads THIS track's
+     * input's arrival watermark), the sibling-slate freeze (rscorr_event_active,
+     * g_mv_slate_mask), and the stale-track watchdog re-homed so it runs under the mv
+     * cadence owner too (rscorr_stale_watchdog, called by compositor + master rung).
+     * NOTE: the SHIP decision for this arm is soak-gated — merge is the owner's call. */
     if (!g_rsync_corr)
         return;
 
@@ -686,6 +727,16 @@ static int audio_drain_fg(AudioState *a)
                             if (dq < 0) { a->pll_drop = (int)(-dq / frame_us); a->af_acq_drop_us += -dq; }  /* advance: drop content */
                             else        { a->pll_pad  = (int)( dq / frame_us); a->af_acq_pad_us  +=  dq; }   /* delay: pad silence */
                             a->pll_acq_count++;
+                            /* 1.0.1-pre17: an ACQUIRE REDEFINES this track's content→label
+                             * mapping in one step (af_applied jump + content drop/pad) — the
+                             * pre-acquire m_a EMA samples describe a dead mapping, and blending
+                             * them in makes R decay for ~2-3min after reality is already fixed
+                             * (the birth-C fixture read −2.2s stale). Re-seed from the next
+                             * emitted frame — the mirror of the compositor's REANCHOR2 m_v
+                             * re-seed; a persistent post-acquire residual (#24's shape) shows
+                             * IMMEDIATELY instead of after the EMA settles. The acquire remains
+                             * a corrector event (pll_acq_count edge → dwell reset). */
+                            a->rs_ma_seed = 0;
                             /* 0.9.18.7: promoted PTV_DIAG→always-on WARNING. An ACQUIRE is a discrete
                              * audio drop/pad (a bank snap, not a TRACK bleed) — rare in normal
                              * operation (startup bank + real disturbances) and already hard

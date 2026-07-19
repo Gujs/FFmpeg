@@ -119,6 +119,26 @@ void *compositor_thread(void *arg)
     int64_t rs_mv_ema[PTV_MAX_INPUT] = {0};
     int     rs_mv_seed[PTV_MAX_INPUT] = {0};
     int64_t rs_mv_div;
+    /* 1.0.1-pre17 BIRTH-TRIM WINDOW (finding 1's measured root cause, Grid_2x2 box logs
+     * 2026-07-19 00:42-01:10): at a birth where one slot is DEAD, the preroll wait runs its
+     * full 3s timeout while the LIVE slots' pipelines keep banking (video_q compressed
+     * backlog decodes into hold.q right after the one-shot v0.9.13 trim — box: occ re-banked
+     * 25→110 within 10s of tick 0). The occupancy servo then drains the excess at its ±2%
+     * authority (~20ms/s content slide, md decimation) for ~3min, while the per-slot audio
+     * follow (PLL acquires throttled 12s-refractory/~400ms + TRACK ≤10ms/s) cannot track a
+     * 20ms/s slide → every live slot runs 150-240ms audio-late per restart (REANCHOR2 birth
+     * storm h0 +~1s, [PTV-AVSYNC] offset −160ms, lipsync −150..−240 decaying; the sensor
+     * read a REAL transient). Fix at the cause: for the first PTV_MV_BIRTHTRIM_S the trim is
+     * a WINDOW, not a one-shot — excess over the primed target is dropped-oldest SILENTLY
+     * (never displayed, never decimation-slid). Content skipped at birth is invisible: h0
+     * anchors at the first DISPLAYED frame, so the mosaic simply joins at the live edge.
+     * mv-only (single-input keeps its deep-prime/AUTO-BANK retention semantics untouched);
+     * PTV_NO_MV_BIRTHTRIM=1 reverts. */
+    int64_t bt_win_ticks = c->tick_dur_us > 0 ? 20000000 / c->tick_dur_us : 500;
+    int64_t bt_cnt[PTV_MAX_INPUT] = {0};
+    int     bt_logged = 0;
+    int     born[PTV_MAX_INPUT] = {0};   /* pre17: slot has displayed its first fresh frame
+                                          * (clears the slot's birth slate-mask bit below) */
     AVFrame *filt = av_frame_alloc();
     int64_t tick = 0, wall0 = 0;
     /* v0.9.18.2 M4: use the RESOLVED preroll (CushionPlan) — this getenv re-read with a 350ms
@@ -130,8 +150,15 @@ void *compositor_thread(void *arg)
     int n_prime = (preroll_ms > 0 && c->tick_dur_us > 0) ? (int)((int64_t)preroll_ms * 1000 / c->tick_dur_us) : 0;
     int64_t diag_t0 = av_gettime_relative(), diag_last = diag_t0;
     int64_t stat_last = diag_t0, stat_prev = 0;
+    int64_t corr_wd_last = diag_t0;   /* 1.0.1-pre17: stale-track corrector watchdog rate limit (1s) */
 
     if (!filt) goto done;
+    /* 1.0.1-pre17: BIRTH slate-mask — every slot starts "slated" for the corrector (its cell
+     * is black until its first display; a NEVER-arriving slot — the finding-1 restart shape —
+     * previously never set the mask because `stale` requires last_fresh_us > 0). Cleared per
+     * slot at its first fresh display. No mv corrector engagement until every cell is live. */
+    for (k = 0; k < n; k++)
+        atomic_fetch_or_explicit(&g_mv_slate_mask, 1 << k, memory_order_relaxed);
     rs_mv_div = c->tick_dur_us > 0 ? 30000000 / c->tick_dur_us : 750;
     if (rs_mv_div < 8) rs_mv_div = 8;
     if (n_prime > g_frameq_cap - 8) n_prime = g_frameq_cap - 8;
@@ -206,6 +233,28 @@ void *compositor_thread(void *arg)
                                                       * its last frame on underrun, black when stale */
             VideoHold *h = &c->inputs[k].hold;
             AVFrame *f = NULL, *st; int stale, fresh = 0;
+            /* pre17 BIRTH-TRIM WINDOW (see the declaration comment): while the window is
+             * open, excess over the primed target is dropped-oldest SILENTLY — the post-
+             * preroll backlog must never be displayed (one-shot-trim → window; +4 margin
+             * keeps normal arrival jitter out of it). */
+            if (g_mv_birthtrim && c->live && g_mv_residence && tick < bt_win_ticks) {
+                AVFrame *tf;
+                while (av_thread_message_queue_nb_elems(h->q) > res_occ_tgt + 4 &&
+                       av_thread_message_queue_recv(h->q, &tf, AV_THREAD_MESSAGE_NONBLOCK) >= 0) {
+                    av_frame_free(&tf);
+                    bt_cnt[k]++;
+                }
+            } else if (!bt_logged && tick >= bt_win_ticks) {
+                char bb[160]; int bp = 0, kk2;
+                bt_logged = 1;
+                for (kk2 = 0; kk2 < n && bp < (int)sizeof bb - 24; kk2++)
+                    bp += snprintf(bb + bp, sizeof bb - bp, " in%d:%"PRId64, kk2, bt_cnt[kk2]);
+                if (bt_cnt[0] + bt_cnt[1] + bt_cnt[2] + bt_cnt[3])
+                    av_log(NULL, AV_LOG_INFO,
+                           "[PTV-RES] birth-trim window closed (%llds): silently dropped%s backlog frames "
+                           "(never displayed — no post-birth catch-up slide; PTV_NO_MV_BIRTHTRIM reverts)\n",
+                           (long long)(bt_win_ticks * c->tick_dur_us / 1000000), bb);
+            }
             /* Take a candidate: a frame held back last tick (pending) or a fresh pop. Two hold
              * gates may keep it back (frame stays in pending, skew/EMA freeze via pending[k]):
              *  - CONTENT CLAMP (opt-in, g_mv_clamp): content-age leads the house clock.
@@ -289,6 +338,11 @@ void *compositor_thread(void *arg)
                 f = cand;                                 /* for the re-anchor diag below */
                 if (last[k]) av_frame_free(&last[k]);
                 last[k] = cand; any_fresh = 1; last_fresh_us[k] = now_us;
+                if (!born[k]) {                           /* pre17: first display — the slot is live;
+                                                           * clear its BIRTH slate-mask bit */
+                    born[k] = 1;
+                    atomic_fetch_and_explicit(&g_mv_slate_mask, ~(1 << k), memory_order_relaxed);
+                }
                 /* Option F (coarse half) — RE-ANCHOR on return from an outage. When a slot
                  * comes back after having been black-slated, clear its accumulated dup skew
                  * so the returning audio is NOT delayed by the stale dup-hold total. For a
@@ -308,13 +362,26 @@ void *compositor_thread(void *arg)
                                k, tick, skew_us[k]/1000, dd/1000, h0d/1000, (tick*c->tick_dur_us)/1000, g_reanchor);
                     }
                     if (g_reanchor) { skew_us[k] = 0; c->inputs[k].house_skew = 0; } slated[k] = 0;
+                    /* 1.0.1-pre17: slate RECOVERY edge — clear this slot's bit; the corrector's
+                     * sibling-slate freeze lifts and its 3min quiet window re-runs from here.
+                     * Also re-seed the slot's m_v EMA: the outage gap + skew reset changed the
+                     * mapping baseline; pre-outage samples must not blend into the fresh one
+                     * (the soak's "readings snap back on recovery" made exact). */
+                    atomic_fetch_and_explicit(&g_mv_slate_mask, ~(1 << k), memory_order_relaxed);
+                    rs_mv_seed[k] = 0;
                     atomic_fetch_add_explicit(&c->inputs[k].house_disturb, 1, memory_order_relaxed);  /* B3: arm PLL mid-run re-acquire */
                     /* audio-follow re-tracks continuously via its EMA — no per-outage reset needed */
                 }
             }
             if (!done_in[k]) all_eof = 0;
             stale = (c->slate_after_us > 0 && last_fresh_us[k] > 0 && now_us - last_fresh_us[k] > c->slate_after_us);
-            if (stale) slated[k] = 1;                 /* mark the outage so the next fresh frame re-anchors */
+            if (stale && !slated[k]) {                /* slate ONSET edge: mark the outage (next fresh frame
+                                                       * re-anchors) + set this slot's bit in the sibling-slate
+                                                       * mask (1.0.1-pre17) — no mv corrector may engage while
+                                                       * any slot is slated (finding 1's condition). */
+                slated[k] = 1;
+                atomic_fetch_or_explicit(&g_mv_slate_mask, 1 << k, memory_order_relaxed);
+            }
             /* Option F (fine half) — per-slot audio skew = the MEASURED output-vs-content
              * offset of the frame this cell actually displays: skew = out_time -
              * (displayed_src - h0). = single-input's house_skew (output - content) but
@@ -422,13 +489,20 @@ void *compositor_thread(void *arg)
                             af_off[k] = sk;                            /* snap the audio-follow EMA to the floored lag */
                             /* 1.0.1-pre16: a REANCHOR2 h0 shift is a label-lineage disturbance for
                              * this slot's tracks — bump the slot's disturbance epoch so the corrector
-                             * dwell resets (feed wired now, consumed by the ARMING pre). REUSES the
-                             * existing per-input house_disturb epoch (owner Q3, 2026-07-18): safe
-                             * because house_disturb is consumed ONLY by corrector snapshots
-                             * (rscorr_event_edge/dwell_reset) — the PLL acquire has been
-                             * event-ungated since v0.6.18 — and the mv corrector is HELD OFF this
-                             * pre, so the bump changes nothing until arming. */
+                             * dwell resets. REUSES the existing per-input house_disturb epoch (owner
+                             * Q3, 2026-07-18): safe because house_disturb is consumed ONLY by
+                             * corrector snapshots (rscorr_event_edge/dwell_reset) — the PLL acquire
+                             * has been event-ungated since v0.6.18. Live-consumed since pre17 (the
+                             * mv corrector is armed): a REANCHOR2 resets THIS slot's tracks' dwell. */
                             atomic_fetch_add_explicit(&c->inputs[k].house_disturb, 1, memory_order_relaxed);
+                            /* 1.0.1-pre17: a REANCHOR2 h0 shift REDEFINES this slot's mapping
+                             * baseline — the pre-shift m_v EMA samples describe a mapping that no
+                             * longer exists (mixing them in is exactly the birth −185ms sensor
+                             * spike measured on the A/B fixture). Re-seed from the next sample:
+                             * a GENUINE displacement still shows immediately (post-shift samples
+                             * measure the new mapping against the audio's unchanged one — a
+                             * cleaner reading of #24's shape, not a masking of it). */
+                            rs_mv_seed[k] = 0;
                             /* 0.9.18.7: promoted PTV_DIAG→always-on WARNING, with the AGLUE-style log
                              * rate limit. In LIVE mv a re-anchor is rare (a real video-ahead excursion),
                              * but on an unpaced source (file mv, decoder outrunning the clock) it can
@@ -570,11 +644,22 @@ void *compositor_thread(void *arg)
                 double secs  = mv_tick_us(c, c->emitted) / 1000000.0;
                 int hh = (int)(secs / 3600), mm = ((int)secs % 3600) / 60;
                 double ss = secs - hh * 3600 - mm * 60;
-                char dlv[64] = "";                   /* §7.5a delivery gate readout (mv gated since v0.9.12.1) */
-                if (c->gate0)
-                    snprintf(dlv, sizeof dlv, " dlvhold=%"PRId64"ms dlvforced=%"PRId64,
+                char dlv[112] = "";                  /* §7.5a delivery gate readout (mv gated since v0.9.12.1) */
+                if (c->gate0) {
+                    int dn = snprintf(dlv, sizeof dlv, " dlvhold=%"PRId64"ms dlvforced=%"PRId64,
                              atomic_load_explicit(&c->gate0->st_hold_us, memory_order_relaxed) / 1000,
                              atomic_load_explicit(&c->gate0->st_forced, memory_order_relaxed));
+                    if (c->gate0->v_on && dn > 0 && dn < (int)sizeof dlv) {
+                        /* §7.5b symmetric gate on mv (task #48): EARLY-VIDEO hold ≈ the audio
+                         * path's wall latency (loudnorm ~3s fill); vdlvforced only when the
+                         * backstop released */
+                        int64_t vf = atomic_load_explicit(&c->gate0->st_vforced, memory_order_relaxed);
+                        dn += snprintf(dlv + dn, sizeof dlv - dn, " vdlvhold=%"PRId64"ms",
+                                 atomic_load_explicit(&c->gate0->st_vhold_us, memory_order_relaxed) / 1000);
+                        if (vf > 0 && dn > 0 && dn < (int)sizeof dlv)
+                            snprintf(dlv + dn, sizeof dlv - dn, " vdlvforced=%"PRId64, vf);
+                    }
+                }
                 char aco[24] = "";                   /* pre15/pre16 #33: corrupt-discarded AUDIO pkts, GLOBAL sum
                                                       * (owner Q — per-track detail stays on the [PTV-ADISC]/NBS
                                                       * lines; absent while zero, clean line unchanged) */
@@ -586,8 +671,10 @@ void *compositor_thread(void *arg)
                 /* pre16.1 (owner-directed): the per-slot sensor reading rides INSIDE each inN:
                  * group below (/lipsync=), not as a separate combined token — the mv line
                  * already keys per input. `--` on a slated slot IS the outage signal.
-                 * corr= deliberately NOT printed: the mv corrector is HELD OFF this pre
-                 * (rscorr_update hold) — the arming pre adds ptv_stats_corr here. */
+                 * pre17: corr= joins the line (the mv corrector is ARMED) — the shared pre14
+                 * builder with the aK: prefix forced; absent while every track is quiet. */
+                char crs[10 + PTV_MAX_AUDIO * 20];
+                ptv_stats_corr(crs, sizeof crs, 1);
                 char ls[448]; int lp = 0;   /* per-slot: qdrop=input-q overflow, corrupt=demux+decode,
                                              * pd=cadence holds (NORMAL for a rate-mismatched slot),
                                              * sv=starvation dups, sk=published audio skew,
@@ -606,9 +693,36 @@ void *compositor_thread(void *arg)
                                    (int)(c->inputs[k].da.disc_resid_us / 1000), lst);
                 }
                 av_log(NULL, AV_LOG_INFO,   /* v0.9.13 parity: size/bitrate/speed/genlock dropped (v0.9.10 single-input rationale) */
-                    "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f dup=%"PRId64" drop=%"PRId64"%s%s%s\n",
-                    c->emitted, fps, hh, mm, ss, c->dup, c->framedrop[0], dlv, aco, ls);
+                    "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f dup=%"PRId64" drop=%"PRId64"%s%s%s%s\n",
+                    c->emitted, fps, hh, mm, ss, c->dup, c->framedrop[0], dlv, aco, ls, crs);
+                /* 1.0.1-pre17 (owner-floated): per-INPUT always-on [PTV-RSYNC] summary, ONE
+                 * compact line per input per stats period — the soak forensics that used to
+                 * need PTV_DIAG. R = this input's track reading(s) (same builder as the
+                 * stats token), ev = the slot's demux edit ledger, sk = published follow
+                 * skew, occ = jitter-buffer depth, SLATED while the cell is black. */
+                if (g_rsync_sense) {
+                    for (k = 0; k < n; k++) {
+                        char rin[40];
+                        ptv_stats_lipsync_in(rin, sizeof rin, nows, k);
+                        av_log(NULL, AV_LOG_INFO,
+                            "[PTV-RSYNC] in%d R=%s ev=%+lldms sk=%+lldms occ=%d%s  [+ = audio early]\n",
+                            k, rin[0] ? rin : "n/a",
+                            (long long)(atomic_load_explicit(&g_rsx.ev_us[k], memory_order_relaxed) / 1000),
+                            (long long)(c->inputs[k].house_skew / 1000),
+                            av_thread_message_queue_nb_elems(c->inputs[k].hold.q),
+                            slated[k] ? " SLATED" : "");
+                    }
+                }
                 stat_last = nows; stat_prev = c->emitted;
+            }
+        }
+        {   /* 1.0.1-pre17: the pre14 stale-track corrector watchdog runs under the MV cadence
+             * owner too (the passthrough rung loops return before the single-input master
+             * block, so it never ran on mv — port-doc §6's named arming prerequisite). */
+            int64_t nww = av_gettime_relative();
+            if (g_rsync_corr && nww - corr_wd_last >= 1000000) {
+                corr_wd_last = nww;
+                rscorr_stale_watchdog(nww);
             }
         }
         if (g_slow) av_usleep(g_slow);

@@ -578,7 +578,16 @@ static int ptv_glue_refuse_h(PtvDiscBuf *b, int s, int64_t wall_now)
  * flush runs SHARED (option (i) of the #47 brief — bounded wait; (ii) retro-applying the
  * offset to the sibling is unsafe because its jumped packets may already have dispatched,
  * and (iii) reduces to today's release for a leg that never crossed). If the sibling still
- * does not cross, the release proceeds as pre14 with a loud line. Returns 1 = hold. */
+ * does not cross, the release proceeds as pre14 with a loud line. Returns 1 = hold.
+ * HONESTY NOTE (rr16 ruling, kept per 1.0.1-pre17 review): in every fixture and live
+ * shape examined, the sibling leg that WOULD convert the held cycle into a shared flush
+ * either already participated (pair_vid_defined/pair_has short-circuits above) or arrives
+ * on its own later cycle — the intended shared outcome has not been observed to be
+ * REACHED via this hold. As shipped it is therefore FORENSIC-ONLY: it buys one 500ms
+ * delay + the log line naming the matching sibling jump, and the release then proceeds
+ * as pre14. Kept (not simplified away) because the hold is bounded, inert on all pinned
+ * partial fixtures, and the log line has diagnostic value; if a future incident shows the
+ * shared path taken, delete this note. */
 static int ptv_disc_partial_hold(DemuxArgs *d, PtvDiscBuf *b)
 {
     int i, has_v = 0, has_a = 0, sib, trig;
@@ -1957,8 +1966,13 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                     av_gettime_relative(),
                     d->disturb_epoch ? atomic_load_explicit(d->disturb_epoch, memory_order_relaxed) : 0);
             /* 1.0.1-pre8: input-flowing signal for the (b)/(c) starvation-contradiction detectors
-             * — a video packet reached the demux dispatch just now (clean-wire evidence). */
+             * — a video packet reached the demux dispatch just now (clean-wire evidence).
+             * 1.0.1-pre17: ALSO stamped per input (Input.v_arrive_wc) — the corrector's §3
+             * per-input liveness; the global stays as the any-input aggregate for the
+             * single-input detectors above (identical there: one input). */
             atomic_store_explicit(&g_v_arrive_wc, av_gettime_relative(), memory_order_relaxed);
+            if (d->v_arrive_wc)
+                atomic_store_explicit(d->v_arrive_wc, av_gettime_relative(), memory_order_relaxed);
             /* 1.0.1-pre10 review fix (rr10 D1): measure THIS input's video arrival rate — the
              * catch-up governor's pacing currency (the master OUT tick was the wrong currency:
              * any input whose pps exceeds 1.25x out-fps was governed below its own arrival

@@ -132,14 +132,41 @@ typedef struct DlvGate {
     int             vcount, vmaxq;      /* vmaxq: force-release-oldest backstop (never blocks, never drops) */
     int64_t         v_band_us;          /* tolerance: video may run this far past a_dlv_dts_hi (PTV_VDLV_BAND_US) */
     int64_t         v_cap_us;           /* audio-death escape + per-packet age backstop (PTV_VDELIVERY_CAP_MS) */
+    int             v_birth_flow;       /* task #48 (mv): video FLOWS at birth until the first audio delivery —
+                                         * mv audio anchors at first DISPLAY, so at the first video packet the
+                                         * §7.5a FIFO is still empty (count==0) and the single-input birth rule
+                                         * would hold video, unbounding the encoder's startup race past mux_q
+                                         * backpressure and flipping healthy channels' equilibrium to
+                                         * dlvhold=0/vdlvhold≈1s (measured). Flowing at birth keeps healthy mv
+                                         * stock-identical; a wall-late audio path still converges once its
+                                         * first delivery lands (one-time ≤fill transient). */
     int             v_disarmed;         /* audio-death escape tripped → video flows direct until audio resumes */
     int64_t         v_disarm_wc;        /* wall time of the disarm (re-arm when a_hi_change_wc passes it) */
+    /* 1.0.1-pre17 (owner mandate: af-independence must never need per-channel config): the
+     * escape/age cap AUTO-SIZES to the MEASURED audio-chain lateness. v_cap_base = the
+     * configured floor (default 6s / PTV_VDELIVERY_CAP_MS, now an override-floor, not a
+     * tuning knob); v_lat_ema = EMA of (v_enc_dts_hi − a_dlv_dts_hi) sampled per video
+     * drain WHILE audio is actively delivering (a_hi_change_wc fresh <2s — an audio
+     * OUTAGE must not inflate the escape timer); v_cap_us = clamp(base, 1.5×ema,
+     * PTV_VDLV_CEIL_US) recomputed there. A >4s -af chain (the class the legend used to
+     * say "raise the env for") now sizes its own hold; the 12s ceiling matches the
+     * CUSHION_MAX posture (beyond it = an upstream incident, not something to buffer).
+     * All fields video-output-thread-only (like the rest of the v-side). */
+    int64_t         v_cap_base;         /* configured floor (env or 6s default) */
+    int64_t         v_lat_ema;          /* EMA of the enc-vs-delivered content skew (µs) */
+    int             v_lat_seed;         /* EMA seeded */
+    int64_t         v_cap_log_wc;       /* rate limit for the cap-resize INFO line */
     _Atomic int64_t a_dlv_dts_hi;       /* newest audio/copy DTS DELIVERED to mux_q (µs); INT64_MIN = none yet */
     _Atomic int64_t a_hi_change_wc;     /* wall time a_dlv_dts_hi last ADVANCED (escape/re-arm detector) */
     _Atomic int64_t st_vhold_us;        /* stats vdlvhold=: age of the oldest held video at the last video drain */
     _Atomic int64_t st_vforced;         /* backstop releases (vmaxq overflow + aged-while-audio-flowing) */
 } DlvGate;
 
+/* §7.5b auto-size ceiling (1.0.1-pre17): the measured-lateness cap growth stops here — an
+ * audio chain claiming to buffer more than this is an upstream incident to surface, not
+ * latency to add (the CUSHION_MAX philosophy). An explicit PTV_VDELIVERY_CAP_MS above the
+ * ceiling still wins (the floor is never clipped). */
+#define PTV_VDLV_CEIL_US 12000000
 /* §7.5b tolerance band: a video packet may lead the audio DELIVERED high-water by this much
  * before it is held. Must exceed one video tick + one audio frame (~60ms) so a healthy channel
  * (audio waiting in the gate, a_hi tracking the video front within a tick) NEVER holds — and it
@@ -239,8 +266,8 @@ typedef struct VOutRing {
  * relabel-erases (glue_off), per-stream-unequal demux rebases (E_v−E_a — the wrong-glue /
  * partner-step-bake class), parked resampler slip, and any label-followed single-stream jump.
  * PASSIVE: nothing consumes R — it feeds the stats line (`lipsync=`) and the [PTV-RSYNC]
- * DIAG line only. The corrector consumes R via rsync_track_R() (pre14; HELD OFF on mv this
- * pre — see rscorr_update). PTV_RSYNC_SENSE=0 disables (sensor + slip probe + the pre15
+ * DIAG line only. The corrector consumes R via rsync_track_R() (pre14; armed on mv since
+ * pre17). PTV_RSYNC_SENSE=0 disables (sensor + slip probe + the pre15
  * realization tripwire, both modes).
  * 1.0.1-pre16 MV SENSOR PORT (analysis/ptvencoder-mv-sensor-port.md): the video half is
  * PER-SLOT — mv_ema/mv_wall/ev_us are arrays keyed by input slot. Single writer per field,
@@ -274,8 +301,14 @@ typedef struct RsyncSense {
  * glue failure (§6 damage bound, owner-approved caps: 5s/engagement, 10s lifetime).
  * MV-NORMATIVE (§8): one CorrState per (input-slot, audio-track), embedded in AudioState;
  * the corrector consumes R only through the rsync_track_R() accessor (pre16: per-slot video
- * ledgers keyed by AudioState.dbg_in — the slot hard-wire died inside the accessor). ON MV
- * THE CORRECTOR IS HELD OFF this pre (sensor-first soak; see the rscorr_update hold).
+ * ledgers keyed by AudioState.dbg_in — the slot hard-wire died inside the accessor).
+ * 1.0.1-pre17: ARMED ON MULTIVIEW (the pre16 sensor-first hold removed): liveness is
+ * per-RUNG (g_mux_sent_wc + gate watermarks, §3 — one dead rung holds the whole channel by
+ * design) AND per-INPUT (the steered track's own input's arrival watermark,
+ * Input.v_arrive_wc); event freeze is per-slot (all pre16 feeds resolve through
+ * dbg_in/per-track state) + the sibling-slate condition (g_mv_slate_mask — while ANY slot
+ * is black-slated, no track may engage: a sibling outage perturbs the shared compositor
+ * pacing, so R is held un-actionable for the whole mosaic until slate + quiet clear).
  * DEFAULT ON single-input (owner-directed 2026-07-17); PTV_NO_RSYNC_CORR=1 kills it
  * outright (§6/§7).
  * All state below is owned by that track's audio thread; cross-thread visibility goes
@@ -611,6 +644,10 @@ typedef struct AudioState {
     _Atomic int64_t *shed_wall;                       /* -> Input.shed_wall (self-shed window) */
     _Atomic int64_t *shed_cnt;                        /* -> Input.shed_cnt */
     _Atomic int     *gov_on;                          /* -> Input.gov_on (catch-up governor engaged) */
+    _Atomic int64_t *v_arrive_wc;                     /* 1.0.1-pre17 (§3 per-input liveness): -> Input.v_arrive_wc —
+                                                       * THIS track's input's video-arrival watermark. NULL → the
+                                                       * g_v_arrive_wc any-input fallback (identical on single input);
+                                                       * on mv a dead sibling input no longer reads as "flowing". */
     /* 1.0.1-pre15 glue classification (#33; g_glueclass) — all owned by this track's audio
      * thread. E5 pad ledger (see the PTV_GLUE_PAD_* block): open GAP-pads awaiting a possible
      * return leg; 0 = consumed/empty slot. */
@@ -858,6 +895,7 @@ typedef struct DemuxArgs {
                                            * publish now (was rsync_pub, single-input input 0 only) */
     _Atomic int64_t      *shed_wall;      /* pre16: -> Input.shed_wall (per-input self-shed stamp) */
     _Atomic int64_t      *shed_cnt;       /* pre16: -> Input.shed_cnt */
+    _Atomic int64_t      *v_arrive_wc;    /* pre17: -> Input.v_arrive_wc (per-input arrival watermark) */
     PtvDiscBuf           *disc;           /* legacy-0004 buffer-classify-discard (g_layera only; NULL otherwise) */
     int64_t               video_fwd_us;   /* wall-clock (us) of the last VIDEO forward-discontinuity crossing (whole-program-splice indicator) */
     int64_t               prog_off;       /* P2 (§7.1): program-level discontinuity offset (90kHz, detected on the
@@ -975,6 +1013,9 @@ typedef struct Input {
      * corrector's quiet window and governor feed, the mv DIAG per-slot gpps/gov segment). */
     _Atomic int64_t       shed_wall;         /* wall µs of this input's last self-inflicted queue drop */
     _Atomic int64_t       shed_cnt;          /* cumulative self-shed pkts on this input */
+    _Atomic int64_t       v_arrive_wc;       /* 1.0.1-pre17: wall µs of THIS input's last video pkt at its demux
+                                              * (per-input twin of g_v_arrive_wc — the corrector's §3 per-input
+                                              * liveness; the global stays as the any-input aggregate) */
     _Atomic int           gov_gpps;          /* catch-up governor: last measured arrival pps it saw */
     _Atomic int           gov_decl;          /* declared input pps (trust floor) */
     _Atomic int           gov_on;            /* 1 = governing this input's decode */
@@ -1014,6 +1055,7 @@ extern int     g_avlock;
 extern int     g_reanchor;
 extern int     g_mv_clamp;
 extern int     g_mv_residence;
+extern int     g_mv_birthtrim;
 extern int     g_discont;
 extern int     g_gapdiscrim;
 extern int     g_adecwd;
@@ -1108,6 +1150,13 @@ extern int64_t g_rscorr_slew_us_s;       /* slew clamp, µs of trim per wall sec
 extern _Atomic int64_t g_corr_pub[PTV_MAX_AUDIO];        /* cumulative corr_us per track */
 extern _Atomic int     g_corr_state_pub[PTV_MAX_AUDIO];  /* PTV_CORR_* per track */
 extern _Atomic int     g_corr_disarm_req[PTV_MAX_AUDIO]; /* master watchdog → audio thread (silent sync) */
+/* 1.0.1-pre17 sibling-slate condition (compositor writes, corrector reads): bit k set while
+ * input slot k is black-slated. While ANY bit is set no mv track may engage — a sibling
+ * outage perturbs the shared compositor pacing (finding 1, grid soak 2026-07-19), so R is
+ * un-actionable mosaic-wide until the slate clears + the quiet window re-runs. Belt over
+ * the pre17 sensor fix (the fixed sensor reads true through a sibling slate; this freeze
+ * is the §4.4 defense-in-depth for whatever the fix did not anticipate). */
+extern _Atomic int g_mv_slate_mask;
 /* per-rung wire-send watermark (§3, owner-approved "build it"): wall µs of the last SUCCESSFUL
  * av_interleaved_write_frame on that rung — the only liveness signal that is actually the wire
  * (the Newsmax2 dead rung read calm on every label-domain signal). One relaxed store per packet. */
@@ -1164,7 +1213,12 @@ void ptv_print_log_legend(int full);
  * Both write "" when the field is absent. */
 void ptv_stats_lipsync(char *buf, size_t size, int64_t now_us, int force_idx);
 void ptv_stats_lipsync_in(char *buf, size_t size, int64_t now_us, int in);
-void ptv_stats_corr(char *buf, size_t size);
+void ptv_stats_corr(char *buf, size_t size, int force_idx);
+/* 1.0.1-pre17: the pre14 stale-track corrector watchdog, shared by both cadence owners —
+ * the single-input master rung (ptvencoder_clock.c) and the mv compositor (the passthrough
+ * rung loop returns before the master block, so mv needed its own call site). Callers
+ * rate-limit (~1s). Body unchanged from pre14 (CAS to DISARMED + silent disarm_req). */
+void rscorr_stale_watchdog(int64_t now);
 /* ptvencoder.c */
 void vring_put(VOutRing *r, int64_t src_us, int64_t out_us);
 int vring_lookup(VOutRing *r, int64_t want_src, int64_t *out_v, int64_t *matched_src);

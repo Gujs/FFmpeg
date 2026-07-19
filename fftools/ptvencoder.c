@@ -41,7 +41,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.0.1-pre16.1"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.0.1-pre17"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -73,6 +73,10 @@ int     g_mv_clamp = 0;
  * newest (clean 2:1 decimation instead of hold-queue overflow). A ≥75%-full hold queue
  * bypasses the gate (pressure valve vs a wrong rate estimate). PTV_NO_RESIDENCE reverts. */
 int     g_mv_residence = 1;
+int     g_mv_birthtrim = 1;   /* 1.0.1-pre17 (finding 1): mv birth-trim WINDOW — post-preroll backlog is
+                               * dropped-oldest silently for the first ~20s instead of being displayed as
+                               * a servo-paced catch-up slide the audio follow cannot track (the restart-
+                               * with-dead-slot 150-240ms audio-late transient). PTV_NO_MV_BIRTHTRIM=1 reverts. */
 /* Per-input source PTS-discontinuity absorber (THE multiview audio-late fix). Real live feeds
  * (the 1080i50 Grid SRT inputs) throw a forward PTS jump of a few hundred ms at the join while
  * FRAMES stay continuous (one per tick, buffer full) — a timestamp glitch, not lost frames. Left
@@ -486,6 +490,9 @@ int     g_selfheal = 1;
 int     g_vindbg;    /* TEMP pre13 diagnosis: PTV_VINDBG=1 traces the vin_pps window + governor */
 _Atomic int     g_selfheal_req;
 _Atomic int64_t g_v_arrive_wc;
+/* 1.0.1-pre17: sibling-slate mask (bit k = input slot k black-slated; compositor writes,
+ * rscorr_event_active reads) — no mv corrector engagement while any slot is slated. */
+_Atomic int     g_mv_slate_mask;
 /* (d) SELF-MADE-GAP LOG HONESTY: every self-inflicted queue drop (video head/tail shed, audio
  * drop-oldest) stamps these; AGLUE/ASTEP lines within 5s carry " [self: N pkts shed]" so our
  * own drops are never again misread as source burstiness. */
@@ -1876,25 +1883,32 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         for (r = 0; r < n_rung; r++)
             dlv_init(&rung[r].gate, rung[r].mux_q, g_cp.delivery_cap_us, maxq);
         /* §7.5b (1.0.1-pre12) symmetric gate: arm the EARLY-VIDEO hold, keyed on the audio
-         * delivered high-water. Single-input only — multiview slots' audio share ONE gate per
-         * rung, so the high-water would key the hold to the LEAST-delayed slot (untested
-         * per-slot death semantics on top) — and only when the run HAS gated audio to key on
-         * (a transcoded track or dense copied AC-3/MP2): a no-audio channel must not pay the
-         * audio-death escape timeout at birth. PTV_NO_VDELIVERY=1 reverts. */
+         * delivered high-water. Multiview too since task #48 (2026-07-19): the 2026-07-13
+         * fleet loudnorm rollout (~3s one-pass analysis fill) made EVERY mv audio track
+         * wall-late, so the §7.5a gate reads dlvhold=0 (nothing early to hold) and the grids'
+         * wire carried video ~2-3s ahead of audio with labels intact — the exact single-input
+         * pre12 class, and mv had no closing mechanism. Slots share ONE gate per rung, so
+         * a_dlv_dts_hi keys the hold to the LEAST-delayed slot's audio: with the fleet-uniform
+         * loudness chain the per-slot latency spread is small, the residual skew is bounded by
+         * it, and a single dead slot cannot wedge video (any flowing track advances the
+         * high-water; the 6s audio-death escape needs ALL tracks silent). Armed only when the
+         * run HAS gated audio to key on (a transcoded track or dense copied AC-3/MP2): a
+         * no-audio channel must not pay the audio-death escape timeout at birth.
+         * PTV_NO_VDELIVERY=1 reverts. */
         if (g_vdelivery) {
             int have_gated_audio = n_audio > 0, gp;
             for (gp = 0; gp < n_pass && !have_gated_audio; gp++)
                 if (pass[gp].gated) have_gated_audio = 1;
-            if (multiview)
-                av_log(NULL, AV_LOG_INFO,
-                       "[PTV-VDLV] early-video hold is single-input only — disabled on this mosaic "
-                       "(per-slot audio skews diverge on the shared per-rung gate)\n");
-            else if (!have_gated_audio)
+            if (!have_gated_audio)
                 av_log(NULL, AV_LOG_INFO,
                        "[PTV-VDLV] no gated audio on this channel — early-video hold disabled\n");
             else
-                for (r = 0; r < n_rung; r++)
+                for (r = 0; r < n_rung; r++) {
                     dlv_video_cfg(&rung[r].gate, PTV_VDLV_BAND_US, g_cp.vdlv_cap_us, g_cp.vdlv_maxq);
+                    /* mv: flow at birth (audio anchors at first DISPLAY, so the §7.5a FIFO
+                     * is legitimately empty at the first video packet — see ptvencoder.h) */
+                    rung[r].gate.v_birth_flow = multiview;
+                }
         }
     }
     /* 0.9.18 M3: register the per-rung gates + master tick with the escalation runtime —
@@ -1993,6 +2007,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         as[k].shed_wall = &inputs[asrc_in[k]].shed_wall;   /* pre16: per-input self-shed window (AGLUE notes + */
         as[k].shed_cnt  = &inputs[asrc_in[k]].shed_cnt;    /* corrector quiet) — slot B never smears slot A */
         as[k].gov_on    = &inputs[asrc_in[k]].gov_on;      /* pre16: this track's OWN input's governor flag */
+        as[k].v_arrive_wc = &inputs[asrc_in[k]].v_arrive_wc;  /* pre17: §3 per-input liveness — the corrector
+                                                               * reads THIS input's arrival watermark */
         as[k].acomp_exp_us = AV_NOPTS_VALUE;             /* [PTV-ACOMP] no expected-pts reference yet */
         as[k].tick_dur_us = av_rescale(1000000, out_fps.den, out_fps.num);  /* 1.0.1: house tick = the PLL's vlag quantum (one house clock for all slots) */
         for (r = 0; r < n_rung; r++) {
@@ -2015,6 +2031,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                                                          * video keyed by this slot (was single-input-only) */
         d->shed_wall = &inputs[kk].shed_wall;           /* pre16: per-input self-shed stamp */
         d->shed_cnt  = &inputs[kk].shed_cnt;
+        d->v_arrive_wc = &inputs[kk].v_arrive_wc;       /* pre17: per-input arrival watermark (corrector §3) */
         d->disc = g_layera ? &inputs[kk].disc : NULL;   /* legacy-0004 buffer (NULL when off) */
         d->vq_shed_req = &inputs[kk].vq_shed_req;       /* 1.0.1-pre8 (a): overflow -> request head-GOP shed */
         d->autobank = g_autobank && !multiview && live && is_net_url(inputs[kk].url);   /* v0.9.14: single-input live only */
@@ -2620,6 +2637,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_CADDISARM")) g_cad_disarm = 0;  /* v0.9.18.1 M7: revert to flag-only pulldown disarm (dropouts drain frame_q again) */
     if (getenv("PTV_NO_MV_EXACTTICK")) g_mv_exacttick = 0;  /* v0.9.12: revert mv measurement axes to integer tick (re-enables the enforced ~10ppm mosaic drift) */
     if (getenv("PTV_NO_RESIDENCE")) g_mv_residence = 0;     /* v0.9.13: revert to one-pop-per-tick (rate-mismatched slots batch dups + fast-forward after starvation) */
+    if (getenv("PTV_NO_MV_BIRTHTRIM")) g_mv_birthtrim = 0;  /* pre17: one-shot trim only (re-enables the birth catch-up slide) */
     /* genlock preroll default + the three deep-prime side-cars moved to resolve_cushions() (0.9.18 M1) */
     if (getenv("PTV_KEEP_CORRUPT")) g_discardcorrupt = 0;   /* keep AV_PKT_FLAG_CORRUPT video packets (don't +discardcorrupt) */
     if (getenv("PTV_NO_DELIVERY")) g_delivery = 0;          /* §7.5a: disable the A/V delivery-alignment gate (audio sent direct = v0.6.23) */

@@ -527,31 +527,13 @@ void *output_thread(void *arg)
                            (long long)(ep_agg_min / 1000), (long long)(ep_agg_max / 1000));
                     ep_agg_cnt = 0; ep_agg_t0 = nw;
                 }
-                /* pre14 corrector stale-track watchdog: a DWELL/ENGAGED track whose audio
-                 * thread stopped emitting (ma_wall stale >5s — source-audio death, the pre12
-                 * W3 class) can neither steer NOR log its own disarm (its thread is blocked
-                 * in recv). Integration is inherently frozen (no frames), so this is purely
-                 * the §6 one-line disarm + published-state sync: CAS the published state to
-                 * DISARMED (the CAS guarantees exactly one line even if the track resumes
-                 * mid-check) and hand the owning thread a silent disarm_req to consume. */
+                /* pre14 corrector stale-track watchdog — body shared with the mv compositor
+                 * since 1.0.1-pre17 (rscorr_stale_watchdog, ptvencoder_audio.c): a
+                 * DWELL/ENGAGED track whose audio thread stopped emitting cannot log its
+                 * own disarm; the cadence owner does it. ~1s rate limit here. */
                 if (g_rsync_corr && nw - corr_wd_last >= 1000000) {
-                    int kc;
                     corr_wd_last = nw;
-                    for (kc = 0; kc < g_rsx.n_a; kc++) {
-                        int st = atomic_load_explicit(&g_corr_state_pub[kc], memory_order_relaxed);
-                        if (st == PTV_CORR_DWELL || st == PTV_CORR_ENGAGED) {
-                            int64_t maw = atomic_load_explicit(&g_rsx.ma_wall[kc], memory_order_relaxed);
-                            if (maw && nw - maw > 5000000 &&
-                                atomic_compare_exchange_strong_explicit(&g_corr_state_pub[kc], &st,
-                                        PTV_CORR_DISARMED, memory_order_relaxed, memory_order_relaxed)) {
-                                atomic_store_explicit(&g_corr_disarm_req[kc], 1, memory_order_relaxed);
-                                av_log(NULL, AV_LOG_WARNING,
-                                       "[PTV-RSCORR] a%d DISARM (track stopped emitting — sensor stale) "
-                                       "corr held %+"PRId64"ms  [+ = audio early]\n",
-                                       kc, atomic_load_explicit(&g_corr_pub[kc], memory_order_relaxed) / 1000);
-                            }
-                        }
-                    }
+                    rscorr_stale_watchdog(nw);
                 }
                 if (g_adapt_cushion && !v->passthrough) {
                     /* 0.9.18 M3: trigger conditions stay here; the write bodies (tier store,
@@ -853,9 +835,9 @@ void *output_thread(void *arg)
                         snprintf(aco, sizeof aco, " acor=%lld", (long long)ac);
                 }
                 char crs[10 + PTV_MAX_AUDIO * 20];                   /* pre14 corrector: corr= (cumulative trim; * = integrating);
-                                                                      * pre16: shared builder — the mv printer gains it by
-                                                                      * calling this when the mv corrector hold is lifted */
-                ptv_stats_corr(crs, sizeof crs);
+                                                                      * shared builder (pre16) — the mv printer calls it too
+                                                                      * since pre17 (mv corrector armed; force_idx there) */
+                ptv_stats_corr(crs, sizeof crs, 0);
                 av_log(NULL, AV_LOG_INFO,
                     "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f "
                     "dup=%"PRId64" pd=%"PRId64" drop=%"PRId64" corrupt=%"PRId64" "
