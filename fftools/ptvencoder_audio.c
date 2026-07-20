@@ -877,10 +877,16 @@ static int audio_drain_fg(AudioState *a)
                                 if (a->acq_backoff < 5) a->acq_backoff++;
                                 a->acq_last_wc = av_gettime_relative();
                             }
-                            av_log(NULL, AV_LOG_WARNING, "[PTV-PLL] a%d(in%d) ACQUIRE %s %"PRId64"ms (ema→%"PRId64"ms applied=%"PRId64"ms #%d backoff=%d)\n",
-                                   a->dbg_k, a->dbg_in, dq < 0 ? "drop" : "pad", FFABS(dq) / 1000,
-                                   a->pll_ema / 1000, a->af_applied_us / 1000, a->pll_acq_count,
-                                   a->acq_backoff);
+                            {   /* rider (c), rr19 finding 3: backoff= only when the mechanism is on
+                                 * (a disabled backoff printing 0 read as "armed at level 0") */
+                                char bo[20] = "";
+                                if (g_acq_backoff)
+                                    snprintf(bo, sizeof bo, " backoff=%d", a->acq_backoff);
+                                av_log(NULL, AV_LOG_WARNING, "[PTV-PLL] a%d(in%d) ACQUIRE %s %"PRId64"ms (ema→%"PRId64"ms applied=%"PRId64"ms #%d%s)\n",
+                                       a->dbg_k, a->dbg_in, dq < 0 ? "drop" : "pad", FFABS(dq) / 1000,
+                                       a->pll_ema / 1000, a->af_applied_us / 1000, a->pll_acq_count,
+                                       bo);
+                            }
                         }
                         a->pll_refractory = (int)(g_pll_refractory_us / frame_us);  /* v0.6.21: HARD ~12s refractory (was g_pll_acquire_n ≈0.68s) — breaks the self-excited limit cycle */
                         a->pll_dbnc = 0; a->pll_dbnc_ref = a->pll_ema;
@@ -2483,6 +2489,16 @@ void *audio_thread(void *arg)
              * audio_push would drop them = ticking). Carry only ever spans contiguous clean
              * decode: adec_error()/adec_swap() invalidate it. */
             if (g_adts_split && frame->nb_samples > 0 && frame->sample_rate > 0) {
+                if (a->dbg_in >= 0 && a->dbg_in < PTV_MAX_INPUT) {   /* rider (a), rr191 F3: a demux
+                                                                      * REOPEN is a fresh join — the
+                                                                      * extrapolation carry must not
+                                                                      * span it */
+                    int64_t rwc = atomic_load_explicit(&g_reopen_wc[a->dbg_in], memory_order_relaxed);
+                    if (rwc && rwc != a->reopen_seen_wc) {
+                        a->reopen_seen_wc = rwc;
+                        a->dec_ts_carry   = AV_NOPTS_VALUE;
+                    }
+                }
                 if (frame->best_effort_timestamp == AV_NOPTS_VALUE &&
                     a->dec_ts_carry != AV_NOPTS_VALUE) {
                     frame->pts = frame->best_effort_timestamp = a->dec_ts_carry;

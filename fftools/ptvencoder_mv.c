@@ -604,6 +604,9 @@ void *compositor_thread(void *arg)
             }
         }
         tick++;
+        if (g_t_us > 0 && mv_tick_us(c, c->emitted) >= g_t_us &&
+            !atomic_load_explicit(&g_t_stop, memory_order_relaxed))
+            atomic_store_explicit(&g_t_stop, 1, memory_order_relaxed);   /* rider (b): -t (mv cadence owner) */
 
         if (g_diag) {
             int64_t nowd = av_gettime_relative();

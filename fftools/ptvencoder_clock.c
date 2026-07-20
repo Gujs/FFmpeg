@@ -303,6 +303,8 @@ void *output_thread(void *arg)
             f->pts = tick++; f->pkt_dts = AV_NOPTS_VALUE; f->duration = 0;
             ret = encode_push(v->mux_q, v->venc, v->ost, f, NULL);   /* offline: no delivery gate */
             v->emitted++; v->last_emit_us = av_gettime_relative();
+            if (g_t_us > 0 && v->is_master && v->emitted * v->tick_dur_us >= g_t_us)
+                atomic_store_explicit(&g_t_stop, 1, memory_order_relaxed);   /* rider (b): -t */
             av_frame_free(&f);
             if (ret < 0) break;
         }
@@ -723,6 +725,11 @@ void *output_thread(void *arg)
         ret = encode_push(v->mux_q, v->venc, v->ost, held, v->gate);   /* §7.5a: publish video front + release caught-up audio/copy */
         v->last_emit_us = av_gettime_relative();
         tick++; v->emitted++;
+        if (g_t_us > 0 && v->is_master && v->emitted * v->tick_dur_us >= g_t_us &&
+            !atomic_load_explicit(&g_t_stop, memory_order_relaxed))
+            atomic_store_explicit(&g_t_stop, 1, memory_order_relaxed);   /* rider (b): -t of output
+                                                                          * media time reached — every
+                                                                          * demux stops pulling */
         if (!fresh) { if (cadence_hold) v->pd++; else v->dup++; }   /* pd = intentional cadence residence; dup stays the health alarm */
         if (g_slow) av_usleep(g_slow);
         if (ret < 0) break;

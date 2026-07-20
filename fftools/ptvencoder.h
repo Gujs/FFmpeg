@@ -741,6 +741,8 @@ typedef struct AudioState {
     int64_t          flush_relab_seen_wc;             /* 1.0.1-pre18 #50 (E5 net): last consumed/retired
                                                        * g_flush_relab_wc value for this track (young
                                                        * unmatched publishes stay pending and re-scan) */
+    int64_t          reopen_seen_wc;                  /* 1.0.1-pre20 rider (a): last consumed g_reopen_wc
+                                                       * value for this track's input (ASTAMP carry inval) */
 } AudioState;
 
 /* ---- demux + mux ---- */
@@ -1301,6 +1303,19 @@ extern int     g_rebuild_reanchor;       /* 1.0.1-pre20: AFMT-rebuild birth-equi
 extern int     g_acq_backoff;            /* #49: repeated-ACQUIRE threshold backoff; PTV_NO_ACQ_BACKOFF=1 reverts */
 extern _Atomic int64_t g_flush_relab_step[PTV_MAX_AUDIO]; /* last LAYERA-flush label shift per track (demux writes, */
 extern _Atomic int64_t g_flush_relab_wc[PTV_MAX_AUDIO];   /* step first / wall last-release; audio thread reads) */
+/* 1.0.1-pre20 rider (a) — rr191 F3: per-input demux-REOPEN stamp (wall µs; demux thread
+ * stores at a successful [PTV-REOPEN], audio threads consume). The [PTV-ASTAMP] extrapolation
+ * carry must never span a demux reopen: the fresh ctx is a fresh join and a first-frame NOPTS
+ * extrapolated from the pre-outage carry would stamp it pre-outage-continuous. */
+extern _Atomic int64_t g_reopen_wc[PTV_MAX_INPUT];
+/* 1.0.1-pre20 rider (b) — proper `-t` (house-clock output media time; was parsed-and-ignored).
+ * The cadence owner (single-input master rung / offline rung 0 / mv compositor) sets
+ * g_t_stop once emitted output media time reaches g_t_us; every demux thread treats it as
+ * EOF (stop pulling), so the whole pipeline flushes and exits through the proven file-EOF
+ * teardown. The flushed pipeline residue means the final duration is >= -t by up to the
+ * buffered cushion — -t bounds the INPUT pull, exactly what test cells need. 0 = no limit. */
+extern int64_t g_t_us;
+extern _Atomic int g_t_stop;
 
 /* ==== cross-file functions ==== */
 /* ptvencoder_gate.c */

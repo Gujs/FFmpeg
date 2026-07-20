@@ -620,6 +620,9 @@ _Atomic int64_t g_pad_pub_wc[PTV_MAX_AUDIO];
 int     g_glueveto = 1;
 _Atomic int64_t g_flush_relab_step[PTV_MAX_AUDIO];  /* last LAYERA-flush label shift per track (µs) */
 _Atomic int64_t g_flush_relab_wc[PTV_MAX_AUDIO];    /* wall µs it was persisted (0 = never) */
+_Atomic int64_t g_reopen_wc[PTV_MAX_INPUT];         /* 1.0.1-pre20 rider (a): per-input demux-reopen stamp (ASTAMP carry inval) */
+int64_t g_t_us = 0;                                 /* 1.0.1-pre20 rider (b): -t output-media-time bound (0 = none) */
+_Atomic int g_t_stop;                               /* set by the cadence owner at -t; demux threads treat it as EOF */
 /* 1.0.1-pre18 #51a — corrector hs-tick event filter (AWE dwell starvation, live 2026-07-19):
  * a ±1-video-tick house_skew step is pulldown/decim cadence noise, not a lineage event —
  * it must neither reset the dwell nor count toward the storm (rscorr_event_edge).
@@ -1651,6 +1654,18 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         OptionGroup *g = &outs->groups[r];
         const char *out_url = g->arg, *out_fmt = og_get(g, "f");
         const char *venc_name = sel[r].venc ? sel[r].venc : "h264_videotoolbox";
+        const char *t_str = og_get(g, "t");   /* 1.0.1-pre20 rider (b): -t now CONSUMED (house-clock
+                                               * output media time; was parsed-and-ignored). Any rung's
+                                               * -t arms the shared bound; the largest wins. */
+        if (t_str) {
+            int64_t tus = 0;
+            if (av_parse_time(&tus, t_str, 1) >= 0 && tus > 0) {
+                if (tus > g_t_us) g_t_us = tus;
+                av_log(NULL, AV_LOG_INFO, "ptvencoder: -t %s -> stop pulling input at %.1fs of output media time (flush + clean exit)\n",
+                       t_str, g_t_us / 1e6);
+            } else
+                av_log(NULL, AV_LOG_ERROR, "ptvencoder: invalid -t '%s' (ignored)\n", t_str);
+        }
         const AVCodec *vencoder;
 
         if (filtering) {

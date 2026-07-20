@@ -1642,6 +1642,9 @@ static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const uint8_t *old_t
     d->ifmt = nf;
     if (d->ifmt_home) *d->ifmt_home = nf;      /* teardown close target follows the swap */
     d->reopen_cnt++;
+    if (d->rsync_slot >= 0 && d->rsync_slot < PTV_MAX_INPUT)   /* rider (a), rr191 F3: the ASTAMP
+                                                                * extrapolation carry must not span the reopen */
+        atomic_store_explicit(&g_reopen_wc[d->rsync_slot], av_gettime_relative(), memory_order_relaxed);
     av_log(NULL, AV_LOG_WARNING,
            "[PTV-REOPEN] input '%s' re-opened after read failure (#%"PRId64") — resuming as a "
            "fresh join (slate/recovery machinery downstream)\n", d->url, d->reopen_cnt);
@@ -1661,6 +1664,10 @@ void *demux_thread(void *arg)
     if (!pkt)
         goto end;
     for (;;) {
+        if (g_t_us > 0 && atomic_load_explicit(&g_t_stop, memory_order_relaxed)) {
+            av_log(NULL, AV_LOG_INFO, "ptvencoder: -t reached — input '%s' stops pulling (flush to clean exit)\n", d->url);
+            break;                                 /* rider (b): ride the file-EOF teardown */
+        }
         if (av_read_frame(d->ifmt, pkt) < 0) {
             /* pre17 R1: a live mv net input must NEVER EOF-latch its slot (rw_timeout expiry
              * on a >=30min outage previously slated the cell forever AND held the corrector
@@ -1681,6 +1688,8 @@ void *demux_thread(void *arg)
                 avformat_close_input(&d->ifmt);
                 if (d->ifmt_home) *d->ifmt_home = NULL;
                 for (;;) {
+                    if (g_t_us > 0 && atomic_load_explicit(&g_t_stop, memory_order_relaxed))
+                        goto end;                  /* rider (b): -t ends the retry-forever loop too */
                     if (demux_reopen_once(d, old_nb, old_types) >= 0)
                         break;
                     if (!rlog || av_gettime_relative() - rlog > 30000000) {
