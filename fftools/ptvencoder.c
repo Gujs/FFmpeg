@@ -41,7 +41,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.0.1-pre19"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.0.1-pre19.1"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -117,6 +117,17 @@ int     g_adecwd = 1;              /* 1.0.1 audio decode-death watchdog (PTV_NO_
                                            * decode-error TOLERANCE in audio_thread (drop + [PTV-ADEC] + continue,
                                            * instead of silent thread death) is unconditional — only the reopen is
                                            * gated here. */
+int     g_adts_split = 1;          /* 1.0.1-pre19.1 broken-phase audio "ticking" fix (PTV_NO_ADTS_SPLIT=1 reverts to
+                                           * pre19): Azorse opened DURING a broken-7.1 phase → lavf's STRICT probe decoder
+                                           * rejects every frame → find_stream_info fails (sample_rate 0) → the parser-split
+                                           * ADTS frames 2..6 of each 6-frame PES get NO pts (no duration to extrapolate
+                                           * with) → the audio_push NOPTS drop rule discarded 5/6 frames = 107ms hole per
+                                           * 128ms. Gates BOTH halves of the fix: (1) tolerant probe (ptv_find_stream_info)
+                                           * and (2) the [PTV-ASTAMP] decoded-frame extrapolation backstop. */
+int     g_tolerant_dec = 1;        /* 1.0.1-pre19.1 kill for the pre19 #38 tolerant AAC channel-element allocation
+                                           * (PTV_NO_TOLERANT_DEC=1 = strict lavc everywhere, the pre-#38 behavior:
+                                           * broken-7.1 phases flood decode errors and stay silent-but-alive). Per-channel
+                                           * control, owner request. Also gates the probe-side tolerance. */
 int     g_achop = 1;               /* 1.0.1-pre19 #46 [PTV-ACHOP] stuck-chop escape (PTV_NO_ACHOP_REBUILD=1 kills):
                                            * sustained per-track chop (decode-error/self-shed rate above the floors for
                                            * g_achop_sust_min minutes — the Azorse never-ending-corruption variant, slot
@@ -1388,7 +1399,7 @@ static void *open_input_thread(void *arg)
 {
     OpenArg *o = arg; Input *in = o->in;
     in->open_ret = avformat_open_input(&in->ifmt, in->url, NULL, o->opts);
-    if (in->open_ret >= 0) in->open_ret = avformat_find_stream_info(in->ifmt, NULL);
+    if (in->open_ret >= 0) in->open_ret = ptv_find_stream_info(in->ifmt);   /* pre19.1: tolerant AUDIO probe */
     return NULL;
 }
 
@@ -1753,6 +1764,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         /* commit: this is audio track n_audio (dense). Add an output stream per rung. */
         a = &as[n_audio];
         a->dec = kdec;
+        a->dec_ts_carry = AV_NOPTS_VALUE;  /* pre19.1 [PTV-ASTAMP]: no extrapolation base yet (0 would be a valid pts) */
         for (r = 0; r < n_rung; r++) {
             AVStream *aos; AVDictionaryEntry *klang;
             a->enc[r] = encs[r];
@@ -2660,6 +2672,8 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_DISCONT")) g_discont = 0;     /* A/B: don't absorb source PTS discontinuities */
     if (getenv("PTV_NO_GAPDISCRIM")) g_gapdiscrim = 0;   /* gap-fix A/B: revert to unconditional forward absorb (old desync-on-audio-gap behaviour) */
     if (getenv("PTV_NO_ADECWD")) g_adecwd = 0;       /* 1.0.1: disable the audio decode-death watchdog (error TOLERANCE stays on) */
+    if (getenv("PTV_NO_ADTS_SPLIT")) g_adts_split = 0;     /* 1.0.1-pre19.1: revert the broken-phase probe/stamp fix (pre19 ticking) */
+    if (getenv("PTV_NO_TOLERANT_DEC")) g_tolerant_dec = 0; /* 1.0.1-pre19.1: strict lavc AAC everywhere (pre-#38) */
     if (getenv("PTV_NO_ACHOP_REBUILD")) g_achop = 0; /* 1.0.1-pre19 #46: disable the sustained-chop full-path rebuild escape */
     { const char *e = getenv("PTV_ACHOP_ERRS_MIN");  if (e && atoi(e) > 0) g_achop_errs_min  = atoi(e); }
     { const char *e = getenv("PTV_ACHOP_SHEDS_MIN"); if (e && atoi(e) > 0) g_achop_sheds_min = atoi(e); }

@@ -1654,7 +1654,7 @@ static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const uint8_t *old_t
     av_dict_free(&o2);
     if (r < 0)
         return r;
-    r = avformat_find_stream_info(nf, NULL);
+    r = ptv_find_stream_info(nf);   /* pre19.1: tolerant AUDIO probe (same as the initial open) */
     if (r < 0)
         goto bad;
     r = AVERROR(EINVAL);

@@ -651,6 +651,18 @@ typedef struct AudioState {
     int              decerr_supp;                     /* errors suppressed this window (still counted) */
     int64_t          wd_frame_us;                     /* wall time of the last decoded frame (seeded at first packet) */
     int64_t          wd_pkts;                         /* packets received since the last decoded frame */
+    /* 1.0.1-pre19.1 [PTV-ASTAMP] — un-stamped decoded-frame extrapolation (g_adts_split).
+     * When the source is opened DURING a broken-AAC phase (Azorse 7.1: lavf's strict probe
+     * decoder rejects every frame → "Could not find codec parameters" → sample_rate 0 → the
+     * mpegts AAC parser splits the 6-frames-per-PES payloads but avformat cannot compute
+     * per-frame durations, so frames 2..6 of each PES carry NO pts), the NOPTS drop rule in
+     * audio_push discarded 5 of 6 frames = 21ms audio + 107ms hole per 128ms "ticking".
+     * Fix: stamp a NOPTS decoded frame from the previous frame's ts + nb_samples. The carry
+     * is INVALIDATED on any decode error (the garbage-tail class the drop rule was added
+     * for) and on a decoder swap, so only contiguous clean decode is ever extrapolated. */
+    int64_t          dec_ts_carry;                    /* next expected decoded-frame ts (ist_tb); AV_NOPTS_VALUE = no valid base */
+    int64_t          nopts_stamped;                   /* frames stamped by extrapolation this run */
+    int              astamp_logged;                   /* one-shot engage log */
     /* 1.0.1-pre19 #46 [PTV-ACHOP] — post-storm stuck-chop escape (g_achop). A track in
      * SUSTAINED chop (decode-error or self-shed rate above the floor for g_achop_sust_min
      * minutes — the Azorse variant where the corruption never ends and the slot warbles
@@ -1149,6 +1161,8 @@ extern int     g_aglue_ceil;
 extern int     g_discont;
 extern int     g_gapdiscrim;
 extern int     g_adecwd;
+extern int     g_adts_split;                              /* 1.0.1-pre19.1 broken-phase probe/stamp fix (PTV_NO_ADTS_SPLIT=1 reverts to pre19) */
+extern int     g_tolerant_dec;                            /* 1.0.1-pre19.1 kill for the #38 tolerant AAC decode (PTV_NO_TOLERANT_DEC=1 = strict pre-#38) */
 extern int     g_achop;                                   /* 1.0.1-pre19 #46 stuck-chop escape (see ptvencoder.c) */
 extern int     g_achop_errs_min, g_achop_sheds_min, g_achop_sust_min;
 extern int64_t g_achop_relimit_us;
@@ -1299,6 +1313,7 @@ void *output_thread(void *arg);
 /* ptvencoder_audio.c */
 void *audio_thread(void *arg);
 void ptv_adec_opts(AVCodecContext *dec);   /* 1.0.1-pre19 #38: opt-in tolerant AAC decode (by name, missing-option tolerant) */
+int  ptv_find_stream_info(AVFormatContext *ic);   /* 1.0.1-pre19.1: find_stream_info with the #38 tolerance on the AUDIO probe decoders */
 int build_audio_filter(AudioState *a, AVCodecContext *adec, AVRational tb,
                        const char *af, enum AVSampleFormat out_fmt);
 /* ptvencoder_demux.c */

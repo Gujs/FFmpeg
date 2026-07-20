@@ -2038,6 +2038,9 @@ static void adec_error(AudioState *a, int err)
 {
     int64_t now = av_gettime_relative();
     a->dec_errs++;
+    a->dec_ts_carry = AV_NOPTS_VALUE;  /* pre19.1 [PTV-ASTAMP]: never extrapolate across a decode error —
+                                        * a garbage-tail NOPTS frame next to a tolerated error keeps being
+                                        * dropped (the rule the audio_push NOPTS guard was added for) */
     if (now - a->decerr_win_us >= 10000000) {
         if (a->decerr_supp)
             av_log(NULL, AV_LOG_WARNING,
@@ -2077,8 +2080,47 @@ static void adec_error(AudioState *a, int err)
  * decoders (option not found). Call before avcodec_open2 (read per-frame either way). */
 void ptv_adec_opts(AVCodecContext *dec)
 {
+    if (!g_tolerant_dec)               /* 1.0.1-pre19.1: PTV_NO_TOLERANT_DEC=1 = strict lavc (pre-#38) */
+        return;
     if (dec && dec->priv_data)
         av_opt_set(dec->priv_data, "tolerant_ch_alloc", "1", 0);
+}
+
+/* 1.0.1-pre19.1 — avformat_find_stream_info with the #38 tolerance on the AUDIO probe
+ * decoders. lavf probes streams with its OWN internal decoders, which ptv_adec_opts never
+ * touched: on a source opened DURING a broken-AAC phase (Azorse 7.1) the strict probe
+ * decoder rejected every frame ("channel element 1.0 is not allocated" ×294 at open) →
+ * "Could not find codec parameters" → sample_rate 0 → avformat could not stamp the
+ * parser-split ADTS frames 2..6 of each PES (no duration to extrapolate cur_dts with) →
+ * 5 of 6 decoded frames arrived NOPTS and were dropped = the 107ms/128ms ticking. With the
+ * probe as tolerant as the runtime decoder, params resolve and every split frame is stamped
+ * upstream — the [PTV-ASTAMP] extrapolation in audio_thread remains as the backstop for any
+ * residual un-stamped class.
+ * The option goes into EVERY stream's dict, not just audio: lavf's try_decode_frame is handed
+ * options[i] with i = the (stale) "first stream still missing parameters" index, NOT the
+ * packet's stream index (demux.c:2937) — measured on the Azorse fixture: the aac probe
+ * decoder opened with stream 0's (video's) dict and stayed strict when the option was set
+ * audio-only. Setting it everywhere is safe: option lookups that miss just leave the entry in
+ * the dict (no open failure, non-AAC decoders unaffected; on a stock lavc the entry is simply
+ * never consumed). Streams discovered DURING find_stream_info keep the strict default. */
+int ptv_find_stream_info(AVFormatContext *ic)
+{
+    AVDictionary **opts;
+    unsigned i, n = ic->nb_streams;
+    int r;
+
+    if (!g_adts_split || !g_tolerant_dec || !n)
+        return avformat_find_stream_info(ic, NULL);
+    opts = av_calloc(n, sizeof(*opts));
+    if (!opts)
+        return avformat_find_stream_info(ic, NULL);
+    for (i = 0; i < n; i++)
+        av_dict_set(&opts[i], "tolerant_ch_alloc", "1", 0);
+    r = avformat_find_stream_info(ic, opts);
+    for (i = 0; i < n; i++)            /* nb_streams may have grown; only n dicts exist */
+        av_dict_free(&opts[i]);
+    av_freep(&opts);
+    return r;
 }
 
 static int adec_swap(AudioState *a)
@@ -2103,6 +2145,7 @@ static int adec_swap(AudioState *a)
     avcodec_free_context(&a->dec);
     a->dec = nd;
     a->dec_reopens++;
+    a->dec_ts_carry = AV_NOPTS_VALUE;  /* pre19.1 [PTV-ASTAMP]: fresh decoder, no extrapolation base */
     return 0;
 }
 
@@ -2296,6 +2339,31 @@ void *audio_thread(void *arg)
             if (a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO)   /* pre15 E6: demux-visible decode watermark (NBS discriminator) */
                 atomic_store_explicit(&g_adec_frame_wc[a->dbg_k], a->wd_frame_us,
                                       memory_order_relaxed);
+            /* 1.0.1-pre19.1 [PTV-ASTAMP] — stamp un-stamped decoded frames by sample-count
+             * extrapolation from the previous frame (see the AudioState field comment: the
+             * probe-failed broken-phase route leaves ADTS frames 2..6 of each PES with no pts;
+             * audio_push would drop them = ticking). Carry only ever spans contiguous clean
+             * decode: adec_error()/adec_swap() invalidate it. */
+            if (g_adts_split && frame->nb_samples > 0 && frame->sample_rate > 0) {
+                if (frame->best_effort_timestamp == AV_NOPTS_VALUE &&
+                    a->dec_ts_carry != AV_NOPTS_VALUE) {
+                    frame->pts = frame->best_effort_timestamp = a->dec_ts_carry;
+                    a->nopts_stamped++;
+                    if (!a->astamp_logged) {
+                        a->astamp_logged = 1;
+                        av_log(NULL, AV_LOG_WARNING,
+                               "[PTV-ASTAMP] a%d(in%d) un-stamped decoded frames — stamping by "
+                               "sample-count extrapolation (probe-failed source phase; "
+                               "PTV_NO_ADTS_SPLIT=1 reverts)\n", a->dbg_k, a->dbg_in);
+                    }
+                }
+                if (frame->best_effort_timestamp != AV_NOPTS_VALUE)
+                    a->dec_ts_carry = frame->best_effort_timestamp +
+                        av_rescale_q(frame->nb_samples,
+                                     (AVRational){1, frame->sample_rate}, a->ist_tb);
+                else
+                    a->dec_ts_carry = AV_NOPTS_VALUE;
+            }
             ret = audio_push(a, frame);
             av_frame_unref(frame);
             if (ret < 0) goto done;
