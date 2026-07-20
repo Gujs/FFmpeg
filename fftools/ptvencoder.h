@@ -651,6 +651,19 @@ typedef struct AudioState {
     int              decerr_supp;                     /* errors suppressed this window (still counted) */
     int64_t          wd_frame_us;                     /* wall time of the last decoded frame (seeded at first packet) */
     int64_t          wd_pkts;                         /* packets received since the last decoded frame */
+    /* 1.0.1-pre19 #46 [PTV-ACHOP] — post-storm stuck-chop escape (g_achop). A track in
+     * SUSTAINED chop (decode-error or self-shed rate above the floor for g_achop_sust_min
+     * minutes — the Azorse variant where the corruption never ends and the slot warbles
+     * until a process restart) escapes via a FULL audio-path rebuild: decoder swap +
+     * graph/swr teardown + the 0.9.17.1 AFMT impossible-seed, so the path re-forms from
+     * the next confirmed-clean frames. Rate-limited (g_achop_relimit_us per track) so a
+     * permanently-broken source cycles quietly instead of chopping. */
+    int64_t          achop_win_wc;                    /* 10s sample window start (wall µs) */
+    int64_t          achop_win_errs;                  /* dec_errs snapshot at window start */
+    int64_t          achop_win_sheds;                 /* shed count snapshot at window start */
+    int              achop_sust;                      /* consecutive windows at/above the chop floor */
+    int64_t          achop_last_wc;                   /* wall µs of the last escape (rate limit) */
+    int              achop_rebuilds;                  /* escapes this run */
     int64_t          shed_mark;                       /* 1.0.1-pre8 (d): g_shed_cnt snapshot while no shed window is
                                                        * open; " [self: N pkts shed]" = cnt_now − mark on AGLUE/ASTEP
                                                        * lines within 5s of a self-inflicted queue drop */
@@ -1136,6 +1149,9 @@ extern int     g_aglue_ceil;
 extern int     g_discont;
 extern int     g_gapdiscrim;
 extern int     g_adecwd;
+extern int     g_achop;                                   /* 1.0.1-pre19 #46 stuck-chop escape (see ptvencoder.c) */
+extern int     g_achop_errs_min, g_achop_sheds_min, g_achop_sust_min;
+extern int64_t g_achop_relimit_us;
 extern int     g_anchor_headfill;
 extern int64_t g_wrap_guard_us;
 extern int     g_aglue_ms;

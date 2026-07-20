@@ -117,6 +117,15 @@ int     g_adecwd = 1;              /* 1.0.1 audio decode-death watchdog (PTV_NO_
                                            * decode-error TOLERANCE in audio_thread (drop + [PTV-ADEC] + continue,
                                            * instead of silent thread death) is unconditional — only the reopen is
                                            * gated here. */
+int     g_achop = 1;               /* 1.0.1-pre19 #46 [PTV-ACHOP] stuck-chop escape (PTV_NO_ACHOP_REBUILD=1 kills):
+                                           * sustained per-track chop (decode-error/self-shed rate above the floors for
+                                           * g_achop_sust_min minutes — the Azorse never-ending-corruption variant, slot
+                                           * warbles until restart) triggers a FULL audio-path rebuild (decoder swap +
+                                           * graph/swr teardown + AFMT impossible-seed), rate-limited per track. */
+int     g_achop_errs_min  = 60;    /* PTV_ACHOP_ERRS_MIN: chop floor, decode errors per minute */
+int     g_achop_sheds_min = 120;   /* PTV_ACHOP_SHEDS_MIN: chop floor, self-shed packets per minute */
+int     g_achop_sust_min  = 3;     /* PTV_ACHOP_SUST_MIN: minutes the rate must hold before the escape */
+int64_t g_achop_relimit_us = 600000000; /* PTV_ACHOP_RELIMIT_S: min wall between escapes per track (default 10min) */
 /* P2 §7.1 (hybrid): apply the program-level discontinuity offset (tracked from the dense VIDEO reference)
  * to the SPARSE copied streams (DVB-sub/teletext, data, SCTE-35) that can't self-rebase — so an ad-break
  * PTS jump shifts them WITH the video instead of orphaning/vanishing them. Dense V/A (incl. copied AC-3)
@@ -2650,6 +2659,11 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_DISCONT")) g_discont = 0;     /* A/B: don't absorb source PTS discontinuities */
     if (getenv("PTV_NO_GAPDISCRIM")) g_gapdiscrim = 0;   /* gap-fix A/B: revert to unconditional forward absorb (old desync-on-audio-gap behaviour) */
     if (getenv("PTV_NO_ADECWD")) g_adecwd = 0;       /* 1.0.1: disable the audio decode-death watchdog (error TOLERANCE stays on) */
+    if (getenv("PTV_NO_ACHOP_REBUILD")) g_achop = 0; /* 1.0.1-pre19 #46: disable the sustained-chop full-path rebuild escape */
+    { const char *e = getenv("PTV_ACHOP_ERRS_MIN");  if (e && atoi(e) > 0) g_achop_errs_min  = atoi(e); }
+    { const char *e = getenv("PTV_ACHOP_SHEDS_MIN"); if (e && atoi(e) > 0) g_achop_sheds_min = atoi(e); }
+    { const char *e = getenv("PTV_ACHOP_SUST_MIN");  if (e && atoi(e) > 0) g_achop_sust_min  = atoi(e); }
+    { const char *e = getenv("PTV_ACHOP_RELIMIT_S"); if (e && atoi(e) > 0) g_achop_relimit_us = (int64_t)atoi(e) * 1000000; }
     if (getenv("PTV_NO_ANCHOR_HEADFILL")) g_anchor_headfill = 0;   /* 1.0.1: revert to first-packet-at-first_audio−h0 birth */
     /* 0.9.18.7: PTV_GAP_MIN_MS internalized (700ms — g_gap_min_us) */
     { const char *wg = getenv("PTV_WRAP_GUARD_S"); if (wg && atoi(wg) > 0) g_wrap_guard_us = (int64_t)atoi(wg) * 1000000; }  /* v0.9.16.1 wrap-guard threshold override (TEST ONLY) */

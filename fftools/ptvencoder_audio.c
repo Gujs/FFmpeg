@@ -2068,36 +2068,113 @@ static void adec_error(AudioState *a, int err)
  * hysteresis+rebuild in audio_feed re-configures downstream (same machinery as a source
  * format change). Swap only on successful open, so a failed reopen leaves the old
  * context in place (never a NULL a->dec) and retries a window later. */
-static void adec_reopen(AudioState *a)
+static int adec_swap(AudioState *a)
 {
     const AVCodec *codec = a->dec ? a->dec->codec : NULL;
     AVCodecContext *nd;
 
-    a->wd_frame_us = av_gettime_relative();   /* re-arm the window whatever happens below */
-    a->wd_pkts     = 0;
     if (!codec || !a->ist_par)
-        return;
+        return AVERROR(EINVAL);
     nd = avcodec_alloc_context3(codec);
     if (!nd)
-        return;
+        return AVERROR(ENOMEM);
     /* pre17 R1: owned codecpar/timebase copies — the mv demux reopen may have closed the
      * AVFormatContext an AVStream* would have pointed into. */
     avcodec_parameters_to_context(nd, a->ist_par);
     nd->pkt_timebase = a->ist_pkt_tb;
     if (avcodec_open2(nd, codec, NULL) < 0) {
         avcodec_free_context(&nd);
+        return AVERROR(EIO);
+    }
+    avcodec_free_context(&a->dec);
+    a->dec = nd;
+    a->dec_reopens++;
+    return 0;
+}
+
+static void adec_reopen(AudioState *a)
+{
+    a->wd_frame_us = av_gettime_relative();   /* re-arm the window whatever happens below */
+    a->wd_pkts     = 0;
+    if (adec_swap(a) < 0) {
         av_log(NULL, AV_LOG_WARNING,
                "[PTV-ADECWD] a%d(in%d) decoder reopen FAILED — keeping the old context, retrying in %ds\n",
                a->dbg_k, a->dbg_in, (int)(PTV_ADECWD_US / 1000000));
         return;
     }
-    avcodec_free_context(&a->dec);
-    a->dec = nd;
-    a->dec_reopens++;
     av_log(NULL, AV_LOG_WARNING,
            "[PTV-ADECWD] a%d(in%d) no decoded frames for %ds with packets arriving — decoder reopened "
            "(#%d, errs=%"PRId64"); anchor preserved, aresample absorbs the gap\n",
            a->dbg_k, a->dbg_in, (int)(PTV_ADECWD_US / 1000000), a->dec_reopens, a->dec_errs);
+}
+
+/* 1.0.1-pre19 #46 [PTV-ACHOP] — sustained-chop stuck-state escape. The Azorse post-storm
+ * variant where the corruption NEVER ends: repeated self-shed/erase-class events sustain
+ * indefinitely and the track warbles/chops until a process restart (the self-recovering
+ * variant — storm ends, corrector walks the bake out — is already covered by pre14+).
+ * pre18's #49 backoff suppressed the ACQUIRE churn; the remaining hole is the stuck LATCH
+ * in the decode→graph→swr path itself. Escape = the FULL audio-path rebuild the 0.9.17.1
+ * init-failure path proved out: swap the decoder, tear down graph+swr, seed impossible
+ * input params so the next confirmed-clean frames rebuild everything through the normal
+ * [PTV-AFMT] hysteresis. Anchor/pts state is PRESERVED (mid-run recovery, same as ADECWD).
+ * Rate-limited per track: a permanently-broken source cycles quietly instead of chopping.
+ * Detection runs on 10s windows in audio_thread: chop = decode-error rate OR self-shed
+ * rate at/above the per-minute floors, sustained g_achop_sust_min minutes. */
+static void achop_rebuild(AudioState *a)
+{
+    int swap = adec_swap(a);
+    a->achop_rebuilds++;
+    if (a->afg) { avfilter_graph_free(&a->afg); a->afsrc = a->afsink = NULL; a->fg_swr = NULL; a->fg_swr_flt = NULL; }
+    a->use_fg = 0;
+    swr_free(&a->swr);
+    /* 0.9.17.1 impossible-seed: every next frame differs from these, so the path re-forms
+     * from real, 5-frame-confirmed params via the [PTV-AFMT] rebuild in audio_feed. */
+    a->fg_in_rate = -1;
+    a->fg_in_fmt  = AV_SAMPLE_FMT_NONE;
+    av_channel_layout_uninit(&a->fg_in_chl);
+    av_channel_layout_uninit(&a->afmt_pending_chl);
+    a->afmt_pending_rate = 0; a->afmt_pending_fmt = AV_SAMPLE_FMT_NONE;
+    a->afmt_stable = 0;
+    a->afmt_rebuilds++;                        /* corrector event (§4.4), same as an AFMT rebuild */
+    av_log(NULL, AV_LOG_WARNING,
+           "[PTV-ACHOP] a%d(in%d) sustained audio chop (>=%d min above floor; errs=%"PRId64") — "
+           "full audio-path rebuild #%d: decoder %s, graph/swr torn down; re-forms from the next "
+           "clean frames [PTV-AFMT]; next attempt in >=%ds (PTV_NO_ACHOP_REBUILD=1 disables)\n",
+           a->dbg_k, a->dbg_in, g_achop_sust_min, a->dec_errs, a->achop_rebuilds,
+           swap < 0 ? "reopen FAILED (old context kept)" : "reopened",
+           (int)(g_achop_relimit_us / 1000000));
+}
+
+static void achop_tick(AudioState *a)
+{
+    int64_t now, errs, sheds, shed_now;
+    int chop;
+    if (!g_achop)
+        return;
+    now = av_gettime_relative();
+    shed_now = a->shed_cnt ? atomic_load_explicit(a->shed_cnt, memory_order_relaxed)
+                           : atomic_load_explicit(&g_shed_cnt, memory_order_relaxed);
+    if (!a->achop_win_wc) {
+        a->achop_win_wc    = now;
+        a->achop_win_errs  = a->dec_errs;
+        a->achop_win_sheds = shed_now;
+        return;
+    }
+    if (now - a->achop_win_wc < 10000000)
+        return;
+    errs  = a->dec_errs - a->achop_win_errs;
+    sheds = shed_now    - a->achop_win_sheds;
+    chop  = errs * 6 >= g_achop_errs_min || sheds * 6 >= g_achop_sheds_min;  /* per-minute rates */
+    a->achop_sust      = chop ? a->achop_sust + 1 : 0;
+    a->achop_win_wc    = now;
+    a->achop_win_errs  = a->dec_errs;
+    a->achop_win_sheds = shed_now;
+    if (a->achop_sust >= g_achop_sust_min * 6 &&
+        (!a->achop_last_wc || now - a->achop_last_wc >= g_achop_relimit_us)) {
+        a->achop_last_wc = now;
+        a->achop_sust    = 0;
+        achop_rebuild(a);
+    }
 }
 
 /* 1.0.1-pre15 #33 §3 (g_glueclass + PTV_NBS_FILL, opt-in): synthesize ONE quantum of stamped
@@ -2212,6 +2289,7 @@ void *audio_thread(void *arg)
         if (g_adecwd && a->wd_pkts > 0 &&
             av_gettime_relative() - a->wd_frame_us > PTV_ADECWD_US)
             adec_reopen(a);
+        achop_tick(a);   /* 1.0.1-pre19 #46: sustained-chop stuck-state escape (10s windows) */
     }
     /* flush decoder -> resampler/filtergraph -> encoder */
     avcodec_send_packet(a->dec, NULL);
