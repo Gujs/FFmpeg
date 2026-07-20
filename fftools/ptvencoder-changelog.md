@@ -7,6 +7,104 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(7r) BROKEN-AAC BATCH — pre19: three items (#42 / #46 / #38), one commit each.
+(#42) swr_convert SIGSEGV on a dead audio path at EOF. SYMPTOM: process crash
+on the broken-AAC awe/Azorse chaos capture (pre11 crash report 2026-07-16:
+SIGSEGV KERN_INVALID_ADDRESS at 0x3ab8 in swr_is_initialized inlined in
+swr_convert, swresample.c:722/:732). ROOT CAUSE (measured, fixture-reproduced
+byte-for-byte): fault address == offsetof(SwrContext, in_buffer.ch_count)
+dereferenced through NULL — the v0.9.17.1 dead-path NULL guard covered
+audio_feed only; the audio_thread EOF/death flush still called
+swr_convert(a->swr, ...) unguarded, and a track whose path init FAILED at open
+(undecodable broken-AAC phase: use_fg==0, swr==NULL, AFMT retry pending)
+crashed the moment the stream hit EOF or died. FIX: guard the flush; plus AFMT
+rebuild hardening — the rebuild configures swr/graph from a->dec while the
+CONFIRMING frame is what gets fed next, so a decoder-context/frame divergence
+(broken-AAC per-frame reconfig) could feed a frame with fewer channels than
+the configured input layout into swr_convert (reads through nonexistent plane
+pointers); mismatched frames are now dropped and detection re-arms.
+GATE: all-XOR-corrupt-audio Azorse capture as file input — pre18 exit 139
+(fresh crash report, identical signature), pre19 exit 0 clean EOF; also
+re-proven on the strict-lavc broken-71 TS run (init-failed track to EOF).
+(#46) [PTV-ACHOP] post-storm audio-chop stuck-state escape (g_achop,
+default ON). SYMPTOM (Azorse class, sensor-soak byproduct): a corruption
+phase that NEVER ends sustains repeated self-shed/erase events and the slot
+warbles/chops until a process restart; pre18 #49 backoff tamed the ACQUIRE
+churn but not the stuck decode->graph->swr LATCH. FIX: per-track 10s windows
+in audio_thread; chop = decode-error rate >= PTV_ACHOP_ERRS_MIN/min (60) OR
+self-shed rate >= PTV_ACHOP_SHEDS_MIN/min (120), sustained >=
+PTV_ACHOP_SUST_MIN minutes (3) -> FULL audio-path rebuild (decoder swap via
+the new adec_swap — factored from the ADECWD reopen —, graph+swr teardown,
+0.9.17.1 AFMT impossible-seed so the path re-forms from 5-frame-confirmed
+clean params; anchor/pts preserved; counts as an afmt-rebuild corrector
+event). One WARNING line per attempt; rate-limited PTV_ACHOP_RELIMIT_S (600)
+per track — a permanently-broken source cycles quietly instead of chopping.
+PTV_NO_ACHOP_REBUILD=1 kills (byte-inert; detection not even sampled).
+GATES (deadaudio recipe, every-3rd audio pkt XOR 0x55, looped tsp/UDP):
+pre18 = indefinite chop, 208 [PTV-ADEC] errors/180s, zero escapes; pre19
+(test-scaled SUST_MIN=1, RELIMIT_S=90) = escapes at t=50s and t=140s (exactly
+the rate limit), and on a mid-run switch to the clean feed the errors stop
+instantly, the impossible-seed [PTV-AFMT] rebuild fires (-1Hz (null) 0ch ->
+48kHz fltp 7.1) and output audio resumes (RMS -23dB, zero >=0.5s holes).
+(#38) TOLERANT AAC DECODE for the Azorse broken-7.1 class — lavc half in the
+NEW v2 patch 0004-aac-tolerant (branch aac-tolerant off master; libav*
+features are SEPARATE patches per the pre19 owner directive), app half here.
+SYMPTOM: broken phases emit 7.1-signalled AAC-LC with a CPE-first element
+sequence; strict lavc rejects every frame ("channel element 1.0 is not
+allocated" — 467/467 pkts on the 2026-07-15 capture) while VLC/FAAD play it.
+LAVC (0004): decoder private option tolerant_ch_alloc (default OFF =
+byte-identical): an element the positional mapper cannot place is mapped by
+its own type/id (existing allocation for that tag, else allocated on demand,
+bounds-checked SCE/CPE/CCE/LFE + MAX_ELEM_ID). HARDENED per owner directive
+(the same error fires on plain corruption/parser desync, which must never be
+decoded as audio): PERSISTENCE-BEFORE-TRUST — the SAME unexpected element
+pattern (ordered (type,id) additions) must repeat over 3 consecutive
+fully-parsed frames before any tolerated frame is released; qualifying frames
+decode (windowing state stays continuous) but are discarded as errors exactly
+like the strict path; any pattern change restarts qualification; tolerance
+covers ALLOCATION only (payload parse errors keep failing frames through the
+existing paths); output planes of absent elements are silenced (no
+uninitialized-buffer leak into a downmix). GA path only; ER/USAC untouched.
+APP (this patch): ptv_adec_opts() sets the option BY NAME via av_opt_set on
+the decoder priv context at both audio open sites (initial + adec_swap) — no
+compile-time dependency; against a stock lavc the option is simply absent and
+decode stays strict (verified: strict flood, dead track, clean exit).
+GATES: corruption fixture (per-frame VARYING bogus element ids, 7046
+target-site rejections) = tolerant releases NOTHING, identical to strict;
+one-off bogus element (LFE[9], exact "not allocated" site) = rejected
+identically both modes (md5-equal outputs); positive fixture
+azorse-broken71-ts.ts (GENUINE Azorse audio re-encoded stereo, ADTS
+channel_configuration precisely rewritten 2->7 via PES-aware ES walk —
+reproduces BOTH live log signatures) = released from frame 3, front-pair PCM
+SAMPLE-EXACT (md5) vs the true stereo decode from the first released frame;
+clean streams md5-identical option ON vs OFF and patched vs unpatched
+(option OFF); ptvencoder end-to-end on the broken TS (combined build):
+init-fail -> "pattern persisted 3 frames" -> [PTV-AFMT] -1Hz->48k/7.1 rebuild
+-> output audio RMS -33.7dB, zero silent holes, clean exit. The 2026-07-15
+VLC reference WAV did not survive the scratchpad wipe; the sample-exact
+front-pair identity is the (stronger) replacement gate. NOTE: broken phases
+only produce audio on builds carrying patch 0004; without it behavior is
+pre-#38 (silent track, AFMT self-heal on source recovery).
+LOCKED SET (final stock-lavc pre19 binary vs pre18-ref, all new envs at
+defaults): mir2 = full CONTENT-EXACT escmp MATCH (p18 a1 == p19 b2 — the
+pre18 gate's own verdict class); tb30 = no 3x3 escmp match (pre18 A/A
+precedent 0/10) but component-exact cross pairs (video ES+pts EXACT in one
+pair, audio ES+pts EXACT in two) and evseq differences 10-13 lines vs the
+SAME-BINARY A/A floor of 11 (all startup scatter: ANCHOR drop counts, LAYERA
+flush 63vs64 pkts, EMPTY wall digits); g2 = audio ES+pts EXACT in EVERY pair
+incl. A/A, video differs identically in A/A, evseq cross 12 == A/A 12; clean
+TruBLU (trublu-20260313-fresh, 30min file cell) audio ES BYTE-IDENTICAL
+across p18/p18-rerun/p19 (89c9d0bc...) with video md5 differing even
+p18-vs-p18 (x264 file-cell nondeterminism — the control that isolates it);
+fx51 corrector cell (TESTHS 40:15 + capped 300ms TESTWALK, dwell 60s/quiet
+30s) line-identical: armed -> ENGAGE R=+300ms -> PARK +300->-17ms corr=+313ms
+in 232s, 0 hs-step holds BOTH binaries (pre18 published +300->-16/+312/230s);
+kill cell PTV_NO_ACHOP_REBUILD=1 on the corrupt feed 150s = ACHOP 0 with 186
+ADEC errors flowing; zero [PTV-ACHOP]/divergence lines in every clean cell.
+fx50's crafted two-PID jump+gap sender did not survive as an artifact — its
+behavior class is covered by mir2's full MATCH (the #50/#33 flush machinery
+path) + the pre18-identical event sequences above; noted for the reviewer.
+
 (7q) LIVE-DEFECT BATCH — pre18: five items, one commit each, kill-switch each.
 (A) GAP-VERDICT vs LAYERA ONE-REMEDY INVARIANT (task #50; the AWE_Plus +2.38s live
 defect 2026-07-19 14:44). SYMPTOM: lipsync stepped to +2385ms flat at a source
