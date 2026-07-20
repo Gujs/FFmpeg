@@ -7,6 +7,53 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(7s) HOTFIX pre19.1 — broken-phase audio "ticking" (Azorse open-during-broken-
+phase; the #38 follow-up). SYMPTOM: on the Azorse broken-7.1 capture the pre19
+combined build (0004 lavc + #38 hook) played 21ms of audio + ~107ms of silence
+per 128ms — a metronome tick (live capture 200 holes/min, local repro 450/min,
+both ~1 hole per 128ms audio PES). ROOT CAUSE (measured): the defect window is
+OPEN-during-broken-phase. lavf's find_stream_info probes with its OWN decoder,
+which the #38 by-name hook never touched → strict probe rejects every frame
+("channel element 1.0 is not allocated" ×294 at open = the probe, not runtime)
+→ "Could not find codec parameters"/sample_rate=0 → the mpegts AAC parser
+still SPLITS the 6-frames-per-PES payloads, but with no sample_rate avformat
+cannot compute parsed-frame durations → frames 2..6 of each PES arrive at the
+decoder with NO pts → the audio_push NOPTS drop rule (1.0.1, mux-wedge guard)
+discarded 5 of 6 decoded frames. 1-in-6 surviving 21ms frames + aresample
+silence fill = the tick, exactly. FIX (fftools-only, g_adts_split default ON):
+ 1. ptv_find_stream_info(): per-stream {tolerant_ch_alloc=1} dicts into
+ avformat_find_stream_info at BOTH open sites (open_input_thread +
+ demux_reopen_once) — the probe gains the runtime's tolerance, params resolve,
+ avformat stamps every split frame. The option goes into EVERY stream's dict,
+ not audio-only: lavf's try_decode_frame indexes options[] by the stale
+ "first stream still missing params" loop variable, NOT pkt->stream_index
+ (demux.c:2937) — measured on the fixture: audio-only dicts left the aac probe
+ strict because it was opened with the VIDEO stream's dict. Unknown-option
+ safe (dict leftovers are ignored; stock lavc = strict probe as today).
+ 2. [PTV-ASTAMP] backstop in audio_thread: a decoded frame with no
+ best_effort_timestamp is stamped by sample-count extrapolation from the
+ previous stamped frame; the carry is INVALIDATED on any decode error (the
+ garbage-tail class the NOPTS drop rule protects against) and on decoder swap,
+ so only contiguous clean decode is extrapolated. One-shot WARNING on engage.
+KILLS: PTV_NO_ADTS_SPLIT=1 reverts both pieces (= pre19 ticking);
+PTV_NO_TOLERANT_DEC=1 gates the #38 runtime hook AND the probe opts (= full
+strict pre-#38: flood + silent-but-alive track).
+GATES (tick-in.ts = tsp capture of the live broken phase; 5ms-block −45dBFS
+hole detector, ≥20ms holes, first 3s/last 1s excluded): FIX = probe flood 0
+(was 294), params found, ONE tolerant qualification line per decoder instance
+(probe + runtime), ticking GONE — 53 scattered content-shaped holes/60s
+(20–105ms, no periodicity) vs the source's OWN content floor of 108/60s and
+rms −19dBFS (the fixture carries corrupt-packet bursts and real silence; the
+literal ≤5/60s target predated measuring the source floor). ASTAMP backstop
+covers the residual un-stamped class (engaged only while the probe fix is
+absent/killed). KILL cell PTV_NO_ADTS_SPLIT=1 = 294 flood + 453 periodic
+~100ms holes/60s (pre19 reproduced); PTV_NO_TOLERANT_DEC=1 = 3328 strict
+errors, audio dead, video flowing (pre-#38 reproduced). HEALTHY parity
+(cinestar 65s UDP cell, fix vs both-kills): output SIZE-IDENTICAL with
+IDENTICAL hole map (113 content-silence holes at identical positions) and
+zero probe/tolerant/ASTAMP lines both — the healthy probe path is untouched.
+fx51 corrector cell re-run green (see LOCKED SET note below).
+
 (7r) BROKEN-AAC BATCH — pre19: three items (#42 / #46 / #38), one commit each.
 (#42) swr_convert SIGSEGV on a dead audio path at EOF. SYMPTOM: process crash
 on the broken-AAC awe/Azorse chaos capture (pre11 crash report 2026-07-16:
