@@ -511,7 +511,6 @@ int     g_ratchrel = 1;
  * its own state and resumes at the next IDR (what a supervisor restart achieves, in-process).
  * Rate-limited to one attempt per 5min; loudly logged [PTV-SELFHEAL]. PTV_NO_SELFHEAL reverts. */
 int     g_selfheal = 1;
-int     g_vindbg;    /* TEMP pre13 diagnosis: PTV_VINDBG=1 traces the vin_pps window + governor */
 _Atomic int     g_selfheal_req;
 _Atomic int64_t g_v_arrive_wc;
 /* 1.0.1-pre17: sibling-slate mask (bit k = input slot k black-slated; compositor writes,
@@ -1208,10 +1207,6 @@ static void *decode_thread(void *arg)
                 if (trusted && gsw && gnw - gsw < 600LL * 1000000 &&
                     av_thread_message_queue_nb_elems(d->video_q) > gpps) {
                     int64_t step = 800000 / gpps;       /* 4/5 input tick = 1.25x INPUT realtime */
-                    if (g_vindbg && !gov_next_us)
-                        av_log(NULL, AV_LOG_INFO, "[PTV-VINDBG] gov ENGAGE gpps=%d decl=%d step=%"PRId64"us vq=%d\n",
-                               gpps, d->in_pps_decl, step,
-                               av_thread_message_queue_nb_elems(d->video_q));
                     if (!d->hold) atomic_store_explicit(&g_gov_on, 1, memory_order_relaxed);
                     if (d->gov_on) atomic_store_explicit(d->gov_on, 1, memory_order_relaxed);   /* pre16: per-input */
                     if (gov_next_us > gnw) {
@@ -1251,9 +1246,6 @@ static void *decode_thread(void *arg)
                     }
                     gov_next_us = FFMAX(gnw, gov_next_us) + step;
                 } else {
-                    if (g_vindbg && gov_next_us)
-                        av_log(NULL, AV_LOG_INFO, "[PTV-VINDBG] gov DISENGAGE gpps=%d trusted=%d vq=%d\n",
-                               gpps, trusted, av_thread_message_queue_nb_elems(d->video_q));
                     if (!d->hold) atomic_store_explicit(&g_gov_on, 0, memory_order_relaxed);
                     if (d->gov_on) atomic_store_explicit(d->gov_on, 0, memory_order_relaxed);   /* pre16: per-input */
                     gov_next_us = 0;                    /* incl. untrusted rate: fail open, never wedge */
@@ -2133,7 +2125,6 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
      * garbage. a_in[] is the track→slot map the shared stats builder keys the video term by
      * (identically 0 on single input); plain ints, set before any thread spawns. */
     g_rsx.n_a  = n_audio;
-    g_rsx.n_in = n_input;
     for (k = 0; k < n_audio; k++)
         g_rsx.a_in[k] = asrc_in[k];
     if (multiview && g_rsync_sense && n_audio > 0) {
@@ -2642,7 +2633,6 @@ int main(int argc, char **argv)
     init_dynload();
     av_log_set_level(AV_LOG_INFO);
     g_diag = !!getenv("PTV_DIAG");
-    g_vindbg = !!getenv("PTV_VINDBG");   /* TEMP pre13 diagnosis probe */
     if (getenv("PTV_NO_AVLOCK")) g_avlock = 0;   /* revert to source-locked audio (drifts on dup) */
     if (getenv("PTV_LAYERA")) g_layera = 1;       /* legacy 0004: audio-derived common offset at glue points (corrects source A/V mis-mux) */
     if (getenv("PTV_REPRIME")) g_reprime = 1;     /* fast buffer re-prime after a glue (default ON since v0.9.10; kept for compat) */

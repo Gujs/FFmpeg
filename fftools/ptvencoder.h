@@ -300,7 +300,6 @@ typedef struct RsyncSense {
     _Atomic int64_t ma_wall[PTV_MAX_AUDIO]; /* wall µs of the last audio sample */
     _Atomic int64_t ea_us[PTV_MAX_AUDIO];   /* per-track audio stream ledger E_a (µs) */
     int             n_a;                    /* transcoded tracks wired (pre16: = n_audio ALWAYS, mv included) */
-    int             n_in;                   /* wired input slots (1 = single input) */
     int             a_in[PTV_MAX_AUDIO];    /* track → input slot map (stats printers; plain int,
                                              * set in transcode() before threads spawn) */
 } RsyncSense;
@@ -661,7 +660,6 @@ typedef struct AudioState {
      * is INVALIDATED on any decode error (the garbage-tail class the drop rule was added
      * for) and on a decoder swap, so only contiguous clean decode is ever extrapolated. */
     int64_t          dec_ts_carry;                    /* next expected decoded-frame ts (ist_tb); AV_NOPTS_VALUE = no valid base */
-    int64_t          nopts_stamped;                   /* frames stamped by extrapolation this run */
     int              astamp_logged;                   /* one-shot engage log */
     /* 1.0.1-pre19 #46 [PTV-ACHOP] — post-storm stuck-chop escape (g_achop). A track in
      * SUSTAINED chop (decode-error or self-shed rate above the floor for g_achop_sust_min
@@ -1006,7 +1004,6 @@ typedef struct DemuxArgs {
                                            * §5.A.2 (g_progoff_av): dense V/A self-rebase by the SHARED first-crosser amount. */
     int64_t               splice_adj;       /* §5.A.2: the first-crosser's discontinuity adj for the current splice */
     int64_t               splice_adj_us;    /* §5.A.2: wall-clock when splice_adj was set (debounce; 0 = never) */
-    int64_t               splice_ref_v;     /* Layer A: video's own adj if it crossed THIS splice before audio (0 = none) → audio re-aligns video to its reference when it crosses */
     int                   drop_until_kf;  /* P2 2b: armed on a video discontinuity → drop video until the next IDR */
     int64_t               kf_arm_us;      /* P2 2b: wall time the drop was armed (first-arm-only escape deadline) */
     int64_t               kf_arm_vdrop;   /* DIAG: vdrop count when DUKF armed (→ per-event drop count at resume) */
@@ -1221,7 +1218,6 @@ extern int     g_slow;
 extern int     g_qshed;                  /* (a) GOP-coherent video_q overflow (PTV_NO_QSHED reverts) */
 extern int     g_ratchrel;               /* (b) ratchet release on starvation contradiction (PTV_NO_RATCHREL) */
 extern int     g_selfheal;               /* (c) self-heal re-prime backstop (PTV_NO_SELFHEAL) */
-extern int     g_vindbg;                 /* TEMP pre13 diagnosis: vin_pps window + governor trace */
 extern _Atomic int     g_selfheal_req;   /* (c) master output thread -> decode thread */
 extern _Atomic int64_t g_v_arrive_wc;    /* wall us of the last video pkt at the demux (input-flowing signal) */
 extern _Atomic int64_t g_shed_wall;      /* (d) wall us of the last self-inflicted queue drop (ANY input —

@@ -2348,7 +2348,6 @@ void *audio_thread(void *arg)
                 if (frame->best_effort_timestamp == AV_NOPTS_VALUE &&
                     a->dec_ts_carry != AV_NOPTS_VALUE) {
                     frame->pts = frame->best_effort_timestamp = a->dec_ts_carry;
-                    a->nopts_stamped++;
                     if (!a->astamp_logged) {
                         a->astamp_logged = 1;
                         av_log(NULL, AV_LOG_WARNING,
@@ -2460,7 +2459,8 @@ int build_audio_filter(AudioState *a, AVCodecContext *adec, AVRational tb,
             }
         }
     }
-    if (a->fg_swr)
+    if (a->fg_swr && g_diag)   /* 1.0.1-pre20: DIAG-demoted (slip-probe investigation closed pre11;
+                                * the periodic [PTV-SWRDELAY] readout is already DIAG-only) */
         av_log(NULL, AV_LOG_INFO, "[PTV-SWRDELAY] sensor armed (aresample SwrContext found)\n");
 
     /* deliver encoder-sized frames so we can feed them straight to the AAC

@@ -29,9 +29,6 @@
 #include "ptvencoder.h"
 
 static int     g_h0_reanchor_ms = 120;   /* trigger (ms); internalized 0.9.18.7 (was PTV_H0_REANCHOR_MS) */
-/* PTV_DIAG: compositor publishes its current VIDEO output time (us) so the audio probe can
- * log a synchronized per-track audio-minus-video offset. Temporary diagnostic. */
-static _Atomic int64_t g_vout_us;
 /* fill a planar-YUV / RGB frame with black (held cell for a not-yet-arrived or
  * stale multiview slot): luma 16, chroma 128, RGB 0. */
 static void ptv_fill_black(AVFrame *f)
@@ -607,7 +604,6 @@ void *compositor_thread(void *arg)
             }
         }
         tick++;
-        g_vout_us = mv_tick_us(c, c->emitted);   /* PTV_DIAG: video output time for the audio probe */
 
         if (g_diag) {
             int64_t nowd = av_gettime_relative();

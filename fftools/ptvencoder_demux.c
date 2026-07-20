@@ -410,28 +410,6 @@ static int ptv_disc_compare(const void *a, const void *bb)
 /* Record this stream's old/new bases on a detected jump and arm jump_detected.
  * Detection runs against the per-stream wrap_last_us we keep in the disc buffer
  * (post-unwrap DTS in us), NOT the demux_unwrap wrap_last (stream-tb raw). */
-/* PTV-QSNAP: one-line depth snapshot of EVERY queue in the pipeline — video_q (demux->decode
- * feed), frame_q cushion (via the published g_frameq_depth atomic), each transcoded audio_q,
- * each per-rung mux_q, and the LAYERA disc buffer. Logged at buffer-start and at flush so the
- * pair shows whether the rebase window starves the decode feed (video_q/frame_q drain during
- * the straddle -> house dup-fill). g_diag-gated, alongside the [PTV-LAYERA] logs. */
-static void ptv_qsnap(DemuxArgs *d, PtvDiscBuf *b, const char *tag)
-{
-    char qs[320]; int p = 0, k;
-    p += snprintf(qs + p, sizeof(qs) - p, "vq=%d frameq=%d aq=[",
-                  av_thread_message_queue_nb_elems(d->video_q),
-                  (int)atomic_load_explicit(&g_frameq_depth, memory_order_relaxed));
-    for (k = 0; k < d->n_audio && p < (int)sizeof(qs); k++)
-        p += snprintf(qs + p, sizeof(qs) - p, "%s%d", k ? "," : "",
-                      av_thread_message_queue_nb_elems(d->audio_q[k]));
-    p += snprintf(qs + p, sizeof(qs) - p, "] muxq=[");
-    for (k = 0; k < d->n_out && p < (int)sizeof(qs); k++)
-        p += snprintf(qs + p, sizeof(qs) - p, "%s%d", k ? "," : "",
-                      av_thread_message_queue_nb_elems(d->mux_q[k]));
-    snprintf(qs + p, sizeof(qs) - p, "] disc=%d", b->nb_packets);
-    av_log(NULL, AV_LOG_INFO, "[PTV-QSNAP] %s: %s\n", tag, qs);
-}
-
 static int ptv_disc_detect_jump(DemuxArgs *d, PtvDiscBuf *b, int stream_idx,
                                 int64_t raw_dts, int64_t last_dts)
 {
@@ -461,7 +439,6 @@ static int ptv_disc_detect_jump(DemuxArgs *d, PtvDiscBuf *b, int stream_idx,
            "[PTV-LAYERA] jump on stream %d: %.3fs -> %.3fs (delta=%.3fs) — buffering\n",
            stream_idx, (double)last_dts / AV_TIME_BASE,
            (double)raw_dts / AV_TIME_BASE, (double)delta / AV_TIME_BASE);
-    if (g_diag) ptv_qsnap(d, b, "buffer-start");
     return 1;
 }
 
@@ -1001,7 +978,6 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
                    "[PTV-GLUE] paired flush: shared_offset=%.3fs av_mismatch=%+.3fs -> audio content path\n",
                    (double)so / AV_TIME_BASE, (double)mm / AV_TIME_BASE);
     }
-    if (g_diag) ptv_qsnap(d, b, "at-flush");
 
     for (i = 0; i < b->nb_packets; i++) {
         PtvDiscPacket *dp = b->packets[i];
@@ -2249,9 +2225,6 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
             {
                 int64_t anw = av_gettime_relative();
                 if (!d->vin_win_us || anw - d->vin_last_us > 1000000) {
-                    if (g_vindbg && d->vin_win_us)
-                        av_log(NULL, AV_LOG_INFO, "[PTV-VINDBG] win RESET gap=%"PRId64"ms cnt=%d elapsed=%"PRId64"ms\n",
-                               (anw - d->vin_last_us) / 1000, d->vin_win_cnt, (anw - d->vin_win_us) / 1000);
                     d->vin_win_us = anw; d->vin_win_cnt = 0;   /* startup or a gap: fresh window */
                 } else {
                     d->vin_win_cnt++;
@@ -2265,10 +2238,6 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                         /* pre13: publish age gates trust — a droughty dispatch pattern (>1s gaps
                          * more often than every 4s, e.g. a stalled/clumped source) stops publishes
                          * entirely, and the governor must not keep pacing on a frozen value. */
-                        if (g_vindbg)
-                            av_log(NULL, AV_LOG_INFO, "[PTV-VINDBG] win PUBLISH pps=%d cnt=%d elapsed=%"PRId64"ms\n",
-                                   atomic_load_explicit(&d->vin_pps, memory_order_relaxed),
-                                   d->vin_win_cnt, (anw - d->vin_win_us) / 1000);
                         d->vin_win_us = anw; d->vin_win_cnt = 0;
                     }
                 }
