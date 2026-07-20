@@ -1712,6 +1712,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         if (!kdec) { ret = AVERROR(ENOMEM); goto end; }
         avcodec_parameters_to_context(kdec, kist->codecpar);
         kdec->pkt_timebase = kist->time_base;
+        ptv_adec_opts(kdec);               /* #38: tolerant AAC decode (by name, optional) */
         if (avcodec_open2(kdec, kdecoder, NULL) < 0) {
             av_log(NULL, AV_LOG_WARNING, "audio track %d decoder failed; skipped\n", k);
             avcodec_free_context(&kdec); continue;

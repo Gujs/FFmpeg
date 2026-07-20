@@ -2068,6 +2068,19 @@ static void adec_error(AudioState *a, int err)
  * hysteresis+rebuild in audio_feed re-configures downstream (same machinery as a source
  * format change). Swap only on successful open, so a failed reopen leaves the old
  * context in place (never a NULL a->dec) and retries a window later. */
+/* 1.0.1-pre19 #38: enable the lavc AAC tolerant channel-element allocation BY NAME on the
+ * decoder's private context — no compile-time dependency: a build against a lavc without
+ * the option (patch 0004 not applied) simply doesn't find it and decodes strictly, the
+ * pre-#38 behavior. With it, broken broadcast phases (Azorse: 7.1-signalled AAC carrying a
+ * CPE-first element sequence, strict lavc rejects every frame with "channel element 1.0 is
+ * not allocated" while VLC/FAAD play it) decode into real PCM. Harmless on non-AAC audio
+ * decoders (option not found). Call before avcodec_open2 (read per-frame either way). */
+void ptv_adec_opts(AVCodecContext *dec)
+{
+    if (dec && dec->priv_data)
+        av_opt_set(dec->priv_data, "tolerant_ch_alloc", "1", 0);
+}
+
 static int adec_swap(AudioState *a)
 {
     const AVCodec *codec = a->dec ? a->dec->codec : NULL;
@@ -2082,6 +2095,7 @@ static int adec_swap(AudioState *a)
      * AVFormatContext an AVStream* would have pointed into. */
     avcodec_parameters_to_context(nd, a->ist_par);
     nd->pkt_timebase = a->ist_pkt_tb;
+    ptv_adec_opts(nd);                         /* #38: tolerant AAC decode (by name, optional) */
     if (avcodec_open2(nd, codec, NULL) < 0) {
         avcodec_free_context(&nd);
         return AVERROR(EIO);

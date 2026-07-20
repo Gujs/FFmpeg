@@ -1298,6 +1298,7 @@ void *watchdog_thread(void *arg);
 void *output_thread(void *arg);
 /* ptvencoder_audio.c */
 void *audio_thread(void *arg);
+void ptv_adec_opts(AVCodecContext *dec);   /* 1.0.1-pre19 #38: opt-in tolerant AAC decode (by name, missing-option tolerant) */
 int build_audio_filter(AudioState *a, AVCodecContext *adec, AVRational tb,
                        const char *af, enum AVSampleFormat out_fmt);
 /* ptvencoder_demux.c */
