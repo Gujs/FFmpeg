@@ -583,6 +583,28 @@ struct AACDecContext {
     int target_level;
     int warned_loudness_missing;
 
+    /**
+     * When set, a channel element present in the bitstream but absent from the
+     * configured channel mapping is allocated and mapped on demand instead of
+     * failing the frame (broadcast streams whose declared channel_configuration
+     * does not match the transmitted element sequence). 0 disables (default).
+     *
+     * Persistence-before-trust: tolerated output is only released after the
+     * SAME unexpected element pattern (the ordered set of (type,id) additions)
+     * has repeated over TOLERANT_QUAL_FRAMES consecutive fully-parsed frames;
+     * until then such frames decode (keeping windowing state continuous) but
+     * are discarded as errors, exactly like the strict path. A one-off unknown
+     * element — bitstream corruption, parser desync — therefore never reaches
+     * the output; only a persistent config/element-sequence mismatch does.
+     */
+    int tolerant_ch_alloc;
+    uint8_t tol_sig[16];       ///< this frame's unexpected additions, (type<<4)|id in order
+    uint8_t tol_prev_sig[16];  ///< the pattern under qualification
+    int tol_n;                 ///< additions this frame (-1: overflowed, frame invalid)
+    int tol_prev_n;            ///< length of the pattern under qualification
+    int tol_consec;            ///< consecutive fully-parsed frames with that same pattern
+    int warned_tolerant_alloc;
+
     OutputConfiguration oc[2];
     int warned_num_aac_frames;
     unsigned warned_71_wide;
