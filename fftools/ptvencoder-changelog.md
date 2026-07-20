@@ -21,79 +21,99 @@ by broken-phase relabel-erasures; the swr-fallback next_pts free counter frozen
 across the outage; a live corr trim sized against the dead mapping; a stale m_a
 EMA blending pre-rebuild samples. FIX (three pieces):
  (a) ptv_rebuild_reanchor() at rebuild COMPLETION in audio_feed (ACHOP rebuilds
- complete through the same site): base re-derived BIRTH-EQUIVALENT from the
- current house mapping — output = content−h0 with glue_off=0, via
- ptv_anchor_next_pts(), the factored single copy of the [PTV-ANCHOR] birth
- formula (birth calls it too; the two can never diverge). Fresh AGLUE label
- baseline (no step classification across the rebuild), pad ledger + pending
- tripwire cleared. CORR RETIREMENT DECISION: carried corr_us is RETIRED to 0
- (logged with the amount) — the new base includes reality, so a kept trim would
- DOUBLE-apply; a DWELL/ENGAGED/PARKED corrector falls back to ARMED (fresh full
- dwell, the §4 re-engagement rule).
+ complete through the same site): fresh AGLUE label baseline (no step
+ classification across the rebuild), pad ledger + pending tripwire cleared,
+ swr-fallback counter re-derived via ptv_anchor_next_pts() — the factored
+ single copy of the [PTV-ANCHOR] birth formula (birth calls it too; the two
+ can never diverge) — clamped FORWARD-only (mux invariant). CORR RETIREMENT
+ DECISION (fix-round rr20 F1 corrected): retirement is a LABEL-NEUTRAL
+ BOOKKEEPING TRANSFER — corr folds INTO glue_off (inj sum unchanged ⇒ door
+ labels perfectly continuous ⇒ no backward step can arise at retirement),
+ logged with the amount; a DWELL/ENGAGED/PARKED corrector falls back to ARMED
+ (fresh full dwell, the §4 re-engagement rule) and the trim never
+ double-applies because the (c) step below is sized by the MEASURED
+ post-transfer R. THE FIRST CUT zeroed glue_off + corr outright — CONFIRMED
+ BLOCKER (rr20, 3 sites): retiring a positive sum stepped the door labels
+ BACKWARD by it → backward audio DTS → mpegts "non monotonically increasing
+ dts" → mux_thread exits on first write error → DEAD WIRE, zombie process, no
+ watchdog (flap222 died at 54.09s on rebuild-2, walk at 264.57s retiring corr
+ +228ms, gap90 at 205.2s — ANY channel rebuilding twice died at the second
+ rebuild). Zeroing glue was also WRONG in the balanced case: the sensor pairs
+ glue against the demux edit ledgers (R = dm + E_v − E_a), so glue that
+ mirrors ledgered video edits is label-TRUTH, not pollution — discarding it
+ re-opened R by the ledger difference (measured: dm −261 / ev +821 → R +560
+ baked).
  (b) m_a EMA re-seed — the rebuild joins the pre17 baseline-redefinition
  re-seed list (REANCHOR2 / ACQUIRE / slate-recovery); m_v deliberately NOT
  re-seeded (an audio-path rebuild does not move the slot's video mapping).
- (c) bounded residual step INSIDE the rebuild discontinuity window only
- (defined precisely: 10s wall from rebuild completion, ≥10 emitted frames of
- settle, ONE step max): |R| > engage band → glue_off += R (cap ±5s, one
- WARNING; dR/d(glue_off) = −1, the same door algebra as corr — verified against
- the sensor inj identity m_a = inj − h0 − slip on the fg path). The rebuild is
- already an audible discontinuity, so the step is free; glue_events++ hands the
- corrector a fresh dwell for leftovers. Outside the window the step can NEVER
- fire (reanch_wc zeroed at expiry). (c) is single-input/non-follow ONLY: on the
- mv audio-follow path the closed-loop PLL owns content alignment (it measures
- out_v−out_a directly and would re-track a base step — two actuators on one
- displacement); there (a)+(b) still apply and the pre17 ACQUIRE re-seed
- restores honesty within ~an acquire.
-GATES (local x264/tsp cells, pre20 vs pre19.1-ref):
- (i) synth flap fixture p20_flap222 (30s stereo → 5.1 → stereo, continuous ts;
- 5.1 not 7.1 — ADTS cannot carry channelConfiguration>7, tick-in covers the
- real 7.1 class): pre20 lipsync=+0ms FLAT through BOTH rebuilds (bound ≤100ms
- within 10s — met at the first stats sample); pre19.1 control = +261ms baked
- after rebuild 1 COMPOUNDING to +821ms after rebuild 2 (the class, in
- miniature); both rebuilds log re-anchored + one residual step each, and the
- second retirement retires exactly the first step (+261ms) — idempotent.
- (ii) outage-resume fixture p20_gap90 (60s stereo / 90s NO audio packets /
- 60s 5.1 resume — the resume-in-a-different-format outage): sensor `--`
- through the outage; at resume the AFMT rebuild fires, re-anchor + ONE
- residual step +821ms (the 90s-outage class, the live ~1s magnitude) and the
- FIRST post-resume reading is lipsync=+0ms (bound ≤100ms within 10s — met at
- the first stats sample); pre19.1 CONTROL = +821ms FLAT from the first
- post-resume reading onward (the corrector would walk it ~10min — the live
- class reproduced at its magnitude). NEGATIVE CONTROLS (recorded):
- p20_dead90 (all-XOR audio) and p20_chop90 (every-3rd XOR) both produce ZERO
- decode errors on this source class — the demux discards / the parser drops
- the garbage silently, no rebuild fires, both builds read +1ms after heal
- (byte-inert no-rebuild path). ACHOP-triggered rebuilds are therefore covered
- BY CONSTRUCTION (achop_rebuild funnels into the same AFMT completion site;
- the pre19 #46 fixture-gate stands) — an ACHOP-reaching local fixture for
- THIS source class is an open fixture gap, noted for the reviewer.
- (i-tick note): on the combined 0004-tolerant build the tick-in capture
- decodes continuously as 7.1 (no AFMT in 100s, lipsync +0ms BOTH builds =
- broken-phase parity clean); the rebuild-class controls moved to the synth
- fixtures above.
- (iii) birth parity: [PTV-ANCHOR] birth line IDENTICAL (first_audio-h0=+8ms,
- h0=5781ms) across pre20/ref/kill (pre-anchor drop counts differ with wall
- join phase — A/A class); the item-2 single parity cell's audio ES was already
+ (c) bounded residual step(s) INSIDE the rebuild discontinuity window only
+ (defined precisely: 10s wall from rebuild completion; each fire needs a fresh
+ ≥10-emitted-frame settle; MULTI-step with a ±5s TOTAL budget per window —
+ fix round: a seam's video-side [PTV-DISCONT] ledger edit can land ~500ms
+ AFTER a first one-shot fire and re-open R, measured on the flap fixture):
+ |R| > engage band → glue_off += R (one WARNING per fire carrying the window
+ total; dR/d(glue_off) = −1, the same door algebra as corr — verified against
+ the sensor inj identity m_a = inj − h0 − slip on the fg path; pend_comp
+ COMPOSED, not clobbered — rr20 minor). The rebuild is already an audible
+ discontinuity, so the steps are free; glue_events++ hands the corrector a
+ fresh dwell for leftovers. Outside the window no step can EVER fire
+ (reanch_wc zeroed at expiry). A NEGATIVE step moves the door labels BACKWARD
+ — it arms the MONOTONIC EMISSION GUARD (the mux must NEVER see a backward
+ audio DTS, absolute invariant): frames whose output label does not exceed
+ the last emitted one are DROPPED (the birth opts<0 rule, mirrored) until
+ the labels catch up naturally — bounded by the step size, released with one
+ WARNING carrying the dropped count; disarm is catch-up-only (a wall expiry
+ would re-open the backward window). (c) is single-input/non-follow ONLY: on
+ the mv audio-follow path the closed-loop PLL owns content alignment (it
+ measures out_v−out_a directly and would re-track a base step — two actuators
+ on one displacement); there (a)+(b) still apply and the pre17 ACQUIRE
+ re-seed restores honesty within ~an acquire; mv-follow emission is already
+ monotonic by the af_last_out clamp.
+GATES (fix-round rr20 F2 battery — every cell WIRE-LIVENESS-asserted: output
+still being written at kill time, ffprobe duration == cell duration − startup
+(floor runs−15s), stats lines to the end, zero muxer non-monotonic errors;
+8/8 cells PASS, controls included; fresh 70xx ports, pid-scoped kills;
+pre20fix-item1.sh):
+ (i) synth flap p20_flap222 (30s stereo → 5.1 → stereo, continuous ts; 5.1 not
+ 7.1 — ADTS cannot carry channelConfiguration>7, tick-in covers the real 7.1
+ class): pre20 = 2 rebuilds, label-neutral retirements, residual steps +261ms
+ (rb1) and +560ms (rb2 — the MULTI-step design earning its keep: rb2's window
+ total includes the seam's late video ledger edit), lipsync=+0ms on ALL 48
+ samples, wire alive 96s (the pre-fix cut died HERE at 54.09s on rebuild-2);
+ pre19.1 control AND kill control: lipsync +0→+261ms→+821ms compounding
+ residual (IDENTICAL histograms 12/15/21 samples — kill parity exact), both
+ liveness-PASS (the no-reanchor path never had the blocker).
+ (ii) outage-resume p20_gap90 (60s stereo / 90s NO audio packets / 60s 5.1
+ resume): pre20 = sensor `--` through the outage, resume rebuild + ONE +821ms
+ step 4ms after it, 59×+0ms (2 in-window transient samples), the fixture-loop
+ seam's SECOND rebuild folds the carried +821ms with NO step needed, wire
+ alive 211s (pre-fix died at 205.2s on that second rebuild); pre19.1 control
+ = +821ms FLAT (34 samples; the corrector would walk it ~10min — the live
+ Azorse class at magnitude). NEGATIVE controls (recorded): p20_dead90
+ (all-XOR) and p20_chop90 (every-3rd XOR) produce ZERO decode errors on this
+ source class (demux discard / parser drop) — no rebuild fires, both builds
+ +1ms after heal; ACHOP-triggered rebuilds covered BY CONSTRUCTION (same AFMT
+ completion site; pre19 #46 gate stands) — an ACHOP-reaching local fixture
+ for this class is an open fixture gap, noted.
+ (iii) birth parity: [PTV-ANCHOR] birth line identical (first_audio-h0=+8ms,
+ h0=5781ms) across pre20/ref/kill; the item-2 single parity cell's audio ES
  byte-identical.
- (iv) corrector interaction (p20_walkflap: 270s stereo then 5.1; test-scaled
- dwell 60s/quiet 30s, TESTWALK 5000µs/s capped 300ms at t=30s): ENGAGE
- R=+300ms → corr integrated to +228ms* by the flap; the rebuild log reads
- "retired glue +0ms corr +228ms" (retirement BEFORE the residual measurement)
- then ONE +300ms step — total applied 300ms, NOT 528ms = no double-correction;
- the second rebuild retires exactly the step (+300ms) with corr +0 and no
- re-engage (fresh full dwell required).
- (v) kill PTV_NO_REBUILD_REANCHOR=1 reproduces the control line-for-line
- (+261ms baked after rebuild 1, no re-anchor lines).
- FINAL-BINARY smoke (post mv-follow gating): flap re-run on the release tip —
- identical re-anchor/step lines, lipsync=+0ms on all 27 samples.
- TEST-HARNESS NOTE (bitten twice this session, recorded for future cells):
- killing a backgrounded shell FUNCTION kills the subshell, not the binary —
- mv cells must pid- or pkill-target the BINARY and use FRESH ports per
- attempt; and cp over a running/mapped binary invalidates its macOS code
- signature (fresh exec dies pre-banner) — rm before cp when refreshing
- gates/bin.
-
+ (iv) corrector interaction (p20_walkflap, test-scaled dwell 60s/quiet 30s,
+ TESTWALK 5000µs/s capped 300ms at t=30s, FRESH ports — the first run was
+ port-collision-contaminated): ENGAGE R=+300ms → corr steered to +229ms at
+ the flap; rebuild logs "corr +229ms retired into the base ledger (door
+ labels continuous)" — the fold keeps the realized trim (real content
+ alignment), corr → 0, corrector re-dwells, NO second engage; ONE +251ms
+ step (the measured post-fold residual); wire alive 326s (the pre-fix cut
+ died HERE at 264.57s — the AWE parked-corr class); post-rebuild stats
+ lipsync flat −298/−299ms = the capped synthetic walk turned into a real
+ offset by the step (the documented TESTWALK artifact: corrector-read
+ R = −299 + walk(+300) ≈ 0, quiet).
+ (v) kill PTV_NO_REBUILD_REANCHOR=1: zero re-anchor lines, lipsync histogram
+ IDENTICAL to the pre19.1 control sample-for-sample, liveness PASS.
+ (i-tick) tick-in 100s: no AFMT fires on the combined 0004-tolerant build
+ (capture decodes continuously as 7.1); lipsync +0ms all 48 samples BOTH
+ builds, liveness PASS both — broken-phase parity clean.
 ITEM 2 — CLEANUP SWEEP (behavior-inert; separate commit, gates bound to it).
 Dead code removed (each provably unreachable or write-only): g_vout_us (mv,
 write-only since the probe era), RsyncSense.n_in (assigned once, never read),
@@ -136,8 +156,10 @@ ITEM 3 — RIDERS (one batch commit).
  loop) treats it as EOF → stop pulling → the proven file-EOF flush/teardown →
  clean rc-0 exit. Final duration ≥ -t by the buffered residue (-t bounds the
  INPUT pull). PLACEMENT: -t is an OUTPUT option (OPT_PERFILE|OPT_OUTPUT) — it
- must come AFTER -i, with the output options (before -i it lands in the input
- group and is ignored, logged parse line confirms consumption). Smoke: -t 20
+ must come AFTER -i, with the output options; a -t found BEFORE -i logs one
+ WARNING ("-t before -i is ignored") — fix round rr20 F5, was a truly silent
+ ignore and ffmpeg users expect input-side -t. The parse line confirms
+ consumption of the output-side form. Smoke: -t 20
  file cell exits clean in 3.7s wall, 30.4s output (offline queues hold ~10s);
  -t 30 LIVE UDP cell exits rc 0 at 31.3s output (live residue = the ~1.3s
  cushion). Every future gate cell can now self-terminate.

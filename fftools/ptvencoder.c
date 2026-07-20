@@ -1420,6 +1420,16 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
     int n_input = ins->nb_groups;
     int n_rung = outs->nb_groups;
     int multiview;
+    {   /* pre20 fix round (F5): -t placed BEFORE -i lands in the INPUT group and is not
+         * consumed (ptvencoder's -t is an OUTPUT option) — was a truly silent ignore, and
+         * ffmpeg users expect input-side -t to work. One loud line per offending input. */
+        int gi5;
+        for (gi5 = 0; gi5 < ins->nb_groups; gi5++)
+            if (og_get(&ins->groups[gi5], "t"))
+                av_log(NULL, AV_LOG_WARNING,
+                       "ptvencoder: -t before -i is ignored (-t is an OUTPUT option — place it "
+                       "after -i with the output options)\n");
+    }
     int delivery_on = 0;                          /* §7.5a delivery gate active for this run */
     Input            inputs[PTV_MAX_INPUT];
     AVCodecContext  *vdecs[PTV_MAX_INPUT];

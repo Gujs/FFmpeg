@@ -736,8 +736,22 @@ typedef struct AudioState {
      * m_a EMA re-seeds (the pre17 baseline-redefinition rule), and for the first 10s a
      * one-shot bounded base step retires any residual the settled sensor still reads. */
     int64_t          reanch_wc;                       /* rebuild-completion wall µs; 0 = no open window */
-    int              reanch_frames;                   /* frames emitted since the rebuild (settle count) */
-    int              reanch_stepped;                  /* one residual step max per window */
+    int              reanch_frames;                   /* emitted frames since the rebuild / last step (settle) */
+    int64_t          reanch_step_us;                  /* cumulative (c) steps this window (±5s budget —
+                                                       * fix round: MULTI-step, a seam's video ledger edit
+                                                       * can land after the first fire) */
+    /* pre20 fix round (F1, reviewer blocker): the retirement is LABEL-NEUTRAL (corr folds into
+     * glue_off — inj sum unchanged, door labels continuous), so no backward step can arise there.
+     * A NEGATIVE (c) residual step still moves door labels backward; this guard makes the mux
+     * invariant absolute: post-step frames whose output label does not EXCEED the last emitted
+     * one are DROPPED (the birth opts<0 rule, mirrored) until labels catch up naturally —
+     * bounded by the step size, inside the already-audible rebuild. The mux must NEVER see a
+     * backward audio DTS. Non-follow path only (mv audio-follow is clamped by af_last_out);
+     * disarms ONLY on catch-up (a wall expiry would re-open the backward window). */
+    int              reanch_mono;                     /* guard armed */
+    int64_t          reanch_mono_dropped;             /* frames dropped by the guard (logged at release) */
+    int64_t          out_last_pts;                    /* last emitted output label (out_rate samples) */
+    int              out_pts_set;                     /* out_last_pts valid */
     int64_t          flush_relab_seen_wc;             /* 1.0.1-pre18 #50 (E5 net): last consumed/retired
                                                        * g_flush_relab_wc value for this track (young
                                                        * unmatched publishes stay pending and re-scan) */

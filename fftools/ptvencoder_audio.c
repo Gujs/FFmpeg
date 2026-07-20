@@ -1015,6 +1015,32 @@ static int audio_drain_fg(AudioState *a)
                 if (a->af_drop >= nb) { a->af_drop -= nb; av_frame_unref(filt); continue; }  /* advance: skip content */
                 filt->pts = a->af_next_pts + ns; a->af_next_pts += nb;        /* continuous + smooth nudge */
             }
+            /* pre20 fix round (F1): MONOTONIC EMISSION GUARD. A re-anchor that retired a
+             * positive carried offset (or a negative (c) step) moved the door labels BACKWARD;
+             * until the source's own label advance covers the retired amount, every drained
+             * frame's output label precedes the last emitted one — emitting it is a backward
+             * DTS into the muxer = dead wire (reviewer blocker, 3 sites). DROP those frames
+             * (the birth opts<0 rule, mirrored); release on the first label that EXCEEDS the
+             * last emitted (bounded: the retired amount itself, in content ms, inside the
+             * already-audible rebuild). Non-follow path only — the mv follow path's af_last_out
+             * clamp already forbids backward emission. Dropped frames do not reach the sensor
+             * or the (c) settle counter (they were never emitted). */
+            if (a->reanch_mono && !(a->multiview && g_audio_follow)) {
+                if (a->out_pts_set && filt->pts <= a->out_last_pts) {
+                    a->reanch_mono_dropped++;
+                    av_frame_unref(filt);
+                    continue;
+                }
+                av_log(NULL, AV_LOG_WARNING,
+                       "[PTV-ANCHOR] a%d(in%d) monotonic guard released — %"PRId64" frames "
+                       "(~%"PRId64"ms) dropped while the re-based labels caught up to the last "
+                       "emitted DTS (the retired offset, realized as a content skip)\n",
+                       a->dbg_k, a->dbg_in, a->reanch_mono_dropped,
+                       a->out_rate > 0 && filt->nb_samples > 0
+                           ? a->reanch_mono_dropped * av_rescale(filt->nb_samples, 1000, a->out_rate)
+                           : 0);
+                a->reanch_mono = 0;
+            }
             /* ====================================================================================
              * 1.0.1-pre9 residual sensor (PASSIVE), audio side. 1.0.1-pre16: live on MULTIVIEW
              * too (the mv gate is gone) — the compositor publishes per-slot video lineage, so
@@ -1200,24 +1226,41 @@ static int audio_drain_fg(AudioState *a)
                     } else if (g_rebuild_reanchor && a->reanch_wc) {
                         if (nowr - a->reanch_wc > PTV_REANCH_WIN_US) {
                             a->reanch_wc = 0;                     /* window closed — never fires late */
-                        } else if (!a->reanch_stepped && ++a->reanch_frames >= PTV_REANCH_MIN_FR &&
+                        } else if (llabs(a->reanch_step_us) < PTV_REANCH_CAP_US &&
+                                   ++a->reanch_frames >= PTV_REANCH_MIN_FR &&
                                    rr.valid && llabs(rr.R_us) > g_rscorr_engage_us) {
+                            /* fix round (F1 follow-up): MULTI-STEP inside the one window — a seam's
+                             * video-side ledger edit can land AFTER the first step (measured: the
+                             * one-shot fired 4ms post-rebuild, the video [PTV-DISCONT] absorb landed
+                             * ~500ms later and re-opened R by the ledger delta); each fire re-requires
+                             * a fresh ≥10-emitted-frame settle, total authority ±5s across the window,
+                             * all inside the same audible rebuild. */
                             int64_t stepR = rr.R_us;
-                            if (stepR >  PTV_REANCH_CAP_US) stepR =  PTV_REANCH_CAP_US;
-                            if (stepR < -PTV_REANCH_CAP_US) stepR = -PTV_REANCH_CAP_US;
+                            int64_t left  = PTV_REANCH_CAP_US - llabs(a->reanch_step_us);
+                            if (stepR >  left) stepR =  left;
+                            if (stepR < -left) stepR = -left;
                             a->glue_off_us   += stepR;
                             a->rs_ma_seed     = 0;                /* base redefined again — re-seed */
-                            a->pend_comp_us   = stepR;            /* §2.4 tripwire: the step must realize */
+                            a->pend_comp_us  += stepR;            /* §2.4 tripwire: COMPOSE with any pending
+                                                                   * verdict (F1 minor — was clobbered) */
                             a->pend_comp_wc   = nowr;
+                            if (stepR < 0) {                      /* F1: a backward step moves the door
+                                                                   * labels BACK — arm the monotonic
+                                                                   * emission guard so the mux can never
+                                                                   * see a backward DTS (absolute) */
+                                a->reanch_mono = 1;
+                                a->reanch_mono_dropped = 0;
+                            }
                             a->glue_events++;                     /* corrector event edge: fresh dwell */
                             a->acomp_exp_us   = AV_NOPTS_VALUE;   /* deliberate step, not a click risk */
-                            a->reanch_stepped = 1;
+                            a->reanch_step_us += stepR;           /* window budget (±5s total) */
+                            a->reanch_frames  = 0;                /* next fire needs a fresh settle */
                             av_log(NULL, AV_LOG_WARNING,
                                    "[PTV-ANCHOR] a%d(in%d) rebuild residual %+"PRId64"ms stepped out at "
-                                   "the base (%"PRId64"ms after rebuild; cap %ds, once per rebuild) — "
-                                   "corrector re-dwells on the remainder\n",
+                                   "the base (%"PRId64"ms after rebuild; window total %+"PRId64"ms, "
+                                   "budget %ds) — corrector re-dwells on the remainder\n",
                                    a->dbg_k, a->dbg_in, stepR / 1000,
-                                   (nowr - a->reanch_wc) / 1000,
+                                   (nowr - a->reanch_wc) / 1000, a->reanch_step_us / 1000,
                                    (int)(PTV_REANCH_CAP_US / 1000000));
                         }
                     }
@@ -1453,6 +1496,8 @@ static int audio_drain_fg(AudioState *a)
                         lag_us / 1000, hs_us / 1000, async_pad_us / 1000, a->dbg_first_out * 1000 / a->out_rate);
                 }
             }
+            a->out_last_pts = filt->pts;   /* F1: the guard's monotonic reference (all paths) */
+            a->out_pts_set  = 1;
         }
         ret = audio_encode_push(a, filt);
         a->out_frames++;
@@ -1539,9 +1584,29 @@ static void ptv_rebuild_reanchor(AudioState *a, const AVFrame *frame)
         return;                        /* content precedes h0: the birth rule would drop it too */
     old_glue = a->glue_off_us;
     old_corr = a->corr.corr_us;
-    /* (a) birth-equivalent base */
-    a->glue_off_us      = 0;
-    a->next_pts         = ptv_anchor_next_pts(a, house_us);
+    /* (a) base re-derivation — LABEL-NEUTRAL at the door (pre20 fix round F1, reviewer
+     * blocker): the first cut zeroed glue_off and corr outright, which stepped the door
+     * labels BACKWARD by the retired sum → backward DTS → mpegts muxer death on the first
+     * write (dead wire, zombie process). And zeroing glue was WRONG in the balanced case:
+     * the sensor pairs glue against the demux edit ledgers (R = dm + E_v − E_a), so a glue
+     * that mirrors ledgered video edits is label-TRUTH, not pollution — discarding it
+     * re-opened R by the ledger difference (fixture: dm −261/ev +821 → R +560). The
+     * retirement is therefore a BOOKKEEPING TRANSFER: corr folds INTO glue_off (inj sum
+     * unchanged ⇒ door labels perfectly continuous ⇒ the blocker is mechanically
+     * impossible at retirement), and whatever part of the carried sum does NOT match
+     * reality shows up as R, which the (c) residual step(s) below retire with an explicit,
+     * forward-or-guarded label edit. The corrector's own trim is still retired (corr = 0,
+     * state → ARMED) — it never double-applies. */
+    a->glue_off_us      = old_glue + old_corr;
+    {   /* F1: the swr-fallback free counter must never step backward either (same mux
+         * invariant); a backward re-derivation is clamped to the current counter — the
+         * fallback path realizes forward re-anchors only, the residual stays with the
+         * sensor/corrector. */
+        int64_t np = ptv_anchor_next_pts(a, house_us);
+        if (np < a->next_pts)
+            np = a->next_pts;
+        a->next_pts = np;
+    }
     a->glue_raw_last_us = AV_NOPTS_VALUE;      /* fresh label baseline: the first post-rebuild
                                                 * frame is a reference, never a "step" */
     for (pi = 0; pi < PTV_GLUE_PAD_LED; pi++)
@@ -1568,12 +1633,12 @@ static void ptv_rebuild_reanchor(AudioState *a, const AVFrame *frame)
     /* (c) arm the residual-step window */
     a->reanch_wc      = av_gettime_relative();
     a->reanch_frames  = 0;
-    a->reanch_stepped = 0;
+    a->reanch_step_us = 0;
     av_log(NULL, AV_LOG_WARNING,
            "[PTV-ANCHOR] a%d(in%d) re-anchored (afmt-rebuild): base=content-h0 at %+"PRId64"ms, "
-           "retired glue %+"PRId64"ms corr %+"PRId64"ms; sensor re-seeded, residual window %ds "
-           "(PTV_NO_REBUILD_REANCHOR reverts)\n",
-           a->dbg_k, a->dbg_in, house_us / 1000, old_glue / 1000, old_corr / 1000,
+           "corr %+"PRId64"ms retired into the base ledger (door labels continuous; carried glue "
+           "%+"PRId64"ms), sensor re-seeded, residual window %ds (PTV_NO_REBUILD_REANCHOR reverts)\n",
+           a->dbg_k, a->dbg_in, house_us / 1000, old_corr / 1000, old_glue / 1000,
            (int)(PTV_REANCH_WIN_US / 1000000));
 }
 
