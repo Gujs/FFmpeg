@@ -35,9 +35,13 @@ silence fill = the tick, exactly. FIX (fftools-only, g_adts_split default ON):
  previous stamped frame; the carry is INVALIDATED on any decode error (the
  garbage-tail class the NOPTS drop rule protects against) and on decoder swap,
  so only contiguous clean decode is extrapolated. One-shot WARNING on engage.
-KILLS: PTV_NO_ADTS_SPLIT=1 reverts both pieces (= pre19 ticking);
+KILLS: PTV_NO_ADTS_SPLIT=1 reverts both pieces (= pre19 ticking) — the name
+is historical (from the pre-diagnosis brief): the parser SPLITS fine either
+way; the env gates the tolerant-probe + ASTAMP fix, not any splitting.
 PTV_NO_TOLERANT_DEC=1 gates the #38 runtime hook AND the probe opts (= full
-strict pre-#38: flood + silent-but-alive track).
+strict pre-#38: flood + silent-but-alive track; rr191 note: ASTAMP stays
+armed under it — moot, strict broken-phase decode yields no clean NOPTS
+frames and healthy streams never produce them).
 GATES (tick-in.ts = tsp capture of the live broken phase; 5ms-block −45dBFS
 hole detector, ≥20ms holes, first 3s/last 1s excluded): FIX = probe flood 0
 (was 294), params found, ONE tolerant qualification line per decoder instance
