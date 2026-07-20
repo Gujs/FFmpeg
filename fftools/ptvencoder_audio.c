@@ -71,6 +71,10 @@ static const char *ptv_self_shed_note(AudioState *a, char *buf, size_t sz)
     return buf;
 }
 
+#define PTV_REANCH_WIN_US   10000000   /* rebuild discontinuity window (µs) */
+#define PTV_REANCH_MIN_FR   10         /* emitted frames before the (c) step may fire (~0.2s settle) */
+#define PTV_REANCH_CAP_US    5000000   /* (c) step authority (µs) */
+
 /* ---- audio path (decode -> resample 48k stereo -> AAC -> mux) ---- */
 
 /* encode the SAME loudness-processed frame into each rung's own AAC encoder (so
@@ -1172,6 +1176,45 @@ static int audio_drain_fg(AudioState *a)
                     RsyncTrackR rr = rsync_track_R(a, nowr);
                     rscorr_update(a, &rr,
                                   av_rescale(filt->nb_samples, 1000000, a->out_rate), nowr);
+                    /* 1.0.1-pre20 (c) rebuild residual step (see ptv_rebuild_reanchor): inside
+                     * the 10s rebuild discontinuity window ONLY, after ≥10 emitted frames have
+                     * re-seeded the sensor, a residual still outside the engage band is applied
+                     * as ONE immediate base step (cap ±5s) — the rebuild is already an audible
+                     * discontinuity, so the step is free; the corrector trims leftovers from a
+                     * fresh dwell (glue_events edge below resets it). dR/d(glue_off) = −1 (the
+                     * same door algebra as corr), so `glue_off += R` retires exactly +R. */
+                    /* (c) runs on the single-input / non-follow path only: on the mv
+                     * audio-follow path the closed-loop PLL owns content alignment (it
+                     * measures out_v−out_a directly and would re-track a base step within
+                     * an acquire — two actuators on one displacement); there the pre17
+                     * ACQUIRE + (b)'s re-seed already restore honesty within ~12s. */
+                    if (g_rebuild_reanchor && a->reanch_wc &&
+                        (a->multiview && g_audio_follow)) {
+                        a->reanch_wc = 0;                         /* mv follow: PLL owns it */
+                    } else if (g_rebuild_reanchor && a->reanch_wc) {
+                        if (nowr - a->reanch_wc > PTV_REANCH_WIN_US) {
+                            a->reanch_wc = 0;                     /* window closed — never fires late */
+                        } else if (!a->reanch_stepped && ++a->reanch_frames >= PTV_REANCH_MIN_FR &&
+                                   rr.valid && llabs(rr.R_us) > g_rscorr_engage_us) {
+                            int64_t stepR = rr.R_us;
+                            if (stepR >  PTV_REANCH_CAP_US) stepR =  PTV_REANCH_CAP_US;
+                            if (stepR < -PTV_REANCH_CAP_US) stepR = -PTV_REANCH_CAP_US;
+                            a->glue_off_us   += stepR;
+                            a->rs_ma_seed     = 0;                /* base redefined again — re-seed */
+                            a->pend_comp_us   = stepR;            /* §2.4 tripwire: the step must realize */
+                            a->pend_comp_wc   = nowr;
+                            a->glue_events++;                     /* corrector event edge: fresh dwell */
+                            a->acomp_exp_us   = AV_NOPTS_VALUE;   /* deliberate step, not a click risk */
+                            a->reanch_stepped = 1;
+                            av_log(NULL, AV_LOG_WARNING,
+                                   "[PTV-ANCHOR] a%d(in%d) rebuild residual %+"PRId64"ms stepped out at "
+                                   "the base (%"PRId64"ms after rebuild; cap %ds, once per rebuild) — "
+                                   "corrector re-dwells on the remainder\n",
+                                   a->dbg_k, a->dbg_in, stepR / 1000,
+                                   (nowr - a->reanch_wc) / 1000,
+                                   (int)(PTV_REANCH_CAP_US / 1000000));
+                        }
+                    }
                 }
                 if (g_diag && (a->rs_log_last == 0 ||
                                nowr - a->rs_log_last >= g_stats_period_us)) {
@@ -1437,6 +1480,97 @@ static void ptv_pad_pub(AudioState *a)
 }
 
 
+/* [PTV-ANCHOR] house mapping, factored (1.0.1-pre20): a content position's house-anchored
+ * output base in out_rate samples — THE single copy of the birth anchoring formula, shared
+ * by the birth anchor (audio_anchor_and_feed) and the rebuild re-anchor below so the two
+ * can never diverge. */
+static int64_t ptv_anchor_next_pts(const AudioState *a, int64_t house_us)
+{
+    return av_rescale(house_us, a->out_rate, 1000000);
+}
+
+/* ===================== 1.0.1-pre20 REBUILD RE-ANCHOR (g_rebuild_reanchor) =====================
+ * Called at [PTV-AFMT] rebuild COMPLETION (audio_feed, after the path is rebuilt for the
+ * confirmed params — the ACHOP full rebuild completes through the same site, so it takes the
+ * same path). TODAY'S DEFECT: the rebuilt path inherited its audio base from carried state —
+ * glue_off_us polluted by broken-phase relabel-erasures, the swr-fallback next_pts free
+ * counter frozen across the outage, a live corr trim sized against the dead mapping — so the
+ * outage/transition duration leaked in as a ~1s residual the corrector then walked for ~10min
+ * (Azorse live 2026-07-20 10:54: rebuild → R +1021ms → 599s walk). The source is A/V-synced
+ * at the change; the residual is OURS. Re-derive the base BIRTH-EQUIVALENT from the current
+ * house/video mapping: output = content − h0 with glue_off_us = 0 (exactly the [PTV-ANCHOR]
+ * birth state; AVLOCK's house_skew stays a dynamic door term on both paths), via the SAME
+ * factored formula birth uses. Pieces:
+ *  (a) base: glue_off_us → 0, next_pts re-derived from the confirming frame's content,
+ *      fresh AGLUE label baseline (no step classification across the rebuild), pad ledger +
+ *      pending tripwire cleared — carried ledgers describe the dead mapping;
+ *  (corr) carried corr_us is RETIRED to 0 (logged): the new base already includes reality,
+ *      so keeping the old trim would DOUBLE-apply it; a steering/parked corrector falls back
+ *      to ARMED (fresh full dwell required — §4's re-engagement rule);
+ *  (b) m_a EMA re-seed (rs_ma_seed=0): a rebuild REDEFINES this track's mapping baseline —
+ *      the pre17 rule (REANCHOR2 / ACQUIRE / slate-recovery already re-seed). m_v is NOT
+ *      touched: an audio-path rebuild does not move the slot's video mapping;
+ *  (c) armed here, applied in audio_drain_fg: within the first 10s post-rebuild (the rebuild
+ *      DISCONTINUITY WINDOW — the rebuild is already audible, so a step is free), once ≥10
+ *      frames have emitted and the re-seeded sensor still reads |R| > the engage band, the
+ *      residual is applied as ONE immediate base step (cap ±5s, one WARNING); outside the
+ *      window the step can never fire — the corrector owns anything later.
+ * Birth is untouched (this runs only with pts_set, and only from the AFMT rebuild site);
+ * REANCHOR2/ACQUIRE mv re-seed paths are untouched. PTV_NO_REBUILD_REANCHOR=1 reverts all
+ * three pieces. */
+static void ptv_rebuild_reanchor(AudioState *a, const AVFrame *frame)
+{
+    int64_t h0, content_us, house_us, old_glue, old_corr;
+    int pi;
+    if (!g_rebuild_reanchor || !a->pts_set)
+        return;
+    pthread_mutex_lock(a->h0_lock); h0 = *a->h0; pthread_mutex_unlock(a->h0_lock);
+    if (h0 == AV_NOPTS_VALUE || frame->best_effort_timestamp == AV_NOPTS_VALUE)
+        return;
+    content_us = av_rescale_q(frame->best_effort_timestamp, a->ist_tb, AV_TIME_BASE_Q);
+    house_us   = content_us - h0;
+    if (house_us < 0)
+        return;                        /* content precedes h0: the birth rule would drop it too */
+    old_glue = a->glue_off_us;
+    old_corr = a->corr.corr_us;
+    /* (a) birth-equivalent base */
+    a->glue_off_us      = 0;
+    a->next_pts         = ptv_anchor_next_pts(a, house_us);
+    a->glue_raw_last_us = AV_NOPTS_VALUE;      /* fresh label baseline: the first post-rebuild
+                                                * frame is a reference, never a "step" */
+    for (pi = 0; pi < PTV_GLUE_PAD_LED; pi++)
+        a->pad_led_us[pi] = 0;
+    ptv_pad_pub(a);
+    a->pend_comp_us = 0;
+    a->acomp_exp_us = AV_NOPTS_VALUE;          /* the base reset is deliberate — not a click risk
+                                                * (the resampler was just rebuilt, no old baseline) */
+    /* (corr) retire the carried trim — the fresh base includes reality */
+    if (old_corr || a->corr.state == PTV_CORR_DWELL ||
+        a->corr.state == PTV_CORR_ENGAGED || a->corr.state == PTV_CORR_PARKED) {
+        a->corr.corr_us       = 0;
+        a->corr.engaged_corr0 = 0;
+        if (a->corr.state == PTV_CORR_DWELL || a->corr.state == PTV_CORR_ENGAGED ||
+            a->corr.state == PTV_CORR_PARKED)
+            a->corr.state = PTV_CORR_ARMED;    /* re-engagement requires a fresh full dwell */
+        if (a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO) {
+            atomic_store_explicit(&g_corr_pub[a->dbg_k], 0, memory_order_relaxed);
+            atomic_store_explicit(&g_corr_state_pub[a->dbg_k], a->corr.state, memory_order_relaxed);
+        }
+    }
+    /* (b) sensor m_a re-seed — the rebuild is a baseline redefinition (pre17 rule) */
+    a->rs_ma_seed = 0;
+    /* (c) arm the residual-step window */
+    a->reanch_wc      = av_gettime_relative();
+    a->reanch_frames  = 0;
+    a->reanch_stepped = 0;
+    av_log(NULL, AV_LOG_WARNING,
+           "[PTV-ANCHOR] a%d(in%d) re-anchored (afmt-rebuild): base=content-h0 at %+"PRId64"ms, "
+           "retired glue %+"PRId64"ms corr %+"PRId64"ms; sensor re-seeded, residual window %ds "
+           "(PTV_NO_REBUILD_REANCHOR reverts)\n",
+           a->dbg_k, a->dbg_in, house_us / 1000, old_glue / 1000, old_corr / 1000,
+           (int)(PTV_REANCH_WIN_US / 1000000));
+}
+
 /* Feed one h0-anchored decoded audio frame into the -af graph (or swr fallback). */
 static int audio_feed(AudioState *a, AVFrame *frame)
 {
@@ -1504,6 +1638,10 @@ static int audio_feed(AudioState *a, AVFrame *frame)
             av_channel_layout_copy(&a->fg_in_chl, &a->dec->ch_layout);
             av_channel_layout_uninit(&a->afmt_pending_chl);
             a->afmt_pending_rate = 0; a->afmt_pending_fmt = AV_SAMPLE_FMT_NONE;
+            /* 1.0.1-pre20: the rebuilt path gets a BIRTH-EQUIVALENT base derived from the
+             * current house mapping instead of the carried one (see ptv_rebuild_reanchor).
+             * Runs for ACHOP-triggered rebuilds too — they complete through this same site. */
+            ptv_rebuild_reanchor(a, frame);
             /* 1.0.1-pre19 #42 hardening: the rebuild above configured the path from a->dec,
              * but THIS frame (the confirming one) falls through to be fed below. During a
              * broken-AAC phase the decoder context can diverge from the frames it emitted
@@ -1932,7 +2070,7 @@ static int audio_anchor_and_feed(AudioState *a, AVFrame *frame, int64_t h0)
             int64_t cap_us = (int64_t)g_cp.aq_prehold * dur_us;   /* ring capacity in time */
             fill_us = FFMIN(house_us, cap_us);
         }
-        a->next_pts = av_rescale(house_us - fill_us, a->out_rate, 1000000);
+        a->next_pts = ptv_anchor_next_pts(a, house_us - fill_us);   /* pre20: shared birth formula */
         a->pts_set  = 1;
         a->dbg_first_src = ts - av_rescale_q(fill_us, AV_TIME_BASE_Q, a->ist_tb);
         /* [PTV-ANCHOR] (v0.9.16.3, always-on) — the birth A/V relationship this track is built on.

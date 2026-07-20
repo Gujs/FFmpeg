@@ -725,6 +725,19 @@ typedef struct AudioState {
     int64_t          nbs_carry_us;                    /* rr15 F9: sub-frame remainder carried between quanta */
     int64_t          glue_cad_us;                     /* rr15 R2: EMA of nonzero fed-frame wall gaps (PES-burst
                                                        * period) — the E3 cadence baseline for the pad-ledger gate */
+    /* 1.0.1-pre20 REBUILD RE-ANCHOR (g_rebuild_reanchor; PTV_NO_REBUILD_REANCHOR=1 reverts).
+     * An [PTV-AFMT] rebuild used to inherit the track's audio base from carried state
+     * (glue_off_us polluted by broken-phase erasures; the swr-fallback next_pts counter
+     * frozen across the outage) — the transition duration leaked in as a ~1s residual the
+     * corrector then walked for ~10min (Azorse live 2026-07-20 10:54: R +1021ms, 599s walk).
+     * The source is A/V-synced at the change, so the residual is OURS: at rebuild completion
+     * the base is re-derived BIRTH-EQUIVALENT from the current house mapping (content − h0,
+     * glue_off 0 — the [PTV-ANCHOR] birth formula, factored), carried corr is RETIRED, the
+     * m_a EMA re-seeds (the pre17 baseline-redefinition rule), and for the first 10s a
+     * one-shot bounded base step retires any residual the settled sensor still reads. */
+    int64_t          reanch_wc;                       /* rebuild-completion wall µs; 0 = no open window */
+    int              reanch_frames;                   /* frames emitted since the rebuild (settle count) */
+    int              reanch_stepped;                  /* one residual step max per window */
     int64_t          flush_relab_seen_wc;             /* 1.0.1-pre18 #50 (E5 net): last consumed/retired
                                                        * g_flush_relab_wc value for this track (young
                                                        * unmatched publishes stay pending and re-scan) */
@@ -1284,6 +1297,7 @@ extern int     g_hstick_filter;          /* #51a: ≤1-tick hs steps are not cor
 extern int     g_rscorr_ceil;            /* #51b: starvation-ceiling engage; PTV_NO_RSCORR_CEIL=1 reverts */
 extern int64_t g_rscorr_ceil_us;         /* #51b ceiling span (15min default; PTV_RSCORR_CEIL_MIN minutes) */
 extern int     g_perstream_wm;           /* §7.5b per-stream watermarks (slowest-live key); PTV_NO_PERSTREAM_WM=1 reverts */
+extern int     g_rebuild_reanchor;       /* 1.0.1-pre20: AFMT-rebuild birth-equivalent re-anchor; PTV_NO_REBUILD_REANCHOR=1 reverts */
 extern int     g_acq_backoff;            /* #49: repeated-ACQUIRE threshold backoff; PTV_NO_ACQ_BACKOFF=1 reverts */
 extern _Atomic int64_t g_flush_relab_step[PTV_MAX_AUDIO]; /* last LAYERA-flush label shift per track (demux writes, */
 extern _Atomic int64_t g_flush_relab_wc[PTV_MAX_AUDIO];   /* step first / wall last-release; audio thread reads) */

@@ -41,7 +41,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.0.1-pre19.1"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.0.1-pre20"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -639,6 +639,11 @@ int64_t g_rscorr_ceil_us = 900000000;
  * (loudnorm AAC + copied AC-3) stop depending on latency coincidence.
  * PTV_NO_PERSTREAM_WM=1 reverts to the aggregate key. */
 int     g_perstream_wm = 1;
+/* 1.0.1-pre20 REBUILD RE-ANCHOR (default ON): at [PTV-AFMT] rebuild completion the track's
+ * audio base is re-derived birth-equivalent from the current house mapping instead of
+ * carrying pre-rebuild state (see the AudioState.reanch_* comment in ptvencoder.h).
+ * PTV_NO_REBUILD_REANCHOR=1 reverts to the pre19.1 carried-base posture. */
+int     g_rebuild_reanchor = 1;
 /* 1.0.1-pre18 #49 — mv PLL repeated-ACQUIRE backoff: erase-class corruption re-anchors a
  * slot ±one flat step per 12s refractory forever (audible warble until restart) — the flat
  * step defeats both the noise-adaptive threshold (it measures jitter, not flat flips) and
@@ -2750,6 +2755,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_RSCORR_CEIL")) g_rscorr_ceil = 0;       /* 1.0.1-pre18 #51b: no starvation-ceiling engage */
     { const char *s = getenv("PTV_RSCORR_CEIL_MIN"); if (s && atoi(s) > 0) g_rscorr_ceil_us = (int64_t)atoi(s) * 60000000; }  /* #51b ceiling, minutes */
     if (getenv("PTV_NO_PERSTREAM_WM")) g_perstream_wm = 0;     /* 1.0.1-pre18: §7.5b back to the aggregate (least-delayed) key */
+    if (getenv("PTV_NO_REBUILD_REANCHOR")) g_rebuild_reanchor = 0;  /* 1.0.1-pre20: AFMT rebuild carries the old base again (residual + corrector walk) */
     if (getenv("PTV_NO_ACQ_BACKOFF")) g_acq_backoff = 0;       /* 1.0.1-pre18 #49: no repeated-ACQUIRE threshold backoff */
     if (getenv("PTV_NBS_FILL") && g_glueclass) g_nbs_fill = 1;
     { const char *s = getenv("PTV_GLUE_HTOL_PCT");     if (s && atoi(s) > 0) g_glue_htol = atoi(s); }             /* tuning knob (G4) */
