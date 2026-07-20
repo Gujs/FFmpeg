@@ -1504,6 +1504,23 @@ static int audio_feed(AudioState *a, AVFrame *frame)
             av_channel_layout_copy(&a->fg_in_chl, &a->dec->ch_layout);
             av_channel_layout_uninit(&a->afmt_pending_chl);
             a->afmt_pending_rate = 0; a->afmt_pending_fmt = AV_SAMPLE_FMT_NONE;
+            /* 1.0.1-pre19 #42 hardening: the rebuild above configured the path from a->dec,
+             * but THIS frame (the confirming one) falls through to be fed below. During a
+             * broken-AAC phase the decoder context can diverge from the frames it emitted
+             * earlier (per-frame reconfig / queued pre-h0 replay), and swr_convert reads as
+             * many planes as ITS configured input layout has — a frame with fewer channels
+             * than a->dec's layout means reads through nonexistent plane pointers. If the
+             * frame no longer matches the just-configured input params, drop it; the next
+             * frame re-enters the normal AFMT detection. */
+            if (frame->sample_rate != a->fg_in_rate ||
+                frame->format      != a->fg_in_fmt  ||
+                av_channel_layout_compare(&frame->ch_layout, &a->fg_in_chl)) {
+                av_log(NULL, AV_LOG_WARNING,
+                       "[PTV-AFMT] a%d(in%d) decoder context diverged from the confirmed frame "
+                       "params during rebuild — frame dropped, detection re-arms\n",
+                       a->dbg_k, a->dbg_in);
+                return 0;
+            }
         }
     } else if (a->afmt_stable) {                   /* params returned to normal → transient filtered out */
         a->afmt_stable = 0;
@@ -2205,7 +2222,13 @@ void *audio_thread(void *arg)
         audio_encode_push(a, NULL);                        /* flush encoders */
     } else {
         uint8_t **out = NULL; int got, out_max = 4096;
-        if (av_samples_alloc_array_and_samples(&out, NULL, a->out_chl.nb_channels,
+        /* 1.0.1-pre19 #42: a dead audio path (init failed on an undecodable source phase,
+         * AFMT retry pending — v0.9.17.1) reaches EOF/death with a->swr == NULL. The
+         * v0.9.17.1 NULL guard covered audio_feed only, so this flush dereferenced NULL
+         * inside swr_convert (SIGSEGV at swr_is_initialized, fault addr = offsetof
+         * in_buffer.ch_count — the pre11 awe/Azorse broken-AAC capture crash). */
+        if (a->swr &&
+            av_samples_alloc_array_and_samples(&out, NULL, a->out_chl.nb_channels,
                                                out_max, a->out_sfmt, 0) >= 0) {
             while ((got = swr_convert(a->swr, out, out_max, NULL, 0)) > 0)
                 av_audio_fifo_write(a->fifo, (void **)out, got);
