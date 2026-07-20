@@ -7,6 +7,155 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(7t) PRE20 — REBUILD RE-ANCHOR (headline) + behavior-inert cleanup sweep + riders.
+The last content pre before the v1.1.0 freeze. Three code commits, in order:
+cleanup (parity gates bind to it alone), re-anchor, riders.
+
+ITEM 1 — AFMT REBUILD RE-ANCHOR (kill PTV_NO_REBUILD_REANCHOR=1).
+SYMPTOM (Azorse live 2026-07-20 10:54): an [PTV-AFMT] rebuild (format flap /
+post-outage resume / ACHOP escape) inherited its audio base from carried state
+— the transition duration leaked in as a ~1s residual (R +1021ms) the corrector
+then walked for ~10min (599s). The source is A/V-synced at the change; the
+residual is OURS. ROOT CAUSE (carried state enumerated): glue_off_us polluted
+by broken-phase relabel-erasures; the swr-fallback next_pts free counter frozen
+across the outage; a live corr trim sized against the dead mapping; a stale m_a
+EMA blending pre-rebuild samples. FIX (three pieces):
+ (a) ptv_rebuild_reanchor() at rebuild COMPLETION in audio_feed (ACHOP rebuilds
+ complete through the same site): base re-derived BIRTH-EQUIVALENT from the
+ current house mapping — output = content−h0 with glue_off=0, via
+ ptv_anchor_next_pts(), the factored single copy of the [PTV-ANCHOR] birth
+ formula (birth calls it too; the two can never diverge). Fresh AGLUE label
+ baseline (no step classification across the rebuild), pad ledger + pending
+ tripwire cleared. CORR RETIREMENT DECISION: carried corr_us is RETIRED to 0
+ (logged with the amount) — the new base includes reality, so a kept trim would
+ DOUBLE-apply; a DWELL/ENGAGED/PARKED corrector falls back to ARMED (fresh full
+ dwell, the §4 re-engagement rule).
+ (b) m_a EMA re-seed — the rebuild joins the pre17 baseline-redefinition
+ re-seed list (REANCHOR2 / ACQUIRE / slate-recovery); m_v deliberately NOT
+ re-seeded (an audio-path rebuild does not move the slot's video mapping).
+ (c) bounded residual step INSIDE the rebuild discontinuity window only
+ (defined precisely: 10s wall from rebuild completion, ≥10 emitted frames of
+ settle, ONE step max): |R| > engage band → glue_off += R (cap ±5s, one
+ WARNING; dR/d(glue_off) = −1, the same door algebra as corr — verified against
+ the sensor inj identity m_a = inj − h0 − slip on the fg path). The rebuild is
+ already an audible discontinuity, so the step is free; glue_events++ hands the
+ corrector a fresh dwell for leftovers. Outside the window the step can NEVER
+ fire (reanch_wc zeroed at expiry). (c) is single-input/non-follow ONLY: on the
+ mv audio-follow path the closed-loop PLL owns content alignment (it measures
+ out_v−out_a directly and would re-track a base step — two actuators on one
+ displacement); there (a)+(b) still apply and the pre17 ACQUIRE re-seed
+ restores honesty within ~an acquire.
+GATES (local x264/tsp cells, pre20 vs pre19.1-ref):
+ (i) synth flap fixture p20_flap222 (30s stereo → 5.1 → stereo, continuous ts;
+ 5.1 not 7.1 — ADTS cannot carry channelConfiguration>7, tick-in covers the
+ real 7.1 class): pre20 lipsync=+0ms FLAT through BOTH rebuilds (bound ≤100ms
+ within 10s — met at the first stats sample); pre19.1 control = +261ms baked
+ after rebuild 1 COMPOUNDING to +821ms after rebuild 2 (the class, in
+ miniature); both rebuilds log re-anchored + one residual step each, and the
+ second retirement retires exactly the first step (+261ms) — idempotent.
+ (ii) outage-resume fixture p20_gap90 (60s stereo / 90s NO audio packets /
+ 60s 5.1 resume — the resume-in-a-different-format outage): sensor `--`
+ through the outage; at resume the AFMT rebuild fires, re-anchor + ONE
+ residual step +821ms (the 90s-outage class, the live ~1s magnitude) and the
+ FIRST post-resume reading is lipsync=+0ms (bound ≤100ms within 10s — met at
+ the first stats sample); pre19.1 CONTROL = +821ms FLAT from the first
+ post-resume reading onward (the corrector would walk it ~10min — the live
+ class reproduced at its magnitude). NEGATIVE CONTROLS (recorded):
+ p20_dead90 (all-XOR audio) and p20_chop90 (every-3rd XOR) both produce ZERO
+ decode errors on this source class — the demux discards / the parser drops
+ the garbage silently, no rebuild fires, both builds read +1ms after heal
+ (byte-inert no-rebuild path). ACHOP-triggered rebuilds are therefore covered
+ BY CONSTRUCTION (achop_rebuild funnels into the same AFMT completion site;
+ the pre19 #46 fixture-gate stands) — an ACHOP-reaching local fixture for
+ THIS source class is an open fixture gap, noted for the reviewer.
+ (i-tick note): on the combined 0004-tolerant build the tick-in capture
+ decodes continuously as 7.1 (no AFMT in 100s, lipsync +0ms BOTH builds =
+ broken-phase parity clean); the rebuild-class controls moved to the synth
+ fixtures above.
+ (iii) birth parity: [PTV-ANCHOR] birth line IDENTICAL (first_audio-h0=+8ms,
+ h0=5781ms) across pre20/ref/kill (pre-anchor drop counts differ with wall
+ join phase — A/A class); the item-2 single parity cell's audio ES was already
+ byte-identical.
+ (iv) corrector interaction (p20_walkflap: 270s stereo then 5.1; test-scaled
+ dwell 60s/quiet 30s, TESTWALK 5000µs/s capped 300ms at t=30s): ENGAGE
+ R=+300ms → corr integrated to +228ms* by the flap; the rebuild log reads
+ "retired glue +0ms corr +228ms" (retirement BEFORE the residual measurement)
+ then ONE +300ms step — total applied 300ms, NOT 528ms = no double-correction;
+ the second rebuild retires exactly the step (+300ms) with corr +0 and no
+ re-engage (fresh full dwell required).
+ (v) kill PTV_NO_REBUILD_REANCHOR=1 reproduces the control line-for-line
+ (+261ms baked after rebuild 1, no re-anchor lines).
+ FINAL-BINARY smoke (post mv-follow gating): flap re-run on the release tip —
+ identical re-anchor/step lines, lipsync=+0ms on all 27 samples.
+ TEST-HARNESS NOTE (bitten twice this session, recorded for future cells):
+ killing a backgrounded shell FUNCTION kills the subshell, not the binary —
+ mv cells must pid- or pkill-target the BINARY and use FRESH ports per
+ attempt; and cp over a running/mapped binary invalidates its macOS code
+ signature (fresh exec dies pre-banner) — rm before cp when refreshing
+ gates/bin.
+
+ITEM 2 — CLEANUP SWEEP (behavior-inert; separate commit, gates bound to it).
+Dead code removed (each provably unreachable or write-only): g_vout_us (mv,
+write-only since the probe era), RsyncSense.n_in (assigned once, never read),
+DemuxArgs.splice_ref_v (declared, zero uses), AudioState.nopts_stamped
+(write-only pre19.1 counter), ptv_qsnap() + its two PTV_DIAG call sites
+(QSNAP-era probe of the CLOSED v0.9.8 feed-drop investigation), g_vindbg +
+[PTV-VINDBG] lines + the PTV_VINDBG env (self-described TEMP pre13 probe;
+investigation closed with the governor trust gate). Demoted: "[PTV-SWRDELAY]
+sensor armed" INFO→PTV_DIAG (slip-probe investigation closed pre11; the
+periodic readout was already DIAG-only). KEPT deliberately: DlvGate.st_dropped
+(write-only but marks REAL non-blocking copy drops — future stats-token
+candidate), [PTV-HDBG] (env-gated test hook), [PTV-START]/[PTV-H0]
+(DIAG-gated), estimator [PTV-CLOCK] lifecycle lines (legend-documented). No
+TESTWALK/TESTHS/TESTNOISE chatter exists outside their envs (verified).
+STATS-LINE AUDIT: every single-input token (frame/fps/time/dup/pd/drop/
+corrupt/async/dlvhold/dlvforced/vdlvhold/vdlvforced/wucr_buf/wucr_rho/hs/
+hsres/cushion/fqhw/bank/cf/decim/acor/lipsync/corr) and every mv token
+(dup/drop/dlv*/acor/inK:qdrop/corrupt/pd/sv/sk/skres/lipsync + corr) verified
+live-wired; NO always-zero/dead tokens found, nothing removed. corr= present
+when armed on both printers; acor= conditional >0; ACQUIRE-line backoff=
+visibility is the rider-(c) fix. Full format (every token, units, when
+present) documented in analysis/ptvencoder-usage.md §"Reading the stats line"
+— parseable by sync_check.
+GATES (pre19.1-ref vs cleanup-only binary): single 65s cinestar UDP cell —
+audio ES BYTE-IDENTICAL across ref/ref/cleanup, video md5 differs even A/A
+(x264 nondeterminism, the pre18 control), event-sequence diff == exactly the
+demoted SWRDELAY line (A/A floor 0); mv 2x2 60s — A/B event diff == A/A floor
+(birth-trim count digits) + the 4 demoted SWRDELAY lines, dup=0, stats shape
+identical; tick-in broken-phase 40s — audio ES BYTE-IDENTICAL, silence-hole
+count identical (0/0 over the first 35s), AFMT/ASTAMP/ADEC counts identical.
+
+ITEM 3 — RIDERS (one batch commit).
+(a) rr191 F3: [PTV-ASTAMP] extrapolation carry INVALIDATED across a demux
+ REOPEN — demux_reopen_once stamps per-input g_reopen_wc; the audio thread
+ consumes the edge and drops dec_ts_carry (a fresh join must never be stamped
+ pre-outage-continuous).
+(b) -t IMPLEMENTED (house-clock output media time; was parsed-and-ignored).
+ The cadence owner (single master rung / offline rung 0 / mv compositor) sets
+ g_t_stop at -t of emitted output; every demux (incl. the mv reopen-retry
+ loop) treats it as EOF → stop pulling → the proven file-EOF flush/teardown →
+ clean rc-0 exit. Final duration ≥ -t by the buffered residue (-t bounds the
+ INPUT pull). PLACEMENT: -t is an OUTPUT option (OPT_PERFILE|OPT_OUTPUT) — it
+ must come AFTER -i, with the output options (before -i it lands in the input
+ group and is ignored, logged parse line confirms consumption). Smoke: -t 20
+ file cell exits clean in 3.7s wall, 30.4s output (offline queues hold ~10s);
+ -t 30 LIVE UDP cell exits rc 0 at 31.3s output (live residue = the ~1.3s
+ cushion). Every future gate cell can now self-terminate.
+(c) rr19 finding 3 (cosmetic): ACQUIRE line prints backoff= only while
+ g_acq_backoff is enabled (disabled builds read "backoff=0" as armed-at-0);
+ line bytes unchanged when on.
+(d) vist-null hygiene + C2 partial-hold simplification: NOTE-AND-SKIP — the
+ partial hold is already factored (ptv_disc_partial_hold, pre17 R3a, window
+ cap + capacity guard), vist reads are null-guarded, no "simplify later"
+ markers remain. Nothing genuinely simple left.
+(e) ceiling-mirror gate cell added to the gates/ collection (p20-ceilmv.sh):
+ the #51b anti-starvation ceiling exercised on MULTIVIEW (2-up, TESTHS
+ staircase + PTV_NO_HSTICK_FILTER churn + capped TESTWALK, CEIL_MIN=2
+ test-scaled): PASS — ceiling ENGAGE on BOTH tracks (a0 R=+299ms, a1 +304ms
+ "starvation ceiling 2min ... dwell never completed"), ZERO plain dwell
+ engages (the churn starves the dwell, as designed), event-storm disarms
+ between — the single-input (C) shape reproduced on mv.
+
 (7s) HOTFIX pre19.1 — broken-phase audio "ticking" (Azorse open-during-broken-
 phase; the #38 follow-up). SYMPTOM: on the Azorse broken-7.1 capture the pre19
 combined build (0004 lavc + #38 hook) played 21ms of audio + ~107ms of silence
