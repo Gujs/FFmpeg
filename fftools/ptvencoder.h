@@ -364,6 +364,9 @@ typedef struct CorrState {          /* all owned by that track's audio thread (�
      * through ARMED/DWELL/DISARMED). Span ≥ the ceiling → ENGAGE anyway (rscorr_update). */
     int64_t starve_wc;              /* span start (wall µs); 0 = no open span */
     int64_t starve_r0;              /* R at span start (the whole-span flatness reference) */
+    int     perm_disarm;            /* 1.0.1-pre21 #24: lifetime-cap disarm is FINAL for this
+                                     * process (10s of trim failed to close R — re-arming would
+                                     * walk the same doomed staircase); logged once at the cap */
 } CorrState;
 
 /* 0.9.18 M3 — CushionRt: the runtime COORDINATION home for cushion escalation (map §1.3).
@@ -577,6 +580,7 @@ typedef struct AudioState {
     int64_t          pll_dbnc_ref;                    /* ema value when the debounce window started (flatness reference) */
     int              pll_refractory;                  /* frames remaining before acquire may re-arm (bumpless-credit backstop) */
     int              pll_acq_win;                     /* 1.0.1: consecutive completed above-threshold debounce windows (fire at 3; PTV_ACQ_INSTANT reverts) */
+    int              pll_yielded;                     /* 1.0.1-pre21 #24: PLL actuators currently yielded to the steering corrector (transition-logged) */
     int              acq_backoff;                     /* 1.0.1-pre18 #49: repeated-ACQUIRE backoff level (thr <<= level; +1 per
                                                        * acquire, −1 per acquire-free 60s) — an erase-class corruption phase
                                                        * re-anchors ±1 flat step per refractory forever (mv slot warble); the
@@ -1209,6 +1213,7 @@ extern int     g_shared_flush;
 extern int     g_vanchor;                /* d1-fix lone-audio video-anchor; PTV_NO_VANCHOR=1 reverts */
 extern int     g_drop_until_kf;
 extern int     g_audio_follow;
+extern int     g_pll_yield;              /* 1.0.1-pre21 #24 PLL/corrector arbitration; PTV_NO_PLL_YIELD=1 reverts */
 extern int     g_h0_reanchor;
 extern int     g_reanchor2_instant;
 extern int     g_h0_at_display;

@@ -648,6 +648,15 @@ static void rscorr_update(AudioState *a, RsyncTrackR *r, int64_t f_us, int64_t n
             if (llabs(c->corr_us) > 10000000) {                      /* §6 lifetime authority */
                 c->corr_us = c->corr_us > 0 ? 10000000 : -10000000;
                 rscorr_disarm(a, now, "lifetime authority cap (10s)", 1);
+                /* 1.0.1-pre21 #24 (owner-approved shape): a lifetime-cap disarm means 10
+                 * whole seconds of trim did not close R — re-arming would only walk the
+                 * same doomed staircase again (each round = another 5s per-engagement of
+                 * content trim on air). Stay DISARMED for the life of the process. */
+                c->perm_disarm = 1;
+                av_log(NULL, AV_LOG_ERROR,
+                       "[PTV-RSCORR] a%d(in%d) lifetime authority cap — corrector stays "
+                       "DISARMED for this process (restart to reset)\n",
+                       a->dbg_k, a->dbg_in);
                 break;
             }
         }
@@ -685,6 +694,8 @@ static void rscorr_update(AudioState *a, RsyncTrackR *r, int64_t f_us, int64_t n
         break;
 
     case PTV_CORR_DISARMED:
+        if (c->perm_disarm)         /* #24: lifetime-cap disarm is final (logged once above) */
+            break;
         if (c->holdoff_wc && now < c->holdoff_wc)
             break;
         if (c->implaus_wc)          /* R still implausible = the disarm condition persists: */
@@ -830,7 +841,31 @@ static int audio_drain_fg(AudioState *a)
                      * acquired+converged. The stability-debounce already rejects noise; the sub-threshold
                      * residuals on the converged slots stay put (won't re-fire); a frozen bank converges in
                      * 1–2 refractory-throttled acquires regardless of WHEN it forms. */
-                    int may_acq = a->pll_refractory <= 0 &&
+                    /* 1.0.1-pre21 #24 PLL/corrector arbitration: while THIS track's residual
+                     * corrector is STEERING (ENGAGED), the audio-follow PLL must YIELD — its
+                     * output-alignment loop (avlag→0) trims back every µs of content the
+                     * corrector realizes at the same graph door, 1:1 (p24 gate-1 measurement:
+                     * corr walked +655ms at full slew with slip=0 while ΔR=−1ms, and the PLL
+                     * steer series read exactly −2ms/s from the engage) — so mv ENGAGE→PARK
+                     * was structurally unreachable. Freeze the PLL's ACTUATORS only (no
+                     * af_steer_us integration, no ACQUIRE drop/pad); the measurement chain
+                     * (ema/dev/debounce/refractory) keeps running so resume is seamless.
+                     * Resumes on any non-ENGAGED state (PARK/DISARM/ARMED). One log line per
+                     * transition. PTV_NO_PLL_YIELD=1 reverts the arbitration only. */
+                    int pll_yield = g_pll_yield && a->corr.state == PTV_CORR_ENGAGED;
+                    if (pll_yield != a->pll_yielded) {
+                        a->pll_yielded = pll_yield;
+                        if (pll_yield)
+                            av_log(NULL, AV_LOG_WARNING,
+                                   "[PTV-RSCORR] a%d(in%d) PLL yields (corrector steering; PTV_NO_PLL_YIELD reverts)\n",
+                                   a->dbg_k, a->dbg_in);
+                        else
+                            av_log(NULL, AV_LOG_WARNING,
+                                   "[PTV-RSCORR] a%d(in%d) PLL resumes (corrector left steering)\n",
+                                   a->dbg_k, a->dbg_in);
+                    }
+                    int may_acq = !pll_yield &&
+                                  a->pll_refractory <= 0 &&
                                   FFABS(a->pll_ema) > thr &&
                                   a->pll_dbnc >= g_pll_acquire_n;
                     /* 1.0.1: SUSTAINED-OFFSET requirement (PTV_ACQ_INSTANT=1 reverts to the old
@@ -891,7 +926,7 @@ static int audio_drain_fg(AudioState *a)
                         a->pll_refractory = (int)(g_pll_refractory_us / frame_us);  /* v0.6.21: HARD ~12s refractory (was g_pll_acquire_n ≈0.68s) — breaks the self-excited limit cycle */
                         a->pll_dbnc = 0; a->pll_dbnc_ref = a->pll_ema;
                         if (a->pll_drop > 0) { a->pll_drop--; av_frame_unref(filt); continue; }  /* drop the current frame too */
-                    } else if (g_pll_trackup) {
+                    } else if (g_pll_trackup && !pll_yield) {   /* #24: TRACK integrator frozen while the corrector steers */
                         /* TRACK — 1.0.1-pre3: RESAMPLER STEER, never labels. pre2's TRACK actuated by
                          * re-stamping output labels (af_applied_us moved `want` every frame): the PCM
                          * stayed byte-clean but the output AAC pts spacing stretched up to +158ms/min

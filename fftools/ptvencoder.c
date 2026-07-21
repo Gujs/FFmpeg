@@ -292,6 +292,11 @@ int     g_af_anchor = 1;
  * audio ONLY; single-input + copy paths untouched. Default OFF for box A/B; PTV_AVSYNC_PLL=1 enables.
  * Sign proven: d(offset)/d(applied) < 0 ⇒ to raise a negative offset (audio late), advance (drop). */
 int     g_avsync_pll = 1;             /* B3 closed-loop A/V controller DEFAULT-ON (v0.6.20, box-validated on cor-2 RAV + live-transcoder grids). PTV_NO_AVSYNC_PLL reverts to the open-loop B1 follow. Multiview transcoded audio only; single-input + copy paths byte-identical regardless. */
+/* 1.0.1-pre21 #24: the mv audio-follow PLL yields (actuators frozen) while the SAME track's
+ * residual corrector is STEERING — the two loops share the graph-door actuator and the PLL's
+ * output-alignment objective cancels the corrector 1:1 (p24 gate-1), making mv ENGAGE→PARK
+ * structurally unreachable. PTV_NO_PLL_YIELD=1 reverts the arbitration only. */
+int     g_pll_yield = 1;
 int     g_acq_instant = 0;            /* 1.0.1 (PTV_ACQ_INSTANT=1 reverts): ACQUIRE needs the |EMA offset| above threshold for 3 CONSECUTIVE debounce windows (and the threshold is floored at 1.5 house ticks) — the vlag measurement is tick-quantized, so the single-window fire snapped on its own quantization noise (live grids: ~939-1511 ACQUIREs/22h alternating ±42ms pad/drop). */
 int     g_pll_trackup = 1;            /* 1.0.1-pre3 (PTV_NO_PLL_TRACKUP=1 disables TRACK entirely = acquire-only, labels flat — the operators' production mute keeps its meaning): TRACK now steers through the RESAMPLER (af_steer_us into the graph-input pts, AVLOCK-style) instead of re-stamping output labels. pre2's label-TRACK stretched output AAC pts spacing up to +158ms/min during integration episodes → PTS-honoring players rate-chased it = audible warble (production 2026-07-13). The pre2 [PTV-TRACKUP] direction-aware anti-windup is retired with the label actuator. */
 int64_t g_pll_testnoise_us = 0;       /* TEST-ONLY (default off): inject a ±N ms square wave (flips ~every 3.2s) into the measured offset to REPRODUCE the box limit cycle locally (local sources are clean). PTV_PLL_TESTNOISE_MS sets it; never set in production. */
@@ -2766,6 +2771,7 @@ int main(int argc, char **argv)
     /* 0.9.18.7: PTV_AF_ACQUIRE_MS (100ms) / PTV_AF_RATE_MS_S (10) internalized —
      * see g_af_acquire_us / g_af_rate_us */
     if (getenv("PTV_NO_AVSYNC_PLL")) g_avsync_pll = 0;     /* B3 closed-loop is DEFAULT-ON (v0.6.20); this reverts to the open-loop B1 content-anchored follow. (PTV_AVSYNC_PLL=1 still honored implicitly = the default.) */
+    if (getenv("PTV_NO_PLL_YIELD")) g_pll_yield = 0;       /* 1.0.1-pre21 #24 revert: PLL keeps actuating while the corrector steers (the 1:1 cancel — A/B only) */
     if (getenv("PTV_ACQ_INSTANT")) g_acq_instant = 1;      /* 1.0.1: revert ACQUIRE to single-window fire (no 3-consecutive-window sustain; the tick floor stays) */
     if (getenv("PTV_NO_PLL_TRACKUP")) g_pll_trackup = 0;   /* 1.0.1-pre3: disable the steer-TRACK entirely (acquire-only; labels flat, no steer — the production mute) */
     /* 0.9.18.7: PTV_PLL_EMA_SHIFT (7) / PTV_PLL_TAU_MS (5000) / PTV_PLL_ACQUIRE_MS (40) /
