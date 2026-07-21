@@ -7,6 +7,57 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(7u) PRE21 — D1 lone-audio anchor fold + #24 PLL/corrector arbitration + [PTV-STALL]
+heartbeats. Four commits: d1-fix merge (3cb74d8b4a + da218b1425, adversarial-reviewed
+MERGE-READY), #24 (c98de627d1), heartbeats (6824e9b4e8), this docs/version commit.
+
+ITEM 1 — D1 REGRESSION FIX (lone-audio video-anchor; kill PTV_NO_VANCHOR=1).
+SYMPTOM (Grid_2x2 in3 live 2026-07-21 14:08, owner ear-confirmed): a lone AUDIO label
+jump +1.344s flushed as a one-sided butt-joint (old=22 new=5 applied=−1.320, NO
+"expected audio label step" line) → audio content 1.32s early permanent (R=+1322,
+ea=−1320) + 22 flowing video pkts DELETED ([PTV-REANCHOR2] video-ahead +860ms).
+Verified working on pre5 (2026-07-14: old=0 vid=+0.020, step +1.700 registered).
+ROOT CAUSE: pre7 (77e7410e61) closed the borrowed-base false crossing that pre5 was
+ACCIDENTALLY relying on for this shape — post-pre7 the flush fell to 3b (provisional,
+no registration, video discarded via cont_eligible's pair_vid_defined gate).
+FIX: deliberate video-anchor at flush time — lone transcoded-audio trigger + video
+flowing own-continuous + video position classifying NEW against the trigger's bases
+(+ rr-d1 fix round: R1 stale-window expiry first, R2 FORWARD-only trigger jumps, R3
+pair_anchored survives the end-of-flush close ≤5s so a staggered video leg finds the
+pair state, declines the #47-C hold, and 2a-flushes immediately).
+KNOWN BOUND (reviewer-accepted, ARM-C): a genuinely-paired event whose video leg
+arrives >500ms after the anchored audio flush bakes a pad-vs-erase residual ≤ the
+step, sensor-visible. ONE-LOG-READ SIGNATURE: anchor line → video 2a flush → R step
+with ev=−step. Closure of that residual rides ITEM 2 (#24). pair_anchored persists
+≤5s (window expiry / 2a) — an independent same-window audio re-cross takes 3c
+(butt-joint) exactly as before. Gates: 7-arm battery (ARM-A/B/C adversarial + main
+fixture + PTV_NO_VANCHOR parity + clean-source + fx50 veto) all PASS, all wire-alive.
+
+ITEM 2 — #24 MV PLL/CORRECTOR ARBITRATION (kill PTV_NO_PLL_YIELD=1).
+MEASURED DISEASE (p24 gate-1): the mv audio-follow PLL and the residual corrector
+share the graph-door actuator with opposing objectives — corr walked +655ms at full
+slew (slip=0) while ΔR=−1ms and the PLL steer series read exactly −2ms/s from the
+engage: the PLL trims back every µs the corrector realizes, 1:1 → mv ENGAGE→PARK
+structurally unreachable, every engagement ends in an authority-cap DISARM.
+FIX: the PLL YIELDS (af_steer_us integration + ACQUIRE drop/pad frozen; measurement
+chain live) while THIS track's corrector is ENGAGED; resumes on PARK/DISARM; one
+"[PTV-RSCORR] aN PLL yields/resumes" line per transition. ALSO (owner-approved
+shape): a lifetime-authority-cap DISARM is now FINAL for the process (perm_disarm,
+logged once) — 10s of failed trim must not re-walk the staircase forever.
+
+ITEM 3 — THREAD-POSITION HEARTBEATS + [PTV-STALL] (always-on, reporting only).
+CONTEXT (Azorse live wedge 2026-07-21 10:43:58; cor-1 1.0.0 survived the same source
+event): vdec froze in a futex with video_q FULL and frame_q EMPTY — the log never
+said WHERE. Now: vdec stamps q_recv/bank/send_pkt/recv_frame/hw_upload/fq_send +
+wall; the stats owner (single-input master output thread / mv compositor) stamps its
+loop points; demux stamps arrival+vq depth. The per-rung watchdog thread (different
+thread, 500ms) reports "[PTV-STALL] vdec thread (inN) stalled Ns at <position>
+(dec=, vq=, frameq=) — input flowing" when a stamp is >5s stale while the demux
+stamp is fresh (<2s); rate-limited 60s/slot. LIVE-FIRED via TEST-ONLY
+PTV_TEST_VDEC_STALL_S (the pre20 silent-zombie rule: no unfired diagnostics).
+Gate tables: analysis + per-cell logs in the session scratchpad (pre21-progress.md);
+summary in PROGRESS.md.
+
 (7t) PRE20 — REBUILD RE-ANCHOR (headline) + behavior-inert cleanup sweep + riders.
 The last content pre before the v1.1.0 freeze. Three code commits, in order:
 cleanup (parity gates bind to it alone), re-anchor, riders.
