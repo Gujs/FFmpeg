@@ -41,9 +41,18 @@ engage: the PLL trims back every µs the corrector realizes, 1:1 → mv ENGAGE�
 structurally unreachable, every engagement ends in an authority-cap DISARM.
 FIX: the PLL YIELDS (af_steer_us integration + ACQUIRE drop/pad frozen; measurement
 chain live) while THIS track's corrector is ENGAGED; resumes on PARK/DISARM; one
-"[PTV-RSCORR] aN PLL yields/resumes" line per transition. ALSO (owner-approved
-shape): a lifetime-authority-cap DISARM is now FINAL for the process (perm_disarm,
-logged once) — 10s of failed trim must not re-walk the staircase forever.
+"[PTV-RSCORR] aN PLL yields/resumes" line per transition. BUMPLESS RESUME (8d6f4de4bb):
+the PLL measures relative to a bias adopted at each yield-resume (bias += ema,
+smoothing re-seeded) — without it the first post-PARK resume reads the corrector's
+DELIBERATE walk as fresh misalignment and ACQUIREs it back (a structural ~12min
+sawtooth exchanging the full step per cycle); when the PLL's pairing measure agrees
+with R (real-content-gap case) the resume ema is ~0 and the bias is a no-op. ALSO
+(owner-approved shape): a lifetime-authority-cap DISARM is now FINAL for the process
+(perm_disarm, logged once) — 10s of failed trim must not re-walk the staircase
+forever. GATE (b-yield, broken-shape fixture): ENGAGE R=+1391 → walk slip=0 → PARK
+R=+1391→−17ms corr=+1452ms in 811s → "PLL resumes ... bumpless: adopted −1380ms";
+post-PARK R flat −16ms, zero re-engage/ACQUIRE churn. CONTROL (+PTV_NO_PLL_YIELD=1):
+the old disease byte-exact — corr walks +476ms while R stays +1358 flat (dR/dcorr≈0).
 
 ITEM 3 — THREAD-POSITION HEARTBEATS + [PTV-STALL] (always-on, reporting only).
 CONTEXT (Azorse live wedge 2026-07-21 10:43:58; cor-1 1.0.0 survived the same source
