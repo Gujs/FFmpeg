@@ -583,6 +583,11 @@ typedef struct AudioState {
     int              pll_acq_win;                     /* 1.0.1: consecutive completed above-threshold debounce windows (fire at 3; PTV_ACQ_INSTANT reverts) */
     int              pll_yielded;                     /* 1.0.1-pre21 #24: PLL actuators currently yielded to the steering corrector (transition-logged) */
     int64_t          pll_yield_bias_us;               /* #24 bumpless resume: alignment reference adopted at yield-resume — the PLL measures RELATIVE to the corrector's realized walk (never undoes it) */
+    int              pll_bias_stale;                  /* rr21 A1: bias calibration voided by a label-baseline event — actuators suspended until the settled-window re-adoption */
+    int              pll_bias_settle;                 /* rr21 A1: frames since the stale mark (adopt at ≥128 flat / 1280 hard cap) */
+    int              pll_watch_seeded;                /* rr21 A1: ea/glue watch initialized */
+    int64_t          pll_ea_watch;                    /* rr21 A1: last-seen demux label-edit ledger (g_rsx.ea_us[track]) */
+    int64_t          pll_glue_watch;                  /* rr21 A1: last-seen AGLUE glue_off_us */
     int              acq_backoff;                     /* 1.0.1-pre18 #49: repeated-ACQUIRE backoff level (thr <<= level; +1 per
                                                        * acquire, −1 per acquire-free 60s) — an erase-class corruption phase
                                                        * re-anchors ±1 flat step per refractory forever (mv slot warble); the

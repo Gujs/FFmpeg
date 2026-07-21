@@ -29,6 +29,7 @@
 
 #include "ptvencoder.h"
 
+static void    ptv_pll_bias_mark(AudioState *a, const char *why, int force);   /* rr21 A1 (defined near ptv_rebuild_reanchor) */
 static int     g_aglue_max_ms = 1000;     /* [PTV-AGLUE] cap (ms): steps above this are the >1s discontinuity layer's job
                                            * (demux_unwrap/LAYERA) — the glue logs and stands aside. Internalized 0.9.18.7 (was PTV_AGLUE_MAX_MS).
                                            * v0.9.17: 900→1000 to meet LAYERA's threshold exactly — the 900ms-1s sliver
@@ -781,15 +782,36 @@ static int audio_drain_fg(AudioState *a)
                 }
                 if (!a->af_started) { a->af_applied_us = 0; a->af_started = 1; }  /* seed 0 (house_skew is wrong-sign in the banked regime) */
                 if (a->av_off_valid) {
-                    /* #24 bumpless resume: measure RELATIVE to the alignment reference adopted at
-                     * the last yield-resume (0 until a corrector engagement ends). Without the
-                     * rebase, the corrector's DELIBERATE content shift (R walked to 0, PARK)
-                     * reads as fresh misalignment the moment the PLL resumes → ACQUIRE undoes
-                     * the whole walk → R re-opens → re-engage: a structural ~12min sawtooth
-                     * exchanging the full step each cycle. The corrector owns what it realized;
-                     * the PLL steers NEW drift relative to it. (When the PLL's pairing measure
-                     * agrees with R — the real-content-gap case — the ema at resume is ~0 and
-                     * the bias is a no-op.) */
+                    /* rr21 A1 label-baseline WATCH: a demux label edit (ea ledger — LAYERA flush
+                     * persist / absorber self-rebase / retro-correct; the splice-RETURN erase
+                     * class) or an AGLUE glue_off change redefines the pairing baseline the #24
+                     * bias was calibrated against → stale-mark it (no-op while bias==0, so
+                     * never-engaged tracks keep legacy behavior byte-identical). Watches update
+                     * unconditionally so a later engagement starts from current values. */
+                    {
+                        int64_t ea_now = (a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO)
+                            ? atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed) : 0;
+                        if (!a->pll_watch_seeded) {
+                            a->pll_watch_seeded = 1;
+                            a->pll_ea_watch     = ea_now;
+                            a->pll_glue_watch   = a->glue_off_us;
+                        } else if (ea_now != a->pll_ea_watch ||
+                                   a->glue_off_us != a->pll_glue_watch) {
+                            a->pll_ea_watch   = ea_now;
+                            a->pll_glue_watch = a->glue_off_us;
+                            ptv_pll_bias_mark(a, "label baseline moved (ledger/glue)", 0);
+                        }
+                    }
+                    /* #24 bumpless resume: measure RELATIVE to the alignment reference adopted
+                     * after each corrector engagement (0 until one ends). Without the rebase,
+                     * the corrector's DELIBERATE content shift (R walked to 0, PARK) reads as
+                     * fresh misalignment the moment the PLL resumes → ACQUIRE undoes the whole
+                     * walk → R re-opens → re-engage: a structural ~12min sawtooth exchanging
+                     * the full step each cycle. The corrector owns what it realized; the PLL
+                     * steers NEW drift relative to it. (When the PLL's pairing measure agrees
+                     * with R — the real-content-gap case — the adopted value is ~0 and the
+                     * bias is a no-op.) rr21 A1: adoption is DEFERRED to a settled window (see
+                     * ptv_pll_bias_mark) — never taken from a mid-transient sample. */
                     int64_t off = a->av_offset_us - a->pll_yield_bias_us;   /* the FAITHFUL measured offset (vlag − alag), corrector-rebased */
                     if (g_pll_testnoise_us)                  /* TEST-ONLY: ±N square wave (default ~7s flip, matches the box thrash period; holds long enough to defeat the debounce like the real noise) to reproduce the box limit cycle locally. 1.0.1-pre18 (#49 gate): PTV_PLL_TESTNOISE_P sets the half-period in FRAMES — the erase-class storm is a FLAT step flipping SLOWER than pll_dev's τ (~11s), so the 7s default lets the noise-adaptive threshold tame it and the storm control never forms; ~30s flips model the live class. */
                         off += ((a->out_frames / g_pll_testnoise_frames) & 1) ? g_pll_testnoise_us : -g_pll_testnoise_us;
@@ -869,20 +891,42 @@ static int audio_drain_fg(AudioState *a)
                                    "[PTV-RSCORR] a%d(in%d) PLL yields (corrector steering; PTV_NO_PLL_YIELD reverts)\n",
                                    a->dbg_k, a->dbg_in);
                         else {
-                            /* bumpless resume (see the bias note at the off computation): adopt
-                             * the offset the corrector's walk left behind as the new reference,
-                             * re-seed the smoothing so the next reading starts clean. */
+                            /* bumpless resume (see the bias note at the off computation) —
+                             * rr21 A1: DEFERRED. Mark the bias stale (force: this is where the
+                             * calibration is CREATED); the settled-window re-adoption below
+                             * takes it once the measurement is flat — a DISARM-path resume
+                             * mid-event can no longer adopt a transient sample. */
+                            av_log(NULL, AV_LOG_WARNING,
+                                   "[PTV-RSCORR] a%d(in%d) PLL resumes (corrector left steering) — "
+                                   "bumpless: re-adoption deferred to a settled window (ema %+"PRId64"ms)\n",
+                                   a->dbg_k, a->dbg_in, a->pll_ema / 1000);
+                            ptv_pll_bias_mark(a, "corrector engagement ended", 1);
+                        }
+                    }
+                    /* rr21 A1 settled-window RE-ADOPTION: while stale (and not yielded — a walk
+                     * in progress is a moving target; the resume re-marks anyway), count the
+                     * settle. Adopt at ≥128 frames (~2.7s, the EMA τ) once the instantaneous
+                     * reading sits within the base acquire band of the EMA (flat), or at the
+                     * 1280-frame hard cap (~27s) so a jittery leg cannot suspend its PLL
+                     * forever. Same arithmetic as the old resume adoption — idempotent. */
+                    if (a->pll_bias_stale && !pll_yield && a->pll_seed) {
+                        a->pll_bias_settle++;
+                        if ((a->pll_bias_settle >= 128 &&
+                             FFABS(off - a->pll_ema) <= (int64_t)g_pll_acquire_us) ||
+                            a->pll_bias_settle >= 1280) {
                             a->pll_yield_bias_us += a->pll_ema;
+                            a->pll_bias_stale = 0;
                             a->pll_seed    = 0;
                             a->pll_dbnc    = 0;
                             a->pll_acq_win = 0;
                             av_log(NULL, AV_LOG_WARNING,
-                                   "[PTV-RSCORR] a%d(in%d) PLL resumes (corrector left steering) — "
-                                   "bumpless: adopted %+"PRId64"ms as the alignment reference (total bias %+"PRId64"ms)\n",
-                                   a->dbg_k, a->dbg_in, a->pll_ema / 1000, a->pll_yield_bias_us / 1000);
+                                   "[PTV-RSCORR] a%d(in%d) PLL bias re-adopted %+"PRId64"ms after a "
+                                   "%d-frame settle (total bias %+"PRId64"ms) — actuators resume\n",
+                                   a->dbg_k, a->dbg_in, a->pll_ema / 1000, a->pll_bias_settle,
+                                   a->pll_yield_bias_us / 1000);
                         }
                     }
-                    int may_acq = !pll_yield &&
+                    int may_acq = !pll_yield && !a->pll_bias_stale &&
                                   a->pll_refractory <= 0 &&
                                   FFABS(a->pll_ema) > thr &&
                                   a->pll_dbnc >= g_pll_acquire_n;
@@ -944,7 +988,7 @@ static int audio_drain_fg(AudioState *a)
                         a->pll_refractory = (int)(g_pll_refractory_us / frame_us);  /* v0.6.21: HARD ~12s refractory (was g_pll_acquire_n ≈0.68s) — breaks the self-excited limit cycle */
                         a->pll_dbnc = 0; a->pll_dbnc_ref = a->pll_ema;
                         if (a->pll_drop > 0) { a->pll_drop--; av_frame_unref(filt); continue; }  /* drop the current frame too */
-                    } else if (g_pll_trackup && !pll_yield) {   /* #24: TRACK integrator frozen while the corrector steers */
+                    } else if (g_pll_trackup && !pll_yield && !a->pll_bias_stale) {   /* #24: TRACK frozen while the corrector steers / the bias is stale (rr21 A1) */
                         /* TRACK — 1.0.1-pre3: RESAMPLER STEER, never labels. pre2's TRACK actuated by
                          * re-stamping output labels (af_applied_us moved `want` every frame): the PCM
                          * stayed byte-clean but the output AAC pts spacing stretched up to +158ms/min
@@ -1622,6 +1666,39 @@ static int64_t ptv_anchor_next_pts(const AudioState *a, int64_t house_us)
  * Birth is untouched (this runs only with pts_set, and only from the AFMT rebuild site);
  * REANCHOR2/ACQUIRE mv re-seed paths are untouched. PTV_NO_REBUILD_REANCHOR=1 reverts all
  * three pieces. */
+/* 1.0.1-pre21 rr21 A1: the #24 bumpless bias (pll_yield_bias_us) is a CALIBRATION of the
+ * PLL's label-domain pairing miscalibration, valid only against the label baseline it was
+ * measured under. Any event that REDEFINES that baseline (a demux label edit — LAYERA flush
+ * persist / absorber self-rebase / retro-correct, all posted to the ea ledger; an AGLUE
+ * glue_off change; a rebuild re-anchor) strands it: e.g. a TruBLU splice-RETURN backward
+ * jump relabel-erases and CANCELS the miscalibration an erase-class walk encoded, so
+ * av_offset returns ~0 while the bias holds −walk → a phantom +walk reading the PLL would
+ * ACQUIRE within seconds (physically mis-aligning real output; permanent after a
+ * lifetime-cap perm_disarm). Fix: STALE-MARK — suspend the PLL's actuators (acquire+TRACK)
+ * and reseed the smoothing; a settled measurement window then RE-ADOPTS (bias += ema, the
+ * same idempotent arithmetic as the resume path — converges to the absolute pairing offset,
+ * never blind-zeroed: zeroing a parked walk's bias re-creates the resume sawtooth).
+ * `force` marks even with bias==0 (the resume path, where the calibration is CREATED);
+ * un-forced marks with bias==0 no-op so the legacy PLL/glue interplay stays byte-identical
+ * on tracks that never engaged. Audio thread only. */
+static void ptv_pll_bias_mark(AudioState *a, const char *why, int force)
+{
+    if (!g_pll_yield || !a->multiview)
+        return;
+    if (!force && a->pll_yield_bias_us == 0 && !a->pll_bias_stale)
+        return;
+    if (!a->pll_bias_stale)
+        av_log(NULL, AV_LOG_WARNING,
+               "[PTV-RSCORR] a%d(in%d) PLL bias STALE (%s) — actuators suspended until a "
+               "settled window re-adopts (bias %+"PRId64"ms)\n",
+               a->dbg_k, a->dbg_in, why, a->pll_yield_bias_us / 1000);
+    a->pll_bias_stale  = 1;
+    a->pll_bias_settle = 0;
+    a->pll_seed        = 0;
+    a->pll_dbnc        = 0;
+    a->pll_acq_win     = 0;
+}
+
 static void ptv_rebuild_reanchor(AudioState *a, const AVFrame *frame)
 {
     int64_t h0, content_us, house_us, old_glue, old_corr;
@@ -1687,6 +1764,13 @@ static void ptv_rebuild_reanchor(AudioState *a, const AVFrame *frame)
     a->reanch_wc      = av_gettime_relative();
     a->reanch_frames  = 0;
     a->reanch_step_us = 0;
+    /* rr21 A1 (reviewer minimum site): the re-anchor redefines the track's label baseline —
+     * the #24 pairing calibration measured under the old baseline is void. The residual
+     * steps inside the 10s window are further label edits; each re-marks via the per-frame
+     * glue/ledger watch, so adoption only completes once the window's edits settle. This
+     * also covers the mid-engagement rebuild (state forced ARMED → the PLL resume defers
+     * adoption to the same settled window instead of adopting a mid-transient sample). */
+    ptv_pll_bias_mark(a, "afmt-rebuild re-anchor", 0);
     av_log(NULL, AV_LOG_WARNING,
            "[PTV-ANCHOR] a%d(in%d) re-anchored (afmt-rebuild): base=content-h0 at %+"PRId64"ms, "
            "corr %+"PRId64"ms retired into the base ledger (door labels continuous; carried glue "

@@ -53,6 +53,20 @@ forever. GATE (b-yield, broken-shape fixture): ENGAGE R=+1391 → walk slip=0 �
 R=+1391→−17ms corr=+1452ms in 811s → "PLL resumes ... bumpless: adopted −1380ms";
 post-PARK R flat −16ms, zero re-engage/ACQUIRE churn. CONTROL (+PTV_NO_PLL_YIELD=1):
 the old disease byte-exact — corr walks +476ms while R stays +1358 flat (dR/dcorr≈0).
+rr21 A1 (review fix round): the bias is a CALIBRATION of the PLL's label-domain
+pairing miscalibration and any label-baseline redefinition strands it — the concrete
+class: a TruBLU splice-RETURN backward jump relabel-erases and CANCELS the
+miscalibration an erase-class walk encoded → av_offset returns ~0 while the bias
+holds −walk → +walk PHANTOM the PLL would ACQUIRE within seconds (permanent
+mis-alignment after a lifetime-cap perm_disarm). FIX: STALE-MARK + settled-window
+RE-ADOPT (never blind-zero): ptv_pll_bias_mark at (i) ptv_rebuild_reanchor, (ii) a
+per-frame watch on the demux label-edit ledger (g_rsx.ea_us — LAYERA persists,
+absorber self-rebase, retro-correct) + AGLUE glue_off changes, (iii) the resume path
+itself (adoption is now ALWAYS deferred — a DISARM-path resume can no longer adopt a
+mid-transient sample, closing the mid-engagement-rebuild hazard). While stale the
+PLL's actuators (acquire+TRACK) suspend, measurement runs; adoption at ≥128 flat
+frames (~2.7s) or the 1280-frame hard cap (~27s). bias==0 un-forced marks no-op
+(never-engaged tracks byte-identical).
 
 ITEM 3 — THREAD-POSITION HEARTBEATS + [PTV-STALL] (always-on, reporting only).
 CONTEXT (Azorse live wedge 2026-07-21 10:43:58; cor-1 1.0.0 survived the same source
@@ -64,6 +78,12 @@ thread, 500ms) reports "[PTV-STALL] vdec thread (inN) stalled Ns at <position>
 (dec=, vq=, frameq=) — input flowing" when a stamp is >5s stale while the demux
 stamp is fresh (<2s); rate-limited 60s/slot. LIVE-FIRED via TEST-ONLY
 PTV_TEST_VDEC_STALL_S (the pre20 silent-zombie rule: no unfired diagnostics).
+Reviewer notes carried (rr21, non-blocking): (1) on mv BOTH the compositor and the
+master rung's output thread write the single OUT stamp — an output-thread stall can
+be masked by a live compositor (UNDER-reporting only, never noise); give the
+compositor sole OUT ownership (or a second slot) in a later pre. (2) a genuine >5s
+graph/hwupload block under GPU load WILL print [PTV-STALL] — that is a TRUE POSITIVE
+by intent (the NVENC-block class), ERROR-level, rate-limited.
 Gate tables: analysis + per-cell logs in the session scratchpad (pre21-progress.md);
 summary in PROGRESS.md.
 
