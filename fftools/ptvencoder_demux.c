@@ -692,6 +692,50 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
     }
     b->flushing = 1;
 
+    /* d1-fix (pre20 regression, live Grid_2x2 2026-07-21): LONE-AUDIO event with the transcoded
+     * VIDEO stream flowing own-continuous through the cycle AND already positioned ON the
+     * trigger's jump-target timeline (borrowed-base classify of video's current position
+     * returns NEW = the audio jump converges audio's labels onto where video already lives —
+     * an A-vs-V divergence event, not a splice video will follow). Anchor the event on the
+     * VIDEO timeline at offset 0 BEFORE classification: cont_eligible then KEEPS the flowing
+     * video (no old= discard / decoder-ref hole), the decision tree takes the 3a INHERIT
+     * (applied = 0, pair_stamp final), and the audio's full butt-joint mismatch is REGISTERED
+     * (ptv_pair_expect) so the label step stays on the wire and the content path APPLIES it —
+     * the D1 handshake. This deliberately restores what pre5 did by ACCIDENT for this shape
+     * (borrowed-base false crossing recorded fake video bases with offset ≈ 0; live pre5
+     * 2026-07-14: old=0 vid=+0.020, step +1.700 registered) and what the pre7 false-crossing
+     * gate (77e7410e61) removed without a replacement — post-pre7 this shape fell to 3b
+     * (provisional butt-joint, NO registration, video discarded): audio content 1.32s early
+     * on air + [PTV-REANCHOR2] video-ahead. Video positioned near the trigger's OLD base
+     * (the PATRIOT audio-first paired ordering — video's own jump still in flight) classifies
+     * OLD and keeps today's 3b provisional + 2d retro-correct path byte-identically.
+     * PTV_NO_VANCHOR=1 reverts. */
+    if (g_shared_flush && g_vanchor && !b->pair_vid_defined &&
+        b->cycle_trigger >= 0 && b->cycle_trigger < b->nb_streams &&
+        b->cycle_trigger < (int)d->ifmt->nb_streams &&
+        d->ifmt->streams[b->cycle_trigger]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
+        d->vstream >= 0 && d->vstream < b->nb_streams &&
+        !b->stream_state[d->vstream].has_new_base &&
+        b->stream_state[d->vstream].last_dts_us != AV_NOPTS_VALUE) {
+        int k, trig_transcoded = 0, vflow = 0;
+        for (k = 0; k < d->n_audio && !trig_transcoded; k++)
+            trig_transcoded = d->astream[k] == b->cycle_trigger;
+        for (i = 0; i < b->nb_packets && !vflow; i++)
+            vflow = b->packets[i] && b->packets[i]->stream_idx == d->vstream &&
+                    b->packets[i]->own_cont;
+        if (trig_transcoded && vflow &&
+            ptv_disc_classify(b, d->vstream, b->stream_state[d->vstream].last_dts_us) == 1) {
+            b->pair_vid_defined = 1;
+            b->pair_vid_off_us  = 0;
+            if (!b->pair_start_us)
+                b->pair_start_us = av_gettime_relative();
+            av_log(NULL, AV_LOG_INFO,
+                   "[PTV-GLUE] lone-audio flush: video flows own-continuous AT the jump target "
+                   "— event anchored on the video timeline (offset 0); audio keeps its label "
+                   "step for the content path (PTV_NO_VANCHOR reverts)\n");
+        }
+    }
+
     for (i = 0; i < b->nb_packets; i++) {
         PtvDiscPacket *dp = b->packets[i];
         /* 1.0.1-pre7: an own-continuous packet of a stream that never crossed this cycle

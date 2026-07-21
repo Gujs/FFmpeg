@@ -1200,6 +1200,7 @@ extern int     g_progoff_av;
 extern int     g_layera;
 extern int     g_layera_fullskip;
 extern int     g_shared_flush;
+extern int     g_vanchor;                /* d1-fix lone-audio video-anchor; PTV_NO_VANCHOR=1 reverts */
 extern int     g_drop_until_kf;
 extern int     g_audio_follow;
 extern int     g_h0_reanchor;

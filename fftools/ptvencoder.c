@@ -201,6 +201,13 @@ int     g_layera_fullskip = 0;
  * invariant holds in the band regardless, since ONE offset is applied either way).
  * Decision tree at ptv_disc_flush. PTV_NO_SHARED_FLUSH=1 reverts to the per-stream erase. */
 int     g_shared_flush = 1;
+/* d1-fix: lone-audio LAYERA event whose flowing video already sits ON the jump-target
+ * timeline anchors the event on video at offset 0 (the audio label step stays on the wire,
+ * registered for the content path — the D1 handshake) instead of the 3b provisional
+ * butt-joint erase + flowing-video discard the pre7 false-crossing gate left this shape
+ * with (live Grid_2x2 2026-07-21: audio 1.32s early + video-ahead re-anchor).
+ * PTV_NO_VANCHOR=1 reverts. */
+int     g_vanchor = 1;
 /* P2 §7.1 / stage 2b: after a detected source discontinuity, DROP video packets until the next keyframe
  * (IDR) before they reach the decoder — a splice starts a NEW timeline mid-GOP, so the P/B frames that
  * reference the missing IDR decode as a corruption burst (greyed/torn frames) that the house clock would
@@ -2674,6 +2681,9 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_SHARED_FLUSH")) g_shared_flush = 0;     /* 1.0.1-pre4 revert: LAYERA flushes erase per-stream again
                                                                 * (bakes the A-vs-V jump difference into the output on
                                                                 * asymmetric events — A/B / rollback only) */
+    if (getenv("PTV_NO_VANCHOR")) g_vanchor = 0;               /* d1-fix revert: lone-audio flush falls back to the 3b
+                                                                * provisional butt-joint (erases the step, discards the
+                                                                * flowing video — the pre7..pre20 regression shape) */
     if (getenv("PTV_NO_ADAPTIVE")) g_adapt_cushion = 0;   /* fixed preroll target (pre-0.9.10 behavior) */
     /* PTV_CUSHION_MS parse moved to resolve_cushions() (0.9.18 M1) */
     if (getenv("PTV_NO_GENLOCK")) g_genlock = 0; /* v0.9.0: revert to free-run nominal pacing (+ old 350ms prime) = byte-identical */
