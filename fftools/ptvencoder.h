@@ -582,6 +582,7 @@ typedef struct AudioState {
     int              pll_refractory;                  /* frames remaining before acquire may re-arm (bumpless-credit backstop) */
     int              pll_acq_win;                     /* 1.0.1: consecutive completed above-threshold debounce windows (fire at 3; PTV_ACQ_INSTANT reverts) */
     int              pll_yielded;                     /* 1.0.1-pre21 #24: PLL actuators currently yielded to the steering corrector (transition-logged) */
+    int64_t          pll_yield_bias_us;               /* #24 bumpless resume: alignment reference adopted at yield-resume — the PLL measures RELATIVE to the corrector's realized walk (never undoes it) */
     int              acq_backoff;                     /* 1.0.1-pre18 #49: repeated-ACQUIRE backoff level (thr <<= level; +1 per
                                                        * acquire, −1 per acquire-free 60s) — an erase-class corruption phase
                                                        * re-anchors ±1 flat step per refractory forever (mv slot warble); the

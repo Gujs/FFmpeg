@@ -781,7 +781,16 @@ static int audio_drain_fg(AudioState *a)
                 }
                 if (!a->af_started) { a->af_applied_us = 0; a->af_started = 1; }  /* seed 0 (house_skew is wrong-sign in the banked regime) */
                 if (a->av_off_valid) {
-                    int64_t off = a->av_offset_us;           /* the FAITHFUL measured offset (vlag − alag) */
+                    /* #24 bumpless resume: measure RELATIVE to the alignment reference adopted at
+                     * the last yield-resume (0 until a corrector engagement ends). Without the
+                     * rebase, the corrector's DELIBERATE content shift (R walked to 0, PARK)
+                     * reads as fresh misalignment the moment the PLL resumes → ACQUIRE undoes
+                     * the whole walk → R re-opens → re-engage: a structural ~12min sawtooth
+                     * exchanging the full step each cycle. The corrector owns what it realized;
+                     * the PLL steers NEW drift relative to it. (When the PLL's pairing measure
+                     * agrees with R — the real-content-gap case — the ema at resume is ~0 and
+                     * the bias is a no-op.) */
+                    int64_t off = a->av_offset_us - a->pll_yield_bias_us;   /* the FAITHFUL measured offset (vlag − alag), corrector-rebased */
                     if (g_pll_testnoise_us)                  /* TEST-ONLY: ±N square wave (default ~7s flip, matches the box thrash period; holds long enough to defeat the debounce like the real noise) to reproduce the box limit cycle locally. 1.0.1-pre18 (#49 gate): PTV_PLL_TESTNOISE_P sets the half-period in FRAMES — the erase-class storm is a FLAT step flipping SLOWER than pll_dev's τ (~11s), so the 7s default lets the noise-adaptive threshold tame it and the storm control never forms; ~30s flips model the live class. */
                         off += ((a->out_frames / g_pll_testnoise_frames) & 1) ? g_pll_testnoise_us : -g_pll_testnoise_us;
                     if (!a->pll_seed) { a->pll_ema = off; a->pll_dbnc_ref = off; a->pll_seed = 1; }
@@ -859,10 +868,19 @@ static int audio_drain_fg(AudioState *a)
                             av_log(NULL, AV_LOG_WARNING,
                                    "[PTV-RSCORR] a%d(in%d) PLL yields (corrector steering; PTV_NO_PLL_YIELD reverts)\n",
                                    a->dbg_k, a->dbg_in);
-                        else
+                        else {
+                            /* bumpless resume (see the bias note at the off computation): adopt
+                             * the offset the corrector's walk left behind as the new reference,
+                             * re-seed the smoothing so the next reading starts clean. */
+                            a->pll_yield_bias_us += a->pll_ema;
+                            a->pll_seed    = 0;
+                            a->pll_dbnc    = 0;
+                            a->pll_acq_win = 0;
                             av_log(NULL, AV_LOG_WARNING,
-                                   "[PTV-RSCORR] a%d(in%d) PLL resumes (corrector left steering)\n",
-                                   a->dbg_k, a->dbg_in);
+                                   "[PTV-RSCORR] a%d(in%d) PLL resumes (corrector left steering) — "
+                                   "bumpless: adopted %+"PRId64"ms as the alignment reference (total bias %+"PRId64"ms)\n",
+                                   a->dbg_k, a->dbg_in, a->pll_ema / 1000, a->pll_yield_bias_us / 1000);
+                        }
                     }
                     int may_acq = !pll_yield &&
                                   a->pll_refractory <= 0 &&
