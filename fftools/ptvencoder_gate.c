@@ -718,8 +718,52 @@ void push_frame_q(AVThreadMessageQueue *q, int live, int64_t *framedrop, AVFrame
 void *watchdog_thread(void *arg)
 {
     VideoCtx *v = arg;
+    int64_t hb_rl_vdec[PTV_MAX_INPUT] = {0};   /* 1.0.1-pre21: per-slot [PTV-STALL] rate limit (60s) */
+    int64_t hb_rl_out = 0;
     while (!v->output_done) {
         av_usleep(500000);
+        /* 1.0.1-pre21 thread-position heartbeats (design note at the g_hb_* externs): the
+         * MASTER rung's watchdog (a different thread from every stamped one) checks the
+         * stamps each pass. A vdec stamp >5s old while its input's demux stamp is fresh
+         * (<2s) = the Azorse-wedge signature (vdec frozen in a futex, video_q full, frame_q
+         * empty — input flowing); one line per 60s per slot names the position. The
+         * output/stats beat is checked the same way (its "input" evidence is any fresh
+         * demux). Reporting only — recovery stays with the supervisor/self-heal layers. */
+        if (v->is_master) {
+            int64_t hnow = av_gettime_relative();
+            int s2, any_demux_fresh = 0;
+            for (s2 = 0; s2 < PTV_MAX_INPUT; s2++) {
+                int64_t dw = atomic_load_explicit(&g_hb_demux_wall[s2], memory_order_relaxed);
+                int64_t vw = atomic_load_explicit(&g_hb_vdec_wall[s2], memory_order_relaxed);
+                if (dw && hnow - dw < 2000000) any_demux_fresh = 1;
+                if (!vw || !dw)
+                    continue;                       /* slot never stamped = not an active input */
+                if (hnow - vw > 5000000 && hnow - dw < 2000000 &&
+                    hnow - hb_rl_vdec[s2] >= 60000000) {
+                    hb_rl_vdec[s2] = hnow;
+                    av_log(NULL, AV_LOG_ERROR,
+                           "[PTV-STALL] vdec thread (in%d) stalled %.0fs at %s "
+                           "(dec=%"PRId64", vq=%d, frameq=%d) — input flowing\n",
+                           s2, (hnow - vw) / 1000000.0,
+                           ptv_hb_name(atomic_load_explicit(&g_hb_vdec_pos[s2], memory_order_relaxed)),
+                           atomic_load_explicit(&g_hb_vdec_dec[s2], memory_order_relaxed),
+                           atomic_load_explicit(&g_hb_vq[s2], memory_order_relaxed),
+                           atomic_load_explicit(&g_frameq_depth, memory_order_relaxed));
+                }
+            }
+            {
+                int64_t ow = atomic_load_explicit(&g_hb_out_wall, memory_order_relaxed);
+                if (ow && hnow - ow > 5000000 && any_demux_fresh &&
+                    hnow - hb_rl_out >= 60000000) {
+                    hb_rl_out = hnow;
+                    av_log(NULL, AV_LOG_ERROR,
+                           "[PTV-STALL] output/stats thread stalled %.0fs at %s (frameq=%d)\n",
+                           (hnow - ow) / 1000000.0,
+                           ptv_hb_name(atomic_load_explicit(&g_hb_out_pos, memory_order_relaxed)),
+                           atomic_load_explicit(&g_frameq_depth, memory_order_relaxed));
+                }
+            }
+        }
         int64_t le = v->last_emit_us;
         if (v->emitted > 0 && le > 0) {
             int64_t age = av_gettime_relative() - le;

@@ -297,6 +297,33 @@ int     g_avsync_pll = 1;             /* B3 closed-loop A/V controller DEFAULT-O
  * output-alignment objective cancels the corrector 1:1 (p24 gate-1), making mv ENGAGE→PARK
  * structurally unreachable. PTV_NO_PLL_YIELD=1 reverts the arbitration only. */
 int     g_pll_yield = 1;
+/* 1.0.1-pre21 heartbeats (see ptvencoder.h for the design note). */
+_Atomic int     g_hb_vdec_pos[PTV_MAX_INPUT];
+_Atomic int64_t g_hb_vdec_wall[PTV_MAX_INPUT];
+_Atomic int64_t g_hb_vdec_dec[PTV_MAX_INPUT];
+_Atomic int64_t g_hb_demux_wall[PTV_MAX_INPUT];
+_Atomic int     g_hb_vq[PTV_MAX_INPUT];
+_Atomic int     g_hb_out_pos;
+_Atomic int64_t g_hb_out_wall;
+int64_t g_test_vdec_stall_us;   /* TEST-ONLY (PTV_TEST_VDEC_STALL_S, precedent PTV_SLOW_US):
+                                 * sleep the vdec loop once after 60s of runtime so the
+                                 * [PTV-STALL] path live-fires in a gate — never ship an
+                                 * unfired diagnostic (the pre20 silent-zombie lesson). */
+const char *ptv_hb_name(int pos)
+{
+    switch (pos) {
+    case PTV_HB_VDEC_QRECV:     return "q_recv";
+    case PTV_HB_VDEC_BANK:      return "bank";
+    case PTV_HB_VDEC_SENDPKT:   return "send_pkt";
+    case PTV_HB_VDEC_RECVFRAME: return "recv_frame";
+    case PTV_HB_VDEC_HWUP:      return "hw_upload";
+    case PTV_HB_VDEC_FQSEND:    return "fq_send";
+    case PTV_HB_OUT_LOOP:       return "loop";
+    case PTV_HB_OUT_ENC:        return "encode_push";
+    case PTV_HB_OUT_STATS:      return "stats";
+    default:                    return "unknown";
+    }
+}
 int     g_acq_instant = 0;            /* 1.0.1 (PTV_ACQ_INSTANT=1 reverts): ACQUIRE needs the |EMA offset| above threshold for 3 CONSECUTIVE debounce windows (and the threshold is floored at 1.5 house ticks) — the vlag measurement is tick-quantized, so the single-window fire snapped on its own quantization noise (live grids: ~939-1511 ACQUIREs/22h alternating ±42ms pad/drop). */
 int     g_pll_trackup = 1;            /* 1.0.1-pre3 (PTV_NO_PLL_TRACKUP=1 disables TRACK entirely = acquire-only, labels flat — the operators' production mute keeps its meaning): TRACK now steers through the RESAMPLER (af_steer_us into the graph-input pts, AVLOCK-style) instead of re-stamping output labels. pre2's label-TRACK stretched output AAC pts spacing up to +158ms/min during integration episodes → PTS-honoring players rate-chased it = audible warble (production 2026-07-13). The pre2 [PTV-TRACKUP] direction-aware anti-windup is retired with the label actuator. */
 int64_t g_pll_testnoise_us = 0;       /* TEST-ONLY (default off): inject a ±N ms square wave (flips ~every 3.2s) into the measured offset to REPRODUCE the box limit cycle locally (local sources are clean). PTV_PLL_TESTNOISE_MS sets it; never set in production. */
@@ -981,6 +1008,8 @@ static void *decode_thread(void *arg)
     int64_t gov_next_us = 0;   /* 1.0.1-pre10 (f): governed catch-up pacing anchor (0 = disengaged) */
     int64_t gov_strike_win_us = 0, gov_holdoff_until_us = 0;   /* 1.0.1-pre13: oversleep strikes + fail-open holdoff */
     int     gov_strikes = 0;
+    int64_t hb_t0 = av_gettime_relative();   /* 1.0.1-pre21: heartbeat + test-stall runtime anchor */
+    int     hb_test_done = 0;
 
     if (!frame || !filt)
         goto done;
@@ -997,8 +1026,10 @@ static void *decode_thread(void *arg)
          * is the deep buffer's latency, paid once at channel start (and on each crash-loop restart). */
         int64_t budget = g_cp.deep_prime_budget_us;   /* 2x preroll_ms, in us (resolve_cushions) */
         while (av_thread_message_queue_nb_elems(d->video_q) < d->deep_prime_packets
-               && av_gettime_relative() - t0 < budget)
+               && av_gettime_relative() - t0 < budget) {
+            PTV_HB_VDEC(d->hb_slot, PTV_HB_VDEC_BANK);   /* pre21: banking is residence, not a stall */
             av_usleep(5000);
+        }
         if (g_diag)
             av_log(NULL, AV_LOG_INFO,
                    "[PTV-DIAG] deep prime: video_q banked %d/%d packets in %.1fs before decode\n",
@@ -1068,6 +1099,8 @@ static void *decode_thread(void *arg)
              * Session-109 escape) then runs instead of waiting for a packet that never
              * comes. */
             for (;;) {
+                PTV_HB_VDEC(d->hb_slot, PTV_HB_VDEC_QRECV);     /* pre21: idle-wait keeps the stamp fresh */
+                atomic_store_explicit(&g_hb_vdec_dec[d->hb_slot], d->dec_frames, memory_order_relaxed);
                 ret = av_thread_message_queue_recv(d->video_q, &pkt, AV_THREAD_MESSAGE_NONBLOCK);
                 if (ret != AVERROR(EAGAIN)) break;              /* got a pkt, or queue closed */
                 if (g_selfheal && d->live && !d->hold &&
@@ -1083,6 +1116,19 @@ static void *decode_thread(void *arg)
                 av_usleep(5000);
             }
             if (ret < 0) break;
+        }
+        /* 1.0.1-pre21 TEST-ONLY stall injection (PTV_TEST_VDEC_STALL_S): once, after 60s of
+         * runtime, park this thread for N seconds at the q_recv position — the gate proves
+         * the [PTV-STALL] watchdog fires with the right position while the wire stays alive
+         * (output dups), then the pipeline recovers. */
+        if (g_test_vdec_stall_us > 0 && !hb_test_done &&
+            av_gettime_relative() - hb_t0 >= 60000000) {
+            hb_test_done = 1;
+            av_log(NULL, AV_LOG_WARNING,
+                   "[PTV-TEST] vdec stall injection: sleeping %"PRId64"s at q_recv (in%d)\n",
+                   g_test_vdec_stall_us / 1000000, d->hb_slot);
+            PTV_HB_VDEC(d->hb_slot, PTV_HB_VDEC_QRECV);
+            av_usleep((unsigned int)g_test_vdec_stall_us);
         }
         /* 1.0.1-pre8 (c) SELF-HEAL RE-PRIME: the master output thread measured sustained
          * frame_q starvation with input flowing — the decode path is wedged on stale or
@@ -1141,9 +1187,11 @@ static void *decode_thread(void *arg)
             if (nws >= g_slow_dec_on_us && (!g_slow_dec_off_us || nws < g_slow_dec_off_us))
                 av_usleep(g_slow_dec);
         }
+        PTV_HB_VDEC(d->hb_slot, PTV_HB_VDEC_SENDPKT);
         ret = avcodec_send_packet(d->vdec, pkt);
         av_packet_free(&pkt);
         while (ret >= 0) {
+            PTV_HB_VDEC(d->hb_slot, PTV_HB_VDEC_RECVFRAME);
             ret = avcodec_receive_frame(d->vdec, frame);
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) { ret = 0; break; }
             if (ret < 0) goto done;
@@ -1272,6 +1320,7 @@ static void *decode_thread(void *arg)
                 }
             }
             d->dec_frames++;
+            PTV_HB_VDEC(d->hb_slot, d->hold ? PTV_HB_VDEC_FQSEND : PTV_HB_VDEC_HWUP);
             if (d->hold) stage_hold(d->hold, d->live, frame);   /* multiview: compositor samples this */
             else         emit_video(d, frame, filt);
         }
@@ -1281,6 +1330,7 @@ static void *decode_thread(void *arg)
     while (avcodec_receive_frame(d->vdec, frame) >= 0) {
         if (frame->flags & AV_FRAME_FLAG_CORRUPT) { av_frame_unref(frame); continue; }
         d->dec_frames++;
+        PTV_HB_VDEC(d->hb_slot, d->hold ? PTV_HB_VDEC_FQSEND : PTV_HB_VDEC_HWUP);
         if (d->hold) stage_hold(d->hold, d->live, frame);
         else         emit_video(d, frame, filt);
     }
@@ -2037,6 +2087,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         else { d->n_rung = n_rung; for (r = 0; r < n_rung; r++) d->frame_q[r] = rung[r].frame_q; }
         /* §13 deep startup cushion — target derivation moved to resolve_cushions() (0.9.18 M1) */
         d->deep_prime_packets = g_cp.deep_prime_pkts;
+        d->hb_slot = k;                            /* 1.0.1-pre21: heartbeat slot key */
         d->vq_shed_req = &inputs[k].vq_shed_req;   /* 1.0.1-pre8 (a): head-GOP shed request slot */
         /* rr10 review fix (D1): the catch-up governor's INPUT-rate currency — measured
          * arrival pps (demux publishes) + the declared header rate.
@@ -2772,6 +2823,7 @@ int main(int argc, char **argv)
      * see g_af_acquire_us / g_af_rate_us */
     if (getenv("PTV_NO_AVSYNC_PLL")) g_avsync_pll = 0;     /* B3 closed-loop is DEFAULT-ON (v0.6.20); this reverts to the open-loop B1 content-anchored follow. (PTV_AVSYNC_PLL=1 still honored implicitly = the default.) */
     if (getenv("PTV_NO_PLL_YIELD")) g_pll_yield = 0;       /* 1.0.1-pre21 #24 revert: PLL keeps actuating while the corrector steers (the 1:1 cancel — A/B only) */
+    { const char *ts = getenv("PTV_TEST_VDEC_STALL_S"); if (ts && atoi(ts) > 0) g_test_vdec_stall_us = (int64_t)atoi(ts) * 1000000; }   /* TEST-ONLY: [PTV-STALL] live-fire */
     if (getenv("PTV_ACQ_INSTANT")) g_acq_instant = 1;      /* 1.0.1: revert ACQUIRE to single-window fire (no 3-consecutive-window sustain; the tick floor stays) */
     if (getenv("PTV_NO_PLL_TRACKUP")) g_pll_trackup = 0;   /* 1.0.1-pre3: disable the steer-TRACK entirely (acquire-only; labels flat, no steer — the production mute) */
     /* 0.9.18.7: PTV_PLL_EMA_SHIFT (7) / PTV_PLL_TAU_MS (5000) / PTV_PLL_ACQUIRE_MS (40) /

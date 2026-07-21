@@ -452,6 +452,7 @@ typedef struct DecodeCtx {
     _Atomic int     *vin_pps;              /* -> DemuxArgs.vin_pps (demux-measured arrival pkts/s) */
     _Atomic int64_t *vin_pps_wall;         /* -> DemuxArgs.vin_pps_wall (wall time of the last publish —
                                             * 1.0.1-pre13: a stale value must never keep governing) */
+    int              hb_slot;              /* 1.0.1-pre21: this input's slot — keys the g_hb_vdec_* heartbeats */
     int              in_pps_decl;          /* declared input rate, ceil(avg_frame_rate) — the
                                             * pre13 trust floor: a measured rate BELOW this is broken,
                                             * not a slow source (Newsmax2 live defect); 0 = unknown */
@@ -1214,6 +1215,42 @@ extern int     g_vanchor;                /* d1-fix lone-audio video-anchor; PTV_
 extern int     g_drop_until_kf;
 extern int     g_audio_follow;
 extern int     g_pll_yield;              /* 1.0.1-pre21 #24 PLL/corrector arbitration; PTV_NO_PLL_YIELD=1 reverts */
+
+/* 1.0.1-pre21 thread-position HEARTBEATS (live Azorse wedge 2026-07-21 10:43:58: the vdec
+ * thread froze in a futex with video_q FULL and frame_q EMPTY — nothing in the log said
+ * WHERE; this is how the next occurrence self-identifies). The vdec thread stamps its step
+ * position + wall before every potentially-blocking stage; the master output thread (the
+ * -stats printer) stamps its loop points; the demux stamps a per-input arrival watermark
+ * (the "input flows" evidence). The existing per-rung watchdog_thread (a DIFFERENT thread,
+ * 500ms cadence, always-on) checks the stamps: vdec stamp >5s old while the demux stamp is
+ * fresh → one rate-limited [PTV-STALL] line naming the position. Stamps are relaxed atomics
+ * — reporting only, no control consumer. */
+enum {
+    PTV_HB_NONE = 0,
+    PTV_HB_VDEC_QRECV,       /* polling video_q for the next packet */
+    PTV_HB_VDEC_BANK,        /* deep-prime bank wait / governed catch-up sleep */
+    PTV_HB_VDEC_SENDPKT,     /* avcodec_send_packet */
+    PTV_HB_VDEC_RECVFRAME,   /* avcodec_receive_frame */
+    PTV_HB_VDEC_HWUP,        /* filter-graph push/pull (hwupload lives in the graph) */
+    PTV_HB_VDEC_FQSEND,      /* frame_q / mv hold.q push */
+    PTV_HB_OUT_LOOP,         /* output/stats thread loop top (tick pacing) */
+    PTV_HB_OUT_ENC,          /* encode_push (encoder + delivery gate) */
+    PTV_HB_OUT_STATS         /* stats/diag print section */
+};
+extern _Atomic int     g_hb_vdec_pos[PTV_MAX_INPUT];
+extern _Atomic int64_t g_hb_vdec_wall[PTV_MAX_INPUT];
+extern _Atomic int64_t g_hb_vdec_dec[PTV_MAX_INPUT];    /* dec_frames snapshot at last stamp */
+extern _Atomic int64_t g_hb_demux_wall[PTV_MAX_INPUT];  /* input-flow evidence (demux read loop) */
+extern _Atomic int     g_hb_vq[PTV_MAX_INPUT];          /* video_q depth (demux-published) */
+extern _Atomic int     g_hb_out_pos;
+extern _Atomic int64_t g_hb_out_wall;
+const char *ptv_hb_name(int pos);
+#define PTV_HB_VDEC(slot, p) do { if ((slot) >= 0 && (slot) < PTV_MAX_INPUT) { \
+    atomic_store_explicit(&g_hb_vdec_pos[slot], (p), memory_order_relaxed); \
+    atomic_store_explicit(&g_hb_vdec_wall[slot], av_gettime_relative(), memory_order_relaxed); } } while (0)
+#define PTV_HB_OUT(p) do { \
+    atomic_store_explicit(&g_hb_out_pos, (p), memory_order_relaxed); \
+    atomic_store_explicit(&g_hb_out_wall, av_gettime_relative(), memory_order_relaxed); } while (0)
 extern int     g_h0_reanchor;
 extern int     g_reanchor2_instant;
 extern int     g_h0_at_display;

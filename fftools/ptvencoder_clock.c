@@ -385,6 +385,8 @@ void *output_thread(void *arg)
 
     for (;;) {
         int fresh = 0, cadence_hold = 0;
+        if (v->is_master)
+            PTV_HB_OUT(PTV_HB_OUT_LOOP);   /* 1.0.1-pre21 heartbeat: stats-thread loop top */
         if (g_pulldown && film_arm && have) {       /* film cadence: pop via content-projected lookahead */
             if (!next_have) {
                 ret = av_thread_message_queue_recv(v->frame_q, &f, AV_THREAD_MESSAGE_NONBLOCK);
@@ -722,6 +724,8 @@ void *output_thread(void *arg)
                 atomic_store_explicit(&g_rsx.mv_wall[0], av_gettime_relative(), memory_order_relaxed);
             }
         }
+        if (v->is_master)
+            PTV_HB_OUT(PTV_HB_OUT_ENC);    /* pre21 heartbeat: entering encoder+gate (the NVENC-block position) */
         ret = encode_push(v->mux_q, v->venc, v->ost, held, v->gate);   /* §7.5a: publish video front + release caught-up audio/copy */
         v->last_emit_us = av_gettime_relative();
         tick++; v->emitted++;
@@ -767,6 +771,7 @@ void *output_thread(void *arg)
 
         if (g_stats && v->is_master) {          /* ffmpeg-style progress line */
             int64_t nows = av_gettime_relative();
+            PTV_HB_OUT(PTV_HB_OUT_STATS);       /* pre21 heartbeat: stats print section */
             if (nows - stat_last >= g_stats_period_us) {
                 double dt    = (nows - stat_last) / 1000000.0;
                 double fps   = (v->emitted - stat_prev) / (dt > 0 ? dt : 1);   /* INSTANTANEOUS emit rate — the

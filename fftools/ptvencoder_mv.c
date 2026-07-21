@@ -217,6 +217,9 @@ void *compositor_thread(void *arg)
     for (;;) {
         int all_eof = 1, any_fresh = 0;
         int64_t now_us;
+        PTV_HB_OUT(PTV_HB_OUT_LOOP);   /* 1.0.1-pre21 heartbeat: on mv the compositor IS the
+                                        * house clock / stats owner — it stamps the OUT beat
+                                        * (single-input: the master output thread stamps it) */
         {                                            /* wall-pace the house tick (also offline:
                                                       * inputs have independent clocks, so the
                                                       * mosaic cadence is the house rate, not media) */

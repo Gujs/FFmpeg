@@ -1746,6 +1746,16 @@ void *demux_thread(void *arg)
             av_log(NULL, AV_LOG_INFO, "ptvencoder: -t reached — input '%s' stops pulling (flush to clean exit)\n", d->url);
             break;                                 /* rider (b): ride the file-EOF teardown */
         }
+        /* 1.0.1-pre21 heartbeat: input-flow evidence + video_q depth for the [PTV-STALL]
+         * watchdog (a vdec stall only reports while THIS keeps advancing — a dead input is
+         * starvation, not a wedge). */
+        if (d->rsync_slot >= 0 && d->rsync_slot < PTV_MAX_INPUT) {
+            atomic_store_explicit(&g_hb_demux_wall[d->rsync_slot],
+                                  av_gettime_relative(), memory_order_relaxed);
+            atomic_store_explicit(&g_hb_vq[d->rsync_slot],
+                                  av_thread_message_queue_nb_elems(d->video_q),
+                                  memory_order_relaxed);
+        }
         if (av_read_frame(d->ifmt, pkt) < 0) {
             /* pre17 R1: a live mv net input must NEVER EOF-latch its slot (rw_timeout expiry
              * on a >=30min outage previously slated the cell forever AND held the corrector
