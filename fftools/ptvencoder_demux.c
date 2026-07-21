@@ -237,6 +237,7 @@ static void ptv_disc_pair_reset(PtvDiscBuf *b)
     b->pair_start_us    = 0;
     b->pair_vid_defined = 0;
     b->pair_vid_off_us  = 0;
+    b->pair_anchored    = 0;   /* rr-d1 R3 */
     for (i = 0; i < b->nb_streams; i++) {
         b->stream_state[i].pair_applied_us = 0;
         b->stream_state[i].pair_has        = 0;
@@ -710,7 +711,7 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
      * (the PATRIOT audio-first paired ordering — video's own jump still in flight) classifies
      * OLD and keeps today's 3b provisional + 2d retro-correct path byte-identically.
      * PTV_NO_VANCHOR=1 reverts. */
-    if (g_shared_flush && g_vanchor && !b->pair_vid_defined &&
+    if (g_shared_flush && g_vanchor &&
         b->cycle_trigger >= 0 && b->cycle_trigger < b->nb_streams &&
         b->cycle_trigger < (int)d->ifmt->nb_streams &&
         d->ifmt->streams[b->cycle_trigger]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
@@ -718,15 +719,39 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
         !b->stream_state[d->vstream].has_new_base &&
         b->stream_state[d->vstream].last_dts_us != AV_NOPTS_VALUE) {
         int k, trig_transcoded = 0, vflow = 0;
+        PtvDiscStreamState *ts = &b->stream_state[b->cycle_trigger];
         for (k = 0; k < d->n_audio && !trig_transcoded; k++)
             trig_transcoded = d->astream[k] == b->cycle_trigger;
+        /* rr-d1 R1: expire a STALE pairing window BEFORE reading pair state — the same
+         * check the decision tree runs at its own top, which executes AFTER this block:
+         * a dangling window from an earlier 3b/F2 audio-only flush (never closed — the
+         * end-of-flush close needs pair_vid_defined) otherwise (a) blocks the anchor via
+         * a stale pair_vid_defined, or (b) lets the tree's expiry reset WIPE a just-set
+         * anchor right after its log line printed (adv-A: second lone-audio event 38s
+         * after a backward 3b flush anchored, logged, then erased anyway — the regression
+         * shape with a lying log line). Scoped to anchor-eligible cycles (transcoded
+         * audio trigger) so every other flush keeps the tree as the sole expiry site. */
+        if (trig_transcoded && b->pair_start_us &&
+            av_gettime_relative() - b->pair_start_us > PTV_PAIR_WINDOW_US)
+            ptv_disc_pair_reset(b);
         for (i = 0; i < b->nb_packets && !vflow; i++)
             vflow = b->packets[i] && b->packets[i]->stream_idx == d->vstream &&
                     b->packets[i]->own_cont;
-        if (trig_transcoded && vflow &&
+        /* rr-d1 R2: FORWARD trigger jumps only. "Video already lives at the jump target"
+         * is only semantically true when audio jumped FORWARD onto a leading video; for a
+         * backward lone jump a video position past the (lower) midpoint merely means video
+         * LAGS — anchoring there registers a backward expect that AGLUE APPLIES (drops
+         * real content), violating the 0.9.16.4 backward-relabel-erase doctrine (adv-B:
+         * −1.679s anchored, only F2's flood heuristic saved the run). All live evidence
+         * for this shape is forward (+1.700, +1.320/+1.366). This also keeps 33-bit
+         * wrap-domain jumps (always backward) out of the anchor entirely. */
+        if (trig_transcoded && vflow && !b->pair_vid_defined &&
+            ts->has_old_base && ts->has_new_base &&
+            ts->new_timeline_base > ts->old_timeline_base &&
             ptv_disc_classify(b, d->vstream, b->stream_state[d->vstream].last_dts_us) == 1) {
             b->pair_vid_defined = 1;
             b->pair_vid_off_us  = 0;
+            b->pair_anchored    = 1;   /* rr-d1 R3: survives the end-of-flush close */
             if (!b->pair_start_us)
                 b->pair_start_us = av_gettime_relative();
             av_log(NULL, AV_LOG_INFO,
@@ -1209,7 +1234,16 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
                 b->stream_state[i].last_dts_us != AV_NOPTS_VALUE &&
                 !b->stream_state[i].pair_has)
                 open_aud = 1;
-        if (!open_aud)
+        /* rr-d1 R3: do NOT close an ANCHORED event here — there was no real video leg, so a
+         * genuinely PAIRED event's staggered video crossing (audio-first, video >500ms later,
+         * adv-C: +1.42s at 1.76s) must still find the audio's pair state: with it, the #47-C
+         * partial-hold declines (an audio leg already applied this window) and the video leg
+         * flushes immediately as 2a (new event, own butt-joint) — without it, the hold chained
+         * to the pairing window and released one-sided (old=143-class discard, ~4.5s deleted,
+         * R parked −1.9..−3.0s vs pre20's clean 2d-band handling). The residual pad-vs-erase
+         * bake (≤ the step) on this staggered-pair shape is a documented bound — sensor-visible,
+         * corrector-addressable. State clears at window expiry (ptv_disc_pair_reset). */
+        if (!open_aud && !b->pair_anchored)
             ptv_disc_pair_reset(b);
     }
 

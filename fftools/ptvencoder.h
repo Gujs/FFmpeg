@@ -939,6 +939,12 @@ typedef struct PtvDiscBuf {
     int64_t             pair_start_us;      /* wall us of the event's first dense flush; 0 = no open event */
     int                 pair_vid_defined;   /* 1 once VIDEO's crossing defined this event's timeline */
     int64_t             pair_vid_off_us;    /* the video-defined shared offset (us) */
+    int                 pair_anchored;      /* rr-d1 R3: this event's video "crossing" is a lone-audio
+                                             * ANCHOR (offset 0, no real video leg) — keep the pair
+                                             * state through the end-of-flush close until the window
+                                             * expires, so a staggered matching VIDEO leg finds the
+                                             * audio pair state (suppresses the #47-C sibling hold;
+                                             * it then flushes immediately as 2a/new event) */
     int                 cycle_trigger;      /* 1.0.1-pre7: stream whose detect ARMED this buffer cycle
                                              * (-1 = none); scopes the continuing-stream keep (see
                                              * ptv_disc_flush) to transcoded-triggered cycles */
