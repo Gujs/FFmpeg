@@ -7,6 +7,59 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(7v) PRE22 — lone-VIDEO-jump audio-anchor (the role-swapped D1 mirror; kill
+PTV_NO_AANCHOR=1).
+SYMPTOM (Fashion live 2026-07-22 13:21:42): a lone VIDEO label jump +5.520s whose
+audio partner never crossed inside the pairing window was one-sided relabel-erased
+(flush 41 pkts old=26 new=15 applied=−5.480 vid_err=−5.480, "partial flush (only
+video crossed)") — video labels glued, audio untouched, NO registration, NO
+expected-step handshake: the ev ledger takes the full −5480ms, R pins there, the
+corrector correctly DISARMs (>5s implausible), and if the video content really
+skipped, the wire is desynced by the jump amount with no remedy. ~0.5s of flowing
+audio (old=26) also deleted. The pre21 D1 anchor only covers lone TRANSCODED-AUDIO
+jumps; the video-trigger mirror fell through to the old one-sided path.
+FIX (deferred, two-phase — the one deliberate design deviation from a flush-time
+mirror): D1's discriminator (video position classifies NEW) is INSTANTANEOUS
+evidence; the mirror's evidence — "the audio partner never arrives" — is only
+provable at PAIRING-WINDOW EXPIRY, and an immediate shift+registration at the video
+flush would destroy the genuine staggered pair the 3a INHERIT machinery handles
+(Fashion 2026-07-20 10:14 class). So:
+  SEED (at the lone-video flush): transcoded-video trigger + no audio crossing or
+  pair state this window + audio flowed own-continuous + trigger jump FORWARD (R2
+  mirror; backward lone flips — the ±11594s class — keep the doctrine-correct
+  erase, wraps excluded) + trigger SETTLED at NEW (an intra-cycle jump+return never
+  seeds) → each flowing transcoded audio stream gets a PROVISIONAL zero-offset leg
+  (pair_prov=1, applied=0 — "audio didn't jump"): cont_eligible now KEEPS the
+  flowing audio (the old=26 discard is gone), the 2d retro-correct skips seeded
+  streams, aanch_pend (R3 mirror) keeps the pair state through the end-of-flush
+  close, and R1-mirror stale-window expiry is the seed block's first act.
+  VERDICT: a real audio leg crossing in-window CANCELS the seed (free — nothing was
+  shifted) and the pairing machinery owns the event byte-identically; window EXPIRY
+  un-crossed FIRES the anchor on the quiet path (ptv_aanch_fire, before
+  demux_unwrap so the firing packet rides the shifted refs): audio re-based onto
+  the video-defined timeline (corr = pair_vid_off = the FULL video delta) +
+  ptv_pair_expect registration — the D1 handshake; the content path (#33/AGLUE +
+  the #47 caps) judges the step, the demux never hard-commits to "real splice".
+  The 2d refuse gates apply unchanged at the fire (120s route cap + label-health
+  H): a refused anchor logs loudly and falls back to the pre21 one-sided erase.
+MAGNITUDE BOUND (measured, F1/F2 gates): a >2s registered backward step is applied
+by aresample as a HARD drop that realizes over ~step seconds of wall time (audio
+output starves meanwhile — muxer waits, wire gap ~step, then resumes CONVERGED;
+the #47-B tripwire does not fire because no output frames are emitted during the
+drop to evaluate it on). ev=ea after the fire → R settles ~0 instead of pinning.
+KNOWN BOUNDS (documented for review): (1) a LABEL-ONLY lone video restamp with no
+return is INDISTINGUISHABLE from a real video-content skip at every layer — the
+anchor converges content onto the labels, which for the label-only shape means
+~step of real audio dropped (audio-early by the step until the source's return);
+an in-window return (≤5s label flip round-trip) is SAFE — the return's 2a cancels
+the pending seed with zero side effects. (2) a genuinely-paired event whose audio
+leg arrives AFTER the window (>5s stagger): pre21 self-healed at the leg's own
+erase; pre22's fired anchor makes that a ≤step residual — sensor-VISIBLE (R steps
+at the leg, ev≠ea) and one-log-read attributable (anchor line → later audio 3b).
+(3) copy-only audio (AC-3 passthrough) is never seeded (no content machinery to
+apply the step) — its labels stay untouched, exactly the pre21 shape for that
+track (the standing D1 copy-audio bound, unchanged).
+
 (7u) PRE21 — D1 lone-audio anchor fold + #24 PLL/corrector arbitration + [PTV-STALL]
 heartbeats. Four commits: d1-fix merge (3cb74d8b4a + da218b1425, adversarial-reviewed
 MERGE-READY), #24 (c98de627d1), heartbeats (6824e9b4e8), this docs/version commit.

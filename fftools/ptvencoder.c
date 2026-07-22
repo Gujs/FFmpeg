@@ -41,7 +41,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.0.1-pre21"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.0.1-pre22"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -208,6 +208,17 @@ int     g_shared_flush = 1;
  * with (live Grid_2x2 2026-07-21: audio 1.32s early + video-ahead re-anchor).
  * PTV_NO_VANCHOR=1 reverts. */
 int     g_vanchor = 1;
+/* 1.0.1-pre22 (a-anchor): the role-swapped mirror of the d1-fix above — a lone VIDEO forward
+ * jump whose audio partner never crosses inside the pairing window (Fashion 2026-07-22 13:21:
+ * +5.520s video-only, one-sided relabel-erase, ev −5.480s, R pinned, corrector DISARMed, wire
+ * desynced by the jump if the video content really skipped). The lone-video flush seeds a
+ * provisional ZERO-offset audio leg ("audio didn't jump") and, if the window EXPIRES with no
+ * real audio crossing, the audio is re-based onto the video-defined timeline and the full
+ * A-vs-V mismatch (= the video delta) is REGISTERED for the content path (ptv_pair_expect) —
+ * the D1 handshake, deferred to expiry because the absence of the audio leg is only provable
+ * then (an immediate shift would destroy the genuine staggered pair the 3a INHERIT handles).
+ * PTV_NO_AANCHOR=1 reverts. */
+int     g_aanchor = 1;
 /* P2 §7.1 / stage 2b: after a detected source discontinuity, DROP video packets until the next keyframe
  * (IDR) before they reach the decoder — a splice starts a NEW timeline mid-GOP, so the P/B frames that
  * reference the missing IDR decode as a corruption burst (greyed/torn frames) that the house clock would
@@ -2740,6 +2751,9 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_VANCHOR")) g_vanchor = 0;               /* d1-fix revert: lone-audio flush falls back to the 3b
                                                                 * provisional butt-joint (erases the step, discards the
                                                                 * flowing video — the pre7..pre20 regression shape) */
+    if (getenv("PTV_NO_AANCHOR")) g_aanchor = 0;               /* 1.0.1-pre22 revert: a lone-video jump keeps the
+                                                                * one-sided relabel-erase (video glued, audio untouched,
+                                                                * no registration — the pre21 Fashion shape) */
     if (getenv("PTV_NO_ADAPTIVE")) g_adapt_cushion = 0;   /* fixed preroll target (pre-0.9.10 behavior) */
     /* PTV_CUSHION_MS parse moved to resolve_cushions() (0.9.18 M1) */
     if (getenv("PTV_NO_GENLOCK")) g_genlock = 0; /* v0.9.0: revert to free-run nominal pacing (+ old 350ms prime) = byte-identical */

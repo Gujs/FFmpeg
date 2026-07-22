@@ -238,10 +238,12 @@ static void ptv_disc_pair_reset(PtvDiscBuf *b)
     b->pair_vid_defined = 0;
     b->pair_vid_off_us  = 0;
     b->pair_anchored    = 0;   /* rr-d1 R3 */
+    b->aanch_pend       = 0;   /* 1.0.1-pre22 audio-anchor: pending mark dies with the window */
     for (i = 0; i < b->nb_streams; i++) {
         b->stream_state[i].pair_applied_us = 0;
         b->stream_state[i].pair_has        = 0;
         b->stream_state[i].pair_prov       = 0;
+        b->stream_state[i].aanch           = 0;   /* 1.0.1-pre22 */
     }
 }
 
@@ -548,6 +550,64 @@ static int ptv_glue_refuse_h(PtvDiscBuf *b, int s, int64_t wall_now)
     return 0;
 }
 
+/* 1.0.1-pre22 audio-anchor FIRE (a-anchor — the role-swapped mirror of the d1-fix lone-audio
+ * video-anchor): the pairing window of a lone-VIDEO-jump event EXPIRED with the seeded
+ * provisional zero-offset audio leg(s) still un-crossed — the audio partner definitively never
+ * arrived (Fashion 2026-07-22 13:21: +5.520s video-only, "partial flush (only video crossed)",
+ * one-sided erase, R pinned at −5480ms, corrector DISARMed). Do now what the 2d retro-correct
+ * would have done had the audio crossed with a zero jump: re-base the audio onto the
+ * video-defined timeline (corr = pair_vid_off_us − 0 = the FULL video delta, since audio didn't
+ * jump) and REGISTER the step (ptv_pair_expect) so the content path judges it — APPLY (aresample
+ * converges content onto the post-event alignment) or bounded stand-aside via the existing #47
+ * caps. Deliberately NOT a demux-layer "real splice" commitment: registration hands the verdict
+ * to the content machinery, exactly like D1 and the paired-flush path. The 2d refuse gates
+ * (120s route cap + label-health H) apply unchanged — a refused anchor falls back to the
+ * pre21 one-sided-erase shape (today's behavior), loudly. Callers run this ONLY on the quiet
+ * path (no buffered packets, buffer inactive): every ref shift (wrap_off/last_dts/last_sent)
+ * is then consistent with all future packets, the exact situation 2d is proven in. Closes the
+ * window when done (the event is decided either way). Mirror guards: R1 (this IS the expiry
+ * act), R2 (forward-only, enforced at seed time), R3 (aanch_pend kept the state alive here).
+ * PTV_NO_AANCHOR=1 disables the seeding, so this can never run. */
+static void ptv_aanch_fire(DemuxArgs *d, PtvDiscBuf *b)
+{
+    int s;
+    for (s = 0; s < b->nb_streams && s < (int)d->ifmt->nb_streams; s++) {
+        PtvDiscStreamState *ss = &b->stream_state[s];
+        int64_t corr;
+        if (!ss->aanch)
+            continue;
+        corr = b->pair_vid_off_us - ss->pair_applied_us;   /* applied is 0 by construction */
+        if (llabs(corr) <= PTV_PAIR_EPS_US)
+            continue;                        /* bookkeeping-scale — nothing worth routing */
+        if (g_glueclass &&
+            (llabs(corr) > PTV_GLUE_MAX_ROUTE_US ||          /* #47-C1 route cap */
+             ptv_glue_refuse_h(b, s, av_gettime_relative()))) {
+            d->glue_refuse_cnt++;
+            if (d->disturb_epoch)
+                atomic_fetch_add_explicit(d->disturb_epoch, 1, memory_order_relaxed);
+            av_log(NULL, AV_LOG_WARNING,
+                   "[PTV-GLUE] REFUSED anchor mismatch %+.3fs (label health %.2f, refuse #%"PRId64")%s "
+                   "— stream %d keeps the one-sided erase, residual left to sensor/corrector\n",
+                   (double)corr / AV_TIME_BASE,
+                   (double)ss->h_ema_q10 / 1024.0, d->glue_refuse_cnt,
+                   llabs(corr) > PTV_GLUE_MAX_ROUTE_US ? " [beyond the 120s route cap]" : "", s);
+            continue;
+        }
+        d->wrap_off[s] += av_rescale_q(corr, AV_TIME_BASE_Q, d->ifmt->streams[s]->time_base);
+        rsync_post_edit(d, s, corr);                    /* pre9 sensor: anchor label edit */
+        if (ss->last_dts_us   != AV_NOPTS_VALUE) ss->last_dts_us   += corr;
+        if (ss->last_sent_dts != AV_NOPTS_VALUE) ss->last_sent_dts += corr;
+        ptv_pair_expect(d, s, corr);         /* the D1 handshake: content path must judge this step */
+        av_log(NULL, AV_LOG_INFO,
+               "[PTV-GLUE] event anchored (audio base pre-defined for lone video jump: no audio "
+               "leg crossed within the pairing window) — stream %d re-based onto the video "
+               "timeline, expected audio label step %+.3fs routed to the content path "
+               "(PTV_NO_AANCHOR reverts)\n",
+               s, (double)corr / AV_TIME_BASE);
+    }
+    ptv_disc_pair_reset(b);                  /* the event is decided — close the window */
+}
+
 /* 1.0.1-pre16 #47-C (TWN/Fashion 2026-07-18): a PARTIAL flush (only one media type
  * crossed) applies a one-sided re-base with NO classification — manifestation (a)'s
  * partial=1 path, the one shape the pre15 flush rules never reached. When the MISSING
@@ -761,6 +821,78 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
         }
     }
 
+    /* 1.0.1-pre22 audio-anchor SEED (a-anchor — the role-swapped mirror of the d1-fix block
+     * above; live evidence Fashion 2026-07-22 13:21): a lone VIDEO forward jump (transcoded
+     * video trigger, no audio crossing, audio flowing own-continuous) is about to be one-sided
+     * relabel-erased with NO registration and NO handshake — if the video content really
+     * skipped, the wire is desynced by the jump with no remedy, and the ev ledger pins R at
+     * −step (corrector DISARMs >5s). Seed each flowing TRANSCODED audio stream a PROVISIONAL
+     * zero-offset leg (pair_prov=1, applied=0 — "audio didn't jump"): cont_eligible then KEEPS
+     * the flowing audio (no old= discard), and the event's verdict is DEFERRED to the pairing
+     * window — the absence of the audio leg is only provable at expiry, unlike D1's
+     * instantaneous position evidence (an immediate shift+registration would destroy the
+     * genuine staggered pair that the 3a INHERIT machinery handles, F6):
+     *   - real audio leg crosses in-window  → the has_aud cancel below clears the seed and the
+     *     genuine pairing machinery (3a INHERIT / #47-C hold) wins, byte-identically;
+     *   - the window EXPIRES un-crossed     → ptv_aanch_fire (quiet path) re-bases the audio
+     *     onto the video timeline and REGISTERS the full video delta (the D1 handshake).
+     * Mirror guards from da218b1425, roles swapped: R1 stale-window expiry is this block's
+     * FIRST act (a window dangled by an earlier 3b/F2 flush must neither block the seed via
+     * stale pair state nor let the tree wipe it); R2 FORWARD trigger jumps only (a backward
+     * lone video jump — the Fashion −11594s one-sided flips — keeps the doctrine-correct
+     * erase; also excludes 33-bit wraps); R3 aanch_pend keeps the pair state alive through
+     * the end-of-flush close until expiry or a real audio crossing. The 2d retro-correct
+     * skips seeded streams (this SAME flush is the video crossing that would trigger it).
+     * PTV_NO_AANCHOR=1 reverts. */
+    if (g_shared_flush && g_aanchor &&
+        d->vstream >= 0 && b->cycle_trigger == d->vstream &&
+        d->vstream < b->nb_streams && d->vstream < (int)d->ifmt->nb_streams) {
+        PtvDiscStreamState *vs = &b->stream_state[d->vstream];
+        /* rr-d1 R1 mirror: expire a STALE pairing window BEFORE reading pair state — scoped
+         * to anchor-eligible (transcoded-video-trigger) cycles so every other flush keeps the
+         * tree as the sole expiry site. A pending anchor here (window expired mid-cycle) is
+         * cancelled silently = the pre21 shape; the quiet-path fire covers the normal case. */
+        if (b->pair_start_us &&
+            av_gettime_relative() - b->pair_start_us > PTV_PAIR_WINDOW_US)
+            ptv_disc_pair_reset(b);
+        if (!b->pair_vid_defined && !b->aanch_pend &&
+            vs->has_old_base && vs->has_new_base &&
+            vs->new_timeline_base > vs->old_timeline_base &&           /* R2 mirror: forward only */
+            vs->last_dts_us != AV_NOPTS_VALUE &&
+            ptv_disc_classify(b, d->vstream, vs->last_dts_us) == 1) {  /* trigger SETTLED at NEW —
+                                                                        * an intra-cycle round trip
+                                                                        * (jump + return) never seeds */
+            int k, blocked = 0, seeded = 0;
+            for (i = 0; i < b->nb_streams && i < (int)d->ifmt->nb_streams && !blocked; i++)
+                if (d->ifmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
+                    (b->stream_state[i].has_new_base ||               /* an audio leg crossed */
+                     b->stream_state[i].pair_has ||                   /* or already applied */
+                     b->stream_state[i].pair_prov))                   /* or holds a provisional */
+                    blocked = 1;                                      /* → event is NOT lone */
+            for (k = 0; k < d->n_audio && !blocked; k++) {
+                int s2 = d->astream[k], aflow = 0;
+                if (s2 < 0 || s2 >= b->nb_streams)
+                    continue;
+                for (i = 0; i < b->nb_packets && !aflow; i++)
+                    aflow = b->packets[i] && b->packets[i]->stream_idx == s2 &&
+                            b->packets[i]->own_cont;
+                if (!aflow)
+                    continue;                 /* (c): only streams that FLOWED own-continuous */
+                b->stream_state[s2].pair_prov       = 1;
+                b->stream_state[s2].pair_applied_us = 0;
+                b->stream_state[s2].aanch           = 1;
+                seeded++;
+            }
+            if (seeded) {
+                b->aanch_pend = 1;            /* R3 mirror: survives the end-of-flush close */
+                av_log(NULL, AV_LOG_INFO,
+                       "[PTV-GLUE] lone-video flush: no audio leg crossed — audio anchor "
+                       "PENDING on %d stream(s) (fires at pairing-window expiry unless the "
+                       "audio leg arrives; PTV_NO_AANCHOR reverts)\n", seeded);
+            }
+        }
+    }
+
     for (i = 0; i < b->nb_packets; i++) {
         PtvDiscPacket *dp = b->packets[i];
         /* 1.0.1-pre7: an own-continuous packet of a stream that never crossed this cycle
@@ -825,6 +957,23 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
         } else if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
             aud_off = b->stream_state[i].cumulative_ts_offset; has_aud = 1;
         }
+    }
+    /* 1.0.1-pre22 audio-anchor CANCEL: a REAL audio leg crossed while the anchor was pending —
+     * the event has an audio leg after all (the staggered pair, Fashion 2026-07-20 10:14
+     * class). Clear the seed BEFORE the decision tree so the genuine pairing machinery
+     * (3a INHERIT off the still-open video-defined window) handles this crossing exactly as
+     * pre21 — no shift was ever applied, no expect registered, so the cancel is free. */
+    if (b->aanch_pend && has_aud) {
+        b->aanch_pend = 0;
+        for (i = 0; i < b->nb_streams; i++)
+            if (b->stream_state[i].aanch) {
+                b->stream_state[i].aanch           = 0;
+                b->stream_state[i].pair_prov       = 0;
+                b->stream_state[i].pair_applied_us = 0;
+            }
+        av_log(NULL, AV_LOG_INFO,
+               "[PTV-GLUE] pending audio-anchor cancelled — a real audio leg crossed within "
+               "the pairing window; the pairing machinery owns the event\n");
     }
     /* 1.0.1-pre4 SHARED FLUSH decision tree (g_shared_flush; see the invariant note at its
      * definition). Dense flushes within PTV_PAIR_WINDOW_US are ONE source event; every dense
@@ -1185,6 +1334,12 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
             int64_t corr;
             if (!ss->pair_prov || ss->has_new_base)
                 continue;                        /* only PROVISIONAL streams from EARLIER flushes of this event */
+            if (ss->aanch)
+                continue;                        /* 1.0.1-pre22: anchor-seeded provisional (THIS flush is the
+                                                  * video crossing that seeded it) — fired at window expiry
+                                                  * (ptv_aanch_fire), never retro-corrected here: an immediate
+                                                  * shift+registration would destroy the genuine staggered
+                                                  * pair (the audio leg may still arrive in-window) */
             corr = b->pair_vid_off_us - ss->pair_applied_us;
             ss->pair_applied_us = b->pair_vid_off_us;
             ss->pair_prov       = 0;
@@ -1243,8 +1398,11 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
          * R parked −1.9..−3.0s vs pre20's clean 2d-band handling). The residual pad-vs-erase
          * bake (≤ the step) on this staggered-pair shape is a documented bound — sensor-visible,
          * corrector-addressable. State clears at window expiry (ptv_disc_pair_reset). */
-        if (!open_aud && !b->pair_anchored)
-            ptv_disc_pair_reset(b);
+        if (!open_aud && !b->pair_anchored && !b->aanch_pend)
+            ptv_disc_pair_reset(b);   /* 1.0.1-pre22 (R3 mirror): a PENDING audio-anchor must
+                                       * survive to the window verdict (expiry fire / real-leg
+                                       * cancel); open_aud=1 normally protects it (seeded
+                                       * streams hold pair_prov, not pair_has) — belt only */
     }
 
     /* 1.0.1-pre18 #50 (g_glueveto) inverse-guard evidence: this flush moved AUDIO labels —
@@ -1843,6 +2001,19 @@ void *demux_thread(void *arg)
             if (ret < 0) break;
             continue;
         }
+        /* 1.0.1-pre22 audio-anchor: pairing-window verdict for a PENDING lone-video-jump
+         * event — the window EXPIRED with no audio crossing, so the audio partner
+         * definitively never arrived: fire the anchor (re-base audio onto the video
+         * timeline + register the expected step). QUIET path only (buffer inactive, no
+         * held packets): every ref the fire shifts is then consistent with all future
+         * packets, and it runs BEFORE demux_unwrap so THIS packet already rides the
+         * shifted wrap_off (no phantom −step detect). Any packet arrival past expiry
+         * triggers this first — including one that would arm a new cycle. */
+        if (g_layera && d->disc && d->disc->aanch_pend &&
+            !d->disc->active && !d->disc->flushing &&
+            d->disc->pair_start_us &&
+            av_gettime_relative() - d->disc->pair_start_us > PTV_PAIR_WINDOW_US)
+            ptv_aanch_fire(d, d->disc);
         demux_unwrap(d, out);               /* 33-bit source wrap -> monotonic extended ts (ONCE) */
 
         /* legacy-0004 TS-discontinuity buffer (g_layera only). Dense V/A get

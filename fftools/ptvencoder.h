@@ -911,6 +911,15 @@ typedef struct PtvDiscStreamState {
     int64_t pair_applied_us;
     int     pair_has;
     int     pair_prov;
+    int     aanch;                 /* 1.0.1-pre22 audio-anchor (a-anchor): this transcoded audio
+                                    * stream was seeded a PROVISIONAL zero-offset leg by a
+                                    * lone-VIDEO-jump flush (pair_prov=1, pair_applied_us=0 —
+                                    * "audio didn't jump"). NOT retro-corrected by the
+                                    * video-crossing flush's 2d (that flush is the SAME one that
+                                    * seeded it); instead FIRED at pairing-window expiry
+                                    * (ptv_aanch_fire) — the absence of the audio leg is only
+                                    * provable then. Cleared by ptv_disc_pair_reset and by any
+                                    * real audio crossing in the window (the cancel). */
     /* 1.0.1-pre15 E4 label health H (#33 §2.1; g_glueclass): demux-side windowed EMA of
      * Δdts/Δwall over the trailing ~30s, EXCLUDING buffered/flush windows and per-packet
      * jumps (those are events, not rate evidence). Healthy ≈ 1.0 ±5% (Q10: 1024 = 1.0);
@@ -956,6 +965,14 @@ typedef struct PtvDiscBuf {
                                              * expires, so a staggered matching VIDEO leg finds the
                                              * audio pair state (suppresses the #47-C sibling hold;
                                              * it then flushes immediately as 2a/new event) */
+    int                 aanch_pend;         /* 1.0.1-pre22 audio-anchor (a-anchor, the rr-d1 R3 mirror):
+                                             * a lone-VIDEO forward jump seeded provisional zero-offset
+                                             * audio leg(s) (stream_state[].aanch) and now awaits the
+                                             * pairing-window verdict — the end-of-flush close must not
+                                             * pair_reset the event away while pending. Fired (audio
+                                             * re-based onto the video timeline + expected step
+                                             * registered) at window EXPIRY on the quiet path; cleared
+                                             * by ptv_disc_pair_reset or by a real audio crossing. */
     int                 cycle_trigger;      /* 1.0.1-pre7: stream whose detect ARMED this buffer cycle
                                              * (-1 = none); scopes the continuing-stream keep (see
                                              * ptv_disc_flush) to transcoded-triggered cycles */
@@ -1218,6 +1235,7 @@ extern int     g_layera;
 extern int     g_layera_fullskip;
 extern int     g_shared_flush;
 extern int     g_vanchor;                /* d1-fix lone-audio video-anchor; PTV_NO_VANCHOR=1 reverts */
+extern int     g_aanchor;                /* 1.0.1-pre22 lone-video audio-anchor (the D1 mirror); PTV_NO_AANCHOR=1 reverts */
 extern int     g_drop_until_kf;
 extern int     g_audio_follow;
 extern int     g_pll_yield;              /* 1.0.1-pre21 #24 PLL/corrector arbitration; PTV_NO_PLL_YIELD=1 reverts */
