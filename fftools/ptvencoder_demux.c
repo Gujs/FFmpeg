@@ -1035,8 +1035,17 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
                 d->ifmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
                 aud_unapplied = 1;
         if (has_vid) {
-            if (b->pair_vid_defined)
+            if (b->pair_vid_defined) {
+                /* 1.0.1-pre22 (rr22 finding 2): a second video jump inside a PENDING
+                 * audio-anchor window supersedes the pending event — both take the erase
+                 * path (pre21 behavior; a useful damper on oscillating channels). Say so,
+                 * or the earlier "PENDING… fires at expiry" line dangles unresolved. */
+                if (b->aanch_pend)
+                    av_log(NULL, AV_LOG_INFO,
+                           "[PTV-GLUE] pending audio-anchor superseded by a new video jump "
+                           "— cancelled (both events take the erase path)\n");
                 ptv_disc_pair_reset(b);                   /* 2a: a second video crossing = a new event */
+            }
             if (!b->pair_start_us)
                 b->pair_start_us = pnow;
             if (has_aud && llabs(vid_off - aud_off) <= PTV_PAIR_EPS_US)

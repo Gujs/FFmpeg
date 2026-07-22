@@ -64,7 +64,15 @@ erase; pre22's fired anchor makes that a ≤step residual — sensor-VISIBLE (R 
 at the leg, ev≠ea) and one-log-read attributable (anchor line → later audio 3b).
 (3) copy-only audio (AC-3 passthrough) is never seeded (no content machinery to
 apply the step) — its labels stay untouched, exactly the pre21 shape for that
-track (the standing D1 copy-audio bound, unchanged).
+track (the standing D1 copy-audio bound, unchanged). (4) gap-verdict compound
+(rr22 finding 3, traced benign): a WALL-ABSENT staggered audio leg routed by the
+§2.5 gap-verdict propagation bypasses the seed cancel (no flush, no has_aud —
+the vcrossed debounce is 1s vs the 5s window), so the anchor still fires on top
+of the AGLUE gap-pad. For a real splice the two are COMPLEMENTARY (the pad
+restores label continuity, the anchor realigns content; pre21 left a permanent
+step); for a label-only restamp it degenerates to the adjudicated bound (1).
+(5) mv-only reopen residual: an anchor firing after demux_reopen_once rides the
+preserved pair state — bounded ≤ the step; the rejoin glue folds or refuses it.
 
 (7u) PRE21 — D1 lone-audio anchor fold + #24 PLL/corrector arbitration + [PTV-STALL]
 heartbeats. Four commits: d1-fix merge (3cb74d8b4a + da218b1425, adversarial-reviewed
