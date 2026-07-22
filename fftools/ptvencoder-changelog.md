@@ -42,17 +42,23 @@ flush would destroy the genuine staggered pair the 3a INHERIT machinery handles
   the #47 caps) judges the step, the demux never hard-commits to "real splice".
   The 2d refuse gates apply unchanged at the fire (120s route cap + label-health
   H): a refused anchor logs loudly and falls back to the pre21 one-sided erase.
-MAGNITUDE BOUND (measured, F1/F2 gates): a >2s registered backward step is applied
-by aresample as a HARD drop that realizes over ~step seconds of wall time (audio
-output starves meanwhile — muxer waits, wire gap ~step, then resumes CONVERGED;
-the #47-B tripwire does not fire because no output frames are emitted during the
-drop to evaluate it on). ev=ea after the fire → R settles ~0 instead of pinning.
+MAGNITUDE BOUND (measured, F1 gate, +5.24s fixture): the registered backward step
+is realized by aresample=async as BOUNDED SOFT compensation — ~2.1%/s (the
+async=1000 slew), ≈ +22900ppm decaying to ~+1000ppm over ~3.5min for a 5.2s step;
+no output hole, no swr starvation, slip stays 0, the #47-B tripwire never arms.
+Content alignment (flash+beep ruler): PRE +32ms → POST +32ms on the fix arm vs
+POST +5232ms on the PTV_NO_AANCHOR control. ev=ea after the fire → R decays
++229→0ms instead of pinning at −5199; lipsync stat +0ms (control −5199 pinned).
 KNOWN BOUNDS (documented for review): (1) a LABEL-ONLY lone video restamp with no
 return is INDISTINGUISHABLE from a real video-content skip at every layer — the
 anchor converges content onto the labels, which for the label-only shape means
-~step of real audio dropped (audio-early by the step until the source's return);
-an in-window return (≤5s label flip round-trip) is SAFE — the return's 2a cancels
-the pending seed with zero side effects. (2) a genuinely-paired event whose audio
+~step of real audio dropped (measured F2 gate: ruler POST −5168ms audio-early,
+R reads +0 — label-blind; the pre21 control keeps the wire at +32ms with R pinned
+−5199). An in-window return (≤5s label flip round-trip, the realistic transient
+restamp) is SAFE — the return's 2a cancels the pending seed with zero side
+effects (measured F2R gate: 0 anchor/0 expect lines, ev round-trips to 0, ruler
++32ms); a return AFTER the fired anchor leaves the created step standing until
+operator action — sensor-visible at the return (R steps to ev−ea = +step). (2) a genuinely-paired event whose audio
 leg arrives AFTER the window (>5s stagger): pre21 self-healed at the leg's own
 erase; pre22's fired anchor makes that a ≤step residual — sensor-VISIBLE (R steps
 at the leg, ev≠ea) and one-log-read attributable (anchor line → later audio 3b).
