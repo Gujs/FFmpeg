@@ -333,6 +333,9 @@ int64_t g_test_vdec_stall_us;   /* TEST-ONLY (PTV_TEST_VDEC_STALL_S, precedent P
                                  * sleep the vdec loop once after 60s of runtime so the
                                  * [PTV-STALL] path live-fires in a gate — never ship an
                                  * unfired diagnostic (the pre20 silent-zombie lesson). */
+int64_t g_test_vdec_stall_at_us = 60LL * 1000000;   /* TEST-ONLY (1.0.1-pre23, PTV_TEST_VDEC_STALL_AT_S):
+                                 * the stall trigger time — 0 lands the stall BEFORE the first
+                                 * decode (the startup-wedge shape the [PTV-NOVIDEO] gate needs). */
 const char *ptv_hb_name(int pos)
 {
     switch (pos) {
@@ -1142,11 +1145,13 @@ static void *decode_thread(void *arg)
             if (ret < 0) break;
         }
         /* 1.0.1-pre21 TEST-ONLY stall injection (PTV_TEST_VDEC_STALL_S): once, after 60s of
-         * runtime, park this thread for N seconds at the q_recv position — the gate proves
-         * the [PTV-STALL] watchdog fires with the right position while the wire stays alive
-         * (output dups), then the pipeline recovers. */
+         * runtime (1.0.1-pre23: PTV_TEST_VDEC_STALL_AT_S overrides the trigger — AT 0 the
+         * stall lands BEFORE the first decode, the startup-wedge shape the [PTV-NOVIDEO]
+         * gate needs), park this thread for N seconds at the q_recv position — the gate
+         * proves the [PTV-STALL] watchdog fires with the right position while the wire
+         * stays alive (output dups), then the pipeline recovers. */
         if (g_test_vdec_stall_us > 0 && !hb_test_done &&
-            av_gettime_relative() - hb_t0 >= 60000000) {
+            av_gettime_relative() - hb_t0 >= g_test_vdec_stall_at_us) {
             hb_test_done = 1;
             av_log(NULL, AV_LOG_WARNING,
                    "[PTV-TEST] vdec stall injection: sleeping %"PRId64"s at q_recv (in%d)\n",
@@ -2872,6 +2877,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_AVSYNC_PLL")) g_avsync_pll = 0;     /* B3 closed-loop is DEFAULT-ON (v0.6.20); this reverts to the open-loop B1 content-anchored follow. (PTV_AVSYNC_PLL=1 still honored implicitly = the default.) */
     if (getenv("PTV_NO_PLL_YIELD")) g_pll_yield = 0;       /* 1.0.1-pre21 #24 revert: PLL keeps actuating while the corrector steers (the 1:1 cancel — A/B only) */
     { const char *ts = getenv("PTV_TEST_VDEC_STALL_S"); if (ts && atoi(ts) > 0) g_test_vdec_stall_us = (int64_t)atoi(ts) * 1000000; }   /* TEST-ONLY: [PTV-STALL] live-fire */
+    { const char *ts = getenv("PTV_TEST_VDEC_STALL_AT_S"); if (ts && atoi(ts) >= 0) g_test_vdec_stall_at_us = (int64_t)atoi(ts) * 1000000; }   /* TEST-ONLY (pre23): stall trigger time; 0 = startup wedge */
     if (getenv("PTV_ACQ_INSTANT")) g_acq_instant = 1;      /* 1.0.1: revert ACQUIRE to single-window fire (no 3-consecutive-window sustain; the tick floor stays) */
     if (getenv("PTV_NO_PLL_TRACKUP")) g_pll_trackup = 0;   /* 1.0.1-pre3: disable the steer-TRACK entirely (acquire-only; labels flat, no steer — the production mute) */
     /* 0.9.18.7: PTV_PLL_EMA_SHIFT (7) / PTV_PLL_TAU_MS (5000) / PTV_PLL_ACQUIRE_MS (40) /
