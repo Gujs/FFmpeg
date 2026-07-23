@@ -2029,7 +2029,7 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                      * cancel; erasing it bakes the pad (rr14 A3: +150/−150 = REAL −150ms). A
                      * coincidental independent relabel of matching size converges to the same
                      * content end-state through the drop (doc §2.6 risk note; G11). */
-                    int pad_cancel = 0;
+                    int pad_cancel = 0, conv_folded = 0;
                     int64_t pc_pad = 0;
                     if (g_glueclass && !exp_hit && step < 0 && !fill_resumed) {
                         int pi;
@@ -2047,13 +2047,117 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                     }
                     char sn[48];   /* 1.0.1-pre8 (d): self-shed honesty note ("" when nothing shed) */
                     if (llabs(step) > (int64_t)g_aglue_max_ms * 1000) {
-                        av_log(NULL, AV_LOG_WARNING,
-                               "[PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms above %dms cap — left to the discontinuity layer%s%s%s%s\n",
-                               a->dbg_k, a->dbg_in, step / 1000, g_aglue_max_ms,
-                               exp_hit ? " (matches the shared-flush expected step — aresample converges it)" : "",
-                               exp_late ? " [late match — TTL had expired]" : "",
-                               pad_cancel ? " (cancels an open GAP-pad — round-trip; aresample drops)" : "",
-                               ptv_self_shed_note(a, sn, sizeof sn));
+                        /* ==========================================================================
+                         * 1.0.1-pre23 #60/#61 BOUNDED CONVERGENCE (g_convcap; PTV_NO_CONVCAP=1
+                         * reverts). Every non-folded branch below leaves the step IN the labels
+                         * for aresample — for a forward step that is an UNCAPPED
+                         * swr_inject_silence allocation (label-gap × 48000 samples, contiguous).
+                         * On a chunk-seam channel (recurring label jumps on a flowing feed) the
+                         * convergence never completes before the next seam and the shared-flush
+                         * handshake re-measures the unconverged backlog into each new step —
+                         * the doubling ladder (Avivando 2026-07-23: +1.2s→+702s in 23min →
+                         * 183GB anon-RSS → whole-box OOM). Bound it in three layers (A/B/C, see
+                         * ptvencoder.h PTV_CONV_ESC block); the remedy is always the same
+                         * LABEL-NEUTRAL FOLD: glue_off_us -= step — the pre20 continuity
+                         * semantic (door labels continuous, inj sum accounts it, the sensor/
+                         * corrector own any real residual) and the backward-RELABEL-erase
+                         * arithmetic, applied loud. NOT folded: pad_cancel (a pad's return leg
+                         * — aresample DROPS our own inserted silence, no allocation; folding
+                         * would bake the pad) and a backward fill-resume overlap (drops OUR
+                         * synthesized fill — same reasoning). exp_hit does NOT exempt: the
+                         * ladder's own orders carry the expected-step suffix.
+                         * The 2026-07-18 Q5 mandate is PRESERVED for accepted orders: in-cap
+                         * convergences stay latency-unbounded while they SHRINK. */
+                        int fold_park = 0, fold_cap = 0, fold_ladder = 0;
+                        int64_t mag = llabs(step), prev_bl = 0;
+                        if (g_convcap && !pad_cancel && !(fill_resumed && step < 0)) {
+                            if (a->seam_park_until) {
+                                if (now_wc < a->seam_park_until)
+                                    fold_park = 1;
+                                else {
+                                    a->seam_park_until = 0;
+                                    av_log(NULL, AV_LOG_WARNING,
+                                           "[PTV-CONV] a%d(in%d) seam-park expired — converging re-enabled\n",
+                                           a->dbg_k, a->dbg_in);
+                                }
+                            }
+                            if (a->conv_bl_wc && now_wc > a->conv_bl_dl) {   /* order played out */
+                                a->conv_bl_us = 0;
+                                a->conv_bl_wc = 0;
+                            }
+                            prev_bl = a->conv_bl_us;
+                            if (!fold_park) {
+                                if (mag > g_conv_cap_us)
+                                    fold_cap = 1;                   /* A: admission cap */
+                                else if (prev_bl && mag >= prev_bl)
+                                    fold_ladder = 1;                /* B: backlog not shrinking */
+                            }
+                        }
+                        if (fold_park || fold_cap || fold_ladder) {
+                            conv_folded = 1;
+                            a->glue_off_us -= step;                 /* the label-neutral fold */
+                            a->glue_events++;                       /* label edit event (corrector freeze) */
+                            a->conv_bl_us = 0;                      /* backlog retired with the fold */
+                            a->conv_bl_wc = 0;
+                            if (fold_ladder)
+                                av_log(NULL, AV_LOG_ERROR,
+                                       "[PTV-CONV] a%d(in%d) backlog grew %+"PRId64"s -> %+"PRId64"s while "
+                                       "converging — not converging; folded label-neutrally (glue total "
+                                       "%+"PRId64"ms)%s\n",
+                                       a->dbg_k, a->dbg_in, prev_bl / AV_TIME_BASE, step / AV_TIME_BASE,
+                                       a->glue_off_us / 1000, ptv_self_shed_note(a, sn, sizeof sn));
+                            else if (fold_cap)
+                                av_log(NULL, AV_LOG_ERROR,
+                                       "[PTV-CONV] a%d(in%d) label step %+"PRId64"s above the %ds convergence "
+                                       "admission cap — folded label-neutrally, NOT handed to aresample "
+                                       "(glue total %+"PRId64"ms; PTV_CONV_CAP_S)%s\n",
+                                       a->dbg_k, a->dbg_in, step / AV_TIME_BASE,
+                                       (int)(g_conv_cap_us / AV_TIME_BASE),
+                                       a->glue_off_us / 1000, ptv_self_shed_note(a, sn, sizeof sn));
+                            else
+                                av_log(NULL, AV_LOG_WARNING,
+                                       "[PTV-CONV] a%d(in%d) seam-park: label step %+"PRId64"ms folded "
+                                       "immediately (%"PRId64"min left; glue total %+"PRId64"ms)%s\n",
+                                       a->dbg_k, a->dbg_in, step / 1000,
+                                       (a->seam_park_until - now_wc) / 60000000,
+                                       a->glue_off_us / 1000, ptv_self_shed_note(a, sn, sizeof sn));
+                            if (fold_cap || fold_ladder) {
+                                /* C: recurrence — ≥3 escapes on this track within the rolling
+                                 * window ⇒ SEAM-PARK (park folds don't re-count, so a parked
+                                 * hour ends on its own and re-arms fresh). */
+                                int ei, esc_in_win = 0;
+                                a->conv_esc_wc[a->conv_esc_n % PTV_CONV_ESC] = now_wc;
+                                a->conv_esc_n++;
+                                for (ei = 0; ei < PTV_CONV_ESC; ei++)
+                                    if (a->conv_esc_wc[ei] &&
+                                        now_wc - a->conv_esc_wc[ei] <= g_seam_park_us)
+                                        esc_in_win++;
+                                if (esc_in_win >= 3 && !a->seam_park_until) {
+                                    a->seam_park_until = now_wc + g_seam_park_us;
+                                    av_log(NULL, AV_LOG_ERROR,
+                                           "[PTV-CONV] a%d(in%d) seam-park: escape %d within the hour — "
+                                           "converging disabled %dmin (every above-cap step folds "
+                                           "label-neutrally; rc1-like parking, loud)\n",
+                                           a->dbg_k, a->dbg_in, esc_in_win,
+                                           (int)(g_seam_park_us / 60000000));
+                                }
+                            }
+                        } else {
+                            if (g_convcap && !pad_cancel && !(fill_resumed && step < 0)) {
+                                /* accepted order — track it as the in-flight backlog (B judges
+                                 * the NEXT seam's re-measured magnitude against this) */
+                                a->conv_bl_us = mag;
+                                a->conv_bl_wc = now_wc;
+                                a->conv_bl_dl = now_wc + 2 * mag + 60000000LL;
+                            }
+                            av_log(NULL, AV_LOG_WARNING,
+                                   "[PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms above %dms cap — left to the discontinuity layer%s%s%s%s\n",
+                                   a->dbg_k, a->dbg_in, step / 1000, g_aglue_max_ms,
+                                   exp_hit ? " (matches the shared-flush expected step — aresample converges it)" : "",
+                                   exp_late ? " [late match — TTL had expired]" : "",
+                                   pad_cancel ? " (cancels an open GAP-pad — round-trip; aresample drops)" : "",
+                                   ptv_self_shed_note(a, sn, sizeof sn));
+                        }
                     } else if (exp_hit) {
                         av_log(NULL, AV_LOG_WARNING,
                                "[PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms matches the shared-flush expected step %+"PRId64"ms "
@@ -2117,15 +2221,22 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                      * backward RELABEL erase left the step IN the labels for aresample to
                      * converge — GAP-pad, FLUSH-APPLY, pad-cancel, above-cap stand-aside): */
                     if (g_glueclass) {
-                        int erased_here = step < 0 && !exp_hit && !pad_cancel && !fill_resumed &&
-                                          llabs(step) <= (int64_t)g_aglue_max_ms * 1000;
+                        /* 1.0.1-pre23: a conv-folded step was ERASED at the door (label-neutral)
+                         * — nothing reaches the resampler, so no pend_comp tripwire, no pad
+                         * ledger entry (a later matching backward step must take the normal
+                         * backward RELABEL erase, which nets the fold to zero — treating it as
+                         * a pad round-trip would DROP content we never padded), and no >10s
+                         * in-flight alert (nothing is in flight). */
+                        int erased_here = conv_folded ||
+                                          (step < 0 && !exp_hit && !pad_cancel && !fill_resumed &&
+                                          llabs(step) <= (int64_t)g_aglue_max_ms * 1000);
                         if (!erased_here) {
                             /* §2.4 realization tripwire: hard comp is instantaneous by design —
                              * checked against the pre11 slip probe ~2s from now (audio_drain_fg). */
                             a->pend_comp_us = step;
                             a->pend_comp_wc = now_wc;
                         }
-                        if (step > 0 && !exp_hit &&
+                        if (step > 0 && !exp_hit && !conv_folded &&
                             wall_gap < step / 2 + FFMAX(a->glue_cad_us, 40000)) {
                             /* E5 pad ledger: an open GAP-pad awaiting a possible return leg (3a).
                              * Registered (flush-routed) forward steps are alignment, not gaps —

@@ -382,6 +382,8 @@ void *output_thread(void *arg)
         int64_t cad_ema_us   = v->tick_dur_us;      /* M7: fresh-frame source-spacing EMA (tau ~8f); seeded real-time */
         int64_t cad_prev_src = AV_NOPTS_VALUE;      /* previous fresh frame's SOURCE pts (held_src_pts domain) */
         int     cad_dropouts = 0, cad_in_drop = 0;  /* flag-dropout EVENTS ridden this engagement + in-a-dropout flag */
+        int64_t nv_wait0 = av_gettime_relative();   /* 1.0.1-pre23 startup sanity: thread-start wall (time-to-first-frame) */
+        int64_t nv_chk_last = 0;                    /* rate-limits the post-deadline flow check (~1/s) */
 
     for (;;) {
         int fresh = 0, cadence_hold = 0;
@@ -451,7 +453,37 @@ void *output_thread(void *arg)
             if (got_eof)
                 break;                              /* decode finished, queue drained */
         }
-        if (!have) { av_usleep(2000); continue; }   /* await first frame (no startup dups) */
+        if (!have) {                                /* await first frame (no startup dups) */
+            /* 1.0.1-pre23 STARTUP SANITY (PTV_NOVIDEO_EXIT_S, default 300s; 0 disables): a
+             * video stream that probes OK but never decodes (#60 arm D — SPS/PPS intact,
+             * every slice corrupt) parks this thread HERE forever: zero stats lines (the
+             * stats block is below), demux pumping, process alive — the log-silent wedged
+             * startup shape from the glo-1 incident. If input packets are demonstrably
+             * FLOWING (any input's demux heartbeat fresh — a dead source is rw_timeout /
+             * [PTV-REOPEN]'s job, not ours) and no video frame has arrived in the whole
+             * window since thread start, die loud for a supervised respawn. Master rung
+             * only (one judge); the mv compositor path never parks here. */
+            if (v->is_master && g_novideo_exit_us > 0) {
+                int64_t nvnow = av_gettime_relative();
+                if (nvnow - nv_wait0 > g_novideo_exit_us && nvnow - nv_chk_last > 1000000) {
+                    int sl, flowing = 0;
+                    nv_chk_last = nvnow;
+                    for (sl = 0; sl < PTV_MAX_INPUT; sl++) {
+                        int64_t hb = atomic_load_explicit(&g_hb_demux_wall[sl], memory_order_relaxed);
+                        if (hb && nvnow - hb < 10000000) { flowing = 1; break; }
+                    }
+                    if (flowing) {
+                        av_log(NULL, AV_LOG_FATAL,
+                               "[PTV-NOVIDEO] input packets flowing but no video frame decoded in the "
+                               "%ds since start — undecodable video; exiting for supervised respawn "
+                               "(PTV_NOVIDEO_EXIT_S)\n", (int)(g_novideo_exit_us / 1000000));
+                        fflush(NULL);
+                        exit(1);
+                    }
+                }
+            }
+            av_usleep(2000); continue;
+        }
 
         if (fresh && g_pulldown) {                  /* film-mode detector: progressive frames with rff==1 only
                                                      * (==1 excludes doubling/tripling 2/4 — the bogus pic_struct=7

@@ -222,6 +222,27 @@ typedef struct DlvGate {
  * channel at async for hours). */
 #define PTV_GLUE_MAX_ROUTE_US (120LL * AV_TIME_BASE)
 #define PTV_GLUE_TW_CAP_US    (2LL * AV_TIME_BASE)
+/* 1.0.1-pre23 #60/#61 BOUNDED CONVERGENCE (g_convcap; PTV_NO_CONVCAP=1 reverts A+B+C as one).
+ * The Avivando OOM class (2026-07-23, 183GB anon-RSS → whole-box outage): a channel with
+ * RECURRING label-jump seams on a continuously flowing feed hands each above-cap AGLUE step
+ * to "aresample converges it"; the convergence never completes before the next seam, the
+ * re-measured step stacks the unconverged backlog (each order ~2× the last: +1.2s→+702s in
+ * 23min), and every order is an UNCAPPED swr_inject_silence allocation. Three layers:
+ *   A admission cap  — a single accepted order above PTV_CONV_CAP_S (default 60s) is never
+ *     handed to the resampler: folded label-neutrally instead (glue_off, the pre20 fold —
+ *     door labels continuous, nothing reaches swr). The 2026-07-18 Q5 mandate is PRESERVED
+ *     for in-cap orders (PATRIOT 30.8s passes through; latency stays unbounded while a
+ *     convergence SHRINKS).
+ *   B ladder escape  — a NEW above-cap step arriving while an order is in flight, whose
+ *     magnitude (≈ the re-measured total backlog — the shared-flush handshake re-measures
+ *     A-vs-V including the unconverged remainder) is NOT SHRINKING vs the in-flight order,
+ *     is the ladder signature: fold the entire backlog, don't stack a bigger order. A
+ *     genuinely draining convergence (strictly shrinking between seams) is left alone.
+ *   C seam-park      — ≥3 fold-escapes (A or B) on one track within a rolling hour puts the
+ *     track in SEAM-PARK for the next hour: every above-cap step folds immediately (the
+ *     rc1-like parking posture that survived the same sources, but label-neutral and loud).
+ * ESC ring: escape wall-times kept for the rolling recurrence window. */
+#define PTV_CONV_ESC          8
 /* NBS silence-fill sentinel (§3): a zero-size AVPacket carrying this PRIVATE flag bit on a
  * track's audio_q tells the audio thread to synthesize one quantum of silence at the track's
  * expected next graph-door pts (demux-side corrupt-discard starvation — the thread itself is
@@ -768,6 +789,20 @@ typedef struct AudioState {
                                                        * unmatched publishes stay pending and re-scan) */
     int64_t          reopen_seen_wc;                  /* 1.0.1-pre20 rider (a): last consumed g_reopen_wc
                                                        * value for this track's input (ASTAMP carry inval) */
+    /* 1.0.1-pre23 #60/#61 bounded convergence (g_convcap — see the PTV_CONV_ESC block).
+     * All owned by this track's audio thread. */
+    int64_t          conv_bl_us;                      /* in-flight accepted-convergence order magnitude (us); 0 = none */
+    int64_t          conv_bl_wc;                      /* wall us the order was accepted */
+    int64_t          conv_bl_dl;                      /* in-flight deadline (wall us): accept + 2×order + 60s —
+                                                       * injected silence plays out ~1× realtime on a live-paced
+                                                       * channel; past this the order is considered played out.
+                                                       * The TTL can only MISS an escape (a slower drain reads as
+                                                       * fresh), never fold a healthy independent step early —
+                                                       * a recurring ladder re-trips B on its own re-measurement. */
+    int64_t          conv_esc_wc[PTV_CONV_ESC];       /* fold-escape wall times (rolling recurrence window) */
+    int              conv_esc_n;                      /* escape ring cursor (monotonic) */
+    int64_t          seam_park_until;                 /* wall us; nonzero+future = SEAM-PARK: every above-cap
+                                                       * step folds immediately (entry/expiry logged) */
 } AudioState;
 
 /* ---- demux + mux ---- */
@@ -1229,6 +1264,13 @@ extern int64_t g_achop_relimit_us;
 extern int     g_anchor_headfill;
 extern int64_t g_wrap_guard_us;
 extern int     g_aglue_ms;
+extern int     g_convcap;                /* 1.0.1-pre23 bounded convergence (A+B+C); PTV_NO_CONVCAP=1 reverts */
+extern int64_t g_conv_cap_us;            /* A: single-order admission cap (PTV_CONV_CAP_S, default 60s) */
+extern int64_t g_seam_park_us;           /* C: recurrence window AND park duration (3600s;
+                                          * PTV_SEAM_PARK_S TEST-ONLY override for the G4 gate) */
+extern int64_t g_novideo_exit_us;        /* 1.0.1-pre23 startup sanity: packets flowing but no video frame
+                                          * decoded for this long since start → FATAL exit
+                                          * (PTV_NOVIDEO_EXIT_S, default 300s; 0 disables) */
 extern int     g_prog_off;
 extern int     g_progoff_av;
 extern int     g_layera;

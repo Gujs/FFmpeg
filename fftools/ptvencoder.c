@@ -41,7 +41,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.0.1-pre22"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.0.1-pre23"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -102,6 +102,19 @@ int     g_aglue_ms = 60;           /* v0.9.16.3 [PTV-AGLUE]: audio label-step gl
                                            * blind and aresample=async silently followed audio labels while video labels are
                                            * structurally erased by the house clock (the AWE-class lip-sync accumulator).
                                            * PTV_AGLUE_MS overrides; 0 disables (reverts to silent label-following). */
+int     g_convcap = 1;             /* 1.0.1-pre23 #60/#61 BOUNDED CONVERGENCE (the Avivando 183GB OOM class): A single-order
+                                           * admission cap + B doubling-ladder escape + C seam-park recurrence guard, one switch.
+                                           * PTV_NO_CONVCAP=1 reverts all three to the pre22 hand-everything-to-aresample posture.
+                                           * See the PTV_CONV_ESC block in ptvencoder.h for the full pathology + design. */
+int64_t g_conv_cap_us = 60LL * 1000000;      /* A: single accepted-convergence order cap (PTV_CONV_CAP_S; default 60s —
+                                           * PATRIOT's 30.8s, the largest REAL convergence ever observed, passes with 2× margin;
+                                           * a 60s order is ≤ ~23MB of injected silence = allocation-bounded). */
+int64_t g_seam_park_us = 3600LL * 1000000;   /* C: rolling recurrence window and park duration (1h).
+                                           * PTV_SEAM_PARK_S TEST-ONLY override (G4 gate); never set in production. */
+int64_t g_novideo_exit_us = 300LL * 1000000; /* 1.0.1-pre23 startup sanity rider: input packets flowing but no video frame
+                                           * decoded for this long since start → FATAL exit (a supervised restart beats a
+                                           * wedged forever-startup — the probe-OK-never-decodes silent state, #60 arm D).
+                                           * PTV_NOVIDEO_EXIT_S overrides; 0 disables. */
 int     g_anchor_headfill = 1;     /* 1.0.1 anchor head-fill (PTV_NO_ANCHOR_HEADFILL reverts): when the source's
                                            * audio head is missing at birth (first kept audio >200ms after h0, or the
                                            * pre-h0 ring overflowed), synthesize silence covering house 0 → first kept
@@ -1396,6 +1409,7 @@ static void *mux_thread(void *arg)
         }
         {
             int64_t wt0 = g_diag ? av_gettime_relative() : 0;
+            int stream_index = pkt->stream_index;
             g_muxed_bytes += pkt->size;
             ret = av_interleaved_write_frame(m->ofmt, pkt);
             if (g_diag) {
@@ -1403,9 +1417,24 @@ static void *mux_thread(void *arg)
                 if (dlt > 800000)
                     av_log(NULL, AV_LOG_WARNING, "[PTV-DIAG] write blocked %"PRId64" ms\n", dlt / 1000);
             }
+            av_packet_free(&pkt);
+            if (ret < 0) {
+                /* 1.0.1-pre23 #54: a mux write error used to break out of this thread with
+                 * ZERO log lines — the wire went dead while the process lived on as a silent
+                 * zombie (and, #60: the closed delivery gate then freed every audio packet
+                 * into a dead mux_q, removing ALL backpressure from the audio thread — the
+                 * sustained-allocation enabler). A dead mux IS a dead channel either way:
+                 * die loud so supervisord respawns a working one. No env gate — this is
+                 * defense-in-depth, not behavior anyone can want to keep. */
+                m->err = ret;
+                av_log(NULL, AV_LOG_FATAL,
+                       "[PTV-MUX] rung %d write failed on stream %d: %s — a dead mux is a dead "
+                       "channel; exiting for supervised respawn\n",
+                       m->rung, stream_index, av_err2str(ret));
+                fflush(NULL);
+                exit(1);
+            }
         }
-        av_packet_free(&pkt);
-        if (ret < 0) { m->err = ret; break; }
         /* pre14 (§3, owner call 3): per-rung wire-send watermark — stamped ONLY after a
          * SUCCESSFUL interleaved write, so a stalled/backed-up muxer (the Newsmax2 dead
          * rung, invisible to every label-domain signal) goes stale within seconds. The
@@ -2784,6 +2813,11 @@ int main(int argc, char **argv)
     { const char *wg = getenv("PTV_WRAP_GUARD_S"); if (wg && atoi(wg) > 0) g_wrap_guard_us = (int64_t)atoi(wg) * 1000000; }  /* v0.9.16.1 wrap-guard threshold override (TEST ONLY) */
     if (getenv("PTV_NVENC_SERIALIZE")) g_nvenc_serialize = 1;  /* v0.9.16.5 scale fix B2 (opt-in): one process-wide mutex around video encoder calls — cuts concurrent NVIDIA RM-lock callers 6->1 per process */
     { const char *ag = getenv("PTV_AGLUE_MS");     if (ag) g_aglue_ms = atoi(ag); }          /* v0.9.16.3 label-step glue threshold; 0 disables */
+    if (getenv("PTV_NO_CONVCAP")) g_convcap = 0;   /* 1.0.1-pre23 revert: above-cap steps all hand to aresample again
+                                                    * (the #60 unbounded swr_inject_silence ladder — A/B only) */
+    { const char *s = getenv("PTV_CONV_CAP_S");  if (s && atoi(s) > 0) g_conv_cap_us  = (int64_t)atoi(s) * 1000000; }
+    { const char *s = getenv("PTV_SEAM_PARK_S"); if (s && atoi(s) > 0) g_seam_park_us = (int64_t)atoi(s) * 1000000; }  /* TEST ONLY (G4) */
+    { const char *s = getenv("PTV_NOVIDEO_EXIT_S"); if (s) g_novideo_exit_us = (int64_t)atoll(s) * 1000000; }  /* 1.0.1-pre23 startup sanity; 0 disables */
     /* 0.9.18.7: PTV_AGLUE_MAX_MS (1000ms) / PTV_DISCONT_MS (1000ms) / PTV_DISCONT_BACK_MS (80ms)
      * internalized — see g_aglue_max_ms / g_discont_ms / g_discont_back_ms */
     if (getenv("PTV_NO_PROG_OFF")) g_prog_off = 0;   /* P2: A/B — sparse copied streams get 33-bit wrap only (v0.6.23) */
