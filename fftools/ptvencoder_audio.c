@@ -2101,10 +2101,10 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                             a->conv_bl_wc = 0;
                             if (fold_ladder)
                                 av_log(NULL, AV_LOG_ERROR,
-                                       "[PTV-CONV] a%d(in%d) backlog grew %+"PRId64"s -> %+"PRId64"s while "
+                                       "[PTV-CONV] a%d(in%d) backlog grew %+"PRId64"ms -> %+"PRId64"ms while "
                                        "converging — not converging; folded label-neutrally (glue total "
                                        "%+"PRId64"ms)%s\n",
-                                       a->dbg_k, a->dbg_in, prev_bl / AV_TIME_BASE, step / AV_TIME_BASE,
+                                       a->dbg_k, a->dbg_in, prev_bl / 1000, step / 1000,
                                        a->glue_off_us / 1000, ptv_self_shed_note(a, sn, sizeof sn));
                             else if (fold_cap)
                                 av_log(NULL, AV_LOG_ERROR,
