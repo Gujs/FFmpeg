@@ -7,6 +7,96 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(7w) PRE23 — BOUNDED AUDIO CONVERGENCE (#60/#61: the Avivando OOM class) + two riders
+(#54 mux-death loud-fatal, startup sanity). Kill: PTV_NO_CONVCAP=1 reverts A+B+C as one;
+riders: #54 has no gate (defense-in-depth), startup sanity PTV_NOVIDEO_EXIT_S=0 disables.
+SYMPTOM (perception-glo-transcoder-1 2026-07-23 01:07 UTC): TV_Avivando_Nações — a
+channel with recurring label-jump seams on a continuously flowing HLS→SRT→UDP relay —
+grew 183GB anon-RSS in 52min and the kernel OOM kill took the WHOLE BOX down (systemd
+OOMPolicy SIGKILLed the supervisord cgroup, 51 channels dark 8.4h). On-box ladder:
+AGLUE steps +1.2s→2.5→5.0→10→21→42→84→172→347→+702s over 23min, every order
+"left to the discontinuity layer (matches the shared-flush expected step — aresample
+converges it)" = an UNCAPPED contiguous swr_inject_silence allocation (label-gap ×
+48000 samples; a single 2^31-byte heap block was measured in the #60 repro). Verbatim
+ladders on 3 boxes under pre21/pre22 (Rsbn cor-3 +2.6→145s survivable on 503GB;
+Praise_TV glo-2 →328s); 22 channels show precursors, 4 are OOM-class. rc1 on identical
+sources PARKED the step in the hs/hsres ledger (stable, ugly) — the pre15 #33 classifier
+turned that parking into unbounded convergence pursuit.
+MECHANISM: each seam's A-vs-V mismatch is routed to the audio content path by the
+shared-flush handshake (registered expected step); the convergence never completes
+before the next seam; the re-measured mismatch stacks the unconverged backlog into
+each new order (~2× the last).
+FIX — three layers in the AGLUE above-cap branch, ONE remedy (the pre20 LABEL-NEUTRAL
+FOLD: glue_off_us -= step — door labels continuous, nothing reaches the resampler, the
+sensor/corrector own any real residual), one loud [PTV-CONV] line each:
+  A ADMISSION CAP (PTV_CONV_CAP_S, default 60s): a single accepted order above the cap
+    is folded, never handed to aresample. THE 2026-07-18 Q5 MANDATE IS PRESERVED for
+    in-cap orders: PATRIOT's 30.8s (the largest REAL convergence ever observed) passes
+    with 2× margin, and an accepted convergence stays latency-UNBOUNDED while it
+    SHRINKS — the mandate governed healthy-source convergences, which all realize
+    instantly (hard comp); only the pathological ladder is refused.
+  B LADDER ESCAPE: a NEW above-cap step arriving while an order is in flight (within
+    2×order+60s of acceptance — injected silence plays out ~1× realtime through the
+    delivery gate) whose magnitude is NOT SHRINKING vs the in-flight order is the
+    ladder signature: the ENTIRE backlog folds, no bigger order is stacked. A recurring
+    equal-size seam train folds too — by design: recurrence IS the chunk-seam channel,
+    even when individual orders drain (one-shot events never see a second step).
+  C SEAM-PARK: ≥3 fold-escapes (A or B) on one track within a rolling hour → every
+    above-cap step folds immediately for the next hour (rc1-like parking, label-neutral
+    and loud; entry/expiry logged; park folds don't re-count so the park self-expires).
+FOLDED steps are ERASED at the door: no §2.4 pend_comp tripwire, no E5 pad-ledger entry
+(a later matching backward step takes the normal RELABEL erase and nets the fold to
+zero — treating it as a pad round-trip would drop content that was never padded), no
+>10s mandate alert. NOT folded (exempt): pad_cancel and backward fill-resume overlaps —
+they DROP our own inserted silence (no allocation; folding would bake it). exp_hit does
+NOT exempt — the ladder's own orders carry the expected-step suffix.
+RIDER #54 (mux-death loud-fatal, no env gate): a mux write error used to end mux_thread
+with ZERO log lines — wire dead, process alive (the silent zombie), and the closed
+delivery gate then freed every audio packet into the dead mux_q, removing all
+backpressure (the #60 sustained-allocation enabler). Now: one [PTV-MUX] AV_LOG_FATAL
+line (rung, stream, error) + exit(1) for supervised respawn. Measured (G5, connected-UDP
+wire broken at t=25): FATAL + rc=1 at t=28; pre22 control = stats frozen, alive 75s+,
+zero lines.
+RIDER STARTUP SANITY (PTV_NOVIDEO_EXIT_S, default 300s, 0 disables): input packets
+flowing (demux heartbeat fresh) but no video frame decoded since start parks the master
+output thread BEFORE the stats block forever (zero log lines — the wedged-startup
+shape). Now: [PTV-NOVIDEO] FATAL + exit(1) at the deadline. Master rung, single-input
+live path only (the mv compositor never parks there). A dead source stays rw_timeout /
+[PTV-REOPEN]'s job (the flowing check). NOTE (measured): an audio-only/no-video-PID or
+garbage-video source already exits LOUD at open (~5-10s, buffersrc 0x0) — the state this
+rider covers is probe-OK-then-never-decodes (startup vdec wedge, the Azorse futex class;
+gate fixture = PTV_TEST_VDEC_STALL_AT_S=0, a new TEST-ONLY trigger-time override for the
+pre21 stall injector).
+GATES (fixture = seam_relay chunk-seam UDP relay; the `asym` mode — video +J, audio
++J+D per seam — reproduces the EXACT production entry lines: "paired flush: expected
+audio label step +Ds registered … content path will APPLY it" → above-cap AGLUE with
+the expected-step suffix → ">10s convergence in flight"; every gate carries a
+PTV_NO_CONVCAP=1 / env-disabled / pre22-binary broken arm as the liveness proof):
+G1 Avivando shape (routed +90s per 45s seam, 16min): CONTROL grew the PRODUCTION
+LADDER (+90→+141.6→+411.7→+1221.4s re-measured orders, RSS 1.1MB→970MB and climbing,
+async −1.9Mppm, dlvhold 21.8s) — FIX: 3 A-cap folds → seam-park at escape 3 → in-park
+folds, RSS 181MB FLAT 15min, wire A/V dts spread ≤40ms to the end. G1b (routed +40s
+per 30s): B ladder-escape fired AND the production ×2 re-measure reproduced (+40s
+accepted → next order arrived +80s [1668 pkts shed] → A-cap fold); RSS 201MB flat.
+G2 PATRIOT (+31s one-shot): pre23 vs pre22 LINE-FOR-LINE identical (accepted, mandate
+alert, 0 [PTV-CONV], lipsync +13ms both) — the mandate is preserved. G3 (+45s
+one-shot): the initial order ACCEPTED (mandate honored); this 1-rung cell then
+self-degenerates (QSHED shed-gaps = secondary above-cap steps on BOTH binaries — the
+pre22 control handed 57 of them to aresample) and pre23 correctly parked the train;
+wire spread 25ms. G4 recurrence (PTV_SEAM_PARK_S=600 TEST override): entry at escape
+3 → per-seam in-park folds → "seam-park expired — converging re-enabled" — full
+lifecycle, RSS 187MB flat 20min. G5 #54: FATAL + exit rc=1 within 3s of the wire
+break; pre22 control = frozen stats, alive 75s+, zero lines. G6 startup wedge
+(PTV_TEST_VDEC_STALL_AT_S=0): [PTV-NOVIDEO] FATAL rc=1 at t=33 (30s deadline);
+disabled control parks silently forever. G7: healthy = log-vocabulary identical +
+per-5s output byte counts IDENTICAL to pre22; bursty stop/go = [PTV-BURSTY]/bank
+engagement identical (bank target Δ4ms); p25 anchor fixtures F1/F2R re-pass (F1
+lipsync decays to +3ms as the pre22 reference, F2R supersede path byte-same).
+MEASUREMENT BOUND (reviewer note): on label-only seam fixtures the pairing lipsync=
+and the v0.9.2 async= stats read the SOURCE-label divergence (+392s / −2Mppm) while
+the WIRE stays aligned (ffprobe A/V dts spread ≤40ms) — the fold refuses the label
+span by design; production seam channels under park will show the same stat shape.
+
 (7v) PRE22 — lone-VIDEO-jump audio-anchor (the role-swapped D1 mirror; kill
 PTV_NO_AANCHOR=1).
 SYMPTOM (Fashion live 2026-07-22 13:21:42): a lone VIDEO label jump +5.520s whose
