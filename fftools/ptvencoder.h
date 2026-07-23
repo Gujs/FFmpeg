@@ -803,6 +803,9 @@ typedef struct AudioState {
     int              conv_esc_n;                      /* escape ring cursor (monotonic) */
     int64_t          seam_park_until;                 /* wall us; nonzero+future = SEAM-PARK: every above-cap
                                                        * step folds immediately (entry/expiry logged) */
+    int64_t          conv_total_us;                   /* rr23: cumulative folded label motion (us) — the net
+                                                       * label divergence the folds refused; published to
+                                                       * g_conv_pub for the stats conv= token */
 } AudioState;
 
 /* ---- demux + mux ---- */
@@ -1397,6 +1400,8 @@ extern int64_t g_rscorr_slew_us_s;       /* slew clamp, µs of trim per wall sec
  * the one transition the owning thread cannot log, see rscorr_* in ptvencoder_audio.c) */
 extern _Atomic int64_t g_corr_pub[PTV_MAX_AUDIO];        /* cumulative corr_us per track */
 extern _Atomic int     g_corr_state_pub[PTV_MAX_AUDIO];  /* PTV_CORR_* per track */
+extern _Atomic int64_t g_conv_pub[PTV_MAX_AUDIO];        /* rr23: cumulative folded label motion (us) */
+extern _Atomic int64_t g_conv_park_pub[PTV_MAX_AUDIO];   /* rr23: seam_park_until wall us (0/past = unparked) */
 extern _Atomic int     g_corr_disarm_req[PTV_MAX_AUDIO]; /* master watchdog → audio thread (silent sync) */
 /* 1.0.1-pre17 sibling-slate condition (compositor writes, corrector reads): bit k set while
  * input slot k is black-slated. While ANY bit is set no mv track may engage — a sibling
@@ -1487,6 +1492,7 @@ void ptv_print_log_legend(int full);
 void ptv_stats_lipsync(char *buf, size_t size, int64_t now_us, int force_idx);
 void ptv_stats_lipsync_in(char *buf, size_t size, int64_t now_us, int in);
 void ptv_stats_corr(char *buf, size_t size, int force_idx);
+void ptv_stats_conv(char *buf, size_t size, int64_t now_us, int force_idx);
 /* 1.0.1-pre17: the pre14 stale-track corrector watchdog, shared by both cadence owners —
  * the single-input master rung (ptvencoder_clock.c) and the mv compositor (the passthrough
  * rung loop returns before the master block, so mv needed its own call site). Callers

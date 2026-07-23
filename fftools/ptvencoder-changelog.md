@@ -92,10 +92,16 @@ disabled control parks silently forever. G7: healthy = log-vocabulary identical 
 per-5s output byte counts IDENTICAL to pre22; bursty stop/go = [PTV-BURSTY]/bank
 engagement identical (bank target Δ4ms); p25 anchor fixtures F1/F2R re-pass (F1
 lipsync decays to +3ms as the pre22 reference, F2R supersede path byte-same).
-MEASUREMENT BOUND (reviewer note): on label-only seam fixtures the pairing lipsync=
-and the v0.9.2 async= stats read the SOURCE-label divergence (+392s / −2Mppm) while
-the WIRE stays aligned (ffprobe A/V dts spread ≤40ms) — the fold refuses the label
-span by design; production seam channels under park will show the same stat shape.
+MEASUREMENT BOUND (reviewer-confirmed, rr23 F1): on fold/park channels read the WIRE +
+the [PTV-CONV] lines — lipsync= includes the folded label divergence BY DESIGN (the
+fold refuses the source's label motion; reviewer measured lipsync= +1,828,749ms at a
+wire A/V dts spread of 80ms) and async= reads Mppm for the same reason. The rr23
+`conv=` stats token quantifies it: appended only when a track's cumulative folded
+label motion is nonzero (healthy lines stay byte-identical), integer seconds of net
+folded motion, `P` suffix while SEAM-PARKED (timestamp-derived, never stale), e.g.
+`conv=+141sP`. rr23 F5: seam-park expiry is logged eagerly (per fed frame, the owning
+audio thread) so every park-entry line gets its matching expiry line even when the
+seams stop mid-park.
 
 (7v) PRE22 — lone-VIDEO-jump audio-anchor (the role-swapped D1 mirror; kill
 PTV_NO_AANCHOR=1).

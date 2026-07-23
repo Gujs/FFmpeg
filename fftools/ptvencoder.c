@@ -655,6 +655,14 @@ int64_t g_rscorr_quiet_us  = 180000000;  /* §4.4: 3min trailing event-free wind
 int64_t g_rscorr_slew_us_s = 2000;       /* §4: 2ms/s slew clamp (1/5 of pre3's TRACK clamp) */
 _Atomic int64_t g_corr_pub[PTV_MAX_AUDIO];
 _Atomic int     g_corr_state_pub[PTV_MAX_AUDIO];
+_Atomic int64_t g_conv_pub[PTV_MAX_AUDIO];       /* 1.0.1-pre23 rr23: cumulative folded label motion (us);
+                                                  * nonzero => the stats line grows a conv= token — on a
+                                                  * fold/park channel the lipsync=/async= stats include the
+                                                  * folded label divergence BY DESIGN (read the wire +
+                                                  * [PTV-CONV] lines); conv= quantifies it for monitors. */
+_Atomic int64_t g_conv_park_pub[PTV_MAX_AUDIO];  /* rr23: seam_park_until (wall us; 0/past = not parked) —
+                                                  * the builder derives the P suffix by timestamp so the
+                                                  * display can never show a stale park. */
 _Atomic int     g_corr_disarm_req[PTV_MAX_AUDIO];
 _Atomic int64_t g_mux_sent_wc[PTV_MAX_RUNG];
 /* 1.0.1-pre15 — glue classification #33 (analysis/ptvencoder-33-glue-classification.md).

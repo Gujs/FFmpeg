@@ -678,6 +678,9 @@ void *compositor_thread(void *arg)
                  * builder with the aK: prefix forced; absent while every track is quiet. */
                 char crs[10 + PTV_MAX_AUDIO * 20];
                 ptv_stats_corr(crs, sizeof crs, 1);
+                char cvs[10 + PTV_MAX_AUDIO * 16];   /* pre23 rr23: conv= (aK: forced, as corr=);
+                                                      * absent while every track's fold total is 0 */
+                ptv_stats_conv(cvs, sizeof cvs, nows, 1);
                 char ls[448]; int lp = 0;   /* per-slot: qdrop=input-q overflow, corrupt=demux+decode,
                                              * pd=cadence holds (NORMAL for a rate-mismatched slot),
                                              * sv=starvation dups, sk=published audio skew,
@@ -696,8 +699,8 @@ void *compositor_thread(void *arg)
                                    (int)(c->inputs[k].da.disc_resid_us / 1000), lst);
                 }
                 av_log(NULL, AV_LOG_INFO,   /* v0.9.13 parity: size/bitrate/speed/genlock dropped (v0.9.10 single-input rationale) */
-                    "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f dup=%"PRId64" drop=%"PRId64"%s%s%s%s\n",
-                    c->emitted, fps, hh, mm, ss, c->dup, c->framedrop[0], dlv, aco, ls, crs);
+                    "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f dup=%"PRId64" drop=%"PRId64"%s%s%s%s%s\n",
+                    c->emitted, fps, hh, mm, ss, c->dup, c->framedrop[0], dlv, aco, ls, crs, cvs);
                 /* 1.0.1-pre17 (owner-floated): per-INPUT always-on [PTV-RSYNC] summary, ONE
                  * compact line per input — the soak forensics that used to need PTV_DIAG.
                  * R = this input's track reading(s) (same builder as the stats token), ev =

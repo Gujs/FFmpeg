@@ -377,6 +377,35 @@ void ptv_stats_lipsync_in(char *buf, size_t size, int64_t now_us, int in)
  * corrector is armed): force_idx=1 (mv) always prints the aK: prefix — the track→slot map
  * (startup [PTV-RSYNC] tracks: line) resolves aK to its input. Absent while every track
  * sits at corr==0 un-engaged — the quiet-channel stats line is unchanged (§6). */
+/* conv= builder (1.0.1-pre23 rr23). On a fold/park channel the pairing lipsync= and the
+ * v0.9.2 async= stats include the FOLDED label divergence by design (the fold refuses the
+ * source's label motion; the wire is the ground truth) — a monitor banding on lipsync=
+ * would alarm on exactly the channels the bounded-convergence fix rescues. This token makes
+ * the state self-describing: cumulative net folded label motion in integer seconds, with a
+ * `P` suffix while the track is SEAM-PARKED (timestamp-derived — never stale). Absent while
+ * every track's fold total is 0, so the healthy-channel stats line stays byte-identical. */
+void ptv_stats_conv(char *buf, size_t size, int64_t now_us, int force_idx)
+{
+    int any = 0, ki, nn;
+    buf[0] = 0;
+    if (!g_convcap || g_rsx.n_a <= 0)
+        return;
+    for (ki = 0; ki < g_rsx.n_a; ki++)
+        if (atomic_load_explicit(&g_conv_pub[ki], memory_order_relaxed) != 0)
+            any = 1;
+    if (!any)
+        return;
+    nn = snprintf(buf, size, " conv=");
+    for (ki = 0; ki < g_rsx.n_a && nn > 0 && nn < (int)size - 18; ki++) {
+        int64_t cv = atomic_load_explicit(&g_conv_pub[ki], memory_order_relaxed);
+        int64_t pu = atomic_load_explicit(&g_conv_park_pub[ki], memory_order_relaxed);
+        if (force_idx || g_rsx.n_a > 1)
+            nn += snprintf(buf + nn, size - nn, "%sa%d:", ki ? "," : "", ki);
+        nn += snprintf(buf + nn, size - nn, "%+llds%s",
+                       (long long)(cv / AV_TIME_BASE), (pu && now_us < pu) ? "P" : "");
+    }
+}
+
 void ptv_stats_corr(char *buf, size_t size, int force_idx)
 {
     int any = 0, ki, nn;

@@ -1927,6 +1927,18 @@ static int audio_feed(AudioState *a, AVFrame *frame)
             int64_t raw_us = av_rescale_q(frame->pts, a->ist_tb, AV_TIME_BASE_Q);
             int64_t now_wc = av_gettime_relative();
             int fill_resumed = 0;   /* 1.0.1-pre15 §3: first REAL frame after an NBS fill phase */
+            /* rr23 (F5): EAGER seam-park expiry — checked per fed frame (this thread owns the
+             * state, race-free), not only at the next above-cap step: if seams stop during the
+             * park, the entry line still gets its matching expiry line. The conv= P suffix is
+             * timestamp-derived by the builder, so the display never depended on this. */
+            if (g_convcap && a->seam_park_until && now_wc >= a->seam_park_until) {
+                a->seam_park_until = 0;
+                if (a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO)
+                    atomic_store_explicit(&g_conv_park_pub[a->dbg_k], 0, memory_order_relaxed);
+                av_log(NULL, AV_LOG_WARNING,
+                       "[PTV-CONV] a%d(in%d) seam-park expired — converging re-enabled\n",
+                       a->dbg_k, a->dbg_in);
+            }
             if (g_glueclass && a->nbs_fill_active && !a->nbs_feeding) {
                 a->nbs_fill_active = 0;
                 a->nbs_last_wall_us = 0;
@@ -2071,16 +2083,9 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                         int fold_park = 0, fold_cap = 0, fold_ladder = 0;
                         int64_t mag = llabs(step), prev_bl = 0;
                         if (g_convcap && !pad_cancel && !(fill_resumed && step < 0)) {
-                            if (a->seam_park_until) {
-                                if (now_wc < a->seam_park_until)
-                                    fold_park = 1;
-                                else {
-                                    a->seam_park_until = 0;
-                                    av_log(NULL, AV_LOG_WARNING,
-                                           "[PTV-CONV] a%d(in%d) seam-park expired — converging re-enabled\n",
-                                           a->dbg_k, a->dbg_in);
-                                }
-                            }
+                            if (a->seam_park_until)          /* rr23: expiry is handled eagerly per
+                                                              * frame above — a set value is future */
+                                fold_park = 1;
                             if (a->conv_bl_wc && now_wc > a->conv_bl_dl) {   /* order played out */
                                 a->conv_bl_us = 0;
                                 a->conv_bl_wc = 0;
@@ -2099,6 +2104,11 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                             a->glue_events++;                       /* label edit event (corrector freeze) */
                             a->conv_bl_us = 0;                      /* backlog retired with the fold */
                             a->conv_bl_wc = 0;
+                            a->conv_total_us += step;               /* rr23: net folded label motion —
+                                                                     * feeds the stats conv= token */
+                            if (a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO)
+                                atomic_store_explicit(&g_conv_pub[a->dbg_k], a->conv_total_us,
+                                                      memory_order_relaxed);
                             if (fold_ladder)
                                 av_log(NULL, AV_LOG_ERROR,
                                        "[PTV-CONV] a%d(in%d) backlog grew %+"PRId64"ms -> %+"PRId64"ms while "
@@ -2134,6 +2144,9 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                                         esc_in_win++;
                                 if (esc_in_win >= 3 && !a->seam_park_until) {
                                     a->seam_park_until = now_wc + g_seam_park_us;
+                                    if (a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO)
+                                        atomic_store_explicit(&g_conv_park_pub[a->dbg_k],
+                                                              a->seam_park_until, memory_order_relaxed);
                                     av_log(NULL, AV_LOG_ERROR,
                                            "[PTV-CONV] a%d(in%d) seam-park: escape %d within the hour — "
                                            "converging disabled %dmin (every above-cap step folds "
