@@ -340,7 +340,13 @@ static int64_t ptv_wallev_w(DemuxArgs *d, int sidx, int64_t jump_us)
         return 0;
     }
     cad = d->wall_cad_us ? d->wall_cad_us[sidx] : 0;
-    w   = gap - (cad > 0 ? cad : 40000);     /* a real hole's gap rides on top of ONE normal interval */
+    if (cad <= 0) cad = 40000;
+    /* a real hole's wall gap = missing content + the resume packet's phase within its
+     * normal delivery interval — uniformly 0..cad, so subtract cad/2 (unbiased; a full-cad
+     * subtraction under-padded composites by half the PES-burst period on bursty muxes,
+     * first fixture battery). Residual estimator error is bounded by ± one burst period —
+     * negligible on tight CBR TS; on burst-muxed sources the corrector owns the leftovers. */
+    w = gap - cad / 2;
     if (w < 0) w = 0;
     if (w > jump_us) w = jump_us;
     return w;
