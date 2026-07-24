@@ -7,7 +7,64 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
-(7w) PRE23 — BOUNDED AUDIO CONVERGENCE (#60/#61: the Avivando OOM class) + two riders
+(7w) PRE24 — #63 CORRUPT-STORM DESYNC: WALL-EVIDENCE SPLIT + CORROBORATED RECOVERY RE-ANCHOR.
+Kills: PTV_NO_WALLEV=1 reverts Part 1's action at every touched site (provenance measurement
+stays on); PTV_NO_RECANCHOR=1 disables Part 2. Tunables: PTV_RECANCHOR_SETTLE_S (300),
+PTV_RECANCHOR_COOLDOWN_S (1800). v1.1.0 freeze gate; owner mandate 2026-07-24: "perfect a/v
+lip sync once input is OK again, no matter what happened on input."
+SYMPTOM (storm-diag 2026-07-24, arithmetic closed against a flash+beep ruler; live: OAN_Plus
++8.8s ear-confirmed, Avivando +4.9s on a +9.812s step, TV_Mundial +3.4s): a TEI corrupt storm
+leaves a PERMANENT post-storm audio-early offset. storm1 repro: ruler +40ms → −4880ms baked;
+ledger R=+4917 TRUE. Closed arithmetic: audio deleted (|ea|+|glue|) 17452ms − video deleted
+(|ev|) 12534ms = +4918 ≡ ruler ≡ R.
+ROOT CAUSE: REAL content holes (corrupt-discarded frames) were classified as label lies and
+ERASED instead of padded, by three per-stream engines with no cross-stream conservation —
+the A−V difference of erased totals IS the on-air offset:
+  E1v LAYERA butt-joints every >1s VIDEO hole (video never had a gap discriminator);
+  E1a audio erased whenever the gap verdict was unreachable (vcrossed — usually true
+      mid-storm — or wall_gap < max(700ms, J/2); the J/2 boundary = Avivando's half-step bake);
+  E2  pre23 conv rule B compared a NEW event's magnitude against a DIFFERENT event's
+      bureaucratically-alive backlog (dl=2×mag+60s) → folded REAL storm gaps; 3 escapes →
+      seam-park folded everything for 60min (−13418 of storm1's −17452);
+  E3  (opposite sign) composite events (label step J containing a real gap W) got a
+      WHOLE-step pad → audio LATE by J−W, sensor-blind (agapseam1: +5840ms, R wrong sign).
+PART 1 — WALL-EVIDENCE SPLIT (g_wallev, [PTV-WALLEV]): split every forward label step J into
+W = wall-absence-evidenced portion (clamp(delivery wall gap − cadence EMA, 0, J); floor
+700ms; W:=0 under bank/bursty delivery — fall back to today, never guess) → PAD (labels keep
+the hole; aresample pads audio, the house clock's starvation dups cover video) and J−W =
+flowing/relabel portion → ERASE (as today). Sites: demux_unwrap gains a VIDEO gap/composite
+discriminator (mirror of the v0.8.2 audio one; full-gap video does NOT stamp video_fwd_us,
+so vcrossed becomes a truthful splice signal mid-storm) + the audio discriminator now splits
+composites and holds full verdicts by per-stream evidence even when vcrossed; wallev-qualified
+verdicts propagate to the disc buffer unconditionally (per-stream W conservation makes
+one-sided handling safe); the LAYERA flush butt-joint preserves each crossing stream's W
+(cumulative_ts_offset + W — the shared-flush tree composes unchanged: per-stream label hole =
+own W + registered mismatch ⇒ padded content = W exactly); the conv classifier EXEMPTS
+wall-evidenced gaps (door wall_gap ≥ step/2 + cadence) from fold_park/cap/ladder — bounded by
+a 120s outstanding-pad HARDCAP that folds anyway with a loud admission (allocation safety
+trumps sync; #60 never regressed) — and rule B's deadline is the order's REALISTIC playout
+(mag + 15s, injection is instantaneous): an order that provably played out cannot be "the
+same non-converging backlog" (the cross-event aliasing fix). PATRIOT-class real 30.8s steps
+unchanged (in-cap, wall-evidenced → pad); HTTV pure-relabel floods still fold label-neutrally.
+PART 2 — CORROBORATED RECOVERY RE-ANCHOR (g_recanchor, [PTV-RECANCHOR]): channels left with a
+large STABLE R after input recovers (the corrector disarms >5s as implausible; ≤5s takes
+~40min at 2ms/s) get a one-shot, health-gated, chunked base re-anchor (the [PTV-ANCHOR]
+algebra: glue_off += step, ≤1s per 10s, budget |R0|×1.2, abort on any event) — ONLY when the
+new UNEVIDENCED-DELETION provenance ledgers (U_a/U_v, measured at every erase engine from
+event-time wall evidence, live even under PTV_NO_WALLEV) CORROBORATE it: R_pred = ΔU_a − ΔU_v
+− Δcorr ≈ R within max(500ms, 10%). THE MANDATORY GUARD (aseam counterexample): a lone flowing
+relabel pins R at the step forever while the wire is PERFECT — its erase was flow-evidenced,
+U_a=0, R_pred≈0 ⇒ REFUSED (a naive "trust large stable R" would CREATE a desync). Engage
+gates: |R|>1s, R stable ±100ms + NO events through a 300s settle window, slip=0, delivery
+live, label health H (now published per track, g_rsx.hh_q10) within ±15%, 1800s cooldown.
+Cross-stream conservation diag: one [PTV-WALLEV] line whenever the running A−V unevidenced
+deletion imbalance moves >500ms (measurement only).
+GATES (local ruler fixtures, x264+fdk 1-rung): smoke clean; storm1 (12 TEI bursts) POST
+≤±60ms hands-off + counterfactual (both kills) still shows the −4.9s bake + Part-2-only arm
+(PTV_NO_WALLEV=1) recovers via re-anchor; aseam1 wire ±40ms + re-anchor REFUSED (grep proof);
+agap1 pad ±40ms; agapseam1 (J=9.8 W=4.0) ≤±100ms (was +5840); PATRIOT 30.8s pad + conv
+admission preserved; HTTV flood folds + RSS flat ≥20min; Avivando J/2 boundary ≤±100ms;
+mv 2×2 smoke 10min.
 (#54 mux-death loud-fatal, startup sanity). Kill: PTV_NO_CONVCAP=1 reverts A+B+C as one;
 riders: #54 has no gate (defense-in-depth), startup sanity PTV_NOVIDEO_EXIT_S=0 disables.
 SYMPTOM (perception-glo-transcoder-1 2026-07-23 01:07 UTC): TV_Avivando_Nações — a
