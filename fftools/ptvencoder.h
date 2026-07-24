@@ -866,6 +866,12 @@ typedef struct AudioState {
     int64_t          ra_step_wc;                      /* wall µs of the last applied chunk */
     int64_t          ra_ua_snap, ra_uv_snap;          /* unevidenced-deletion ledger snapshots (corroborate
                                                        * only NEW deletions since the last completion) */
+    int64_t          ra_applied_us;                   /* rr24 F2: Σ signed steps applied since the last
+                                                       * COMPLETE — each step retired exactly +step of R,
+                                                       * so after a mid-walk ABORT the corroboration must
+                                                       * predict the REMAINDER: rp = ΔU − Δcorr − Σapplied
+                                                       * (without this, |R−rp| = Σapplied wedged re-engage
+                                                       * forever → permanently half-recovered channel) */
     int64_t          ra_corr_snap;                    /* corr_us snapshot (trim already applied against the
                                                        * same bake must not double-count in R_pred) */
     int64_t          ra_log_wc;                       /* refusal-line rate limit */

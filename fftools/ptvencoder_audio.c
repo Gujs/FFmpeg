@@ -792,6 +792,8 @@ static void ptv_recanchor(AudioState *a, RsyncTrackR *r, int64_t now)
                            + a->u_door_us;
             a->ra_uv_snap  = atomic_load_explicit(&g_rsx.uev_us[a->dbg_in], memory_order_relaxed);
             a->ra_corr_snap = a->corr.corr_us;
+            a->ra_applied_us = 0;                     /* rr24 F2: ledger baseline redefined with the
+                                                       * snapshots — applied steps fully accounted */
             av_log(NULL, AV_LOG_WARNING,
                    "[PTV-RECANCHOR] a%d(in%d) re-anchor COMPLETE — R=%+"PRId64"ms (inside the "
                    "engage band); corrector polishes the remainder; cooldown %"PRId64"s\n",
@@ -827,6 +829,9 @@ static void ptv_recanchor(AudioState *a, RsyncTrackR *r, int64_t now)
             a->ra_glue_snap  = a->glue_events;  /* our own edit is not an abort event */
             a->acomp_exp_us  = AV_NOPTS_VALUE;  /* deliberate step, not a click risk */
             a->ra_budget_us -= llabs(step);
+            a->ra_applied_us += step;           /* rr24 F2: every applied chunk retires +step of R —
+                                                 * an ABORT must not orphan it (corroboration then
+                                                 * predicts the remainder, not the original R0) */
             a->ra_step_wc    = now;
             av_log(NULL, AV_LOG_WARNING,
                    "[PTV-RECANCHOR] a%d(in%d) step %+"PRId64"ms applied (R was %+"PRId64"ms; "
@@ -850,7 +855,11 @@ static void ptv_recanchor(AudioState *a, RsyncTrackR *r, int64_t now)
     ua  = atomic_load_explicit(&g_rsx.uea_us[a->dbg_k], memory_order_relaxed) + a->u_door_us
         - a->ra_ua_snap;
     uv  = atomic_load_explicit(&g_rsx.uev_us[a->dbg_in], memory_order_relaxed) - a->ra_uv_snap;
-    rp  = (ua - uv) - (a->corr.corr_us - a->ra_corr_snap);
+    /* rr24 F2: each applied chunk retired exactly +step of R, so the ledgers (which never
+     * saw those deliberate edits) must predict the REMAINDER — subtract Σapplied. After a
+     * mid-walk abort this is what lets the re-engage walk only what's left; it is 0 in the
+     * clean COMPLETE cycle (reset with the snapshots). */
+    rp  = (ua - uv) - (a->corr.corr_us - a->ra_corr_snap) - a->ra_applied_us;
     tol = FFMAX(500000, llabs(R) / 10);
     if (llabs(R - rp) > tol) {
         if (a->ra_log_wc == 0 || now - a->ra_log_wc >= 60000000) {
@@ -858,10 +867,11 @@ static void ptv_recanchor(AudioState *a, RsyncTrackR *r, int64_t now)
             av_log(NULL, AV_LOG_INFO,
                    "[PTV-RECANCHOR] a%d(in%d) stable R=%+"PRId64"ms NOT corroborated by the "
                    "deletion ledgers (pred=%+"PRId64"ms: ΔU_a=%+"PRId64" ΔU_v=%+"PRId64" "
-                   "Δcorr=%+"PRId64"ms) — refusing (a flowing-relabel pinned R is correct "
-                   "on air; re-anchoring it would CREATE a desync)\n",
+                   "Δcorr=%+"PRId64"ms Σapplied=%+"PRId64"ms) — refusing (a flowing-relabel "
+                   "pinned R is correct on air; re-anchoring it would CREATE a desync)\n",
                    a->dbg_k, a->dbg_in, R / 1000, rp / 1000,
-                   ua / 1000, uv / 1000, (a->corr.corr_us - a->ra_corr_snap) / 1000);
+                   ua / 1000, uv / 1000, (a->corr.corr_us - a->ra_corr_snap) / 1000,
+                   a->ra_applied_us / 1000);
         }
         return;
     }
@@ -870,11 +880,11 @@ static void ptv_recanchor(AudioState *a, RsyncTrackR *r, int64_t now)
     a->ra_step_wc   = 0;                        /* first chunk on the next evaluation */
     av_log(NULL, AV_LOG_WARNING,
            "[PTV-RECANCHOR] a%d(in%d) ENGAGE — R=%+"PRId64"ms stable %"PRId64"s, quiet, "
-           "CORROBORATED (pred=%+"PRId64"ms: ΔU_a=%+"PRId64" ΔU_v=%+"PRId64"ms) → slewed "
-           "base re-anchor (≤1s/10s, budget %"PRId64"ms; PTV_NO_RECANCHOR disables)  "
-           "[+ = audio early]\n",
+           "CORROBORATED (pred=%+"PRId64"ms: ΔU_a=%+"PRId64" ΔU_v=%+"PRId64"ms "
+           "Σapplied=%+"PRId64"ms) → slewed base re-anchor (≤1s/10s, budget %"PRId64"ms; "
+           "PTV_NO_RECANCHOR disables)  [+ = audio early]\n",
            a->dbg_k, a->dbg_in, R / 1000, (now - a->ra_r0_wc) / 1000000,
-           rp / 1000, ua / 1000, uv / 1000, a->ra_budget_us / 1000);
+           rp / 1000, ua / 1000, uv / 1000, a->ra_applied_us / 1000, a->ra_budget_us / 1000);
 }
 /* ======================================================================================= */
 
