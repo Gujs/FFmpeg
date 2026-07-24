@@ -2595,8 +2595,17 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
          * (libavformat's own flag discards silently, hiding the count). Drop before decode: a corrupt
          * frame, like a dropped one, becomes a content gap the position-anchored composite leaps
          * across → desync. PTV_KEEP_CORRUPT=1 disables (lets the decoder try to use them). */
-        if (out->stream_index == d->vstream) d->vcorrupt++;
-        else {
+        if (out->stream_index == d->vstream) {
+            d->vcorrupt++;
+            /* pre24 #63: a corrupt-discarded video packet IS a delivery arrival — the
+             * [PTV-BURSTY]/AUTO-BANK advisor measures DELIVERY stalls (HLS-burst clumping),
+             * and leaving these unstamped made every TEI corrupt storm read as arrival
+             * stalls: auto-bank escalated on a channel whose transport was flowing
+             * perfectly, and the armed bank then disabled the wall-evidence split exactly
+             * when it was needed (storm1 fixture, first battery). Content absence is the
+             * wall-evidence machinery's business; the bank is for delivery. */
+            d->by_last_v_wall = av_gettime_relative();
+        } else {
             /* 1.0.1-pre15 #33 §3 (NBS manifestation (c)): audio was discarded here SILENTLY,
              * UNCOUNTED — the track's thread blocks on recv (no recovery logic can run), ADECWD
              * is structurally blind (wd_pkts never advances), the sensor label-walks and the
@@ -2667,6 +2676,10 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                         g_dukf_escape_us/1000, d->vdrop - d->kf_arm_vdrop,
                         atomic_load_explicit(&g_frameq_depth, memory_order_relaxed));
                 } else {
+                    /* pre24 #63: a DUKF-dropped packet is also a delivery arrival (see the
+                     * corrupt-branch note) — without the stamp, hole + DUKF span read as one
+                     * ≥3s stall and single-stall auto-bank escalation could fire post-hole. */
+                    d->by_last_v_wall = av_gettime_relative();
                     d->vdrop++; av_packet_free(&out); return 0;           /* drop the mid-GOP new-timeline burst */
                 }
             }
