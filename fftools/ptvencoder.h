@@ -243,6 +243,22 @@ typedef struct DlvGate {
  *     rc1-like parking posture that survived the same sources, but label-neutral and loud).
  * ESC ring: escape wall-times kept for the rolling recurrence window. */
 #define PTV_CONV_ESC          8
+/* 1.0.1-pre24 #63 WALL-EVIDENCE SPLIT (g_wallev; PTV_NO_WALLEV=1 reverts to the pre23
+ * behavior at every touched site — the storm-diag counterfactual). Root cause (storm-diag
+ * 2026-07-24, arithmetic closed against a flash+beep ruler): REAL content holes
+ * (corrupt-discarded frames) were classified as label lies and ERASED (butt-joint / relabel /
+ * fold) instead of padded, by three per-stream engines with no cross-stream conservation —
+ * the A−V difference of erased totals is the permanent on-air offset (storm1: audio erased
+ * 17452ms − video erased 12534ms = +4918 ≡ ruler ≡ ledger R). Principle: split every forward
+ * label step J into W = wall-absence-evidenced portion (real missing content — PAD: labels
+ * keep the hole, aresample pads audio / the house clock dups video) and J−W = flowing/relabel
+ * portion (a lie — ERASE, exactly as today). W = clamp(delivery wall gap − cadence EMA, 0, J);
+ * evidence floor g_gap_min_us (700ms); W forced 0 (fall back to today) when delivery is
+ * bursty/banked (g_bank_us armed / bursty advisor) — wall absence is then not content
+ * evidence. HARDCAP: the conv-fold exemption for wall-evidenced gaps is bounded by an
+ * outstanding-pad backlog ledger — above it the fold happens anyway (allocation safety trumps
+ * sync, one loud admission): the #60 OOM protection is never regressed. */
+#define PTV_WALLEV_HARDCAP_US (120LL * AV_TIME_BASE)
 /* NBS silence-fill sentinel (§3): a zero-size AVPacket carrying this PRIVATE flag bit on a
  * track's audio_q tells the audio thread to synthesize one quantum of silence at the track's
  * expected next graph-door pts (demux-side corrupt-discard starvation — the thread itself is
@@ -320,6 +336,19 @@ typedef struct RsyncSense {
     _Atomic int64_t ma_ema[PTV_MAX_AUDIO];  /* per-track audio EMA (audio threads write) */
     _Atomic int64_t ma_wall[PTV_MAX_AUDIO]; /* wall µs of the last audio sample */
     _Atomic int64_t ea_us[PTV_MAX_AUDIO];   /* per-track audio stream ledger E_a (µs) */
+    /* 1.0.1-pre24 #63 wall-evidence PROVENANCE ledgers (always measured, even under
+     * PTV_NO_WALLEV — they feed the re-anchor corroboration, never control directly):
+     * cumulative UNEVIDENCED real-content deletions (µs, ≥0) — label erases whose event-time
+     * wall evidence said the content was genuinely ABSENT (a real hole erased = a real on-air
+     * desync of that amount on that stream). Erases of wall-FLOWING relabels (lies — correct
+     * on air) are deliberately NOT counted: aseam-class pinned-R false positives read 0 here.
+     * Demux thread posts (fetch_add; single logical writer per slot/track). */
+    _Atomic int64_t uev_us[PTV_MAX_INPUT];  /* per-slot VIDEO unevidenced deletions */
+    _Atomic int64_t uea_us[PTV_MAX_AUDIO];  /* per-track AUDIO unevidenced deletions (demux side;
+                                             * the door adds its own AudioState.u_door_us) */
+    _Atomic int64_t hh_q10[PTV_MAX_AUDIO];  /* pre24: the audio stream's demux label-health H
+                                             * (Q10 EMA — see PtvDiscStreamState) published for
+                                             * the re-anchor health gate (0 = no reading yet) */
     int             n_a;                    /* transcoded tracks wired (pre16: = n_audio ALWAYS, mv included) */
     int             a_in[PTV_MAX_AUDIO];    /* track → input slot map (stats printers; plain int,
                                              * set in transcode() before threads spawn) */
@@ -806,6 +835,45 @@ typedef struct AudioState {
     int64_t          conv_total_us;                   /* rr23: cumulative folded label motion (us) — the net
                                                        * label divergence the folds refused; published to
                                                        * g_conv_pub for the stats conv= token */
+    /* 1.0.1-pre24 #63 WALL-EVIDENCE (g_wallev; PTV_NO_WALLEV=1 reverts the ACTION — the
+     * measurement below stays on to feed the re-anchor corroboration). Door side. */
+    int64_t          u_door_us;                       /* Σ unevidenced REAL-content deletions this door made
+                                                       * (µs, ≥0): folds/erases of steps whose own wall
+                                                       * evidence (wall_gap ≥ step/2 + cadence) said the
+                                                       * content was genuinely absent — the #63 leak term,
+                                                       * measured. Feeds the re-anchor corroboration. */
+    int64_t          wev_out_us;                      /* outstanding wall-evidenced pad backlog (µs) — the
+                                                       * conv-fold-exemption OOM backstop ledger; drains at
+                                                       * ~1× realtime (decayed by wall elapsed) */
+    int64_t          wev_out_wc;                      /* wall µs of the last wev_out update (decay ref) */
+    int64_t          wev_cons_last_us;                /* conservation diag: last logged A−V unevidenced
+                                                       * deletion imbalance (µs) */
+    int64_t          wev_cons_log_wc;                 /* conservation diag log rate limit (10s) */
+    /* 1.0.1-pre24 #63 CORROBORATED RECOVERY RE-ANCHOR (g_recanchor; PTV_NO_RECANCHOR=1).
+     * One-shot, health-gated recovery for a channel left with a stable content↔label offset
+     * after input recovers (owner mandate 2026-07-24: "perfect lip sync once input is OK
+     * again"). Engages ONLY when R is large+stable through a quiet settle window AND the
+     * unevidenced-deletion ledgers CORROBORATE it (aseam-class pinned-R false positives have
+     * no deletion imbalance and must never engage). Actuation = the [PTV-ANCHOR] base-step
+     * algebra (glue_off += step retires +R), slewed in bounded chunks. All owned by this
+     * track's audio thread. */
+    int64_t          ra_r0;                           /* R stability reference (µs) */
+    int64_t          ra_r0_wc;                        /* wall µs R last moved beyond ±100ms of ra_r0 */
+    int64_t          ra_ev_wc;                        /* wall µs of the last observed event (own snapshots) */
+    int64_t          ra_cooldown_until;               /* wall µs before which no engage (0 = none) */
+    int              ra_active;                       /* mid-walk (chunked slew in progress) */
+    int64_t          ra_budget_us;                    /* remaining authority this engagement (|R0|×1.2) */
+    int64_t          ra_step_wc;                      /* wall µs of the last applied chunk */
+    int64_t          ra_ua_snap, ra_uv_snap;          /* unevidenced-deletion ledger snapshots (corroborate
+                                                       * only NEW deletions since the last completion) */
+    int64_t          ra_corr_snap;                    /* corr_us snapshot (trim already applied against the
+                                                       * same bake must not double-count in R_pred) */
+    int64_t          ra_log_wc;                       /* refusal-line rate limit */
+    /* own event-edge snapshots (the corrector's CorrState snapshots are CONSUMED by its own
+     * edge detector — the re-anchor must never share them) */
+    int64_t          ra_epoch_snap, ra_ev_led_snap, ra_ea_led_snap, ra_bank_snap, ra_hs_snap;
+    int              ra_glue_snap, ra_acq_snap, ra_afmt_snap, ra_reopen_snap, ra_esc_snap;
+    int              ra_seeded;                       /* snapshots initialized */
 } AudioState;
 
 /* ---- demux + mux ---- */
@@ -970,6 +1038,13 @@ typedef struct PtvDiscStreamState {
     int     h_wins;                /* closed windows folded into the EMA */
     int64_t h_wild_wc;             /* wall us of the last WILD window (|r-1| > 50%) — the
                                     * flood-recency signal for the <3-packet base rule */
+    /* 1.0.1-pre24 #63 (g_wallev): the wall-absence-evidenced portion W of this stream's
+     * jump (µs, ∈ [0, J]; 0 = flowing/unmeasurable), captured at base-record time from the
+     * jump packet's pre-update delivery wall gap. The flush's butt-joint preserves this
+     * much of the label hole (erase only J−W, the flowing/relabel part) so each stream's
+     * content path pads exactly its REAL hole — the storm cross-stream conservation fix.
+     * Per-cycle: cleared with the bases. */
+    int64_t jump_wallev_us;
 } PtvDiscStreamState;
 
 typedef struct PtvDiscBuf {
@@ -1074,6 +1149,13 @@ typedef struct DemuxArgs {
     int64_t              *wrap_off;       /* per input stream: cumulative 33-bit wrap offset (stream tb) */
     int64_t              *wrap_last;      /* per input stream: last RAW ts seen (wrap detection) */
     int64_t              *wrap_wall_last; /* per input stream: wall-clock (us) of this stream's last packet — gap-vs-splice discriminator */
+    /* 1.0.1-pre24 #63 wall-evidence (g_wallev): per-stream delivery-cadence EMA (µs between
+     * good dense packets, quiet gaps only) + the CURRENT packet's pre-update wall gap —
+     * demux_unwrap updates wrap_wall_last before the LAYERA loop runs, so jump detection
+     * needs the gap preserved separately. W = clamp(pkt_wall_gap − cadence, 0, J). */
+    int64_t              *wall_cad_us;
+    int64_t              *pkt_wall_gap_us;
+    int64_t               wallev_fb_log_us; /* fallback (bank/bursty) advisory rate limit */
     int64_t              *edit_us;        /* 1.0.1-pre9 sensor: per-stream label-EDIT ledger (µs) — the
                                            * non-wrap share of wrap_off (splice absorbs, LAYERA persists,
                                            * retro-corrections); demux thread only, published via g_rsx */
@@ -1198,6 +1280,8 @@ typedef struct Input {
     int64_t              *wrap_wall_last;    /* per stream: wall-clock (us) of last packet (gap-vs-splice discriminator) */
     int64_t              *edit_us;           /* pre9 sensor: per-stream label-edit ledger storage (µs) */
     int64_t              *gap_vsnap;         /* 1.0.1-pre16 #47-A: per-stream d->vpkt snapshot storage */
+    int64_t              *wall_cad_us;       /* 1.0.1-pre24 #63: per-stream delivery-cadence EMA storage */
+    int64_t              *pkt_wall_gap_us;   /* 1.0.1-pre24 #63: per-stream current-pkt wall-gap storage */
     PtvDiscBuf            disc;              /* legacy-0004 buffer-classify-discard state (used only when g_layera) */
     /* 1.0.1-pre5 shared-flush expected-step handshake storage (D1) — one slot per GLOBAL
      * transcoded track index (only the tracks sourced from this input are wired). Demux thread
@@ -1274,6 +1358,13 @@ extern int64_t g_seam_park_us;           /* C: recurrence window AND park durati
 extern int64_t g_novideo_exit_us;        /* 1.0.1-pre23 startup sanity: packets flowing but no video frame
                                           * decoded for this long since start → FATAL exit
                                           * (PTV_NOVIDEO_EXIT_S, default 300s; 0 disables) */
+extern int     g_wallev;                 /* 1.0.1-pre24 #63 wall-evidence split (PTV_NO_WALLEV=1 reverts
+                                          * the action; provenance measurement stays on) */
+extern int     g_recanchor;              /* 1.0.1-pre24 #63 corroborated recovery re-anchor
+                                          * (PTV_NO_RECANCHOR=1 disables) */
+extern int64_t g_recanchor_settle_us;    /* quiet+stable window before an engage (PTV_RECANCHOR_SETTLE_S, 300s) */
+extern int64_t g_recanchor_cooldown_us;  /* re-engage holdoff after a completed re-anchor
+                                          * (PTV_RECANCHOR_COOLDOWN_S, 1800s) */
 extern int     g_prog_off;
 extern int     g_progoff_av;
 extern int     g_layera;

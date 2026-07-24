@@ -41,7 +41,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.0.1-pre23"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.0.1-pre24"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -115,6 +115,22 @@ int64_t g_novideo_exit_us = 300LL * 1000000; /* 1.0.1-pre23 startup sanity rider
                                            * decoded for this long since start → FATAL exit (a supervised restart beats a
                                            * wedged forever-startup — the probe-OK-never-decodes silent state, #60 arm D).
                                            * PTV_NOVIDEO_EXIT_S overrides; 0 disables. */
+int     g_wallev = 1;              /* 1.0.1-pre24 #63 WALL-EVIDENCE SPLIT (the corrupt-storm desync class): every
+                                           * erase engine splits a forward label step J into W = wall-absence-evidenced
+                                           * portion (real missing content → PAD) and J−W = flowing/relabel portion
+                                           * (label lie → ERASE, as today). PTV_NO_WALLEV=1 reverts the ACTION at every
+                                           * touched site (the storm-diag counterfactual); the W measurement itself
+                                           * stays on — it feeds the re-anchor corroboration provenance. See the
+                                           * PTV_WALLEV_HARDCAP_US block in ptvencoder.h. */
+int     g_recanchor = 1;           /* 1.0.1-pre24 #63 CORROBORATED RECOVERY RE-ANCHOR (owner mandate 2026-07-24:
+                                           * "perfect lip sync once input is OK again"): one-shot, health-gated, slewed
+                                           * base re-anchor of a large stable R — ONLY when the unevidenced-deletion
+                                           * ledgers corroborate a real deletion imbalance ≈ R (aseam-class pinned-R
+                                           * false positives read 0 there and must never engage — a naive trust of
+                                           * large stable R would CREATE a desync on relabel channels).
+                                           * PTV_NO_RECANCHOR=1 disables. */
+int64_t g_recanchor_settle_us   = 300LL  * 1000000; /* PTV_RECANCHOR_SETTLE_S */
+int64_t g_recanchor_cooldown_us = 1800LL * 1000000; /* PTV_RECANCHOR_COOLDOWN_S */
 int     g_anchor_headfill = 1;     /* 1.0.1 anchor head-fill (PTV_NO_ANCHOR_HEADFILL reverts): when the source's
                                            * audio head is missing at birth (first kept audio >200ms after h0, or the
                                            * pre-h0 ring overflowed), synthesize silence covering house 0 → first kept
@@ -1681,7 +1697,10 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         inputs[k].wrap_wall_last = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].wrap_wall_last)); /* 0 = no prev packet yet */
         inputs[k].edit_us   = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].edit_us));   /* pre9 sensor label-edit ledger */
         inputs[k].gap_vsnap = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].gap_vsnap)); /* pre16 #47-A: vpkt snapshots */
-        if (!inputs[k].wrap_off || !inputs[k].wrap_last || !inputs[k].wrap_wall_last || !inputs[k].edit_us || !inputs[k].gap_vsnap) { ret = AVERROR(ENOMEM); goto end; }
+        inputs[k].wall_cad_us     = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].wall_cad_us));     /* pre24 #63: cadence EMA */
+        inputs[k].pkt_wall_gap_us = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].pkt_wall_gap_us)); /* pre24 #63: current-pkt gap */
+        if (!inputs[k].wrap_off || !inputs[k].wrap_last || !inputs[k].wrap_wall_last || !inputs[k].edit_us || !inputs[k].gap_vsnap ||
+            !inputs[k].wall_cad_us || !inputs[k].pkt_wall_gap_us) { ret = AVERROR(ENOMEM); goto end; }
         for (si = 0; si < (int)inputs[k].ifmt->nb_streams; si++) inputs[k].wrap_last[si] = AV_NOPTS_VALUE;
         if (g_layera) {   /* legacy-0004 buffer-classify-discard state (only when enabled) */
             if ((ret = ptv_disc_init(&inputs[k].disc, PTV_DISC_CAPACITY,
@@ -2237,6 +2256,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         d->wrap_wall_last = inputs[kk].wrap_wall_last; d->video_fwd_us = 0;
         d->edit_us = inputs[kk].edit_us;                /* pre9 sensor: per-stream label-edit ledger */
         d->gap_vsnap = inputs[kk].gap_vsnap;            /* pre16 #47-A: per-stream vpkt snapshots */
+        d->wall_cad_us     = inputs[kk].wall_cad_us;     /* pre24 #63: delivery-cadence EMA */
+        d->pkt_wall_gap_us = inputs[kk].pkt_wall_gap_us; /* pre24 #63: current-pkt wall gap */
         d->rsync_slot = kk;                             /* pre16: EVERY input publishes its ledgers to g_rsx,
                                                          * video keyed by this slot (was single-input-only) */
         d->shed_wall = &inputs[kk].shed_wall;           /* pre16: per-input self-shed stamp */
@@ -2420,6 +2441,8 @@ end:
         av_freep(&inputs[k].wrap_wall_last);
         av_freep(&inputs[k].edit_us);
         av_freep(&inputs[k].gap_vsnap);
+        av_freep(&inputs[k].wall_cad_us);       /* pre24 #63 */
+        av_freep(&inputs[k].pkt_wall_gap_us);   /* pre24 #63 */
         av_dict_free(&inputs[k].da.reopen_opts);   /* pre17 R1 */
         ptv_disc_free(&inputs[k].disc);   /* legacy-0004 buffer (no-op if never inited) */
         if (inputs[k].ifmt) avformat_close_input(&inputs[k].ifmt);
@@ -2830,6 +2853,13 @@ int main(int argc, char **argv)
                                                     * (the #60 unbounded swr_inject_silence ladder — A/B only) */
     { const char *s = getenv("PTV_CONV_CAP_S");  if (s && atoi(s) > 0) g_conv_cap_us  = (int64_t)atoi(s) * 1000000; }
     { const char *s = getenv("PTV_SEAM_PARK_S"); if (s && atoi(s) > 0) g_seam_park_us = (int64_t)atoi(s) * 1000000; }  /* TEST ONLY (G4) */
+    if (getenv("PTV_NO_WALLEV")) g_wallev = 0;     /* 1.0.1-pre24 #63 revert: erase engines back to the pre23
+                                                    * whole-step remedies (butt-joint every >1s hole; the
+                                                    * corrupt-storm desync counterfactual — A/B only) */
+    if (getenv("PTV_NO_RECANCHOR")) g_recanchor = 0;  /* 1.0.1-pre24 #63: no recovery re-anchor (a baked
+                                                       * post-storm offset stays until restart) */
+    { const char *s = getenv("PTV_RECANCHOR_SETTLE_S");   if (s && atoi(s) > 0) g_recanchor_settle_us   = (int64_t)atoi(s) * 1000000; }
+    { const char *s = getenv("PTV_RECANCHOR_COOLDOWN_S"); if (s && atoi(s) > 0) g_recanchor_cooldown_us = (int64_t)atoi(s) * 1000000; }
     { const char *s = getenv("PTV_NOVIDEO_EXIT_S"); if (s) g_novideo_exit_us = (int64_t)atoll(s) * 1000000; }  /* 1.0.1-pre23 startup sanity; 0 disables */
     /* 0.9.18.7: PTV_AGLUE_MAX_MS (1000ms) / PTV_DISCONT_MS (1000ms) / PTV_DISCONT_BACK_MS (80ms)
      * internalized — see g_aglue_max_ms / g_discont_ms / g_discont_back_ms */

@@ -217,6 +217,7 @@ static void ptv_disc_reset(PtvDiscBuf *b)
         b->stream_state[i].new_timeline_base = AV_NOPTS_VALUE;
         b->stream_state[i].has_old_base      = 0;
         b->stream_state[i].has_new_base      = 0;
+        b->stream_state[i].jump_wallev_us    = 0;   /* pre24 #63: per-cycle, dies with the bases */
     }
     b->active            = 0;
     b->jump_detected     = 0;
@@ -300,6 +301,70 @@ static void rsync_post_edit(DemuxArgs *d, int s, int64_t delta_us)
                 d->aglobal[j] >= 0 && d->aglobal[j] < PTV_MAX_AUDIO)
                 atomic_store_explicit(&g_rsx.ea_us[d->aglobal[j]], d->edit_us[s], memory_order_relaxed);
 }
+
+/* ============================ 1.0.1-pre24 #63 WALL-EVIDENCE ============================
+ * (g_wallev; see the PTV_WALLEV_HARDCAP_US block in ptvencoder.h for the full pathology.)
+ * W = the wall-absence-evidenced portion of a FORWARD label step J on a dense stream:
+ * the delivery wall gap across the jump packet minus one normal inter-packet interval
+ * (cadence EMA), clamped to [0, J]. W ≈ J = a real hole (corrupt-discarded frames, PID
+ * dropout) — the content is genuinely missing and must be PADDED; W ≈ 0 = a flowing
+ * relabel (label lie) — erase as today; 0 < W < J = a composite event (label step J
+ * containing a real gap W): pad W, erase J−W. Evidence floor g_gap_min_us (700ms — the
+ * same bar the v0.8.2 gap discriminator uses); bursty/banked delivery falls back to W=0
+ * (wall absence there is delivery jitter, not content evidence). ALWAYS measured — the
+ * ACTION is g_wallev-gated at each site, but the measurement feeds the re-anchor
+ * corroboration provenance (ptv_wallev_post_unev) in both modes. */
+static int64_t ptv_wallev_w(DemuxArgs *d, int sidx, int64_t jump_us)
+{
+    int64_t gap, cad, w;
+    if (jump_us <= 0 || !d->pkt_wall_gap_us || sidx < 0 || sidx >= (int)d->ifmt->nb_streams)
+        return 0;
+    gap = d->pkt_wall_gap_us[sidx];
+    if (gap < g_gap_min_us)                  /* evidence floor: below this, "flowing" */
+        return 0;
+    if (atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 || d->autobank) {
+        int64_t now = av_gettime_relative();
+        if (now - d->wallev_fb_log_us >= 60000000) {
+            d->wallev_fb_log_us = now;
+            av_log(NULL, AV_LOG_INFO,
+                   "[PTV-WALLEV] stream %d: wall evidence unreliable (bank armed / bursty "
+                   "input) — split disabled for this event (whole-step remedy as before)\n",
+                   sidx);
+        }
+        return 0;
+    }
+    cad = d->wall_cad_us ? d->wall_cad_us[sidx] : 0;
+    w   = gap - (cad > 0 ? cad : 40000);     /* a real hole's gap rides on top of ONE normal interval */
+    if (w < 0) w = 0;
+    if (w > jump_us) w = jump_us;
+    return w;
+}
+
+/* W covers J up to the evidence floor (or J/8 for large J) = the whole step is a real gap */
+static int ptv_wallev_full(int64_t w, int64_t jump_us)
+{
+    return w > 0 && w >= jump_us - FFMAX(g_gap_min_us, jump_us / 8);
+}
+
+/* pre24 #63 provenance: post `w_us` of UNEVIDENCED real-content deletion on stream s —
+ * an erase whose event-time wall evidence said the content was genuinely missing (the #63
+ * leak term, per stream). Always measured, even under PTV_NO_WALLEV; read ONLY by the
+ * recovery re-anchor's corroboration (never a control input on its own). Demux thread. */
+static void ptv_wallev_post_unev(DemuxArgs *d, int s, int64_t w_us)
+{
+    int j;
+    if (w_us <= 0 || s < 0 || s >= (int)d->ifmt->nb_streams)
+        return;
+    if (s == d->vstream) {
+        if (d->rsync_slot >= 0 && d->rsync_slot < PTV_MAX_INPUT)
+            atomic_fetch_add_explicit(&g_rsx.uev_us[d->rsync_slot], w_us, memory_order_relaxed);
+    } else
+        for (j = 0; j < d->n_audio && j < PTV_MAX_AUDIO; j++)
+            if (d->astream[j] == s &&
+                d->aglobal[j] >= 0 && d->aglobal[j] < PTV_MAX_AUDIO)
+                atomic_fetch_add_explicit(&g_rsx.uea_us[d->aglobal[j]], w_us, memory_order_relaxed);
+}
+/* ======================================================================================= */
 
 void ptv_disc_free(PtvDiscBuf *b)
 {
@@ -428,6 +493,11 @@ static int ptv_disc_detect_jump(DemuxArgs *d, PtvDiscBuf *b, int stream_idx,
         ss->new_timeline_base = raw_dts;
         ss->has_old_base = 1;
         ss->has_new_base = 1;
+        /* pre24 #63: capture this jump's wall-absence evidence W with the bases (forward
+         * only) — the flush's butt-joint preserves W of the label hole (erase only the
+         * flowing J−W). Read from the packet's PRE-update wall gap (demux_unwrap already
+         * advanced wrap_wall_last to this packet before the loop calls us). */
+        ss->jump_wallev_us = delta > 0 ? ptv_wallev_w(d, stream_idx, delta) : 0;
     }
     b->jump_detected = 1;
     if (stream_idx >= 0 && stream_idx < (int)d->ifmt->nb_streams) {
@@ -930,16 +1000,34 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
         keep_timeline = 1;
 
     /* Per-stream offset = where this stream left off minus where NEW resumes,
-     * so the kept content butts against the previously-sent timeline. */
+     * so the kept content butts against the previously-sent timeline.
+     * 1.0.1-pre24 #63 (g_wallev): + the stream's wall-evidenced W — the butt-joint erases
+     * only the flowing J−W and PRESERVES W of the label hole (real missing content), so each
+     * stream's content path pads exactly its own real hole (audio: AGLUE/aresample; video:
+     * the house clock's starvation dups already covered the real absence). The shared-flush
+     * tree composes unchanged: any (applied − own) difference is the registered mismatch,
+     * and per-stream label hole = own W + registered mism ⇒ padded content = W exactly.
+     * W=0 (flowing/fallback/backward) keeps every offset byte-identical. */
     if (keep_timeline == 1 && any_started) {
         for (i = 0; i < b->nb_streams; i++) {
             PtvDiscStreamState *ss = &b->stream_state[i];
+            int64_t wev = g_wallev ? ss->jump_wallev_us : 0;
             if (!ss->has_new_base)
                 continue;
             if (ss->last_sent_dts != AV_NOPTS_VALUE)
-                ss->cumulative_ts_offset = ss->last_sent_dts - ss->new_timeline_base;
+                ss->cumulative_ts_offset = ss->last_sent_dts - ss->new_timeline_base + wev;
             else if (ss->has_old_base)
-                ss->cumulative_ts_offset = ss->old_timeline_base - ss->new_timeline_base;
+                ss->cumulative_ts_offset = ss->old_timeline_base - ss->new_timeline_base + wev;
+            if (g_wallev && wev > 0)
+                av_log(NULL, AV_LOG_WARNING,
+                       "[PTV-WALLEV] flush split: stream %d keeps %"PRId64"ms wall-evidenced "
+                       "hole (butt-joint erases only the flowing part; content path pads it) "
+                       "(PTV_NO_WALLEV reverts)\n",
+                       i, wev / 1000);
+            /* pre24 #63 provenance (measurement only): in the counterfactual mode the flush
+             * erases the WHOLE step — W of that was real content, deleted for real. */
+            if (!g_wallev && ss->jump_wallev_us > 0)
+                ptv_wallev_post_unev(d, i, ss->jump_wallev_us);
         }
     }
 
@@ -1535,6 +1623,24 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
     if (raw != AV_NOPTS_VALUE) {
         int64_t wall_now = av_gettime_relative();
         int64_t last = d->wrap_last[pkt->stream_index];
+        /* pre24 #63: preserve THIS packet's pre-update delivery wall gap and fold quiet gaps
+         * into the per-stream cadence EMA (burst-period reading — the rr15 R2 door pattern).
+         * The LAYERA loop runs AFTER wrap_wall_last below has advanced to this packet, so the
+         * wall-evidence sites there read the preserved copy. Dense streams only. */
+        if (d->pkt_wall_gap_us &&
+            (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO ||
+             st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)) {
+            int64_t pwl = d->wrap_wall_last[pkt->stream_index];
+            int64_t pg  = pwl > 0 ? wall_now - pwl : 0;
+            d->pkt_wall_gap_us[pkt->stream_index] = pg;
+            if (d->wall_cad_us && pg > 5000 && pg < 2000000) {
+                if (!d->wall_cad_us[pkt->stream_index])
+                    d->wall_cad_us[pkt->stream_index] = pg;
+                else
+                    d->wall_cad_us[pkt->stream_index] +=
+                        (pg - d->wall_cad_us[pkt->stream_index]) / 8;
+            }
+        }
         if (last != AV_NOPTS_VALUE) {
             int64_t delta = raw - last;
             int ct = st->codecpar->codec_type;
@@ -1632,7 +1738,20 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                                    (wall_now - d->disc->fl_wall) / 1000,
                                    (double)d->disc->fl_delta_us / AV_TIME_BASE);
                         }
-                        if (!vcrossed && !veto_supp && wall_gap >= FFMAX(g_gap_min_us, jump_us / 2)) {
+                        /* 1.0.1-pre24 #63 (g_wallev): measure the wall-absence-evidenced portion W
+                         * of this step. W ≈ J ⇒ full gap (the verdict below, now reachable even
+                         * when vcrossed — per-stream wall absence is content evidence regardless
+                         * of what the sibling did); 0 < W < J ⇒ COMPOSITE (split: erase the
+                         * flowing J−W, keep the real W hole in the labels — the agapseam /
+                         * Avivando-J/2-boundary class); W == 0 (flowing / floor / bank fallback)
+                         * ⇒ the pre23 binary rule decides, byte-identically. veto_supp keeps
+                         * one-event-one-remedy priority over any W path. */
+                        int64_t wev_w    = !veto_supp ? ptv_wallev_w(d, pkt->stream_index, jump_us) : 0;
+                        int     wev_full = g_wallev && wev_w > 0 && ptv_wallev_full(wev_w, jump_us);
+                        int     wev_comp = g_wallev && wev_w > 0 && !wev_full;
+                        if (wev_full ||
+                            ((!g_wallev || wev_w == 0) &&
+                             !vcrossed && !veto_supp && wall_gap >= FFMAX(g_gap_min_us, jump_us / 2))) {
                             is_gap = 1;
                             d->sib_jump_us[1]   = jump_us;   /* pre16 #47-C: a gap is a known audio jump */
                             d->sib_jump_wall[1] = wall_now;
@@ -1641,6 +1760,12 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                             av_log(NULL, AV_LOG_INFO,   /* v0.9.13: always-on — a real source audio dropout, rare + meaningful */
                                    "[PTV-DISCONT] stream %d: %+"PRId64"ms audio GAP — NOT absorbed (aresample pads; wall_gap=%"PRId64"ms)\n",
                                    pkt->stream_index, av_rescale_q(delta, st->time_base, (AVRational){1,1000}), wall_gap / 1000);
+                            if (wev_full && vcrossed)
+                                av_log(NULL, AV_LOG_INFO,
+                                       "[PTV-WALLEV] stream %d: gap verdict held by WALL EVIDENCE "
+                                       "(W=%"PRId64"ms of +%"PRId64"ms) despite a recent video crossing "
+                                       "— per-stream absence is content evidence (PTV_NO_WALLEV reverts)\n",
+                                       pkt->stream_index, wev_w / 1000, jump_us / 1000);
                             /* 1.0.1-pre18 #50 VETO (g_glueveto): an ARMED-but-unflushed LAYERA
                              * cycle whose trigger jump matches this gap is the SAME source
                              * event seen twice — flowing labels on the sibling PID, wall
@@ -1716,25 +1841,34 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                              * audio-only gap has video_last ≪ wall_gap; a whole-program stall has
                              * video_last ≈ wall_gap: require video_last ≤ min(2s, wall_gap/2).
                              * Byte-identical everywhere the discriminator doesn't fire. */
-                            if (g_glueclass && g_layera && d->disc &&
+                            if (g_layera && d->disc &&
                                 pkt->stream_index < d->disc->nb_streams &&
-                                d->vstream >= 0 &&
-                                d->wrap_wall_last[d->vstream] > 0 &&
-                                wall_now - d->wrap_wall_last[d->vstream] <= 2000000 &&
-                                /* #47-A (TWN 2026-07-18): the rr15 min(2s, wall_gap/2)
-                                 * freshness bound measured video's AGE at verdict time and
-                                 * was satisfied when video RESUMED 2ms before audio after a
-                                 * whole-program outage (one-sided −10s bake, corrector
-                                 * correctly disarmed implausible). The real test is that
-                                 * video PROGRESSED DURING the gap: require ≥ one video
-                                 * packet per 80ms of gap (≈ half the slowest frame rate) to
-                                 * have arrived since this audio stream's last packet. A
-                                 * whole-program outage yields ~0-5 resume packets and falls
-                                 * through to the shared LAYERA flush (the pre14 path, which
-                                 * handles it perfectly). */
-                                d->gap_vsnap &&
-                                d->vpkt - d->gap_vsnap[pkt->stream_index] >=
-                                    FFMAX((int64_t)3, wall_gap / 80000)) {
+                                /* pre24 #63: a wall-evidence-qualified verdict propagates
+                                 * UNCONDITIONALLY — the video-progress guard below protected
+                                 * against splitting a whole-program outage one-sidedly, but
+                                 * with per-stream W conservation the video leg keeps its OWN
+                                 * real hole at its own crossing (gap path or flush split), so
+                                 * one-sided handling is no longer a divergence. Old-rule
+                                 * verdicts keep the #47-A guard byte-identically. */
+                                (wev_full ||
+                                 (g_glueclass &&
+                                  d->vstream >= 0 &&
+                                  d->wrap_wall_last[d->vstream] > 0 &&
+                                  wall_now - d->wrap_wall_last[d->vstream] <= 2000000 &&
+                                  /* #47-A (TWN 2026-07-18): the rr15 min(2s, wall_gap/2)
+                                   * freshness bound measured video's AGE at verdict time and
+                                   * was satisfied when video RESUMED 2ms before audio after a
+                                   * whole-program outage (one-sided −10s bake, corrector
+                                   * correctly disarmed implausible). The real test is that
+                                   * video PROGRESSED DURING the gap: require ≥ one video
+                                   * packet per 80ms of gap (≈ half the slowest frame rate) to
+                                   * have arrived since this audio stream's last packet. A
+                                   * whole-program outage yields ~0-5 resume packets and falls
+                                   * through to the shared LAYERA flush (the pre14 path, which
+                                   * handles it perfectly). */
+                                  d->gap_vsnap &&
+                                  d->vpkt - d->gap_vsnap[pkt->stream_index] >=
+                                      FFMAX((int64_t)3, wall_gap / 80000)))) {
                                 d->disc->stream_state[pkt->stream_index].last_dts_us =
                                     av_rescale_q(raw + d->wrap_off[pkt->stream_index],
                                                  st->time_base, AV_TIME_BASE_Q);
@@ -1743,6 +1877,38 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                                        "— no LAYERA cycle for this gap (labels carry it; AGLUE pads)\n",
                                        pkt->stream_index);
                             }
+                        } else if (wev_comp) {
+                            /* pre24 #63 COMPOSITE SPLIT (the agapseam / Avivando J/2-boundary
+                             * class): the label step J carries a real hole of only W — erase
+                             * the flowing J−W at the packet layer (the relabel lie: wrap_off,
+                             * exactly the absorber's algebra, partial amount) and leave the
+                             * W hole in the labels for the content path to PAD (AGLUE GAP /
+                             * aresample). Whole-step remedies bake |J−W| (pad path, audio
+                             * LATE) or |W| (erase path, audio EARLY — capped at J/2 by the
+                             * old boundary = Avivando's half-step bake). Propagate the
+                             * continuity ref so no LAYERA cycle arms on the remaining W. */
+                            int64_t flow_us = jump_us - wev_w;
+                            d->wrap_off[pkt->stream_index] -=
+                                av_rescale_q(flow_us, AV_TIME_BASE_Q, st->time_base);
+                            rsync_post_edit(d, pkt->stream_index, -flow_us);   /* flow-evidenced erase */
+                            d->sib_jump_us[1]   = jump_us;
+                            d->sib_jump_wall[1] = wall_now;
+                            if (d->disturb_epoch)
+                                atomic_fetch_add_explicit(d->disturb_epoch, 1, memory_order_relaxed);
+                            if (g_layera && d->disc &&
+                                pkt->stream_index < d->disc->nb_streams)
+                                d->disc->stream_state[pkt->stream_index].last_dts_us =
+                                    av_rescale_q(raw + d->wrap_off[pkt->stream_index],
+                                                 st->time_base, AV_TIME_BASE_Q);
+                            av_log(NULL, AV_LOG_WARNING,
+                                   "[PTV-WALLEV] stream %d: +%"PRId64"ms label step SPLIT = "
+                                   "%"PRId64"ms wall-absent (real hole — labels keep it, content "
+                                   "path pads) + %"PRId64"ms flowing (relabel — erased) "
+                                   "(wall_gap=%"PRId64"ms cad=%"PRId64"ms) (PTV_NO_WALLEV reverts)\n",
+                                   pkt->stream_index, jump_us / 1000, wev_w / 1000,
+                                   flow_us / 1000, wall_gap / 1000,
+                                   d->wall_cad_us ? d->wall_cad_us[pkt->stream_index] / 1000 : 0);
+                            is_gap = 1;   /* no-absorb exit: our partial rebase is complete */
                         }
                     }
                     /* 1.0.1-pre15 §2.2-3a packet-layer leg (#33, the b1 fix): a backward AUDIO step
@@ -1775,6 +1941,62 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                         }
                     }
                     if (is_gap) goto absorb_done;
+                    /* pre24 #63 VIDEO wall-evidence discriminator (E1v): video never had a
+                     * gap-vs-splice discriminator — every >1s video hole was splice-classified
+                     * and LAYERA butt-jointed (hsres==|ev| in storm1 confirmed all-LAYERA),
+                     * deleting the hole from the video timeline while audio's own remedy
+                     * differed → the A−V erased-total difference IS the permanent offset.
+                     * Mirror of the audio rule: a wall-absent video hole keeps its labels
+                     * (full) or keeps W and erases the flowing J−W (composite); the house
+                     * clock dups through the real hole (frame_q starved in real time during
+                     * the absence — existing machinery), so post-resume content and house
+                     * clock have both advanced W and the mapping stays truthful. A flowing
+                     * video step (W=0: TruBLU splices, relabels) keeps today's LAYERA/absorb
+                     * path byte-identically. */
+                    if (g_wallev && ct == AVMEDIA_TYPE_VIDEO && delta > 0) {
+                        int64_t vjump_us = av_rescale_q(delta, st->time_base, AV_TIME_BASE_Q);
+                        int64_t vw = ptv_wallev_w(d, pkt->stream_index, vjump_us);
+                        if (vw > 0) {
+                            int vfull = ptv_wallev_full(vw, vjump_us);
+                            int64_t vflow_us = vfull ? 0 : vjump_us - vw;
+                            int64_t dukf_thresh = av_rescale(g_dukf_min_ms, st->time_base.den,
+                                                             (int64_t)st->time_base.num * 1000);
+                            if (vflow_us > 0) {
+                                int64_t vflow_tb = av_rescale_q(vflow_us, AV_TIME_BASE_Q, st->time_base);
+                                d->wrap_off[pkt->stream_index] -= vflow_tb;
+                                rsync_post_edit(d, pkt->stream_index, -vflow_us);   /* flow-evidenced erase */
+                                d->prog_off -= vflow_tb;   /* sparse sub/data/SCTE ride the ERASED portion only
+                                                            * (the kept W hole is real for them too) */
+                                d->video_fwd_us = wall_now; /* the flowing part IS splice-like — keep the
+                                                             * audio discriminator's vcrossed truthful */
+                            }
+                            /* a decode gap resumes on garbage until an IDR — arm DUKF exactly
+                             * like the absorb path does for a large jump (the dropped span is
+                             * itself a real content hole; its labels stay truthful too) */
+                            if (g_drop_until_kf && !d->drop_until_kf && delta > dukf_thresh) {
+                                d->drop_until_kf = 1;
+                                d->kf_arm_us = av_gettime_relative();
+                                d->kf_arm_vdrop = d->vdrop;
+                            }
+                            d->sib_jump_us[0]   = vjump_us;   /* #47-C: a known video jump */
+                            d->sib_jump_wall[0] = wall_now;
+                            if (d->disturb_epoch)
+                                atomic_fetch_add_explicit(d->disturb_epoch, 1, memory_order_relaxed);
+                            /* propagate the continuity ref — no LAYERA cycle for the kept hole */
+                            if (g_layera && d->disc && pkt->stream_index < d->disc->nb_streams)
+                                d->disc->stream_state[pkt->stream_index].last_dts_us =
+                                    av_rescale_q(raw + d->wrap_off[pkt->stream_index],
+                                                 st->time_base, AV_TIME_BASE_Q);
+                            av_log(NULL, AV_LOG_WARNING,
+                                   "[PTV-WALLEV] stream %d (video): +%"PRId64"ms hole = %"PRId64"ms "
+                                   "wall-absent (labels keep it; house dups through) + %"PRId64"ms "
+                                   "flowing (erased)%s (wall_gap=%"PRId64"ms) (PTV_NO_WALLEV reverts)\n",
+                                   pkt->stream_index, vjump_us / 1000, vw / 1000, vflow_us / 1000,
+                                   d->drop_until_kf ? " [DUKF armed]" : "",
+                                   d->pkt_wall_gap_us ? d->pkt_wall_gap_us[pkt->stream_index] / 1000 : 0);
+                            goto absorb_done;
+                        }
+                    }
                     int64_t nowb = av_gettime_relative();
                     /* 0.9.18.5 fold-in (log-truth only, no behavior coupling): record video forward
                      * crossings BEFORE the LAYERA skip so the audio gap discriminator's `vcrossed`
@@ -1813,6 +2035,16 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                     d->wrap_off[pkt->stream_index] -= adj;   /* per-stream rebase AT OWN CROSSING (audio-derived common offset when g_layera) */
                     rsync_post_edit(d, pkt->stream_index,    /* pre9 sensor: a label EDIT (−adj added to this stream's labels) */
                                     -av_rescale_q(adj, st->time_base, AV_TIME_BASE_Q));
+                    /* pre24 #63 provenance (measurement only): this absorb ERASES the step; if
+                     * its wall evidence said part of it was a REAL hole, that much content was
+                     * deleted for real — post it unevidenced (re-anchor corroboration). Under
+                     * g_wallev the W>0 paths exited above, so this posts only in the
+                     * counterfactual/fallback modes where the erase actually happens. */
+                    if (delta > 0) {
+                        int64_t au = av_rescale_q(delta, st->time_base, AV_TIME_BASE_Q);
+                        ptv_wallev_post_unev(d, pkt->stream_index,
+                                             ptv_wallev_w(d, pkt->stream_index, au));
+                    }
                     if (ct == AVMEDIA_TYPE_VIDEO) {
                         d->prog_off -= adj;                  /* P2: sparse sub/data/SCTE ride this */
                         /* (video_fwd_us for the gap discriminator is stamped above, before the LAYERA skip — 0.9.18.5) */
@@ -2047,9 +2279,21 @@ void *demux_thread(void *arg)
                                llabs(raw_dts - last_dts) <= PTV_DISC_THRESHOLD_US;
                 /* 1.0.1-pre15 E4 (#33): fold this packet into the stream's label-health EMA —
                  * quiet path only (buffered/flush windows excluded by design, §2.1). */
-                if (g_glueclass && !b->active && !b->flushing && sidx < b->nb_streams)
+                if (g_glueclass && !b->active && !b->flushing && sidx < b->nb_streams) {
                     ptv_glue_h_feed(&b->stream_state[sidx], raw_dts, last_dts,
                                     av_gettime_relative());
+                    /* pre24 #63: publish the audio stream's label health H for the recovery
+                     * re-anchor's gate (audio thread reads; 0 = no reading yet). */
+                    if (ct == AVMEDIA_TYPE_AUDIO && b->stream_state[sidx].h_wins > 0) {
+                        int jh;
+                        for (jh = 0; jh < d->n_audio; jh++)
+                            if (d->astream[jh] == sidx &&
+                                d->aglobal[jh] >= 0 && d->aglobal[jh] < PTV_MAX_AUDIO)
+                                atomic_store_explicit(&g_rsx.hh_q10[d->aglobal[jh]],
+                                                      b->stream_state[sidx].h_ema_q10,
+                                                      memory_order_relaxed);
+                    }
+                }
                 /* Arm buffering on a fresh jump. */
                 if (!b->active && ptv_disc_detect_jump(d, b, sidx, raw_dts, last_dts)) {
                     b->active = 1;
@@ -2115,6 +2359,12 @@ void *demux_thread(void *arg)
                                 ss->old_timeline_base = last_dts;
                                 ss->has_old_base = 1;
                             }
+                            /* pre24 #63: a silent borrowed-classify transition records bases
+                             * too — capture its wall evidence exactly like a detect (forward
+                             * own-jump only; a borrowed-NEW with no own last_dts has no gap). */
+                            ss->jump_wallev_us =
+                                (last_dts != AV_NOPTS_VALUE && raw_dts > last_dts)
+                                    ? ptv_wallev_w(d, sidx, raw_dts - last_dts) : 0;
                             /* pre17 fix round (R3a): a SILENT borrowed-classify transition is
                              * a KNOWN jump of this media type just like a detect — stamp the
                              * #47-C sibling-jump evidence here too, or a later partial-hold

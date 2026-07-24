@@ -715,6 +715,169 @@ static void rscorr_update(AudioState *a, RsyncTrackR *r, int64_t f_us, int64_t n
     atomic_store_explicit(&g_corr_state_pub[a->dbg_k], c->state, memory_order_relaxed);
 }
 
+/* ================== 1.0.1-pre24 #63 — CORROBORATED RECOVERY RE-ANCHOR ==================
+ * (g_recanchor; PTV_NO_RECANCHOR=1 disables.) Owner mandate 2026-07-24: "perfect a/v lip
+ * sync once input is OK again, no matter what happened on input." A corrupt storm can leave
+ * a channel with a LARGE, STABLE content↔label offset after input recovers — beyond the
+ * corrector's posture (>5s R disarms it as implausible; ≤5s takes ~40min at 2ms/s slew).
+ * This block retires such an offset with a bounded, chunked base re-anchor — the proven
+ * [PTV-ANCHOR] algebra: glue_off += step retires exactly +R (dR/d(glue_off) = −1), realized
+ * by aresample's instantaneous hard comp — but ONLY when the provenance ledgers CORROBORATE
+ * a real deletion imbalance:
+ *     R_pred = ΔU_a − ΔU_v − Δcorr  ≈  R    (tolerance max(500ms, |R|/10))
+ * where U_a/U_v are the unevidenced-deletion ledgers (REAL content erased per stream,
+ * measured at every erase engine from event-time wall evidence — see ptv_wallev_* in
+ * ptvencoder_demux.c) and Δcorr subtracts trim the corrector already applied against the
+ * same bake. THE MANDATORY GUARD (aseam counterexample, storm-diag 2026-07-24): a lone
+ * FLOWING relabel leaves the wire PERFECT while the ledger R pins at the step forever —
+ * its erase was wall-flow-evidenced, so U_a reads 0, R_pred ≈ 0 ≠ R, and the engage is
+ * REFUSED: a naive "trust large stable R" re-anchor would CREATE a desync on such channels.
+ * Engage gates (ALL must hold): |R| > 1s, R stable ±100ms and NO events for the settle
+ * window (default 300s, PTV_RECANCHOR_SETTLE_S), slip parked at 0, delivery live, label
+ * health H healthy, cooldown expired (default 1800s, PTV_RECANCHOR_COOLDOWN_S). The walk
+ * is ≤1s per 10s with a |R0|×1.2 authority budget; any external event aborts it loudly.
+ * Runs on the single-input / non-follow path only (the mv follow PLL owns content
+ * alignment there — same exclusion as the pre20 rebuild re-anchor). */
+static void ptv_recanchor(AudioState *a, RsyncTrackR *r, int64_t now)
+{
+    int64_t v, R, hh, ua, uv, rp, tol;
+    int ev = 0;
+    const char *dead;
+
+    /* own event-edge snapshots — the corrector's CorrState snapshots are CONSUMED by its
+     * edge detector and must never be shared. hs tick churn is absorbed per the #51a rule. */
+    v = a->corr_epoch ? atomic_load_explicit(a->corr_epoch, memory_order_relaxed) : 0;
+    if (v != a->ra_epoch_snap)                 { a->ra_epoch_snap  = v;                ev = 1; }
+    if (a->glue_events   != a->ra_glue_snap)   { a->ra_glue_snap   = a->glue_events;   ev = 1; }
+    if (a->pll_acq_count != a->ra_acq_snap)    { a->ra_acq_snap    = a->pll_acq_count; ev = 1; }
+    if (a->afmt_rebuilds != a->ra_afmt_snap)   { a->ra_afmt_snap   = a->afmt_rebuilds; ev = 1; }
+    if (a->dec_reopens   != a->ra_reopen_snap) { a->ra_reopen_snap = a->dec_reopens;   ev = 1; }
+    if (a->conv_esc_n    != a->ra_esc_snap)    { a->ra_esc_snap    = a->conv_esc_n;    ev = 1; }
+    v = atomic_load_explicit(&g_rsx.ev_us[a->dbg_in], memory_order_relaxed);
+    if (v != a->ra_ev_led_snap)                { a->ra_ev_led_snap = v;                ev = 1; }
+    v = atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed);
+    if (v != a->ra_ea_led_snap)                { a->ra_ea_led_snap = v;                ev = 1; }
+    v = atomic_load_explicit(&g_bank_us, memory_order_relaxed);
+    if (v != a->ra_bank_snap)                  { a->ra_bank_snap   = v;                ev = 1; }
+    if (a->house_skew) {
+        int64_t hstol = a->tick_dur_us > 0 ? a->tick_dur_us + a->tick_dur_us / 4 : 50000;
+        v = *a->house_skew;
+        if (llabs(v - a->ra_hs_snap) > hstol) { a->ra_hs_snap = v; ev = 1; }
+        else                                    a->ra_hs_snap = v;
+    }
+    if (!a->ra_seeded) { a->ra_seeded = 1; a->ra_ev_wc = now; return; }
+    if (ev || rscorr_event_active(a, now))
+        a->ra_ev_wc = now;
+
+    if (!r->valid)          /* mid-walk this is EXPECTED (our own step re-seeds the EMA) — hold */
+        return;
+    R = r->R_us;
+    if (llabs(R - a->ra_r0) > 100000) { a->ra_r0 = R; a->ra_r0_wc = now; }   /* stability tracker */
+    dead = rscorr_delivery_dead(a, now);
+
+    if (a->ra_active) {
+        if (ev || dead) {                       /* an EXTERNAL disturbance mid-walk: abort loudly */
+            a->ra_active = 0;
+            a->ra_cooldown_until = now + g_recanchor_settle_us;
+            av_log(NULL, AV_LOG_WARNING,
+                   "[PTV-RECANCHOR] a%d(in%d) re-anchor ABORTED mid-walk (%s) — R=%+"PRId64"ms "
+                   "left until the gates re-establish\n",
+                   a->dbg_k, a->dbg_in, dead ? dead : "new event", R / 1000);
+            return;
+        }
+        if (llabs(R) <= g_rscorr_engage_us) {   /* done — corrector polishes the remainder */
+            a->ra_active = 0;
+            a->ra_cooldown_until = now + g_recanchor_cooldown_us;
+            a->ra_ua_snap  = atomic_load_explicit(&g_rsx.uea_us[a->dbg_k], memory_order_relaxed)
+                           + a->u_door_us;
+            a->ra_uv_snap  = atomic_load_explicit(&g_rsx.uev_us[a->dbg_in], memory_order_relaxed);
+            a->ra_corr_snap = a->corr.corr_us;
+            av_log(NULL, AV_LOG_WARNING,
+                   "[PTV-RECANCHOR] a%d(in%d) re-anchor COMPLETE — R=%+"PRId64"ms (inside the "
+                   "engage band); corrector polishes the remainder; cooldown %"PRId64"s\n",
+                   a->dbg_k, a->dbg_in, R / 1000, g_recanchor_cooldown_us / 1000000);
+            return;
+        }
+        if (a->ra_step_wc && now - a->ra_step_wc < 10000000)
+            return;                             /* one chunk per 10s (sensor settles in between) */
+        if (a->ra_budget_us <= 0) {
+            a->ra_active = 0;
+            a->ra_cooldown_until = now + g_recanchor_cooldown_us;
+            av_log(NULL, AV_LOG_ERROR,
+                   "[PTV-RECANCHOR] a%d(in%d) authority budget exhausted with R=%+"PRId64"ms "
+                   "remaining — stopping (cooldown %"PRId64"s)\n",
+                   a->dbg_k, a->dbg_in, R / 1000, g_recanchor_cooldown_us / 1000000);
+            return;
+        }
+        {
+            int64_t step = R;
+            if (step >  1000000) step =  1000000;
+            if (step < -1000000) step = -1000000;
+            if (llabs(step) > a->ra_budget_us)
+                step = step > 0 ? a->ra_budget_us : -a->ra_budget_us;
+            a->glue_off_us  += step;            /* the [PTV-ANCHOR] algebra: retires exactly +step */
+            a->rs_ma_seed    = 0;               /* base redefined — sensor re-seeds */
+            a->pend_comp_us += step;            /* §2.4 tripwire composes with any pending verdict */
+            a->pend_comp_wc  = now;
+            if (step < 0) {                     /* backward door labels — arm the mux monotonic guard */
+                a->reanch_mono = 1;
+                a->reanch_mono_dropped = 0;
+            }
+            a->glue_events++;                   /* corrector event edge: it re-dwells fresh */
+            a->ra_glue_snap  = a->glue_events;  /* our own edit is not an abort event */
+            a->acomp_exp_us  = AV_NOPTS_VALUE;  /* deliberate step, not a click risk */
+            a->ra_budget_us -= llabs(step);
+            a->ra_step_wc    = now;
+            av_log(NULL, AV_LOG_WARNING,
+                   "[PTV-RECANCHOR] a%d(in%d) step %+"PRId64"ms applied (R was %+"PRId64"ms; "
+                   "budget %"PRId64"ms left)  [+ = audio early]\n",
+                   a->dbg_k, a->dbg_in, step / 1000, R / 1000, a->ra_budget_us / 1000);
+        }
+        return;
+    }
+
+    /* ---- engagement gates ---- */
+    if (llabs(R) <= 1000000 || a->rs_slip_us != 0 || dead)
+        return;
+    if (a->ra_cooldown_until && now < a->ra_cooldown_until)
+        return;
+    if (now - a->ra_r0_wc < g_recanchor_settle_us || now - a->ra_ev_wc < g_recanchor_settle_us)
+        return;
+    hh = atomic_load_explicit(&g_rsx.hh_q10[a->dbg_k], memory_order_relaxed);
+    if (hh <= 0 || llabs(hh - 1024) > 154)      /* label health unknown or beyond ±15% */
+        return;
+    /* CORROBORATION — the mandatory aseam guard */
+    ua  = atomic_load_explicit(&g_rsx.uea_us[a->dbg_k], memory_order_relaxed) + a->u_door_us
+        - a->ra_ua_snap;
+    uv  = atomic_load_explicit(&g_rsx.uev_us[a->dbg_in], memory_order_relaxed) - a->ra_uv_snap;
+    rp  = (ua - uv) - (a->corr.corr_us - a->ra_corr_snap);
+    tol = FFMAX(500000, llabs(R) / 10);
+    if (llabs(R - rp) > tol) {
+        if (a->ra_log_wc == 0 || now - a->ra_log_wc >= 60000000) {
+            a->ra_log_wc = now;
+            av_log(NULL, AV_LOG_INFO,
+                   "[PTV-RECANCHOR] a%d(in%d) stable R=%+"PRId64"ms NOT corroborated by the "
+                   "deletion ledgers (pred=%+"PRId64"ms: ΔU_a=%+"PRId64" ΔU_v=%+"PRId64" "
+                   "Δcorr=%+"PRId64"ms) — refusing (a flowing-relabel pinned R is correct "
+                   "on air; re-anchoring it would CREATE a desync)\n",
+                   a->dbg_k, a->dbg_in, R / 1000, rp / 1000,
+                   ua / 1000, uv / 1000, (a->corr.corr_us - a->ra_corr_snap) / 1000);
+        }
+        return;
+    }
+    a->ra_active    = 1;
+    a->ra_budget_us = llabs(R) + llabs(R) / 5;
+    a->ra_step_wc   = 0;                        /* first chunk on the next evaluation */
+    av_log(NULL, AV_LOG_WARNING,
+           "[PTV-RECANCHOR] a%d(in%d) ENGAGE — R=%+"PRId64"ms stable %"PRId64"s, quiet, "
+           "CORROBORATED (pred=%+"PRId64"ms: ΔU_a=%+"PRId64" ΔU_v=%+"PRId64"ms) → slewed "
+           "base re-anchor (≤1s/10s, budget %"PRId64"ms; PTV_NO_RECANCHOR disables)  "
+           "[+ = audio early]\n",
+           a->dbg_k, a->dbg_in, R / 1000, (now - a->ra_r0_wc) / 1000000,
+           rp / 1000, ua / 1000, uv / 1000, a->ra_budget_us / 1000);
+}
+/* ======================================================================================= */
+
 /* -af path: drain the filtergraph's (fixed-size) output frames straight to the
  * per-rung encoders, stamping each with ITS OWN filter PTS rebased onto the house
  * anchor h0 (in out_rate sample units). This HONORS aresample=async's correction
@@ -1360,6 +1523,30 @@ static int audio_drain_fg(AudioState *a)
                                    (nowr - a->reanch_wc) / 1000, a->reanch_step_us / 1000,
                                    (int)(PTV_REANCH_CAP_US / 1000000));
                         }
+                    }
+                    /* 1.0.1-pre24 #63: corroborated recovery re-anchor (single-input /
+                     * non-follow only — the mv follow PLL owns content alignment; and never
+                     * inside a rebuild's own [PTV-ANCHOR] discontinuity window). */
+                    if (g_recanchor && !(a->multiview && g_audio_follow) && !a->reanch_wc)
+                        ptv_recanchor(a, &rr, nowr);
+                }
+                /* pre24 #63 cross-stream conservation diag (measurement only, no control):
+                 * the running A−V difference of UNEVIDENCED real-content deletions IS the
+                 * predicted permanent on-air offset pressure — say so when it moves. */
+                {
+                    int64_t cua = atomic_load_explicit(&g_rsx.uea_us[a->dbg_k], memory_order_relaxed)
+                                + a->u_door_us;
+                    int64_t cuv = atomic_load_explicit(&g_rsx.uev_us[a->dbg_in], memory_order_relaxed);
+                    int64_t imb = cua - cuv;
+                    if (llabs(imb - a->wev_cons_last_us) > 500000 &&
+                        (a->wev_cons_log_wc == 0 || nowr - a->wev_cons_log_wc >= 10000000)) {
+                        a->wev_cons_last_us = imb;
+                        a->wev_cons_log_wc  = nowr;
+                        av_log(NULL, AV_LOG_WARNING,
+                               "[PTV-WALLEV] a%d(in%d) unevidenced real-content deletion imbalance "
+                               "A−V = %+"PRId64"ms (A=%"PRId64"ms V=%"PRId64"ms) — permanent-offset "
+                               "pressure (measurement only)  [+ = audio early]\n",
+                               a->dbg_k, a->dbg_in, imb / 1000, cua / 1000, cuv / 1000);
                     }
                 }
                 if (g_diag && (a->rs_log_last == 0 ||
@@ -2081,7 +2268,20 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                          * The 2026-07-18 Q5 mandate is PRESERVED for accepted orders: in-cap
                          * convergences stay latency-unbounded while they SHRINK. */
                         int fold_park = 0, fold_cap = 0, fold_ladder = 0;
+                        int wev_meas = 0, wev_gap = 0, wev_hardcap = 0;
                         int64_t mag = llabs(step), prev_bl = 0;
+                        /* 1.0.1-pre24 #63 (g_wallev): the door's OWN wall evidence — a step whose
+                         * arrival wall gap covers ≥ half the step on top of the normal cadence is
+                         * a REAL gap (the same evidence class the E5 pad-ledger gate inverts): the
+                         * pad is the right remedy, so it is EXEMPT from every fold layer (folding
+                         * it deletes real content = the storm's E2 leak; storm1: −13418ms of the
+                         * −17452 audio deletion came from exactly these folds). Bounded by the
+                         * HARDCAP backstop below — allocation safety still trumps sync (#60 is
+                         * never regressed). wev_meas is measured even under PTV_NO_WALLEV: a fold
+                         * of an evidenced gap then feeds the re-anchor provenance (u_door_us). */
+                        wev_meas = step > 0 &&
+                                   wall_gap >= step / 2 + FFMAX(a->glue_cad_us, 40000);
+                        wev_gap  = g_wallev && wev_meas;
                         if (g_convcap && !pad_cancel && !(fill_resumed && step < 0)) {
                             if (a->seam_park_until)          /* rr23: expiry is handled eagerly per
                                                               * frame above — a set value is future */
@@ -2091,7 +2291,26 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                                 a->conv_bl_wc = 0;
                             }
                             prev_bl = a->conv_bl_us;
-                            if (!fold_park) {
+                            if (wev_gap) {
+                                /* outstanding wall-evidenced pad backlog: drains ~1× realtime
+                                 * (injected silence plays out through the delivery gate) */
+                                int64_t el = a->wev_out_wc ? now_wc - a->wev_out_wc : 0;
+                                a->wev_out_us = FFMAX(a->wev_out_us - el, 0);
+                                a->wev_out_wc = now_wc;
+                                if (a->wev_out_us + step > PTV_WALLEV_HARDCAP_US) {
+                                    fold_cap = wev_hardcap = 1;   /* the OOM backstop wins */
+                                    av_log(NULL, AV_LOG_ERROR,
+                                           "[PTV-WALLEV] a%d(in%d) wall-evidenced +%"PRId64"ms gap folded "
+                                           "ANYWAY — outstanding pad backlog %"PRId64"s + step exceeds the "
+                                           "%ds hardcap: sacrificing sync for allocation safety\n",
+                                           a->dbg_k, a->dbg_in, step / 1000,
+                                           a->wev_out_us / AV_TIME_BASE,
+                                           (int)(PTV_WALLEV_HARDCAP_US / AV_TIME_BASE));
+                                } else {
+                                    a->wev_out_us += step;
+                                    fold_park = 0;   /* park exemption: real gaps pad even mid-park */
+                                }
+                            } else if (!fold_park) {
                                 if (mag > g_conv_cap_us)
                                     fold_cap = 1;                   /* A: admission cap */
                                 else if (prev_bl && mag >= prev_bl)
@@ -2102,6 +2321,11 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                             conv_folded = 1;
                             a->glue_off_us -= step;                 /* the label-neutral fold */
                             a->glue_events++;                       /* label edit event (corrector freeze) */
+                            /* pre24 #63 provenance (measurement only): this fold ERASED a step
+                             * whose wall evidence said the content was genuinely missing — real
+                             * content deleted (counterfactual mode / hardcap). Re-anchor reads it. */
+                            if (wev_meas && step > 0)
+                                a->u_door_us += step;
                             a->conv_bl_us = 0;                      /* backlog retired with the fold */
                             a->conv_bl_wc = 0;
                             a->conv_total_us += step;               /* rr23: net folded label motion —
@@ -2156,12 +2380,27 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                                 }
                             }
                         } else {
-                            if (g_convcap && !pad_cancel && !(fill_resumed && step < 0)) {
+                            if (g_convcap && !pad_cancel && !(fill_resumed && step < 0) &&
+                                !wev_gap) {
                                 /* accepted order — track it as the in-flight backlog (B judges
-                                 * the NEXT seam's re-measured magnitude against this) */
+                                 * the NEXT seam's re-measured magnitude against this). A
+                                 * wall-evidenced gap never enters the ladder (pre24 #63): it is
+                                 * a pad of real absence, not a convergence order — its backstop
+                                 * is the wev_out hardcap above.
+                                 * pre24 #63 rule-B same-event identity (the storm cross-event
+                                 * aliasing fix): the deadline is the order's REALISTIC playout —
+                                 * injection is instantaneous (the allocation happens at the
+                                 * step), drain-through = mag of output realtime + pipeline depth
+                                 * (≤ ~15s incl. gate/mux). The old 2×mag+60s kept a 2.2s storm
+                                 * order bureaucratically "in flight" for 64s, so an INDEPENDENT
+                                 * gap 25s later compared against a DIFFERENT event's backlog and
+                                 * folded a real gap. An order that provably played out cannot be
+                                 * "the same non-converging backlog"; the doubling-ladder seams
+                                 * recur in seconds ≪ mag+15s and are still caught (A and C
+                                 * unchanged as backstops). */
                                 a->conv_bl_us = mag;
                                 a->conv_bl_wc = now_wc;
-                                a->conv_bl_dl = now_wc + 2 * mag + 60000000LL;
+                                a->conv_bl_dl = now_wc + mag + 15000000LL;
                             }
                             av_log(NULL, AV_LOG_WARNING,
                                    "[PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms above %dms cap — left to the discontinuity layer%s%s%s%s\n",
