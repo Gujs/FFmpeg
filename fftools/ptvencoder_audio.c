@@ -800,6 +800,20 @@ static void ptv_recanchor(AudioState *a, RsyncTrackR *r, int64_t now)
                    a->dbg_k, a->dbg_in, R / 1000, g_recanchor_cooldown_us / 1000000);
             return;
         }
+        /* TEST ONLY (rr24 F2 gate): after N applied steps, force ONE abort with NO content
+         * event — exercises the clean re-engage-on-remainder path (ra_applied persists →
+         * corroboration predicts the remainder). Off by default (byte-identical). */
+        if (g_recanchor_test_abort_n > 0 && !a->ra_test_aborted &&
+            a->ra_test_steps >= g_recanchor_test_abort_n) {
+            a->ra_test_aborted = 1;
+            a->ra_active = 0;
+            a->ra_cooldown_until = now + g_recanchor_settle_us;
+            av_log(NULL, AV_LOG_WARNING,
+                   "[PTV-RECANCHOR] a%d(in%d) re-anchor ABORTED mid-walk (TEST forced after "
+                   "%d steps, Σapplied=%+"PRId64"ms) — R=%+"PRId64"ms, no event injected\n",
+                   a->dbg_k, a->dbg_in, a->ra_test_steps, a->ra_applied_us / 1000, R / 1000);
+            return;
+        }
         if (a->ra_step_wc && now - a->ra_step_wc < 10000000)
             return;                             /* one chunk per 10s (sensor settles in between) */
         if (a->ra_budget_us <= 0) {
@@ -832,6 +846,7 @@ static void ptv_recanchor(AudioState *a, RsyncTrackR *r, int64_t now)
             a->ra_applied_us += step;           /* rr24 F2: every applied chunk retires +step of R —
                                                  * an ABORT must not orphan it (corroboration then
                                                  * predicts the remainder, not the original R0) */
+            a->ra_test_steps++;                 /* TEST ONLY (rr24 F2 gate) */
             a->ra_step_wc    = now;
             av_log(NULL, AV_LOG_WARNING,
                    "[PTV-RECANCHOR] a%d(in%d) step %+"PRId64"ms applied (R was %+"PRId64"ms; "
@@ -878,6 +893,7 @@ static void ptv_recanchor(AudioState *a, RsyncTrackR *r, int64_t now)
     a->ra_active    = 1;
     a->ra_budget_us = llabs(R) + llabs(R) / 5;
     a->ra_step_wc   = 0;                        /* first chunk on the next evaluation */
+    a->ra_test_steps = 0;                       /* TEST ONLY (rr24 F2 gate): per-engagement */
     av_log(NULL, AV_LOG_WARNING,
            "[PTV-RECANCHOR] a%d(in%d) ENGAGE — R=%+"PRId64"ms stable %"PRId64"s, quiet, "
            "CORROBORATED (pred=%+"PRId64"ms: ΔU_a=%+"PRId64" ΔU_v=%+"PRId64"ms "

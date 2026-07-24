@@ -131,6 +131,10 @@ int     g_recanchor = 1;           /* 1.0.1-pre24 #63 CORROBORATED RECOVERY RE-A
                                            * PTV_NO_RECANCHOR=1 disables. */
 int64_t g_recanchor_settle_us   = 300LL  * 1000000; /* PTV_RECANCHOR_SETTLE_S */
 int64_t g_recanchor_cooldown_us = 1800LL * 1000000; /* PTV_RECANCHOR_COOLDOWN_S */
+int     g_recanchor_test_abort_n = 0;  /* TEST ONLY (rr24 F2 gate): force ONE mid-walk abort after
+                                        * N applied steps, no content event injected — so the clean
+                                        * re-engage-on-remainder path can be gated. 0 = off (default,
+                                        * byte-identical). PTV_RECANCHOR_TEST_ABORT_N. */
 int     g_anchor_headfill = 1;     /* 1.0.1 anchor head-fill (PTV_NO_ANCHOR_HEADFILL reverts): when the source's
                                            * audio head is missing at birth (first kept audio >200ms after h0, or the
                                            * pre-h0 ring overflowed), synthesize silence covering house 0 → first kept
@@ -2860,6 +2864,7 @@ int main(int argc, char **argv)
                                                        * post-storm offset stays until restart) */
     { const char *s = getenv("PTV_RECANCHOR_SETTLE_S");   if (s && atoi(s) > 0) g_recanchor_settle_us   = (int64_t)atoi(s) * 1000000; }
     { const char *s = getenv("PTV_RECANCHOR_COOLDOWN_S"); if (s && atoi(s) > 0) g_recanchor_cooldown_us = (int64_t)atoi(s) * 1000000; }
+    { const char *s = getenv("PTV_RECANCHOR_TEST_ABORT_N"); if (s && atoi(s) > 0) g_recanchor_test_abort_n = atoi(s); }  /* TEST ONLY (rr24 F2 gate) */
     { const char *s = getenv("PTV_NOVIDEO_EXIT_S"); if (s) g_novideo_exit_us = (int64_t)atoll(s) * 1000000; }  /* 1.0.1-pre23 startup sanity; 0 disables */
     /* 0.9.18.7: PTV_AGLUE_MAX_MS (1000ms) / PTV_DISCONT_MS (1000ms) / PTV_DISCONT_BACK_MS (80ms)
      * internalized — see g_aglue_max_ms / g_discont_ms / g_discont_back_ms */

@@ -867,6 +867,8 @@ typedef struct AudioState {
     int64_t          ra_step_wc;                      /* wall µs of the last applied chunk */
     int64_t          ra_ua_snap, ra_uv_snap;          /* unevidenced-deletion ledger snapshots (corroborate
                                                        * only NEW deletions since the last completion) */
+    int              ra_test_steps;                   /* TEST ONLY (rr24 F2 gate): steps this engagement */
+    int              ra_test_aborted;                 /* TEST ONLY: forced abort already fired this run */
     int64_t          ra_applied_us;                   /* rr24 F2: Σ signed steps applied since the last
                                                        * COMPLETE — each step retired exactly +step of R,
                                                        * so after a mid-walk ABORT the corroboration must
@@ -1372,6 +1374,8 @@ extern int     g_recanchor;              /* 1.0.1-pre24 #63 corroborated recover
 extern int64_t g_recanchor_settle_us;    /* quiet+stable window before an engage (PTV_RECANCHOR_SETTLE_S, 300s) */
 extern int64_t g_recanchor_cooldown_us;  /* re-engage holdoff after a completed re-anchor
                                           * (PTV_RECANCHOR_COOLDOWN_S, 1800s) */
+extern int     g_recanchor_test_abort_n; /* TEST ONLY (rr24 F2 gate): force one mid-walk abort
+                                          * after N steps, no event injected (0 = off, default) */
 extern int     g_prog_off;
 extern int     g_progoff_av;
 extern int     g_layera;
