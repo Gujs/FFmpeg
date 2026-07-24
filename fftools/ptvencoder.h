@@ -846,6 +846,7 @@ typedef struct AudioState {
                                                        * conv-fold-exemption OOM backstop ledger; drains at
                                                        * ~1× realtime (decayed by wall elapsed) */
     int64_t          wev_out_wc;                      /* wall µs of the last wev_out update (decay ref) */
+    int64_t          wev_fb_log_wc;                   /* rr24 F4: door-side bursty-fallback log rate limit */
     int64_t          wev_cons_last_us;                /* conservation diag: last logged A−V unevidenced
                                                        * deletion imbalance (µs) */
     int64_t          wev_cons_log_wc;                 /* conservation diag log rate limit (10s) */

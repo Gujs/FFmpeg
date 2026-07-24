@@ -2291,6 +2291,27 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                          * of an evidenced gap then feeds the re-anchor provenance (u_door_us). */
                         wev_meas = step > 0 &&
                                    wall_gap >= step / 2 + FFMAX(a->glue_cad_us, 40000);
+                        /* rr24 F4: mirror the demux-side ptv_wallev_w fallback gate — when
+                         * delivery is KNOWN bursty (an ACTIVE bank escalation or an
+                         * operator-declared deep prime, the same two signals) the door's wall
+                         * gap is delivery jitter, not content evidence: no exemption (above-cap
+                         * steps take the pre23 fold path) and no u_door provenance either (the
+                         * measurement itself is unreliable there — the demux side returns W=0
+                         * for the same reason; the deep-prime class is a documented pre24
+                         * limitation, F7: Part 1 inert, Part 2 uncorroborated). */
+                        if (wev_meas &&
+                            (atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 ||
+                             (int64_t)g_preroll_ms >= 4000)) {
+                            wev_meas = 0;
+                            if (a->wev_fb_log_wc == 0 || now_wc - a->wev_fb_log_wc >= 60000000) {
+                                a->wev_fb_log_wc = now_wc;
+                                av_log(NULL, AV_LOG_INFO,
+                                       "[PTV-WALLEV] a%d(in%d) door wall evidence unreliable "
+                                       "(bank armed / deep-prime bursty input) — no fold "
+                                       "exemption (pre23 remedy)\n",
+                                       a->dbg_k, a->dbg_in);
+                            }
+                        }
                         wev_gap  = g_wallev && wev_meas;
                         if (g_convcap && !pad_cancel && !(fill_resumed && step < 0)) {
                             if (a->seam_park_until)          /* rr23: expiry is handled eagerly per
