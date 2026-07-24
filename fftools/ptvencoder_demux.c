@@ -322,13 +322,19 @@ static int64_t ptv_wallev_w(DemuxArgs *d, int sidx, int64_t jump_us)
     gap = d->pkt_wall_gap_us[sidx];
     if (gap < g_gap_min_us)                  /* evidence floor: below this, "flowing" */
         return 0;
-    if (atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 || d->autobank) {
+    /* fallback gate — delivery is KNOWN bursty, so wall absence is not content evidence:
+     * an ACTIVE bank escalation (g_bank_us > 0 — AUTO-BANK actually armed, not merely
+     * eligible: d->autobank is set on every single-input live channel and must NOT gate
+     * this) or an operator-declared deep prime (Fintech-class §13 channels run
+     * PTV_PREROLL_MS ≥ 4000 precisely because their delivery stalls multi-second). */
+    if (atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 ||
+        (int64_t)g_preroll_ms >= 4000) {
         int64_t now = av_gettime_relative();
         if (now - d->wallev_fb_log_us >= 60000000) {
             d->wallev_fb_log_us = now;
             av_log(NULL, AV_LOG_INFO,
-                   "[PTV-WALLEV] stream %d: wall evidence unreliable (bank armed / bursty "
-                   "input) — split disabled for this event (whole-step remedy as before)\n",
+                   "[PTV-WALLEV] stream %d: wall evidence unreliable (bank armed / deep-prime "
+                   "bursty input) — split disabled for this event (whole-step remedy as before)\n",
                    sidx);
         }
         return 0;
