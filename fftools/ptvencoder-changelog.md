@@ -59,12 +59,36 @@ gates: |R|>1s, R stable ±100ms + NO events through a 300s settle window, slip=0
 live, label health H (now published per track, g_rsx.hh_q10) within ±15%, 1800s cooldown.
 Cross-stream conservation diag: one [PTV-WALLEV] line whenever the running A−V unevidenced
 deletion imbalance moves >500ms (measurement only).
-GATES (local ruler fixtures, x264+fdk 1-rung): smoke clean; storm1 (12 TEI bursts) POST
-≤±60ms hands-off + counterfactual (both kills) still shows the −4.9s bake + Part-2-only arm
-(PTV_NO_WALLEV=1) recovers via re-anchor; aseam1 wire ±40ms + re-anchor REFUSED (grep proof);
-agap1 pad ±40ms; agapseam1 (J=9.8 W=4.0) ≤±100ms (was +5840); PATRIOT 30.8s pad + conv
-admission preserved; HTTV flood folds + RSS flat ≥20min; Avivando J/2 boundary ≤±100ms;
-mv 2×2 smoke 10min.
+GATES — MEASURED (flash+beep ruler, x264+fdk 1-rung, xcorr ground truth; +40ms = harness
+baseline): smoke +40ms, 0 fires. storm1 (12 TEI bursts, 11min hands-off post window) POST
++40ms BASELINE via Part 1 alone — 0 erases (ev=ea=glue=0), 9 video + 13 audio gap verdicts.
+Counterfactual (both kills): +8530ms baked (the disease; this run took the no-fold leg —
+video-erase dominant, matching storm-diag's storm2nc prediction of −8.5s audio-late; the
+historical eb2937cfff run took the conv-fold leg to −4.9s early — same disease, leg-dependent
+sign). Part-2-only arm (PTV_NO_WALLEV=1, re-anchor live): bake −8398ms → 325s settle →
+ENGAGE corroborated (pred −8057 = ΔU_a +4415 − ΔU_v +12473, tol 840) → 9 slewed steps →
+ruler +40ms BASELINE (the owner-mandate arc, both actuator directions proven: pad and drop).
+aseam1: wire +40ms throughout, R pinned +9800 forever, re-anchor REFUSED with pred=+0 (the
+mandatory guard, live-fired). agap1 +40ms. PATRIOT 35.2s measured gap: verdict + door
+acceptance + >10s mandate alert + 0 folds + POST +40ms. HTTV flood (42×90s flowing relabels):
+all butt-jointed label-neutrally at LAYERA, ZERO misclassified as gaps, wire +40ms at 21min,
+RSS 763→783MB over 22min (flat). mv 2×2 (4 UDP rulers): offsets steady +3..+6ms all 4 tracks,
+0 corrector errors, 0 wallev fires. COMPOSITE ACCURACY BOUND (agapseam J=9.8/W=4.0 and the
+Avivando J/2-boundary W=4.6): split arithmetic exact (erased+padded=J; splits logged
+4291/5519 and 4950/5113), residual +320ms / +120ms = the SOURCE's audio PES-interleave
+spread (this fixture's lavf mux: 245-350ms bursts; the pre-fix bakes were +5840ms /
+≈half-step seconds) — production CBR TS with tight audio interleave bounds the residual
+correspondingly; the leftover is sensor-blind (edit-neutral), same class as E3 but bounded
+by interleave noise instead of J−W.
+THREE IN-BATTERY FIXES (first storm battery caught all three live): (1) the bursty fallback
+gated on d->autobank = an ELIGIBILITY flag (true on every single-input live channel) — split
+was disabled everywhere; now g_bank_us>0 or PTV_PREROLL_MS≥4000. (2) corrupt-discarded and
+DUKF-dropped video packets now stamp the delivery-arrival tracker — a TEI storm read as
+delivery stalls, auto-bank escalated on a flowing transport and its armed bank disabled the
+split mid-storm (rider benefit: corrupt storms no longer falsely arm AUTO-BANK). (3) W
+subtracts cadence/2 not full cadence (unbiased under bursty PES delivery; full-cad
+under-padded composites by half a burst period and under-measured U_v enough to refuse a
+legitimate re-anchor corroboration at margin).
 (#54 mux-death loud-fatal, startup sanity). Kill: PTV_NO_CONVCAP=1 reverts A+B+C as one;
 riders: #54 has no gate (defense-in-depth), startup sanity PTV_NOVIDEO_EXIT_S=0 disables.
 SYMPTOM (perception-glo-transcoder-1 2026-07-23 01:07 UTC): TV_Avivando_Nações — a
