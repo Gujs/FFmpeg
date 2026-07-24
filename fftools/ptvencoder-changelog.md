@@ -64,7 +64,9 @@ gates: |R|>1s, R stable ±100ms + NO events through a 300s settle window, slip=0
 live, label health H (now published per track, g_rsx.hh_q10) within ±15%, 1800s cooldown.
 rr24 F2: applied slew chunks are accounted across mid-walk ABORTS (Σapplied subtracted in
 R_pred, reset only at COMPLETE) — a post-abort re-engage corroborates and walks only the
-REMAINDER instead of being refused forever with a half-recovered channel.
+REMAINDER instead of being refused forever with a half-recovered channel. (Gate-only hook
+PTV_RECANCHOR_TEST_ABORT_N forces one mid-walk abort after N steps, no event injected;
+0 = off = byte-identical.)
 Cross-stream conservation diag: one [PTV-WALLEV] line whenever the running A−V unevidenced
 deletion imbalance moves >500ms (measurement only).
 DOCUMENTED LIMITATION (F7): bank-armed / deep-prime channels (Fintech-class bursty
