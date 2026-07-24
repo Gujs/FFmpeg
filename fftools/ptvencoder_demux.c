@@ -1016,10 +1016,12 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
      * 1.0.1-pre24 #63 (g_wallev): + the stream's wall-evidenced W — the butt-joint erases
      * only the flowing J−W and PRESERVES W of the label hole (real missing content), so each
      * stream's content path pads exactly its own real hole (audio: AGLUE/aresample; video:
-     * the house clock's starvation dups already covered the real absence). The shared-flush
-     * tree composes unchanged: any (applied − own) difference is the registered mismatch,
-     * and per-stream label hole = own W + registered mism ⇒ padded content = W exactly.
-     * W=0 (flowing/fallback/backward) keeps every offset byte-identical. */
+     * the house clock's starvation dups already covered the real absence). Shared-flush
+     * composition (rr24 F1): when the tree overrides this offset with the event's shared one,
+     * the door step becomes mism + W and THAT is what gets registered (see the stamp block);
+     * padded content = W exactly when mism ≥ 0, and a negative mism collapses part of the
+     * hole — the collapsed portion is posted as unevidenced provenance for the recovery
+     * re-anchor. W=0 (flowing/fallback/backward) keeps every offset byte-identical. */
     if (keep_timeline == 1 && any_started) {
         for (i = 0; i < b->nb_streams; i++) {
             PtvDiscStreamState *ss = &b->stream_state[i];
@@ -1234,11 +1236,38 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
                      * examines the step and aresample=async soft-converges it unregistered
                      * (registering there would only arm a stale expect that could mis-consume an
                      * unrelated later step). Same-cycle full flushes (2b) keep the >EPS gate —
-                     * their sub-band residual stays on the byte-identical band path. */
+                     * their sub-band residual stays on the byte-identical band path.
+                     * pre24 rr24 F1 (g_wallev): the stream's own butt-joint PRESERVES its
+                     * wall-evidenced hole W (cumulative_ts_offset includes +W), so the label
+                     * step this flush actually creates at the door is
+                     *   (new_base + applied) − last_sent = applied − (own − W) = mism + W —
+                     * register THAT (the D1 invariant is "expect == the step the flush
+                     * creates"; registering bare mism missed the door's exp window whenever
+                     * W > 500ms, leaving a stale expect AND an unpredicted step). The pairing
+                     * tree and the label-health/route-cap REFUSE above still judge mism
+                     * itself (label trust) — only the registered number carries W. When
+                     * mism < 0 the override COLLAPSES that much of the preserved hole out of
+                     * the labels (worst corner mism ≈ −W: door step ≈ 0, structurally
+                     * nothing left to pad) — the collapsed portion is real content deleted
+                     * with no label representation, posted as UNEVIDENCED provenance so the
+                     * recovery re-anchor can corroborate and walk it back (Part 2). W = 0
+                     * (flowing / fallback / PTV_NO_WALLEV) keeps all of this byte-identical
+                     * to pre23. */
                     int64_t mism = b->applied_offset - ss->cumulative_ts_offset;
-                    if (has_aud && (llabs(mism) > PTV_PAIR_EPS_US ||
-                                    (pair_inherit && llabs(mism) > (int64_t)g_aglue_ms * 1000)))
-                        ptv_pair_expect(d, i, mism);
+                    int64_t wevr = g_wallev ? ss->jump_wallev_us : 0;
+                    int64_t exp_step = mism + wevr;
+                    if (has_aud && (llabs(exp_step) > PTV_PAIR_EPS_US ||
+                                    (pair_inherit && llabs(exp_step) > (int64_t)g_aglue_ms * 1000)))
+                        ptv_pair_expect(d, i, exp_step);
+                    if (wevr > 0 && mism < 0) {
+                        int64_t coll = FFMIN(-mism, wevr);
+                        ptv_wallev_post_unev(d, i, coll);
+                        av_log(NULL, AV_LOG_WARNING,
+                               "[PTV-WALLEV] flush override collapsed %"PRId64"ms of stream %d's "
+                               "wall-evidenced hole (door step %+"PRId64"ms, W=%"PRId64"ms) — "
+                               "posted as unevidenced provenance for the recovery re-anchor\n",
+                               coll / 1000, i, exp_step / 1000, wevr / 1000);
+                    }
                     ss->pair_applied_us = b->applied_offset;
                     ss->pair_has        = 1;
                     ss->pair_prov       = 0;
