@@ -38,9 +38,14 @@ so vcrossed becomes a truthful splice signal mid-storm) + the audio discriminato
 composites and holds full verdicts by per-stream evidence even when vcrossed; wallev-qualified
 verdicts propagate to the disc buffer unconditionally (per-stream W conservation makes
 one-sided handling safe); the LAYERA flush butt-joint preserves each crossing stream's W
-(cumulative_ts_offset + W — the shared-flush tree composes unchanged: per-stream label hole =
-own W + registered mismatch ⇒ padded content = W exactly); the conv classifier EXEMPTS
-wall-evidenced gaps (door wall_gap ≥ step/2 + cadence) from fold_park/cap/ladder — bounded by
+(cumulative_ts_offset + W; rr24 F1: when the shared-flush tree overrides that offset the door
+step becomes mism + W and THAT is what the flush registers — padded content = W exactly when
+mism ≥ 0, and a negative mism collapses part of the hole out of the labels, posted as
+unevidenced provenance so the recovery re-anchor corroborates and walks it back — the
+whole-splice-with-audio-absence corner, mism ≈ −W, is recovered by Part 2 by design); the
+conv classifier EXEMPTS wall-evidenced gaps (door wall_gap ≥ step/2 + cadence; rr24 F4: the
+exemption AND its measurement respect the same bank/deep-prime fallback gate as the demux
+side — bursty door wall gaps are delivery jitter) from fold_park/cap/ladder — bounded by
 a 120s outstanding-pad HARDCAP that folds anyway with a loud admission (allocation safety
 trumps sync; #60 never regressed) — and rule B's deadline is the order's REALISTIC playout
 (mag + 15s, injection is instantaneous): an order that provably played out cannot be "the
@@ -57,8 +62,15 @@ relabel pins R at the step forever while the wire is PERFECT — its erase was f
 U_a=0, R_pred≈0 ⇒ REFUSED (a naive "trust large stable R" would CREATE a desync). Engage
 gates: |R|>1s, R stable ±100ms + NO events through a 300s settle window, slip=0, delivery
 live, label health H (now published per track, g_rsx.hh_q10) within ±15%, 1800s cooldown.
+rr24 F2: applied slew chunks are accounted across mid-walk ABORTS (Σapplied subtracted in
+R_pred, reset only at COMPLETE) — a post-abort re-engage corroborates and walks only the
+REMAINDER instead of being refused forever with a half-recovered channel.
 Cross-stream conservation diag: one [PTV-WALLEV] line whenever the running A−V unevidenced
 deletion imbalance moves >500ms (measurement only).
+DOCUMENTED LIMITATION (F7): bank-armed / deep-prime channels (Fintech-class bursty
+delivery) have wall evidence disabled BY DESIGN at every site — Part 1 is inert and Part 2
+has no provenance to corroborate there (nothing measurable to act on): the deep-prime class
+is out of scope for pre24.
 GATES — MEASURED (flash+beep ruler, x264+fdk 1-rung, xcorr ground truth; +40ms = harness
 baseline): smoke +40ms, 0 fires. storm1 (12 TEI bursts, 11min hands-off post window) POST
 +40ms BASELINE via Part 1 alone — 0 erases (ev=ea=glue=0), 9 video + 13 audio gap verdicts.
