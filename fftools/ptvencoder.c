@@ -144,6 +144,8 @@ int64_t g_muxtest_back_at_us = 0;  /* TEST ONLY (pre26 W1/W2 gates): PTV_MUXTEST
                                         * artificial backward audio dts at the mux feed t s after mux start.
                                         * 0 = off (default, byte-identical). */
 int64_t g_muxtest_back_ms = 2795;  /* TEST ONLY: PTV_MUXTEST_BACK_MS (default ≈ the live −2794.7ms). */
+int     g_muxdiag = 0;             /* pre26 D3 instrumentation (PTV_MUXDIAG=1): emission-point backward-label
+                                        * detector + state dump in the audio thread. Diagnostic only. */
 int     g_anchor_headfill = 1;     /* 1.0.1 anchor head-fill (PTV_NO_ANCHOR_HEADFILL reverts): when the source's
                                            * audio head is missing at birth (first kept audio >200ms after h0, or the
                                            * pre-h0 ring overflowed), synthesize silence covering house 0 → first kept
@@ -2951,6 +2953,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_MUXGUARD")) g_muxguard = 0;   /* 1.0.1-pre26: disable the survive-first backward-dts mux backstop (pre24 EINVAL-exit behavior) */
     { const char *s = getenv("PTV_MUXTEST_BACK_AT_S"); if (s && atoi(s) > 0) g_muxtest_back_at_us = (int64_t)atoi(s) * 1000000; }  /* TEST ONLY (pre26 gates) */
     { const char *s = getenv("PTV_MUXTEST_BACK_MS");   if (s && atoi(s) > 0) g_muxtest_back_ms = atoi(s); }                        /* TEST ONLY (pre26 gates) */
+    if (getenv("PTV_MUXDIAG")) g_muxdiag = 1;        /* pre26 D3: gated emission-point backward-label instrumentation */
     { const char *s = getenv("PTV_NOVIDEO_EXIT_S"); if (s) g_novideo_exit_us = (int64_t)atoll(s) * 1000000; }  /* 1.0.1-pre23 startup sanity; 0 disables */
     /* 0.9.18.7: PTV_AGLUE_MAX_MS (1000ms) / PTV_DISCONT_MS (1000ms) / PTV_DISCONT_BACK_MS (80ms)
      * internalized — see g_aglue_max_ms / g_discont_ms / g_discont_back_ms */

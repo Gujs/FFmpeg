@@ -1806,6 +1806,28 @@ static int audio_drain_fg(AudioState *a)
                         lag_us / 1000, hs_us / 1000, async_pad_us / 1000, a->dbg_first_out * 1000 / a->out_rate);
                 }
             }
+            /* 1.0.1-pre26 D3 instrumentation (PTV_MUXDIAG=1, temporary/gated): the emission-point
+             * backward detector — the closest upstream twin of [PTV-MUXGUARD]. Fires when THIS
+             * emission's label precedes the last emitted one (the exact packet the muxer would
+             * EINVAL), dumping the composition state so the preceding loud label-edit lines
+             * (AGLUE/CONV/WALLEV/ANCHOR/flush) name the emitter. */
+            if (g_muxdiag && a->out_pts_set && filt->pts <= a->out_last_pts) {
+                int64_t now_md = av_gettime_relative();
+                if (now_md - a->md_warn_wc >= 500000) {
+                    a->md_warn_wc = now_md;
+                    av_log(NULL, AV_LOG_WARNING,
+                           "[PTV-MUXDIAG] a%d(in%d) BACKWARD EMISSION %+"PRId64"ms (out %"PRId64" <= last %"PRId64" smp) "
+                           "glue_off=%+"PRId64"ms pend_comp=%+"PRId64"ms corr=%+"PRId64"ms reanch_win=%s "
+                           "afmt_rebuilds=%d nbs_fill=%d reanch_mono=%d conv_bl=%+"PRId64"ms wev_out=%+"PRId64"ms\n",
+                           a->dbg_k, a->dbg_in,
+                           av_rescale(filt->pts - a->out_last_pts, 1000, a->out_rate > 0 ? a->out_rate : 48000),
+                           filt->pts, a->out_last_pts,
+                           a->glue_off_us / 1000, a->pend_comp_us / 1000, a->corr.corr_us / 1000,
+                           (a->reanch_wc && now_md - a->reanch_wc <= PTV_REANCH_WIN_US) ? "IN" : "out",
+                           a->afmt_rebuilds, a->nbs_fill_active, a->reanch_mono,
+                           a->conv_bl_us / 1000, a->wev_out_us / 1000);
+                }
+            }
             a->out_last_pts = filt->pts;   /* F1: the guard's monotonic reference (all paths) */
             a->out_pts_set  = 1;
         }

@@ -847,6 +847,7 @@ typedef struct AudioState {
                                                        * ~1× realtime (decayed by wall elapsed) */
     int64_t          wev_out_wc;                      /* wall µs of the last wev_out update (decay ref) */
     int64_t          wev_fb_log_wc;                   /* rr24 F4: door-side bursty-fallback log rate limit */
+    int64_t          md_warn_wc;                      /* pre26 D3: [PTV-MUXDIAG] emission-point rate limit */
     int64_t          wev_cons_last_us;                /* conservation diag: last logged A−V unevidenced
                                                        * deletion imbalance (µs) */
     int64_t          wev_cons_log_wc;                 /* conservation diag log rate limit (10s) */
@@ -1381,6 +1382,7 @@ extern int     g_muxguard;               /* 1.0.1-pre26 survive-first backward-d
 extern int64_t g_muxtest_back_at_us;     /* TEST ONLY (pre26 gates): one injected backward audio
                                           * dts at the mux feed, t µs after mux start (0 = off) */
 extern int64_t g_muxtest_back_ms;        /* TEST ONLY: injected backward magnitude (ms) */
+extern int     g_muxdiag;                /* pre26 D3: gated emission-point backward-label instrumentation */
 extern int     g_prog_off;
 extern int     g_progoff_av;
 extern int     g_layera;
