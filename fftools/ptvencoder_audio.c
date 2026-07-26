@@ -1844,6 +1844,10 @@ static int audio_drain_fg(AudioState *a)
  * corrupt single-frame flip at a splice boundary doesn't trigger a spurious reconfig (legacy 0003). */
 #define PTV_AFMT_HYSTERESIS 5
 
+/* memcap F1: AFMT rebuild-storm circuit-breaker master switch (-1 = parse PTV_NO_AFMT_BREAKER
+ * on first confirmed rebuild candidate; audio threads race benignly — same getenv result). */
+static int g_afmt_breaker = -1;
+
 /* 1.0.1-pre15 #33 (g_glueclass): publish this track's NEWEST still-open pad-ledger entry so
  * the demux §5.A.2 absorber can decline to erase a matching backward return leg at the packet
  * layer (advisory — AGLUE's own ledger scan is the authoritative match). Audio thread only. */
@@ -2044,6 +2048,40 @@ static int audio_feed(AudioState *a, AVFrame *frame)
         }
         if (++a->afmt_stable < PTV_AFMT_HYSTERESIS)
             return 0;                              /* still settling — drop (downstream can't take the change) */
+        /* memcap F1: rebuild-storm CIRCUIT-BREAKER. A flapping origin (CORELINK class flaps
+         * 44.1<->48kHz across discontinuities, sometimes continuously) confirms a "new" format
+         * over and over; every rebuild churns the whole -af graph (measured ~2MB RSS/rebuild of
+         * allocator fragmentation with a FLAT live heap — the growth is unbounded only in
+         * rebuild COUNT = the HTTV 26GB RSS-runaway class, and pre26's crash fix means flap
+         * storms now survive long enough for it to matter). Enforce an ESCALATING minimum
+         * interval between rebuilds: 2nd rebuild within 120s of the previous starts the backoff
+         * at 2s, doubling to a 60s cap; 120s of rebuild quiet resets it. While the breaker
+         * holds, changed-format frames keep being dropped (the existing settling posture —
+         * during a flap storm the audio is upstream-garbage anyway, the Azorse broken-phase
+         * rule); the flap that is still present when the interval expires rebuilds normally.
+         * Bounds the churn to ~1 rebuild/min worst case. PTV_NO_AFMT_BREAKER=1 disables. */
+        if (g_afmt_breaker < 0) {
+            const char *bs = getenv("PTV_NO_AFMT_BREAKER");
+            g_afmt_breaker = !(bs && atoi(bs));
+        }
+        if (g_afmt_breaker && a->afmt_next_ok_us) {
+            int64_t bnow = av_gettime_relative();
+            if (bnow < a->afmt_next_ok_us) {
+                if (a->afmt_stable > PTV_AFMT_HYSTERESIS)
+                    a->afmt_stable = PTV_AFMT_HYSTERESIS;   /* stay "confirmed", don't overflow */
+                a->afmt_bk_dropped++;
+                if (bnow - a->afmt_bk_log_us >= 5000000) {
+                    a->afmt_bk_log_us = bnow;
+                    av_log(NULL, AV_LOG_WARNING,
+                           "[PTV-AFMT] a%d(in%d) rebuild BREAKER holding %.1fs more (backoff %.0fs, "
+                           "flap storm; %"PRId64" frames dropped) — origin keeps flapping audio params "
+                           "(PTV_NO_AFMT_BREAKER=1 disables)\n",
+                           a->dbg_k, a->dbg_in, (a->afmt_next_ok_us - bnow) / 1e6,
+                           a->afmt_backoff_us / 1e6, a->afmt_bk_dropped);
+                }
+                return 0;
+            }
+        }
         {   /* confirmed: rebuild for the new params (a->dec already reflects them) */
             char ochl[64], nchl[64], tchl[64];
             av_channel_layout_describe(&a->fg_in_chl, ochl, sizeof ochl);
@@ -2075,6 +2113,26 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                 if (a->swr) swr_init(a->swr);
             }
             a->afmt_rebuilds++;                    /* pre14: an AFMT rebuild is a corrector event (§4.4) */
+            /* memcap F1: escalate the breaker interval — a rebuild within 120s of the previous
+             * doubles the backoff (2s start, 60s cap); 120s of quiet resets it. Covers ACHOP
+             * too (its teardown re-forms through this same confirm site). */
+            {
+                int64_t brb = av_gettime_relative();
+                if (a->afmt_last_rb_us && brb - a->afmt_last_rb_us < 120000000)
+                    a->afmt_backoff_us = a->afmt_backoff_us ? FFMIN(a->afmt_backoff_us * 2, 60000000)
+                                                            : 2000000;
+                else
+                    a->afmt_backoff_us = 0;
+                a->afmt_last_rb_us = brb;
+                a->afmt_next_ok_us = a->afmt_backoff_us ? brb + a->afmt_backoff_us : 0;
+                a->afmt_bk_dropped = 0;
+                if (a->afmt_backoff_us)
+                    av_log(NULL, AV_LOG_WARNING,
+                           "[PTV-AFMT] a%d(in%d) rebuild #%d within 120s of the last — breaker "
+                           "backoff now %.0fs (flap-storm churn bound; PTV_NO_AFMT_BREAKER=1 "
+                           "disables)\n",
+                           a->dbg_k, a->dbg_in, a->afmt_rebuilds, a->afmt_backoff_us / 1e6);
+            }
             a->fg_in_rate = a->dec->sample_rate;   /* the path is now configured for these */
             a->fg_in_fmt  = a->dec->sample_fmt;
             av_channel_layout_uninit(&a->fg_in_chl);

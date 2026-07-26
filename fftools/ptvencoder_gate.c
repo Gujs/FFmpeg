@@ -26,6 +26,11 @@
 #include "libavfilter/buffersink.h"
 #include "libswresample/swresample.h"
 
+#include <unistd.h>            /* memcap F2: _exit + sysconf for the RSS cap watchdog */
+#if defined(__APPLE__)
+#include <mach/mach.h>         /* memcap F2: task_info(MACH_TASK_BASIC_INFO) RSS on macOS */
+#endif
+
 #include "ptvencoder.h"
 
 #define PTV_WD_DEADLINE_US (2 * (int64_t)AV_TIME_BASE)   /* watchdog stall threshold */
@@ -712,6 +717,30 @@ void push_frame_q(AVThreadMessageQueue *q, int live, int64_t *framedrop, AVFrame
     }
 }
 
+/* memcap F2: process RSS in bytes (-1 = unknown). Linux: /proc/self/statm resident pages;
+ * macOS: mach task_info. Called every ~10s from the master watchdog — negligible cost. */
+static int64_t ptv_self_rss_bytes(void)
+{
+#if defined(__APPLE__)
+    struct mach_task_basic_info mi;
+    mach_msg_type_number_t cnt = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&mi, &cnt) == KERN_SUCCESS)
+        return (int64_t)mi.resident_size;
+    return -1;
+#elif defined(__linux__)
+    long tot = 0, res = -1;
+    FILE *f = fopen("/proc/self/statm", "r");
+    if (f) {
+        if (fscanf(f, "%ld %ld", &tot, &res) != 2)
+            res = -1;
+        fclose(f);
+    }
+    return res > 0 ? (int64_t)res * sysconf(_SC_PAGESIZE) : -1;
+#else
+    return -1;
+#endif
+}
+
 /* watchdog: flag (does not yet auto-recover) a stalled output/encoder so a hung
  * NVENC session is visible. A hung in-process session can't be safely torn down
  * from another thread, so auto-reinit needs process isolation — a follow-up. */
@@ -720,8 +749,55 @@ void *watchdog_thread(void *arg)
     VideoCtx *v = arg;
     int64_t hb_rl_vdec[PTV_MAX_INPUT] = {0};   /* 1.0.1-pre21: per-slot [PTV-STALL] rate limit (60s) */
     int64_t hb_rl_out = 0;
+    /* memcap F2: RSS cap watchdog (the HTTV 26GB-in-46min runaway killed NEIGHBORS with
+     * ENOMEM before the channel itself died — a per-process ceiling turns a box-wide
+     * incident into one supervised respawn). PTV_RSS_CAP_MB, default 8192 (normal RSS
+     * ~0.4GB; deep-prime/bank peaks measured ~2-3GB => >2.5x headroom), 0 disables.
+     * Warn (60s rate limit) at >=75%; FATAL on 2 consecutive 10s samples >= cap —
+     * _exit(1), never exit() (the pre26 wedge lesson). Master watchdog only. */
+    int64_t rss_cap_bytes = -1, rss_warn_last = 0;
+    int     rss_breaches = 0, wd_pass = 0;
     while (!v->output_done) {
         av_usleep(500000);
+        if (v->is_master && ++wd_pass >= 20) {
+            wd_pass = 0;
+            if (rss_cap_bytes < 0) {
+                const char *rc = getenv("PTV_RSS_CAP_MB");
+                int64_t mb = rc ? atoll(rc) : 8192;
+                rss_cap_bytes = mb > 0 ? mb * 1048576 : 0;
+            }
+            if (rss_cap_bytes > 0) {
+                int64_t rss = ptv_self_rss_bytes();
+                if (rss >= rss_cap_bytes) {
+                    if (++rss_breaches >= 2) {
+                        av_log(NULL, AV_LOG_FATAL,
+                               "[PTV-MEMCAP] RSS %.2f GB >= cap %.2f GB on 2 consecutive samples — "
+                               "memory runaway (HTTV class); exiting for supervised respawn "
+                               "(PTV_RSS_CAP_MB=%lld, 0 disables)\n",
+                               rss / 1073741824.0, rss_cap_bytes / 1073741824.0,
+                               (long long)(rss_cap_bytes / 1048576));
+                        fflush(NULL);
+                        _exit(1);
+                    }
+                    av_log(NULL, AV_LOG_WARNING,
+                           "[PTV-MEMCAP] RSS %.2f GB >= cap %.2f GB (sample 1 of 2) — fatal on the "
+                           "next 10s sample\n", rss / 1073741824.0, rss_cap_bytes / 1073741824.0);
+                } else {
+                    rss_breaches = 0;
+                    if (rss >= 0 && rss >= rss_cap_bytes - rss_cap_bytes / 4) {
+                        int64_t wnow = av_gettime_relative();
+                        if (wnow - rss_warn_last >= 60000000) {
+                            rss_warn_last = wnow;
+                            av_log(NULL, AV_LOG_WARNING,
+                                   "[PTV-MEMCAP] RSS %.2f GB at >=75%% of the %.2f GB cap — "
+                                   "memory growth under way (capture pmap + [PTV-AFMT]/[PTV-CUSHION] "
+                                   "lines now; PTV_RSS_CAP_MB tunes the ceiling)\n",
+                                   rss / 1073741824.0, rss_cap_bytes / 1073741824.0);
+                        }
+                    }
+                }
+            }
+        }
         /* 1.0.1-pre21 thread-position heartbeats (design note at the g_hb_* externs): the
          * MASTER rung's watchdog (a different thread from every stamped one) checks the
          * stamps each pass. A vdec stamp >5s old while its input's demux stamp is fresh

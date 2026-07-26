@@ -583,6 +583,15 @@ typedef struct AudioState {
     enum AVSampleFormat afmt_pending_fmt;
     AVChannelLayout  afmt_pending_chl;
     int              afmt_stable;          /* consecutive frames seen at the candidate params */
+    /* memcap F1: AFMT rebuild-storm circuit-breaker (flapping origins — CORELINK 44.1<->48kHz —
+     * fire rebuilds continuously; each graph free/rebuild cycle churns ~2MB of allocator
+     * fragmentation (measured, flat live-heap), unbounded ONLY in rebuild count = the HTTV
+     * RSS-runaway class). Escalating minimum interval between rebuilds; see audio_feed. */
+    int64_t          afmt_last_rb_us;      /* wall time of the last rebuild (0 = none yet) */
+    int64_t          afmt_backoff_us;      /* current escalated min-interval (0 = no backoff) */
+    int64_t          afmt_next_ok_us;      /* earliest wall time the next rebuild may run */
+    int64_t          afmt_bk_dropped;      /* frames dropped while the breaker held */
+    int64_t          afmt_bk_log_us;       /* rate limit for the breaker WARNING line */
     AVAudioFifo     *fifo;
     int              frame_size;
     int              out_rate;
