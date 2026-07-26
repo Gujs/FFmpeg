@@ -2085,6 +2085,26 @@ static int audio_feed(AudioState *a, AVFrame *frame)
              * current house mapping instead of the carried one (see ptv_rebuild_reanchor).
              * Runs for ACHOP-triggered rebuilds too — they complete through this same site. */
             ptv_rebuild_reanchor(a, frame);
+            /* 1.0.1-pre26 ROOT-CAUSE FIX (the NBS/CORELINK backward-label mux killer,
+             * live 2026-07-25, 8+ crashes/24h; fixture-reproduced): a BACKWARD door step
+             * left in the labels (a flush-routed negative mismatch / pad round-trip — the
+             * exp_hit "aresample drops content" remedies) opens a window of |step| seconds
+             * where the OLD graph's emitted labels lead its input labels while swr realizes
+             * the drop. A rebuild landing INSIDE that window destroys the swr state that
+             * carried the high-water mark: the NEW graph re-seeds its output at the door
+             * labels — up to |step| BEHIND the last emitted label — and the next emission
+             * is a backward DTS into the muxer (measured: door −2773ms → rebuild → emission
+             * −2667ms → libfdk "Queue input is backward in time" → mpegts EINVAL → all
+             * rungs die). ptv_rebuild_reanchor keeps the DOOR labels continuous (correct)
+             * but never protected the EMISSION side. Arm the existing pre20 monotonic
+             * emission guard at EVERY rebuild (unconditionally — also when the re-anchor
+             * itself gated off): it drops post-rebuild frames until the first label that
+             * exceeds the last emitted one, realizing the interrupted drop's REMAINDER as
+             * the same content skip the old graph was mid-way through — label-only, no
+             * re-stamp, releases with the existing [PTV-ANCHOR] guard line. The mv follow
+             * path is excluded inside the guard itself (its af_last_out clamp owns this). */
+            a->reanch_mono = 1;
+            a->reanch_mono_dropped = 0;
             /* 1.0.1-pre19 #42 hardening: the rebuild above configured the path from a->dec,
              * but THIS frame (the confirming one) falls through to be fed below. During a
              * broken-AAC phase the decoder context can diverge from the frames it emitted
