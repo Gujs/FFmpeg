@@ -135,6 +135,15 @@ int     g_recanchor_test_abort_n = 0;  /* TEST ONLY (rr24 F2 gate): force ONE mi
                                         * N applied steps, no content event injected — so the clean
                                         * re-engage-on-remainder path can be gated. 0 = off (default,
                                         * byte-identical). PTV_RECANCHOR_TEST_ABORT_N. */
+int     g_muxguard = 1;            /* 1.0.1-pre26 [PTV-MUXGUARD] survive-first mux backstop: drop (never
+                                           * re-stamp) any packet whose DTS would EINVAL lavf's per-stream
+                                           * monotonic feed check, instead of letting one leaked backward label
+                                           * kill all rungs at once (NBS/CORELINK live crash class 2026-07-25).
+                                           * PTV_NO_MUXGUARD=1 disables (pre24 EINVAL-exit behavior). */
+int64_t g_muxtest_back_at_us = 0;  /* TEST ONLY (pre26 W1/W2 gates): PTV_MUXTEST_BACK_AT_S — inject ONE
+                                        * artificial backward audio dts at the mux feed t s after mux start.
+                                        * 0 = off (default, byte-identical). */
+int64_t g_muxtest_back_ms = 2795;  /* TEST ONLY: PTV_MUXTEST_BACK_MS (default ≈ the live −2794.7ms). */
 int     g_anchor_headfill = 1;     /* 1.0.1 anchor head-fill (PTV_NO_ANCHOR_HEADFILL reverts): when the source's
                                            * audio head is missing at birth (first kept audio >200ms after h0, or the
                                            * pre-h0 ring overflowed), synthesize silence covering house 0 → first kept
@@ -1430,6 +1439,25 @@ static void *mux_thread(void *arg)
     MuxArgs *m = arg;
     AVPacket *pkt;
     int done = 0, ret;
+    /* 1.0.1-pre26 [PTV-MUXGUARD] survive-first backward-DTS backstop (PTV_NO_MUXGUARD=1
+     * disables). Live crash class (NBS/CORELINK 2026-07-25, 8+ in 24h): a remedy-leaked
+     * BACKWARD audio label reaches the muxer → lavf mux.c EINVALs the feed ("non
+     * monotonically increasing dts") → every rung dies at once (single audio encode fans
+     * out) → supervised respawn (and, before pre26, a wedged exit). A dropped packet is a
+     * ~24ms content blip; a dead mux is a dead channel. So: mirror lavf's per-stream
+     * monotonic check HERE (it fires at FEED time, compute_muxer_pkt_fields — so a
+     * last-fed-DTS mirror is exactly aligned with what EINVALs) and DROP the offending
+     * packet with a loud rate-limited diag + counter instead of feeding it to its death.
+     * LABEL-ONLY: never re-stamps. The EINVAL fatal path below REMAINS as final backstop.
+     * No interaction with reanch_mono (that guard drops FRAMES pre-encode; whatever it
+     * drops never becomes a packet — this one catches only what actually leaks through). */
+    int       mg_n = m->ofmt->nb_streams;
+    int64_t  *mg_last = av_malloc_array(mg_n > 0 ? mg_n : 1, sizeof(*mg_last));
+    int64_t   mg_dropped = 0, mg_warn_last = 0;
+    int64_t   mt0 = av_gettime_relative();
+    int       mg_test_injected = 0;
+    if (mg_last)
+        for (int i = 0; i < mg_n; i++) mg_last[i] = AV_NOPTS_VALUE;
 
     for (;;) {
         ret = av_thread_message_queue_recv(m->mux_q, &pkt, 0);
@@ -1443,6 +1471,51 @@ static void *mux_thread(void *arg)
         {
             int64_t wt0 = g_diag ? av_gettime_relative() : 0;
             int stream_index = pkt->stream_index;
+            /* TEST ONLY (pre26 W1/W2 gates, PTV_RECANCHOR_TEST_ABORT_N precedent):
+             * PTV_MUXTEST_BACK_AT_S=<t> re-stamps the first AUDIO packet ≥t s after mux
+             * start backward by PTV_MUXTEST_BACK_MS (default 2795 ≈ the live −2794.7ms),
+             * once per rung — the live shape: one fanned-out backward audio packet hits
+             * every rung at the same content position. 0/unset = off, byte-identical. */
+            if (g_muxtest_back_at_us > 0 && !mg_test_injected &&
+                pkt->dts != AV_NOPTS_VALUE && stream_index < mg_n &&
+                m->ofmt->streams[stream_index]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
+                av_gettime_relative() - mt0 >= g_muxtest_back_at_us) {
+                int64_t back = av_rescale_q(g_muxtest_back_ms * 1000, AV_TIME_BASE_Q,
+                                            m->ofmt->streams[stream_index]->time_base);
+                pkt->dts -= back;
+                if (pkt->pts != AV_NOPTS_VALUE) pkt->pts -= back;
+                mg_test_injected = 1;
+                av_log(NULL, AV_LOG_WARNING,
+                       "[PTV-MUXTEST] rung %d: injected backward dts (-%"PRId64"ms) on stream %d "
+                       "(gate fixture, PTV_MUXTEST_BACK_AT_S)\n",
+                       m->rung, g_muxtest_back_ms, stream_index);
+            }
+            if (g_muxguard && mg_last && pkt->dts != AV_NOPTS_VALUE && stream_index < mg_n) {
+                enum AVMediaType mgt = m->ofmt->streams[stream_index]->codecpar->codec_type;
+                int     strict = mgt != AVMEDIA_TYPE_SUBTITLE && mgt != AVMEDIA_TYPE_DATA;
+                int64_t last   = mg_last[stream_index];
+                /* `last != 0` mirrors lavf's `sti->cur_dts &&` quirk: fire iff the muxer
+                 * would EINVAL, never stricter. */
+                if (last != AV_NOPTS_VALUE && last != 0 &&
+                    (strict ? pkt->dts <= last : pkt->dts < last)) {
+                    int64_t now = av_gettime_relative();
+                    int64_t back_ms = av_rescale_q(last - pkt->dts,
+                                                   m->ofmt->streams[stream_index]->time_base,
+                                                   (AVRational){ 1, 1000 });
+                    mg_dropped++;
+                    if (now - mg_warn_last >= 1000000) {
+                        mg_warn_last = now;
+                        av_log(NULL, AV_LOG_WARNING,
+                               "[PTV-MUXGUARD] rung %d stream %d: dropped pkt with backward dts "
+                               "(-%"PRId64"ms vs last) — remedy leak, channel survives "
+                               "(%"PRId64" dropped on this rung so far)\n",
+                               m->rung, stream_index, back_ms, mg_dropped);
+                    }
+                    av_packet_free(&pkt);
+                    continue;
+                }
+                mg_last[stream_index] = pkt->dts;
+            }
             g_muxed_bytes += pkt->size;
             ret = av_interleaved_write_frame(m->ofmt, pkt);
             if (g_diag) {
@@ -1458,14 +1531,20 @@ static void *mux_thread(void *arg)
                  * into a dead mux_q, removing ALL backpressure from the audio thread — the
                  * sustained-allocation enabler). A dead mux IS a dead channel either way:
                  * die loud so supervisord respawns a working one. No env gate — this is
-                 * defense-in-depth, not behavior anyone can want to keep. */
+                 * defense-in-depth, not behavior anyone can want to keep.
+                 * 1.0.1-pre26: _exit(1), NOT exit(1). exit() runs atexit/cleanup handlers
+                 * from THIS (non-main) thread while udp-rx/CUDA/audio threads run and hold
+                 * locks — live-captured wedge (NBS cor-3 / CORELINK glo-2 2026-07-25): the
+                 * exiting thread parked in futex_do_wait inside exit cleanup, process
+                 * zombied with a dead wire until sync_check bounced it minutes later.
+                 * _exit() skips all handlers (fflush(NULL) first so the FATAL line lands). */
                 m->err = ret;
                 av_log(NULL, AV_LOG_FATAL,
                        "[PTV-MUX] rung %d write failed on stream %d: %s — a dead mux is a dead "
                        "channel; exiting for supervised respawn\n",
                        m->rung, stream_index, av_err2str(ret));
                 fflush(NULL);
-                exit(1);
+                _exit(1);
             }
         }
         /* pre14 (§3, owner call 3): per-rung wire-send watermark — stamped ONLY after a
@@ -1475,6 +1554,10 @@ static void *mux_thread(void *arg)
         atomic_store_explicit(&g_mux_sent_wc[m->rung], av_gettime_relative(), memory_order_relaxed);
         g_muxed++;
     }
+    if (mg_dropped)
+        av_log(NULL, AV_LOG_WARNING, "[PTV-MUXGUARD] rung %d: %"PRId64" backward-dts pkts "
+               "dropped in total this run\n", m->rung, mg_dropped);
+    av_freep(&mg_last);
     av_thread_message_queue_set_err_send(m->mux_q, AVERROR_EOF);   /* unblock producers (SENDERS) */
     return NULL;
 }
@@ -2865,6 +2948,9 @@ int main(int argc, char **argv)
     { const char *s = getenv("PTV_RECANCHOR_SETTLE_S");   if (s && atoi(s) > 0) g_recanchor_settle_us   = (int64_t)atoi(s) * 1000000; }
     { const char *s = getenv("PTV_RECANCHOR_COOLDOWN_S"); if (s && atoi(s) > 0) g_recanchor_cooldown_us = (int64_t)atoi(s) * 1000000; }
     { const char *s = getenv("PTV_RECANCHOR_TEST_ABORT_N"); if (s && atoi(s) > 0) g_recanchor_test_abort_n = atoi(s); }  /* TEST ONLY (rr24 F2 gate) */
+    if (getenv("PTV_NO_MUXGUARD")) g_muxguard = 0;   /* 1.0.1-pre26: disable the survive-first backward-dts mux backstop (pre24 EINVAL-exit behavior) */
+    { const char *s = getenv("PTV_MUXTEST_BACK_AT_S"); if (s && atoi(s) > 0) g_muxtest_back_at_us = (int64_t)atoi(s) * 1000000; }  /* TEST ONLY (pre26 gates) */
+    { const char *s = getenv("PTV_MUXTEST_BACK_MS");   if (s && atoi(s) > 0) g_muxtest_back_ms = atoi(s); }                        /* TEST ONLY (pre26 gates) */
     { const char *s = getenv("PTV_NOVIDEO_EXIT_S"); if (s) g_novideo_exit_us = (int64_t)atoll(s) * 1000000; }  /* 1.0.1-pre23 startup sanity; 0 disables */
     /* 0.9.18.7: PTV_AGLUE_MAX_MS (1000ms) / PTV_DISCONT_MS (1000ms) / PTV_DISCONT_BACK_MS (80ms)
      * internalized — see g_aglue_max_ms / g_discont_ms / g_discont_back_ms */

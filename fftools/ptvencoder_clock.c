@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>   /* _exit() — 1.0.1-pre26 wedge-free fatal path */
 #include <pthread.h>
 #include <stdatomic.h>
 #include <time.h>
@@ -478,7 +479,11 @@ void *output_thread(void *arg)
                                "%ds since start — undecodable video; exiting for supervised respawn "
                                "(PTV_NOVIDEO_EXIT_S)\n", (int)(g_novideo_exit_us / 1000000));
                         fflush(NULL);
-                        exit(1);
+                        /* 1.0.1-pre26: _exit, not exit — same wedge class as the [PTV-MUX]
+                         * fatal path (exit() from a non-main thread runs atexit/cleanup
+                         * handlers while demux/CUDA threads hold locks; live-captured
+                         * futex_do_wait zombie). fflush(NULL) above lands the line. */
+                        _exit(1);
                     }
                 }
             }

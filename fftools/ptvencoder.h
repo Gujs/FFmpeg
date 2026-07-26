@@ -1376,6 +1376,11 @@ extern int64_t g_recanchor_cooldown_us;  /* re-engage holdoff after a completed 
                                           * (PTV_RECANCHOR_COOLDOWN_S, 1800s) */
 extern int     g_recanchor_test_abort_n; /* TEST ONLY (rr24 F2 gate): force one mid-walk abort
                                           * after N steps, no event injected (0 = off, default) */
+extern int     g_muxguard;               /* 1.0.1-pre26 survive-first backward-dts mux backstop
+                                          * (PTV_NO_MUXGUARD=1 disables) */
+extern int64_t g_muxtest_back_at_us;     /* TEST ONLY (pre26 gates): one injected backward audio
+                                          * dts at the mux feed, t µs after mux start (0 = off) */
+extern int64_t g_muxtest_back_ms;        /* TEST ONLY: injected backward magnitude (ms) */
 extern int     g_prog_off;
 extern int     g_progoff_av;
 extern int     g_layera;
