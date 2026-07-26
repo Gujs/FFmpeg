@@ -7,6 +7,35 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(7x) PRE27 — THE MEMORY-RUNAWAY CLASS (ENT-CORELINK-HTTV glo-2 2026-07-26: 26.2GB RSS in
+~46min on pre24, neighbors ENOMEM-killed by slice pressure; normal RSS 0.4GB). Hunt verdict
+(memhunt, local pre24 fixtures + live Praise_TV thread/queue captures): the WEDGE does NOT
+grow (measured flat 17min with input flowing, default AND deep-prime; every queue is capped —
+video_q ≤2048 deep-prime, frame_q ≤PTV_FRAMEQ, mux_q 48, gate lists bounded, disc buffer
+per-cycle-freed, udp fifo stock-bounded; Praise's vq=2048 was the CAP, not growth); storm
+events step RSS once via AUTO-BANK/cushion escalation filling frame_q to cap (bounded
+pool-peak ratchet, +600MB local). The UNBOUNDED axis is AFMT REBUILD COUNT: param-flapping
+origins (CORELINK flaps 44.1<->48kHz across discontinuities — Riff_TV [PTV-AFMT] 2.9s before
+its EINVAL death) confirm audio-path rebuilds forever; each rebuild churns the whole -af
+graph (~2MB/cycle transient, live heap FLAT = allocator churn, which glibc's per-thread
+arenas retain far worse than macOS); a 6s-flap fixture also reproduced pre24's full EINVAL
+crash chain at rebuild #3 (60s) — and with pre26's crash fix the channel now SURVIVES the
+storm, so the churn runs indefinitely. Two bounds, both new:
+1) [PTV-AFMT] REBUILD-STORM CIRCUIT-BREAKER (audio_feed confirm block): an escalating
+   minimum interval between rebuilds — 2nd rebuild within 120s starts at 2s, doubles to a
+   60s cap, 120s of quiet resets; while held, changed-format frames keep dropping (the
+   existing settling posture; flap-storm audio is upstream-garbage anyway) and a rate-limited
+   WARNING names the hold. Bounds worst-case churn to ~1 rebuild/min. Covers ACHOP re-forms
+   (same confirm site). Measured A/B (6s flap, 6-rung, ~6min): pre26 57 rebuilds vs memcap
+   10 rebuilds + breaker lines. PTV_NO_AFMT_BREAKER=1 disables.
+2) [PTV-MEMCAP] RSS CAP WATCHDOG (master watchdog thread, 10s samples): PTV_RSS_CAP_MB
+   (default 8192, 0 disables) — WARNING at 75% (with a capture-now hint), FATAL + fflush +
+   _exit(1) on two consecutive samples >= cap: one supervised respawn at a bounded size
+   instead of a 26GB box-killer taking out neighbors. Linux /proc/self/statm; macOS mach
+   task_info. Live-fired in gate (900MB test cap: warn + fatal + death <2s).
+   Ops note: MALLOC_ARENA_MAX=2 in the channel wrapper is a zero-code live A/B lever for
+   the glibc-arena-retention half of the runaway.
+
 (7w) PRE26 — THE BACKWARD-LABEL MUX-DEATH CLASS (NBS/CORELINK live 2026-07-25, 8+ crashes in
 24h): wedge-free fatal exits + survive-first mux backstop + the emitter root-cause fix.
 Kills: PTV_NO_MUXGUARD=1 disables the mux backstop (pre24 EINVAL-exit behavior). Diagnostics:
