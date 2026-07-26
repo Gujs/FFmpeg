@@ -144,8 +144,30 @@ int64_t g_muxtest_back_at_us = 0;  /* TEST ONLY (pre26 W1/W2 gates): PTV_MUXTEST
                                         * artificial backward audio dts at the mux feed t s after mux start.
                                         * 0 = off (default, byte-identical). */
 int64_t g_muxtest_back_ms = 2795;  /* TEST ONLY: PTV_MUXTEST_BACK_MS (default ≈ the live −2794.7ms). */
+int64_t g_muxtest_back_hold_us = 0; /* TEST ONLY (pre27 #62 GF gate): PTV_MUXTEST_BACK_HOLD_S — with >0,
+                                        * the backward-dts injection above applies to EVERY audio pkt in
+                                        * [back_at, back_at+hold) instead of once, so [PTV-MUXGUARD] drops
+                                        * continuously (exercises the 60s drop-span ceiling). 0 = off. */
 int     g_muxdiag = 0;             /* pre26 D3 instrumentation (PTV_MUXDIAG=1): emission-point backward-label
                                         * detector + state dump in the audio thread. Diagnostic only. */
+int     g_muxtol = 1;              /* 1.0.1-pre27 #62 [PTV-MUXTOL] egress-pressure errno filter (Praise_TV
+                                        * glo-2 death loop 2026-07-24: bitrate=-paced udp egress with a ~6.4s
+                                        * fifo_size — every respawn's startup catch-up burst filled the fifo
+                                        * ~6-7s after anchor, udp.c returned ENOMEM, the pre26 always-fatal
+                                        * path killed the channel again; 7 deaths, channel dark). ENOMEM/
+                                        * EAGAIN from the mux write = transient egress pressure: DROP the pkt
+                                        * + count + rate-limited warn and keep muxing; a rung with NO
+                                        * successful write for 60s escalates to the fatal path (a dark
+                                        * channel needs the respawn anyway — never a forever-throttled
+                                        * zombie). Everything else (EINVAL label corruption = the pre26
+                                        * crash class, EPIPE, EIO, ...) stays immediately fatal.
+                                        * PTV_NO_MUXTOL=1 reverts (any write error = fatal, pre26 behavior). */
+int     g_muxfail_sim_err = 0;     /* TEST ONLY (pre27 #62 gates): PTV_MUXFAIL_SIM="<errno>:<start_s>:<dur_s>"
+                                        * (errno = enomem|eagain|einval) — the write path pretends
+                                        * av_interleaved_write_frame returned that error (pkt NOT written)
+                                        * during the window, measured from mux start. 0 = off (unset =
+                                        * byte-identical). */
+int64_t g_muxfail_sim_from_us = 0, g_muxfail_sim_to_us = 0;
 int     g_anchor_headfill = 1;     /* 1.0.1 anchor head-fill (PTV_NO_ANCHOR_HEADFILL reverts): when the source's
                                            * audio head is missing at birth (first kept audio >200ms after h0, or the
                                            * pre-h0 ring overflowed), synthesize silence covering house 0 → first kept
@@ -1458,6 +1480,16 @@ static void *mux_thread(void *arg)
     int64_t   mg_dropped = 0, mg_warn_last = 0;
     int64_t   mt0 = av_gettime_relative();
     int       mg_test_injected = 0;
+    /* 1.0.1-pre27 #62 (pre26 review rider): [PTV-MUXGUARD] drop-span ceiling — per-stream
+     * wallclock of the first drop of a CONTINUOUS drop run (0 = not dropping; reset when a
+     * pkt on that stream is accepted by the guard). 60s of uninterrupted drops on one stream
+     * means the label stream is dead, not leaking: escalate to the fatal path instead of
+     * silently discarding that stream forever. Governed by g_muxguard (no guard, no ceiling). */
+    int64_t  *mg_dropsince = av_calloc(mg_n > 0 ? mg_n : 1, sizeof(*mg_dropsince));
+    /* 1.0.1-pre27 #62 [PTV-MUXTOL] per-rung tolerated-write state (thread-local; one
+     * mux_thread per rung): running count, 10s warn rate limit, wallclock of the last
+     * SUCCESSFUL write (the 60s dead-egress ceiling base — starts at mux start). */
+    int64_t   tol_count = 0, tol_warn_last = 0, tol_last_ok = mt0;
     if (mg_last)
         for (int i = 0; i < mg_n; i++) mg_last[i] = AV_NOPTS_VALUE;
 
@@ -1477,20 +1509,28 @@ static void *mux_thread(void *arg)
              * PTV_MUXTEST_BACK_AT_S=<t> re-stamps the first AUDIO packet ≥t s after mux
              * start backward by PTV_MUXTEST_BACK_MS (default 2795 ≈ the live −2794.7ms),
              * once per rung — the live shape: one fanned-out backward audio packet hits
-             * every rung at the same content position. 0/unset = off, byte-identical. */
-            if (g_muxtest_back_at_us > 0 && !mg_test_injected &&
+             * every rung at the same content position. 0/unset = off, byte-identical.
+             * 1.0.1-pre27 #62 GF gate: PTV_MUXTEST_BACK_HOLD_S=<dur> widens the injection
+             * to EVERY audio pkt in [back_at, back_at+hold) — with a back_ms larger than
+             * the hold, [PTV-MUXGUARD] then drops continuously for the whole window
+             * (exercises the 60s drop-span ceiling below). */
+            if (g_muxtest_back_at_us > 0 &&
                 pkt->dts != AV_NOPTS_VALUE && stream_index < mg_n &&
                 m->ofmt->streams[stream_index]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
-                av_gettime_relative() - mt0 >= g_muxtest_back_at_us) {
+                av_gettime_relative() - mt0 >= g_muxtest_back_at_us &&
+                (g_muxtest_back_hold_us > 0
+                     ? av_gettime_relative() - mt0 < g_muxtest_back_at_us + g_muxtest_back_hold_us
+                     : !mg_test_injected)) {
                 int64_t back = av_rescale_q(g_muxtest_back_ms * 1000, AV_TIME_BASE_Q,
                                             m->ofmt->streams[stream_index]->time_base);
                 pkt->dts -= back;
                 if (pkt->pts != AV_NOPTS_VALUE) pkt->pts -= back;
+                if (!mg_test_injected)
+                    av_log(NULL, AV_LOG_WARNING,
+                           "[PTV-MUXTEST] rung %d: injected backward dts (-%"PRId64"ms) on stream %d "
+                           "(gate fixture, PTV_MUXTEST_BACK_AT_S)\n",
+                           m->rung, g_muxtest_back_ms, stream_index);
                 mg_test_injected = 1;
-                av_log(NULL, AV_LOG_WARNING,
-                       "[PTV-MUXTEST] rung %d: injected backward dts (-%"PRId64"ms) on stream %d "
-                       "(gate fixture, PTV_MUXTEST_BACK_AT_S)\n",
-                       m->rung, g_muxtest_back_ms, stream_index);
             }
             if (g_muxguard && mg_last && pkt->dts != AV_NOPTS_VALUE && stream_index < mg_n) {
                 enum AVMediaType mgt = m->ofmt->streams[stream_index]->codecpar->codec_type;
@@ -1505,6 +1545,22 @@ static void *mux_thread(void *arg)
                                                    m->ofmt->streams[stream_index]->time_base,
                                                    (AVRational){ 1, 1000 });
                     mg_dropped++;
+                    /* 1.0.1-pre27 #62 rider: 60s of CONTINUOUS drops on one stream with no
+                     * accepted pkt = a dead label stream, not a transient leak — exit for a
+                     * supervised respawn instead of discarding that stream forever. */
+                    if (mg_dropsince) {
+                        if (!mg_dropsince[stream_index]) {
+                            mg_dropsince[stream_index] = now;
+                        } else if (now - mg_dropsince[stream_index] >= 60000000) {
+                            av_log(NULL, AV_LOG_FATAL,
+                                   "[PTV-MUX] rung %d stream %d: MUXGUARD dropping continuously "
+                                   "for 60s (%"PRId64" dropped on this rung, none accepted on "
+                                   "this stream) — label stream dead; exiting for supervised "
+                                   "respawn\n", m->rung, stream_index, mg_dropped);
+                            fflush(NULL);
+                            _exit(1);
+                        }
+                    }
                     if (now - mg_warn_last >= 1000000) {
                         mg_warn_last = now;
                         av_log(NULL, AV_LOG_WARNING,
@@ -1517,15 +1573,57 @@ static void *mux_thread(void *arg)
                     continue;
                 }
                 mg_last[stream_index] = pkt->dts;
+                if (mg_dropsince) mg_dropsince[stream_index] = 0;   /* accepted — reset the drop span */
             }
             g_muxed_bytes += pkt->size;
-            ret = av_interleaved_write_frame(m->ofmt, pkt);
+            if (g_muxfail_sim_err) {
+                /* TEST ONLY (pre27 #62 gates): pretend the write failed inside the window —
+                 * the pkt is NOT written (a failed write loses it), matching the real shape. */
+                int64_t el = av_gettime_relative() - mt0;
+                if (el >= g_muxfail_sim_from_us && el < g_muxfail_sim_to_us)
+                    ret = g_muxfail_sim_err;
+                else
+                    ret = av_interleaved_write_frame(m->ofmt, pkt);
+            } else
+                ret = av_interleaved_write_frame(m->ofmt, pkt);
             if (g_diag) {
                 int64_t dlt = av_gettime_relative() - wt0;
                 if (dlt > 800000)
                     av_log(NULL, AV_LOG_WARNING, "[PTV-DIAG] write blocked %"PRId64" ms\n", dlt / 1000);
             }
             av_packet_free(&pkt);
+            if (ret < 0 && g_muxtol &&
+                (ret == AVERROR(ENOMEM) || ret == AVERROR(EAGAIN))) {
+                /* 1.0.1-pre27 #62 [PTV-MUXTOL]: ENOMEM/EAGAIN = transient egress pressure
+                 * (the paced-udp fifo is full — Praise_TV glo-2 respawn death loop
+                 * 2026-07-24: every restart's catch-up burst overran the bitrate=-paced
+                 * fifo_size egress ~6s after anchor, udp.c returned ENOMEM, the fatal path
+                 * below killed the channel again). A full fifo drains; a dropped pkt is a
+                 * blip. Tolerate: drop + count + rate-limited warn. But a rung with NO
+                 * successful write for 60 continuous seconds is a dead egress, not
+                 * pressure — a dark channel needs the respawn anyway, so escalate rather
+                 * than idle as a forever-throttled zombie. Everything else (EINVAL label
+                 * corruption = the pre26 crash class, EPIPE, EIO, ...) stays immediately
+                 * fatal below. PTV_NO_MUXTOL=1 reverts. */
+                int64_t now = av_gettime_relative();
+                tol_count++;
+                if (now - tol_last_ok >= 60000000) {
+                    av_log(NULL, AV_LOG_FATAL,
+                           "[PTV-MUX] rung %d egress dead 60s (tolerated %"PRId64" writes) — "
+                           "exiting for supervised respawn\n", m->rung, tol_count);
+                    fflush(NULL);
+                    _exit(1);
+                }
+                if (now - tol_warn_last >= 10000000) {
+                    tol_warn_last = now;
+                    av_log(NULL, AV_LOG_WARNING,
+                           "[PTV-MUXTOL] rung %d stream %d: %s from mux write — pkt dropped, "
+                           "channel survives (%"PRId64" tolerated on this rung so far)\n",
+                           m->rung, stream_index,
+                           ret == AVERROR(ENOMEM) ? "ENOMEM" : "EAGAIN", tol_count);
+                }
+                continue;
+            }
             if (ret < 0) {
                 /* 1.0.1-pre23 #54: a mux write error used to break out of this thread with
                  * ZERO log lines — the wire went dead while the process lived on as a silent
@@ -1553,13 +1651,18 @@ static void *mux_thread(void *arg)
          * SUCCESSFUL interleaved write, so a stalled/backed-up muxer (the Newsmax2 dead
          * rung, invisible to every label-domain signal) goes stale within seconds. The
          * corrector's delivery-liveness gate treats this as the primary signal. */
-        atomic_store_explicit(&g_mux_sent_wc[m->rung], av_gettime_relative(), memory_order_relaxed);
+        tol_last_ok = av_gettime_relative();     /* pre27 #62: dead-egress ceiling base */
+        atomic_store_explicit(&g_mux_sent_wc[m->rung], tol_last_ok, memory_order_relaxed);
         g_muxed++;
     }
     if (mg_dropped)
         av_log(NULL, AV_LOG_WARNING, "[PTV-MUXGUARD] rung %d: %"PRId64" backward-dts pkts "
                "dropped in total this run\n", m->rung, mg_dropped);
+    if (tol_count)
+        av_log(NULL, AV_LOG_WARNING, "[PTV-MUXTOL] rung %d: %"PRId64" egress-pressure write "
+               "errors tolerated in total this run\n", m->rung, tol_count);
     av_freep(&mg_last);
+    av_freep(&mg_dropsince);
     av_thread_message_queue_set_err_send(m->mux_q, AVERROR_EOF);   /* unblock producers (SENDERS) */
     return NULL;
 }
@@ -2953,7 +3056,23 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_MUXGUARD")) g_muxguard = 0;   /* 1.0.1-pre26: disable the survive-first backward-dts mux backstop (pre24 EINVAL-exit behavior) */
     { const char *s = getenv("PTV_MUXTEST_BACK_AT_S"); if (s && atoi(s) > 0) g_muxtest_back_at_us = (int64_t)atoi(s) * 1000000; }  /* TEST ONLY (pre26 gates) */
     { const char *s = getenv("PTV_MUXTEST_BACK_MS");   if (s && atoi(s) > 0) g_muxtest_back_ms = atoi(s); }                        /* TEST ONLY (pre26 gates) */
+    { const char *s = getenv("PTV_MUXTEST_BACK_HOLD_S"); if (s && atoi(s) > 0) g_muxtest_back_hold_us = (int64_t)atoi(s) * 1000000; }  /* TEST ONLY (pre27 #62 GF gate) */
     if (getenv("PTV_MUXDIAG")) g_muxdiag = 1;        /* pre26 D3: gated emission-point backward-label instrumentation */
+    if (getenv("PTV_NO_MUXTOL")) g_muxtol = 0;       /* 1.0.1-pre27 #62: any mux write error = fatal (pre26 behavior) */
+    { const char *s = getenv("PTV_MUXFAIL_SIM");     /* TEST ONLY (pre27 #62 gates): <errno>:<start_s>:<dur_s> */
+      if (s) {
+          char name[16] = ""; int st = 0, du = 0;
+          if (sscanf(s, "%15[a-z]:%d:%d", name, &st, &du) == 3 && st >= 0 && du > 0)
+              g_muxfail_sim_err = !strcmp(name, "enomem") ? AVERROR(ENOMEM) :
+                                  !strcmp(name, "eagain") ? AVERROR(EAGAIN) :
+                                  !strcmp(name, "einval") ? AVERROR(EINVAL) : 0;
+          if (g_muxfail_sim_err) {
+              g_muxfail_sim_from_us = (int64_t)st * 1000000;
+              g_muxfail_sim_to_us   = g_muxfail_sim_from_us + (int64_t)du * 1000000;
+          } else
+              av_log(NULL, AV_LOG_WARNING, "[PTV-MUXTOL] bad PTV_MUXFAIL_SIM '%s' "
+                     "(want enomem|eagain|einval:<start_s>:<dur_s>) — ignored\n", s);
+      } }
     { const char *s = getenv("PTV_NOVIDEO_EXIT_S"); if (s) g_novideo_exit_us = (int64_t)atoll(s) * 1000000; }  /* 1.0.1-pre23 startup sanity; 0 disables */
     /* 0.9.18.7: PTV_AGLUE_MAX_MS (1000ms) / PTV_DISCONT_MS (1000ms) / PTV_DISCONT_BACK_MS (80ms)
      * internalized — see g_aglue_max_ms / g_discont_ms / g_discont_back_ms */

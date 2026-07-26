@@ -7,6 +7,28 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(7y) PRE27 (same release) — #62 THE EGRESS-PRESSURE MUX-DEATH CLASS (Praise_TV glo-2
+2026-07-24: output udp uses bitrate= pacing + fifo_size=28672 ≈ 6.4s at the cap; every
+supervised respawn's startup prime/catch-up burst filled the paced egress fifo ~6-7s after
+anchor, udp.c returned ENOMEM from the write, and the pre26 always-fatal [PTV-MUX] path
+killed the channel again — 7 deaths in a row, channel dark). The fatal path treated ALL
+write errors alike; transient egress pressure is not label corruption.
+1) [PTV-MUXTOL] errno filter at the mux write (mux_thread, per-rung thread-local state):
+   ENOMEM/EAGAIN = tolerate — drop that pkt, count it, rate-limited WARNING (1/10s per
+   rung) with rung/stream/errno/count, keep muxing. Everything else (EINVAL = the pre26
+   backward-label crash class, EPIPE, EIO, ...) stays immediately fatal, unchanged.
+2) Dead-egress ceiling: a rung with NO successful write for 60 continuous seconds while
+   tolerating escalates to the fatal path with a distinct message ("egress dead 60s") —
+   a dark channel needs the respawn anyway; never a silent forever-throttled zombie.
+3) [PTV-MUXGUARD] drop-span ceiling (pre26 review rider): 60s of CONTINUOUS guard drops
+   on one stream with no accepted pkt likewise escalates to the fatal path (span resets
+   on any accepted pkt on that stream); governed by PTV_NO_MUXGUARD as before.
+Kills: PTV_NO_MUXTOL=1 reverts 1+2 (any write error = fatal, pre26 behavior). Test-only:
+PTV_MUXFAIL_SIM="<enomem|eagain|einval>:<start_s>:<dur_s>" makes the write path pretend
+av_interleaved_write_frame failed during the window (unset = byte-identical);
+PTV_MUXTEST_BACK_HOLD_S widens the pre26 one-shot backward-dts injection to a window
+(sustains MUXGUARD drops to exercise ceiling 3).
+
 (7x) PRE27 — THE MEMORY-RUNAWAY CLASS (ENT-CORELINK-HTTV glo-2 2026-07-26: 26.2GB RSS in
 ~46min on pre24, neighbors ENOMEM-killed by slice pressure; normal RSS 0.4GB). Hunt verdict
 (memhunt, local pre24 fixtures + live Praise_TV thread/queue captures): the WEDGE does NOT

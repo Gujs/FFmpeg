@@ -92,6 +92,10 @@ void show_help_default(const char *opt, const char *arg)
         "    PTV_NO_QSHED        GOP-coherent video_q overflow shed (back to per-pkt tail-drop = the #32 wedge)\n"
         "    PTV_NO_RATCHREL     bank/dlvhold release on the starved-while-flowing contradiction\n"
         "    PTV_NO_SELFHEAL     internal re-prime backstop on sustained frame_q starvation\n"
+        "    PTV_NO_MUXTOL       [PTV-MUXTOL] egress-pressure tolerance (mux-write ENOMEM/EAGAIN =\n"
+        "                        drop pkt + 60s dead-rung ceiling) back to any-write-error-is-fatal\n"
+        "                        (test-only: PTV_MUXFAIL_SIM=enomem|eagain|einval:<start_s>:<dur_s>\n"
+        "                        pretends the mux write failed during the window)\n"
         "   logging: PTV_DIAG=1 debug lines · PTV_LOG_TS=1 timestamp prefix · see -log-legend for probes\n");
 }
 
