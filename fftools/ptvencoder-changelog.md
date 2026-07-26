@@ -7,6 +7,57 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(7w) PRE26 — THE BACKWARD-LABEL MUX-DEATH CLASS (NBS/CORELINK live 2026-07-25, 8+ crashes in
+24h): wedge-free fatal exits + survive-first mux backstop + the emitter root-cause fix.
+Kills: PTV_NO_MUXGUARD=1 disables the mux backstop (pre24 EINVAL-exit behavior). Diagnostics:
+PTV_MUXDIAG=1 (gated, default off) enables an emission-point backward-label detector with a
+composition-state dump. Test-only: PTV_MUXTEST_BACK_AT_S / PTV_MUXTEST_BACK_MS inject one
+backward audio dts at the mux feed (gate fixture; unset = byte-identical).
+SYMPTOM (live, canary+glo): relabel-flood provider channels (HTTV/Non-Profit/Riff/NBS class)
+died with "[mpegts] non monotonically increasing dts in stream 1" → EINVAL → [PTV-MUX] exit,
+which then WEDGED (exit() cleanup parked in futex_do_wait while udp-rx/CUDA threads ran) =
+silent zombie until sync_check bounced it. Backward magnitudes −2794.7ms / −20778ms; libfdk
+"Queue input is backward in time" in the same logs; splits/folds precede by 1-10min.
+1) WEDGE FIX (measured: pre24 + a blocking-atexit shim stayed alive ≥30s after [PTV-MUX];
+   fixed binary gone <2s, rc=1): the two non-main-thread fatal sites — [PTV-MUX] mux_thread
+   and [PTV-NOVIDEO] clock thread, the only exit() calls in ptvencoder*.c — now _exit(1)
+   after fflush(NULL): no atexit/cleanup handlers run from a worker thread.
+2) [PTV-MUXGUARD] survive-first backstop in mux_thread, immediately before
+   av_interleaved_write_frame: mirrors lavf's per-stream monotonic feed check exactly (strict
+   for A/V, non-strict for sub/data, incl. the cur_dts!=0 quirk — fires iff the muxer would
+   EINVAL) and DROPS the offending packet with a rate-limited WARNING + per-rung counter.
+   Label-only (never re-stamps); the EINVAL fatal path remains as final backstop. Measured:
+   the injected live-shape backward dts (−2795ms on the fanned-out audio) EINVAL-killed the
+   guard-off binary at t=46s and was dropped guard-on with the wire at the +40ms harness
+   baseline before and after (240s cell). It also caught the ROOT-CAUSE leak below (−2667ms)
+   live in a fixture cell — channel survived where pre24 died.
+3) ROOT CAUSE (fixture-reproduced on unmodified pre24 with the exact live signature — libfdk
+   backward-input line + mpegts EINVAL at −2667ms, the live magnitude class): a BACKWARD door
+   step left in the labels (flush-routed negative A-vs-V mismatch exp_hit / pad round-trip —
+   the "aresample drops content" remedies) opens a window of |step| seconds during which the
+   graph's emitted labels lead its door labels while swr realizes the drop (swr outpts is
+   monotonic by construction — a LIVE graph can never emit backward; lavfi-verified, 0
+   non-monotonic out of a −2.6s input step). An [PTV-AFMT]/ACHOP audio-path REBUILD landing
+   inside that window destroys the swr state carrying the high-water mark: the new graph
+   re-seeds output at the door labels, up to |step| behind the last emitted label, and the
+   next emission is a backward DTS fanned to every rung. ptv_rebuild_reanchor (pre20) keeps
+   the DOOR labels continuous but never protected the EMISSION side.
+   FIX: arm the existing pre20 monotonic emission guard (reanch_mono) unconditionally at the
+   rebuild-completion site in audio_feed (covers AFMT, ACHOP, and re-anchor-gated-off paths):
+   post-rebuild frames drop until the first label exceeding the last emitted one — the
+   interrupted drop's remainder realizes as the same content skip the old graph was mid-way
+   through; releases with the existing [PTV-ANCHOR] guard line. Measured: the crash fixture
+   on the fix = "monotonic guard released — 126 frames (~2646ms) dropped", 0 backward at mux;
+   a 21-min flood with 15 alternating AFMT rebuilds = 10 real windows contained (2.2-2.6s
+   each), 0 backward labels, 0 EINVALs — the same fixture killed pre24 at its second event.
+   Invariants re-held on the fix binary: storm1 PRE/POST +40ms 0 erases; aseam +40ms pre+post
+   (R-pinned relabel class untouched); agapseam ruler3 +320ms (the pre24 composite bound).
+   NOTE: the owner-supplied canonical HTTV origin trace (double discontinuity + 16s dark +
+   destroyed segments) does NOT crash pre24 by itself in fixture — its resume is near-
+   symmetric (mism −31ms); the live chain additionally requires a backward-mismatch window ×
+   a rebuild. Falsifiable prediction for the live logs: an [PTV-AFMT]/[PTV-ACHOP]/rebuild
+   line sits between each crash's event cluster and its EINVAL.
+
 (7w) PRE24 — #63 CORRUPT-STORM DESYNC: WALL-EVIDENCE SPLIT + CORROBORATED RECOVERY RE-ANCHOR.
 Kills: PTV_NO_WALLEV=1 reverts Part 1's action at every touched site (provenance measurement
 stays on); PTV_NO_RECANCHOR=1 disables Part 2. Tunables: PTV_RECANCHOR_SETTLE_S (300),
