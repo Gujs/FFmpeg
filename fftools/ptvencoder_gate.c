@@ -762,9 +762,36 @@ void *watchdog_thread(void *arg)
         if (v->is_master && ++wd_pass >= 20) {
             wd_pass = 0;
             if (rss_cap_bytes < 0) {
+                /* pre27 review finding 4 — harden the parse: atoll("8G")=8 would arm an
+                 * 8MB cap (a guaranteed ~20s respawn loop) and atoll("abc")=0 silently
+                 * disabled the watchdog. Non-numeric = OFF with a warning; numeric 0
+                 * (or negative) = OFF as documented; 0 < mb < 1024 = implausible,
+                 * warn loudly and clamp to 1024. One line states the effective cap. */
                 const char *rc = getenv("PTV_RSS_CAP_MB");
-                int64_t mb = rc ? atoll(rc) : 8192;
+                int64_t mb = 8192;
+                if (rc) {
+                    char *end = NULL;
+                    mb = strtoll(rc, &end, 10);
+                    if (end == rc) {
+                        av_log(NULL, AV_LOG_WARNING,
+                               "[PTV-MEMCAP] PTV_RSS_CAP_MB='%s' is not a number — RSS cap "
+                               "watchdog OFF\n", rc);
+                        mb = 0;
+                    } else if (mb > 0 && mb < 1024) {
+                        av_log(NULL, AV_LOG_WARNING,
+                               "[PTV-MEMCAP] PTV_RSS_CAP_MB='%s' < 1024 MB is implausible "
+                               "(a unit suffix like '8G' parses as 8) — clamped to 1024 MB\n",
+                               rc);
+                        mb = 1024;
+                    }
+                }
                 rss_cap_bytes = mb > 0 ? mb * 1048576 : 0;
+                if (rss_cap_bytes > 0)
+                    av_log(NULL, AV_LOG_INFO,
+                           "[PTV-MEMCAP] RSS cap watchdog armed: %lld MB (10s samples; warn "
+                           "at 75%%, exit on 2 consecutive samples >= cap)\n", (long long)mb);
+                else
+                    av_log(NULL, AV_LOG_INFO, "[PTV-MEMCAP] RSS cap watchdog OFF\n");
             }
             if (rss_cap_bytes > 0) {
                 int64_t rss = ptv_self_rss_bytes();

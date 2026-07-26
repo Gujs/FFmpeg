@@ -17,17 +17,24 @@ write errors alike; transient egress pressure is not label corruption.
    ENOMEM/EAGAIN = tolerate — drop that pkt, count it, rate-limited WARNING (1/10s per
    rung) with rung/stream/errno/count, keep muxing. Everything else (EINVAL = the pre26
    backward-label crash class, EPIPE, EIO, ...) stays immediately fatal, unchanged.
-2) Dead-egress ceiling: a rung with NO successful write for 60 continuous seconds while
-   tolerating escalates to the fatal path with a distinct message ("egress dead 60s") —
-   a dark channel needs the respawn anyway; never a silent forever-throttled zombie.
-3) [PTV-MUXGUARD] drop-span ceiling (pre26 review rider): 60s of CONTINUOUS guard drops
-   on one stream with no accepted pkt likewise escalates to the fatal path (span resets
-   on any accepted pkt on that stream); governed by PTV_NO_MUXGUARD as before.
+2) Dead-egress ceiling: 60s after the FIRST tolerated failure of a failing run with no
+   successful write in between escalates to the fatal path with a distinct message
+   ("egress dead 60s") — a dark channel needs the respawn anyway; never a silent
+   forever-throttled zombie. (Review hardening: first-failure-based, not last-success-
+   based, so a >60s upstream stall + one transient catch-up error still gets 60s.)
+3) [PTV-MUXGUARD] drop-span ceiling (pre26 review rider), STRICT (audio/video) streams
+   only: a 60s guard-drop span on one A/V stream with no accepted pkt there likewise
+   escalates to the fatal path (span resets on any accepted pkt on that stream);
+   governed by PTV_NO_MUXGUARD as before. Sparse guarded streams (SCTE-35/teletext/
+   DVB-sub) keep the pre26 drop-silently-survive posture — two isolated drops minutes
+   apart (the sparse-PID wrap-aliasing class) must never kill the channel.
 Kills: PTV_NO_MUXTOL=1 reverts 1+2 (any write error = fatal, pre26 behavior). Test-only:
 PTV_MUXFAIL_SIM="<enomem|eagain|einval>:<start_s>:<dur_s>" makes the write path pretend
 av_interleaved_write_frame failed during the window (unset = byte-identical);
 PTV_MUXTEST_BACK_HOLD_S widens the pre26 one-shot backward-dts injection to a window
-(sustains MUXGUARD drops to exercise ceiling 3).
+(sustains MUXGUARD drops to exercise ceiling 3); PTV_MUXTEST_BACK_TYPE=a|s|d targets
+the injection at audio (default) or a sparse subtitle/data stream (verifies the
+ceiling's strict-only scope).
 
 (7x) PRE27 — THE MEMORY-RUNAWAY CLASS (ENT-CORELINK-HTTV glo-2 2026-07-26: 26.2GB RSS in
 ~46min on pre24, neighbors ENOMEM-killed by slice pressure; normal RSS 0.4GB). Hunt verdict
@@ -55,6 +62,9 @@ storm, so the churn runs indefinitely. Two bounds, both new:
    _exit(1) on two consecutive samples >= cap: one supervised respawn at a bounded size
    instead of a 26GB box-killer taking out neighbors. Linux /proc/self/statm; macOS mach
    task_info. Live-fired in gate (900MB test cap: warn + fatal + death <2s).
+   Parse hardened (review finding 4): non-numeric PTV_RSS_CAP_MB = OFF with a warning
+   (was: silently off), 0 < value < 1024 warns and clamps to 1024 MB (was: "8G" parsed
+   as an 8MB cap = a ~20s respawn loop); one [PTV-MEMCAP] line states the effective cap.
    Ops note: MALLOC_ARENA_MAX=2 in the channel wrapper is a zero-code live A/B lever for
    the glibc-arena-retention half of the runaway.
 
