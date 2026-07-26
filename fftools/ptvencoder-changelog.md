@@ -7,6 +7,24 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(7z) PRE28 — #67 THE STORM-STATE PPS-CHURN RUNAWAY (ENT-CORELINK-HTTV glo-2 2026-07-26:
+    40.1GB RSS in 37min, run born into an active discontinuity storm; ~625 fully-dirty
+    ~64MiB glibc heaps). Root cause is in libavcodec, so the fix ships as v2 patch
+    0005-h264-pps-dedup (libavcodec/h264_ps.c): ff_h264_decode_picture_parameter_set
+    allocated a fresh ~174KB refstruct for EVERY PPS NAL; the SPS path has an
+    identical-content shortcut, PPS did not. Calm channels reuse the freed chunk (flat
+    RSS); sustained storms interleave long-lived disc-buffer allocations into the same
+    arenas so every churned PPS lands in fresh space and the arenas only grow. Fix =
+    PPS mirror of the SPS shortcut (length+raw-RBSP memcmp vs pps_list[id] + SPS
+    refstruct pointer-identity check -> keep existing object). Verified bit-exact vs
+    stock ffmpeg 8.1.1 on identical-resend, one-bit-changed, and byte-identical-PPS-
+    across-SPS-change fixtures; 174KB alloc rate under storm fixture -> 0. This
+    fftools tree carries NO code change for pre28 (version bump only) — the content
+    is entirely patch 0005. Known residual grower (bounded by PTV_RSS_CAP_MB, next
+    release): aresample hard-comp gap-silence buffer churn from the non-converging
+    storm-birth control loop (hsres climbing forever, vdlvhold pinned) — convergence
+    fix tracked as the #63-adjacent control-loop item.
+
 (7y) PRE27 (same release) — #62 THE EGRESS-PRESSURE MUX-DEATH CLASS (Praise_TV glo-2
 2026-07-24: output udp uses bitrate= pacing + fifo_size=28672 ≈ 6.4s at the cap; every
 supervised respawn's startup prime/catch-up burst filled the paced egress fifo ~6-7s after
