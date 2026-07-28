@@ -41,7 +41,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.0.1-pre28"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.0.1-pre29"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -135,6 +135,36 @@ int     g_recanchor_test_abort_n = 0;  /* TEST ONLY (rr24 F2 gate): force ONE mi
                                         * N applied steps, no content event injected — so the clean
                                         * re-engage-on-remainder path can be gated. 0 = off (default,
                                         * byte-identical). PTV_RECANCHOR_TEST_ABORT_N. */
+int     g_resync = 0;              /* 1.0.1-pre29 #69 RESYNC (PTV_RESYNC=1 enables, default OFF): the
+                                           * hard-reset second engage path inside ptv_recanchor for the
+                                           * >PTV_RESYNC_MS dead zone. lipsync= R is owner-verified correct
+                                           * (4/4 by eye, both signs, up to 20s) — a large STABLE R is a real
+                                           * on-air desync, but today the implausibility disarm plus the
+                                           * RECANCHOR corroboration refusal leave |R|>5s unowned. A confirmed
+                                           * timer (no corroboration — the confirm span + health gates are the
+                                           * evidence) fires ONE whole backward step (audio LATE: skip seam)
+                                           * or a chunked forward walk (audio EARLY: silence-pad seams), then
+                                           * runs the RECANCHOR ledger amnesty. OFF = byte-identical pre28. */
+int64_t g_resync_ms_us          = 350000;          /* PTV_RESYNC_MS (350ms band threshold) */
+int64_t g_resync_ok_us          = 150000;          /* PTV_RESYNC_OK_MS (timer close / walk done) */
+int64_t g_resync_confirm_us     = 120LL * 1000000; /* PTV_RESYNC_CONFIRM_S */
+int64_t g_resync_confirm_big_us = 60LL  * 1000000; /* PTV_RESYNC_CONFIRM_BIG_S (|R0| > 2s) */
+/* NO routine cooldown (owner decision 2026-07-28: a seam costs <1s, a desync costs the whole
+ * wait — the fresh confirm window IS the seam-spacing floor, ~1 per 60-120s max). The
+ * CIRCUIT BREAKER below exists solely to surface+contain pathological loops (a resync
+ * self-oscillation, an extreme source thrash-storm) at ERROR level, with an escalating
+ * backoff (#49 ACQUIRE / pre27 AFMT-breaker pattern, fixed 120s base ×2 → 600s cap). */
+int     g_resync_breaker_n      = 4;               /* PTV_RESYNC_BREAKER_N: fires within the window that ARM */
+int64_t g_resync_breaker_win_us = 900LL  * 1000000;/* PTV_RESYNC_BREAKER_WIN_S */
+int64_t g_resync_quiet_us       = 1800LL * 1000000;/* PTV_RESYNC_QUIET_S: R below the band this long
+                                                    * DISARMS the breaker and clears the fire history */
+int64_t g_resync_chunk_us       = 2000000;         /* PTV_RESYNC_CHUNK_MS (audio-early chunk) */
+int64_t g_resync_chunk_gap_us   = 5LL   * 1000000; /* PTV_RESYNC_CHUNK_GAP_S */
+int64_t g_rscorr_slew_fast      = 5000;            /* pre29 adaptive corrector slew above 150ms |R|
+                                                    * (PTV_RSCORR_SLEW_FAST µs/s; 0 = always the base
+                                                    * clamp). Active regardless of PTV_RESYNC — 0.5%
+                                                    * rate is below the pitch JND, inaudible. */
+_Atomic int64_t g_rsn_pub[PTV_MAX_AUDIO];          /* pre29: resync fire count (stats rsn= token) */
 int     g_muxguard = 1;            /* 1.0.1-pre26 [PTV-MUXGUARD] survive-first mux backstop: drop (never
                                            * re-stamp) any packet whose DTS would EINVAL lavf's per-stream
                                            * monotonic feed check, instead of letting one leaked backward label
@@ -3072,6 +3102,17 @@ int main(int argc, char **argv)
     { const char *s = getenv("PTV_RECANCHOR_SETTLE_S");   if (s && atoi(s) > 0) g_recanchor_settle_us   = (int64_t)atoi(s) * 1000000; }
     { const char *s = getenv("PTV_RECANCHOR_COOLDOWN_S"); if (s && atoi(s) > 0) g_recanchor_cooldown_us = (int64_t)atoi(s) * 1000000; }
     { const char *s = getenv("PTV_RECANCHOR_TEST_ABORT_N"); if (s && atoi(s) > 0) g_recanchor_test_abort_n = atoi(s); }  /* TEST ONLY (rr24 F2 gate) */
+    { const char *s = getenv("PTV_RESYNC"); if (s && atoi(s)) g_resync = 1; }   /* 1.0.1-pre29 #69: enable the >350ms hard-reset path (default OFF) */
+    { const char *s = getenv("PTV_RESYNC_MS");            if (s && atoi(s) > 0) g_resync_ms_us          = (int64_t)atoi(s) * 1000; }
+    { const char *s = getenv("PTV_RESYNC_OK_MS");         if (s && atoi(s) > 0) g_resync_ok_us          = (int64_t)atoi(s) * 1000; }
+    { const char *s = getenv("PTV_RESYNC_CONFIRM_S");     if (s && atoi(s) > 0) g_resync_confirm_us     = (int64_t)atoi(s) * 1000000; }
+    { const char *s = getenv("PTV_RESYNC_CONFIRM_BIG_S"); if (s && atoi(s) > 0) g_resync_confirm_big_us = (int64_t)atoi(s) * 1000000; }
+    { const char *s = getenv("PTV_RESYNC_BREAKER_N");     if (s && atoi(s) > 0) g_resync_breaker_n      = atoi(s); }
+    { const char *s = getenv("PTV_RESYNC_BREAKER_WIN_S"); if (s && atoi(s) > 0) g_resync_breaker_win_us = (int64_t)atoi(s) * 1000000; }
+    { const char *s = getenv("PTV_RESYNC_QUIET_S");       if (s && atoi(s) > 0) g_resync_quiet_us       = (int64_t)atoi(s) * 1000000; }
+    { const char *s = getenv("PTV_RESYNC_CHUNK_MS");      if (s && atoi(s) > 0) g_resync_chunk_us       = (int64_t)atoi(s) * 1000; }
+    { const char *s = getenv("PTV_RESYNC_CHUNK_GAP_S");   if (s && atoi(s) > 0) g_resync_chunk_gap_us   = (int64_t)atoi(s) * 1000000; }
+    { const char *s = getenv("PTV_RSCORR_SLEW_FAST");     if (s) g_rscorr_slew_fast = atoi(s) > 0 ? atoi(s) : 0; }  /* 0 = disabled (always the base clamp) */
     if (getenv("PTV_NO_MUXGUARD")) g_muxguard = 0;   /* 1.0.1-pre26: disable the survive-first backward-dts mux backstop (pre24 EINVAL-exit behavior) */
     { const char *s = getenv("PTV_MUXTEST_BACK_AT_S"); if (s && atoi(s) > 0) g_muxtest_back_at_us = (int64_t)atoi(s) * 1000000; }  /* TEST ONLY (pre26 gates) */
     { const char *s = getenv("PTV_MUXTEST_BACK_MS");   if (s && atoi(s) > 0) g_muxtest_back_ms = atoi(s); }                        /* TEST ONLY (pre26 gates) */

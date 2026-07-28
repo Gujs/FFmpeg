@@ -171,8 +171,13 @@ static int64_t g_rscorr_testwalk_us_s = 0, g_rscorr_testwalk_t0 = 0;
 /* pre17 fix round (F2): PTV_RSCORR_TESTWALK_CAP_MS saturates the walk — without it the
  * linear-forever walk is cancelled by the steer at equal rate, R never re-enters the park
  * band, and mv ENGAGE→PARK is structurally unreachable via TESTWALK (reviewer F2). A capped
- * walk = a synthetic SETTLED bake the corrector can steer to 0 and PARK on. TEST-ONLY. */
-static int64_t g_rscorr_testwalk_cap_us = 0;
+ * walk = a synthetic SETTLED bake the corrector can steer to 0 and PARK on. TEST-ONLY.
+ * pre29: the cap saturates by MAGNITUDE (a negative walk saturates at −cap) — the RESYNC
+ * audio-LATE fixture needs a settled NEGATIVE bake; positive-walk behavior unchanged.
+ * pre29: PTV_RSCORR_TESTWALK_DECAY_AT_S zeroes the walk t seconds after its onset — the
+ * bounded stand-in for a TRANSIENT (R rises over the resync threshold, then the source
+ * recovers inside the confirm window; the timer must close without firing). TEST-ONLY. */
+static int64_t g_rscorr_testwalk_cap_us = 0, g_rscorr_testwalk_decay_us = 0;
 static RsyncTrackR rsync_track_R(const AudioState *a, int64_t now)
 {
     RsyncTrackR r = { 0, 0, 0, 0 };
@@ -194,17 +199,29 @@ static RsyncTrackR rsync_track_R(const AudioState *a, int64_t now)
         const char *tw = getenv("PTV_RSCORR_TESTWALK");
         const char *ta = getenv("PTV_RSCORR_TESTWALK_AT_S");
         const char *tc = getenv("PTV_RSCORR_TESTWALK_CAP_MS");
+        const char *td = getenv("PTV_RSCORR_TESTWALK_DECAY_AT_S");
         g_rscorr_testwalk_us_s = (tw && atoi(tw)) ? atoi(tw) : -1;   /* -1 = parsed, off */
         g_rscorr_testwalk_cap_us = (tc && atoi(tc) > 0) ? (int64_t)atoi(tc) * 1000 : 0;
+        g_rscorr_testwalk_decay_us = (td && atoi(td) > 0) ? (int64_t)atoi(td) * 1000000 : 0;
         /* PTV_RSCORR_TESTWALK_AT_S delays the walk's onset — the cap is only reachable
          * through MID-ENGAGEMENT drift (§6): a walk from birth is correctly rejected by the
          * dwell stability bound and can never engage (verified, first fixture round). */
         g_rscorr_testwalk_t0 = now + (ta ? (int64_t)atoi(ta) * 1000000 : 0);
     }
-    if (g_rscorr_testwalk_us_s > 0 && now > g_rscorr_testwalk_t0) {
-        int64_t w = av_rescale(now - g_rscorr_testwalk_t0, g_rscorr_testwalk_us_s, 1000000);
-        if (g_rscorr_testwalk_cap_us > 0 && w > g_rscorr_testwalk_cap_us)
-            w = g_rscorr_testwalk_cap_us;   /* F2: saturated walk = a steerable settled bake */
+    if (g_rscorr_testwalk_us_s != 0 && g_rscorr_testwalk_us_s != -1 &&
+        now > g_rscorr_testwalk_t0) {
+        /* pre29: negative rates are now legal (audio-LATE fixtures) — av_rescale requires
+         * b >= 0 (returns INT64_MIN otherwise), so rescale the magnitude and re-sign. */
+        int64_t w = av_rescale(now - g_rscorr_testwalk_t0,
+                               llabs(g_rscorr_testwalk_us_s), 1000000);
+        if (g_rscorr_testwalk_us_s < 0)
+            w = -w;
+        if (g_rscorr_testwalk_cap_us > 0 && llabs(w) > g_rscorr_testwalk_cap_us)
+            w = w > 0 ? g_rscorr_testwalk_cap_us   /* F2: saturated walk = a steerable settled bake */
+                      : -g_rscorr_testwalk_cap_us; /* pre29: magnitude cap (negative resync fixture) */
+        if (g_rscorr_testwalk_decay_us > 0 &&
+            now - g_rscorr_testwalk_t0 > g_rscorr_testwalk_decay_us)
+            w = 0;                                 /* pre29: transient fixture — the "source recovered" */
         r.R_us += w;
     }
     r.valid = 1;
@@ -462,6 +479,7 @@ static void rscorr_update(AudioState *a, RsyncTrackR *r, int64_t f_us, int64_t n
     CorrState *c = &a->corr;
     const char *dead, *ev;
     int64_t R = r->R_us;
+    int resync_owns;
 
     /* 1.0.1-pre17: the pre16 `if (a->multiview) return;` sensor-first hold is REMOVED — the
      * mv corrector is ARMED (mv-sensor-port §6's named removal site, after the observation
@@ -500,6 +518,19 @@ static void rscorr_update(AudioState *a, RsyncTrackR *r, int64_t f_us, int64_t n
 
     dead = rscorr_delivery_dead(a, now);
 
+    /* pre29 #69: above PTV_RESYNC_MS the band is owned by the RESYNC path — a new corrector
+     * engagement there would fight the pending whole-step (an already-ENGAGED corrector keeps
+     * steering; the resync amnesty folds its trim at fire time). NO-DEAD-ZONE RULE (owner,
+     * 2026-07-28): the deferral holds ONLY while resync is actually ABLE to act — enabled,
+     * this track runs ptv_recanchor, and not held by an armed-breaker backoff or an abort
+     * settle (rsn_cooldown_until; a routine COMPLETE sets none). While that hold is pending
+     * the corrector MUST engage even above the band (fast-slew nibbling is partial coverage;
+     * everything sitting idle is exactly the dead zone this pre exists to close). */
+    resync_owns = g_resync && g_recanchor && !(a->multiview && g_audio_follow) &&
+                  r->valid && llabs(R) > g_resync_ms_us &&
+                  (a->rsn_active ||
+                   !a->rsn_cooldown_until || now >= a->rsn_cooldown_until);
+
     /* 1.0.1-pre18 #51b ANTI-STARVATION CEILING (the legacy-0007 PLL_HARD_CEILING 60min +
      * PLL_STUCK |baseline|>2s & drift<50ms pattern, sized to the certified sensor): a channel
      * whose R has stayed LARGE and FLAT for ≥ the ceiling while the corrector could never
@@ -520,8 +551,10 @@ static void rscorr_update(AudioState *a, RsyncTrackR *r, int64_t f_us, int64_t n
                    llabs(R - c->starve_r0) >= FFMAX(40000, llabs(R) / 4)) {
             c->starve_wc = now;      /* open — or churning R: restart from here */
             c->starve_r0 = R;
-        } else if (now - c->starve_wc >= g_rscorr_ceil_us) {
-            /* re-snapshot every event feed first — entering ENGAGED from a long
+        } else if (now - c->starve_wc >= g_rscorr_ceil_us && !resync_owns) {
+            /* (pre29: !resync_owns holds the ceiling engage — span stays open — while the
+             * RESYNC path can act on the same band; it re-fires the moment resync cannot.)
+             * re-snapshot every event feed first — entering ENGAGED from a long
              * DISARM/holdoff would otherwise read the accumulated feed deltas as fresh
              * events on the first evaluation (spurious freeze + storm credit). */
             rscorr_dwell_reset(a, now, R);
@@ -589,7 +622,8 @@ static void rscorr_update(AudioState *a, RsyncTrackR *r, int64_t f_us, int64_t n
             break;
         }
         if (accum >= g_rscorr_dwell_us &&
-            (!c->last_event_wc || now - c->last_event_wc >= g_rscorr_quiet_us)) {
+            (!c->last_event_wc || now - c->last_event_wc >= g_rscorr_quiet_us) &&
+            !resync_owns) {   /* pre29: dwell holds (keeps accumulating) while resync owns the band */
             c->state         = PTV_CORR_ENGAGED;
             c->engage_r0     = R;
             c->engaged_corr0 = c->corr_us;
@@ -634,11 +668,17 @@ static void rscorr_update(AudioState *a, RsyncTrackR *r, int64_t f_us, int64_t n
             c->slip_bad_wc = 0;
         if (!frozen) {
             /* §4 steer law: proportional R/τ (τ=30s), slew-clamped, per emitted frame.
-             * dR/dcorr = −1: +R (audio early) → +step → audio content delayed → R → 0. */
+             * dR/dcorr = −1: +R (audio early) → +step → audio content delayed → R → 0.
+             * pre29 #69 adaptive slew: above 150ms |R| the clamp rises to PTV_RSCORR_SLEW_FAST
+             * (default 5ms/s = 0.5% rate, below the pitch JND — inaudible); back inside 150ms
+             * the base clamp applies. Cuts a 300ms steer from ~2.5min to ~1min. Independent
+             * of PTV_RESYNC (0 disables = the base clamp everywhere, pre28 behavior). */
+            int64_t slew = (g_rscorr_slew_fast > 0 && llabs(R) > 150000)
+                         ? g_rscorr_slew_fast : g_rscorr_slew_us_s;
             int64_t rate = R / 30;                                   /* µs of trim per second */
             int64_t step;
-            if (rate >  g_rscorr_slew_us_s) rate =  g_rscorr_slew_us_s;
-            if (rate < -g_rscorr_slew_us_s) rate = -g_rscorr_slew_us_s;
+            if (rate >  slew) rate =  slew;
+            if (rate < -slew) rate = -slew;
             step = rate * f_us / 1000000;
             c->corr_us += step;
             if (llabs(c->corr_us - c->engaged_corr0) > 5000000) {    /* §6 per-engagement authority */
@@ -738,6 +778,281 @@ static void rscorr_update(AudioState *a, RsyncTrackR *r, int64_t f_us, int64_t n
  * is ≤1s per 10s with a |R0|×1.2 authority budget; any external event aborts it loudly.
  * Runs on the single-input / non-follow path only (the mv follow PLL owns content
  * alignment there — same exclusion as the pre20 rebuild re-anchor). */
+
+/* pre24 COMPLETE-side ledger amnesty, factored for pre29 (#69 RESYNC shares it verbatim):
+ * cooldown + corroboration-baseline re-snapshot + applied-step reset. Amnesty is baseline
+ * REDEFINITION — the monotonic uea/uev ledgers themselves are never rewritten (their other
+ * readers: the conservation diag, the corrector's event edges). */
+static void ptv_recanchor_amnesty(AudioState *a, int64_t now)
+{
+    a->ra_cooldown_until = now + g_recanchor_cooldown_us;
+    a->ra_ua_snap  = atomic_load_explicit(&g_rsx.uea_us[a->dbg_k], memory_order_relaxed)
+                   + a->u_door_us;
+    a->ra_uv_snap  = atomic_load_explicit(&g_rsx.uev_us[a->dbg_in], memory_order_relaxed);
+    a->ra_corr_snap = a->corr.corr_us;
+    a->ra_applied_us = 0;                     /* rr24 F2: ledger baseline redefined with the
+                                               * snapshots — applied steps fully accounted */
+}
+
+/* ========================= 1.0.1-pre29 #69 — RESYNC (g_resync) =========================
+ * The SECOND ENGAGE PATH inside ptv_recanchor (PTV_RESYNC=1 enables; default OFF =
+ * byte-identical pre28). The lipsync= R is owner-verified correct (4/4 by eye, both signs,
+ * up to 20s) — a LARGE STABLE R is a real on-air desync — yet today |R|>5s is a dead zone:
+ * the corrector disarms it as implausible and RECANCHOR's ledger corroboration (rightly)
+ * refuses the uncorroborated class. The RESYNC path trades corroboration for TIME: a
+ * confirm timer (120s; 60s when |R0|>2s) during which R must stay over the OK band, plus
+ * every RECANCHOR engage-side health gate, is the evidence. Actuation is the same proven
+ * [PTV-ANCHOR] door algebra and self-edit recipe; sharing this engine's walk state keeps
+ * mutual exclusion with the corroborated path structural. Two seam types:
+ *   R < 0 (audio LATE):  ONE whole backward step — the monotonic emission guard realizes
+ *                        it as a bounded audio content skip (skip seam);
+ *   R > 0 (audio EARLY): chunked forward steps (≤2s per 5s) — aresample hard-comp silence
+ *                        (silence-pad seams), completing when R re-enters the OK band.
+ * NO routine cooldown (owner decision 2026-07-28: a seam costs <1s on air, a desync costs
+ * the whole wait — throttling normal operation is wrong). After a COMPLETE the only gate
+ * before the next reset is the trigger sequence itself: R over the band again + a fresh
+ * confirm window (the natural seam-spacing floor). A CIRCUIT BREAKER exists solely for
+ * pathological loops (a resync self-oscillation defect, an extreme thrash-storm): N fires
+ * (PTV_RESYNC_BREAKER_N=4) within PTV_RESYNC_BREAKER_WIN_S=900 ARM it with ONE ERROR line;
+ * armed, each further reset additionally waits an escalating backoff (fixed 120s ×2 →
+ * 600s cap — the #49 ACQUIRE / pre27 AFMT-breaker pattern); PTV_RESYNC_QUIET_S=1800 below
+ * the band disarms it and clears the history.
+ * NO-DEAD-ZONE invariant (owner, 2026-07-28): while the armed breaker's backoff (or an
+ * abort settle) blocks a re-fire, the corrector's deferral lifts (rscorr_update
+ * resync_owns) so an over-band R always has an engine allowed to act on it. */
+
+/* the fire-time corrector fold — the ptv_rebuild_reanchor bookkeeping transfer: corr folds
+ * INTO glue_off label-neutrally (inj sum unchanged ⇒ door labels perfectly continuous), so
+ * the amnesty snapshots corr at 0 and the corrector re-arms fresh. perm_disarm and the
+ * lifetime authority accounting are NOT touched (deliberate: a resync is not a corrector
+ * exoneration). */
+static void ptv_resync_fold_corr(AudioState *a)
+{
+    CorrState *c = &a->corr;
+    if (!c->corr_us && c->state != PTV_CORR_DWELL &&
+        c->state != PTV_CORR_ENGAGED && c->state != PTV_CORR_PARKED)
+        return;
+    a->glue_off_us  += c->corr_us;
+    c->corr_us       = 0;
+    c->engaged_corr0 = 0;
+    if (c->state == PTV_CORR_DWELL || c->state == PTV_CORR_ENGAGED ||
+        c->state == PTV_CORR_PARKED)
+        c->state = PTV_CORR_ARMED;             /* re-engagement requires a fresh full dwell */
+    if (a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO) {
+        atomic_store_explicit(&g_corr_pub[a->dbg_k], 0, memory_order_relaxed);
+        atomic_store_explicit(&g_corr_state_pub[a->dbg_k], c->state, memory_order_relaxed);
+    }
+}
+
+/* the RECANCHOR step block's self-edit recipe, verbatim (audio.c step block / rr24 F2) —
+ * one deliberate door-label step every observing engine treats as expected. */
+static void ptv_resync_step(AudioState *a, int64_t step, int64_t now)
+{
+    a->glue_off_us  += step;            /* the [PTV-ANCHOR] algebra: retires exactly +step */
+    a->rs_ma_seed    = 0;               /* base redefined — sensor re-seeds */
+    a->pend_comp_us += step;            /* §2.4 tripwire composes with any pending verdict */
+    a->pend_comp_wc  = now;
+    if (step < 0) {                     /* backward door labels — arm the mux monotonic guard */
+        a->reanch_mono = 1;
+        a->reanch_mono_dropped = 0;
+    }
+    a->glue_events++;                   /* corrector event edge: it re-dwells fresh */
+    a->ra_glue_snap  = a->glue_events;  /* our own edit is not an abort event */
+    a->acomp_exp_us  = AV_NOPTS_VALUE;  /* deliberate step, not a click risk */
+    a->ra_applied_us += step;           /* rr24 F2 accounting: after an abort the corroborated
+                                         * path's prediction must see resync steps too */
+}
+
+static void ptv_resync(AudioState *a, int64_t R, int ev, const char *dead, int64_t now)
+{
+    int64_t hh, confirm;
+
+    /* BROKEN-SENSOR CEILING (found live by the first fixture round: a sensor artifact
+     * published R ≈ INT64_MIN with valid=1, and an unguarded fire stepped glue_off by
+     * −9.2e18µs — the exact "creates new sync cases" class). The owner-verified real range
+     * is ≤ tens of seconds; an |R| beyond 600s is a broken sensor, not a desync — close
+     * the timer / abort the walk, never fire. (The corrector's own >5s implausibility
+     * disarm still applies to it; this ceiling is the resync-scale equivalent.) */
+    if (llabs(R) > 600000000) {
+        if (a->rsn_active) {
+            a->rsn_active = 0;
+            a->rsn_cooldown_until = now + g_recanchor_settle_us;
+            av_log(NULL, AV_LOG_WARNING,
+                   "[PTV-RESYNC] a%d(in%d) walk ABORTED (R=%+"PRId64"ms beyond the 600s "
+                   "broken-sensor ceiling) — settle %"PRId64"s\n",
+                   a->dbg_k, a->dbg_in, R / 1000, g_recanchor_settle_us / 1000000);
+        }
+        a->rsn_wc = 0;
+        return;
+    }
+
+    /* breaker quiet-disarm bookkeeping (every evaluation with a valid R) */
+    if (llabs(R) > g_resync_ms_us)
+        a->rsn_last_over_wc = now;
+    else if ((a->rsn_breaker || a->rsn_fire_win_n) && a->rsn_last_over_wc &&
+             now - a->rsn_last_over_wc >= g_resync_quiet_us) {
+        if (a->rsn_breaker)
+            av_log(NULL, AV_LOG_INFO,
+                   "[PTV-RESYNC] a%d(in%d) BREAKER disarmed — R below the band %"PRId64"s; "
+                   "fire history cleared\n",
+                   a->dbg_k, a->dbg_in, g_resync_quiet_us / 1000000);
+        a->rsn_breaker        = 0;
+        a->rsn_backoff_us     = 0;
+        a->rsn_fire_win_start = 0;
+        a->rsn_fire_win_n     = 0;
+    }
+
+    if (a->rsn_active) {
+        /* audio-EARLY chunked walk in progress (silence-pad seams) */
+        if (ev || dead) {                       /* external disturbance: stop loudly, gates
+                                                 * re-establish */
+            a->rsn_active = 0;
+            a->rsn_cooldown_until = now + g_recanchor_settle_us;
+            av_log(NULL, AV_LOG_WARNING,
+                   "[PTV-RESYNC] a%d(in%d) walk ABORTED (%s) — R=%+"PRId64"ms left; settle "
+                   "%"PRId64"s before any re-fire\n",
+                   a->dbg_k, a->dbg_in, dead ? dead : "new event",
+                   R / 1000, g_recanchor_settle_us / 1000000);
+            return;
+        }
+        if (llabs(R) <= g_resync_ok_us) {       /* done — amnesty; corrector polishes. NO routine
+                                                 * cooldown: the next fire only needs a fresh
+                                                 * over-band confirm window. */
+            a->rsn_active = 0;
+            ptv_recanchor_amnesty(a, now);
+            av_log(NULL, AV_LOG_WARNING,
+                   "[PTV-RESYNC] a%d(in%d) COMPLETE — R=%+"PRId64"ms (inside the OK band); "
+                   "ledger amnesty, corrector re-arms fresh  [+ = audio early]\n",
+                   a->dbg_k, a->dbg_in, R / 1000);
+            return;
+        }
+        if (R < 0) {                            /* BEYOND the OK band on the wrong side (the
+                                                 * in-band case completed above — first fixture
+                                                 * round aborted on ±ms jitter at R≈0): something
+                                                 * external moved — stop loudly, settle */
+            a->rsn_active = 0;
+            a->rsn_cooldown_until = now + g_recanchor_settle_us;
+            av_log(NULL, AV_LOG_WARNING,
+                   "[PTV-RESYNC] a%d(in%d) walk ABORTED (R crossed the OK band mid-walk) — "
+                   "R=%+"PRId64"ms; settle %"PRId64"s before any re-fire\n",
+                   a->dbg_k, a->dbg_in, R / 1000, g_recanchor_settle_us / 1000000);
+            return;
+        }
+        if (a->rsn_step_wc && now - a->rsn_step_wc < g_resync_chunk_gap_us)
+            return;                             /* one chunk per gap (sensor re-seeds in between) */
+        if (a->rsn_budget_us <= 0) {
+            a->rsn_active = 0;
+            a->rsn_cooldown_until = now + g_recanchor_settle_us;
+            av_log(NULL, AV_LOG_ERROR,
+                   "[PTV-RESYNC] a%d(in%d) chunk budget exhausted with R=%+"PRId64"ms "
+                   "remaining — stopping (settle %"PRId64"s before any re-fire)\n",
+                   a->dbg_k, a->dbg_in, R / 1000, g_recanchor_settle_us / 1000000);
+            return;
+        }
+        {
+            int64_t step = R;
+            if (step > g_resync_chunk_us)
+                step = g_resync_chunk_us;
+            if (step > a->rsn_budget_us)
+                step = a->rsn_budget_us;
+            ptv_resync_step(a, step, now);
+            a->rsn_budget_us -= step;
+            a->rsn_step_wc    = now;
+            av_log(NULL, AV_LOG_WARNING,
+                   "[PTV-RESYNC] a%d(in%d) chunk %+"PRId64"ms applied (silence-pad seam; R was "
+                   "%+"PRId64"ms, budget %"PRId64"ms left)  [+ = audio early]\n",
+                   a->dbg_k, a->dbg_in, step / 1000, R / 1000, a->rsn_budget_us / 1000);
+        }
+        return;
+    }
+
+    /* ---- confirm timer ---- */
+    if (!a->rsn_wc) {
+        if (llabs(R) > g_resync_ms_us) {        /* over the band: open the timer */
+            a->rsn_wc = now;
+            a->rsn_r0 = R;
+        }
+        return;
+    }
+    if (llabs(R) < g_resync_ok_us) { a->rsn_wc = 0; return; }   /* corrector/source won — no action */
+    if (dead)                      { a->rsn_wc = 0; return; }   /* liveness must re-establish */
+    hh = atomic_load_explicit(&g_rsx.hh_q10[a->dbg_k], memory_order_relaxed);
+    if (hh <= 0 || llabs(hh - 1024) > 154)
+                                   { a->rsn_wc = 0; return; }   /* label health out of band */
+    confirm = llabs(a->rsn_r0) > 2000000 ? g_resync_confirm_big_us : g_resync_confirm_us;
+    if (now - a->rsn_wc < confirm)
+        return;
+    /* ---- fire-time gates (events do NOT close the timer, but block the fire) ---- */
+    if (now - a->ra_ev_wc < 10000000)
+        return;                                 /* within 10s of an event — wait it out */
+    if (a->rs_slip_us != 0)
+        return;                                 /* resampler slip must be parked */
+    if (a->rsn_cooldown_until && now < a->rsn_cooldown_until)
+        return;                                 /* abort settle or armed-breaker backoff ONLY —
+                                                 * a routine COMPLETE sets no cooldown */
+    if (a->ra_active)
+        return;                                 /* corroborated walk running — it owns the door */
+
+    /* ---- FIRE ---- */
+    /* circuit-breaker accounting: count fires in a rolling window; ARM at the Nth. */
+    if (!a->rsn_fire_win_start || now - a->rsn_fire_win_start > g_resync_breaker_win_us) {
+        a->rsn_fire_win_start = now;            /* window expired/first fire: restart the count */
+        a->rsn_fire_win_n     = 0;
+    }
+    a->rsn_fire_win_n++;
+    if (!a->rsn_breaker && a->rsn_fire_win_n >= g_resync_breaker_n) {
+        a->rsn_breaker        = 1;
+        a->rsn_backoff_us     = 120000000;      /* fixed base; ×2 per reset to the 600s cap */
+        a->rsn_cooldown_until = now + a->rsn_backoff_us;
+        av_log(NULL, AV_LOG_ERROR,
+               "[PTV-RESYNC] a%d(in%d) BREAKER armed — %d resets in %"PRId64"s (source "
+               "thrash-storm or resync oscillation; investigate) — backing off\n",
+               a->dbg_k, a->dbg_in, a->rsn_fire_win_n,
+               (now - a->rsn_fire_win_start) / 1000000);
+    } else if (a->rsn_breaker) {
+        a->rsn_backoff_us *= 2;                 /* escalate per throttled reset */
+        if (a->rsn_backoff_us > 600000000)
+            a->rsn_backoff_us = 600000000;
+        a->rsn_cooldown_until = now + a->rsn_backoff_us;
+        av_log(NULL, AV_LOG_WARNING,
+               "[PTV-RESYNC] a%d(in%d) BREAKER throttled reset — next no sooner than "
+               "%"PRId64"s (quiet %"PRId64"s below the band disarms)\n",
+               a->dbg_k, a->dbg_in, a->rsn_backoff_us / 1000000,
+               g_resync_quiet_us / 1000000);
+    }
+    a->rsn_wc = 0;
+    a->rsn_count++;
+    if (a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO)
+        atomic_store_explicit(&g_rsn_pub[a->dbg_k], a->rsn_count, memory_order_relaxed);
+    ptv_resync_fold_corr(a);                    /* trim retires into glue label-neutrally —
+                                                 * the amnesty below snapshots corr at 0 */
+    if (R < 0) {
+        /* audio LATE: ONE whole step, realized by the monotonic emission guard as a
+         * bounded audio content skip. Amnesty immediately — the reset is complete. */
+        ptv_resync_step(a, R, now);
+        av_log(NULL, AV_LOG_WARNING,
+               "[PTV-RESYNC] a%d(in%d) FIRE — audio LATE: one whole step %+"PRId64"ms "
+               "(R was %+"PRId64"ms, confirmed %"PRId64"s over the %"PRId64"ms band; audio "
+               "skip seam) — ledger amnesty, corrector re-arms fresh  [+ = audio early]\n",
+               a->dbg_k, a->dbg_in, R / 1000, R / 1000, confirm / 1000000,
+               g_resync_ms_us / 1000);
+        ptv_recanchor_amnesty(a, now);
+    } else {
+        /* audio EARLY: chunked silence-pad walk; amnesty at COMPLETE */
+        a->rsn_active    = 1;
+        a->rsn_budget_us = R + R / 5;
+        a->rsn_step_wc   = 0;                   /* first chunk on the next evaluation */
+        av_log(NULL, AV_LOG_WARNING,
+               "[PTV-RESYNC] a%d(in%d) ENGAGE — audio EARLY R=%+"PRId64"ms (confirmed "
+               "%"PRId64"s over the %"PRId64"ms band): chunked silence-pad walk "
+               "(≤%"PRId64"ms per %"PRId64"s, budget %"PRId64"ms)  [+ = audio early]\n",
+               a->dbg_k, a->dbg_in, R / 1000, confirm / 1000000, g_resync_ms_us / 1000,
+               g_resync_chunk_us / 1000, g_resync_chunk_gap_us / 1000000,
+               a->rsn_budget_us / 1000);
+    }
+}
+/* ======================================================================================= */
+
 static void ptv_recanchor(AudioState *a, RsyncTrackR *r, int64_t now)
 {
     int64_t v, R, hh, ua, uv, rp, tol;
@@ -769,8 +1084,11 @@ static void ptv_recanchor(AudioState *a, RsyncTrackR *r, int64_t now)
     if (ev || rscorr_event_active(a, now))
         a->ra_ev_wc = now;
 
-    if (!r->valid)          /* mid-walk this is EXPECTED (our own step re-seeds the EMA) — hold */
+    if (!r->valid) {        /* mid-walk this is EXPECTED (our own step re-seeds the EMA) — hold */
+        if (a->rsn_wc && !a->rsn_active)
+            a->rsn_wc = 0;  /* pre29: an open (pre-fire) resync confirm timer needs a live sensor */
         return;
+    }
     R = r->R_us;
     if (llabs(R - a->ra_r0) > 100000) { a->ra_r0 = R; a->ra_r0_wc = now; }   /* stability tracker */
     dead = rscorr_delivery_dead(a, now);
@@ -787,13 +1105,7 @@ static void ptv_recanchor(AudioState *a, RsyncTrackR *r, int64_t now)
         }
         if (llabs(R) <= g_rscorr_engage_us) {   /* done — corrector polishes the remainder */
             a->ra_active = 0;
-            a->ra_cooldown_until = now + g_recanchor_cooldown_us;
-            a->ra_ua_snap  = atomic_load_explicit(&g_rsx.uea_us[a->dbg_k], memory_order_relaxed)
-                           + a->u_door_us;
-            a->ra_uv_snap  = atomic_load_explicit(&g_rsx.uev_us[a->dbg_in], memory_order_relaxed);
-            a->ra_corr_snap = a->corr.corr_us;
-            a->ra_applied_us = 0;                     /* rr24 F2: ledger baseline redefined with the
-                                                       * snapshots — applied steps fully accounted */
+            ptv_recanchor_amnesty(a, now);      /* pre29: factored (byte-identical) — resync shares it */
             av_log(NULL, AV_LOG_WARNING,
                    "[PTV-RECANCHOR] a%d(in%d) re-anchor COMPLETE — R=%+"PRId64"ms (inside the "
                    "engage band); corrector polishes the remainder; cooldown %"PRId64"s\n",
@@ -855,6 +1167,15 @@ static void ptv_recanchor(AudioState *a, RsyncTrackR *r, int64_t now)
         }
         return;
     }
+
+    /* pre29 #69: the RESYNC second engage path (confirm-timer hard reset for the band the
+     * corroboration gate below cannot own). Runs before the corroborated gates; while its
+     * chunked walk is active it owns the door (no corroborated engage mid-walk — mutual
+     * exclusion is structural: resync fires only with ra_active==0, and vice versa here). */
+    if (g_resync)
+        ptv_resync(a, R, ev, dead, now);
+    if (a->rsn_active)
+        return;
 
     /* ---- engagement gates ---- */
     if (llabs(R) <= 1000000 || a->rs_slip_us != 0 || dead)

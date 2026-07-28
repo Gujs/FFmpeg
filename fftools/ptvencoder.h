@@ -893,6 +893,27 @@ typedef struct AudioState {
     int64_t          ra_epoch_snap, ra_ev_led_snap, ra_ea_led_snap, ra_bank_snap, ra_hs_snap;
     int              ra_glue_snap, ra_acq_snap, ra_afmt_snap, ra_reopen_snap, ra_esc_snap;
     int              ra_seeded;                       /* snapshots initialized */
+    /* 1.0.1-pre29 #69 RESYNC (g_resync; PTV_RESYNC=1 enables, default OFF). The second
+     * engage path inside ptv_recanchor: a confirmed-timer HARD RESET for the >PTV_RESYNC_MS
+     * dead zone (owner-verified 4/4: large stable R is a real on-air desync; today it is
+     * refused by the corroboration gate and disarms the corrector as implausible). Shares
+     * the walk/actuation state above (ra_cooldown_until, ra_applied_us, the step recipe)
+     * so mutual exclusion with the corroborated path is structural. */
+    int64_t          rsn_wc;                          /* wall µs the >threshold timer opened (0 = closed) */
+    int64_t          rsn_r0;                          /* R at timer open (|r0|>2s selects the big confirm) */
+    int              rsn_active;                      /* chunked audio-early (R>0) walk in progress */
+    int64_t          rsn_budget_us;                   /* remaining chunk authority (R0 + R0/5) */
+    int64_t          rsn_step_wc;                     /* wall µs of the last applied chunk */
+    int64_t          rsn_cooldown_until;              /* wall µs before which no fire — set ONLY by a
+                                                       * mid-walk abort (settle) or the armed breaker's
+                                                       * backoff; NEVER by a routine COMPLETE (owner:
+                                                       * seams are cheaper than desync-time) */
+    int              rsn_breaker;                     /* circuit breaker armed (pathological fire rate) */
+    int64_t          rsn_backoff_us;                  /* armed-breaker backoff (120s ×2 → 600s cap) */
+    int64_t          rsn_fire_win_start;              /* breaker window start (wall µs; 0 = no history) */
+    int              rsn_fire_win_n;                  /* fires inside the current breaker window */
+    int64_t          rsn_last_over_wc;                /* wall µs |R| last exceeded the band (quiet disarm) */
+    int64_t          rsn_count;                       /* total resync fires (stats rsn= token) */
 } AudioState;
 
 /* ---- demux + mux ---- */
@@ -1386,6 +1407,22 @@ extern int64_t g_recanchor_cooldown_us;  /* re-engage holdoff after a completed 
                                           * (PTV_RECANCHOR_COOLDOWN_S, 1800s) */
 extern int     g_recanchor_test_abort_n; /* TEST ONLY (rr24 F2 gate): force one mid-walk abort
                                           * after N steps, no event injected (0 = off, default) */
+extern int     g_resync;                 /* 1.0.1-pre29 #69 RESYNC hard-reset path for the
+                                          * >PTV_RESYNC_MS dead zone (PTV_RESYNC=1 enables, default OFF) */
+extern int64_t g_resync_ms_us;           /* resync band threshold (PTV_RESYNC_MS, 350ms) */
+extern int64_t g_resync_ok_us;           /* OK band — timer closes / walk completes (PTV_RESYNC_OK_MS, 150ms) */
+extern int64_t g_resync_confirm_us;      /* confirm timer before a fire (PTV_RESYNC_CONFIRM_S, 120s) */
+extern int64_t g_resync_confirm_big_us;  /* confirm when |R0| > 2s (PTV_RESYNC_CONFIRM_BIG_S, 60s) */
+extern int     g_resync_breaker_n;       /* circuit breaker: fires within the window that ARM
+                                          * (PTV_RESYNC_BREAKER_N, 4) — NO routine cooldown otherwise */
+extern int64_t g_resync_breaker_win_us;  /* breaker fire-count window (PTV_RESYNC_BREAKER_WIN_S, 900s) */
+extern int64_t g_resync_quiet_us;        /* below-band span that DISARMS the breaker + clears the
+                                          * history (PTV_RESYNC_QUIET_S, 1800s) */
+extern int64_t g_resync_chunk_us;        /* audio-early chunk size (PTV_RESYNC_CHUNK_MS, 2000ms) */
+extern int64_t g_resync_chunk_gap_us;    /* gap between chunks (PTV_RESYNC_CHUNK_GAP_S, 5s) */
+extern int64_t g_rscorr_slew_fast;       /* pre29 adaptive corrector slew above 150ms |R|, µs/s
+                                          * (PTV_RSCORR_SLEW_FAST, 5000; 0 = always the base clamp);
+                                          * active regardless of PTV_RESYNC (0.5%% rate < pitch JND) */
 extern int     g_muxguard;               /* 1.0.1-pre26 survive-first backward-dts mux backstop
                                           * (PTV_NO_MUXGUARD=1 disables) */
 extern int64_t g_muxtest_back_at_us;     /* TEST ONLY (pre26 gates): one injected backward audio
@@ -1520,6 +1557,7 @@ extern _Atomic int64_t g_corr_pub[PTV_MAX_AUDIO];        /* cumulative corr_us p
 extern _Atomic int     g_corr_state_pub[PTV_MAX_AUDIO];  /* PTV_CORR_* per track */
 extern _Atomic int64_t g_conv_pub[PTV_MAX_AUDIO];        /* rr23: cumulative folded label motion (us) */
 extern _Atomic int64_t g_conv_park_pub[PTV_MAX_AUDIO];   /* rr23: seam_park_until wall us (0/past = unparked) */
+extern _Atomic int64_t g_rsn_pub[PTV_MAX_AUDIO];         /* pre29: total resync fires (stats rsn= token) */
 extern _Atomic int     g_corr_disarm_req[PTV_MAX_AUDIO]; /* master watchdog → audio thread (silent sync) */
 /* 1.0.1-pre17 sibling-slate condition (compositor writes, corrector reads): bit k set while
  * input slot k is black-slated. While ANY bit is set no mv track may engage — a sibling
@@ -1611,6 +1649,7 @@ void ptv_stats_lipsync(char *buf, size_t size, int64_t now_us, int force_idx);
 void ptv_stats_lipsync_in(char *buf, size_t size, int64_t now_us, int in);
 void ptv_stats_corr(char *buf, size_t size, int force_idx);
 void ptv_stats_conv(char *buf, size_t size, int64_t now_us, int force_idx);
+void ptv_stats_rsn(char *buf, size_t size, int force_idx);
 /* 1.0.1-pre17: the pre14 stale-track corrector watchdog, shared by both cadence owners —
  * the single-input master rung (ptvencoder_clock.c) and the mv compositor (the passthrough
  * rung loop returns before the master block, so mv needed its own call site). Callers

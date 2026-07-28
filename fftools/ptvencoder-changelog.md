@@ -7,6 +7,66 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(8a) PRE29 — #69 RESYNC: THE LARGE-STABLE-R DEAD ZONE (owner verification 2026-07-28: the
+lipsync= R checked 4/4 by eye against real channels — both signs, offsets up to 20s — the
+sensor is CORRECT; a large STABLE R is a real on-air desync). Root cause of the dead zone:
+above ~5s the corrector disarms R as implausible, and RECANCHOR's deletion-ledger
+corroboration (rightly — the aseam pinned-R guard) refuses the uncorroborated class, so a
+channel like RNTV (+14.4s) had NO engine allowed to act until restart. pre29 gives every
+band an owner:
+    |R| ≤ 50ms          nothing (the existing 20ms park / 80ms engage behavior, unchanged)
+    50–350ms            corrector as today + ADAPTIVE SLEW: above 150ms |R| the 2ms/s clamp
+                        rises to PTV_RSCORR_SLEW_FAST (default 5000 µs/s = 0.5% rate, below
+                        the pitch JND — inaudible; 0 disables). Active regardless of
+                        PTV_RESYNC; cuts a 300ms steer from ~2.5min to ~1min.
+    >350ms (PTV_RESYNC=1) the RESYNC path — a SECOND ENGAGE PATH inside ptv_recanchor
+                        (one engine, shared walk state = structural mutual exclusion with
+                        the corroborated path). Corroboration is traded for TIME: a confirm
+                        timer (PTV_RESYNC_CONFIRM_S=120; PTV_RESYNC_CONFIRM_BIG_S=60 when
+                        |R0|>2s) during which R must stay over PTV_RESYNC_OK_MS=150, plus
+                        every RECANCHOR engage-side health gate (delivery live, slip
+                        parked, label health, no event within 10s), is the evidence. Two
+                        seam types, both the proven [PTV-ANCHOR] door algebra + the exact
+                        RECANCHOR self-edit recipe: audio LATE (R<0) = ONE whole backward
+                        step, realized by the monotonic emission guard as a bounded audio
+                        content skip (skip seam); audio EARLY (R>0) = chunked forward steps
+                        (PTV_RESYNC_CHUNK_MS=2000 per PTV_RESYNC_CHUNK_GAP_S=5, budget
+                        R+R/5) as aresample hard-comp silence (silence-pad seams). At fire
+                        time any carried corrector trim folds INTO glue_off label-neutrally
+                        (the ptv_rebuild_reanchor bookkeeping transfer) and the RECANCHOR
+                        ledger AMNESTY runs (factored helper, existing path byte-identical);
+                        the corrector's perm_disarm / lifetime authority accounting is NOT
+                        touched. While the corrector defers to resync it keeps any ALREADY
+                        ENGAGED steer running.
+NO routine cooldown (owner decision: a seam costs <1s on air, a desync costs the whole wait
+— throttling normal operation is wrong). After a COMPLETE the only gate before the next
+reset is the trigger sequence itself — R over the band again + a fresh confirm window (the
+natural seam-spacing floor, ~1 seam per 60-120s max). A CIRCUIT BREAKER exists solely to
+surface+contain pathology (resync self-oscillation, extreme thrash-storm) at ERROR level:
+PTV_RESYNC_BREAKER_N=4 fires within PTV_RESYNC_BREAKER_WIN_S=900 ARM it (one ERROR line);
+armed, each further reset additionally waits an escalating backoff (fixed 120s ×2 → 600s
+cap — the #49 ACQUIRE / pre27 AFMT-breaker escalating-interval pattern) and logs the
+throttle at WARNING; PTV_RESYNC_QUIET_S=1800 below the band disarms it and clears the
+history. NO-DEAD-ZONE invariant (owner): under no combination of flags, timers, or states
+is an over-band R left with no engine allowed to act — while the armed breaker's backoff
+(or an abort settle) blocks a re-fire, the corrector's deferral lifts and it engages even
+above 350ms (fixture-asserted). BROKEN-SENSOR CEILING: |R| > 600s never fires (closes the
+timer / aborts the walk) — the first fixture round live-fired the need: a sensor artifact
+published R ≈ INT64_MIN with valid=1 and an unguarded fire stepped glue_off by −9.2e18µs;
+the owner-verified real range is tens of seconds, beyond 600s is a broken sensor. Adaptive
+fast slew carries ~rate×sensor-lag proportional overshoot (~50ms at 5ms/s, settles at the
+base slew inside the park band); end-to-end park time for ~300ms offsets stays
+settle-dominated — the fast rate's end-to-end win is at larger offsets and in the
+no-dead-zone nibbling role. Stats: fired resets append rsn=N (absent-when-zero — the
+healthy-channel line is byte-identical). Explicitly OUT of this pre: the video-side
+IDR-skip actuator (QSHED-based, pre30 — resync only actuates the audio door); corrector
+lifetime accounting unchanged; mv untouched (ptv_recanchor already runs only on the
+single-input / non-follow path; the follow PLL owns content alignment). PTV_RESYNC
+defaults OFF = byte-identical pre28 everywhere (the adaptive slew alone is live, and only
+alters behavior when an engaged corrector steers |R|>150ms). Test-only: the TESTWALK cap
+now saturates by magnitude (negative bakes) and PTV_RSCORR_TESTWALK_DECAY_AT_S zeroes the
+walk after t seconds (the transient/no-fire and breaker fixtures).
+
 (7z) PRE28 — #67 THE STORM-STATE PPS-CHURN RUNAWAY (ENT-CORELINK-HTTV glo-2 2026-07-26:
     40.1GB RSS in 37min, run born into an active discontinuity storm; ~625 fully-dirty
     ~64MiB glibc heaps). Root cause is in libavcodec, so the fix ships as v2 patch

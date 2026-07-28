@@ -891,12 +891,15 @@ void *output_thread(void *arg)
                                                                       * motion; P = seam-parked); absent
                                                                       * while zero — clean line unchanged */
                 ptv_stats_conv(cvs, sizeof cvs, nows, 0);
+                char rsn[10 + PTV_MAX_AUDIO * 16];                   /* pre29 #69: rsn= (resync fires); absent
+                                                                      * while zero — clean line unchanged */
+                ptv_stats_rsn(rsn, sizeof rsn, 0);
                 av_log(NULL, AV_LOG_INFO,
                     "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f "
                     "dup=%"PRId64" pd=%"PRId64" drop=%"PRId64" corrupt=%"PRId64" "
-                    "async=%+"PRId64"ppm%s%s%s%s%s%s%s%s\n",
+                    "async=%+"PRId64"ppm%s%s%s%s%s%s%s%s%s\n",
                     v->emitted, fps, hh, mm, ss,
-                    v->dup, v->pd, v->framedrop, cr, aw, dlv, wu, bk, cfs, aco, rsl, crs, cvs);
+                    v->dup, v->pd, v->framedrop, cr, aw, dlv, wu, bk, cfs, aco, rsl, crs, cvs, rsn);
                 stat_last = nows; stat_prev = v->emitted;
             }
         }

@@ -415,6 +415,30 @@ void ptv_stats_conv(char *buf, size_t size, int64_t now_us, int force_idx)
     }
 }
 
+/* rsn= builder (1.0.1-pre29 #69). Total RESYNC hard-reset fires per track — a fired reset is
+ * an on-air seam a monitor should know about. Absent while every track's count is 0 (and
+ * always absent with PTV_RESYNC off), so the healthy-channel stats line stays byte-identical
+ * (the ptv_stats_corr absent-when-zero pattern). */
+void ptv_stats_rsn(char *buf, size_t size, int force_idx)
+{
+    int any = 0, ki, nn;
+    buf[0] = 0;
+    if (!g_resync || g_rsx.n_a <= 0)
+        return;
+    for (ki = 0; ki < g_rsx.n_a; ki++)
+        if (atomic_load_explicit(&g_rsn_pub[ki], memory_order_relaxed) > 0)
+            any = 1;
+    if (!any)
+        return;
+    nn = snprintf(buf, size, " rsn=");
+    for (ki = 0; ki < g_rsx.n_a && nn > 0 && nn < (int)size - 18; ki++) {
+        int64_t rc = atomic_load_explicit(&g_rsn_pub[ki], memory_order_relaxed);
+        if (force_idx || g_rsx.n_a > 1)
+            nn += snprintf(buf + nn, size - nn, "%sa%d:", ki ? "," : "", ki);
+        nn += snprintf(buf + nn, size - nn, "%lld", (long long)rc);
+    }
+}
+
 void ptv_stats_corr(char *buf, size_t size, int force_idx)
 {
     int any = 0, ki, nn;
