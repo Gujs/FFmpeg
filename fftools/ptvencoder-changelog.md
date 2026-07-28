@@ -62,8 +62,13 @@ healthy-channel line is byte-identical). Explicitly OUT of this pre: the video-s
 IDR-skip actuator (QSHED-based, pre30 — resync only actuates the audio door); corrector
 lifetime accounting unchanged; mv untouched (ptv_recanchor already runs only on the
 single-input / non-follow path; the follow PLL owns content alignment). PTV_RESYNC
-defaults OFF = byte-identical pre28 everywhere (the adaptive slew alone is live, and only
-alters behavior when an engaged corrector steers |R|>150ms). Test-only: the TESTWALK cap
+defaults OFF = pre28 behavior everywhere EXCEPT the adaptive slew, which is live by
+default and changes pre28 behavior whenever an engaged corrector steers |R|>150ms
+(PTV_RSCORR_SLEW_FAST=0 restores the exact pre28 clamp; every other code path is inert
+with the flag off). Review fixes (r2): the corrector deferral lifts when resync's confirm
+timer cannot run (label health out of band / unpublished — closes the timer every
+evaluation, so deferring there recreated the dead zone; measured), and the 600s ceiling
+also catches the exact INT64_MIN sentinel (llabs UB bypassed it). Test-only: the TESTWALK cap
 now saturates by magnitude (negative bakes) and PTV_RSCORR_TESTWALK_DECAY_AT_S zeroes the
 walk after t seconds (the transient/no-fire and breaker fixtures).
 

@@ -530,6 +530,17 @@ static void rscorr_update(AudioState *a, RsyncTrackR *r, int64_t f_us, int64_t n
                   r->valid && llabs(R) > g_resync_ms_us &&
                   (a->rsn_active ||
                    !a->rsn_cooldown_until || now >= a->rsn_cooldown_until);
+    if (resync_owns && !a->rsn_active) {
+        /* pre29 review fix: ptv_resync CLOSES its confirm timer whenever the label-health
+         * gate is out of band (hh unpublished — e.g. PTV_NO_GLUECLASS — or beyond ±15%), so
+         * on such a track resync can NEVER fire; deferring the corrector there would leave
+         * an over-band R with no engine — the exact dead zone the NO-DEAD-ZONE rule forbids
+         * (measured: hh=0 + stable −1.5s R sat unowned for 110s while the healthy-hh control
+         * fired). Deferral holds only while resync's timer can actually run. */
+        int64_t hh_ro = atomic_load_explicit(&g_rsx.hh_q10[a->dbg_k], memory_order_relaxed);
+        if (hh_ro <= 0 || llabs(hh_ro - 1024) > 154)
+            resync_owns = 0;
+    }
 
     /* 1.0.1-pre18 #51b ANTI-STARVATION CEILING (the legacy-0007 PLL_HARD_CEILING 60min +
      * PLL_STUCK |baseline|>2s & drift<50ms pattern, sized to the certified sensor): a channel
@@ -873,7 +884,10 @@ static void ptv_resync(AudioState *a, int64_t R, int ev, const char *dead, int64
      * is ≤ tens of seconds; an |R| beyond 600s is a broken sensor, not a desync — close
      * the timer / abort the walk, never fire. (The corrector's own >5s implausibility
      * disarm still applies to it; this ceiling is the resync-scale equivalent.) */
-    if (llabs(R) > 600000000) {
+    if (R == INT64_MIN || llabs(R) > 600000000) {   /* review fix: llabs(INT64_MIN) is UB and
+                                                     * (in practice) stays negative — the exact
+                                                     * sentinel av_rescale returns on error would
+                                                     * BYPASS the ceiling it motivated */
         if (a->rsn_active) {
             a->rsn_active = 0;
             a->rsn_cooldown_until = now + g_recanchor_settle_us;
