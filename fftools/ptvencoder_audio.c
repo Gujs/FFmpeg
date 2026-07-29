@@ -1232,19 +1232,29 @@ static void ptv_resync(AudioState *a, int64_t R, int ev, const char *dead, int64
                    a->dbg_k, a->dbg_in, R / 1000, confirm / 1000000, g_resync_ms_us / 1000,
                    ge / 1000, g_resync_vskip_tol_us / 1000, a->rsn_budget_us / 1000);
         } else {
+            char why[96];
+            if (!g_resync_vskip)
+                snprintf(why, sizeof why, " (PTV_RESYNC_SILENCE)");
+            else if (a->multiview)
+                snprintf(why, sizeof why, " (multiview: vskip is single-input only)");
+            else if (ge <= 0)
+                snprintf(why, sizeof why, " (vskip unavailable: no GOP estimate yet)");
+            else if (ge > R + g_resync_vskip_tol_us)
+                snprintf(why, sizeof why,
+                         " (vskip unavailable: GOP est %"PRId64"ms exceeds the target)",
+                         ge / 1000);
+            else
+                snprintf(why, sizeof why,
+                         " (vskip unavailable: no fresh IDR — key age %"PRId64"s > %"PRId64"s)",
+                         kw ? (now - kw) / 1000000 : -1,
+                         FFMAX(2 * ge, g_resync_idr_wait_us) / 1000000);
             av_log(NULL, AV_LOG_WARNING,
                    "[PTV-RESYNC] a%d(in%d) ENGAGE — audio EARLY R=%+"PRId64"ms (confirmed "
                    "%"PRId64"s over the %"PRId64"ms band): chunked silence-pad walk "
                    "(≤%"PRId64"ms per %"PRId64"s, budget %"PRId64"ms)%s  [+ = audio early]\n",
                    a->dbg_k, a->dbg_in, R / 1000, confirm / 1000000, g_resync_ms_us / 1000,
                    g_resync_chunk_us / 1000, g_resync_chunk_gap_us / 1000000,
-                   a->rsn_budget_us / 1000,
-                   !g_resync_vskip ? " (PTV_RESYNC_SILENCE)" :
-                   a->multiview    ? " (multiview: vskip is single-input only)" :
-                   ge <= 0         ? " (vskip unavailable: no GOP estimate yet)" :
-                   ge > R + g_resync_vskip_tol_us
-                                   ? " (vskip unavailable: GOP exceeds the target)" :
-                                     " (vskip unavailable: no fresh IDR)");
+                   a->rsn_budget_us / 1000, why);
         }
     }
 }
