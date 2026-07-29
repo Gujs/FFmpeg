@@ -941,6 +941,13 @@ typedef struct AudioState {
      * silence-pad chunks, which also remain the in-walk fallback when no IDR is viable. */
     int              rsn_vskip;                       /* this walk actuates via video IDR-skip */
     int64_t          rsn_vskip_deadline;              /* wall µs: executor-unresponsive fallback */
+    int64_t          rsn_walk_wc;                     /* rr30 (T1): walk ENGAGE stamp — with item A,
+                                                       * a sensor that never corroborates (2 stable
+                                                       * samples) would otherwise pin rsn_active
+                                                       * forever (and the corrector defers via
+                                                       * resync_owns): the liveness ceiling aborts
+                                                       * a walk with no seam/complete progress for
+                                                       * PTV_RESYNC_WALK_CEIL_S */
 } AudioState;
 
 /* ---- demux + mux ---- */
@@ -1458,6 +1465,10 @@ extern int64_t g_resync_idr_wait_us;     /* item B: executor bound waiting for a
 extern int64_t g_resync_vskip_tol_us;    /* item B: whole-GOP overshoot tolerance — skip the
                                           * largest whole-GOP total ≤ R + tol
                                           * (PTV_RESYNC_VSKIP_TOL_MS, 250ms) */
+extern int64_t g_resync_walk_ceil_us;    /* rr30 (T1): walk liveness ceiling — abort a walk
+                                          * whose sensor never corroborates, measured from the
+                                          * last seam (or ENGAGE) (PTV_RESYNC_WALK_CEIL_S,
+                                          * 600s; 0 disables) */
 /* item B cross-thread state (single-input only; the audio thread requests, the decode thread
  * executes at the video_q pop site — upstream of the rung split, so every rung skips the same
  * content coherently; the output threads read the label mapping in content_index()). */

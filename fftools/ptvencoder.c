@@ -182,6 +182,15 @@ int64_t g_resync_idr_wait_us    = 5LL   * 1000000; /* PTV_RESYNC_IDR_WAIT_S (ite
                                                     * waiting for a usable IDR (~2× typical GOP) */
 int64_t g_resync_vskip_tol_us   = 250000;          /* PTV_RESYNC_VSKIP_TOL_MS (item B): whole-GOP
                                                     * overshoot tolerance (skip ≤ R + tol) */
+int64_t g_resync_walk_ceil_us   = 600LL * 1000000; /* PTV_RESYNC_WALK_CEIL_S (rr30 T1): walk
+                                                    * liveness ceiling — a never-stable sensor
+                                                    * (readings moving ≥50ms every sample) never
+                                                    * satisfies item A's corroboration, so a walk
+                                                    * would otherwise pin rsn_active FOREVER
+                                                    * (blocking the corrector via resync_owns);
+                                                    * abort + settle when no seam/complete lands
+                                                    * for this long. 10x the worst measured
+                                                    * post-seam settle (~1-2min). 0 disables. */
 /* item B cross-thread state — see ptvencoder.h for the handshake/mapping contract */
 _Atomic int64_t g_vskip_req_us;
 _Atomic int     g_vskip_state;
@@ -3310,6 +3319,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_RESYNC_SILENCE")) g_resync_vskip = 0; /* item B kill: pre29 silence-pad actuator */
     { const char *s = getenv("PTV_RESYNC_IDR_WAIT_S");    if (s && atoi(s) > 0) g_resync_idr_wait_us    = (int64_t)atoi(s) * 1000000; }
     { const char *s = getenv("PTV_RESYNC_VSKIP_TOL_MS");  if (s && atoi(s) > 0) g_resync_vskip_tol_us   = (int64_t)atoi(s) * 1000; }
+    { const char *s = getenv("PTV_RESYNC_WALK_CEIL_S");   if (s && atoi(s) >= 0) g_resync_walk_ceil_us  = (int64_t)atoi(s) * 1000000; }   /* rr30 T1; 0 disables */
     /* item C: the ring is fixed-size — clamp N into [2, PTV_RSN_RING] whatever the env says */
     if (g_resync_breaker_n < 2)            g_resync_breaker_n = 2;
     if (g_resync_breaker_n > PTV_RSN_RING) g_resync_breaker_n = PTV_RSN_RING;

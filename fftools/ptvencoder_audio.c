@@ -946,12 +946,28 @@ static void ptv_resync(AudioState *a, int64_t R, int ev, const char *dead, int64
     if (a->rsn_active) {
         /* audio-EARLY walk in progress (pre30 item B: vskip jump-cut seams by default;
          * silence-pad seams under PTV_RESYNC_SILENCE=1 or as the no-IDR fallback) */
+        /* rr30 (T9): our own 2s silence pad transits mux_q above the half-depth
+         * delivery-dead line while the wire drains it (PTV_QDEPTH/2 = 24 < ~94 AAC frames
+         * per 2s pad) — self-made backpressure, not a dead wire. Inside the post-seam
+         * window that ONE reason must not abort the walk the seam itself caused (pre29
+         * never lived long enough to see it — the crossing check aborted first; item A
+         * unmasks it). A really dead wire also trips the 5s watermarks, which still abort. */
+        if (!ev && dead && a->rsn_step_wc &&
+            now - a->rsn_step_wc < FFMAX(g_resync_chunk_gap_us, g_resync_seam_hold_us) &&
+            !strcmp(dead, "mux_q backed up"))
+            dead = NULL;
         if (ev || dead) {                       /* external disturbance: stop loudly, gates
                                                  * re-establish. NOT gated by the item-A hold —
                                                  * event-edge aborts stay live on any reading. */
             a->rsn_active = 0;
-            a->rsn_vskip  = 0;                  /* a still-pending executor request may land its
-                                                 * skip anyway — that is a real content edit and
+            if (a->rsn_vskip &&                 /* rr30 (T3): recall an UNSTARTED executor
+                                                 * request — otherwise it sits in g_vskip_req_us
+                                                 * and a later unwedged decode thread would land
+                                                 * a stale skip on a walk long gone */
+                atomic_exchange_explicit(&g_vskip_req_us, 0, memory_order_relaxed) > 0)
+                atomic_store_explicit(&g_vskip_state, PTV_VSKIP_IDLE, memory_order_relaxed);
+            a->rsn_vskip  = 0;                  /* a still-DRAINING executor may land its skip
+                                                 * anyway — that is a real content edit and
                                                  * the sensor owns the truth; the settle below
                                                  * outlasts the executor deadline by 60x */
             a->rsn_cooldown_until = now + g_recanchor_settle_us;
@@ -962,12 +978,44 @@ static void ptv_resync(AudioState *a, int64_t R, int ev, const char *dead, int64
                    R / 1000, g_recanchor_settle_us / 1000000);
             return;
         }
+        /* rr30 (T1): WALK LIVENESS CEILING. Item A's corroboration WAITS OUT a moving
+         * sensor "however long it takes" — a sensor that never stabilizes (consecutive
+         * samples always ≥50ms apart: jittery source, storm) would pin rsn_active FOREVER:
+         * COMPLETE / crossed-band / budget all sit behind the corroboration gate, and a
+         * pinned walk also defers the corrector (resync_owns) — a new wedge class with NO
+         * engine on the band. Bound it: no seam (or completion) for PTV_RESYNC_WALK_CEIL_S
+         * after the last seam/ENGAGE → abort + settle, same posture as budget exhaustion.
+         * 600s ≈ 10x the worst measured post-seam settle, so a legitimate decay never
+         * trips it. */
+        if (g_resync_walk_ceil_us > 0) {
+            int64_t ref = a->rsn_step_wc ? a->rsn_step_wc : a->rsn_walk_wc;
+            if (ref && now - ref > g_resync_walk_ceil_us) {
+                a->rsn_active = 0;
+                if (a->rsn_vskip &&
+                    atomic_exchange_explicit(&g_vskip_req_us, 0, memory_order_relaxed) > 0)
+                    atomic_store_explicit(&g_vskip_state, PTV_VSKIP_IDLE, memory_order_relaxed);
+                a->rsn_vskip = 0;
+                a->rsn_cooldown_until = now + g_recanchor_settle_us;
+                av_log(NULL, AV_LOG_ERROR,
+                       "[PTV-RESYNC] a%d(in%d) walk ABORTED (liveness ceiling %"PRId64"s — "
+                       "sensor never corroborated after the last seam) — R=%+"PRId64"ms left; "
+                       "settle %"PRId64"s\n",
+                       a->dbg_k, a->dbg_in, g_resync_walk_ceil_us / 1000000, R / 1000,
+                       g_recanchor_settle_us / 1000000);
+                return;
+            }
+        }
         /* pre30 item B: harvest the decode-thread executor handshake */
         if (a->rsn_vskip) {
             int st = atomic_load_explicit(&g_vskip_state, memory_order_acquire);
             if (st == PTV_VSKIP_PENDING) {
                 if (now > a->rsn_vskip_deadline) {
                     a->rsn_vskip = 0;
+                    /* rr30 (T3): recall the request if the executor never picked it up —
+                     * a decode thread that unwedges minutes later must not land a stale
+                     * skip (double actuation: the silence chunks below already own R). */
+                    if (atomic_exchange_explicit(&g_vskip_req_us, 0, memory_order_relaxed) > 0)
+                        atomic_store_explicit(&g_vskip_state, PTV_VSKIP_IDLE, memory_order_relaxed);
                     av_log(NULL, AV_LOG_WARNING,
                            "[PTV-RESYNC] a%d(in%d) vskip executor unresponsive past the "
                            "deadline — silence chunks own the remainder (a late skip would "
@@ -1215,6 +1263,8 @@ static void ptv_resync(AudioState *a, int64_t R, int ev, const char *dead, int64
         a->rsn_active    = 1;
         a->rsn_budget_us = R + R / 5;
         a->rsn_step_wc   = 0;                   /* first seam on the next evaluation */
+        a->rsn_walk_wc   = now;                 /* rr30 (T1): liveness-ceiling reference until
+                                                 * the first seam stamps rsn_step_wc */
         a->rsn_rd_n      = 0;
         a->rsn_vskip     = 0;
         if (g_resync_vskip && !a->multiview &&
