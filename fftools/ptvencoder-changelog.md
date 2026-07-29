@@ -7,6 +7,47 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(8c-rr30) PRE30 ADVERSARIAL-REVIEW FIXES (2026-07-29, on top of 8c):
+- T1 WALK LIVENESS CEILING: item A's corroboration waits a moving sensor out "however
+  long it takes" — with NO bound, a never-stable sensor (storm, jittery source) pinned
+  rsn_active forever, and a pinned walk defers ALL other engines (corrector via
+  resync_owns, RECANCHOR via its rsn_active gate) — a new wedge class. A walk with no
+  seam progress for PTV_RESYNC_WALK_CEIL_S (600s ≈ 10x the worst measured post-seam
+  settle; 0 disables) now aborts + settles, same posture as budget exhaustion. FX-J.
+- T4 EXECUTOR RUNNING SPAN BOUND: the vskip stop rule evaluated only at KEYS, so a GOP
+  longer than the fire-time estimate (film→ad, 1s→4s) dropped its whole REAL length —
+  audio flipped LATE by the overshoot (a bigger desync than the one being fixed, plus
+  hold+abort+settle before recovery). The drop loop now escapes mid-GOP past
+  target+tol at PACKET granularity (overshoot ≤ tol + 1 pkt).
+- T2b DONE-PATH DECODER FLUSH: a non-IDR stop key (recovery-point SEI also sets
+  AV_PKT_FLAG_KEY) left pre-skip refs in the DPB; h264 frame_num-gap concealment then
+  smears stale content under clean labels with NO corrupt flag — the claimed CORRUPT-
+  check coverage does not exist on the SW h264 path. Clean-IDR resume now flushes
+  (the selfheal deferred-reset recipe); the deadline ESCAPE stays unflushed (Session-109
+  no-IDR posture) with its log/comment stating the real concealment behavior.
+- T2a OFFSET-PUBLISH ORDERING: off_total store is release / content_index load is
+  acquire — the relaxed pair let compiler/CPU reordering tear boundary vs total for
+  in-flight pre-boundary frames.
+- T3 STALE-REQUEST RECALL: after the walk gave up on an unresponsive executor (or an
+  event abort), an un-picked-up g_vskip_req_us stayed posted — a decode thread
+  unwedging minutes later would land a stale skip on a walk long gone (double actuation
+  with the silence chunks that took over). Both paths atomically recall an unstarted
+  request; a started one is left to land (real content edit; the sensor owns the truth).
+- T9 SELF-PAD DELIVERY-DEAD GUARD: the walk's own 2s silence pad transits mux_q above
+  the half-depth dead line while the wire drains it (~94 AAC frames vs PTV_QDEPTH/2=24)
+  — pre29 never lived long enough to see it (the crossing check aborted first); item A
+  unmasks it. Exactly the "mux_q backed up" reason is ignored inside the post-seam
+  window; the 5s wire watermarks still abort a really dead wire.
+Knob added: PTV_RESYNC_WALK_CEIL_S=600 (0 disables). Fixture added: FX-J (ceiling).
+Full battery (A..J) re-run green on the fixed binary.
+KNOWN + DEFERRED (documented, no code change): the confirm timer can fire on a reading
+that decayed/flipped sign during the window (i24 08:58 −327ms on r0=+2081 — pre30 does
+not change this); a same-side/flatness-at-expiry condition is recommended as a follow-up
+but NOT hot-patched here because FX-I's designed fire train deliberately exploits the
+flip (residue-pinned reopen fires LATE after a positive-r0 confirm) — the guard needs a
+new test knob and an FX-I redesign together. The ESCAPE path's mid-GOP smear (see T2b)
+is accepted, bounded by one GOP.
+
 (8c) PRE30 — #69 RESYNC REFINEMENTS: post-seam sensor hold + video IDR-skip actuator +
 sliding breaker (owner-approved 2026-07-29, driven by the first two production fires).
 
