@@ -7,6 +7,17 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(8b) PRE29.1 — #69 RESYNC DEFAULT ON (owner 2026-07-29). pre29 shipped the engine opt-in
+(PTV_RESYNC=1) as a deploy-safety stance, but that contradicts the project convention — new
+engines arm by default on the pre train (RECANCHOR/MEMCAP/MUXTOL all shipped default-on with
+a PTV_NO_* kill switch) — and the fleet deploy mechanics set no per-channel env, so an opt-in
+flag would simply never arm. Flip: g_resync defaults to 1; the PTV_RESYNC enable knob is
+REMOVED; **PTV_NO_RESYNC=1 is the kill switch** and restores byte-identical pre28 behavior
+(the review-proven inert path). All other knobs/defaults unchanged. Fixture battery updated
+(FX-A's flag-off state = PTV_NO_RESYNC=1; armed fixtures rely on the default). Safety stance
+unchanged in substance: the 120s/60s confirm windows, health/stability gates, and the circuit
+breaker are the protection — the flag was never the safety mechanism.
+
 (8a) PRE29 — #69 RESYNC: THE LARGE-STABLE-R DEAD ZONE (owner verification 2026-07-28: the
 lipsync= R checked 4/4 by eye against real channels — both signs, offsets up to 20s — the
 sensor is CORRECT; a large STABLE R is a real on-air desync). Root cause of the dead zone:

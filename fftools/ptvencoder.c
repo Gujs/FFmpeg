@@ -41,7 +41,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.0.1-pre29"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.0.1-pre29.1"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -135,7 +135,9 @@ int     g_recanchor_test_abort_n = 0;  /* TEST ONLY (rr24 F2 gate): force ONE mi
                                         * N applied steps, no content event injected — so the clean
                                         * re-engage-on-remainder path can be gated. 0 = off (default,
                                         * byte-identical). PTV_RECANCHOR_TEST_ABORT_N. */
-int     g_resync = 0;              /* 1.0.1-pre29 #69 RESYNC (PTV_RESYNC=1 enables, default OFF): the
+int     g_resync = 1;              /* 1.0.1-pre29 #69 RESYNC (default ON since pre29.1 per the project
+                                           * convention — new engines arm by default on the pre train,
+                                           * PTV_NO_RESYNC=1 disables; owner 2026-07-29): the
                                            * hard-reset second engage path inside ptv_recanchor for the
                                            * >PTV_RESYNC_MS dead zone. lipsync= R is owner-verified correct
                                            * (4/4 by eye, both signs, up to 20s) — a large STABLE R is a real
@@ -144,7 +146,8 @@ int     g_resync = 0;              /* 1.0.1-pre29 #69 RESYNC (PTV_RESYNC=1 enabl
                                            * timer (no corroboration — the confirm span + health gates are the
                                            * evidence) fires ONE whole backward step (audio LATE: skip seam)
                                            * or a chunked forward walk (audio EARLY: silence-pad seams), then
-                                           * runs the RECANCHOR ledger amnesty. OFF = byte-identical pre28. */
+                                           * runs the RECANCHOR ledger amnesty. PTV_NO_RESYNC=1 =
+                                           * byte-identical pre28 (kill switch). */
 int64_t g_resync_ms_us          = 350000;          /* PTV_RESYNC_MS (350ms band threshold) */
 int64_t g_resync_ok_us          = 150000;          /* PTV_RESYNC_OK_MS (timer close / walk done) */
 int64_t g_resync_confirm_us     = 120LL * 1000000; /* PTV_RESYNC_CONFIRM_S */
@@ -3102,7 +3105,7 @@ int main(int argc, char **argv)
     { const char *s = getenv("PTV_RECANCHOR_SETTLE_S");   if (s && atoi(s) > 0) g_recanchor_settle_us   = (int64_t)atoi(s) * 1000000; }
     { const char *s = getenv("PTV_RECANCHOR_COOLDOWN_S"); if (s && atoi(s) > 0) g_recanchor_cooldown_us = (int64_t)atoi(s) * 1000000; }
     { const char *s = getenv("PTV_RECANCHOR_TEST_ABORT_N"); if (s && atoi(s) > 0) g_recanchor_test_abort_n = atoi(s); }  /* TEST ONLY (rr24 F2 gate) */
-    { const char *s = getenv("PTV_RESYNC"); if (s && atoi(s)) g_resync = 1; }   /* 1.0.1-pre29 #69: enable the >350ms hard-reset path (default OFF) */
+    if (getenv("PTV_NO_RESYNC")) g_resync = 0;   /* 1.0.1-pre29.1 #69: >350ms hard-reset path default ON; kill switch reverts to pre28 */
     { const char *s = getenv("PTV_RESYNC_MS");            if (s && atoi(s) > 0) g_resync_ms_us          = (int64_t)atoi(s) * 1000; }
     { const char *s = getenv("PTV_RESYNC_OK_MS");         if (s && atoi(s) > 0) g_resync_ok_us          = (int64_t)atoi(s) * 1000; }
     { const char *s = getenv("PTV_RESYNC_CONFIRM_S");     if (s && atoi(s) > 0) g_resync_confirm_us     = (int64_t)atoi(s) * 1000000; }
