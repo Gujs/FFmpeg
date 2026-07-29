@@ -516,6 +516,12 @@ typedef struct DecodeCtx {
     _Atomic int     *gov_on;               /* -> Input.gov_on */
     _Atomic int64_t *shed_wall;            /* -> Input.shed_wall */
     _Atomic int64_t *shed_cnt;             /* -> Input.shed_cnt */
+    /* 1.0.1-pre30 #69 (item B): GOP-span estimator — key-to-key dts spacing EMA measured at
+     * the pop site (published to g_vgop_est_us / g_vgop_key_wall; the resync fire-side
+     * viability gate reads them). Measurement only; gated on g_resync so the kill switch
+     * keeps the whole path inert. */
+    int64_t          vgop_last_key_dts;    /* dts of the last KEY packet popped */
+    int              vgop_key_seen;        /* first key seen (0 until then) */
 } DecodeCtx;
 
 /* Per-rung output side: pop this rung's frame_q on the house clock, stamp the
@@ -910,10 +916,31 @@ typedef struct AudioState {
                                                        * seams are cheaper than desync-time) */
     int              rsn_breaker;                     /* circuit breaker armed (pathological fire rate) */
     int64_t          rsn_backoff_us;                  /* armed-breaker backoff (120s ×2 → 600s cap) */
-    int64_t          rsn_fire_win_start;              /* breaker window start (wall µs; 0 = no history) */
-    int              rsn_fire_win_n;                  /* fires inside the current breaker window */
+    /* 1.0.1-pre30 (item C): SLIDING breaker window — ring of the last N fire wall-times.
+     * Replaces the pre29 tumbling first-fire-anchored window (N fires straddling a window
+     * boundary never armed it). Arm rule: ts[newest] − ts[newest−(N−1)] ≤ BREAKER_WIN. */
+#define PTV_RSN_RING 16
+    int64_t          rsn_fire_ring[PTV_RSN_RING];     /* fire wall µs, newest at (head−1) mod ring */
+    int              rsn_fire_head;                   /* next write slot */
+    int              rsn_fire_cnt;                    /* valid entries (≤ PTV_RSN_RING) */
     int64_t          rsn_last_over_wc;                /* wall µs |R| last exceeded the band (quiet disarm) */
     int64_t          rsn_count;                       /* total resync fires (stats rsn= token) */
+    /* 1.0.1-pre30 (item A): post-seam sensor hold. Live evidence (first two production
+     * fires, 2026-07-29): the reading ~2-4ms after a seam is garbage (i24: chunk +2000 on
+     * R=+2081 → expected +81, instant read −1035 → false ABORT; settled +125 ~1-2min later,
+     * decay ~12ms/s). rsn_step_wc doubles as the last-seam stamp; R-based walk decisions
+     * (COMPLETE / band-crossing / next seam) are suspended for PTV_RESYNC_SEAM_HOLD_S after
+     * it, then need 2 consecutive ≥5s-spaced SAME-SIDE samples moving <50ms (a still-decaying
+     * sensor never reads stable, so the walk waits it out instead of aborting falsely). */
+    int              rsn_rd_side;                     /* last post-hold sample's side (in-band/cross/over) */
+    int64_t          rsn_rd_R;                        /* last post-hold sample's R (stability check) */
+    int64_t          rsn_rd_wc;                       /* wall µs of that sample (≥5s spacing) */
+    int              rsn_rd_n;                        /* consecutive same-side stable samples */
+    /* 1.0.1-pre30 (item B): audio-EARLY default actuator = video IDR-skip (jump cut) via the
+     * decode-thread executor (g_vskip_* handshake); PTV_RESYNC_SILENCE=1 reverts to pre29
+     * silence-pad chunks, which also remain the in-walk fallback when no IDR is viable. */
+    int              rsn_vskip;                       /* this walk actuates via video IDR-skip */
+    int64_t          rsn_vskip_deadline;              /* wall µs: executor-unresponsive fallback */
 } AudioState;
 
 /* ---- demux + mux ---- */
@@ -1420,6 +1447,42 @@ extern int64_t g_resync_quiet_us;        /* below-band span that DISARMS the bre
                                           * history (PTV_RESYNC_QUIET_S, 1800s) */
 extern int64_t g_resync_chunk_us;        /* audio-early chunk size (PTV_RESYNC_CHUNK_MS, 2000ms) */
 extern int64_t g_resync_chunk_gap_us;    /* gap between chunks (PTV_RESYNC_CHUNK_GAP_S, 5s) */
+/* ---- 1.0.1-pre30 #69 refinements ---- */
+extern int64_t g_resync_seam_hold_us;    /* item A: post-seam sensor hold before any R-based walk
+                                          * decision (PTV_RESYNC_SEAM_HOLD_S, 20s; 0 disables).
+                                          * The effective inter-seam gap is max(chunk_gap, hold). */
+extern int     g_resync_vskip;           /* item B: audio-EARLY default actuator = video IDR-skip
+                                          * (PTV_RESYNC_SILENCE=1 reverts to pre29 silence chunks) */
+extern int64_t g_resync_idr_wait_us;     /* item B: executor bound waiting for a usable IDR
+                                          * (PTV_RESYNC_IDR_WAIT_S, 5s ≈ 2× typical GOP) */
+extern int64_t g_resync_vskip_tol_us;    /* item B: whole-GOP overshoot tolerance — skip the
+                                          * largest whole-GOP total ≤ R + tol
+                                          * (PTV_RESYNC_VSKIP_TOL_MS, 250ms) */
+/* item B cross-thread state (single-input only; the audio thread requests, the decode thread
+ * executes at the video_q pop site — upstream of the rung split, so every rung skips the same
+ * content coherently; the output threads read the label mapping in content_index()). */
+enum {                                   /* g_vskip_state */
+    PTV_VSKIP_IDLE = 0,
+    PTV_VSKIP_PENDING,                   /* request posted, executor working */
+    PTV_VSKIP_DONE,                      /* clean IDR stop — achieved span in g_vskip_done_us */
+    PTV_VSKIP_ESCAPE,                    /* deadline escape (mid-GOP resume) — partial span */
+    PTV_VSKIP_REFUSED                    /* nothing skippable inside the horizon */
+};
+extern _Atomic int64_t g_vskip_req_us;   /* requested target span µs (audio posts, decode consumes) */
+extern _Atomic int     g_vskip_state;    /* PTV_VSKIP_* (audio arms PENDING, decode completes) */
+extern _Atomic int64_t g_vskip_done_us;  /* achieved span µs (valid at DONE/ESCAPE) */
+extern _Atomic int     g_vskip_done_gops;/* whole GOPs (key packets) dropped */
+/* label mapping: the skip is label-neutral — content advances, output labels continue
+ * monotonically. content_index() subtracts off_total for src ≥ from (post-skip content) and
+ * off_before for src < from (frames of earlier epochs still in flight through frame_q).
+ * Write order (decode thread): off_before=old_total → from=new → off_total=new_total. */
+extern _Atomic int64_t g_vskip_off_total;  /* cumulative skipped span (µs) for src ≥ from */
+extern _Atomic int64_t g_vskip_off_before; /* cumulative span before the latest skip */
+extern _Atomic int64_t g_vskip_from_us;    /* latest skip boundary on the source-time axis (µs) */
+extern _Atomic int     g_vskip_epoch;      /* bumped per applied skip → master rung re-seeds m_v EMA
+                                            * at the first post-boundary emit */
+extern _Atomic int64_t g_vgop_est_us;      /* decode-measured key-to-key span EMA (0 = unknown) */
+extern _Atomic int64_t g_vgop_key_wall;    /* wall µs a KEY packet last passed the pop site */
 extern int64_t g_rscorr_slew_fast;       /* pre29 adaptive corrector slew above 150ms |R|, µs/s
                                           * (PTV_RSCORR_SLEW_FAST, 5000; 0 = always the base clamp);
                                           * active regardless of PTV_RESYNC (0.5%% rate < pitch JND) */

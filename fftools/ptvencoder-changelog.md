@@ -7,6 +7,105 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(8c) PRE30 — #69 RESYNC REFINEMENTS: post-seam sensor hold + video IDR-skip actuator +
+sliding breaker (owner-approved 2026-07-29, driven by the first two production fires).
+
+A. POST-SEAM SENSOR HOLD (the priority — live evidence 2026-07-29). The sensor reading
+taken ~2-4ms after a seam is garbage: i24 applied chunk +2000 on R=+2081 (expected residual
++81) and the instant reading was −1035 — the mid-walk band-crossing check falsely ABORTED
+the walk; the true value settled +125 flat only ~1-2min later (observed decay ~12ms/s).
+Law&Crime's chunk +1708 on R=+1708 read −110 — in-band, so it COMPLETEd, luckily correct.
+Root: the seam re-seeds the content-anchor EMA (rs_ma_seed=0) and readings during
+re-convergence are biased. Fix, gating R-BASED WALK DECISIONS ONLY (event-edge aborts —
+AFMT/rebuild/reopen/delivery-death — stay live on any reading):
+  - After every seam (audio-early chunk, vskip, and the LATE whole-step fire) NO R is
+    consumed for the COMPLETE / band-crossing / next-seam decisions for
+    PTV_RESYNC_SEAM_HOLD_S (default 20s; 0 disables = pre29 walk decisions).
+  - After the hold, acting on a reading additionally requires 2 consecutive samples ≥5s
+    apart on the SAME side (in-band / crossed / still-over) moving <50ms between them.
+    Justification for hold=20s despite the ~90-120s observed settle: a still-decaying
+    sensor moves ~60ms per 5s at the observed 12ms/s — it NEVER reads stable — so the
+    stability rule makes the walk wait out the transient however long it takes, while a
+    settled sensor passes within ~10s of the hold expiring. The hold alone would have
+    needed ~90s+ to make i24's reading trustworthy; hold+stability gets the right answer
+    without hard-coding the decay time. (Deliberate strengthening beyond "2 same-side
+    readings": same-side alone is defeated by a slow decay that parks on the wrong side
+    for a minute — i24's would have double-aborted at any hold ≤60s.)
+  - The inter-seam gap is now max(PTV_RESYNC_CHUNK_GAP_S, PTV_RESYNC_SEAM_HOLD_S) — a seam
+    never fires on an unheld reading.
+  - A reading inside the hold cannot OPEN a confirm timer (the LATE seam stamps the hold
+    too) — an opened-on-garbage timer with |r0|>2s could otherwise confirm a
+    wrong-direction second fire on the BIG window.
+  - Confirm-window logic BEFORE an engage is untouched (no seam yet — the sensor is fine).
+    Budget/abort/settle semantics unchanged.
+
+B. VIDEO IDR-SKIP ACTUATOR for audio-EARLY walks (owner mandate: "drop video, not insert
+silence"). The pre29 audio-early actuator mutes audio up to 2s per chunk. Default is now a
+video jump cut: skip video content FORWARD at GOP granularity using the pre8 QSHED
+machinery — the audio thread posts a target span, the DECODE THREAD executes it at the
+video_q pop site (upstream of decode and the rung split, so every rung skips the same
+content coherently), dropping whole GOPs from the head and decoding the stop IDR (the
+QSHED shape: decoder input stays contiguous whole GOPs). Greedy whole-GOP rule: largest
+whole-GOP total ≤ R + PTV_RESYNC_VSKIP_TOL_MS (250ms); the sub-GOP residual goes to the
+corrector exactly like today's post-walk handoff. Label-neutrality: the achieved span is
+published as a src-keyed offset subtracted in content_index() — output labels CONTINUE
+monotonically while content jumps (the video mirror of the audio-late reanch_mono skip
+seam; two-tier src-keyed so frames of earlier epochs still in frame_q keep their mapping) —
+and the m_v EMA re-seeds at the first post-boundary emit (the rs_ma_seed=0 mirror). The
+sensor sees the skip directly through m_v (out−src drops by the achieved span), so the walk
+measures its own progress; ra_applied_us accounts it for the corroborated path exactly like
+a door step. Audio is UNTOUCHED — no silence, no glue edit, no corrector event edge needed.
+  - Default ON for audio-early fires; PTV_RESYNC_SILENCE=1 reverts to the pre29
+    silence-chunk actuator (code path intact — it remains the fallback whenever vskip is
+    not viable: multiview, no GOP estimate yet, GOP longer than R+tol, stale keys, executor
+    REFUSED/ESCAPE/unresponsive).
+  - Viability gate at fire/next-seam time: decode-thread-measured key-to-key span EMA
+    (g_vgop_est_us) must fit R+tol AND a key must have passed within max(2×GOP,
+    PTV_RESYNC_IDR_WAIT_S) — never start dropping into a stream that has stopped
+    delivering IDRs.
+  - If no usable IDR appears within PTV_RESYNC_IDR_WAIT_S (default 5s ≈ 2× typical GOP)
+    the executor DEADLINE-ESCAPES: stops dropping, resumes decoding mid-GOP UNFLUSHED
+    (the Session-109 posture; corrupt frames are dropped by the existing CORRUPT check
+    until the next key), reports the partial span, and the walk falls back to silence
+    chunks for the remainder (logged).
+  - A/V ordering: the skip realizes as one jump cut; the walk is fire → item-A hold →
+    assess residual → possibly another skip after max(gap, hold). Chunk budget/abort
+    semantics carry over (achieved spans decrement the same budget).
+  - Log lines: `[PTV-RESYNC] ... vskip <N>ms (<K> GOPs) applied (IDR jump-cut seam; ...)`
+    (walk side) + `[PTV-VSKIP] skipped <N>ms ...` (executor side).
+  - HONEST LIMITS (flagged for review): (1) the skip consumes BUFFERED content — on a
+    shallow pipeline the IDR wait rides the frame_q cushion; if the cushion empties
+    mid-wait the output dups and the dup-advanced label cursor eats part of the relabel
+    (AVLOCK then realizes that part as audio delay = pad, the very thing being avoided) —
+    bounded by the wait cap and self-correcting because the walk re-measures real R.
+    (2) A sub-GOP residual >OK-band re-enters the walk as silence chunks (bounded < 1 GOP)
+    — strictly better than pre29's full-R mute but not silence-free on every phase.
+    (3) The whole-GOP overshoot beyond R+tol is possible when the head partial-GOP
+    remainder alone exceeds the target (entry-gated by GOP-est ≤ R+tol, so bounded ~1 GOP;
+    a resulting small negative R is owned by the crossed-band abort → corrector/LATE path).
+    (4) SCTE-35/sub copied streams keep their source→h0 mapping (no orphaning, gates
+    unaffected) but a cue's lead vs the SKIPPED video content shifts by the skipped span —
+    same class as any content deletion upstream of the splice point.
+
+C. SLIDING BREAKER WINDOW. The pre29 tumbling first-fire-anchored window reset its count
+at expiry, so N fires straddling one boundary (e.g. 6 fires across it, 3+3) never armed
+the breaker. Now a ring of the last PTV_RSN_RING(16) fire wall-times arms when
+ts[newest] − ts[newest−(N−1)] ≤ PTV_RESYNC_BREAKER_WIN_S. PTV_RESYNC_BREAKER_N is clamped
+into [2,16]. Escalating backoff / quiet-disarm (clears the ring) / no-dead-zone semantics
+unchanged.
+
+Knobs added (all pre30): PTV_RESYNC_SEAM_HOLD_S=20 (0 disables) · PTV_RESYNC_SILENCE=1
+reverts item B · PTV_RESYNC_IDR_WAIT_S=5 · PTV_RESYNC_VSKIP_TOL_MS=250. Test-only:
+PTV_RSCORR_TESTWALK_PAUSE_AT_S/_PAUSE_S and _PAUSE2_* (zero the walk inside a window —
+the FX-I long-short-short fire train). Fixtures: battery re-based on pre29.1 (d3b10d2d37,
+PTV_NO_RESYNC=1 kill-switch inertness gate); FX-C/F pinned to the silence path + short
+seam-hold; new FX-G (item A), FX-H/H2/H3 (item B + control + escape), FX-I (item C, with
+a measured straddle self-check). DEVIATION NOTES: the silence ENGAGE line now carries a
+one-word reason suffix (e.g. "(PTV_RESYNC_SILENCE)") — log-signature-identical tags, not
+byte-identical lines, vs pre29; FX-H tolerates a bounded silence-chunk fallback for
+sub-GOP residuals (hard-gates zero-silence only on the zero-chunk path) — see item B
+honest limits.
+
 (8b) PRE29.1 — #69 RESYNC DEFAULT ON (owner 2026-07-29). pre29 shipped the engine opt-in
 (PTV_RESYNC=1) as a deploy-safety stance, but that contradicts the project convention — new
 engines arm by default on the pre train (RECANCHOR/MEMCAP/MUXTOL all shipped default-on with

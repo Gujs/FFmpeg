@@ -149,6 +149,23 @@ static int64_t content_index(VideoCtx *v, int64_t src_pts)
     int64_t house_us;
     if (src_pts == AV_NOPTS_VALUE || *v->h0 == AV_NOPTS_VALUE) return -1;
     house_us = av_rescale_q(src_pts, v->out_tb, AV_TIME_BASE_Q) - *v->h0;
+    /* 1.0.1-pre30 #69 (item B) vskip label-neutrality: a resync video IDR-skip deleted
+     * content upstream (video_q head); subtract the published skip offset so the output
+     * labels CONTINUE monotonically while the content jumps — the video mirror of the
+     * audio-late skip seam. src-keyed two-tier: post-boundary content gets the new total,
+     * frames of earlier epochs still in flight through frame_q keep the previous one (skips
+     * are ≥ max(chunk_gap, seam_hold) apart, far above any frame_q residence). Every rung
+     * shares this function, so all rungs stay label-coherent. Inert until a skip fires
+     * (off_total stays 0). */
+    {
+        int64_t off = atomic_load_explicit(&g_vskip_off_total, memory_order_relaxed);
+        if (off) {
+            int64_t src_us = house_us + *v->h0;   /* back on the source-time axis */
+            if (src_us < atomic_load_explicit(&g_vskip_from_us, memory_order_relaxed))
+                off = atomic_load_explicit(&g_vskip_off_before, memory_order_relaxed);
+            house_us -= off;
+        }
+    }
     if (house_us < 0) house_us = 0;
     if (g_exacttick && v->out_fps.num > 0)
         return av_rescale_rnd(house_us, v->out_fps.num, 1000000LL * v->out_fps.den, AV_ROUND_NEAR_INF);
@@ -375,6 +392,7 @@ void *output_thread(void *arg)
         /* 1.0.1-pre9 residual sensor: video-side EMA state (master rung; τ ≈ 30s of ticks) */
         int64_t rs_mv_ema = 0, rs_mv_div = v->tick_dur_us > 0 ? 30000000 / v->tick_dur_us : 750;
         int     rs_mv_seed = 0;
+        int     rs_mv_vskip_ep = 0;   /* 1.0.1-pre30: last vskip epoch this EMA re-seeded for */
         if (rs_mv_div < 8) rs_mv_div = 8;
         /* v0.9.11 pulldown state: 1-frame lookahead + film-mode detector (see g_pulldown comment) */
         AVFrame *nextf = NULL;
@@ -752,6 +770,19 @@ void *output_thread(void *arg)
                     ? av_rescale(vpts, 1000000LL * v->out_fps.den, v->out_fps.num)
                     : vpts * v->tick_dur_us;
                 int64_t m = out_us - av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q);
+                /* 1.0.1-pre30 #69 (item B): a vskip seam redefines the video content↔label
+                 * mapping (m steps by −achieved at the first post-boundary frame) — re-seed
+                 * the EMA there, the exact video mirror of the audio seam's rs_ma_seed=0,
+                 * so the walk's post-hold reading converges instead of slewing 30s. */
+                {
+                    int ep = atomic_load_explicit(&g_vskip_epoch, memory_order_relaxed);
+                    if (ep != rs_mv_vskip_ep &&
+                        av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q) >=
+                            atomic_load_explicit(&g_vskip_from_us, memory_order_relaxed)) {
+                        rs_mv_seed     = 0;
+                        rs_mv_vskip_ep = ep;
+                    }
+                }
                 if (!rs_mv_seed) { rs_mv_ema = m; rs_mv_seed = 1; }
                 else rs_mv_ema += (m - rs_mv_ema) / rs_mv_div;
                 /* pre16: slot 0 of the per-slot arrays — single input IS slot 0 (multiview

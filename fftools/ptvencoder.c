@@ -41,7 +41,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.0.1-pre29.1"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.0.1-pre30"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -163,6 +163,36 @@ int64_t g_resync_quiet_us       = 1800LL * 1000000;/* PTV_RESYNC_QUIET_S: R belo
                                                     * DISARMS the breaker and clears the fire history */
 int64_t g_resync_chunk_us       = 2000000;         /* PTV_RESYNC_CHUNK_MS (audio-early chunk) */
 int64_t g_resync_chunk_gap_us   = 5LL   * 1000000; /* PTV_RESYNC_CHUNK_GAP_S */
+/* ---- 1.0.1-pre30 #69 refinements ---- */
+int64_t g_resync_seam_hold_us   = 20LL  * 1000000; /* PTV_RESYNC_SEAM_HOLD_S (item A): post-seam
+                                                    * sensor hold. Live evidence (i24/Law&Crime
+                                                    * 2026-07-29): the instant post-seam reading is
+                                                    * garbage-negative and decays ~12ms/s, so the
+                                                    * hold buys re-convergence headroom, and the
+                                                    * 2-consecutive-stable-samples rule after it
+                                                    * (5s spacing, <50ms motion) refuses a reading
+                                                    * that is still decaying. 0 disables. */
+int     g_resync_vskip          = 1;               /* item B: audio-EARLY default actuator = video
+                                                    * IDR-skip jump cut (owner mandate: "drop video,
+                                                    * not insert silence"). PTV_RESYNC_SILENCE=1
+                                                    * reverts to the pre29 silence-pad chunks; that
+                                                    * path also remains the in-walk fallback when no
+                                                    * IDR is viable inside the horizon. */
+int64_t g_resync_idr_wait_us    = 5LL   * 1000000; /* PTV_RESYNC_IDR_WAIT_S (item B): executor bound
+                                                    * waiting for a usable IDR (~2× typical GOP) */
+int64_t g_resync_vskip_tol_us   = 250000;          /* PTV_RESYNC_VSKIP_TOL_MS (item B): whole-GOP
+                                                    * overshoot tolerance (skip ≤ R + tol) */
+/* item B cross-thread state — see ptvencoder.h for the handshake/mapping contract */
+_Atomic int64_t g_vskip_req_us;
+_Atomic int     g_vskip_state;
+_Atomic int64_t g_vskip_done_us;
+_Atomic int     g_vskip_done_gops;
+_Atomic int64_t g_vskip_off_total;
+_Atomic int64_t g_vskip_off_before;
+_Atomic int64_t g_vskip_from_us;
+_Atomic int     g_vskip_epoch;
+_Atomic int64_t g_vgop_est_us;
+_Atomic int64_t g_vgop_key_wall;
 int64_t g_rscorr_slew_fast      = 5000;            /* pre29 adaptive corrector slew above 150ms |R|
                                                     * (PTV_RSCORR_SLEW_FAST µs/s; 0 = always the base
                                                     * clamp). Active regardless of PTV_RESYNC — 0.5%
@@ -1216,6 +1246,114 @@ static void *decode_thread(void *arg)
                 }
             }
         }
+        /* 1.0.1-pre30 #69 (item B) VIDEO IDR-SKIP EXECUTOR: the resync audio-EARLY actuator.
+         * The audio thread posted a target span; skip that much video content FORWARD here at
+         * the video_q pop site — upstream of decode and the rung split, so every rung skips
+         * the same content coherently — by dropping whole GOPs from the head, exactly the
+         * pre8 QSHED shape (the stop KEY decodes; the decoder input stays contiguous whole
+         * GOPs). Greedy whole-GOP rule: keep dropping while (span-to-this-key + gop_est) ≤
+         * target + tol — the largest whole-GOP total ≤ R + tol; the sub-GOP residual goes to
+         * the corrector (the same +125ms handoff as a chunked walk). Label-neutrality: the
+         * achieved span is published as a src-keyed offset that content_index() subtracts for
+         * post-boundary content, so output labels continue monotonically while content jumps
+         * (the video mirror of the audio-late reanch_mono skip seam); the m_v EMA re-seeds at
+         * the first post-boundary emit (g_vskip_epoch). If no usable IDR appears within
+         * PTV_RESYNC_IDR_WAIT_S, escape: resume decoding mid-GOP UNFLUSHED (Session-109
+         * posture — corrupt frames are dropped by the existing CORRUPT check until the next
+         * key) and report the partial span so the walk falls back to silence chunks. */
+        if (!pkt && g_resync && g_resync_vskip && d->live && !d->hold) {
+            int64_t tgt = atomic_exchange_explicit(&g_vskip_req_us, 0, memory_order_relaxed);
+            if (tgt > 0) {
+                int64_t deadline = av_gettime_relative() + g_resync_idr_wait_us;
+                int64_t gop_est  = atomic_load_explicit(&g_vgop_est_us, memory_order_relaxed);
+                int64_t d0 = AV_NOPTS_VALUE, dl = AV_NOPTS_VALUE, lkey = AV_NOPTS_VALUE;
+                int64_t achieved = 0, boundary = AV_NOPTS_VALUE;
+                int     gops = 0, ndrop = 0, escape = 0;
+                if (gop_est <= 0) gop_est = 1000000;             /* fire-side gate vetted it; belt+braces */
+                for (;;) {
+                    AVPacket *sp;
+                    int rc = av_thread_message_queue_recv(d->video_q, &sp,
+                                                          AV_THREAD_MESSAGE_NONBLOCK);
+                    if (rc == AVERROR(EAGAIN)) {
+                        if (av_gettime_relative() > deadline) { escape = 1; break; }
+                        PTV_HB_VDEC(d->hb_slot, PTV_HB_VDEC_QRECV);   /* waiting = residence, not a stall */
+                        av_usleep(5000);
+                        continue;
+                    }
+                    if (rc < 0) { escape = 1; break; }           /* queue closed/EOF: stop */
+                    if ((sp->flags & AV_PKT_FLAG_KEY) && d0 != AV_NOPTS_VALUE) {
+                        int64_t kts  = sp->dts != AV_NOPTS_VALUE ? sp->dts : sp->pts;
+                        int64_t span = kts != AV_NOPTS_VALUE
+                            ? av_rescale_q(kts - d0, d->ist_tb, AV_TIME_BASE_Q) : 0;
+                        if (lkey != AV_NOPTS_VALUE && kts != AV_NOPTS_VALUE && kts > lkey) {
+                            int64_t g = av_rescale_q(kts - lkey, d->ist_tb, AV_TIME_BASE_Q);
+                            if (g > 0 && g < 30000000) gop_est = g;   /* live update while walking */
+                        }
+                        if (span + gop_est > tgt + g_resync_vskip_tol_us || span >= tgt) {
+                            pkt      = sp;                       /* STOP: this key DECODES */
+                            achieved = span;
+                            boundary = sp->pts != AV_NOPTS_VALUE
+                                ? av_rescale_q(sp->pts, d->ist_tb, AV_TIME_BASE_Q)
+                                : av_rescale_q(kts, d->ist_tb, AV_TIME_BASE_Q);
+                            break;
+                        }
+                        lkey = kts;                              /* this whole GOP goes too */
+                        gops++;
+                    } else if ((sp->flags & AV_PKT_FLAG_KEY) && d0 == AV_NOPTS_VALUE) {
+                        lkey = sp->dts != AV_NOPTS_VALUE ? sp->dts : sp->pts;
+                        gops++;                                  /* head IS a key: GOP 1 starts the skip */
+                    }
+                    if (sp->dts != AV_NOPTS_VALUE) {
+                        if (d0 == AV_NOPTS_VALUE) d0 = sp->dts;
+                        dl = sp->dts;
+                    }
+                    ndrop++;
+                    av_packet_free(&sp);
+                }
+                if (escape && d0 != AV_NOPTS_VALUE && dl != AV_NOPTS_VALUE && dl > d0) {
+                    achieved = av_rescale_q(dl - d0, d->ist_tb, AV_TIME_BASE_Q);
+                    boundary = av_rescale_q(dl, d->ist_tb, AV_TIME_BASE_Q) + 1000;   /* just past the last drop */
+                }
+                if (achieved > 0 && boundary != AV_NOPTS_VALUE) {
+                    int64_t nw  = av_gettime_relative();
+                    int64_t old = atomic_load_explicit(&g_vskip_off_total, memory_order_relaxed);
+                    /* mapping publish — WRITE ORDER is the readers' consistency contract:
+                     * off_before (old total) → from (new boundary) → off_total (new total).
+                     * In-flight frames older than the new boundary keep the old mapping;
+                     * post-boundary frames (not yet decoded) pick up the new one. */
+                    atomic_store_explicit(&g_vskip_off_before, old, memory_order_relaxed);
+                    atomic_store_explicit(&g_vskip_from_us, boundary, memory_order_relaxed);
+                    atomic_store_explicit(&g_vskip_off_total, old + achieved, memory_order_relaxed);
+                    atomic_fetch_add_explicit(&g_vskip_epoch, 1, memory_order_relaxed);
+                    /* self-made-gap honesty + catch-up governor engagement (the QSHED stamps) */
+                    d->shed_pkts += ndrop;
+                    atomic_store_explicit(&g_shed_wall, nw, memory_order_relaxed);
+                    atomic_fetch_add_explicit(&g_shed_cnt, ndrop, memory_order_relaxed);
+                    if (d->shed_wall) atomic_store_explicit(d->shed_wall, nw, memory_order_relaxed);
+                    if (d->shed_cnt)  atomic_fetch_add_explicit(d->shed_cnt, ndrop, memory_order_relaxed);
+                    atomic_store_explicit(&g_vskip_done_us, achieved, memory_order_relaxed);
+                    atomic_store_explicit(&g_vskip_done_gops, gops, memory_order_relaxed);
+                    atomic_store_explicit(&g_vskip_state,
+                                          escape ? PTV_VSKIP_ESCAPE : PTV_VSKIP_DONE,
+                                          memory_order_release);
+                    av_log(NULL, escape ? AV_LOG_ERROR : AV_LOG_WARNING,
+                           "[PTV-VSKIP] skipped %"PRId64"ms video content (%d GOPs, %d pkts) at the "
+                           "video_q head%s — labels continue (offset %+"PRId64"ms from src %"PRId64"ms)\n",
+                           achieved / 1000, gops, ndrop,
+                           escape ? "; DEADLINE ESCAPE, resuming mid-GOP unflushed (corrupt frames "
+                                    "dropped until the next key)" : ", resuming at the stop IDR",
+                           (old + achieved) / 1000, boundary / 1000);
+                } else {
+                    atomic_store_explicit(&g_vskip_done_us, 0, memory_order_relaxed);
+                    atomic_store_explicit(&g_vskip_done_gops, 0, memory_order_relaxed);
+                    atomic_store_explicit(&g_vskip_state, PTV_VSKIP_REFUSED, memory_order_release);
+                    av_log(NULL, AV_LOG_WARNING,
+                           "[PTV-VSKIP] no skippable GOP inside the %"PRId64"s horizon (target "
+                           "%"PRId64"ms) — refusing; the walk falls back to silence chunks\n",
+                           g_resync_idr_wait_us / 1000000, tgt / 1000);
+                }
+            }
+        }
         if (!pkt) {
             /* Timed recv (rr8 review defect 1, heal reachability): the heal executor lives in
              * THIS thread, so a pending g_selfheal_req must be servable even while video_q is
@@ -1314,6 +1452,26 @@ static void *decode_thread(void *arg)
             int64_t nws = av_gettime_relative();
             if (nws >= g_slow_dec_on_us && (!g_slow_dec_off_us || nws < g_slow_dec_off_us))
                 av_usleep(g_slow_dec);
+        }
+        /* 1.0.1-pre30 #69 (item B): GOP-span estimator — key-to-key dts spacing EMA at the pop
+         * site, published for the resync fire-side viability gate (vskip is only chosen when a
+         * whole GOP fits inside R + tol and a key passed recently). Measurement only; gated on
+         * g_resync so PTV_NO_RESYNC keeps the path inert. */
+        if (g_resync && d->live && !d->hold && (pkt->flags & AV_PKT_FLAG_KEY)) {
+            int64_t kdts = pkt->dts != AV_NOPTS_VALUE ? pkt->dts : pkt->pts;
+            if (kdts != AV_NOPTS_VALUE) {
+                if (d->vgop_key_seen && kdts > d->vgop_last_key_dts) {
+                    int64_t g = av_rescale_q(kdts - d->vgop_last_key_dts, d->ist_tb, AV_TIME_BASE_Q);
+                    if (g > 0 && g < 30000000) {                 /* splice/wrap-guarded */
+                        int64_t e = atomic_load_explicit(&g_vgop_est_us, memory_order_relaxed);
+                        atomic_store_explicit(&g_vgop_est_us, e > 0 ? e + (g - e) / 4 : g,
+                                              memory_order_relaxed);
+                    }
+                }
+                d->vgop_last_key_dts = kdts;
+                d->vgop_key_seen     = 1;
+                atomic_store_explicit(&g_vgop_key_wall, av_gettime_relative(), memory_order_relaxed);
+            }
         }
         PTV_HB_VDEC(d->hb_slot, PTV_HB_VDEC_SENDPKT);
         ret = avcodec_send_packet(d->vdec, pkt);
@@ -3115,6 +3273,14 @@ int main(int argc, char **argv)
     { const char *s = getenv("PTV_RESYNC_QUIET_S");       if (s && atoi(s) > 0) g_resync_quiet_us       = (int64_t)atoi(s) * 1000000; }
     { const char *s = getenv("PTV_RESYNC_CHUNK_MS");      if (s && atoi(s) > 0) g_resync_chunk_us       = (int64_t)atoi(s) * 1000; }
     { const char *s = getenv("PTV_RESYNC_CHUNK_GAP_S");   if (s && atoi(s) > 0) g_resync_chunk_gap_us   = (int64_t)atoi(s) * 1000000; }
+    /* 1.0.1-pre30 #69 refinements */
+    { const char *s = getenv("PTV_RESYNC_SEAM_HOLD_S");   if (s && atoi(s) >= 0) g_resync_seam_hold_us  = (int64_t)atoi(s) * 1000000; }   /* 0 explicitly disables the hold */
+    if (getenv("PTV_RESYNC_SILENCE")) g_resync_vskip = 0; /* item B kill: pre29 silence-pad actuator */
+    { const char *s = getenv("PTV_RESYNC_IDR_WAIT_S");    if (s && atoi(s) > 0) g_resync_idr_wait_us    = (int64_t)atoi(s) * 1000000; }
+    { const char *s = getenv("PTV_RESYNC_VSKIP_TOL_MS");  if (s && atoi(s) > 0) g_resync_vskip_tol_us   = (int64_t)atoi(s) * 1000; }
+    /* item C: the ring is fixed-size — clamp N into [2, PTV_RSN_RING] whatever the env says */
+    if (g_resync_breaker_n < 2)            g_resync_breaker_n = 2;
+    if (g_resync_breaker_n > PTV_RSN_RING) g_resync_breaker_n = PTV_RSN_RING;
     { const char *s = getenv("PTV_RSCORR_SLEW_FAST");     if (s) g_rscorr_slew_fast = atoi(s) > 0 ? atoi(s) : 0; }  /* 0 = disabled (always the base clamp) */
     if (getenv("PTV_NO_MUXGUARD")) g_muxguard = 0;   /* 1.0.1-pre26: disable the survive-first backward-dts mux backstop (pre24 EINVAL-exit behavior) */
     { const char *s = getenv("PTV_MUXTEST_BACK_AT_S"); if (s && atoi(s) > 0) g_muxtest_back_at_us = (int64_t)atoi(s) * 1000000; }  /* TEST ONLY (pre26 gates) */
