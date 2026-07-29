@@ -1259,8 +1259,11 @@ static void *decode_thread(void *arg)
          * (the video mirror of the audio-late reanch_mono skip seam); the m_v EMA re-seeds at
          * the first post-boundary emit (g_vskip_epoch). If no usable IDR appears within
          * PTV_RESYNC_IDR_WAIT_S, escape: resume decoding mid-GOP UNFLUSHED (Session-109
-         * posture — corrupt frames are dropped by the existing CORRUPT check until the next
-         * key) and report the partial span so the walk falls back to silence chunks. */
+         * posture — rr30 honesty: on SW h264 the frame_num-gap concealment decodes those
+         * frames against stale/dummy refs with NO corrupt flag, so expect smear, not a
+         * clean freeze, until the next key; flushing instead would permanently freeze a
+         * no-IDR source) and report the partial span so the walk falls back to silence
+         * chunks. */
         if (!pkt && g_resync && g_resync_vskip && d->live && !d->hold) {
             int64_t tgt = atomic_exchange_explicit(&g_vskip_req_us, 0, memory_order_relaxed);
             if (tgt > 0) {
@@ -1309,6 +1312,20 @@ static void *decode_thread(void *arg)
                     }
                     ndrop++;
                     av_packet_free(&sp);
+                    /* rr30 (T4): RUNNING SPAN BOUND — the stop rule only evaluates at KEYS,
+                     * so a GOP that turns out longer than the estimate (film→ad break,
+                     * 1s→4s) would otherwise drop its WHOLE real length before the next key
+                     * (worst case: audio flips LATE by new-GOP − R, a bigger desync than
+                     * the one being fixed, then hold+abort+settle before recovery). Bound
+                     * the dropped span at target+tol at PACKET granularity: past it, escape
+                     * mid-GOP exactly like the deadline path (partial span, silence chunks
+                     * own the remainder). */
+                    if (d0 != AV_NOPTS_VALUE && dl != AV_NOPTS_VALUE && dl > d0 &&
+                        av_rescale_q(dl - d0, d->ist_tb, AV_TIME_BASE_Q) >
+                            tgt + g_resync_vskip_tol_us) {
+                        escape = 1;
+                        break;
+                    }
                 }
                 if (escape && d0 != AV_NOPTS_VALUE && dl != AV_NOPTS_VALUE && dl > d0) {
                     achieved = av_rescale_q(dl - d0, d->ist_tb, AV_TIME_BASE_Q);
@@ -1317,13 +1334,28 @@ static void *decode_thread(void *arg)
                 if (achieved > 0 && boundary != AV_NOPTS_VALUE) {
                     int64_t nw  = av_gettime_relative();
                     int64_t old = atomic_load_explicit(&g_vskip_off_total, memory_order_relaxed);
+                    /* rr30 (T2b): clean-IDR resume FLUSHES the decoder first — the selfheal
+                     * executor's deferred-reset recipe. Without it a non-IDR stop key
+                     * (recovery-point SEI sets AV_PKT_FLAG_KEY too) leaves pre-skip refs in
+                     * the DPB, and h264's frame_num-gap concealment then papers stale
+                     * content into the skipped range with NO corrupt flag (the CORRUPT
+                     * check never sees it) — smeared frames on air under clean labels.
+                     * Flushed, everything before the recovery point is suppressed by the
+                     * decoder itself. The deadline ESCAPE stays deliberately UNFLUSHED
+                     * (Session-109 posture: a no-IDR source's established sync is the only
+                     * one it will ever have). */
+                    if (!escape)
+                        avcodec_flush_buffers(d->vdec);
                     /* mapping publish — WRITE ORDER is the readers' consistency contract:
-                     * off_before (old total) → from (new boundary) → off_total (new total).
-                     * In-flight frames older than the new boundary keep the old mapping;
-                     * post-boundary frames (not yet decoded) pick up the new one. */
+                     * off_before (old total) → from (new boundary) → off_total (new total,
+                     * RELEASE: content_index() acquire-loads off_total first, so seeing the
+                     * new total guarantees it sees the new boundary — rr30 (T2a), relaxed
+                     * stores alone let the compiler/CPU tear the pair). In-flight frames
+                     * older than the new boundary keep the old mapping; post-boundary
+                     * frames (not yet decoded) pick up the new one. */
                     atomic_store_explicit(&g_vskip_off_before, old, memory_order_relaxed);
                     atomic_store_explicit(&g_vskip_from_us, boundary, memory_order_relaxed);
-                    atomic_store_explicit(&g_vskip_off_total, old + achieved, memory_order_relaxed);
+                    atomic_store_explicit(&g_vskip_off_total, old + achieved, memory_order_release);
                     atomic_fetch_add_explicit(&g_vskip_epoch, 1, memory_order_relaxed);
                     /* self-made-gap honesty + catch-up governor engagement (the QSHED stamps) */
                     d->shed_pkts += ndrop;
@@ -1340,8 +1372,8 @@ static void *decode_thread(void *arg)
                            "[PTV-VSKIP] skipped %"PRId64"ms video content (%d GOPs, %d pkts) at the "
                            "video_q head%s — labels continue (offset %+"PRId64"ms from src %"PRId64"ms)\n",
                            achieved / 1000, gops, ndrop,
-                           escape ? "; DEADLINE ESCAPE, resuming mid-GOP unflushed (corrupt frames "
-                                    "dropped until the next key)" : ", resuming at the stop IDR",
+                           escape ? "; DEADLINE ESCAPE, resuming mid-GOP unflushed (decoder "
+                                    "conceals until the next key)" : ", resuming at the stop IDR",
                            (old + achieved) / 1000, boundary / 1000);
                 } else {
                     atomic_store_explicit(&g_vskip_done_us, 0, memory_order_relaxed);

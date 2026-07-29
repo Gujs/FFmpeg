@@ -158,7 +158,10 @@ static int64_t content_index(VideoCtx *v, int64_t src_pts)
      * shares this function, so all rungs stay label-coherent. Inert until a skip fires
      * (off_total stays 0). */
     {
-        int64_t off = atomic_load_explicit(&g_vskip_off_total, memory_order_relaxed);
+        /* rr30 (T2a): acquire pairs with the executor's release on off_total — a reader
+         * that sees the new total is guaranteed the new from/off_before (relaxed loads
+         * below are ordered by this acquire). */
+        int64_t off = atomic_load_explicit(&g_vskip_off_total, memory_order_acquire);
         if (off) {
             int64_t src_us = house_us + *v->h0;   /* back on the source-time axis */
             if (src_us < atomic_load_explicit(&g_vskip_from_us, memory_order_relaxed))
