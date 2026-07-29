@@ -101,10 +101,16 @@ the FX-I long-short-short fire train). Fixtures: battery re-based on pre29.1 (d3
 PTV_NO_RESYNC=1 kill-switch inertness gate); FX-C/F pinned to the silence path + short
 seam-hold; new FX-G (item A), FX-H/H2/H3 (item B + control + escape), FX-I (item C, with
 a measured straddle self-check). DEVIATION NOTES: the silence ENGAGE line now carries a
-one-word reason suffix (e.g. "(PTV_RESYNC_SILENCE)") — log-signature-identical tags, not
-byte-identical lines, vs pre29; FX-H tolerates a bounded silence-chunk fallback for
-sub-GOP residuals (hard-gates zero-silence only on the zero-chunk path) — see item B
-honest limits.
+reason suffix (e.g. "(PTV_RESYNC_SILENCE)", or the measured key-age vs freshness limit) —
+log-signature-identical tags, not byte-identical lines, vs pre29; FX-H tolerates a bounded
+silence-chunk fallback for sub-GOP residuals (hard-gates zero-silence only on the
+zero-chunk path) — see item B honest limits; FX-F1 runs 275s (the item-A hold + 2-sample
+corroboration stretch the pre29 fire/walk cadence ~+20s against the 40s quiet-disarm
+deadline). Fixture-round harness findings (test-scripts/repro/resync-fx.sh comments carry
+the detail): ptvencoder's -t is a PER-OUTPUT-GROUP option — placed before -i it lands in
+the input group and is silently ignored (the 2-rung runner hit it); a sparse-key source
+joined mid-GOP fails the input probe (video_size 0x0), so explicit-src fixtures start the
+receiver before the sender; force_key_frames expr needs the isnan(prev_forced_t) seed.
 
 (8b) PRE29.1 — #69 RESYNC DEFAULT ON (owner 2026-07-29). pre29 shipped the engine opt-in
 (PTV_RESYNC=1) as a deploy-safety stance, but that contradicts the project convention — new
