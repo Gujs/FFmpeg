@@ -1315,28 +1315,32 @@ static void ptv_recanchor(AudioState *a, RsyncTrackR *r, int64_t now)
     int64_t v, R, hh, ua, uv, rp, tol;
     int ev = 0;
     const char *dead;
+    const char *evr = NULL;   /* TEMP INSTRUMENTATION (pre30.1 diagnosis): which edge fired */
 
     /* own event-edge snapshots — the corrector's CorrState snapshots are CONSUMED by its
      * edge detector and must never be shared. hs tick churn is absorbed per the #51a rule. */
     v = a->corr_epoch ? atomic_load_explicit(a->corr_epoch, memory_order_relaxed) : 0;
-    if (v != a->ra_epoch_snap)                 { a->ra_epoch_snap  = v;                ev = 1; }
-    if (a->glue_events   != a->ra_glue_snap)   { a->ra_glue_snap   = a->glue_events;   ev = 1; }
-    if (a->pll_acq_count != a->ra_acq_snap)    { a->ra_acq_snap    = a->pll_acq_count; ev = 1; }
-    if (a->afmt_rebuilds != a->ra_afmt_snap)   { a->ra_afmt_snap   = a->afmt_rebuilds; ev = 1; }
-    if (a->dec_reopens   != a->ra_reopen_snap) { a->ra_reopen_snap = a->dec_reopens;   ev = 1; }
-    if (a->conv_esc_n    != a->ra_esc_snap)    { a->ra_esc_snap    = a->conv_esc_n;    ev = 1; }
+    if (v != a->ra_epoch_snap)                 { a->ra_epoch_snap  = v;                ev = 1; evr = "epoch"; }
+    if (a->glue_events   != a->ra_glue_snap)   { a->ra_glue_snap   = a->glue_events;   ev = 1; evr = "glue"; }
+    if (a->pll_acq_count != a->ra_acq_snap)    { a->ra_acq_snap    = a->pll_acq_count; ev = 1; evr = "pll-acq"; }
+    if (a->afmt_rebuilds != a->ra_afmt_snap)   { a->ra_afmt_snap   = a->afmt_rebuilds; ev = 1; evr = "afmt"; }
+    if (a->dec_reopens   != a->ra_reopen_snap) { a->ra_reopen_snap = a->dec_reopens;   ev = 1; evr = "reopen"; }
+    if (a->conv_esc_n    != a->ra_esc_snap)    { a->ra_esc_snap    = a->conv_esc_n;    ev = 1; evr = "conv-esc"; }
     v = atomic_load_explicit(&g_rsx.ev_us[a->dbg_in], memory_order_relaxed);
-    if (v != a->ra_ev_led_snap)                { a->ra_ev_led_snap = v;                ev = 1; }
+    if (v != a->ra_ev_led_snap)                { a->ra_ev_led_snap = v;                ev = 1; evr = "Ev-ledger"; }
     v = atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed);
-    if (v != a->ra_ea_led_snap)                { a->ra_ea_led_snap = v;                ev = 1; }
+    if (v != a->ra_ea_led_snap)                { a->ra_ea_led_snap = v;                ev = 1; evr = "Ea-ledger"; }
     v = atomic_load_explicit(&g_bank_us, memory_order_relaxed);
-    if (v != a->ra_bank_snap)                  { a->ra_bank_snap   = v;                ev = 1; }
+    if (v != a->ra_bank_snap)                  { a->ra_bank_snap   = v;                ev = 1; evr = "bank"; }
     if (a->house_skew) {
         int64_t hstol = a->tick_dur_us > 0 ? a->tick_dur_us + a->tick_dur_us / 4 : 50000;
         v = *a->house_skew;
-        if (llabs(v - a->ra_hs_snap) > hstol) { a->ra_hs_snap = v; ev = 1; }
+        if (llabs(v - a->ra_hs_snap) > hstol) { a->ra_hs_snap = v; ev = 1; evr = "hs-step"; }
         else                                    a->ra_hs_snap = v;
     }
+    if (ev && a->rsn_active)
+        av_log(NULL, AV_LOG_WARNING, "[PTV-EVDBG] a%d(in%d) mid-walk event edge: %s\n",
+               a->dbg_k, a->dbg_in, evr);
     if (!a->ra_seeded) { a->ra_seeded = 1; a->ra_ev_wc = now; return; }
     if (ev || rscorr_event_active(a, now))
         a->ra_ev_wc = now;
