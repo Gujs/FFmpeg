@@ -941,6 +941,21 @@ typedef struct AudioState {
      * silence-pad chunks, which also remain the in-walk fallback when no IDR is viable. */
     int              rsn_vskip;                       /* this walk actuates via video IDR-skip */
     int64_t          rsn_vskip_deadline;              /* wall µs: executor-unresponsive fallback */
+    /* 1.0.1-pre30.1: hs-step SELF-ATTRIBUTION for vskip walks. Live (i24/cor-3 3x
+     * 2026-07-30, reproduced): the skip consumes buffered video; the next delivery gap
+     * then starves frame_q → a dup run raises house_skew one tick per dup while the
+     * audio thread idles the same gap → its next evaluation sees ONE >1.25-tick hs jump
+     * → the walk's event-edge check aborted its own walk ("new event: hs-step") ~2s
+     * after every seam. Attribution is directional + budgeted, NOT a blanket window: a
+     * POSITIVE hs-only step is absorbed while cumulative growth since arming stays
+     * within Σ(posted skip spans)+slack — the most starvation our own skip can cause.
+     * Foreign disturbances still abort: any other edge type, any negative step, or
+     * growth beyond the budget (e.g. a genuine input stall's dup run busts it). */
+    int              rsn_hs_absorb;                   /* armed: vskip span posted this walk */
+    int64_t          rsn_hs0;                         /* house_skew at arming (growth base) */
+    int64_t          rsn_hs_budget_us;                /* max self-attributable hs growth */
+    int64_t          rsn_hs_req_us;                   /* last posted span (refund on REFUSED/recall;
+                                                       * shrink by req−achieved at DONE/ESCAPE) */
     int64_t          rsn_walk_wc;                     /* rr30 (T1): walk ENGAGE stamp — with item A,
                                                        * a sensor that never corroborates (2 stable
                                                        * samples) would otherwise pin rsn_active

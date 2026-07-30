@@ -7,6 +7,61 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 1.0.1 (pending) — mv-audio robustness batch
 
+(8d) PRE30.1 — RESYNC vskip walk survives its own post-seam starvation dups
+(2026-07-30, driven by the first live vskip fires).
+
+LIVE EVIDENCE (i24/cor-3, three identical arcs 2026-07-30): every vskip seam was followed
+~2s later by "walk ABORTED (new event)", turning a tens-of-seconds walk into a 5.5-minute
+two-stage arc — 14:26 CDT: ENGAGE +2081ms → vskip 1560ms (1 whole GOP) → abort at R=+619ms
+→ settle 300s → re-ENGAGE +543 → chunk → COMPLETE −1ms; 14:51 CDT: same shape through the
+PARTIAL-GOP ESCAPE seam (vskip +1320ms, 0 GOPs). Control: glo-2/RNTV (same binary, calm
+pipeline) completed two multi-seam vskip walks the same day with NO abort — the abort is
+environment-coupled.
+
+MEASURED ROOT CAUSE (reproduced locally: bursty 2s-burst delivery + a cushion the skip
+mostly consumes; edge-naming instrumentation): the walk's own vskip consumes buffered
+video; the next inter-burst delivery gap then starves frame_q and the output dups — one
+house_skew tick per dup — while the audio thread idles the same gap. Its next evaluation
+sees ONE >1.25-tick hs jump, ptv_recanchor's event-edge snapshot fires, and the walk
+aborts its own seam's aftermath as an external disturbance ("new event" = the hs-step
+edge — verified by naming the edge; NOT the g_shed_wall annotation, which feeds only the
+corrector's event-ACTIVE hold and never the walk's abort check; the pll-acquire edge is
+multiview-only and vskip walks are single-input-only).
+
+FIX — hs-step SELF-ATTRIBUTION, directional + budgeted (not a blanket window):
+- Arming: when the walk posts a vskip span to the executor (ENGAGE and every in-walk
+  re-request), the span extends an hs "self-budget" (Σ posted spans + 2-tick slack),
+  based at the house_skew value at first arming. Covers the PENDING phase too (a
+  shallow-cushion executor starves frame_q while waiting for the stop IDR — dups begin
+  before the seam is harvested) and both seam shapes (DONE and partial-GOP ESCAPE).
+- Absorb rule (walk block, before the abort check): an event that is hs-ONLY, with a
+  POSITIVE step (starvation dups only ever raise hs), while cumulative growth since
+  arming ≤ the self-budget → absorbed with a WARNING line
+  ("hs step +Nms absorbed mid-walk (own vskip's starvation dups; ...)"), walk continues.
+- Foreign disturbances still abort: any other edge type (AFMT/rebuild/reopen/ledger/
+  bank/epoch/glue — never gated), any negative hs step, or growth beyond the budget
+  (a genuine input stall's dup run busts it within one gap; a ≥5s stall additionally
+  trips the delivery-dead watermarks unchanged). Budget honesty: the posted span is
+  refunded on REFUSED / executor-unresponsive recall, and shrunk by (requested −
+  achieved) at DONE/ESCAPE, so the foreign-hiding room never exceeds what our skip
+  could actually starve.
+- Chunk-only walks (PTV_RESYNC_SILENCE / fallback) arm nothing — byte-identical abort
+  behavior there. Corrector HOLD-on-recent-self-shed, dwell resets, and every
+  RECANCHOR/corrector event path untouched.
+- The walk's abort line now NAMES the edge ("walk ABORTED (new event: hs step)") —
+  the live arcs' bare "new event" cost a full diagnosis round; grep-compatible prefix.
+No new knobs (the budget is derived from the walk's own posted spans). Fixtures: FX-K
+(multi-seam vskip walk under bursty delivery + shallow cushion survives its own
+starvation dups to COMPLETE; the pre-fix binary aborts on the same harness), FX-K2
+(foreign-disturbance control: a mid-walk sender stall must still abort the walk).
+DEVIATION NOTE vs the task brief: the brief attributed the abort to the executor's
+g_shed_wall/g_shed_cnt stamp and suggested tagging it; measurement showed the shed
+stamp has NO path into the walk's abort check — the real carrier is the hs-step
+snapshot edge, so the attribution tag lives on the hs axis (directional budget from
+posted spans) instead. Verdict on the coordinator's "should walks yield in churning
+environments?": yes for genuinely-foreign churn (everything outside the budget still
+aborts), no for the walk's own seam aftermath (that self-abort is the live defect).
+
 (8c-rr30) PRE30 ADVERSARIAL-REVIEW FIXES (2026-07-29, on top of 8c):
 - T1 WALK LIVENESS CEILING: item A's corroboration waits a moving sensor out "however
   long it takes" — with NO bound, a never-stable sensor (storm, jittery source) pinned

@@ -900,7 +900,23 @@ static void ptv_resync_step(AudioState *a, int64_t step, int64_t now)
                                          * path's prediction must see resync steps too */
 }
 
-static void ptv_resync(AudioState *a, int64_t R, int ev, const char *dead, int64_t now)
+/* pre30.1: arm/extend the walk's hs-step self-attribution budget when a vskip span is
+ * posted to the executor — the span bounds the starvation (dup run → house_skew growth)
+ * our own skip can cause; see the absorb site in the walk block. Slack = 2 house ticks
+ * (quantization + one in-flight dup). */
+static void ptv_resync_hs_arm(AudioState *a, int64_t tgt)
+{
+    if (!a->rsn_hs_absorb) {
+        a->rsn_hs_absorb    = 1;
+        a->rsn_hs0          = a->house_skew ? *a->house_skew : 0;
+        a->rsn_hs_budget_us = a->tick_dur_us > 0 ? 2 * a->tick_dur_us : 100000;
+    }
+    a->rsn_hs_budget_us += tgt;
+    a->rsn_hs_req_us     = tgt;
+}
+
+static void ptv_resync(AudioState *a, int64_t R, int ev, int ev_nonhs, const char *evr,
+                       int64_t hs_step, int64_t hs_now, const char *dead, int64_t now)
 {
     int64_t hh, confirm;
 
@@ -952,6 +968,33 @@ static void ptv_resync(AudioState *a, int64_t R, int ev, const char *dead, int64
          * window that ONE reason must not abort the walk the seam itself caused (pre29
          * never lived long enough to see it — the crossing check aborted first; item A
          * unmasks it). A really dead wire also trips the 5s watermarks, which still abort. */
+        /* 1.0.1-pre30.1: hs-step SELF-ATTRIBUTION (live i24/cor-3, 3 identical arcs
+         * 2026-07-30, reproduced under bursty delivery + shallow cushion): the walk's own
+         * vskip consumes buffered video, the next delivery gap starves frame_q, and the
+         * resulting dup run raises house_skew one tick per dup while this thread idles the
+         * same gap — its next evaluation then sees ONE >1.25-tick hs jump and the pre29
+         * event-edge abort killed the walk ~2s after every seam ("new event"), turning a
+         * tens-of-seconds walk into a 5.5-minute two-stage arc (abort settle 300s +
+         * re-confirm). Absorb it by ATTRIBUTION, not a blanket window: only an hs-ONLY
+         * edge, only a POSITIVE step (starvation dups only ever raise hs), and only while
+         * cumulative growth since the walk posted its first span stays within
+         * Σ(posted spans)+slack — the most starvation our own skip can cause. A foreign
+         * disturbance still aborts: any other edge type, a negative step, or growth
+         * beyond the budget (a genuine input stall's dup run busts it in one gap; a
+         * ≥5s stall additionally trips the delivery-dead watermarks unchanged). Covers
+         * BOTH seam shapes (whole-GOP DONE and partial-GOP ESCAPE stamp the same
+         * handshake) and the PENDING phase (a shallow-cushion executor starves frame_q
+         * while it waits for the stop IDR — dups begin before the seam is harvested). */
+        if (ev && !ev_nonhs && a->rsn_hs_absorb && hs_step > 0 &&
+            hs_now - a->rsn_hs0 <= a->rsn_hs_budget_us) {
+            ev = 0;
+            av_log(NULL, AV_LOG_WARNING,
+                   "[PTV-RESYNC] a%d(in%d) hs step %+"PRId64"ms absorbed mid-walk (own vskip's "
+                   "starvation dups; %+"PRId64"ms of the %+"PRId64"ms self-budget used) — walk "
+                   "continues; foreign events still abort\n",
+                   a->dbg_k, a->dbg_in, hs_step / 1000,
+                   (hs_now - a->rsn_hs0) / 1000, a->rsn_hs_budget_us / 1000);
+        }
         if (!ev && dead && a->rsn_step_wc &&
             now - a->rsn_step_wc < FFMAX(g_resync_chunk_gap_us, g_resync_seam_hold_us) &&
             !strcmp(dead, "mux_q backed up"))
@@ -971,11 +1014,16 @@ static void ptv_resync(AudioState *a, int64_t R, int ev, const char *dead, int64
                                                  * the sensor owns the truth; the settle below
                                                  * outlasts the executor deadline by 60x */
             a->rsn_cooldown_until = now + g_recanchor_settle_us;
-            av_log(NULL, AV_LOG_WARNING,
-                   "[PTV-RESYNC] a%d(in%d) walk ABORTED (%s) — R=%+"PRId64"ms left; settle "
-                   "%"PRId64"s before any re-fire\n",
-                   a->dbg_k, a->dbg_in, dead ? dead : "new event",
-                   R / 1000, g_recanchor_settle_us / 1000000);
+            {   /* pre30.1: name the edge — the live arcs' bare "new event" cost a whole
+                 * diagnosis round (grep-compatible prefix: "walk ABORTED (new event"). */
+                char why[64];
+                if (!dead) snprintf(why, sizeof why, "new event: %s", evr);
+                av_log(NULL, AV_LOG_WARNING,
+                       "[PTV-RESYNC] a%d(in%d) walk ABORTED (%s) — R=%+"PRId64"ms left; settle "
+                       "%"PRId64"s before any re-fire\n",
+                       a->dbg_k, a->dbg_in, dead ? dead : why,
+                       R / 1000, g_recanchor_settle_us / 1000000);
+            }
             return;
         }
         /* rr30 (T1): WALK LIVENESS CEILING. Item A's corroboration WAITS OUT a moving
@@ -1016,6 +1064,10 @@ static void ptv_resync(AudioState *a, int64_t R, int ev, const char *dead, int64
                      * skip (double actuation: the silence chunks below already own R). */
                     if (atomic_exchange_explicit(&g_vskip_req_us, 0, memory_order_relaxed) > 0)
                         atomic_store_explicit(&g_vskip_state, PTV_VSKIP_IDLE, memory_order_relaxed);
+                    a->rsn_hs_budget_us -= a->rsn_hs_req_us;   /* pre30.1: nothing skipped —
+                                                                * refund the posted span */
+                    if (a->rsn_hs_budget_us < 0) a->rsn_hs_budget_us = 0;
+                    a->rsn_hs_req_us = 0;
                     av_log(NULL, AV_LOG_WARNING,
                            "[PTV-RESYNC] a%d(in%d) vskip executor unresponsive past the "
                            "deadline — silence chunks own the remainder (a late skip would "
@@ -1029,6 +1081,14 @@ static void ptv_resync(AudioState *a, int64_t R, int ev, const char *dead, int64
                 int     gk  = atomic_load_explicit(&g_vskip_done_gops, memory_order_relaxed);
                 atomic_store_explicit(&g_vskip_state, PTV_VSKIP_IDLE, memory_order_relaxed);
                 a->rsn_budget_us -= ach;
+                /* pre30.1: shrink the hs self-budget to what was actually skipped — the
+                 * unachieved surplus (req − ach) is starvation our skip can no longer
+                 * cause; leaving it would widen the foreign-hiding room for free. */
+                if (ach < a->rsn_hs_req_us) {
+                    a->rsn_hs_budget_us -= a->rsn_hs_req_us - ach;
+                    if (a->rsn_hs_budget_us < 0) a->rsn_hs_budget_us = 0;
+                }
+                a->rsn_hs_req_us  = 0;
                 a->rsn_step_wc    = now;        /* the seam stamp: item-A hold + gap run from here */
                 a->rsn_rd_n       = 0;          /* fresh post-seam corroboration */
                 a->ra_applied_us += ach;        /* rr24 F2 accounting: the skip retired +ach of R
@@ -1052,6 +1112,9 @@ static void ptv_resync(AudioState *a, int64_t R, int ev, const char *dead, int64
             if (st == PTV_VSKIP_REFUSED) {
                 atomic_store_explicit(&g_vskip_state, PTV_VSKIP_IDLE, memory_order_relaxed);
                 a->rsn_vskip = 0;
+                a->rsn_hs_budget_us -= a->rsn_hs_req_us;   /* pre30.1: nothing skipped — refund */
+                if (a->rsn_hs_budget_us < 0) a->rsn_hs_budget_us = 0;
+                a->rsn_hs_req_us = 0;
                 av_log(NULL, AV_LOG_WARNING,
                        "[PTV-RESYNC] a%d(in%d) vskip refused (no skippable GOP inside the "
                        "IDR horizon) — falling back to silence chunks for this walk\n",
@@ -1136,6 +1199,7 @@ static void ptv_resync(AudioState *a, int64_t R, int ev, const char *dead, int64
                 kw && now - kw <= FFMAX(2 * ge, g_resync_idr_wait_us)) {
                 int64_t tgt = R < a->rsn_budget_us ? R : a->rsn_budget_us;
                 a->rsn_vskip_deadline = now + g_resync_idr_wait_us + 5000000;
+                ptv_resync_hs_arm(a, tgt);      /* pre30.1: this span's starvation is ours */
                 atomic_store_explicit(&g_vskip_state, PTV_VSKIP_PENDING, memory_order_relaxed);
                 atomic_store_explicit(&g_vskip_req_us, tgt, memory_order_release);
                 return;
@@ -1267,11 +1331,16 @@ static void ptv_resync(AudioState *a, int64_t R, int ev, const char *dead, int64
                                                  * the first seam stamps rsn_step_wc */
         a->rsn_rd_n      = 0;
         a->rsn_vskip     = 0;
+        a->rsn_hs_absorb    = 0;                /* pre30.1: fresh walk — no self-attribution
+                                                 * carried over; arms on the first posted span */
+        a->rsn_hs_budget_us = 0;
+        a->rsn_hs_req_us    = 0;
         if (g_resync_vskip && !a->multiview &&
             ge > 0 && ge <= R + g_resync_vskip_tol_us &&
             kw && now - kw <= FFMAX(2 * ge, g_resync_idr_wait_us)) {
             a->rsn_vskip          = 1;
             a->rsn_vskip_deadline = now + g_resync_idr_wait_us + 5000000;
+            ptv_resync_hs_arm(a, R);            /* pre30.1: this span's starvation is ours */
             atomic_store_explicit(&g_vskip_state, PTV_VSKIP_PENDING, memory_order_relaxed);
             atomic_store_explicit(&g_vskip_req_us, R, memory_order_release);
             av_log(NULL, AV_LOG_WARNING,
@@ -1313,34 +1382,35 @@ static void ptv_resync(AudioState *a, int64_t R, int ev, const char *dead, int64
 static void ptv_recanchor(AudioState *a, RsyncTrackR *r, int64_t now)
 {
     int64_t v, R, hh, ua, uv, rp, tol;
-    int ev = 0;
+    int ev = 0, ev_nonhs = 0;
+    int64_t hs_step = 0, hs_now = 0;
     const char *dead;
-    const char *evr = NULL;   /* TEMP INSTRUMENTATION (pre30.1 diagnosis): which edge fired */
+    const char *evr = "?";     /* pre30.1: edge name for the resync walk's abort line (the live
+                                * arcs' bare "new event" cost a diagnosis round) */
 
     /* own event-edge snapshots — the corrector's CorrState snapshots are CONSUMED by its
      * edge detector and must never be shared. hs tick churn is absorbed per the #51a rule. */
     v = a->corr_epoch ? atomic_load_explicit(a->corr_epoch, memory_order_relaxed) : 0;
-    if (v != a->ra_epoch_snap)                 { a->ra_epoch_snap  = v;                ev = 1; evr = "epoch"; }
-    if (a->glue_events   != a->ra_glue_snap)   { a->ra_glue_snap   = a->glue_events;   ev = 1; evr = "glue"; }
-    if (a->pll_acq_count != a->ra_acq_snap)    { a->ra_acq_snap    = a->pll_acq_count; ev = 1; evr = "pll-acq"; }
-    if (a->afmt_rebuilds != a->ra_afmt_snap)   { a->ra_afmt_snap   = a->afmt_rebuilds; ev = 1; evr = "afmt"; }
-    if (a->dec_reopens   != a->ra_reopen_snap) { a->ra_reopen_snap = a->dec_reopens;   ev = 1; evr = "reopen"; }
-    if (a->conv_esc_n    != a->ra_esc_snap)    { a->ra_esc_snap    = a->conv_esc_n;    ev = 1; evr = "conv-esc"; }
+    if (v != a->ra_epoch_snap)                 { a->ra_epoch_snap  = v;                ev = ev_nonhs = 1; evr = "disturb_epoch"; }
+    if (a->glue_events   != a->ra_glue_snap)   { a->ra_glue_snap   = a->glue_events;   ev = ev_nonhs = 1; evr = "aglue"; }
+    if (a->pll_acq_count != a->ra_acq_snap)    { a->ra_acq_snap    = a->pll_acq_count; ev = ev_nonhs = 1; evr = "pll-acquire"; }
+    if (a->afmt_rebuilds != a->ra_afmt_snap)   { a->ra_afmt_snap   = a->afmt_rebuilds; ev = ev_nonhs = 1; evr = "afmt-rebuild"; }
+    if (a->dec_reopens   != a->ra_reopen_snap) { a->ra_reopen_snap = a->dec_reopens;   ev = ev_nonhs = 1; evr = "adecwd-reopen"; }
+    if (a->conv_esc_n    != a->ra_esc_snap)    { a->ra_esc_snap    = a->conv_esc_n;    ev = ev_nonhs = 1; evr = "conv-escape"; }
     v = atomic_load_explicit(&g_rsx.ev_us[a->dbg_in], memory_order_relaxed);
-    if (v != a->ra_ev_led_snap)                { a->ra_ev_led_snap = v;                ev = 1; evr = "Ev-ledger"; }
+    if (v != a->ra_ev_led_snap)                { a->ra_ev_led_snap = v;                ev = ev_nonhs = 1; evr = "E_v ledger"; }
     v = atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed);
-    if (v != a->ra_ea_led_snap)                { a->ra_ea_led_snap = v;                ev = 1; evr = "Ea-ledger"; }
+    if (v != a->ra_ea_led_snap)                { a->ra_ea_led_snap = v;                ev = ev_nonhs = 1; evr = "E_a ledger"; }
     v = atomic_load_explicit(&g_bank_us, memory_order_relaxed);
-    if (v != a->ra_bank_snap)                  { a->ra_bank_snap   = v;                ev = 1; evr = "bank"; }
+    if (v != a->ra_bank_snap)                  { a->ra_bank_snap   = v;                ev = ev_nonhs = 1; evr = "bank change"; }
     if (a->house_skew) {
         int64_t hstol = a->tick_dur_us > 0 ? a->tick_dur_us + a->tick_dur_us / 4 : 50000;
-        v = *a->house_skew;
-        if (llabs(v - a->ra_hs_snap) > hstol) { a->ra_hs_snap = v; ev = 1; evr = "hs-step"; }
+        v = hs_now = *a->house_skew;
+        if (llabs(v - a->ra_hs_snap) > hstol) { hs_step = v - a->ra_hs_snap;
+                                                a->ra_hs_snap = v; ev = 1;
+                                                if (!ev_nonhs) evr = "hs step"; }
         else                                    a->ra_hs_snap = v;
     }
-    if (ev && a->rsn_active)
-        av_log(NULL, AV_LOG_WARNING, "[PTV-EVDBG] a%d(in%d) mid-walk event edge: %s\n",
-               a->dbg_k, a->dbg_in, evr);
     if (!a->ra_seeded) { a->ra_seeded = 1; a->ra_ev_wc = now; return; }
     if (ev || rscorr_event_active(a, now))
         a->ra_ev_wc = now;
@@ -1434,7 +1504,7 @@ static void ptv_recanchor(AudioState *a, RsyncTrackR *r, int64_t now)
      * chunked walk is active it owns the door (no corroborated engage mid-walk — mutual
      * exclusion is structural: resync fires only with ra_active==0, and vice versa here). */
     if (g_resync)
-        ptv_resync(a, R, ev, dead, now);
+        ptv_resync(a, R, ev, ev_nonhs, evr, hs_step, hs_now, dead, now);
     if (a->rsn_active)
         return;
 
