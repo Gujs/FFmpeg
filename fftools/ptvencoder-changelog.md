@@ -62,6 +62,23 @@ posted spans) instead. Verdict on the coordinator's "should walks yield in churn
 environments?": yes for genuinely-foreign churn (everything outside the budget still
 aborts), no for the walk's own seam aftermath (that self-abort is the live defect).
 
+(8d-rr301) PRE30.1 ADVERSARIAL-REVIEW FIX (2026-07-30, on top of 8d):
+- T1 OVERSHOOT CREDIT: the DONE/ESCAPE budget re-true only handled ach < req; the
+  executor's stop rule and the rr30-T4 packet bound both land up to tol + 1 pkt
+  (~290ms at the 250ms default) PAST the requested span — real self-caused starvation
+  with only the 80ms 2-tick slack to cover it, so our own post-seam dups could bust
+  the budget and re-open the false abort. The adjustment is now symmetric
+  (budget += ach − req, clamped ≥0) — attribution stays bounded by what the skip
+  actually consumed. Review verdicts: shed-no-path claim VERIFIED in code (abort
+  inputs = 9 snapshot edges + delivery watermarks only; shed reaches only the
+  corrector's event-ACTIVE hold + log annotation); budget clears on every walk exit
+  (absorb check is inside the rsn_active block, fields reset at ENGAGE before re-arm);
+  pre-fix pre30 binary FAILS FX-K 3/3 (aborts in the PENDING phase at R=+4502, zero
+  seams) — non-vacuity proven against a 2d71edeede worktree build. FX-K live log:
+  budget 4580 = 4500 posted + 2×40ms ticks, +360ms PENDING-phase absorb, COMPLETE.
+  Harness: FX-K/K2's no-ENGAGE path now consumes a retry instead of failing the
+  fixture (measured flake: a try with zero resync activity and healthy buffers).
+
 (8c-rr30) PRE30 ADVERSARIAL-REVIEW FIXES (2026-07-29, on top of 8c):
 - T1 WALK LIVENESS CEILING: item A's corroboration waits a moving sensor out "however
   long it takes" — with NO bound, a never-stable sensor (storm, jittery source) pinned
