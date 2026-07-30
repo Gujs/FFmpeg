@@ -1081,13 +1081,15 @@ static void ptv_resync(AudioState *a, int64_t R, int ev, int ev_nonhs, const cha
                 int     gk  = atomic_load_explicit(&g_vskip_done_gops, memory_order_relaxed);
                 atomic_store_explicit(&g_vskip_state, PTV_VSKIP_IDLE, memory_order_relaxed);
                 a->rsn_budget_us -= ach;
-                /* pre30.1: shrink the hs self-budget to what was actually skipped — the
-                 * unachieved surplus (req − ach) is starvation our skip can no longer
-                 * cause; leaving it would widen the foreign-hiding room for free. */
-                if (ach < a->rsn_hs_req_us) {
-                    a->rsn_hs_budget_us -= a->rsn_hs_req_us - ach;
-                    if (a->rsn_hs_budget_us < 0) a->rsn_hs_budget_us = 0;
-                }
+                /* pre30.1: re-true the hs self-budget to what was ACTUALLY skipped, both
+                 * directions (review): the unachieved surplus (req − ach) is starvation our
+                 * skip can no longer cause — leaving it would widen the foreign-hiding room
+                 * for free — and an OVERSHOOT (ach > req: the stop key / packet-bound escape
+                 * land up to tol + 1 pkt past the target, ~290ms vs the 80ms 2-tick slack)
+                 * is real extra starvation our skip DID cause — without it our own dups can
+                 * bust the budget and re-open the exact false abort this pre fixes. */
+                a->rsn_hs_budget_us += ach - a->rsn_hs_req_us;
+                if (a->rsn_hs_budget_us < 0) a->rsn_hs_budget_us = 0;
                 a->rsn_hs_req_us  = 0;
                 a->rsn_step_wc    = now;        /* the seam stamp: item-A hold + gap run from here */
                 a->rsn_rd_n       = 0;          /* fresh post-seam corroboration */
