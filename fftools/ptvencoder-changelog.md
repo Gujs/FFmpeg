@@ -5,6 +5,51 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 1.1.0-rc1 (2026-08-05) — CONTENT FREEZE, tag `v1.1.0-rc1` = pre30.1 `c43094bbf9`
+
+Release candidate for v1.1.0 (the fleet-wide milestone, roadmap #43). The tag sits on the EXACT
+commit the whole fleet runs (build `N-125856-g2ae2413488`, banner still reads `1.0.1-pre30.1`) —
+tagging the running content instead of a banner-bump build preserves the banked soak uptime
+(canary tier since 2026-07-30; fleet-wide incl. cor-1/cor-2 since 2026-08-05, ~100% adoption
+after the restart waves). At release: one banner-bump commit → tag `v1.1.0` → one build.
+**Content freeze on `audio-batch`: docs-only commits until v1.1.0.**
+
+**Soak gate (7 days, through ~2026-08-12), pass criteria stated up front:** zero
+FATAL/segv/[PTV-STALL] fleet-wide; RSS bounded — MEMCAP kills confined to the known leak channels
+at a stable ~1-2/day; no silent >5s desync that outlives PIN_DESYNC detection; engines converging
+(completes/parks accruing, circuit breaker never ERROR-latching). These are the v1.0.0 gates plus
+the sensor-backed criteria that build could not express.
+
+**What 1.1.0 adds over 1.0.0 (the pre9→pre30.1 line, headline items):** the passive residual
+lip-sync SENSOR (`lipsync=`, owner-certified against the wire oracle) → the residual-sync
+CORRECTOR (default-ON, band ≤350ms) → RESYNC hard-reset engine for the >350ms band (default-ON,
+audio-late whole-step jump cut + audio-early video IDR-skip walks with hs self-attribution) →
+recovery re-anchor + wall-evidence split (#63 storm fix) → glue classifier (#33) → broken-AAC
+tolerance + rebuild escapes (#38/#42/#46) → AFMT rebuild re-anchor → MEMCAP/MUXTOL/MUXGUARD
+guardrails → PPS-dedup (patch 0005, the 40GB storm-heap fix) → mv sensor port + mv corrector.
+Wedge classes fixed: #32 (pre8), EINVAL zombie (pre26), egress-pressure death loop (pre27).
+
+**Known limitations (all documented, all with containment — none is a 1.0.0 regression):**
+1. **F7 bank-blind whole-step bake** — an armed bank disables the wall-evidence split; on
+   chronically bursty feeds (63 channels at the 12s ceiling) an asymmetric event can erase a real
+   hole and bake the difference (Avivando −5.9s, 2026-08-03). Contained: sync_check PIN_DESYNC
+   auto-restarts. Fix = #58 §9/A4 per-event disturbance test (1.1.x).
+2. **>5s gate-silence** — above the corrector's implausibility bound, RESYNC's confirm gates can
+   decline with zero log output. Contained: PIN_DESYNC. Fix = decline-reason logging (1.1.1).
+3. **T5 confirm-on-flipped-reading** — a RESYNC confirm timer can fire on a reading whose truth
+   flipped during the window; measured live at ±30s (AlrightTV 2026-08-04); the engine walks its
+   own overcorrection back (self-correcting double excursion). Fix needs the FX-I redesign (1.1.x).
+4. **No mv RESYNC** — multiview slots have corrector+PLL only; a slot pinned >5s has no in-process
+   owner. Contained: PIN_DESYNC (proven live: mv 2×2 slot +2.7s → restart → +13ms, 2026-08-05).
+   Fix = mv-RESYNC with #24 (1.1.x).
+5. **Dying-feed async runaway (ZENLIFE class)** — video trickle drives unbounded aresample pad;
+   bounded by MEMCAP (~10min respawn cycles). Fix = #53 + async-pad rate bound (1.1.x).
+
+External containment shipped alongside (transcoder repo): sync_check.sh PIN_DESYNC — content-domain
+pinned-desync detection from the `lipsync=` sensor with engine-activity awareness (`96647ea` +
+multi-audio token fix `fb08f66`); day-1 in production: 16 flags → 9 confirmed → 5 channels
+restarted, incl. the first unattended save of a class no in-process engine could own.
+
 ## 1.0.1 (pending) — mv-audio robustness batch
 
 (8d) PRE30.1 — RESYNC vskip walk survives its own post-seam starvation dups
