@@ -5,6 +5,35 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 🏁 1.1.0 (2026-08-08) — RELEASED. Content-identical to `v1.1.0-rc1` (banner bump only).
+
+**Release gate PASSED — 4-day fleet soak, 2026-08-05 → 08-08, ~243 channels on 8 hosts** (the rc
+content ran on the canary tier from 07-30, so effectively 9 days on the code):
+- **Zero FATAL, zero SIGSEGV, zero `[PTV-STALL]`** fleet-wide for the whole window.
+- **Accumulator classes exercised and clean:** the 26.5h 33-bit PTS wrap was crossed by ~200
+  channels within the same morning (48/56 readable on cor-1 alone past 27h) with **zero muxer
+  EINVAL / MUXGUARD** — the class that froze Cinestar in July. 43 channels passed 3 days uptime
+  with `lipsync=` flat and RSS bounded.
+- **Lip-sync at gate time: 236/243 in band (≤50ms), nothing above 1s** fleet-wide.
+- **Engines converging:** 140 RESYNC engages → 56 completes, 167 corrector parks, **0 circuit
+  breaker ERROR-latches** in the final 2-day window.
+- **Every desync intervention traced to a broken INPUT, never to healthy content:** 67 PIN-driven
+  restarts over 16 channels in 5 days (160 flags → 122 confirmed → 67 restarts; 93 flags cleared by
+  recheck, 4 channels flagged but never restarted). 37 of the 67 were one channel (K-TV) whose
+  source mux was discarding 4.7% of video packets; after the provider was given the TSDuck evidence
+  its rate went 37 → 3 → 0/day. **Zero PIN restarts on a healthy feed in the entire soak.**
+- **First unattended save of a previously-unownable class:** a multiview 2×2 slot pinned at +2.7s
+  with its corrector storm-disarmed and no mv-RESYNC to take over → detected, confirmed, restarted,
+  +13ms (2026-08-05). That class cost 30 hours of on-air desync in July (NewsNation) because nothing
+  could see it.
+
+Known limitations carry forward UNCHANGED from the rc entry below (F7 bank-blind bake / >5s
+gate-silence / T5 confirm-on-flipped-reading / no mv-RESYNC / ZENLIFE dying-feed runaway) — each with
+containment, each with a named 1.1.x fix vehicle; see
+`analysis/ptvencoder-f7-silence-fix-plan.md` and #58 v0.5 §9–§10. Release patch set:
+`patches/v2/release-1.1.0/` (0001–0005, chain-verified on clean upstream `master fc4b523596`).
+**v1.0.0 remains the rollback anchor.**
+
 ## 1.1.0-rc1 (2026-08-05) — CONTENT FREEZE, tag `v1.1.0-rc1` = pre30.1 `c43094bbf9`
 
 Release candidate for v1.1.0 (the fleet-wide milestone, roadmap #43). The tag sits on the EXACT
