@@ -206,17 +206,33 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
     int64_t idx, house_us;
     int n, r;
 
-    /* content_index() wants the source pts in the rung's own out_tb */
-    idx = content_index(v, av_rescale_q(ev->src_us, AV_TIME_BASE_Q, v->out_tb));
-    if (idx < 0) {                       /* h0 not anchored yet (pre-first-video caption) */
-        atomic_fetch_add_explicit(&g_cc_dropped, 1, memory_order_relaxed);
-        return;
+    if (ev->src_us == AV_NOPTS_VALUE) {
+        /* SYNTHETIC keepalive (see cc_thread): this input stopped delivering frames, so
+         * there is no source pts to map. Advance the stamp by the wall time actually
+         * elapsed — the house clock runs at real time, so that is the right axis — which
+         * keeps the encoder's 10s stale-content timer counting and lets it erase the page.
+         * Without this a dead mosaic slot froze its last caption on air forever. */
+        int64_t now_wc = av_gettime_relative();
+        if (c->last_dts == AV_NOPTS_VALUE || c->last_emit_wc == 0)
+            return;                      /* nothing has ever been on screen: nothing to keep alive */
+        house_us = c->last_dts + (now_wc - c->last_emit_wc);
+    } else {
+        /* content_index() wants the source pts in the rung's own out_tb. h0_lock is held
+         * because on multiview the compositor's REANCHOR2 mutates this slot's h0 at runtime
+         * (every other reader of it takes the lock too). */
+        pthread_mutex_lock(v->h0_lock);
+        idx = content_index(v, av_rescale_q(ev->src_us, AV_TIME_BASE_Q, v->out_tb));
+        pthread_mutex_unlock(v->h0_lock);
+        if (idx < 0) {                   /* h0 not anchored yet (pre-first-video caption) */
+            atomic_fetch_add_explicit(&g_cc_dropped, 1, memory_order_relaxed);
+            return;
+        }
+        /* the exact-rational house time of that content index — the same axis the video pts
+         * ride (the integer-tick divisor would re-import the ~10ppm EXACTTICK error) */
+        house_us = v->out_fps.num > 0
+                 ? av_rescale(idx, 1000000LL * v->out_fps.den, v->out_fps.num)
+                 : idx * v->tick_dur_us;
     }
-    /* the exact-rational house time of that content index — the same axis the video pts
-     * ride (the integer-tick divisor would re-import the ~10ppm EXACTTICK error) */
-    house_us = v->out_fps.num > 0
-             ? av_rescale(idx, 1000000LL * v->out_fps.den, v->out_fps.num)
-             : idx * v->tick_dur_us;
     if (c->last_dts != AV_NOPTS_VALUE) {
         if (house_us < c->last_dts - PTV_CC_BACKSTEP_US) {
             /* the source timeline was rebased under us: adopt the new baseline rather than
@@ -294,7 +310,8 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
     pkt->dts      = house_us;
     pkt->duration = (int64_t)ev->end_ms * 1000;
     pkt->pos      = -1;
-    c->last_dts   = house_us;
+    c->last_dts     = house_us;
+    c->last_emit_wc = av_gettime_relative();
     for (r = 0; r < c->n_out; r++) {              /* fan out to every rung's muxer */
         AVPacket *o = av_packet_clone(pkt);
         if (!o) {
@@ -365,12 +382,30 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
 void *cc_thread(void *arg)
 {
     CcCtx *c = arg;
-    char tag[16];
+    char tag[16], per[80] = "";   /* the "(this input)" half — multiview only, where the
+                                   * fleet totals cannot say which slot went dark */
     int r;
 
+    /* NON-BLOCKING poll rather than a blocking recv: every real event is produced from a
+     * decoded frame of this input, so an input that stops delivering frames (a dead slot on
+     * a mosaic — the channel survives, the cell goes black) would otherwise stop producing
+     * events entirely. No events means no encoder call, which means the encoder's stale-
+     * content erase never runs and the QUIET watchdog never fires: the slot's last caption
+     * freezes on air, silently. Synthesising the keepalive here on the WALL clock restores
+     * both, and keeps the sparse PID advancing for lavf's interleaver. */
     for (;;) {
         CcEvent ev;
-        if (av_thread_message_queue_recv(c->q, &ev, 0) < 0)
+        int ret = av_thread_message_queue_recv(c->q, &ev, AV_THREAD_MESSAGE_NONBLOCK);
+        if (ret == AVERROR(EAGAIN)) {
+            int64_t now_wc = av_gettime_relative();
+            if (c->last_emit_wc && now_wc - c->last_emit_wc >= PTV_CC_KEEPALIVE_US) {
+                CcEvent ka = { NULL, AV_NOPTS_VALUE, 0, PTV_CC_KEEPALIVE };
+                cc_emit(c, &ka);
+            } else
+                av_usleep(20000);                 /* 20ms: 1 Hz floor without a busy loop */
+            continue;
+        }
+        if (ret < 0)
             break;                                /* decode thread EOF'd the queue */
         cc_emit(c, &ev);
         av_freep(&ev.ass);
@@ -379,13 +414,14 @@ void *cc_thread(void *arg)
         AVPacket *eof = NULL;
         av_thread_message_queue_send(c->mux_q[r], &eof, 0);
     }
+    if (c->multi)
+        snprintf(per, sizeof per, "a53=%lld caps=%lld on this input | all inputs: ",
+                 (long long)atomic_load_explicit(&g_cc_a53_in[c->slot],  memory_order_relaxed),
+                 (long long)atomic_load_explicit(&g_cc_caps_in[c->slot], memory_order_relaxed));
     av_log(NULL, AV_LOG_INFO,
-           "[PTV-CC]%s done — a53=%"PRId64" caps=%"PRId64" (this input) | all inputs: "
-           "a53=%"PRId64" caps=%"PRId64" erase=%"PRId64" keep=%"PRId64
+           "[PTV-CC]%s done — %sa53=%"PRId64" caps=%"PRId64" erase=%"PRId64" keep=%"PRId64
            " err=%"PRId64" drop=%"PRId64" bump=%"PRId64" reset=%"PRId64"\n",
-           cc_tag(c, tag, sizeof tag),
-           atomic_load_explicit(&g_cc_a53_in[c->slot],  memory_order_relaxed),
-           atomic_load_explicit(&g_cc_caps_in[c->slot], memory_order_relaxed),
+           cc_tag(c, tag, sizeof tag), per,
            atomic_load_explicit(&g_cc_a53,     memory_order_relaxed),
            atomic_load_explicit(&g_cc_caps,    memory_order_relaxed),
            atomic_load_explicit(&g_cc_erase,   memory_order_relaxed),

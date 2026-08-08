@@ -509,6 +509,11 @@ typedef struct CcEvent {
  * (single-input: input 0 by definition — see cc_setup()). */
 typedef struct CcTap {
     int              on;               /* 0 = byte-inert (default) */
+    int              strip;            /* 1 = strip A53 side data even though this input is
+                                        * NOT extracted (-cc_slots excluded it): overlay-type
+                                        * filters forward side data, and h264_nvenc's a53cc
+                                        * would then re-inject raw 608 onto the composite */
+    int              multi;            /* 1 = multiview: tag this tap's log lines with the slot */
     int              slot;             /* input index — the per-slot counter it feeds */
     AVCodecContext  *dec;              /* cc_dec (AV_CODEC_ID_EIA_608, real_time=1) */
     AVThreadMessageQueue *q;           /* -> CcCtx (CcEvent by value) */
@@ -638,6 +643,8 @@ typedef struct CcCtx {
     int              slot;                    /* input index this extraction belongs to (0 single) */
     int              multi;                   /* 1 = multiview: log lines carry the slot */
     int64_t          last_dts;                /* house-domain us; strictly-increasing guard */
+    int64_t          last_emit_wc;            /* wall clock of the last emitted packet — the
+                                               * synthetic-keepalive timer for a frameless input */
     int64_t          err_log_us;              /* encoder-error log rate limit */
     /* state log (§2 observability): first caption, and the caption-went-quiet transition */
     int              seen_caption;

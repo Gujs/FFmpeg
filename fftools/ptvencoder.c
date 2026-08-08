@@ -1219,9 +1219,18 @@ static int cc_ass_has_text(const char *ass)
  * auto-erase reachable and what keeps a sparse SUBTITLE stream from gating lavf's
  * interleaver (mux.c counts SUBTITLE in nb_interleaved_streams; ptvencoder only bounds
  * that with max_interleave_delta). */
+/* decode-side twin of cc_tag(): "" single-input, " in2" on a mosaic */
+static const char *cc_tap_tag(CcTap *t, char *buf, size_t n)
+{
+    if (!t->multi) { buf[0] = 0; return buf; }
+    snprintf(buf, n, " in%d", t->slot);
+    return buf;
+}
+
 static void cc_tap_frame(CcTap *t, AVFrame *frame, AVRational ist_tb)
 {
     AVFrameSideData *sd;
+    char ttag[16];
     AVSubtitle sub = { 0 };
     CcEvent ev = { NULL, AV_NOPTS_VALUE, 0, PTV_CC_KEEPALIVE };
     int64_t cur_us;
@@ -1239,8 +1248,8 @@ static void cc_tap_frame(CcTap *t, AVFrame *frame, AVRational ist_tb)
         t->last_evt_us = AV_NOPTS_VALUE;
         atomic_fetch_add_explicit(&g_cc_reset, 1, memory_order_relaxed);
         av_log(NULL, AV_LOG_INFO,
-               "[PTV-CC] source pts stepped back %"PRId64"ms — cc_dec state reset\n",
-               (t->last_src_us - cur_us) / 1000);
+               "[PTV-CC]%s source pts stepped back %"PRId64"ms — cc_dec state reset\n",
+               cc_tap_tag(t, ttag, sizeof ttag), (t->last_src_us - cur_us) / 1000);
     }
     t->last_src_us = cur_us;
 
@@ -1264,8 +1273,8 @@ static void cc_tap_frame(CcTap *t, AVFrame *frame, AVRational ist_tb)
                 atomic_fetch_add_explicit(&g_cc_err, 1, memory_order_relaxed);
                 if (nw - t->err_log_us > 10000000) {       /* one line per 10s */
                     t->err_log_us = nw;
-                    av_log(NULL, AV_LOG_WARNING, "[PTV-CC] EIA-608 decode error: %s\n",
-                           av_err2str(ret));
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-CC]%s EIA-608 decode error: %s\n",
+                           cc_tap_tag(t, ttag, sizeof ttag), av_err2str(ret));
                 }
             }
         }
@@ -1309,8 +1318,9 @@ static void cc_tap_frame(CcTap *t, AVFrame *frame, AVRational ist_tb)
         if (!t->lost_warned) {
             t->lost_warned = 1;
             av_log(NULL, AV_LOG_WARNING,
-                   "[PTV-CC] event queue full or closed — caption events are being DROPPED "
-                   "(video is unaffected; see ccdrop= on the stats line)\n");
+                   "[PTV-CC]%s event queue full or closed — caption events are being DROPPED "
+                   "(video is unaffected; see ccdrop= on the stats line)\n",
+                   cc_tap_tag(t, ttag, sizeof ttag));
         }
     } else
         t->last_evt_us = cur_us;
@@ -1740,7 +1750,7 @@ static void *decode_thread(void *arg)
              * because cc_dec must see each frame's 608 pair exactly once in order, and this
              * is the last point upstream of the frame_q drop-oldest / dup / QSHED paths.
              * Always strips the A53 side data (so the video encoder cannot re-inject it). */
-            if (d->cc.on) cc_tap_frame(&d->cc, frame, d->ist_tb);
+            if (d->cc.on || d->cc.strip) cc_tap_frame(&d->cc, frame, d->ist_tb);
             int64_t ts = frame->best_effort_timestamp;
             if (ts != AV_NOPTS_VALUE) {
                 int unset;
@@ -1874,7 +1884,7 @@ static void *decode_thread(void *arg)
     avcodec_send_packet(d->vdec, NULL);
     while (avcodec_receive_frame(d->vdec, frame) >= 0) {
         if (frame->flags & AV_FRAME_FLAG_CORRUPT) { av_frame_unref(frame); continue; }
-        if (d->cc.on) cc_tap_frame(&d->cc, frame, d->ist_tb);
+        if (d->cc.on || d->cc.strip) cc_tap_frame(&d->cc, frame, d->ist_tb);
         d->dec_frames++;
         PTV_HB_VDEC(d->hb_slot, d->hold ? PTV_HB_VDEC_FQSEND : PTV_HB_VDEC_HWUP);
         if (d->hold) stage_hold(d->hold, d->live, frame);
@@ -2238,6 +2248,7 @@ static int cc_setup(CcCtx *cc, CcTap *tap, AVThreadMessageQueue **cc_q,
     tap->last_src_us = AV_NOPTS_VALUE;
     tap->last_evt_us = AV_NOPTS_VALUE;
     tap->slot        = slot;
+    tap->multi       = multi;
 
     /* --- language: -cc_lang, else the first non-"und" audio language on the video's own
      * input, else English. Drives both the stream metadata (which mpegtsenc writes into the
@@ -2273,7 +2284,9 @@ static int cc_setup(CcCtx *cc, CcTap *tap, AVThreadMessageQueue **cc_q,
      * a page a normal receiver will show. */
     for (k = 0; k < slot; k++) {
         page = (page & 0x0F) < 9 ? page + 1 : (page & 0xF0) + 0x10;
-        if (page > 0xFF) {
+        /* both nibbles must stay decimal: 0x99 -> 0xA0 is "8A0", not a page any receiver
+         * keypad can reach, and > 0xFF alone would let it through silently */
+        if (page > 0x99 || (page & 0x0F) > 9) {
             av_log(NULL, AV_LOG_ERROR,
                    "[PTV-CC] -cc_page base 0x%X leaves no room for %d slots\n",
                    ccpage ? (int)strtol(ccpage, NULL, 0) : 0x88, slot + 1);
@@ -2313,8 +2326,7 @@ static int cc_setup(CcCtx *cc, CcTap *tap, AVThreadMessageQueue **cc_q,
             return ret;
         os->time_base = AV_TIME_BASE_Q;
         av_dict_set(&os->metadata, "language", cclang, 0);   /* the 0x56 descriptor reads this */
-        /* Extracted CC streams own the LOGICAL subtitle indices s:0 .. s:(n_cc-1); copied
-         * DVB-subs are numbered from there. -metadata:s:s:N therefore lands on THIS track,
+        /* -metadata:s:s:N lands on THIS track (index assignment is at the copy fan),
          * which is how the multiview convention (language=mva/mvb/…, title="View N") is
          * applied — and it deliberately runs AFTER the source-derived language above, so the
          * operator's virtual code wins on the wire while the G0 subset stays derived from the
@@ -2331,16 +2343,25 @@ static int cc_setup(CcCtx *cc, CcTap *tap, AVThreadMessageQueue **cc_q,
     cc->slot            = slot;
     cc->multi           = multi;
 
+    /* Two DIFFERENT things, and conflating them is the trap: the source language chooses the
+     * teletext G0 national character set, while the tag a player lists is whatever ends up in
+     * the stream metadata — which -metadata:s:s:N overrides (multiview sets mva/mvb/mvc/mvd).
+     * Keeping them separate is what lets a slot be listed as "mvc" and still render its
+     * Spanish accents; deriving the subset from the virtual code would silently give it the
+     * English repertoire. Say both, so the log cannot be read as "the output is tagged eng". */
     if (multi)
         av_log(NULL, AV_LOG_INFO,
                "ptvencoder: CC extraction ON for input %d — EIA-608 -> dvb_teletext page "
-               "%d%02X, lang \"%s\" (G0 subset %d), subtitle s:%d in every output\n",
-               slot, magazine, page, cclang, subset, sidx);
+               "%d%02X, subtitle s:%d in every output; source lang \"%s\" -> G0 subset %d "
+               "(character set only — the tag on the wire is s:%d's metadata, e.g. "
+               "-metadata:s:s:%d language=mva)\n",
+               slot, magazine, page, sidx, cclang, subset, sidx, sidx);
     else
         av_log(NULL, AV_LOG_INFO,
-               "ptvencoder: CC extraction ON — EIA-608 -> dvb_teletext page %d%02X, lang \"%s\" "
-               "(G0 subset %d), 1 subtitle stream per output\n",
-               magazine, page, cclang, subset);
+               "ptvencoder: CC extraction ON — EIA-608 -> dvb_teletext page %d%02X, "
+               "1 subtitle stream per output; source lang \"%s\" -> G0 subset %d, tagged "
+               "\"%s\" unless -metadata:s:s:0 language=... overrides it\n",
+               magazine, page, cclang, subset, cclang);
     return 0;
 }
 
@@ -2459,6 +2480,9 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
          * copied, not a second, redundant caption track synthesised beside them (that is
          * exactly the per-slot dvb/cc/none choice the production wrapper already makes).
          * There is no guessing left — a slot is either named or it is not extracted. */
+        if (!cc_on && og_get(&outs->groups[0], "cc_slots"))
+            av_log(NULL, AV_LOG_WARNING,
+                   "[PTV-CC] -cc_slots is ignored without -cc_extract\n");
         if (cc_on) {
             const char *ccsl = og_get(&outs->groups[0], "cc_slots");
             if (ccsl && ccsl[0]) {
@@ -3170,6 +3194,14 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         inputs[in].dc.cc.q  = cc_q[k];           /* decode-thread tap -> this slot's emitter */
         inputs[in].dc.cc.on = 1;
     }
+    /* Strip A53 side data on EVERY input, including ones -cc_slots excluded. xstack/hstack
+     * allocate a fresh frame and drop side data, but overlay-type filters forward the main
+     * frame intact — so an excluded slot's raw 608 could otherwise reach h264_nvenc (a53cc
+     * defaults ON) and be re-injected as SEI on the composite, source-timeline-stamped,
+     * alongside the teletext tracks. An unarmed tap has no decoder and does nothing else. */
+    if (cc_on)
+        for (k = 0; k < n_input; k++)
+            if (!inputs[k].dc.cc.on) inputs[k].dc.cc.strip = 1;
     for (k = 0; k < n_audio; k++) {              /* per-track audio: source from its input's clock */
         as[k].audio_q = audio_q[k];
         as[k].h0 = &inputs[asrc_in[k]].h0; as[k].h0_lock = &inputs[asrc_in[k]].h0_lock;
@@ -3278,11 +3310,6 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
     }
     for (r = 0; r < n_rung; r++)
         if (!pthread_create(&rung[r].th_wd, NULL, watchdog_thread, &rung[r].vc)) rung[r].started_wd = 1;
-    if (multiview) {
-        int pe = pthread_create(&th_compositor, NULL, compositor_thread, &comp);
-        if (pe) { ret = AVERROR(pe); aborted = 1; goto shutdown; }
-        started_compositor = 1;
-    }
     for (k = 0; k < n_cc; k++) {                 /* BEFORE the decode threads: on a create
                                                   * failure the tap is disarmed with nothing
                                                   * yet pushing into the queue (no race) */
@@ -3295,6 +3322,13 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         /* this emitter's producer slot is retired by hand, or every muxer would wait for an
          * EOF marker that no thread will ever send */
         for (r = 0; r < n_rung; r++) { AVPacket *eof = NULL; av_thread_message_queue_send(rung[r].mux_q, &eof, 0); }
+    }
+    if (multiview) {                             /* AFTER the CC emitters: the compositor's
+                                                  * stats line reads dc.cc.on, which the
+                                                  * create-failure path above clears */
+        int pe = pthread_create(&th_compositor, NULL, compositor_thread, &comp);
+        if (pe) { ret = AVERROR(pe); aborted = 1; goto shutdown; }
+        started_compositor = 1;
     }
     {   /* the stats line's cc= is meaningful only while at least one extraction is alive */
         int alive = 0;

@@ -685,7 +685,9 @@ void *compositor_thread(void *arg)
                                                       * nonzero on a non-follow mv track — the
                                                       * follow path never runs ptv_recanchor) */
                 ptv_stats_rsn(rsn, sizeof rsn, 1);
-                char ls[448]; int lp = 0;   /* per-slot: qdrop=input-q overflow, corrupt=demux+decode,
+                char ls[768]; int lp = 0;   /* 4 slots x ~122 chars once the counters grow: at 448
+                                             * the 4th slot's whole token silently vanished — the
+                                             * one the per-slot cc= exists to make visible */   /* per-slot: qdrop=input-q overflow, corrupt=demux+decode,
                                              * pd=cadence holds (NORMAL for a rate-mismatched slot),
                                              * sv=starvation dups, sk=published audio skew,
                                              * skres=LAYERA erase-residue ledger (0.9.18.7, same
