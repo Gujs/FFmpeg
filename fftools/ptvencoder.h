@@ -461,6 +461,62 @@ typedef struct VideoHold {
     int             eof;       /* decode terminated for this input (terminal) */
 } VideoHold;
 
+/* ---- EIA-608 closed captions -> DVB-teletext subtitles (opt-in: -cc_extract) ----
+ * The video decoder hands us the source's A53 CC bytes as frame side data; cc_dec turns
+ * them into ASS dialog lines and the dvb_teletext encoder turns those into teletext PES
+ * (page 888) on a synthetic subtitle stream in every rung.
+ *
+ * WHY THE WORK IS SPLIT ACROSS TWO THREADS:
+ *  - cc_dec is STATEFUL and must see every frame's 608 pair exactly once, in order, so
+ *    the tap sits in the DECODE thread — upstream of the frame_q drop-oldest, the dup
+ *    emission and the QSHED head-sheds, all of which would corrupt the caption stream.
+ *  - the PTS must come from the HOUSE clock, not the source, or the captions drift off
+ *    the re-stamped video by the accumulated house-vs-content skew. So the decode thread
+ *    only ships the caption plus the SOURCE pts of the frame that carried it, and the
+ *    emitter stamps it through the very same content_index() the video frame goes
+ *    through (ptvencoder_clock.c) — one arithmetic, no second copy to diverge.
+ * The queue is bounded and the decode-side push is NONBLOCK (drop-newest): a wedged
+ * emitter must never stall video. */
+#define PTV_CC_QDEPTH          64        /* decode -> emitter events (~1 min of 1 Hz keepalive) */
+#define PTV_CC_KEEPALIVE_US    1000000   /* zero-rect keepalive cadence (source-time domain) */
+#define PTV_CC_MAX_DISPLAY_MS  10000     /* end_display_time clamp (cc_dec real_time returns -1) */
+#define PTV_CC_ENC_BUF         4096      /* one teletext PES payload is 1 + 46*units bytes */
+#define PTV_CC_BACKSTEP_US     500000    /* backward source jump => new timeline (reset baselines) */
+#define PTV_CC_QUIET_US        60000000  /* captions absent this long while A53 keeps arriving
+                                          * => one [PTV-CC] QUIET line (and one on recovery) */
+
+/* What a queued event MEANS. All three reach the encoder — an empty/zero-rect subtitle is
+ * how the teletext encoder is told to keep or clear the page, so it must never be filtered
+ * out here; the kind exists for the counters and the state log. CAPTION and ERASE differ
+ * only in whether the rect's text field is empty (cc_ass_has_text); both carry the rect. */
+enum {
+    PTV_CC_CAPTION = 0,   /* cc_dec produced displayable text */
+    PTV_CC_ERASE,         /* cc_dec produced a rect with EMPTY text = the source cleared its
+                           * caption memory (EDM/EOC) => the encoder erases the page now */
+    PTV_CC_KEEPALIVE      /* nothing new; the 1 Hz floor (the only zero-rect event) */
+};
+
+/* One caption event in flight. `ass` is owned by the queue (freed by the queue's free
+ * func or by the emitter after it is consumed); NULL for KEEPALIVE only. */
+typedef struct CcEvent {
+    char    *ass;        /* ASS dialog line from cc_dec (NULL = zero-rect subtitle) */
+    int64_t  src_us;     /* SOURCE pts of the video frame that carried the CC (us) */
+    uint32_t end_ms;     /* end_display_time, already clamped */
+    int      kind;       /* PTV_CC_* */
+} CcEvent;
+
+/* Decode-thread side. One per input; wired only to the input that owns the encoded video
+ * (single-input: input 0 by definition — see cc_setup()). */
+typedef struct CcTap {
+    int              on;               /* 0 = byte-inert (default) */
+    AVCodecContext  *dec;              /* cc_dec (AV_CODEC_ID_EIA_608, real_time=1) */
+    AVThreadMessageQueue *q;           /* -> CcCtx (CcEvent by value) */
+    int64_t          last_src_us;      /* previous frame's source pts (backward-jump detector) */
+    int64_t          last_evt_us;      /* source pts of the last QUEUED event (keepalive timer) */
+    int64_t          err_log_us;       /* cc_dec error log rate limit */
+    int              lost_warned;      /* the "emitter gone, captions being lost" line, once */
+} CcTap;
+
 /* Shared decode side of the ABR ladder (the ffmpeg model: decode the source
  * ONCE, run it through one filter graph — a -filter_complex `split`, a single
  * -filter:v chain, or none — and hand each rung its own frames via that rung's
@@ -522,6 +578,7 @@ typedef struct DecodeCtx {
      * keeps the whole path inert. */
     int64_t          vgop_last_key_dts;    /* dts of the last KEY packet popped */
     int              vgop_key_seen;        /* first key seen (0 until then) */
+    CcTap            cc;                   /* -cc_extract: EIA-608 tap (off = byte-inert) */
 } DecodeCtx;
 
 /* Per-rung output side: pop this rung's frame_q on the house clock, stamp the
@@ -557,6 +614,26 @@ typedef struct VideoCtx {
     volatile int     output_done;
     int              stalled;
 } VideoCtx;
+
+/* CC emitter side (one instance; its own thread — see the CcTap header). It borrows the
+ * MASTER rung's VideoCtx purely as the stamping domain: content_index() reads only h0 /
+ * out_tb / out_fps / tick_dur_us, all of which every rung shares, so one stamp is
+ * rung-coherent by construction. Sparse by design: no DlvGate (the gate exists to hold
+ * DENSE audio for the video front), straight into each rung's mux_q. */
+typedef struct CcCtx {
+    AVThreadMessageQueue *q;                  /* <- CcTap (CcEvent by value) */
+    VideoCtx        *vc;                      /* master rung — content_index() domain only */
+    AVCodecContext  *enc;                     /* dvb_teletext (opened before write_header) */
+    AVThreadMessageQueue *mux_q[PTV_MAX_RUNG];
+    AVStream        *ost[PTV_MAX_RUNG];
+    int              n_out;
+    int64_t          last_dts;                /* house-domain us; strictly-increasing guard */
+    int64_t          err_log_us;              /* encoder-error log rate limit */
+    /* state log (§2 observability): first caption, and the caption-went-quiet transition */
+    int              seen_caption;
+    int              quiet;                   /* 1 = currently in the QUIET state */
+    int64_t          last_caption_us;         /* house us of the last CAPTION emitted */
+} CcCtx;
 
 typedef struct AudioState {
     AVThreadMessageQueue *audio_q;
@@ -1695,6 +1772,24 @@ extern _Atomic int64_t g_reopen_wc[PTV_MAX_INPUT];
  * buffered cushion — -t bounds the INPUT pull, exactly what test cells need. 0 = no limit. */
 extern int64_t g_t_us;
 extern _Atomic int g_t_stop;
+/* EIA-608 -> DVB-teletext CC extraction (defined in ptvencoder.c). OFF by default and
+ * byte-inert unless -cc_extract is given; g_cc is the runtime kill switch (PTV_NO_CC),
+ * g_cc_on the resolved "this run emits CC" flag (set once at setup, read-only after —
+ * the stats line prints cc= whenever it is set, so a silent CC path is visible). */
+extern int     g_cc;
+extern _Atomic int g_cc_on;
+/* observability counters (relaxed atomics; reporting only — no control consumer reads them).
+ * The triple a53/caps/keep is the diagnostic: a53=0 means the SOURCE carries no captions,
+ * a53>0 with caps=0 means the extraction itself is producing nothing, and a keep= that stops
+ * advancing means the tap or the emitter is wedged. */
+extern _Atomic int64_t g_cc_a53;         /* decoded frames carrying A53 CC side data */
+extern _Atomic int64_t g_cc_caps;        /* caption pages emitted (text-bearing ONLY) */
+extern _Atomic int64_t g_cc_erase;       /* page erases emitted (source cleared its captions) */
+extern _Atomic int64_t g_cc_keep;        /* keepalive (stuffing) packets emitted */
+extern _Atomic int64_t g_cc_err;         /* cc_dec + teletext encoder errors */
+extern _Atomic int64_t g_cc_dropped;     /* events lost (queue full / unstampable / enc error) */
+extern _Atomic int64_t g_cc_bump;        /* stamps pushed forward by the monotonic-DTS guard */
+extern _Atomic int64_t g_cc_reset;       /* timeline resets (backward source/house step) */
 
 /* ==== cross-file functions ==== */
 /* ptvencoder_gate.c */
@@ -1714,6 +1809,7 @@ void resolve_cushions(CushionPlan *cp, int live, int multiview,
 void *watchdog_thread(void *arg);
 /* ptvencoder_clock.c */
 void *output_thread(void *arg);
+void *cc_thread(void *arg);   /* -cc_extract emitter: lives here for content_index() */
 /* ptvencoder_audio.c */
 void *audio_thread(void *arg);
 void ptv_adec_opts(AVCodecContext *dec);   /* 1.0.1-pre19 #38: opt-in tolerant AAC decode (by name, missing-option tolerant) */

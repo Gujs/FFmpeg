@@ -175,6 +175,209 @@ static int64_t content_index(VideoCtx *v, int64_t src_pts)
     return (house_us + v->tick_dur_us / 2) / v->tick_dur_us;
 }
 
+/* ---- -cc_extract: EIA-608 -> DVB-teletext emitter (see the CcTap header in ptvencoder.h) ----
+ * This lives in this file for ONE reason: content_index() above is the single copy of the
+ * house-clock stamping arithmetic, and the captions must ride exactly it. The decode thread
+ * shipped us the caption plus the SOURCE pts of the frame that carried it; we map that pts
+ * through content_index() — the same call, the same h0, the same EXACTTICK rational — so the
+ * teletext page lands on the video frame it belongs to no matter how much house-vs-content
+ * skew has accumulated. Stamping once is rung-coherent by construction (every rung shares
+ * h0/out_tb/out_fps), and the resulting packet is cloned per rung.
+ *
+ * Emits one packet per event, including the zero-rect keepalive (the dvb_teletext encoder
+ * turns that into stuffing units, or a page-erase once its 10s content timeout expires). */
+static void cc_emit(CcCtx *c, CcEvent *ev)
+{
+    VideoCtx *v = c->vc;
+    AVSubtitle sub = { 0 };
+    AVSubtitleRect rect = { 0 };
+    AVSubtitleRect *rects[1] = { &rect };
+    AVPacket *pkt;
+    int64_t idx, house_us;
+    int n, r;
+
+    /* content_index() wants the source pts in the rung's own out_tb */
+    idx = content_index(v, av_rescale_q(ev->src_us, AV_TIME_BASE_Q, v->out_tb));
+    if (idx < 0) {                       /* h0 not anchored yet (pre-first-video caption) */
+        atomic_fetch_add_explicit(&g_cc_dropped, 1, memory_order_relaxed);
+        return;
+    }
+    /* the exact-rational house time of that content index — the same axis the video pts
+     * ride (the integer-tick divisor would re-import the ~10ppm EXACTTICK error) */
+    house_us = v->out_fps.num > 0
+             ? av_rescale(idx, 1000000LL * v->out_fps.den, v->out_fps.num)
+             : idx * v->tick_dur_us;
+    if (c->last_dts != AV_NOPTS_VALUE) {
+        if (house_us < c->last_dts - PTV_CC_BACKSTEP_US) {
+            /* the source timeline was rebased under us: adopt the new baseline rather than
+             * ratcheting every future caption off a now-stale high-water (the muxer's own
+             * [PTV-MUXGUARD] drops whatever is still backward — SUBTITLE is non-fatal there) */
+            atomic_fetch_add_explicit(&g_cc_reset, 1, memory_order_relaxed);
+            av_log(NULL, AV_LOG_INFO,
+                   "[PTV-CC] house stamp stepped back %"PRId64"ms — subtitle dts baseline reset\n",
+                   (c->last_dts - house_us) / 1000);
+            c->last_dts = AV_NOPTS_VALUE;
+            /* the QUIET watchdog measures on this same axis: leaving last_caption_us on the
+             * OLD (higher) house time makes house_us - last_caption_us negative for as long
+             * as the step was, silently disarming it. Re-baseline on the next event. */
+            c->last_caption_us = AV_NOPTS_VALUE;
+        } else if (house_us <= c->last_dts) {
+            house_us = c->last_dts + 1000;        /* strictly increasing (1ms == 90 @90kHz) */
+            atomic_fetch_add_explicit(&g_cc_bump, 1, memory_order_relaxed);
+        }
+    }
+
+    pkt = av_packet_alloc();
+    if (!pkt) {                                   /* counted: a silent CC path with every
+                                                   * counter flat is the one thing the
+                                                   * observability design rules out */
+        atomic_fetch_add_explicit(&g_cc_dropped, 1, memory_order_relaxed);
+        return;
+    }
+    if (av_new_packet(pkt, PTV_CC_ENC_BUF) < 0) {
+        atomic_fetch_add_explicit(&g_cc_dropped, 1, memory_order_relaxed);
+        av_packet_free(&pkt);
+        return;
+    }
+    sub.pts              = house_us;              /* the encoder's erase timer reads this */
+    sub.end_display_time = ev->end_ms;
+    if (ev->ass) {
+        rect.type    = SUBTITLE_ASS;
+        rect.ass     = ev->ass;
+        sub.rects    = rects;
+        sub.num_rects = 1;
+    }
+    n = avcodec_encode_subtitle(c->enc, pkt->data, pkt->size, &sub);
+    if (n <= 0 && sub.num_rects) {
+        /* The encoder had nothing to say about this caption (n == 0: no printable text and
+         * no page up to erase) or could not encode it at all (n < 0). Send the keepalive in
+         * its place: the tap phases its 1 Hz floor on events SENT, so swallowing this one
+         * would let the CC PID go silent for as long as such captions keep arriving — the
+         * very failure this retry exists to prevent. One event in => one packet out. */
+        if (n < 0) {
+            int64_t nw = av_gettime_relative();
+            atomic_fetch_add_explicit(&g_cc_err, 1, memory_order_relaxed);
+            if (nw - c->err_log_us > 10000000) {
+                c->err_log_us = nw;
+                av_log(NULL, AV_LOG_WARNING, "[PTV-CC] teletext encode failed: %s\n",
+                       av_err2str(n));
+            }
+        }
+        sub.num_rects = 0;
+        sub.rects     = NULL;
+        ev->kind      = PTV_CC_KEEPALIVE;
+        ev->end_ms    = 0;                        /* stuffing has no on-screen life */
+        sub.end_display_time = 0;
+        n = avcodec_encode_subtitle(c->enc, pkt->data, pkt->size, &sub);
+    }
+    if (n <= 0) {
+        /* the encoder declined even the keepalive (n == 0 => buffer too small, see
+         * PTV_CC_ENC_BUF) or failed it outright */
+        if (n < 0)
+            atomic_fetch_add_explicit(&g_cc_err, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_cc_dropped, 1, memory_order_relaxed);
+        av_packet_free(&pkt);
+        return;
+    }
+    av_shrink_packet(pkt, n);
+    pkt->pts      = house_us;                     /* AV_TIME_BASE_Q; rescaled per rung below */
+    pkt->dts      = house_us;
+    pkt->duration = (int64_t)ev->end_ms * 1000;
+    pkt->pos      = -1;
+    c->last_dts   = house_us;
+    for (r = 0; r < c->n_out; r++) {              /* fan out to every rung's muxer */
+        AVPacket *o = av_packet_clone(pkt);
+        if (!o) {
+            atomic_fetch_add_explicit(&g_cc_dropped, 1, memory_order_relaxed);
+            continue;
+        }
+        av_packet_rescale_ts(o, AV_TIME_BASE_Q, c->ost[r]->time_base);
+        o->stream_index = c->ost[r]->index;
+        /* NO delivery gate: the gate holds DENSE audio for the video front; a sparse
+         * subtitle's wire-arrival lead is a feature (same rule as copied DVB-subs). */
+        if (av_thread_message_queue_send(c->mux_q[r], &o, 0) < 0)
+            av_packet_free(&o);
+    }
+    av_packet_free(&pkt);
+    /* counted APART: caps= must mean "pages of text went out". Folding erases in would make
+     * a source that only ever clears its captions look like a working extraction, and would
+     * keep last_caption_us fresh so the QUIET watchdog below could never fire. */
+    if (ev->kind == PTV_CC_CAPTION)
+        atomic_fetch_add_explicit(&g_cc_caps, 1, memory_order_relaxed);
+    else if (ev->kind == PTV_CC_ERASE)
+        atomic_fetch_add_explicit(&g_cc_erase, 1, memory_order_relaxed);
+    else
+        atomic_fetch_add_explicit(&g_cc_keep, 1, memory_order_relaxed);
+
+    /* --- state log: the two transitions an operator actually needs --- */
+    if (ev->kind == PTV_CC_CAPTION) {
+        /* clear the quiet latch UNCONDITIONALLY: a run that starts inside an ad break goes
+         * QUIET before its first caption, and leaving the latch set there would make every
+         * LATER outage — the interesting one — unreportable. */
+        if (c->quiet) {
+            c->quiet = 0;
+            if (c->seen_caption)
+                av_log(NULL, AV_LOG_INFO, "[PTV-CC] captions RESUMED at output time %.3fs\n",
+                       house_us / 1000000.0);
+        }
+        if (!c->seen_caption) {
+            c->seen_caption = 1;
+            av_log(NULL, AV_LOG_INFO,
+                   "[PTV-CC] first caption emitted at output time %.3fs\n",
+                   house_us / 1000000.0);
+        }
+        c->last_caption_us = house_us;
+    } else if (c->last_caption_us == AV_NOPTS_VALUE) {
+        /* Baseline on the FIRST event of any kind, not on the first caption: a run that
+         * never produces one is precisely the "extraction is broken" case this watchdog
+         * exists for, and anchoring on captions alone would make it unreportable. */
+        c->last_caption_us = house_us;
+    } else if (!c->quiet && house_us - c->last_caption_us > PTV_CC_QUIET_US) {
+        /* CC bytes are still arriving (a53= keeps climbing) but nothing decodes to text —
+         * either the source genuinely stopped captioning, or the extraction is broken.
+         * One line either way; the counters say which. */
+        c->quiet = 1;
+        av_log(NULL, AV_LOG_WARNING,
+               "[PTV-CC] QUIET — no caption for %"PRId64"s (a53=%"PRId64" frames seen, "
+               "caps=%"PRId64", ccera=%"PRId64", ccerr=%"PRId64")\n",
+               (house_us - c->last_caption_us) / 1000000,
+               atomic_load_explicit(&g_cc_a53,   memory_order_relaxed),
+               atomic_load_explicit(&g_cc_caps,  memory_order_relaxed),
+               atomic_load_explicit(&g_cc_erase, memory_order_relaxed),
+               atomic_load_explicit(&g_cc_err,   memory_order_relaxed));
+    }
+}
+
+void *cc_thread(void *arg)
+{
+    CcCtx *c = arg;
+    int r;
+
+    for (;;) {
+        CcEvent ev;
+        if (av_thread_message_queue_recv(c->q, &ev, 0) < 0)
+            break;                                /* decode thread EOF'd the queue */
+        cc_emit(c, &ev);
+        av_freep(&ev.ass);
+    }
+    for (r = 0; r < c->n_out; r++) {              /* our own producer EOF marker per muxer */
+        AVPacket *eof = NULL;
+        av_thread_message_queue_send(c->mux_q[r], &eof, 0);
+    }
+    av_log(NULL, AV_LOG_INFO,
+           "[PTV-CC] done — a53=%"PRId64" caps=%"PRId64" erase=%"PRId64" keep=%"PRId64
+           " err=%"PRId64" drop=%"PRId64" bump=%"PRId64" reset=%"PRId64"\n",
+           atomic_load_explicit(&g_cc_a53,     memory_order_relaxed),
+           atomic_load_explicit(&g_cc_caps,    memory_order_relaxed),
+           atomic_load_explicit(&g_cc_erase,   memory_order_relaxed),
+           atomic_load_explicit(&g_cc_keep,    memory_order_relaxed),
+           atomic_load_explicit(&g_cc_err,     memory_order_relaxed),
+           atomic_load_explicit(&g_cc_dropped, memory_order_relaxed),
+           atomic_load_explicit(&g_cc_bump,    memory_order_relaxed),
+           atomic_load_explicit(&g_cc_reset,   memory_order_relaxed));
+    return NULL;
+}
+
 /* 0.9.18 R2 (map §2.4): the house-rate correction LADDER, extracted verbatim from
  * output_thread's master block. Returns the correction (ppm; positive = slow the house)
  * the master publishes and every rung applies. Priority order, unchanged:
@@ -928,12 +1131,32 @@ void *output_thread(void *arg)
                 char rsn[10 + PTV_MAX_AUDIO * 16];                   /* pre29 #69: rsn= (resync fires); absent
                                                                       * while zero — clean line unchanged */
                 ptv_stats_rsn(rsn, sizeof rsn, 0);
+                char ccs[96] = "";                                   /* -cc_extract: caps/erase/keep/a53 —
+                                                                      * printed WHENEVER the feature is on
+                                                                      * (SUBTITLE streams are exempt from the
+                                                                      * MUXGUARD fatal escalation, so a dead
+                                                                      * CC path would otherwise be silent);
+                                                                      * absent when off — line unchanged.
+                                                                      * ccerr/ccdrop appear only when nonzero. */
+                if (g_cc_on) {
+                    int64_t ce = atomic_load_explicit(&g_cc_err,     memory_order_relaxed);
+                    int64_t cd = atomic_load_explicit(&g_cc_dropped, memory_order_relaxed);
+                    int cn = snprintf(ccs, sizeof ccs, " cc=%lld/%lld/%lld/%lld",
+                             (long long)atomic_load_explicit(&g_cc_caps,  memory_order_relaxed),
+                             (long long)atomic_load_explicit(&g_cc_erase, memory_order_relaxed),
+                             (long long)atomic_load_explicit(&g_cc_keep,  memory_order_relaxed),
+                             (long long)atomic_load_explicit(&g_cc_a53,  memory_order_relaxed));
+                    if (ce > 0 && cn > 0 && cn < (int)sizeof ccs)
+                        cn += snprintf(ccs + cn, sizeof ccs - cn, " ccerr=%lld", (long long)ce);
+                    if (cd > 0 && cn > 0 && cn < (int)sizeof ccs)
+                        snprintf(ccs + cn, sizeof ccs - cn, " ccdrop=%lld", (long long)cd);
+                }
                 av_log(NULL, AV_LOG_INFO,
                     "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f "
                     "dup=%"PRId64" pd=%"PRId64" drop=%"PRId64" corrupt=%"PRId64" "
-                    "async=%+"PRId64"ppm%s%s%s%s%s%s%s%s%s\n",
+                    "async=%+"PRId64"ppm%s%s%s%s%s%s%s%s%s%s\n",
                     v->emitted, fps, hh, mm, ss,
-                    v->dup, v->pd, v->framedrop, cr, aw, dlv, wu, bk, cfs, aco, rsl, crs, cvs, rsn);
+                    v->dup, v->pd, v->framedrop, cr, aw, dlv, wu, bk, cfs, aco, rsl, crs, cvs, rsn, ccs);
                 stat_last = nows; stat_prev = v->emitted;
             }
         }
