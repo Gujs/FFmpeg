@@ -402,7 +402,11 @@ static char *utf8_to_teletext_g0(const char *src, int g0_subset)
     int i = 0;
     char *result;
 
-    av_bprint_init(&bp, 0, 256);
+    /* UNLIMITED, not a 256-byte cap: a full CC screen is up to 15 rows and cc_dec
+     * emits multi-byte UTF-8 for accents and symbols, so a real caption can exceed
+     * 256 bytes.  A capped AVBPrint would go !is_complete and fail the whole
+     * encode, silencing the PID for as long as such captions keep arriving. */
+    av_bprint_init(&bp, 0, AV_BPRINT_SIZE_UNLIMITED);
 
     while (s[i]) {
         uint32_t cp;
@@ -695,7 +699,9 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
     }
 
     /* Extract plain text from ASS subtitle */
-    av_bprint_init(&extract.buf, 0, 256);
+    /* UNLIMITED: see utf8_to_teletext_g0().  A capped buffer turns a long caption
+     * into an encode failure rather than a truncated page. */
+    av_bprint_init(&extract.buf, 0, AV_BPRINT_SIZE_UNLIMITED);
 
     for (i = 0; i < sub->num_rects; i++) {
         const char *ass = sub->rects[i]->ass;
@@ -742,16 +748,36 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
 
         p = av_strtok(text_str, "\n", &saveptr);
         while (p && nb_lines < 2) {
-            /* skip empty lines */
-            if (*p != '\0')
-                lines[nb_lines++] = av_strdup(p);
+            /* Map into the teletext G0 repertoire FIRST, then decide whether the
+             * line still shows anything.  The mapping turns every codepoint it
+             * cannot represent into a space — including NBSP and the U+2588 full
+             * block that real EIA-608 encoders use for blanked rows — so a line
+             * that looks non-empty as UTF-8 can map to nothing but spaces.
+             * Drawing that would put a boxed grey bar on screen where the source
+             * asked for a clear one; treating it as empty routes it to the erase
+             * below instead. */
+            char *mapped = utf8_to_teletext_g0(p, ctx->g0_subset);
+            const unsigned char *q = (const unsigned char *)(mapped ? mapped : p);
+
+            while (*q && *q <= ' ')
+                q++;
+            if (*q != '\0')
+                lines[nb_lines++] = mapped ? mapped : av_strdup(p);
+            else
+                av_free(mapped);
             p = av_strtok(NULL, "\n", &saveptr);
         }
         av_free(text_str);
     }
 
-    if (nb_lines == 0)
-        goto cleanup;
+    if (nb_lines == 0) {
+        /* Markup or whitespace only — same meaning as the empty-text case above:
+         * the source is showing nothing. Clear the page rather than returning
+         * silently and leaving the previous caption up until the 10 s timeout. */
+        if (ctx->content_active)
+            return write_erase_page(ctx, buf, bufsize);
+        return 0;
+    }
 
     /* Build teletext PES payload */
 
@@ -772,8 +798,7 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
     /* Content rows: place subtitle text at rows 22 and 23 (bottom of screen)
      * Each data unit gets a unique VBI line offset (8, 9, ...) */
     for (i = 0; i < nb_lines; i++) {
-        char *safe_line = utf8_to_teletext_g0(lines[i], ctx->g0_subset);
-        const char *line = safe_line ? safe_line : lines[i];
+        const char *line = lines[i];   /* already G0-mapped at split time */
         int len, pad_left, j;
         int row = (nb_lines == 1) ? TELETEXT_SUBTITLE_ROW2
                                   : (i == 0 ? TELETEXT_SUBTITLE_ROW1
@@ -809,7 +834,6 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
 
         offset += write_data_unit(buf + offset, ctx->magazine, row,
                                   row_text, 1, 8 + i);
-        av_free(safe_line);
     }
 
     ctx->content_active    = 1;
@@ -827,7 +851,6 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
         }
     }
 
-cleanup:
     for (i = 0; i < nb_lines; i++)
         av_free(lines[i]);
     return offset;
