@@ -678,7 +678,13 @@ typedef struct AudioState {
     AVStream             *ost[PTV_MAX_RUNG];     /* audio out stream in each muxer */
     int              n_out;
     AVCodecContext  *dec;
-    AVCodecContext  *enc[PTV_MAX_RUNG];          /* one AAC encoder per rung (per-rung -b:a) */
+    AVCodecContext  *enc[PTV_MAX_RUNG];          /* per rung; ALIASED when rungs share settings */
+    /* Rungs whose encoder settings are identical share ONE encoder: enc_owner[r] is the rung
+     * that owns enc[r], and only that rung's context is fed and freed. Production ladders run
+     * 6 rungs over 2 distinct audio bitrates (160k x3, 64k x3), so 4 of 6 encodes were
+     * byte-identical duplicates of another rung's. PTV_NO_AENC_SHARE=1 restores one encoder
+     * per rung. */
+    uint8_t          enc_owner[PTV_MAX_RUNG];
     AVRational       ist_tb;
     SwrContext      *swr;                         /* no -af: plain resample to 48k stereo */
     SwrContext      *fg_swr;                       /* -af path: the (async) aresample filter's internal SwrContext — swr_get_delay() = faithful resampler-slip sensor (PTS metrics are blind to it) */
@@ -1812,6 +1818,7 @@ extern _Atomic int g_t_stop;
  * byte-inert unless -cc_extract is given; g_cc is the runtime kill switch (PTV_NO_CC),
  * g_cc_on the resolved "this run emits CC" flag (set once at setup, read-only after —
  * the stats line prints cc= whenever it is set, so a silent CC path is visible). */
+extern int     g_aenc_share;
 extern int     g_cc;
 extern _Atomic int g_cc_on;
 /* observability counters (relaxed atomics; reporting only — no control consumer reads them).

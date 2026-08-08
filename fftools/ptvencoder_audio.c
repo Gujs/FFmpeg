@@ -84,8 +84,10 @@ static const char *ptv_self_shed_note(AudioState *a, char *buf, size_t sz)
  * frame=NULL flushes every encoder. (ffmpeg's filter -> asplit -> N encoders.) */
 static int audio_encode_push(AudioState *a, AVFrame *frame)
 {
-    int i, ret;
+    int i, j, ret;
     for (i = 0; i < a->n_out; i++) {
+        if (a->enc_owner[i] != i)
+            continue;                       /* this rung rides another rung's encoder */
         ret = avcodec_send_frame(a->enc[i], frame);
         if (ret < 0)
             return ret;
@@ -96,14 +98,25 @@ static int audio_encode_push(AudioState *a, AVFrame *frame)
             ret = avcodec_receive_packet(a->enc[i], pkt);
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) { av_packet_free(&pkt); break; }
             if (ret < 0) { av_packet_free(&pkt); return ret; }
-            av_packet_rescale_ts(pkt, a->enc[i]->time_base, a->ost[i]->time_base);
-            pkt->stream_index = a->ost[i]->index;
-            if (a->gate[i] && (pkt->dts != AV_NOPTS_VALUE || pkt->pts != AV_NOPTS_VALUE)) {
-                /* §7.5a: hold until this rung's video front reaches it (block=1 → back-pressure) */
-                int64_t ts = pkt->dts != AV_NOPTS_VALUE ? pkt->dts : pkt->pts;
-                dlv_enqueue(a->gate[i], pkt, av_rescale_q(ts, a->ost[i]->time_base, AV_TIME_BASE_Q), 1);
-            } else if (av_thread_message_queue_send(a->mux_q[i], &pkt, 0) < 0)   /* blocking */
-                av_packet_free(&pkt);
+            /* fan this encode out to every rung sharing it. Each still gets its OWN rescale,
+             * stream_index and delivery gate — only the encode itself is shared, and the
+             * bytes are identical by construction (same encoder, frames and settings). */
+            for (j = 0; j < a->n_out; j++) {
+                AVPacket *out;
+                if (a->enc_owner[j] != i)
+                    continue;
+                out = av_packet_clone(pkt);
+                if (!out) { av_packet_free(&pkt); return AVERROR(ENOMEM); }
+                av_packet_rescale_ts(out, a->enc[i]->time_base, a->ost[j]->time_base);
+                out->stream_index = a->ost[j]->index;
+                if (a->gate[j] && (out->dts != AV_NOPTS_VALUE || out->pts != AV_NOPTS_VALUE)) {
+                    /* §7.5a: hold until this rung's video front reaches it (block=1 → back-pressure) */
+                    int64_t ts = out->dts != AV_NOPTS_VALUE ? out->dts : out->pts;
+                    dlv_enqueue(a->gate[j], out, av_rescale_q(ts, a->ost[j]->time_base, AV_TIME_BASE_Q), 1);
+                } else if (av_thread_message_queue_send(a->mux_q[j], &out, 0) < 0)   /* blocking */
+                    av_packet_free(&out);
+            }
+            av_packet_free(&pkt);
         }
     }
     return 0;

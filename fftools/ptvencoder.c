@@ -862,6 +862,7 @@ int     g_acq_backoff = 1;
  * switch that keeps the whole path inert even when the CLI asks for it. Without
  * -cc_extract nothing is allocated, no stream is created and no packet is produced — the
  * output is byte-identical to a build without this feature. */
+int     g_aenc_share = 1;   /* share one audio encoder between rungs with identical settings */
 int     g_cc = 1;
 /* atomic because the "emitter thread create failed" path clears it AFTER the output threads
  * (which read it for the stats line) are already running */
@@ -2464,6 +2465,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
     pthread_t        th_compositor, th_audio[PTV_MAX_AUDIO];
     int              started_compositor = 0;
     int              started_audio[PTV_MAX_AUDIO] = {0};
+    int eowner[PTV_MAX_RUNG];                  /* audio encoder sharing: owning rung per rung */
     int ret = 0, live, net_input, have_audio = 0, hw_cuda = 0;
     int aborted = 0, r, si, k, kk, n_copy_inputs = 0;
     AVRational out_fps;
@@ -2862,6 +2864,23 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
             const char *abr = (k < sel[r].n_aout) ? sel[r].aout[k].abr : NULL;
             AVDictionary *aopts = NULL; AVCodecContext *e;
             if (!aenc) aenc = avcodec_find_encoder_by_name("aac");
+            /* SHARE an encoder with an earlier rung whose settings are identical. Within one
+             * audio track every other input to the encoder is fixed (48k, ochl, sample_fmt,
+             * the same codec), so the key is exactly (codec, bitrate) — a 6-rung ladder over
+             * 2 distinct bitrates opens 2 encoders, not 6, and the bytes are unchanged.
+             * ⚠ IF A PER-RUNG AUDIO OPTION IS EVER ADDED (profile, cutoff, afterburner…) IT
+             * MUST JOIN THIS KEY, or rungs would silently receive another rung's stream. */
+            eowner[r] = r;
+            if (g_aenc_share) {
+                for (si = 0; si < r; si++) {
+                    const char *sbr = (k < sel[si].n_aout) ? sel[si].aout[k].abr : NULL;
+                    if (eowner[si] == si && encs[si] && encs[si]->codec == aenc &&
+                        ((!sbr && !abr) || (sbr && abr && !strcmp(sbr, abr)))) {
+                        eowner[r] = si; break;
+                    }
+                }
+                if (eowner[r] != r) { encs[r] = NULL; continue; }
+            }
             e = avcodec_alloc_context3(aenc);
             if (!e) { ret = AVERROR(ENOMEM); avcodec_free_context(&kdec); for (si = 0; si < r; si++) avcodec_free_context(&encs[si]); goto end; }
             e->sample_rate = 48000;
@@ -2894,11 +2913,12 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         a->dec_ts_carry = AV_NOPTS_VALUE;  /* pre19.1 [PTV-ASTAMP]: no extrapolation base yet (0 would be a valid pts) */
         for (r = 0; r < n_rung; r++) {
             AVStream *aos; AVDictionaryEntry *klang;
-            a->enc[r] = encs[r];
+            a->enc[r]       = encs[eowner[r]];        /* aliased when shared */
+            a->enc_owner[r] = eowner[r];
             aos = avformat_new_stream(rung[r].ofmt, NULL);
             if (!aos) { ret = AVERROR(ENOMEM); goto end; }
-            avcodec_parameters_from_context(aos->codecpar, encs[r]);
-            aos->time_base = encs[r]->time_base;
+            avcodec_parameters_from_context(aos->codecpar, a->enc[r]);
+            aos->time_base = a->enc[r]->time_base;
             if ((klang = av_dict_get(kist->metadata, "language", NULL, 0)))
                 av_dict_set(&aos->metadata, "language", klang->value, 0);
             apply_stream_meta(&outs->groups[r], 'a', k, aos);   /* CLI -metadata:s:a:N / -disposition:a:N (G5) */
@@ -3480,7 +3500,8 @@ end:
         if (as[k].swr)  swr_free(&as[k].swr);
         if (as[k].fifo) av_audio_fifo_free(as[k].fifo);
         avfilter_graph_free(&as[k].afg);
-        for (r = 0; r < n_rung; r++) avcodec_free_context(&as[k].enc[r]);
+        for (r = 0; r < n_rung; r++)             /* shared encoders are aliased: free once */
+            if (as[k].enc_owner[r] == r) avcodec_free_context(&as[k].enc[r]);
         avcodec_free_context(&as[k].dec);
         avcodec_parameters_free(&as[k].ist_par);   /* pre17 R1: owned copy */
     }
@@ -4059,6 +4080,7 @@ int main(int argc, char **argv)
     { const char *s = getenv("PTV_RSCORR_DWELL_S");   if (s && atoi(s) > 0) g_rscorr_dwell_us  = (int64_t)atoi(s) * 1000000; }
     { const char *s = getenv("PTV_RSCORR_QUIET_S");   if (s && atoi(s) > 0) g_rscorr_quiet_us  = (int64_t)atoi(s) * 1000000; }
     { const char *s = getenv("PTV_RSCORR_SLEW");      if (s && atoi(s) > 0) g_rscorr_slew_us_s = atoi(s); }
+    if (getenv("PTV_NO_AENC_SHARE")) g_aenc_share = 0;  /* one audio encoder per rung (pre-1.2.0 behaviour) */
     if (getenv("PTV_NO_CC"))       g_cc       = 0;   /* CC->teletext kill switch: ignore -cc_extract entirely (byte-inert output) */
     if (getenv("PTV_NO_CUSHREL"))  g_cushrel  = 0;   /* 1.0.1-pre10 (e): keep the 6h zero-starvation cushion decay even under the contradiction */
     if (getenv("PTV_NO_CATCHGOV")) g_catchgov = 0;   /* 1.0.1-pre10 (f): deficit-recovery decode back to device max (the 2.2x catch-up bursts) */
