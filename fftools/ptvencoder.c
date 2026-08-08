@@ -2526,6 +2526,25 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         if (!cc_on && og_get(&outs->groups[0], "cc_slots"))
             av_log(NULL, AV_LOG_WARNING,
                    "[PTV-CC] -cc_slots is ignored without -cc_extract\n");
+    {   /* -af / -filter:a are resolved PER AUDIO TRACK from output group 0 only (one filter
+         * graph per AudioState — see the af lookup at the audio setup), so a DIFFERENT chain
+         * on a later output is silently ignored: that rung gets group 0's audio. Identical
+         * copies are what the production wrapper emits and are harmless, so say nothing for
+         * those; warn only on a real divergence, which is otherwise invisible in the output. */
+        const char *af0 = og_get(&outs->groups[0], "af");
+        int gi;
+        if (!af0) af0 = og_get(&outs->groups[0], "filter:a");
+        for (gi = 1; gi < outs->nb_groups; gi++) {
+            const char *afn = og_get(&outs->groups[gi], "af");
+            if (!afn) afn = og_get(&outs->groups[gi], "filter:a");
+            if (afn && (!af0 || strcmp(afn, af0)))
+                av_log(NULL, AV_LOG_WARNING,
+                       "[PTV-AF] -af/-filter:a on output %d DIFFERS from output 0 and is IGNORED "
+                       "— the audio filter graph is built once per TRACK from output 0, so this "
+                       "output receives output 0's audio. Use -filter:a:N for a per-track chain; "
+                       "per-RUNG audio filtering is not supported.\n", gi);
+        }
+    }
         if (cc_on) {
             const char *ccsl = og_get(&outs->groups[0], "cc_slots");
             if (ccsl && ccsl[0]) {
