@@ -1227,6 +1227,25 @@ static const char *cc_tap_tag(CcTap *t, char *buf, size_t n)
     return buf;
 }
 
+/* Push one event to the emitter. NEVER blocks: a full queue drops the NEWEST and the
+ * counter carries it — a wedged emitter must not cost a video frame. Takes ownership of
+ * ev->ass either way. */
+static void cc_tap_send(CcTap *t, CcEvent *ev, char *ttag)
+{
+    if (av_thread_message_queue_send(t->q, ev, AV_THREAD_MESSAGE_NONBLOCK) < 0) {
+        av_freep(&ev->ass);
+        atomic_fetch_add_explicit(&g_cc_dropped, 1, memory_order_relaxed);
+        if (!t->lost_warned) {
+            t->lost_warned = 1;
+            av_log(NULL, AV_LOG_WARNING,
+                   "[PTV-CC]%s event queue full or closed — caption events are being DROPPED "
+                   "(video is unaffected; see ccdrop= on the stats line)\n",
+                   cc_tap_tag(t, ttag, sizeof(char[16])));
+        }
+    } else
+        t->last_evt_us = ev->src_us;
+}
+
 static void cc_tap_frame(CcTap *t, AVFrame *frame, AVRational ist_tb)
 {
     AVFrameSideData *sd;
@@ -1287,43 +1306,65 @@ static void cc_tap_frame(CcTap *t, AVFrame *frame, AVRational ist_tb)
          * reads the same rect and answers with a page update or a page erase; sending a
          * zero-rect subtitle in the erase case instead would be WRONG, because zero rects
          * is the keepalive contract and only erases after the encoder's 10s timeout. */
-        ev.ass    = av_strdup(sub.rects[0]->ass);
-        ev.kind   = cc_ass_has_text(sub.rects[0]->ass) ? PTV_CC_CAPTION : PTV_CC_ERASE;
-        /* real_time mode leaves end_display_time open (UINT32_MAX) — clamp so the
-         * teletext page has a bounded on-screen life even if nothing follows it. */
-        ev.end_ms = (sub.end_display_time == UINT32_MAX ||
-                     sub.end_display_time > PTV_CC_MAX_DISPLAY_MS)
-                    ? PTV_CC_MAX_DISPLAY_MS : sub.end_display_time;
-        ev.src_us = cur_us;
+        const char *ass = sub.rects[0]->ass;
+        int end_ms = (sub.end_display_time == UINT32_MAX ||
+                      sub.end_display_time > PTV_CC_MAX_DISPLAY_MS)
+                     ? PTV_CC_MAX_DISPLAY_MS : sub.end_display_time;
+        if (cc_ass_has_text(ass)) {
+            /* DEBOUNCE (see PTV_CC_DEBOUNCE_US): buffer it. Only a CHANGE restarts the
+             * silence timer — an identical retransmission must not keep the caption
+             * pending forever. */
+            if (!t->pend_ass || strcmp(t->pend_ass, ass)) {
+                if (!t->pend_ass)
+                    t->pend_first_us = cur_us;        /* new pending cycle */
+                av_freep(&t->pend_ass);
+                t->pend_ass = av_strdup(ass);
+                t->pend_changed_us = cur_us;
+                t->pend_end_ms = end_ms;
+            }
+        } else {
+            /* Source erase (EDM/EOC). Whatever is pending was on screen up to now, so it
+             * must go out BEFORE the clear, otherwise a caption that ends the moment it
+             * completes is never seen at all. */
+            if (t->pend_ass) {
+                CcEvent pe = { t->pend_ass, cur_us, t->pend_end_ms, PTV_CC_CAPTION };
+                t->pend_ass = NULL;
+                cc_tap_send(t, &pe, ttag);
+            }
+            ev.ass    = av_strdup(ass);
+            ev.kind   = PTV_CC_ERASE;
+            ev.end_ms = end_ms;
+            ev.src_us = cur_us;
+            avsubtitle_free(&sub);
+            cc_tap_send(t, &ev, ttag);
+            goto strip;
+        }
         avsubtitle_free(&sub);
-    } else {                                      /* nothing new: the 1 Hz floor, or nothing */
+    } else {
         /* Belt-and-braces. avcodec_decode_subtitle2 already frees on its own error paths
          * (and avsubtitle_free memsets, so this is a no-op, never a double free); what it
          * genuinely covers is got != 0 with no usable rect 0, which the branch above skips.
          * Cheap insurance on a path that runs for months. */
         avsubtitle_free(&sub);
-        if (t->last_evt_us == AV_NOPTS_VALUE) {
-            t->last_evt_us = cur_us;              /* phase the cadence on the first frame */
-            goto strip;
-        }
-        if (cur_us - t->last_evt_us < PTV_CC_KEEPALIVE_US)
-            goto strip;
-        ev.src_us = cur_us;                       /* ass == NULL => zero-rect subtitle */
     }
-    if (av_thread_message_queue_send(t->q, &ev, AV_THREAD_MESSAGE_NONBLOCK) < 0) {
-        /* full or gone: drop the NEWEST and carry on — a wedged emitter must never cost a
-         * video frame. Say so once (the counter carries the rest). */
-        av_freep(&ev.ass);
-        atomic_fetch_add_explicit(&g_cc_dropped, 1, memory_order_relaxed);
-        if (!t->lost_warned) {
-            t->lost_warned = 1;
-            av_log(NULL, AV_LOG_WARNING,
-                   "[PTV-CC]%s event queue full or closed — caption events are being DROPPED "
-                   "(video is unaffected; see ccdrop= on the stats line)\n",
-                   cc_tap_tag(t, ttag, sizeof ttag));
-        }
-    } else
-        t->last_evt_us = cur_us;
+
+    /* --- the two timers --- */
+    if (t->pend_ass &&
+        (cur_us - t->pend_changed_us >= PTV_CC_DEBOUNCE_US ||     /* text went quiet */
+         cur_us - t->pend_first_us   >= PTV_CC_DEADLINE_US)) {    /* roll-up deadline */
+        CcEvent pe = { t->pend_ass, cur_us, t->pend_end_ms, PTV_CC_CAPTION };
+        t->pend_ass = NULL;
+        cc_tap_send(t, &pe, ttag);
+        goto strip;
+    }
+    if (t->last_evt_us == AV_NOPTS_VALUE) {
+        t->last_evt_us = cur_us;                  /* phase the cadence on the first frame */
+        goto strip;
+    }
+    if (t->pend_ass || cur_us - t->last_evt_us < PTV_CC_KEEPALIVE_US)
+        goto strip;                               /* don't keepalive over a pending caption */
+    ev.src_us = cur_us;                           /* ass == NULL => zero-rect keepalive */
+    cc_tap_send(t, &ev, ttag);
 
 strip:
     /* ALWAYS, on every path: both h264_nvenc (a53_cc, default on) and h264_videotoolbox
@@ -3188,6 +3229,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         cc[k].clk.h0         = &inputs[in].h0;   /* ...then re-point the anchor at this slot */
         cc[k].clk.h0_lock    = &inputs[in].h0_lock;
         cc[k].vc             = &cc[k].clk;
+        cc[k].live           = &rung[0].vc;      /* LIVE master rung: current house position */
         cc[k].q              = cc_q[k];
         cc[k].n_out          = n_rung;
         for (r = 0; r < n_rung; r++) cc[k].mux_q[r] = rung[r].mux_q;
@@ -3446,6 +3488,7 @@ end:
     for (k = 0; k < n_input; k++) {
         avfilter_graph_free(&inputs[k].dc.fg);       /* single-input graph (multiview: NULL) */
         avcodec_free_context(&inputs[k].dc.cc.dec);  /* -cc_extract (NULL when off) */
+        av_freep(&inputs[k].dc.cc.pend_ass);         /* a caption still inside the debounce */
         avcodec_free_context(&inputs[k].vdec);
         av_thread_message_queue_free(&inputs[k].video_q);
         av_thread_message_queue_free(&inputs[k].hold.q);

@@ -207,15 +207,26 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
     int n, r;
 
     if (ev->src_us == AV_NOPTS_VALUE) {
-        /* SYNTHETIC keepalive (see cc_thread): this input stopped delivering frames, so
-         * there is no source pts to map. Advance the stamp by the wall time actually
-         * elapsed — the house clock runs at real time, so that is the right axis — which
-         * keeps the encoder's 10s stale-content timer counting and lets it erase the page.
-         * Without this a dead mosaic slot froze its last caption on air forever. */
-        int64_t now_wc = av_gettime_relative();
-        if (c->last_dts == AV_NOPTS_VALUE || c->last_emit_wc == 0)
+        /* SYNTHETIC keepalive (see cc_thread): this input stopped delivering frames, so there
+         * is no source pts to map. Stamp it at the CURRENT HOUSE POSITION — the master rung's
+         * emitted-frame count on the exact-rational axis — which is precisely where the video
+         * being muxed alongside it sits.
+         *
+         * It must NOT advance on wall time. The house clock runs behind the wall by the
+         * pipeline's latency (house_skew, ~3s on a cushioned channel), so a wall-advanced
+         * stamp races ahead of every real caption and the next one looks like a backward
+         * step: [PTV-CC] house stamp stepped back, once per caption, on every channel with a
+         * cushion. Reading the live rung keeps synthetic and real stamps on one axis. */
+        int64_t emitted;
+        if (c->last_dts == AV_NOPTS_VALUE || !c->live)
             return;                      /* nothing has ever been on screen: nothing to keep alive */
-        house_us = c->last_dts + (now_wc - c->last_emit_wc);
+        emitted = c->live->emitted;      /* plain read: a slightly stale count only shifts a
+                                          * keepalive by a frame, and it is monotone */
+        if (emitted <= 0)
+            return;
+        house_us = v->out_fps.num > 0
+                 ? av_rescale(emitted, 1000000LL * v->out_fps.den, v->out_fps.num)
+                 : emitted * v->tick_dur_us;
     } else {
         /* content_index() wants the source pts in the rung's own out_tb. h0_lock is held
          * because on multiview the compositor's REANCHOR2 mutates this slot's h0 at runtime

@@ -482,6 +482,15 @@ typedef struct VideoHold {
 #define PTV_CC_MAX_DISPLAY_MS  10000     /* end_display_time clamp (cc_dec real_time returns -1) */
 #define PTV_CC_ENC_BUF         4096      /* one teletext PES payload is 1 + 46*units bytes */
 #define PTV_CC_BACKSTEP_US     500000    /* backward source jump => new timeline (reset baselines) */
+/* DEBOUNCE (ported from legacy 0005 — load-bearing, not the CDN's "coalescing").
+ * cc_dec real_time=1 emits on EVERY caption-memory change, so a roll-up caption arrives as
+ * a stream of partial lines ("IN", "IN MY TIMES OF", "IN MY TIMES OF DISTRESS."). Turning
+ * each into its own teletext page produced ~5-7 pages per real caption, which libzvbi
+ * (ffplay/VLC) cannot reassemble — measured on air: nothing rendered at all. Two timers:
+ *   SILENCE  emit once the text has stopped changing  (pop-on captions)
+ *   DEADLINE emit anyway after this long pending      (roll-up never stops changing) */
+#define PTV_CC_DEBOUNCE_US     500000    /* text stable this long => emit */
+#define PTV_CC_DEADLINE_US     300000    /* pending this long => emit regardless */
 #define PTV_CC_QUIET_US        60000000  /* captions absent this long while A53 keeps arriving
                                           * => one [PTV-CC] QUIET line (and one on recovery) */
 
@@ -521,6 +530,12 @@ typedef struct CcTap {
     int64_t          last_evt_us;      /* source pts of the last QUEUED event (keepalive timer) */
     int64_t          err_log_us;       /* cc_dec error log rate limit */
     int              lost_warned;      /* the "emitter gone, captions being lost" line, once */
+    /* debounce state (see PTV_CC_DEBOUNCE_US) */
+    char            *pend_ass;         /* buffered ASS line awaiting emit (owned) */
+    int              pend_end_ms;
+    int64_t          pend_changed_us;  /* source pts when the text last CHANGED */
+    int64_t          pend_first_us;    /* source pts when this pending cycle began */
+    int64_t          last_emit_src_us; /* source pts of the last event QUEUED (1 Hz floor) */
 } CcTap;
 
 /* Shared decode side of the ABR ladder (the ffmpeg model: decode the source
@@ -636,6 +651,10 @@ typedef struct CcCtx {
      * locked to its own dialogue instead of to the mosaic's leader. */
     VideoCtx         clk;
     VideoCtx        *vc;                      /* == &clk; content_index() domain only */
+    VideoCtx        *live;                    /* LIVE master rung — read for the current house
+                                               * position (emitted) when stamping a synthetic
+                                               * keepalive; the clk copy above is a snapshot
+                                               * and its counters never advance */
     AVCodecContext  *enc;                     /* dvb_teletext (opened before write_header) */
     AVThreadMessageQueue *mux_q[PTV_MAX_RUNG];
     AVStream        *ost[PTV_MAX_RUNG];
