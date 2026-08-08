@@ -691,16 +691,25 @@ void *compositor_thread(void *arg)
                                              * skres=LAYERA erase-residue ledger (0.9.18.7, same
                                              * accounting as single-input hsres= — the slot's sk
                                              * measurement rides the same erased label stream) */
-                for (k = 0; k < n && lp < (int)sizeof ls - 112; k++) {
-                    char lsin[40], lst[56] = "";
+                for (k = 0; k < n && lp < (int)sizeof ls - 144; k++) {
+                    char lsin[40], lst[56] = "", cct[32] = "";
                     ptv_stats_lipsync_in(lsin, sizeof lsin, nows, k);
                     if (lsin[0])
                         snprintf(lst, sizeof lst, "/lipsync=%s", lsin);
+                    /* -cc_extract: THIS slot's captions/a53. The fleet-wide cc= of the
+                     * single-input line cannot say which slot of a mosaic went dark, which is
+                     * the only CC failure that matters here. Present only on slots the
+                     * extraction actually runs on (-cc_slots), so the line is unchanged when
+                     * the feature is off. */
+                    if (c->inputs[k].dc.cc.on)
+                        snprintf(cct, sizeof cct, "/cc=%lld/%lld",
+                                 (long long)atomic_load_explicit(&g_cc_caps_in[k], memory_order_relaxed),
+                                 (long long)atomic_load_explicit(&g_cc_a53_in[k],  memory_order_relaxed));
                     lp += snprintf(ls + lp, sizeof ls - lp,
-                                   " in%d:qdrop=%"PRId64"/corrupt=%"PRId64"/pd=%"PRId64"/sv=%"PRId64"/sk=%+dms/skres=%+dms%s",
+                                   " in%d:qdrop=%"PRId64"/corrupt=%"PRId64"/pd=%"PRId64"/sv=%"PRId64"/sk=%+dms/skres=%+dms%s%s",
                                    k, c->inputs[k].da.vdrop, c->inputs[k].da.vcorrupt + c->inputs[k].dc.vcorrupt,
                                    pd_cnt[k], sv_cnt[k], (int)(c->inputs[k].house_skew / 1000),
-                                   (int)(c->inputs[k].da.disc_resid_us / 1000), lst);
+                                   (int)(c->inputs[k].da.disc_resid_us / 1000), lst, cct);
                 }
                 av_log(NULL, AV_LOG_INFO,   /* v0.9.13 parity: size/bitrate/speed/genlock dropped (v0.9.10 single-input rationale) */
                     "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f dup=%"PRId64" drop=%"PRId64"%s%s%s%s%s%s\n",

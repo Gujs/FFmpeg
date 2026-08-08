@@ -505,10 +505,11 @@ typedef struct CcEvent {
     int      kind;       /* PTV_CC_* */
 } CcEvent;
 
-/* Decode-thread side. One per input; wired only to the input that owns the encoded video
+/* Decode-thread side. One per input; wired to every input the extraction runs on
  * (single-input: input 0 by definition — see cc_setup()). */
 typedef struct CcTap {
     int              on;               /* 0 = byte-inert (default) */
+    int              slot;             /* input index — the per-slot counter it feeds */
     AVCodecContext  *dec;              /* cc_dec (AV_CODEC_ID_EIA_608, real_time=1) */
     AVThreadMessageQueue *q;           /* -> CcCtx (CcEvent by value) */
     int64_t          last_src_us;      /* previous frame's source pts (backward-jump detector) */
@@ -622,11 +623,20 @@ typedef struct VideoCtx {
  * DENSE audio for the video front), straight into each rung's mux_q. */
 typedef struct CcCtx {
     AVThreadMessageQueue *q;                  /* <- CcTap (CcEvent by value) */
-    VideoCtx        *vc;                      /* master rung — content_index() domain only */
+    /* Clock DESCRIPTOR, owned here, not a borrowed rung. content_index() reads exactly four
+     * fields (h0 / out_tb / out_fps / tick_dur_us) and this carries them, so the single copy
+     * of the stamping arithmetic serves both modes: single-input points h0 at input 0 (what
+     * the rungs use — identical result), multiview points it at THIS SLOT's own h0, which is
+     * the same reference that slot's audio rides. That is what keeps a slot's captions
+     * locked to its own dialogue instead of to the mosaic's leader. */
+    VideoCtx         clk;
+    VideoCtx        *vc;                      /* == &clk; content_index() domain only */
     AVCodecContext  *enc;                     /* dvb_teletext (opened before write_header) */
     AVThreadMessageQueue *mux_q[PTV_MAX_RUNG];
     AVStream        *ost[PTV_MAX_RUNG];
     int              n_out;
+    int              slot;                    /* input index this extraction belongs to (0 single) */
+    int              multi;                   /* 1 = multiview: log lines carry the slot */
     int64_t          last_dts;                /* house-domain us; strictly-increasing guard */
     int64_t          err_log_us;              /* encoder-error log rate limit */
     /* state log (§2 observability): first caption, and the caption-went-quiet transition */
@@ -1790,6 +1800,10 @@ extern _Atomic int64_t g_cc_err;         /* cc_dec + teletext encoder errors */
 extern _Atomic int64_t g_cc_dropped;     /* events lost (queue full / unstampable / enc error) */
 extern _Atomic int64_t g_cc_bump;        /* stamps pushed forward by the monotonic-DTS guard */
 extern _Atomic int64_t g_cc_reset;       /* timeline resets (backward source/house step) */
+/* per-INPUT breakdown. The totals above are fleet-wide; on a mosaic they cannot say WHICH
+ * slot went dark, and "one of four slots lost its captions" is the failure that matters. */
+extern _Atomic int64_t g_cc_caps_in[PTV_MAX_INPUT];
+extern _Atomic int64_t g_cc_a53_in[PTV_MAX_INPUT];
 
 /* ==== cross-file functions ==== */
 /* ptvencoder_gate.c */

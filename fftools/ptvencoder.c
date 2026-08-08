@@ -868,6 +868,7 @@ int     g_cc = 1;
 _Atomic int g_cc_on;
 _Atomic int64_t g_cc_a53, g_cc_caps, g_cc_erase, g_cc_keep, g_cc_err, g_cc_dropped,
                 g_cc_bump, g_cc_reset;
+_Atomic int64_t g_cc_caps_in[PTV_MAX_INPUT], g_cc_a53_in[PTV_MAX_INPUT];
 
 /* PTV_LOG_TS=1: prefix every log line with a local wall-clock timestamp
  * [YYYY-MM-DD HH:MM:SS.mmm], so production logs are self-dated natively
@@ -1247,6 +1248,7 @@ static void cc_tap_frame(CcTap *t, AVFrame *frame, AVRational ist_tb)
     if (sd && sd->size >= 3) {
         AVPacket *cc_pkt = av_packet_alloc();
         atomic_fetch_add_explicit(&g_cc_a53, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_cc_a53_in[t->slot], 1, memory_order_relaxed);
         if (cc_pkt && av_new_packet(cc_pkt, sd->size) >= 0) {
             int ret;
             memcpy(cc_pkt->data, sd->data, sd->size);
@@ -2198,17 +2200,23 @@ typedef struct Rung {
  *  - BEFORE avformat_write_header: mpegtsenc builds the PMT teletext descriptor (0x56) out
  *    of codecpar->extradata, and the encoder only produces those 2 bytes at avcodec_open2.
  *
- * `vin` is the AVFormatContext of THE INPUT THAT OWNS THE ENCODED VIDEO — passed in
+ * `vin` is the AVFormatContext of THE INPUT THIS EXTRACTION BELONGS TO — passed in
  * explicitly rather than assumed, because the legacy code's bug was exactly this: it walked
  * the filtergraph and then unconditionally took the first video stream of the first input
  * file, so on a mosaic it always bound input 0 (which in the reported incident had no
- * captions at all). Multiview is refused outright by the caller instead. */
+ * captions at all). Multiview now calls this ONCE PER SLOT, each with its own input, its own
+ * cc_dec/encoder/queue/thread and its own subtitle track — no slot is ever guessed.
+ *
+ * `slot` is the input index (0 for single-input), `sidx` the LOGICAL subtitle index this
+ * track takes for -metadata:s:s:N, and `multi` marks multiview for the log lines. */
 static int cc_setup(CcCtx *cc, CcTap *tap, AVThreadMessageQueue **cc_q,
                     const AVCodec *cdec, const AVCodec *cenc,
-                    AVFormatContext *vin, Rung *rung, int n_rung, OptionGroupList *outs)
+                    AVFormatContext *vin, Rung *rung, int n_rung, OptionGroupList *outs,
+                    int slot, int sidx, int multi)
 {
-    /* the cc_* options describe ONE extraction shared by the whole ladder, so they are read
-     * from the first output group (like -cc_extract itself) */
+    /* the cc_* options configure the extraction for the WHOLE ladder, so they are read from
+     * the first output group (like -cc_extract itself). On multiview they apply to every
+     * slot: -cc_lang pins the language for all of them, and the page walks per slot below. */
     const char *cclang = og_get(&outs->groups[0], "cc_lang");
     const char *ccpage = og_get(&outs->groups[0], "cc_page");
     const char *ccmag  = og_get(&outs->groups[0], "cc_magazine");
@@ -2229,6 +2237,7 @@ static int cc_setup(CcCtx *cc, CcTap *tap, AVThreadMessageQueue **cc_q,
     }
     tap->last_src_us = AV_NOPTS_VALUE;
     tap->last_evt_us = AV_NOPTS_VALUE;
+    tap->slot        = slot;
 
     /* --- language: -cc_lang, else the first non-"und" audio language on the video's own
      * input, else English. Drives both the stream metadata (which mpegtsenc writes into the
@@ -2256,6 +2265,20 @@ static int cc_setup(CcCtx *cc, CcTap *tap, AVThreadMessageQueue **cc_q,
     if (page < 0 || page > 0xFF) {
         av_log(NULL, AV_LOG_ERROR, "[PTV-CC] -cc_page 0x%X out of range (0x00-0xFF)\n", page);
         return AVERROR(EINVAL);
+    }
+    /* Multiview: each slot gets its OWN page, walked in BCD from the base (888, 889, 890,
+     * 891) so a receiver browsing teletext sees four distinct pages rather than four things
+     * all claiming 888. Separate PIDs would make identical pages legal, but distinct ones
+     * cost nothing and are unambiguous everywhere. Nibbles above 9 are skipped — 88A is not
+     * a page a normal receiver will show. */
+    for (k = 0; k < slot; k++) {
+        page = (page & 0x0F) < 9 ? page + 1 : (page & 0xF0) + 0x10;
+        if (page > 0xFF) {
+            av_log(NULL, AV_LOG_ERROR,
+                   "[PTV-CC] -cc_page base 0x%X leaves no room for %d slots\n",
+                   ccpage ? (int)strtol(ccpage, NULL, 0) : 0x88, slot + 1);
+            return AVERROR(EINVAL);
+        }
     }
     ce = avcodec_alloc_context3(cenc);
     if (!ce)
@@ -2290,10 +2313,13 @@ static int cc_setup(CcCtx *cc, CcTap *tap, AVThreadMessageQueue **cc_q,
             return ret;
         os->time_base = AV_TIME_BASE_Q;
         av_dict_set(&os->metadata, "language", cclang, 0);   /* the 0x56 descriptor reads this */
-        /* the extracted CC stream owns the LOGICAL subtitle index s:0 (copied DVB-subs were
-         * numbered from 1 for exactly this reason); it is created last in the muxer only
-         * because the encoder's extradata must exist before write_header */
-        apply_stream_meta(&outs->groups[r], 's', 0, os);
+        /* Extracted CC streams own the LOGICAL subtitle indices s:0 .. s:(n_cc-1); copied
+         * DVB-subs are numbered from there. -metadata:s:s:N therefore lands on THIS track,
+         * which is how the multiview convention (language=mva/mvb/…, title="View N") is
+         * applied — and it deliberately runs AFTER the source-derived language above, so the
+         * operator's virtual code wins on the wire while the G0 subset stays derived from the
+         * REAL language (a slot tagged "mva" must still render its Spanish correctly). */
+        apply_stream_meta(&outs->groups[r], 's', sidx, os);
         cc->ost[r] = os;
     }
 
@@ -2302,11 +2328,19 @@ static int cc_setup(CcCtx *cc, CcTap *tap, AVThreadMessageQueue **cc_q,
     av_thread_message_queue_set_free_func(*cc_q, free_cc_msg);
     cc->last_dts        = AV_NOPTS_VALUE;
     cc->last_caption_us = AV_NOPTS_VALUE;
+    cc->slot            = slot;
+    cc->multi           = multi;
 
-    av_log(NULL, AV_LOG_INFO,
-           "ptvencoder: CC extraction ON — EIA-608 -> dvb_teletext page %d%02X, lang \"%s\" "
-           "(G0 subset %d), 1 subtitle stream per output\n",
-           magazine, page, cclang, subset);
+    if (multi)
+        av_log(NULL, AV_LOG_INFO,
+               "ptvencoder: CC extraction ON for input %d — EIA-608 -> dvb_teletext page "
+               "%d%02X, lang \"%s\" (G0 subset %d), subtitle s:%d in every output\n",
+               slot, magazine, page, cclang, subset, sidx);
+    else
+        av_log(NULL, AV_LOG_INFO,
+               "ptvencoder: CC extraction ON — EIA-608 -> dvb_teletext page %d%02X, lang \"%s\" "
+               "(G0 subset %d), 1 subtitle stream per output\n",
+               magazine, page, cclang, subset);
     return 0;
 }
 
@@ -2372,12 +2406,16 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
     int aborted = 0, r, si, k, kk, n_copy_inputs = 0;
     AVRational out_fps;
     PassStream pass[PTV_MAX_PASS]; int n_pass = 0;
-    /* -cc_extract: EIA-608 -> DVB-teletext (all inert unless the option is given) */
-    CcCtx            cc;
-    AVThreadMessageQueue *cc_q = NULL;
+    /* -cc_extract: EIA-608 -> DVB-teletext (all inert unless the option is given). One
+     * INDEPENDENT extraction per participating input — single-input is simply n_cc == 1. */
+    CcCtx            cc[PTV_MAX_INPUT];
+    AVThreadMessageQueue *cc_q[PTV_MAX_INPUT] = {0};
     const AVCodec   *cc_dec_codec = NULL, *cc_enc_codec = NULL;
-    pthread_t        th_cc;
-    int              cc_on = 0, started_cc = 0;
+    pthread_t        th_cc[PTV_MAX_INPUT];
+    int              cc_slot[PTV_MAX_INPUT];      /* input index of each extraction */
+    int              started_cc[PTV_MAX_INPUT] = {0};
+    int              cc_want[PTV_MAX_INPUT] = {0};/* per-input: extract from this slot? */
+    int              cc_on = 0, n_cc = 0;
     /* aliases to input 0 (the shared single-input setup code works on it) */
     AVCodecContext *vdec; AVStream *vist; int vstream; const AVCodec *vdecoder;
 
@@ -2403,30 +2441,54 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
          * than letting a rung-1 -cc_extract look like it did something. */
         for (gi = 1; gi < outs->nb_groups; gi++) {
             if (og_get(&outs->groups[gi], "cc_extract")   ||
+                og_get(&outs->groups[gi], "cc_slots")     ||
                 og_get(&outs->groups[gi], "cc_lang")      ||
                 og_get(&outs->groups[gi], "cc_page")      ||
                 og_get(&outs->groups[gi], "cc_magazine")) {
                 av_log(NULL, AV_LOG_WARNING,
-                       "[PTV-CC] -cc_extract/-cc_lang/-cc_page/-cc_magazine on output %d are "
+                       "[PTV-CC] -cc_extract/-cc_slots/-cc_lang/-cc_page/-cc_magazine on output %d are "
                        "IGNORED — the extraction is shared by the whole ladder and is "
                        "configured on the first output only%s\n", gi,
                        cc_on ? "" : " (and the first output does not enable it, so no CC "
                                     "stream will exist at all)");
             }
         }
-        if (cc_on && multiview) {
-            /* REFUSED, not silently mis-bound. On a mosaic there is no single "the video
-             * input": each slot carries its own captions, the compositor (not a VideoCtx) is
-             * the house clock, and there is no defined answer for which slot's captions the
-             * composite should carry. The legacy fftools implementation guessed here and
-             * always bound input 0 — which in the reported production incident had no
-             * captions at all. Per-slot CC is a separate feature; until it exists this is a
-             * hard error rather than wrong output. */
-            av_log(NULL, AV_LOG_ERROR,
-                   "[PTV-CC] -cc_extract is not supported for multi-input (multiview, %d inputs): "
-                   "there is no single video input to extract from, and picking one silently "
-                   "would carry the wrong slot's captions. Remove -cc_extract.\n", n_input);
-            return AVERROR(EINVAL);
+        /* WHICH inputs to extract from. Single-input: the one input. Multiview: every slot
+         * by default, or the explicit list in -cc_slots. The list exists because the caller
+         * usually knows more than we can: a slot that carries real DVB subtitles wants those
+         * copied, not a second, redundant caption track synthesised beside them (that is
+         * exactly the per-slot dvb/cc/none choice the production wrapper already makes).
+         * There is no guessing left — a slot is either named or it is not extracted. */
+        if (cc_on) {
+            const char *ccsl = og_get(&outs->groups[0], "cc_slots");
+            if (ccsl && ccsl[0]) {
+                const char *s = ccsl;
+                while (*s) {
+                    char *end;
+                    long v = strtol(s, &end, 10);
+                    if (end == s) {
+                        av_log(NULL, AV_LOG_ERROR,
+                               "[PTV-CC] -cc_slots '%s': expected a comma-separated list of "
+                               "input indices (e.g. 0,2)\n", ccsl);
+                        return AVERROR(EINVAL);
+                    }
+                    if (v < 0 || v >= n_input) {
+                        av_log(NULL, AV_LOG_ERROR,
+                               "[PTV-CC] -cc_slots names input %ld but this run has %d input(s)\n",
+                               v, n_input);
+                        return AVERROR(EINVAL);
+                    }
+                    cc_want[v] = 1;
+                    s = end;
+                    while (*s == ',' || *s == ' ') s++;
+                }
+            } else
+                for (k = 0; k < n_input; k++) cc_want[k] = 1;
+            for (k = 0; k < n_input; k++) if (cc_want[k]) n_cc++;
+            if (!n_cc) {
+                av_log(NULL, AV_LOG_ERROR, "[PTV-CC] -cc_slots selected no input\n");
+                return AVERROR(EINVAL);
+            }
         }
         if (cc_on) {
             cc_dec_codec = avcodec_find_decoder(AV_CODEC_ID_EIA_608);
@@ -2461,7 +2523,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
     }
     memset(inputs, 0, sizeof inputs); memset(as, 0, sizeof as); memset(rung, 0, sizeof rung);
     memset(&comp, 0, sizeof comp); memset(&house_rate, 0, sizeof house_rate);
-    memset(&cc, 0, sizeof cc); cc.last_dts = AV_NOPTS_VALUE;
+    memset(cc, 0, sizeof cc);
+    for (k = 0; k < PTV_MAX_INPUT; k++) { cc[k].last_dts = AV_NOPTS_VALUE; cc_slot[k] = 0; }
     for (k = 0; k < n_input; k++) {
         inputs[k].url = ins->groups[k].arg;
         inputs[k].h0  = AV_NOPTS_VALUE;
@@ -2843,7 +2906,13 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
     /* cc_on was resolved at entry; the extracted CC stream owns the LOGICAL subtitle index
      * s:0 (its -metadata:s:s:0 / -disposition:s:0), so copied DVB-sub streams start at 1
      * instead of colliding with it. */
-    int copy_vidx = 1, copy_aidx = n_audio, copy_sidx = cc_on ? 1 : 0, copy_didx = 0;
+    /* Extracted CC tracks own the LOGICAL subtitle indices s:0 .. s:(n_cc-1) — one per
+     * participating input, in input order — so copied DVB-subs start after them. NOTE the
+     * PHYSICAL muxer order differs: the CC streams are created below, after this fan, because
+     * their extradata must exist before write_header. So ffprobe lists the copied subs first
+     * while -metadata:s:s:N / -c:s:N count the CC tracks first. The N used by the wrapper is
+     * the logical one. */
+    int copy_vidx = 1, copy_aidx = n_audio, copy_sidx = n_cc, copy_didx = 0;
     for (kk = 0; kk < n_input; kk++) {
         inputs[kk].da.pass = &pass[n_pass];          /* this input's contiguous slice */
         inputs[kk].da.n_pass = 0;
@@ -2885,13 +2954,21 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         av_log(NULL, AV_LOG_INFO, "ptvencoder: passthrough %d stream(s) per output (copy), %d input(s)\n",
                n_pass, n_copy_inputs);
 
-    /* -cc_extract: build the EIA-608 -> DVB-teletext path (ordering rationale in cc_setup).
-     * Single-input only, so the video input IS input 0 — the binding is explicit, not
-     * assumed. A hard failure here is fatal: the operator asked for captions. */
+    /* -cc_extract: build the EIA-608 -> DVB-teletext path (ordering rationale in cc_setup),
+     * ONE INDEPENDENT EXTRACTION PER PARTICIPATING INPUT — its own cc_dec on that input's own
+     * decode thread, its own encoder, its own queue and thread, its own subtitle track. Each
+     * binding is explicit; nothing is guessed. Single-input is just n_cc == 1 on input 0.
+     * A hard failure here is fatal: the operator asked for captions. */
     if (cc_on) {
-        ret = cc_setup(&cc, &inputs[0].dc.cc, &cc_q, cc_dec_codec, cc_enc_codec,
-                       inputs[0].ifmt, rung, n_rung, outs);
-        if (ret < 0) goto end;
+        int ci = 0;
+        for (kk = 0; kk < n_input; kk++) {
+            if (!cc_want[kk]) continue;
+            cc_slot[ci] = kk;
+            ret = cc_setup(&cc[ci], &inputs[kk].dc.cc, &cc_q[ci], cc_dec_codec, cc_enc_codec,
+                           inputs[kk].ifmt, rung, n_rung, outs, kk, ci, multiview);
+            if (ret < 0) goto end;
+            ci++;
+        }
         g_cc_on = 1;
     }
 
@@ -3073,15 +3150,25 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         rung[r].ma.ofmt = rung[r].ofmt; rung[r].ma.mux_q = rung[r].mux_q;
         rung[r].ma.is_master = (r == 0);                        /* Φ1′: wire-DTS sensor on rung 0 only */
         rung[r].ma.rung = r;                                    /* pre14: g_mux_sent_wc slot (wire watermark) */
-        rung[r].ma.n_producers = 1 + n_audio + n_copy_inputs + (cc_on ? 1 : 0);   /* video out + N audio + per-input copy fan + CC emitter */
+        rung[r].ma.n_producers = 1 + n_audio + n_copy_inputs + n_cc;   /* video out + N audio + per-input copy fan + one CC emitter per extraction */
     }
-    if (cc_on) {                                 /* CC emitter: master rung = the stamping domain */
-        cc.vc    = &rung[0].vc;
-        cc.q     = cc_q;
-        cc.n_out = n_rung;
-        for (r = 0; r < n_rung; r++) cc.mux_q[r] = rung[r].mux_q;
-        inputs[0].dc.cc.q  = cc_q;               /* decode-thread tap -> emitter */
-        inputs[0].dc.cc.on = 1;
+    for (k = 0; k < n_cc; k++) {                 /* one emitter per extraction */
+        int in = cc_slot[k];
+        /* The stamping domain. Every rung shares out_tb/out_fps/tick_dur_us (one cadence for
+         * the whole ladder), so those come from rung 0 either way; only h0 is per-slot. On
+         * single-input that is input 0 = exactly what the rungs use, so the result is
+         * unchanged. On multiview it is THIS SLOT's h0 — the same anchor its audio rides
+         * (as[].h0), which is what puts a slot's captions on its own dialogue rather than on
+         * whichever input happens to lead the mosaic. */
+        cc[k].clk            = rung[0].vc;       /* copy the cadence fields... */
+        cc[k].clk.h0         = &inputs[in].h0;   /* ...then re-point the anchor at this slot */
+        cc[k].clk.h0_lock    = &inputs[in].h0_lock;
+        cc[k].vc             = &cc[k].clk;
+        cc[k].q              = cc_q[k];
+        cc[k].n_out          = n_rung;
+        for (r = 0; r < n_rung; r++) cc[k].mux_q[r] = rung[r].mux_q;
+        inputs[in].dc.cc.q  = cc_q[k];           /* decode-thread tap -> this slot's emitter */
+        inputs[in].dc.cc.on = 1;
     }
     for (k = 0; k < n_audio; k++) {              /* per-track audio: source from its input's clock */
         as[k].audio_q = audio_q[k];
@@ -3196,17 +3283,23 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         if (pe) { ret = AVERROR(pe); aborted = 1; goto shutdown; }
         started_compositor = 1;
     }
-    if (cc_on) {                                 /* BEFORE the decode threads: on a create
+    for (k = 0; k < n_cc; k++) {                 /* BEFORE the decode threads: on a create
                                                   * failure the tap is disarmed with nothing
                                                   * yet pushing into the queue (no race) */
-        if (!pthread_create(&th_cc, NULL, cc_thread, &cc)) started_cc = 1;
-        else {
-            av_log(NULL, AV_LOG_WARNING, "[PTV-CC] emitter thread create failed — no CC output\n");
-            inputs[0].dc.cc.on = 0;
-            g_cc_on = 0;
-            av_thread_message_queue_set_err_send(cc_q, AVERROR_EOF);
-            for (r = 0; r < n_rung; r++) { AVPacket *eof = NULL; av_thread_message_queue_send(rung[r].mux_q, &eof, 0); }
-        }
+        if (!pthread_create(&th_cc[k], NULL, cc_thread, &cc[k])) { started_cc[k] = 1; continue; }
+        av_log(NULL, AV_LOG_WARNING,
+               "[PTV-CC] emitter thread create failed for input %d — no CC output from that "
+               "input (the other extractions are unaffected)\n", cc_slot[k]);
+        inputs[cc_slot[k]].dc.cc.on = 0;
+        av_thread_message_queue_set_err_send(cc_q[k], AVERROR_EOF);
+        /* this emitter's producer slot is retired by hand, or every muxer would wait for an
+         * EOF marker that no thread will ever send */
+        for (r = 0; r < n_rung; r++) { AVPacket *eof = NULL; av_thread_message_queue_send(rung[r].mux_q, &eof, 0); }
+    }
+    {   /* the stats line's cc= is meaningful only while at least one extraction is alive */
+        int alive = 0;
+        for (k = 0; k < n_cc; k++) alive += started_cc[k];
+        if (cc_on && !alive) g_cc_on = 0;
     }
     for (k = 0; k < n_input; k++) {
         int pe = pthread_create(&inputs[k].th_decode, NULL, decode_thread, &inputs[k].dc);
@@ -3242,9 +3335,9 @@ shutdown:
             av_thread_message_queue_set_err_send(audio_q[k], AVERROR_EOF);
             av_thread_message_queue_set_err_recv(audio_q[k], AVERROR_EOF);
         }
-        if (cc_q) {
-            av_thread_message_queue_set_err_send(cc_q, AVERROR_EOF);
-            av_thread_message_queue_set_err_recv(cc_q, AVERROR_EOF);
+        for (k = 0; k < n_cc; k++) if (cc_q[k]) {
+            av_thread_message_queue_set_err_send(cc_q[k], AVERROR_EOF);
+            av_thread_message_queue_set_err_recv(cc_q[k], AVERROR_EOF);
         }
         for (r = 0; r < n_rung; r++) {
             rung[r].vc.output_done = 1;             /* stop the watchdog */
@@ -3259,7 +3352,8 @@ shutdown:
         }
     }
     for (k = 0; k < n_input; k++) if (inputs[k].started_decode) pthread_join(inputs[k].th_decode, NULL);
-    if (started_cc) pthread_join(th_cc, NULL);   /* the decode thread EOF'd cc_q at its exit */
+    for (k = 0; k < n_cc; k++)                   /* each decode thread EOF'd its own cc_q at exit */
+        if (started_cc[k]) pthread_join(th_cc[k], NULL);
     if (started_compositor) pthread_join(th_compositor, NULL);
     for (r = 0; r < n_rung; r++) if (rung[r].started_output) pthread_join(rung[r].th_output, NULL);
     for (k = 0; k < n_audio; k++) if (started_audio[k]) pthread_join(th_audio[k], NULL);
@@ -3295,8 +3389,9 @@ end:
             avio_closep(&rung[r].ofmt->pb);
     }
     for (k = 0; k < n_audio; k++) av_thread_message_queue_free(&audio_q[k]);
-    av_thread_message_queue_free(&cc_q);         /* the free func releases any queued ASS lines */
-    avcodec_free_context(&cc.enc);
+    for (k = 0; k < n_cc; k++)                   /* the free func releases any queued ASS lines */
+        av_thread_message_queue_free(&cc_q[k]);
+    for (k = 0; k < n_cc; k++) avcodec_free_context(&cc[k].enc);
     for (r = 0; r < n_rung; r++) {
         dlv_destroy(&rung[r].gate);              /* §7.5a: free any held packets + the gate's mutex/cond */
         av_thread_message_queue_free(&rung[r].frame_q);
@@ -3381,6 +3476,7 @@ static const OptionDef ptv_options[] = {
     { "t",                OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "duration", "sec" },
     { "an",               OPT_TYPE_BOOL,   OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "no audio" },
     { "cc_extract",       OPT_TYPE_BOOL,   OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "extract EIA-608 closed captions to a DVB-teletext subtitle stream" },
+    { "cc_slots",         OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "multiview: which inputs to extract CC from (default: all)", "list" },
     { "cc_lang",          OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "language of the extracted CC stream (default: from audio)", "iso639-2" },
     { "cc_page",          OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "teletext page for the extracted CC (default 0x88)", "page" },
     { "cc_magazine",      OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "teletext magazine for the extracted CC (1-8, default 8)", "n" },

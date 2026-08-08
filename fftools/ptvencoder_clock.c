@@ -186,9 +186,19 @@ static int64_t content_index(VideoCtx *v, int64_t src_pts)
  *
  * Emits one packet per event, including the zero-rect keepalive (the dvb_teletext encoder
  * turns that into stuffing units, or a page-erase once its 10s content timeout expires). */
+/* "" for single-input, " in2" for multiview — every [PTV-CC] runtime line carries it so a
+ * per-slot QUIET/reset is attributable on a mosaic. */
+static const char *cc_tag(CcCtx *c, char *buf, size_t n)
+{
+    if (!c->multi) { buf[0] = 0; return buf; }
+    snprintf(buf, n, " in%d", c->slot);
+    return buf;
+}
+
 static void cc_emit(CcCtx *c, CcEvent *ev)
 {
     VideoCtx *v = c->vc;
+    char tag[16];
     AVSubtitle sub = { 0 };
     AVSubtitleRect rect = { 0 };
     AVSubtitleRect *rects[1] = { &rect };
@@ -214,8 +224,8 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
              * [PTV-MUXGUARD] drops whatever is still backward — SUBTITLE is non-fatal there) */
             atomic_fetch_add_explicit(&g_cc_reset, 1, memory_order_relaxed);
             av_log(NULL, AV_LOG_INFO,
-                   "[PTV-CC] house stamp stepped back %"PRId64"ms — subtitle dts baseline reset\n",
-                   (c->last_dts - house_us) / 1000);
+                   "[PTV-CC]%s house stamp stepped back %"PRId64"ms — subtitle dts baseline reset\n",
+                   cc_tag(c, tag, sizeof tag), (c->last_dts - house_us) / 1000);
             c->last_dts = AV_NOPTS_VALUE;
             /* the QUIET watchdog measures on this same axis: leaving last_caption_us on the
              * OLD (higher) house time makes house_us - last_caption_us negative for as long
@@ -259,8 +269,8 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
             atomic_fetch_add_explicit(&g_cc_err, 1, memory_order_relaxed);
             if (nw - c->err_log_us > 10000000) {
                 c->err_log_us = nw;
-                av_log(NULL, AV_LOG_WARNING, "[PTV-CC] teletext encode failed: %s\n",
-                       av_err2str(n));
+                av_log(NULL, AV_LOG_WARNING, "[PTV-CC]%s teletext encode failed: %s\n",
+                       cc_tag(c, tag, sizeof tag), av_err2str(n));
             }
         }
         sub.num_rects = 0;
@@ -302,9 +312,10 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
     /* counted APART: caps= must mean "pages of text went out". Folding erases in would make
      * a source that only ever clears its captions look like a working extraction, and would
      * keep last_caption_us fresh so the QUIET watchdog below could never fire. */
-    if (ev->kind == PTV_CC_CAPTION)
+    if (ev->kind == PTV_CC_CAPTION) {
         atomic_fetch_add_explicit(&g_cc_caps, 1, memory_order_relaxed);
-    else if (ev->kind == PTV_CC_ERASE)
+        atomic_fetch_add_explicit(&g_cc_caps_in[c->slot], 1, memory_order_relaxed);
+    } else if (ev->kind == PTV_CC_ERASE)
         atomic_fetch_add_explicit(&g_cc_erase, 1, memory_order_relaxed);
     else
         atomic_fetch_add_explicit(&g_cc_keep, 1, memory_order_relaxed);
@@ -317,14 +328,14 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
         if (c->quiet) {
             c->quiet = 0;
             if (c->seen_caption)
-                av_log(NULL, AV_LOG_INFO, "[PTV-CC] captions RESUMED at output time %.3fs\n",
-                       house_us / 1000000.0);
+                av_log(NULL, AV_LOG_INFO, "[PTV-CC]%s captions RESUMED at output time %.3fs\n",
+                       cc_tag(c, tag, sizeof tag), house_us / 1000000.0);
         }
         if (!c->seen_caption) {
             c->seen_caption = 1;
             av_log(NULL, AV_LOG_INFO,
-                   "[PTV-CC] first caption emitted at output time %.3fs\n",
-                   house_us / 1000000.0);
+                   "[PTV-CC]%s first caption emitted at output time %.3fs\n",
+                   cc_tag(c, tag, sizeof tag), house_us / 1000000.0);
         }
         c->last_caption_us = house_us;
     } else if (c->last_caption_us == AV_NOPTS_VALUE) {
@@ -337,20 +348,24 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
          * either the source genuinely stopped captioning, or the extraction is broken.
          * One line either way; the counters say which. */
         c->quiet = 1;
+        /* THIS SLOT's a53/caps, not the fleet totals: on a mosaic "in3 QUIET ... caps=264"
+         * read as if in3 had produced 264 captions when its own count was 0 — the line was
+         * reporting the very thing it exists to contradict. ccerr stays a total (errors are
+         * not attributed per slot). */
         av_log(NULL, AV_LOG_WARNING,
-               "[PTV-CC] QUIET — no caption for %"PRId64"s (a53=%"PRId64" frames seen, "
-               "caps=%"PRId64", ccera=%"PRId64", ccerr=%"PRId64")\n",
-               (house_us - c->last_caption_us) / 1000000,
-               atomic_load_explicit(&g_cc_a53,   memory_order_relaxed),
-               atomic_load_explicit(&g_cc_caps,  memory_order_relaxed),
-               atomic_load_explicit(&g_cc_erase, memory_order_relaxed),
-               atomic_load_explicit(&g_cc_err,   memory_order_relaxed));
+               "[PTV-CC]%s QUIET — no caption for %"PRId64"s (a53=%"PRId64" frames seen, "
+               "caps=%"PRId64" on this input; ccerr=%"PRId64" total)\n",
+               cc_tag(c, tag, sizeof tag), (house_us - c->last_caption_us) / 1000000,
+               atomic_load_explicit(&g_cc_a53_in[c->slot],  memory_order_relaxed),
+               atomic_load_explicit(&g_cc_caps_in[c->slot], memory_order_relaxed),
+               atomic_load_explicit(&g_cc_err,              memory_order_relaxed));
     }
 }
 
 void *cc_thread(void *arg)
 {
     CcCtx *c = arg;
+    char tag[16];
     int r;
 
     for (;;) {
@@ -365,8 +380,12 @@ void *cc_thread(void *arg)
         av_thread_message_queue_send(c->mux_q[r], &eof, 0);
     }
     av_log(NULL, AV_LOG_INFO,
-           "[PTV-CC] done — a53=%"PRId64" caps=%"PRId64" erase=%"PRId64" keep=%"PRId64
+           "[PTV-CC]%s done — a53=%"PRId64" caps=%"PRId64" (this input) | all inputs: "
+           "a53=%"PRId64" caps=%"PRId64" erase=%"PRId64" keep=%"PRId64
            " err=%"PRId64" drop=%"PRId64" bump=%"PRId64" reset=%"PRId64"\n",
+           cc_tag(c, tag, sizeof tag),
+           atomic_load_explicit(&g_cc_a53_in[c->slot],  memory_order_relaxed),
+           atomic_load_explicit(&g_cc_caps_in[c->slot], memory_order_relaxed),
            atomic_load_explicit(&g_cc_a53,     memory_order_relaxed),
            atomic_load_explicit(&g_cc_caps,    memory_order_relaxed),
            atomic_load_explicit(&g_cc_erase,   memory_order_relaxed),
