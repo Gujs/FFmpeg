@@ -362,7 +362,13 @@ static int write_page_header(uint8_t *buf, DVBTeletextEncContext *ctx,
     buf[9]  = hamming84_encode[(erase ? 0x08 : 0x00)]; /* S2 + C4 (erase page) */
     buf[10] = hamming84_encode[0];               /* S3 */
     buf[11] = hamming84_encode[0x08];            /* S4=0, C5=0, C6=0, C7=1(SuppressHdr) */
-    buf[12] = hamming84_encode[0x01];            /* C8=1 (Update Indicator), C9=0, C10=0, C11=0 */
+    /* C8 MUST STAY 1. ETS 300 706 calls it an Update Indicator that inverts on change, but
+     * libavcodec's libzvbi teletext decoder — i.e. ffplay and VLC — classifies a page as a
+     * SUBTITLE with
+     *     !(C6) && C7 && C8            (libzvbi-teletextdec.c, subtitle_map[])
+     * so toggling it de-classifies every other page and the decoder ignores it outright.
+     * Tried and measured; do not "fix" this again. */
+    buf[12] = hamming84_encode[0x01];            /* C8=1 (Update Indicator), C9..C11=0 */
     buf[13] = hamming84_encode[ctx->g0_subset & 0x07]; /* C12-C14: national option subset */
 
     /* Header display area: 26 bytes (positions 14-39 in data unit payload,
@@ -790,8 +796,12 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
      * updates use erase=0 so the decoder replaces content in-place
      * without a visible blank flash between updates. */
     {
-        int erase = !ctx->content_active ||
-                    (nb_lines < ctx->last_nb_lines);
+        /* C4 erase on EVERY caption page. The "smart erase" this replaces (set C4 only
+         * after silence or when the row count shrank) is what a real broadcast encoder
+         * does to avoid a blank flash between updates — but libzvbi then treats each
+         * header as an update to the page already displayed and never raises a new
+         * VBI_EVENT_TTX_PAGE, so ffplay/VLC show nothing after the first. */
+        int erase = 1;
         offset += write_page_header(buf + offset, ctx, erase, 7);
     }
 
