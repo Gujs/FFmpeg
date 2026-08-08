@@ -5,6 +5,37 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 1.2.0-pre1 (2026-08-08) — CC (EIA-608) → DVB-teletext
+
+**New capability, so a new minor line.** Ported from legacy patch 0005 **minus coalescing** (the
+CDN owns that) and extended to multiview.
+
+- **`-cc_extract`** (+ `-cc_slots` / `-cc_lang` / `-cc_page` / `-cc_magazine`; `PTV_NO_CC=1` kill
+  switch). OFF by default — output is byte-identical to a build without the feature when the
+  option is absent.
+- **One INDEPENDENT extraction per participating input.** Single-input is just N=1; on multiview
+  each slot gets its own `cc_dec` (on that input's own decode thread), its own `dvb_teletext`
+  encoder, its own subtitle track per rung, and its own page (BCD-walked from the base: 888, 889,
+  890, 891). Each slot's captions are stamped on **that slot's own `h0`** — the same anchor its
+  audio rides — which is what keeps them on their own dialogue instead of the mosaic's leader.
+  The legacy implementation guessed here and always bound input 0.
+- **Per-slot naming:** CC tracks own the LOGICAL subtitle indices `s:0..s:(n_cc-1)` in INPUT
+  order (copies numbered after), so `-metadata:s:s:N language=mva` applies the multiview
+  convention. The tag on the wire is the metadata; the G0 national subset still follows the REAL
+  source language, so a slot tagged `mvc` still renders its Spanish.
+- **Observability:** `cc=caps/erase/keep/a53` on the single-input stats line, per-slot
+  `in<k>:.../cc=<caps>/<a53>` on the multiview one, `[PTV-CC]` first-caption / QUIET / RESUMED /
+  reset lines all carrying their slot.
+
+**⚠ A binary reporting 1.1.0 may or may not have this** — three builds carried that banner
+(released 1.1.0 without CC; an intermediate that got the teletext ENCODER via patch 0006 but not
+the option, because patch 0001 was not regenerated; and the intended one). Check the option, not
+the banner: `ptvencoder -h 2>&1 | grep cc_extract`.
+
+**Verified:** 9/9 deterministic encoder fixtures; four live SRT feeds x 200s (err=0 drop=0); 2- and
+4-slot mosaics with distinct per-slot captions proven by an independent libzvbi decode; a killed
+slot erases its page and keeps its PID alive; mixed dvb+cc numbering; byte-inert when off.
+
 ## 🏁 1.1.0 (2026-08-08) — RELEASED. Content-identical to `v1.1.0-rc1` (banner bump only).
 
 **Release gate PASSED — 4-day fleet soak, 2026-08-05 → 08-08, ~243 channels on 8 hosts** (the rc
