@@ -2679,10 +2679,22 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         if (!inputs[k].vdec) { ret = AVERROR(ENOMEM); goto end; }
         avcodec_parameters_to_context(inputs[k].vdec, inputs[k].vist->codecpar);
         inputs[k].vdec->pkt_timebase = inputs[k].ist_tb;
-        /* NOTE: keep single-threaded decode — frame-threaded hangs offline at EOF. */
+        /* Decode threading is left to libavcodec, which resolves to ONE thread for our
+         * streams (measured: "threads=1 type=none"). That is what we want on a box running
+         * 40+ channels — each needs 1x realtime, not minimum latency — and it matches the
+         * long-standing intent here, which was never actually enforced in code. The log below
+         * makes it visible, so a libavcodec default change that starts spawning a pool per
+         * channel cannot slip in unnoticed. */
         if ((ret = avcodec_open2(inputs[k].vdec, vd, NULL)) < 0) {
             av_log(NULL, AV_LOG_ERROR, "open video decoder (input %d): %s\n", k, av_err2str(ret)); goto end;
         }
+        /* what libavcodec ACTUALLY resolved — auto-detect is invisible otherwise, and the
+         * thread count per channel is the whole point of the knob */
+        av_log(NULL, AV_LOG_INFO,
+               "ptvencoder: input %d video decoder %s — threads=%d type=%s%s\n", k, vd->name,
+               inputs[k].vdec->thread_count,
+               inputs[k].vdec->active_thread_type & FF_THREAD_FRAME ? "frame" :
+               inputs[k].vdec->active_thread_type & FF_THREAD_SLICE ? "slice" : "none", "");
         vdecs[k] = inputs[k].vdec;
         inputs[k].wrap_off  = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].wrap_off));
         inputs[k].wrap_last = av_malloc_array(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].wrap_last));
