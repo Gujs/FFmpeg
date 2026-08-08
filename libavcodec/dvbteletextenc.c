@@ -224,7 +224,6 @@ typedef struct DVBTeletextEncContext {
     int magazine;           /* magazine number 1-8, default 8 */
     int page;               /* page number in hex (0x00-0xFF), default 0x88 */
     int g0_subset;          /* G0 national option subset (0-6), default 0 (English) */
-    int page_counter;       /* erase page sequence counter (C4 flag) */
     int content_active;     /* 1 if display has content (needs erase eventually) */
     int last_nb_lines;      /* number of content rows in previous subtitle */
     int64_t last_content_pts; /* PTS (AV_TIME_BASE) of last content subtitle */
@@ -579,7 +578,6 @@ static av_cold int dvb_teletext_encode_init(AVCodecContext *avctx)
     if (!ctx->ass_ctx)
         return AVERROR_INVALIDDATA;
 
-    ctx->page_counter = 0;
 
     /* Set up extradata for the MPEG-TS muxer's teletext descriptor (0x56).
      * Format: pairs of (teletext_type_magazine, page_number_bcd)
@@ -590,13 +588,12 @@ static av_cold int dvb_teletext_encode_init(AVCodecContext *avctx)
     magazine_code = ctx->magazine & 0x07; /* 8 → 0 */
     teletext_type = 0x02; /* subtitle page */
 
-    extradata = av_mallocz(3);
+    extradata = av_mallocz(2 + AV_INPUT_BUFFER_PADDING_SIZE);
     if (!extradata)
         return AVERROR(ENOMEM);
 
     extradata[0] = (teletext_type << 3) | magazine_code;
     extradata[1] = ctx->page;
-    extradata[2] = 0; /* NUL terminator for safety */
 
     av_freep(&avctx->extradata);
     avctx->extradata      = extradata;
@@ -616,6 +613,43 @@ static av_cold int dvb_teletext_encode_init(AVCodecContext *avctx)
     }
 
     return 0;
+}
+
+/* Page header with the C4 erase flag + stuffing to the required unit count:
+ * clears whatever is currently displayed. Used both for an explicit source
+ * erase and for the stale-content timeout. */
+static int write_erase_page(DVBTeletextEncContext *ctx, unsigned char *buf,
+                            int bufsize)
+{
+    int offset;
+
+    if (bufsize < 1 + 46 * TELETEXT_MIN_DATA_UNITS)
+        return 0;
+
+    buf[0] = TELETEXT_DATA_IDENTIFIER;
+    offset  = 1 + write_page_header(buf + 1, ctx, 1, 7);
+    offset += write_stuffing_unit(buf + offset);
+    offset += write_stuffing_unit(buf + offset);
+    ctx->content_active = 0;
+
+    return offset;
+}
+
+/* Stuffing-only page: decoders ignore it, so the displayed text is preserved
+ * while the MPEG-TS interleaver keeps seeing packets on this sparse PID. */
+static int write_keepalive_page(unsigned char *buf, int bufsize)
+{
+    int i, offset;
+
+    if (bufsize < 1 + 46 * TELETEXT_MIN_DATA_UNITS)
+        return 0;
+
+    buf[0] = TELETEXT_DATA_IDENTIFIER;
+    offset = 1;
+    for (i = 0; i < TELETEXT_MIN_DATA_UNITS; i++)
+        offset += write_stuffing_unit(buf + offset);
+
+    return offset;
 }
 
 static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
@@ -644,26 +678,12 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
      * preserving the currently displayed text while satisfying the
      * MPEG-TS muxer's interleaving requirements. */
     if (sub->num_rects == 0) {
-        if (bufsize < 1 + 46 * TELETEXT_MIN_DATA_UNITS)
-            return 0;
-
         if (ctx->content_active && sub->pts != AV_NOPTS_VALUE &&
             ctx->last_content_pts != AV_NOPTS_VALUE &&
-            sub->pts - ctx->last_content_pts >= TELETEXT_ERASE_TIMEOUT_US) {
-            /* Erase stale content: page header with C4 (erase) flag */
-            buf[0] = TELETEXT_DATA_IDENTIFIER;
-            offset = 1 + write_page_header(buf + 1, ctx, 1, 7);
-            offset += write_stuffing_unit(buf + offset);
-            offset += write_stuffing_unit(buf + offset);
-            ctx->content_active = 0;
-            return offset;
-        }
+            sub->pts - ctx->last_content_pts >= TELETEXT_ERASE_TIMEOUT_US)
+            return write_erase_page(ctx, buf, bufsize);
 
-        buf[0] = TELETEXT_DATA_IDENTIFIER;
-        offset = 1;
-        for (i = 0; i < TELETEXT_MIN_DATA_UNITS; i++)
-            offset += write_stuffing_unit(buf + offset);
-        return offset;
+        return write_keepalive_page(buf, bufsize);
     }
 
     /* We need at minimum:
@@ -701,6 +721,13 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
 
     if (extract.buf.len == 0) {
         av_bprint_finalize(&extract.buf, NULL);
+        /* An explicit source erase (EIA-608 EDM/EOC) arrives as a caption whose
+         * text is empty once the ASS markup is stripped. Clear the page now
+         * instead of leaving stale text up until the 10 s stale-content
+         * timeout — otherwise a deliberate caption-off is invisible on the wire
+         * and the previous caption persists over the following shot. */
+        if (ctx->content_active)
+            return write_erase_page(ctx, buf, bufsize);
         return 0;
     }
 
@@ -785,7 +812,6 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
         av_free(safe_line);
     }
 
-    ctx->page_counter++;
     ctx->content_active    = 1;
     ctx->last_nb_lines     = nb_lines;
     ctx->last_content_pts  = sub->pts;
