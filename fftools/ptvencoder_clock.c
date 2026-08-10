@@ -208,25 +208,23 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
 
     if (ev->src_us == AV_NOPTS_VALUE) {
         /* SYNTHETIC keepalive (see cc_thread): this input stopped delivering frames, so there
-         * is no source pts to map. Stamp it at the CURRENT HOUSE POSITION — the master rung's
-         * emitted-frame count on the exact-rational axis — which is precisely where the video
-         * being muxed alongside it sits.
+         * is no source pts to map. Stamp it as a pure MONOTONE EXTRAPOLATION of our own last
+         * stamp — one keepalive interval on from wherever we last were.
          *
-         * It must NOT advance on wall time. The house clock runs behind the wall by the
-         * pipeline's latency (house_skew, ~3s on a cushioned channel), so a wall-advanced
-         * stamp races ahead of every real caption and the next one looks like a backward
-         * step: [PTV-CC] house stamp stepped back, once per caption, on every channel with a
-         * cushion. Reading the live rung keeps synthetic and real stamps on one axis. */
-        int64_t emitted;
-        if (c->last_dts == AV_NOPTS_VALUE || !c->live)
+         * It must NOT come from any other clock. Deriving it from the master rung's emitted
+         * count (the OUTPUT position) or from the wall clock puts keepalives on a different
+         * axis than captions, which content_index() maps from SOURCE content: the two differ
+         * by whatever the pipeline is buffering, so every caption/keepalive alternation looks
+         * like a timeline jump. Measured on air with the emitted-count version: subtitle DTS
+         * thrashing backward 6.5s typically and up to 79s, 2721 resets on TruBLU and 6799 on
+         * Newsmax2, every backward packet silently dropped by the muxer's monotonic guard —
+         * so the counters reported captions while the wire carried no teletext PID at all.
+         * Extrapolating our own stamp is monotone by construction, so nothing is dropped, and
+         * since keepalives fire at ~1 Hz it tracks real time closely enough for the encoder's
+         * 10s stale-content timer. */
+        if (c->last_dts == AV_NOPTS_VALUE)
             return;                      /* nothing has ever been on screen: nothing to keep alive */
-        emitted = c->live->emitted;      /* plain read: a slightly stale count only shifts a
-                                          * keepalive by a frame, and it is monotone */
-        if (emitted <= 0)
-            return;
-        house_us = v->out_fps.num > 0
-                 ? av_rescale(emitted, 1000000LL * v->out_fps.den, v->out_fps.num)
-                 : emitted * v->tick_dur_us;
+        house_us = c->last_dts + PTV_CC_KEEPALIVE_US;
     } else {
         /* content_index() wants the source pts in the rung's own out_tb. h0_lock is held
          * because on multiview the compositor's REANCHOR2 mutates this slot's h0 at runtime

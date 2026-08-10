@@ -658,10 +658,6 @@ typedef struct CcCtx {
      * locked to its own dialogue instead of to the mosaic's leader. */
     VideoCtx         clk;
     VideoCtx        *vc;                      /* == &clk; content_index() domain only */
-    VideoCtx        *live;                    /* LIVE master rung — read for the current house
-                                               * position (emitted) when stamping a synthetic
-                                               * keepalive; the clk copy above is a snapshot
-                                               * and its counters never advance */
     AVCodecContext  *enc;                     /* dvb_teletext (opened before write_header) */
     AVThreadMessageQueue *mux_q[PTV_MAX_RUNG];
     AVStream        *ost[PTV_MAX_RUNG];

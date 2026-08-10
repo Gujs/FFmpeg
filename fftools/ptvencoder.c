@@ -3300,7 +3300,6 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         cc[k].clk.h0         = &inputs[in].h0;   /* ...then re-point the anchor at this slot */
         cc[k].clk.h0_lock    = &inputs[in].h0_lock;
         cc[k].vc             = &cc[k].clk;
-        cc[k].live           = &rung[0].vc;      /* LIVE master rung: current house position */
         cc[k].q              = cc_q[k];
         cc[k].n_out          = n_rung;
         for (r = 0; r < n_rung; r++) cc[k].mux_q[r] = rung[r].mux_q;
