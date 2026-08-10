@@ -5,6 +5,64 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 1.2.0-pre2 (2026-08-10) — teletext page model: the away-switch, and captions that stay up
+
+pre1 put captions on the wire; pre2 makes them appear on a real decoder and stay readable. **This
+one needs BOTH patches** — `0001` and `0006` — because the page model lives in the encoder.
+
+- **The away-switch is MANDATORY, and pre1 shipped without it.** A C4-less page transmission raises
+  **no `VBI_EVENT_TTX_PAGE` at all** in plain libzvbi. Measured with a purpose-built oracle
+  (Homebrew libzvbi 0.2.44, *without* ffmpeg's `last_p5` workaround — i.e. what VLC uses): page
+  events == C4-carrying transmissions − 1. So pre1's "C4 on every caption page" was load-bearing,
+  and the flash it caused could not be removed on its own. Real broadcast teletext is safe at ~5%
+  C4 (GB News page 888: C4 on 9 of 171 transmissions) **because a blank filler page runs
+  continuously between subtitle transmissions**, making every subtitle header a fresh page
+  instance. pre2 copies the mechanism: blank filler page appended to every content PES (7 data
+  units, `1 + 46*7 = 323` bytes, `(323+45) % 184 == 0`), C4 only at a genuine block start.
+  Page-888 events, pre1 → pre2: trublu_in0 43→**61** (61 captions), trublu_in1 39→**72** (72),
+  NTD **1→79** (79), Weather_nation **1→122** (122), Newsmax2 20→**167** (167), Law_Crime 6→**13**.
+  Flash (C4 arriving with content already on screen) 44.3% → **3.3%**.
+  ⚠ **Never validate a page-header change with ffmpeg's own teletext decoder**:
+  `libzvbi-teletextdec.c:618-628` sets C4 in `p[5]` then stores the MUTATED byte, so once any
+  header carries C4 every later same-page header is treated as C4-set forever — it structurally
+  cannot show this regression.
+- **Up to four content rows, bottom-anchored 20..23** (three-row → 21/22/23, verified by decoding
+  MRAG off the wire). Two rows truncated **43 of 43** three-row captions on a US roll-up feed and
+  4 of 56 on TruBLU; source and wire now match exactly (distinct missing lines 1 → 0). One- and
+  two-row output is byte-identical to pre1.
+- **A deferred erase is re-armed when a newer caption goes up.** It previously kept the *previous*
+  page's clear deadline, so a caption could be wiped ~1 frame after appearing: measured lives of
+  **1 ms** (2 per 120 s feed, natural) and up to 0.53 s under accelerated cadence — worse than the
+  0.3–0.6 s the minimum-display rule exists to prevent. Wire result: shortest caption life
+  0.00 s → **0.43 s**, captions under 1.2 s 11 → 9, dts bumps 2 → 0, and zero violations of "a
+  caption terminated by an erase in under 1.2 s" across four fixtures.
+- **`cclate` is now wire truth** — counted in `cc_emit` after the encode like every other counter,
+  so a queue-full drop or an erase answered with a keepalive no longer reports as a delivered
+  clear. `ccheld` counts a clear once on entry, so `cclate <= ccheld` holds structurally.
+- **A non-BCD `-cc_page` is rejected** (`0xFF`, `0x9A`, `0x00`): these were accepted and produced a
+  stream whose PMT reads "full page 965" and in which *both* decoders find zero captions.
+
+**Two measurement corrections carried into the code comments.** (1) The minimum-display rule is
+driven by **POP-ON**, not roll-up: three real roll-up feeds (NTD, Weather_nation, Newsmax2 source
+multicast) are RU2/RU3 + CR with **zero EDM**, so a roll-up source never asks for a clear.
+(2) The "max page life 6.6 s vs the source's 3.5 s" that motivated the deferral was a
+**`tsp -P teletext` artifact** — it attributes a cue start to a preceding stuffing-only keepalive.
+Read off the wire, max page life is 3.24 s and unchanged by the rule. Use CCExtractor or decode the
+page addresses directly.
+
+**Verified:** all six v2 patches apply in order on clean upstream `master`, and every touched file
+in the patched tree is byte-identical to the source that was measured; raw-libzvbi event counts on
+six sources (above); four F1 fixtures; multiview 4 PIDs with correct pages/languages, dead slot
+`QUIET` at 60 s, `-cc_slots "0,3"` → 2 tracks; 10 s stale-content clear at +10.010 s; `-cc_page
+0x99 -cc_magazine 3` → PMT full page 399 + filler 3FF; one 0x56 descriptor, C6=0/C7=1/C8=1
+preserved, 0 hamming/framing errors, 0 MUXGUARD drops, 0 house-stamp backsteps.
+
+**NOT verified — soak gates:** the `shown_since_us` backstep reset is by inspection only (the demux
+absorbs the step before the tap sees it, in both bands); the **four-row path (row 20) never
+occurred** in any local window and is exercised by construction only; and **VLC itself was not
+run** — the oracle is the same libzvbi version, which is a strong proxy, not the article. Given the
+away-switch near-miss, confirm on a real STB before fleet-wide.
+
 ## 1.2.0-pre1 (2026-08-08) — CC (EIA-608) → DVB-teletext
 
 **New capability, so a new minor line.** Ported from legacy patch 0005 **minus coalescing** (the
