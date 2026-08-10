@@ -870,6 +870,7 @@ _Atomic int g_cc_on;
 _Atomic int64_t g_cc_a53, g_cc_caps, g_cc_erase, g_cc_keep, g_cc_err, g_cc_dropped,
                 g_cc_bump, g_cc_reset;
 _Atomic int64_t g_cc_caps_in[PTV_MAX_INPUT], g_cc_a53_in[PTV_MAX_INPUT];
+_Atomic int64_t g_cc_eskip;   /* erases refused for the minimum-display rule */
 
 /* PTV_LOG_TS=1: prefix every log line with a local wall-clock timestamp
  * [YYYY-MM-DD HH:MM:SS.mmm], so production logs are self-dated natively
@@ -1324,9 +1325,19 @@ static void cc_tap_frame(CcTap *t, AVFrame *frame, AVRational ist_tb)
                 t->pend_end_ms = end_ms;
             }
         } else {
-            /* Source erase (EDM/EOC). Whatever is pending was on screen up to now, so it
-             * must go out BEFORE the clear, otherwise a caption that ends the moment it
-             * completes is never seen at all. */
+            /* Source erase (EDM/EOC). REFUSE it if the page has not had its minimum time on
+             * screen: a roll-up clears rows constantly, and obeying every clear reduced real
+             * captions to 0.3-0.6s of display. Dropping the erase is safe — the next caption
+             * replaces the page, and the encoder's 10s stale-content timeout still clears an
+             * abandoned one. */
+            if (t->shown_since_us != AV_NOPTS_VALUE &&
+                cur_us - t->shown_since_us < PTV_CC_MIN_DISPLAY_US) {
+                avsubtitle_free(&sub);
+                atomic_fetch_add_explicit(&g_cc_eskip, 1, memory_order_relaxed);
+                goto strip;
+            }
+            /* Whatever is pending was on screen up to now, so it must go out BEFORE the
+             * clear, otherwise a caption that ends the moment it completes is never seen. */
             if (t->pend_ass) {
                 CcEvent pe = { t->pend_ass, cur_us, t->pend_end_ms, PTV_CC_CAPTION };
                 t->pend_ass = NULL;
@@ -1356,6 +1367,7 @@ static void cc_tap_frame(CcTap *t, AVFrame *frame, AVRational ist_tb)
         CcEvent pe = { t->pend_ass, cur_us, t->pend_end_ms, PTV_CC_CAPTION };
         t->pend_ass = NULL;
         cc_tap_send(t, &pe, ttag);
+        t->shown_since_us = cur_us;               /* min-display clock starts now */
         goto strip;
     }
     if (t->last_evt_us == AV_NOPTS_VALUE) {
@@ -2283,12 +2295,20 @@ static int cc_setup(CcCtx *cc, CcTap *tap, AVThreadMessageQueue **cc_q,
     /* real_time: emit on every CC buffer change instead of waiting for a mode switch — a
      * live channel has no end of stream to flush against. */
     av_opt_set_int(tap->dec, "real_time", 1, AV_OPT_SEARCH_CHILDREN);
+    /* FIELD 1 explicitly. cc_dec's data_field defaults to -1 = "pick the first field that
+     * appears" and then IGNORES the other one for the rest of the run. Field 2 carries
+     * secondary services (CC3/CC4) and XDS, so on a source whose first A53 pair happens to be
+     * field 2 the extraction locks onto XDS and emits two-character fragments that accumulate
+     * into garbage — measured on Newsmax2: "HDPAHDPAHDHDPAHD..." on air while stock ffmpeg
+     * read real captions off the same source. CC1 (field 1) is the primary caption service. */
+    av_opt_set_int(tap->dec, "data_field", 0, AV_OPT_SEARCH_CHILDREN);
     if ((ret = avcodec_open2(tap->dec, cdec, NULL)) < 0) {
         av_log(NULL, AV_LOG_ERROR, "[PTV-CC] open cc_dec: %s\n", av_err2str(ret));
         return ret;
     }
     tap->last_src_us = AV_NOPTS_VALUE;
     tap->last_evt_us = AV_NOPTS_VALUE;
+    tap->shown_since_us = AV_NOPTS_VALUE;
     tap->slot        = slot;
     tap->multi       = multi;
 

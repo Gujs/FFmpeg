@@ -491,6 +491,12 @@ typedef struct VideoHold {
  *   DEADLINE emit anyway after this long pending      (roll-up never stops changing) */
 #define PTV_CC_DEBOUNCE_US     500000    /* text stable this long => emit */
 #define PTV_CC_DEADLINE_US     300000    /* pending this long => emit regardless */
+/* MINIMUM on-screen time. A roll-up source clears rows constantly, so cc_dec emits an empty
+ * caption (= "erase") within a few hundred ms of almost every caption. Honouring those
+ * instantly put text on screen for 0.3-0.6s — measured on air, unreadable. A page that
+ * genuinely should go stays cleared by the next caption replacing it, or by the encoder's 10s
+ * stale-content timeout; refusing the early erase only ever keeps readable text up longer. */
+#define PTV_CC_MIN_DISPLAY_US 1200000
 #define PTV_CC_QUIET_US        60000000  /* captions absent this long while A53 keeps arriving
                                           * => one [PTV-CC] QUIET line (and one on recovery) */
 
@@ -536,6 +542,7 @@ typedef struct CcTap {
     int64_t          pend_changed_us;  /* source pts when the text last CHANGED */
     int64_t          pend_first_us;    /* source pts when this pending cycle began */
     int64_t          last_emit_src_us; /* source pts of the last event QUEUED (1 Hz floor) */
+    int64_t          shown_since_us;   /* source pts the current page went up (min-display) */
 } CcTap;
 
 /* Shared decode side of the ABR ladder (the ffmpeg model: decode the source
@@ -1827,7 +1834,8 @@ extern _Atomic int g_cc_on;
  * advancing means the tap or the emitter is wedged. */
 extern _Atomic int64_t g_cc_a53;         /* decoded frames carrying A53 CC side data */
 extern _Atomic int64_t g_cc_caps;        /* caption pages emitted (text-bearing ONLY) */
-extern _Atomic int64_t g_cc_erase;       /* page erases emitted (source cleared its captions) */
+extern _Atomic int64_t g_cc_erase;
+extern _Atomic int64_t g_cc_eskip;      /* early erases refused (min display time) */       /* page erases emitted (source cleared its captions) */
 extern _Atomic int64_t g_cc_keep;        /* keepalive (stuffing) packets emitted */
 extern _Atomic int64_t g_cc_err;         /* cc_dec + teletext encoder errors */
 extern _Atomic int64_t g_cc_dropped;     /* events lost (queue full / unstampable / enc error) */

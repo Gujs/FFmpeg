@@ -431,7 +431,7 @@ void *cc_thread(void *arg)
                  (long long)atomic_load_explicit(&g_cc_caps_in[c->slot], memory_order_relaxed));
     av_log(NULL, AV_LOG_INFO,
            "[PTV-CC]%s done — %sa53=%"PRId64" caps=%"PRId64" erase=%"PRId64" keep=%"PRId64
-           " err=%"PRId64" drop=%"PRId64" bump=%"PRId64" reset=%"PRId64"\n",
+           " err=%"PRId64" drop=%"PRId64" bump=%"PRId64" reset=%"PRId64" eskip=%"PRId64"\n",
            cc_tag(c, tag, sizeof tag), per,
            atomic_load_explicit(&g_cc_a53,     memory_order_relaxed),
            atomic_load_explicit(&g_cc_caps,    memory_order_relaxed),
@@ -440,7 +440,8 @@ void *cc_thread(void *arg)
            atomic_load_explicit(&g_cc_err,     memory_order_relaxed),
            atomic_load_explicit(&g_cc_dropped, memory_order_relaxed),
            atomic_load_explicit(&g_cc_bump,    memory_order_relaxed),
-           atomic_load_explicit(&g_cc_reset,   memory_order_relaxed));
+           atomic_load_explicit(&g_cc_reset,   memory_order_relaxed),
+           atomic_load_explicit(&g_cc_eskip,   memory_order_relaxed));
     return NULL;
 }
 
@@ -1215,7 +1216,14 @@ void *output_thread(void *arg)
                     if (ce > 0 && cn > 0 && cn < (int)sizeof ccs)
                         cn += snprintf(ccs + cn, sizeof ccs - cn, " ccerr=%lld", (long long)ce);
                     if (cd > 0 && cn > 0 && cn < (int)sizeof ccs)
-                        snprintf(ccs + cn, sizeof ccs - cn, " ccdrop=%lld", (long long)cd);
+                        cn += snprintf(ccs + cn, sizeof ccs - cn, " ccdrop=%lld", (long long)cd);
+                    {   /* erases refused by the minimum-display rule — holding a caption
+                         * LONGER than the source asked is a deliberate choice, so it must be
+                         * visible rather than silent */
+                        int64_t ck = atomic_load_explicit(&g_cc_eskip, memory_order_relaxed);
+                        if (ck > 0 && cn > 0 && cn < (int)sizeof ccs)
+                            snprintf(ccs + cn, sizeof ccs - cn, " ccheld=%lld", (long long)ck);
+                    }
                 }
                 av_log(NULL, AV_LOG_INFO,
                     "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f "
