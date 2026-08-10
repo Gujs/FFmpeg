@@ -57,11 +57,15 @@ six sources (above); four F1 fixtures; multiview 4 PIDs with correct pages/langu
 0x99 -cc_magazine 3` → PMT full page 399 + filler 3FF; one 0x56 descriptor, C6=0/C7=1/C8=1
 preserved, 0 hamming/framing errors, 0 MUXGUARD drops, 0 house-stamp backsteps.
 
+**Confirmed on air (owner observation, 2026-08-10, TruBLU output):** four rows of subtitles
+rendered, and captions visibly stay up longer. That closes the four-row gate below — row 20 never
+occurred in any local window, so it had been exercised by construction only.
+
 **NOT verified — soak gates:** the `shown_since_us` backstep reset is by inspection only (the demux
-absorbs the step before the tap sees it, in both bands); the **four-row path (row 20) never
-occurred** in any local window and is exercised by construction only; and **VLC itself was not
-run** — the oracle is the same libzvbi version, which is a strong proxy, not the article. Given the
-away-switch near-miss, confirm on a real STB before fleet-wide.
+absorbs the step before the tap sees it, in both bands); and **VLC itself was not run** — the oracle
+is the same libzvbi version, which is a strong proxy, not the article. Given the away-switch
+near-miss, confirm on a real STB before fleet-wide, and prefer a ROLL-UP channel (NTD,
+Weather_nation) for the soak: those are where the missing away-switch cost 78 of 79 captions.
 
 ## 1.2.0-pre1 (2026-08-08) — CC (EIA-608) → DVB-teletext
 
