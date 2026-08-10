@@ -341,9 +341,15 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
     if (ev->kind == PTV_CC_CAPTION) {
         atomic_fetch_add_explicit(&g_cc_caps, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&g_cc_caps_in[c->slot], 1, memory_order_relaxed);
-    } else if (ev->kind == PTV_CC_ERASE)
+    } else if (ev->kind == PTV_CC_ERASE) {
         atomic_fetch_add_explicit(&g_cc_erase, 1, memory_order_relaxed);
-    else
+        /* cclate= is WIRE TRUTH, like every counter around it: a deferred clear only counts
+         * once the encoder has actually produced a clear page for it. Counting it where it
+         * was queued would credit events the queue dropped and events the encoder answered
+         * with a keepalive instead (an already-blank page => n == 0 => kind rewritten above). */
+        if (ev->deferred)
+            atomic_fetch_add_explicit(&g_cc_elate, 1, memory_order_relaxed);
+    } else
         atomic_fetch_add_explicit(&g_cc_keep, 1, memory_order_relaxed);
 
     /* --- state log: the two transitions an operator actually needs --- */
@@ -429,7 +435,8 @@ void *cc_thread(void *arg)
                  (long long)atomic_load_explicit(&g_cc_caps_in[c->slot], memory_order_relaxed));
     av_log(NULL, AV_LOG_INFO,
            "[PTV-CC]%s done — %sa53=%"PRId64" caps=%"PRId64" erase=%"PRId64" keep=%"PRId64
-           " err=%"PRId64" drop=%"PRId64" bump=%"PRId64" reset=%"PRId64" eskip=%"PRId64"\n",
+           " err=%"PRId64" drop=%"PRId64" bump=%"PRId64" reset=%"PRId64" eheld=%"PRId64
+           " elate=%"PRId64"\n",
            cc_tag(c, tag, sizeof tag), per,
            atomic_load_explicit(&g_cc_a53,     memory_order_relaxed),
            atomic_load_explicit(&g_cc_caps,    memory_order_relaxed),
@@ -439,7 +446,8 @@ void *cc_thread(void *arg)
            atomic_load_explicit(&g_cc_dropped, memory_order_relaxed),
            atomic_load_explicit(&g_cc_bump,    memory_order_relaxed),
            atomic_load_explicit(&g_cc_reset,   memory_order_relaxed),
-           atomic_load_explicit(&g_cc_eskip,   memory_order_relaxed));
+           atomic_load_explicit(&g_cc_eskip,   memory_order_relaxed),
+           atomic_load_explicit(&g_cc_elate,   memory_order_relaxed));
     return NULL;
 }
 
@@ -1196,7 +1204,7 @@ void *output_thread(void *arg)
                 char rsn[10 + PTV_MAX_AUDIO * 16];                   /* pre29 #69: rsn= (resync fires); absent
                                                                       * while zero — clean line unchanged */
                 ptv_stats_rsn(rsn, sizeof rsn, 0);
-                char ccs[96] = "";                                   /* -cc_extract: caps/erase/keep/a53 —
+                char ccs[128] = "";                                  /* -cc_extract: caps/erase/keep/a53 —
                                                                       * printed WHENEVER the feature is on
                                                                       * (SUBTITLE streams are exempt from the
                                                                       * MUXGUARD fatal escalation, so a dead
@@ -1215,12 +1223,18 @@ void *output_thread(void *arg)
                         cn += snprintf(ccs + cn, sizeof ccs - cn, " ccerr=%lld", (long long)ce);
                     if (cd > 0 && cn > 0 && cn < (int)sizeof ccs)
                         cn += snprintf(ccs + cn, sizeof ccs - cn, " ccdrop=%lld", (long long)cd);
-                    {   /* erases refused by the minimum-display rule — holding a caption
-                         * LONGER than the source asked is a deliberate choice, so it must be
-                         * visible rather than silent */
+                    {   /* erases deferred by the minimum-display rule, and how many of them
+                         * then went out — holding a caption LONGER than the source asked is a
+                         * deliberate choice, so it must be visible rather than silent, and
+                         * ccheld climbing while cclate stays flat means clears are being lost
+                         * rather than delayed */
                         int64_t ck = atomic_load_explicit(&g_cc_eskip, memory_order_relaxed);
+                        int64_t cl = atomic_load_explicit(&g_cc_elate, memory_order_relaxed);
                         if (ck > 0 && cn > 0 && cn < (int)sizeof ccs)
-                            snprintf(ccs + cn, sizeof ccs - cn, " ccheld=%lld", (long long)ck);
+                            cn += snprintf(ccs + cn, sizeof ccs - cn, " ccheld=%lld",
+                                           (long long)ck);
+                        if (cl > 0 && cn > 0 && cn < (int)sizeof ccs)
+                            snprintf(ccs + cn, sizeof ccs - cn, " cclate=%lld", (long long)cl);
                     }
                 }
                 av_log(NULL, AV_LOG_INFO,

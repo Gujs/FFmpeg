@@ -870,7 +870,8 @@ _Atomic int g_cc_on;
 _Atomic int64_t g_cc_a53, g_cc_caps, g_cc_erase, g_cc_keep, g_cc_err, g_cc_dropped,
                 g_cc_bump, g_cc_reset;
 _Atomic int64_t g_cc_caps_in[PTV_MAX_INPUT], g_cc_a53_in[PTV_MAX_INPUT];
-_Atomic int64_t g_cc_eskip;   /* erases refused for the minimum-display rule */
+_Atomic int64_t g_cc_eskip;   /* distinct clears deferred by the minimum-display rule */
+_Atomic int64_t g_cc_elate;   /* of those, the ones the encoder actually put on the wire */
 
 /* PTV_LOG_TS=1: prefix every log line with a local wall-clock timestamp
  * [YYYY-MM-DD HH:MM:SS.mmm], so production logs are self-dated natively
@@ -1248,6 +1249,38 @@ static void cc_tap_send(CcTap *t, CcEvent *ev, char *ttag)
         t->last_evt_us = ev->src_us;
 }
 
+/* Emit the debounced caption NOW and start its minimum-display clock. Every path that puts
+ * a page up goes through here, so shown_since_us can never be left behind — a caption
+ * emitted without it gets no minimum display at all (measured: caption and clear 1ms apart
+ * on the wire, i.e. invisible). */
+static void cc_tap_flush_pending(CcTap *t, int64_t cur_us, char *ttag)
+{
+    CcEvent pe = { t->pend_ass, cur_us, t->pend_end_ms, PTV_CC_CAPTION };
+    t->pend_ass = NULL;
+    cc_tap_send(t, &pe, ttag);
+    t->shown_since_us = cur_us;               /* min-display clock starts now */
+}
+
+/* Hold a source erase back until due_us (see PTV_CC_MIN_DISPLAY_US).
+ *   ass != NULL — a clear from the source enters the hold. ccheld counts it ONCE, on entry:
+ *                 a roll-up repeats its EDM/EOC, and counting every repeat made ccheld >
+ *                 cclate structurally even when nothing was ever lost.
+ *   ass == NULL — RE-ARM: the held clear stays, only its deadline moves. Used whenever a
+ *                 page goes up underneath it, so the clear applies to the NEW page's
+ *                 minimum display and cannot wipe it after a few ms. */
+static void cc_tap_hold_erase(CcTap *t, const char *ass, uint32_t end_ms, int64_t due_us)
+{
+    if (ass) {
+        if (!t->erase_ass)
+            atomic_fetch_add_explicit(&g_cc_eskip, 1, memory_order_relaxed);
+        av_freep(&t->erase_ass);
+        t->erase_ass    = av_strdup(ass);
+        t->erase_end_ms = end_ms;
+    } else if (!t->erase_ass)
+        return;                               /* nothing held: nothing to re-arm */
+    t->erase_due_us = due_us;
+}
+
 static void cc_tap_frame(CcTap *t, AVFrame *frame, AVRational ist_tb)
 {
     AVFrameSideData *sd;
@@ -1267,6 +1300,15 @@ static void cc_tap_frame(CcTap *t, AVFrame *frame, AVRational ist_tb)
     if (t->last_src_us != AV_NOPTS_VALUE && cur_us < t->last_src_us - PTV_CC_BACKSTEP_US) {
         avcodec_flush_buffers(t->dec);
         t->last_evt_us = AV_NOPTS_VALUE;
+        /* erase_due_us was computed on the OLD timeline: keeping it would either fire the
+         * clear at once or park it unreachably far ahead. Drop it with the rest — and with
+         * shown_since_us, which is on that same dead timeline: leaving it there makes
+         * cur_us - shown_since_us negative for the whole size of the step (6.5s typical,
+         * 79s measured), so EVERY clear would be deferred to a deadline that is never
+         * reached and source clears would be silently lost until the encoder's 10s stale
+         * timeout — ccheld climbing with cclate flat. */
+        av_freep(&t->erase_ass);
+        t->shown_since_us = AV_NOPTS_VALUE;
         atomic_fetch_add_explicit(&g_cc_reset, 1, memory_order_relaxed);
         av_log(NULL, AV_LOG_INFO,
                "[PTV-CC]%s source pts stepped back %"PRId64"ms — cc_dec state reset\n",
@@ -1324,25 +1366,39 @@ static void cc_tap_frame(CcTap *t, AVFrame *frame, AVRational ist_tb)
                 t->pend_changed_us = cur_us;
                 t->pend_end_ms = end_ms;
             }
+            /* New text supersedes a deferred clear: the page is about to be replaced, so
+             * emitting the erase first would only insert a blank flash. */
+            av_freep(&t->erase_ass);
         } else {
-            /* Source erase (EDM/EOC). REFUSE it if the page has not had its minimum time on
+            /* Source erase (EDM/EOC). DEFER it if the page has not had its minimum time on
              * screen: a roll-up clears rows constantly, and obeying every clear reduced real
-             * captions to 0.3-0.6s of display. Dropping the erase is safe — the next caption
-             * replaces the page, and the encoder's 10s stale-content timeout still clears an
-             * abandoned one. */
+             * captions to 0.3-0.6s of display. Deferring, not dropping — dropping left the
+             * page up until the next caption arrived (measured max page life 6.6s vs the
+             * source's 3.5s, blank-gap median 0.04s vs 0.34s), i.e. we kept showing text the
+             * source had already cleared. The timer below emits it; a real caption cancels
+             * it. */
+            /* NOTE shown_since_us is AV_NOPTS_VALUE until a page has actually gone up (and
+             * again after a timeline rebase): no page on screen => no minimum to enforce. */
             if (t->shown_since_us != AV_NOPTS_VALUE &&
                 cur_us - t->shown_since_us < PTV_CC_MIN_DISPLAY_US) {
+                cc_tap_hold_erase(t, ass, end_ms,
+                                  t->shown_since_us + PTV_CC_MIN_DISPLAY_US);
                 avsubtitle_free(&sub);
-                atomic_fetch_add_explicit(&g_cc_eskip, 1, memory_order_relaxed);
                 goto strip;
             }
             /* Whatever is pending was on screen up to now, so it must go out BEFORE the
-             * clear, otherwise a caption that ends the moment it completes is never seen. */
+             * clear, otherwise a caption that ends the moment it completes is never seen.
+             * Sending both back-to-back is not enough: that gave the caption ZERO display
+             * time (measured on the wire, caption and clear 90 ticks = 1ms apart, 2/61 cues
+             * on TruBLU). Put the page up now and hold the clear for its minimum display,
+             * exactly like an early erase. */
             if (t->pend_ass) {
-                CcEvent pe = { t->pend_ass, cur_us, t->pend_end_ms, PTV_CC_CAPTION };
-                t->pend_ass = NULL;
-                cc_tap_send(t, &pe, ttag);
+                cc_tap_flush_pending(t, cur_us, ttag);
+                cc_tap_hold_erase(t, ass, end_ms, cur_us + PTV_CC_MIN_DISPLAY_US);
+                avsubtitle_free(&sub);
+                goto strip;
             }
+            av_freep(&t->erase_ass);          /* this erase supersedes any deferred one */
             ev.ass    = av_strdup(ass);
             ev.kind   = PTV_CC_ERASE;
             ev.end_ms = end_ms;
@@ -1360,14 +1416,33 @@ static void cc_tap_frame(CcTap *t, AVFrame *frame, AVRational ist_tb)
         avsubtitle_free(&sub);
     }
 
-    /* --- the two timers --- */
+    /* --- the timers --- */
+    /* A deferred source erase whose minimum-display time has now elapsed. A caption CAN be
+     * pending at the same time — the clear was deferred against the OUTGOING page's clock,
+     * so its deadline can fall before the debounce timer of text that arrived after it. The
+     * pending page goes out FIRST (source order: the text preceded the clear) and the clear
+     * is re-armed against it, same rule as the immediate-erase path above. */
+    if (t->erase_ass && cur_us >= t->erase_due_us) {
+        if (t->pend_ass) {
+            cc_tap_flush_pending(t, cur_us, ttag);
+            cc_tap_hold_erase(t, NULL, 0, cur_us + PTV_CC_MIN_DISPLAY_US);
+        } else {
+            CcEvent ee = { t->erase_ass, cur_us, t->erase_end_ms, PTV_CC_ERASE, 1 };
+            t->erase_ass = NULL;
+            cc_tap_send(t, &ee, ttag);        /* cclate= is counted in the emitter */
+        }
+        goto strip;
+    }
     if (t->pend_ass &&
         (cur_us - t->pend_changed_us >= PTV_CC_DEBOUNCE_US ||     /* text went quiet */
          cur_us - t->pend_first_us   >= PTV_CC_DEADLINE_US)) {    /* roll-up deadline */
-        CcEvent pe = { t->pend_ass, cur_us, t->pend_end_ms, PTV_CC_CAPTION };
-        t->pend_ass = NULL;
-        cc_tap_send(t, &pe, ttag);
-        t->shown_since_us = cur_us;               /* min-display clock starts now */
+        cc_tap_flush_pending(t, cur_us, ttag);
+        /* A clear still held from the PREVIOUS page applies to this one too (the source
+         * asked for a blank screen), but it must not wipe it after a few ms: re-arm it on
+         * the new page's own minimum display. Without this, an erase that arrived while
+         * this text was already buffered fired at the old page's deadline and the new
+         * caption lasted as little as 50ms. */
+        cc_tap_hold_erase(t, NULL, 0, cur_us + PTV_CC_MIN_DISPLAY_US);
         goto strip;
     }
     if (t->last_evt_us == AV_NOPTS_VALUE) {
@@ -2337,6 +2412,19 @@ static int cc_setup(CcCtx *cc, CcTap *tap, AVThreadMessageQueue **cc_q,
     }
     if (page < 0 || page > 0xFF) {
         av_log(NULL, AV_LOG_ERROR, "[PTV-CC] -cc_page 0x%X out of range (0x00-0xFF)\n", page);
+        return AVERROR(EINVAL);
+    }
+    /* Teletext page numbers are BCD: BOTH hex digits must be 0-9. A non-BCD value is accepted
+     * by strtol and then produces a stream with NO CUES AT ALL — mpegtsenc writes the nibbles
+     * into the 0x56 descriptor as decimal digits, so 0xFF announces "page 965" while the wire
+     * carries 0xFF, and neither TSDuck nor libzvbi finds anything (measured). 0xFF is also the
+     * filler/time-filling page the clear PES switches away to, and 0x00 is the magazine's own
+     * rolling header page — neither is a subtitle page. */
+    if (page < 0x01 || (page & 0x0F) > 9 || (page >> 4) > 9) {
+        av_log(NULL, AV_LOG_ERROR,
+               "[PTV-CC] -cc_page 0x%02X is not a teletext page: page numbers are BCD, so both "
+               "hex digits must be 0-9 and 00 is reserved (valid 0x01-0x99; the default 0x88 "
+               "with -cc_magazine 8 is page 888)\n", page);
         return AVERROR(EINVAL);
     }
     /* Multiview: each slot gets its OWN page, walked in BCD from the base (888, 889, 890,
@@ -3560,6 +3648,7 @@ end:
         avfilter_graph_free(&inputs[k].dc.fg);       /* single-input graph (multiview: NULL) */
         avcodec_free_context(&inputs[k].dc.cc.dec);  /* -cc_extract (NULL when off) */
         av_freep(&inputs[k].dc.cc.pend_ass);         /* a caption still inside the debounce */
+        av_freep(&inputs[k].dc.cc.erase_ass);        /* a clear still inside the min-display hold */
         avcodec_free_context(&inputs[k].vdec);
         av_thread_message_queue_free(&inputs[k].video_q);
         av_thread_message_queue_free(&inputs[k].hold.q);

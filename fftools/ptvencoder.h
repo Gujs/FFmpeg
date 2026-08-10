@@ -491,11 +491,24 @@ typedef struct VideoHold {
  *   DEADLINE emit anyway after this long pending      (roll-up never stops changing) */
 #define PTV_CC_DEBOUNCE_US     500000    /* text stable this long => emit */
 #define PTV_CC_DEADLINE_US     300000    /* pending this long => emit regardless */
-/* MINIMUM on-screen time. A roll-up source clears rows constantly, so cc_dec emits an empty
- * caption (= "erase") within a few hundred ms of almost every caption. Honouring those
- * instantly put text on screen for 0.3-0.6s — measured on air, unreadable. A page that
- * genuinely should go stays cleared by the next caption replacing it, or by the encoder's 10s
- * stale-content timeout; refusing the early erase only ever keeps readable text up longer. */
+/* MINIMUM on-screen time. A POP-ON source erases the screen (EIA-608 EDM) shortly before it
+ * flips in the next caption, so cc_dec emits an empty caption (= "erase") within a few hundred
+ * ms of almost every caption. Honouring those instantly put text on screen for 0.3-0.6s —
+ * measured on air, unreadable. So an early erase is DEFERRED to shown_since_us + this, not
+ * dropped, and it is RE-ARMED whenever a newer caption goes up (an erase still pending from the
+ * previous page must not clear the new one; unarmed, that put a caption on screen for 1ms).
+ * Measured on the wire, trublu_in0: shortest caption life 0.00s -> 0.43s, captions under 1.2s
+ * 11 -> 9.
+ *
+ * Do NOT re-justify this by roll-up. Measured 2026-08-10 on three real roll-up feeds (NTD,
+ * Weather_nation, Newsmax2 source multicast): RU2/RU3 + CR with ZERO EDM, i.e. erase=0
+ * eheld=0 elate=0 — a roll-up source never asks for a clear, so this path is exercised by
+ * pop-on only. An earlier version of this comment claimed the opposite.
+ *
+ * Also do not re-derive the numbers from `tsp -P teletext` cue times: TSDuck attributes a cue
+ * start to a preceding stuffing-only keepalive, which invented a 6.6s "max page life" and a
+ * 0.04s blank-gap median that the wire does not show (reader-independent: max 3.24s, unchanged
+ * by this rule). Read the page addresses off the wire, or use CCExtractor. */
 #define PTV_CC_MIN_DISPLAY_US 1200000
 #define PTV_CC_QUIET_US        60000000  /* captions absent this long while A53 keeps arriving
                                           * => one [PTV-CC] QUIET line (and one on recovery) */
@@ -518,6 +531,9 @@ typedef struct CcEvent {
     int64_t  src_us;     /* SOURCE pts of the video frame that carried the CC (us) */
     uint32_t end_ms;     /* end_display_time, already clamped */
     int      kind;       /* PTV_CC_* */
+    int      deferred;   /* ERASE held by the min-display rule; cclate= counts these in the
+                          * EMITTER (after the encode), never here — a queue-full drop or an
+                          * already-blank page must not read as a clear that went out */
 } CcEvent;
 
 /* Decode-thread side. One per input; wired to every input the extraction runs on
@@ -543,6 +559,12 @@ typedef struct CcTap {
     int64_t          pend_first_us;    /* source pts when this pending cycle began */
     int64_t          last_emit_src_us; /* source pts of the last event QUEUED (1 Hz floor) */
     int64_t          shown_since_us;   /* source pts the current page went up (min-display) */
+    /* DEFERRED source erase (see PTV_CC_MIN_DISPLAY_US): an erase that arrived before the
+     * page had its minimum on-screen time is held here, not thrown away, and emitted once
+     * erase_due_us is reached. A real caption arriving first cancels it. */
+    char            *erase_ass;        /* the deferred erase rect's ASS line (owned) */
+    uint32_t         erase_end_ms;
+    int64_t          erase_due_us;     /* source pts the deferred erase may go out at */
 } CcTap;
 
 /* Shared decode side of the ABR ladder (the ffmpeg model: decode the source
@@ -1831,7 +1853,8 @@ extern _Atomic int g_cc_on;
 extern _Atomic int64_t g_cc_a53;         /* decoded frames carrying A53 CC side data */
 extern _Atomic int64_t g_cc_caps;        /* caption pages emitted (text-bearing ONLY) */
 extern _Atomic int64_t g_cc_erase;
-extern _Atomic int64_t g_cc_eskip;      /* early erases refused (min display time) */       /* page erases emitted (source cleared its captions) */
+extern _Atomic int64_t g_cc_eskip;      /* DISTINCT clears DEFERRED (min display time) */     /* page erases emitted (source cleared its captions) */
+extern _Atomic int64_t g_cc_elate;      /* deferred clears the ENCODER actually put on the wire */
 extern _Atomic int64_t g_cc_keep;        /* keepalive (stuffing) packets emitted */
 extern _Atomic int64_t g_cc_err;         /* cc_dec + teletext encoder errors */
 extern _Atomic int64_t g_cc_dropped;     /* events lost (queue full / unstampable / enc error) */
