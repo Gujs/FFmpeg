@@ -50,9 +50,19 @@
 #define TELETEXT_DATA_UNIT_LENGTH   0x2C  /* 44 bytes per data unit */
 #define TELETEXT_FRAMING_CODE       0xE4  /* clock run-in + framing code */
 #define TELETEXT_CHARS_PER_ROW      40    /* characters per teletext row */
-#define TELETEXT_SUBTITLE_ROW1      22    /* first subtitle row (two-line) */
-#define TELETEXT_SUBTITLE_ROW2      23    /* second subtitle row (bottom) */
+/* Subtitle rows sit at the BOTTOM of the page and grow upwards from row 23, so a 1-row
+ * caption is on 23, a 2-row one on 22+23, and a 4-row roll-up on 20..23 — the conventional
+ * DVB-subtitle band. EIA-608 carries up to 4 rows (roll-up 4, multi-line pop-on); anything
+ * beyond that is dropped rather than pushed further up the screen. */
+#define TELETEXT_SUBTITLE_LAST_ROW  23    /* bottom subtitle row */
+#define TELETEXT_MAX_SUBTITLE_ROWS  4     /* rows 20..23 */
 #define TELETEXT_DATA_UNIT_STUFFING 0xFF  /* stuffing data unit, EN 300 472 */
+/* Page 0xFF in our own magazine is the "filler"/time-filling page (ETS 300 706 9.3.1): a
+ * header no receiver displays, used to switch AWAY from the subtitle page. It MUST differ
+ * from the subtitle page — otherwise the clear PES emits two headers for the same page, the
+ * second one without C4, and there is no away-switch at all. */
+#define TELETEXT_FILLER_PAGE        0xFF
+#define TELETEXT_FILLER_ALT_PAGE    0xFE  /* when the operator asked for page 0xFF itself */
 
 /*
  * The libzvbi teletext decoder requires PES packets to be exact multiples
@@ -63,6 +73,9 @@
  * We always pad to exactly 3 data units (the minimum that passes).
  */
 #define TELETEXT_MIN_DATA_UNITS     3
+/* A content PES carries the page header + up to TELETEXT_MAX_SUBTITLE_ROWS content rows +
+ * the away-switch filler header = up to 6 units, so it pads to the next legal count, 7. */
+#define TELETEXT_CONTENT_DATA_UNITS 7
 
 /*
  * Hamming 8/4 encoding table.
@@ -321,18 +334,24 @@ static int write_stuffing_unit(uint8_t *buf)
  *
  * @param buf         Output buffer
  * @param ctx         Encoder context
+ * @param page        Page number in hex (0x00-0xFF) within ctx->magazine
  * @param erase       1 to set the erase page flag (C4)
  * @param line_offset VBI line offset (7-22)
  * @return number of bytes written
  */
 static int write_page_header(uint8_t *buf, DVBTeletextEncContext *ctx,
-                             int erase, int line_offset)
+                             int page, int erase, int line_offset)
 {
     uint8_t header_text[TELETEXT_CHARS_PER_ROW];
     int page_units, page_tens;
+    /* Only the page we announce in the teletext descriptor is flagged as a subtitle
+     * page; the blank filler page must not be, or decoders that follow the subtitle
+     * flags would treat it as a second subtitle service. */
+    int subtitle_page = (page == ctx->page);
     int i;
 
-    buf[0] = TELETEXT_DATA_UNIT_SUBTITLE;
+    buf[0] = subtitle_page ? TELETEXT_DATA_UNIT_SUBTITLE
+                           : TELETEXT_DATA_UNIT_NONSUBT;
     buf[1] = TELETEXT_DATA_UNIT_LENGTH;
     /* Per EN 300 472 section 4.4:
      * bits 7-6: reserved "11", bit 5: field_parity, bits 4-0: line_offset */
@@ -343,8 +362,8 @@ static int write_page_header(uint8_t *buf, DVBTeletextEncContext *ctx,
     encode_mrag(ctx->magazine, 0, &buf[4]);
 
     /* Page address: page number as two Hamming 8/4 bytes (BCD) */
-    page_units = ctx->page & 0x0F;
-    page_tens  = (ctx->page >> 4) & 0x0F;
+    page_units = page & 0x0F;
+    page_tens  = (page >> 4) & 0x0F;
     buf[6] = hamming84_encode[page_units];
     buf[7] = hamming84_encode[page_tens];
 
@@ -361,14 +380,14 @@ static int write_page_header(uint8_t *buf, DVBTeletextEncContext *ctx,
     buf[8]  = hamming84_encode[0];               /* S1 */
     buf[9]  = hamming84_encode[(erase ? 0x08 : 0x00)]; /* S2 + C4 (erase page) */
     buf[10] = hamming84_encode[0];               /* S3 */
-    buf[11] = hamming84_encode[0x08];            /* S4=0, C5=0, C6=0, C7=1(SuppressHdr) */
+    buf[11] = hamming84_encode[subtitle_page ? 0x08 : 0x00]; /* S4=0, C5=0, C6=0, C7=1(SuppressHdr) */
     /* C8 MUST STAY 1. ETS 300 706 calls it an Update Indicator that inverts on change, but
      * libavcodec's libzvbi teletext decoder — i.e. ffplay and VLC — classifies a page as a
      * SUBTITLE with
      *     !(C6) && C7 && C8            (libzvbi-teletextdec.c, subtitle_map[])
      * so toggling it de-classifies every other page and the decoder ignores it outright.
      * Tried and measured; do not "fix" this again. */
-    buf[12] = hamming84_encode[0x01];            /* C8=1 (Update Indicator), C9..C11=0 */
+    buf[12] = hamming84_encode[subtitle_page ? 0x01 : 0x00]; /* C8=1 (Update Indicator), C9..C11=0 */
     buf[13] = hamming84_encode[ctx->g0_subset & 0x07]; /* C12-C14: national option subset */
 
     /* Header display area: 26 bytes (positions 14-39 in data unit payload,
@@ -625,9 +644,30 @@ static av_cold int dvb_teletext_encode_init(AVCodecContext *avctx)
     return 0;
 }
 
-/* Page header with the C4 erase flag + stuffing to the required unit count:
- * clears whatever is currently displayed. Used both for an explicit source
- * erase and for the stale-content timeout. */
+/* The blank filler page to switch away to. Never ctx->page: two headers for the same page in
+ * one PES is not an away-switch, it is a second (C4-less) transmission of the subtitle page. */
+static int filler_page(const DVBTeletextEncContext *ctx)
+{
+    return ctx->page == TELETEXT_FILLER_PAGE ? TELETEXT_FILLER_ALT_PAGE
+                                             : TELETEXT_FILLER_PAGE;
+}
+
+/* Clear whatever is currently displayed. Used both for an explicit source erase and for
+ * the stale-content timeout. Two mechanisms in ONE PES, in this order:
+ *
+ *   1. a blank page header for OUR subtitle page, C4 (erase page) set;
+ *   2. the blank filler page in the same magazine (see filler_page(); 8FF by default).
+ *
+ * (2) is how a real broadcast encoder clears: the GB News page-888 reference keeps a blank
+ * 8FF running constantly and switches away from the subtitle page instead of wiping it,
+ * which is why C4 appears on only ~5% of its page transmissions. It also terminates the
+ * page-888 transmission immediately, so a decoder that only completes a page when the next
+ * header arrives raises its clear event now rather than seconds later.
+ *
+ * (1) is kept because (2) ALONE does not clear libzvbi: ffmpeg's libzvbi-teletextdec.c
+ * drops any VBI_EVENT_TTX_PAGE whose page number is outside the txt_page filter (and VLC
+ * filters the same way), so a decoder tuned to 888 never sees the 8FF at all and holds the
+ * last caption on screen. Measured — do not drop the blank 888 header. */
 static int write_erase_page(DVBTeletextEncContext *ctx, unsigned char *buf,
                             int bufsize)
 {
@@ -637,8 +677,8 @@ static int write_erase_page(DVBTeletextEncContext *ctx, unsigned char *buf,
         return 0;
 
     buf[0] = TELETEXT_DATA_IDENTIFIER;
-    offset  = 1 + write_page_header(buf + 1, ctx, 1, 7);
-    offset += write_stuffing_unit(buf + offset);
+    offset  = 1 + write_page_header(buf + 1, ctx, ctx->page, 1, 7);
+    offset += write_page_header(buf + offset, ctx, filler_page(ctx), 0, 8);
     offset += write_stuffing_unit(buf + offset);
     ctx->content_active = 0;
 
@@ -668,7 +708,7 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
     DVBTeletextEncContext *ctx = avctx->priv_data;
     TextExtractCtx extract = { 0 };
     ASSDialog *dialog;
-    char *lines[2] = { NULL, NULL };
+    char *lines[TELETEXT_MAX_SUBTITLE_ROWS] = { NULL };
     int nb_lines = 0;
     uint8_t row_text[TELETEXT_CHARS_PER_ROW];
     int offset = 0;
@@ -696,10 +736,10 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
         return write_keepalive_page(buf, bufsize);
     }
 
-    /* We need at minimum:
-     * 1 byte (data_identifier) + 46 bytes (page header) + 46*2 (content rows) = 139
-     * With padding to 3 data units: 1 + 46*3 = 139. */
-    if (bufsize < 1 + 46 * 3) {
+    /* A content PES is padded to TELETEXT_CONTENT_DATA_UNITS: 1 byte (data_identifier) +
+     * 46 * 7 = 323 — the worst case is the page header + 4 content rows + the away-switch
+     * filler header = 6 units, and 7 is the next unit count with (size + 45) % 184 == 0. */
+    if (bufsize < 1 + 46 * TELETEXT_CONTENT_DATA_UNITS) {
         av_log(avctx, AV_LOG_ERROR, "Buffer too small for teletext packet\n");
         return AVERROR_BUFFER_TOO_SMALL;
     }
@@ -753,7 +793,7 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
             return AVERROR(ENOMEM);
 
         p = av_strtok(text_str, "\n", &saveptr);
-        while (p && nb_lines < 2) {
+        while (p && nb_lines < TELETEXT_MAX_SUBTITLE_ROWS) {
             /* Map into the teletext G0 repertoire FIRST, then decide whether the
              * line still shows anything.  The mapping turns every codepoint it
              * cannot represent into a space — including NBSP and the U+2588 full
@@ -796,23 +836,31 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
      * updates use erase=0 so the decoder replaces content in-place
      * without a visible blank flash between updates. */
     {
-        /* C4 erase on EVERY caption page. The "smart erase" this replaces (set C4 only
-         * after silence or when the row count shrank) is what a real broadcast encoder
-         * does to avoid a blank flash between updates — but libzvbi then treats each
-         * header as an update to the page already displayed and never raises a new
-         * VBI_EVENT_TTX_PAGE, so ffplay/VLC show nothing after the first. */
-        int erase = 1;
-        offset += write_page_header(buf + offset, ctx, erase, 7);
+        /* Measured against a real broadcast (GB News page 888: C4 on 9 of 171 page
+         * transmissions, ~5%). C4 on every page — what this replaces — is what made the
+         * display flash clear->redraw on each update.
+         *
+         * This is only safe BECAUSE of the away-switch appended below. Measured with a RAW
+         * libzvbi (Homebrew 0.2.44, none of libavcodec/libzvbi-teletextdec.c's wrapper
+         * logic — that wrapper's last_p5 block re-asserts C4 itself and stores the MUTATED
+         * byte, so it self-propagates and CANNOT tell C4-always from C4-once; VLC has no
+         * such workaround): raw libzvbi raises VBI_EVENT_TTX_PAGE only for transmissions
+         * whose header carries C4. Without the away-switch, 17 of 61 caption updates on
+         * TruBLU raised NO event at all — 28% of updates invisible on a real receiver.
+         * Do not remove the filler header while C4 is conditional. */
+        int erase = !ctx->content_active || nb_lines < ctx->last_nb_lines;
+        offset += write_page_header(buf + offset, ctx, ctx->page, erase, 7);
     }
 
-    /* Content rows: place subtitle text at rows 22 and 23 (bottom of screen)
-     * Each data unit gets a unique VBI line offset (8, 9, ...) */
+    /* Content rows: bottom-anchored, so the LAST line always lands on row 23 and the block
+     * grows upwards (1 row => 23, 2 => 22+23, 3 => 21..23, 4 => 20..23). A source caption
+     * with more rows than this used to be silently truncated to two: measured 4 of 56
+     * captions on TruBLU lost their third row ("Send me the" without "address.").
+     * Each data unit gets a unique VBI line offset (8, 9, ...) per EN 300 472. */
     for (i = 0; i < nb_lines; i++) {
         const char *line = lines[i];   /* already G0-mapped at split time */
         int len, pad_left, j;
-        int row = (nb_lines == 1) ? TELETEXT_SUBTITLE_ROW2
-                                  : (i == 0 ? TELETEXT_SUBTITLE_ROW1
-                                            : TELETEXT_SUBTITLE_ROW2);
+        int row = TELETEXT_SUBTITLE_LAST_ROW - (nb_lines - 1 - i);
 
         /* Build row text: center the text in 40-char row, wrapped in
          * Start Box (0x0B) / End Box (0x0A) markers. Teletext subtitle
@@ -846,16 +894,26 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
                                   row_text, 1, 8 + i);
     }
 
+    /* AWAY-SWITCH: terminate this transmission of the subtitle page with a blank filler-page
+     * header, the way a real broadcast encoder does (the GB News page-888 reference runs a
+     * blank 8FF continuously between subtitle transmissions, which is why C4 appears on only
+     * ~5% of its page transmissions). Every subtitle header is then preceded by a
+     * different-page header, i.e. a FRESH page instance rather than a repeat.
+     *
+     * This is what makes the conditional C4 above safe: measured with a raw libzvbi, a
+     * C4-less repeat of the same page raises no VBI_EVENT_TTX_PAGE at all. */
+    offset += write_page_header(buf + offset, ctx, filler_page(ctx), 0, 8 + nb_lines);
+
     ctx->content_active    = 1;
     ctx->last_nb_lines     = nb_lines;
     ctx->last_content_pts  = sub->pts;
 
-    /* Pad with stuffing data units to reach TELETEXT_MIN_DATA_UNITS total.
+    /* Pad with stuffing data units to reach TELETEXT_CONTENT_DATA_UNITS total.
      * This ensures (pkt_size + 45) % 184 == 0 for the libzvbi decoder. */
     {
-        /* Count data units written: 1 (page header) + nb_lines (content rows) */
-        int data_units = 1 + nb_lines;
-        while (data_units < TELETEXT_MIN_DATA_UNITS) {
+        /* 1 (page header) + nb_lines (content rows) + 1 (away-switch filler) */
+        int data_units = 2 + nb_lines;
+        while (data_units < TELETEXT_CONTENT_DATA_UNITS) {
             offset += write_stuffing_unit(buf + offset);
             data_units++;
         }
