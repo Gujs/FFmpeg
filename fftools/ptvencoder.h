@@ -482,6 +482,17 @@ typedef struct VideoHold {
 #define PTV_CC_MAX_DISPLAY_MS  10000     /* end_display_time clamp (cc_dec real_time returns -1) */
 #define PTV_CC_ENC_BUF         4096      /* one teletext PES payload is 1 + 46*units bytes */
 #define PTV_CC_BACKSTEP_US     500000    /* backward source jump => new timeline (reset baselines) */
+/* The EMITTER's baseline is a different question from the tap's. A backward HOUSE stamp of
+ * this size or less is not a new timeline at all — it is the multiview compositor moving a
+ * slot's h0 (REANCHOR2 shifts 560ms..2.5s), so content_index() legitimately drops. Adopting
+ * the lower baseline there is what silently deleted captions: the MUX high-water does not
+ * move back with us, so [PTV-MUXGUARD] dropped every teletext packet until content climbed
+ * past the old high-water — while caps=/cclate= counted them as delivered (live evidence:
+ * "[PTV-MUXGUARD] rung N stream 7" x4 pkts x5 rungs). Below this bound we keep the monotone
+ * +1ms bump instead: captions run at most `shift` late and converge on their own. Only a step
+ * BEYOND it is treated as a genuine rebase (source pts jumps are absorbed upstream, so those
+ * are rare). */
+#define PTV_CC_REBASE_US      3000000    /* backward HOUSE step beyond this => real rebase */
 /* DEBOUNCE (ported from legacy 0005 — load-bearing, not the CDN's "coalescing").
  * cc_dec real_time=1 emits on EVERY caption-memory change, so a roll-up caption arrives as
  * a stream of partial lines ("IN", "IN MY TIMES OF", "IN MY TIMES OF DISTRESS."). Turning
@@ -565,6 +576,7 @@ typedef struct CcTap {
     char            *erase_ass;        /* the deferred erase rect's ASS line (owned) */
     uint32_t         erase_end_ms;
     int64_t          erase_due_us;     /* source pts the deferred erase may go out at */
+    int              mrect_warned;     /* the "this source emits >1 rect per subtitle" line, once */
 } CcTap;
 
 /* Shared decode side of the ABR ladder (the ffmpeg model: decode the source
@@ -694,6 +706,11 @@ typedef struct CcCtx {
     int              seen_caption;
     int              quiet;                   /* 1 = currently in the QUIET state */
     int64_t          last_caption_us;         /* house us of the last CAPTION emitted */
+    /* House stamp of the last CAPTION packet — the floor an ERASE is held to while the
+     * monotone bump is active (see cc_emit). NOT last_caption_us: that one baselines on the
+     * first event of ANY kind for the QUIET watchdog, so it is not a caption position.
+     * AV_NOPTS_VALUE until a caption has gone out, and reset by a baseline rebase. */
+    int64_t          last_cap_dts;
 } CcCtx;
 
 typedef struct AudioState {
@@ -1662,6 +1679,8 @@ extern int64_t g_muxtest_back_at_us;     /* TEST ONLY (pre26 gates): one injecte
                                           * dts at the mux feed, t µs after mux start (0 = off) */
 extern int64_t g_muxtest_back_ms;        /* TEST ONLY: injected backward magnitude (ms) */
 extern int     g_muxdiag;                /* pre26 D3: gated emission-point backward-label instrumentation */
+extern int     g_cctest_corrupt;         /* TEST ONLY (F6 gate): mark every Nth decoded video frame
+                                          * AV_FRAME_FLAG_CORRUPT (0 = off) */
 extern int     g_prog_off;
 extern int     g_progoff_av;
 extern int     g_layera;
@@ -1855,6 +1874,8 @@ extern _Atomic int64_t g_cc_caps;        /* caption pages emitted (text-bearing 
 extern _Atomic int64_t g_cc_erase;
 extern _Atomic int64_t g_cc_eskip;      /* DISTINCT clears DEFERRED (min display time) */     /* page erases emitted (source cleared its captions) */
 extern _Atomic int64_t g_cc_elate;      /* deferred clears the ENCODER actually put on the wire */
+extern _Atomic int64_t g_cc_mrect;      /* cc_dec subtitles with >1 rect (all rects processed) */
+extern _Atomic int64_t g_cc_mux;        /* teletext pkts DROPPED by the mux backward-dts guard */
 extern _Atomic int64_t g_cc_keep;        /* keepalive (stuffing) packets emitted */
 extern _Atomic int64_t g_cc_err;         /* cc_dec + teletext encoder errors */
 extern _Atomic int64_t g_cc_dropped;     /* events lost (queue full / unstampable / enc error) */

@@ -713,9 +713,23 @@ void *compositor_thread(void *arg)
                                    pd_cnt[k], sv_cnt[k], (int)(c->inputs[k].house_skew / 1000),
                                    (int)(c->inputs[k].da.disc_resid_us / 1000), lst, cct);
                 }
+                /* GLOBAL ccmux= — teletext packets our own mux backward-dts guard dropped.
+                 * Its own buffer rather than an append to ls[]: that loop's bound only
+                 * guarantees headroom for one more slot token, and this line already lost a
+                 * whole token to a too-small buffer once. Not per-slot: the guard sits in the
+                 * mux thread, downstream of the fan-out, so the count is not attributable to a
+                 * slot — and it is per rung per packet (see the log legend). Printed only when
+                 * the extraction runs at all, so an mv without -cc_extract is unchanged. */
+                char ccg[32] = "";
+                {   /* shown only when NONZERO, exactly like the single-input line and what the
+                     * log legend promises — a clean run's line stays byte-for-byte unchanged. */
+                    int64_t cx = atomic_load_explicit(&g_cc_mux, memory_order_relaxed);
+                    if (cx > 0)
+                        snprintf(ccg, sizeof ccg, " ccmux=%lld", (long long)cx);
+                }
                 av_log(NULL, AV_LOG_INFO,   /* v0.9.13 parity: size/bitrate/speed/genlock dropped (v0.9.10 single-input rationale) */
-                    "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f dup=%"PRId64" drop=%"PRId64"%s%s%s%s%s%s\n",
-                    c->emitted, fps, hh, mm, ss, c->dup, c->framedrop[0], dlv, aco, ls, crs, cvs, rsn);
+                    "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f dup=%"PRId64" drop=%"PRId64"%s%s%s%s%s%s%s\n",
+                    c->emitted, fps, hh, mm, ss, c->dup, c->framedrop[0], dlv, aco, ls, ccg, crs, cvs, rsn);
                 /* 1.0.1-pre17 (owner-floated): per-INPUT always-on [PTV-RSYNC] summary, ONE
                  * compact line per input — the soak forensics that used to need PTV_DIAG.
                  * R = this input's track reading(s) (same builder as the stats token), ev =

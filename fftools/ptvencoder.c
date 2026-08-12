@@ -6,6 +6,7 @@
  * This file is licensed under the same terms as FFmpeg (GPL, --enable-gpl).
  */
 
+#include <assert.h>   /* static_assert — the G0-subset table anti-drift tie */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -225,6 +226,12 @@ int     g_muxtest_back_type = AVMEDIA_TYPE_AUDIO; /* TEST ONLY (pre27 #62 GH gat
                                         * PTV_MUXTEST_BACK_TYPE=a|s|d — stream type the injection
                                         * targets (audio default; s/d = sparse guarded streams, to
                                         * verify the ceiling does NOT fire there). */
+int     g_cctest_corrupt = 0;      /* TEST ONLY (F6 gate): PTV_CCTEST_CORRUPT_EVERY=N marks every Nth
+                                        * decoded video frame AV_FRAME_FLAG_CORRUPT, which is the one
+                                        * thing a file fixture cannot produce on demand (real slice
+                                        * damage is dropped by the demuxer's own corrupt-packet path
+                                        * long before the decoder flags a frame). 0 = off (default,
+                                        * byte-identical). */
 int     g_muxdiag = 0;             /* pre26 D3 instrumentation (PTV_MUXDIAG=1): emission-point backward-label
                                         * detector + state dump in the audio thread. Diagnostic only. */
 int     g_muxtol = 1;              /* 1.0.1-pre27 #62 [PTV-MUXTOL] egress-pressure errno filter (Praise_TV
@@ -872,6 +879,10 @@ _Atomic int64_t g_cc_a53, g_cc_caps, g_cc_erase, g_cc_keep, g_cc_err, g_cc_dropp
 _Atomic int64_t g_cc_caps_in[PTV_MAX_INPUT], g_cc_a53_in[PTV_MAX_INPUT];
 _Atomic int64_t g_cc_eskip;   /* distinct clears deferred by the minimum-display rule */
 _Atomic int64_t g_cc_elate;   /* of those, the ones the encoder actually put on the wire */
+_Atomic int64_t g_cc_mrect;   /* cc_dec subtitles carrying MORE THAN ONE rect (all processed) */
+_Atomic int64_t g_cc_mux;     /* teletext pkts the mux backward-dts guard dropped (wire truth
+                               * past the encoder: caps= counts what we handed the muxer, this
+                               * counts what the muxer refused) */
 
 /* PTV_LOG_TS=1: prefix every log line with a local wall-clock timestamp
  * [YYYY-MM-DD HH:MM:SS.mmm], so production logs are self-dated natively
@@ -1124,11 +1135,41 @@ fail:
     return ret;
 }
 
+/* The dvb_teletext encoder's g0_subset values, with the ETS 300 706 national option code each
+ * one transmits in C12-C14. The two numberings are bit-reversals of each other, which is why
+ * the code is logged next to it: an operator comparing the log against a wire dump (or
+ * test-scripts/teletext-oracle) needs the ETS number, not ours. The MASTER COPY of this
+ * numbering is g0_national_subsets[] / g0_subset_ets_code[] in libavcodec/dvbteletextenc.c —
+ * see the comment there for everything that has to agree with it. */
+static const struct { const char *name; int ets; } g0_subset_info[] = {
+    { "English",                    0 },
+    { "German",                     4 },
+    { "Swedish/Finnish/Hungarian",  2 },
+    { "Italian",                    6 },
+    { "French",                     1 },
+    { "Spanish/Portuguese",         5 },
+    /* region-dependent: see the Czech/Slovak row in dvbteletextenc.c's g0_national_subsets[] */
+    { "Czech/Slovak (region-0) / Turkish (region-16)", 3 },
+};
+
+/* ANTI-DRIFT TIE. lang_to_g0_subset() below returns an index into BOTH this table and the
+ * encoder's g0_national_subsets[] (the MASTER copy — dvbteletextenc.c, whose own static
+ * asserts cover its three tables and the g0_subset option's maximum). The highest index it can
+ * return is PTV_G0_SUBSET_MAX, so a subset added to the encoder and mapped here without a row
+ * added to this table would index off the end of it. Checked at COMPILE time — deliberately
+ * not an av_assert0, which would abort a live channel over a table-maintenance slip. */
+#define PTV_G0_SUBSET_MAX 6      /* Czech/Slovak; == G0_NATIONAL_SUBSETS - 1 in the encoder */
+static_assert(FF_ARRAY_ELEMS(g0_subset_info) == PTV_G0_SUBSET_MAX + 1,
+              "g0_subset_info[] needs one row per subset lang_to_g0_subset() can return");
+
 /* Map an ISO 639-2 language code to the teletext G0 national option subset (ETS 300 706
- * table 33). Ported verbatim from legacy patch 0005; unknown languages get 0 (English). */
+ * table 33). Returns -1 for a language with no subset of its own — the caller falls back to
+ * English and says so, because a SILENT fallback is indistinguishable from a correct mapping. */
 static int lang_to_g0_subset(const char *lang)
 {
     if (!lang || !lang[0])
+        return -1;
+    if (!strcmp(lang, "eng"))
         return 0;
     if (!strcmp(lang, "deu") || !strcmp(lang, "ger"))
         return 1;
@@ -1141,9 +1182,30 @@ static int lang_to_g0_subset(const char *lang)
     if (!strcmp(lang, "spa") || !strcmp(lang, "por"))
         return 5;
     if (!strcmp(lang, "cze") || !strcmp(lang, "ces") ||
-        !strcmp(lang, "slo") || !strcmp(lang, "slk"))
+        !strcmp(lang, "slo") || !strcmp(lang, "slk")) {
+        /* Subset 6 = ETS national option code 3. MEASURED with a raw libzvbi: a receiver on
+         * ETS region 0 renders "#ůčťžýířéáěúš" — real Czech/Slovak — while one left on
+         * libzvbi's DEFAULT region 16 renders Turkish "ğİŞÖÇÜĞışöçü" from the same wire. Code 3
+         * is the only one of the seven we transmit whose glyphs depend on the region.
+         *
+         * WARN, not silence, and not a fallback: region 0 is the right answer for a Czech
+         * channel and this is the best the page header alone can do (pinning the region needs
+         * packet X/28 or M/29, which this encoder does not transmit). The caller keeps the
+         * subset; the operator gets told what a region-16 receiver will show.
+         *
+         * The 2026-08-12 removal of this mapping was made off a region-16 measurement and was
+         * wrong — the pre-existing -cc_lang cze was correct. */
+        av_log(NULL, AV_LOG_WARNING,
+               "[PTV-CC] language \"%s\": using G0 subset 6 (ETS national option code 3). "
+               "Receivers on ETS region 0 render Czech/Slovak; receivers left on libzvbi's "
+               "default region 16 render TURKISH from the same bytes — pinning the region "
+               "needs packet X/28, which this encoder does not transmit. Note EIA-608 cannot "
+               "carry most Czech accents in the first place, so the captions themselves "
+               "arrive largely de-accented.\n",
+               lang);
         return 6;
-    return 0;
+    }
+    return -1;
 }
 
 /* free func for the CC event queue (the queue owns the ASS string) */
@@ -1281,6 +1343,67 @@ static void cc_tap_hold_erase(CcTap *t, const char *ass, uint32_t end_ms, int64_
     t->erase_due_us = due_us;
 }
 
+/* Classify and act on ONE cc_dec rect (see the two branches' own comments).
+ *
+ * Returns 1 when this rect settled the frame — the caller must then skip the debounce/erase
+ * timers, exactly as the single-rect code did with its `goto strip`. Returns 0 to carry on.
+ *
+ * `ass` points into the AVSubtitle, which the caller still owns: every path here COPIES it. */
+static int cc_tap_rect(CcTap *t, const char *ass, int end_ms, int64_t cur_us, char *ttag)
+{
+    CcEvent ev = { NULL, cur_us, (uint32_t)end_ms, PTV_CC_ERASE };
+
+    if (cc_ass_has_text(ass)) {
+        /* DEBOUNCE (see PTV_CC_DEBOUNCE_US): buffer it. Only a CHANGE restarts the
+         * silence timer — an identical retransmission must not keep the caption
+         * pending forever. */
+        if (!t->pend_ass || strcmp(t->pend_ass, ass)) {
+            if (!t->pend_ass)
+                t->pend_first_us = cur_us;        /* new pending cycle */
+            av_freep(&t->pend_ass);
+            t->pend_ass = av_strdup(ass);
+            t->pend_changed_us = cur_us;
+            t->pend_end_ms = end_ms;
+        }
+        /* New text supersedes a deferred clear: the page is about to be replaced, so
+         * emitting the erase first would only insert a blank flash. (Also how an
+         * [EDM, chars] pair in ONE frame resolves: the erase this frame just held is
+         * cancelled by the text that followed it.) */
+        av_freep(&t->erase_ass);
+        return 0;
+    }
+
+    /* Source erase (EDM/EOC). DEFER it if the page has not had its minimum time on
+     * screen: a roll-up clears rows constantly, and obeying every clear reduced real
+     * captions to 0.3-0.6s of display. Deferring, not dropping — dropping left the
+     * page up until the next caption arrived (measured max page life 6.6s vs the
+     * source's 3.5s, blank-gap median 0.04s vs 0.34s), i.e. we kept showing text the
+     * source had already cleared. The timer in the caller emits it; a real caption
+     * cancels it. */
+    /* NOTE shown_since_us is AV_NOPTS_VALUE until a page has actually gone up (and
+     * again after a timeline rebase): no page on screen => no minimum to enforce. */
+    if (t->shown_since_us != AV_NOPTS_VALUE &&
+        cur_us - t->shown_since_us < PTV_CC_MIN_DISPLAY_US) {
+        cc_tap_hold_erase(t, ass, end_ms, t->shown_since_us + PTV_CC_MIN_DISPLAY_US);
+        return 1;
+    }
+    /* Whatever is pending was on screen up to now, so it must go out BEFORE the
+     * clear, otherwise a caption that ends the moment it completes is never seen.
+     * Sending both back-to-back is not enough: that gave the caption ZERO display
+     * time (measured on the wire, caption and clear 90 ticks = 1ms apart, 2/61 cues
+     * on TruBLU). Put the page up now and hold the clear for its minimum display,
+     * exactly like an early erase. */
+    if (t->pend_ass) {
+        cc_tap_flush_pending(t, cur_us, ttag);
+        cc_tap_hold_erase(t, ass, end_ms, cur_us + PTV_CC_MIN_DISPLAY_US);
+        return 1;
+    }
+    av_freep(&t->erase_ass);              /* this erase supersedes any deferred one */
+    ev.ass = av_strdup(ass);
+    cc_tap_send(t, &ev, ttag);
+    return 1;
+}
+
 static void cc_tap_frame(CcTap *t, AVFrame *frame, AVRational ist_tb)
 {
     AVFrameSideData *sd;
@@ -1290,9 +1413,18 @@ static void cc_tap_frame(CcTap *t, AVFrame *frame, AVRational ist_tb)
     int64_t cur_us;
     int got = 0;
 
-    if (!t->dec || !t->q || frame->best_effort_timestamp == AV_NOPTS_VALUE)
+    if (!t->dec || !t->q)
         goto strip;
-    cur_us = av_rescale_q(frame->best_effort_timestamp, ist_tb, AV_TIME_BASE_Q);
+    if (frame->best_effort_timestamp != AV_NOPTS_VALUE)
+        cur_us = av_rescale_q(frame->best_effort_timestamp, ist_tb, AV_TIME_BASE_Q);
+    else if (t->last_src_us != AV_NOPTS_VALUE)
+        cur_us = t->last_src_us;   /* An unstamped frame still carries its 608 pair, and
+                                    * cc_dec is stateful: DECODE it on the previous frame's
+                                    * stamp rather than dropping the pair. The emitter's
+                                    * monotone bump handles the repeated stamp; only the
+                                    * placement is approximate, and only for that frame. */
+    else
+        goto strip;                /* nothing stamped yet: no timeline to place it on at all */
 
     /* A backward source step this large is a rebased/glued timeline (LAYERA, wrap edge,
      * splice): the half-assembled caption inside cc_dec belongs to the old one, and the
@@ -1343,71 +1475,49 @@ static void cc_tap_frame(CcTap *t, AVFrame *frame, AVRational ist_tb)
         }
         av_packet_free(&cc_pkt);
     }
-    if (got && sub.num_rects > 0 && sub.rects[0]->ass) {
-        /* cc_dec emits a single ASS rect per subtitle; rect 0 is the caption. Forward it
-         * verbatim EITHER WAY — a text-bearing caption and a source erase (an empty text
-         * field, see cc_ass_has_text) differ only in how we count them here. The encoder
-         * reads the same rect and answers with a page update or a page erase; sending a
-         * zero-rect subtitle in the erase case instead would be WRONG, because zero rects
-         * is the keepalive contract and only erases after the encoder's 10s timeout. */
-        const char *ass = sub.rects[0]->ass;
+    if (got && sub.num_rects > 0) {
+        /* EVERY rect, IN ORDER — not just rect 0. cc_dec usually emits one rect per
+         * subtitle, but it can emit several for a single A53 frame (an EDM followed by the
+         * next screen's characters is the reachable case), and reading only rect 0 there
+         * classified the whole packet by the ERASE and threw the text away. Each rect is one
+         * event, so the pair resolves the same way it would across two frames.
+         *
+         * A rect is forwarded verbatim EITHER WAY — a text-bearing caption and a source
+         * erase (an empty text field, see cc_ass_has_text) differ only in how we count them.
+         * The encoder reads the same rect and answers with a page update or a page erase;
+         * sending a zero-rect subtitle in the erase case instead would be WRONG, because
+         * zero rects is the keepalive contract and only erases after the encoder's 10s
+         * timeout. */
         int end_ms = (sub.end_display_time == UINT32_MAX ||
                       sub.end_display_time > PTV_CC_MAX_DISPLAY_MS)
                      ? PTV_CC_MAX_DISPLAY_MS : sub.end_display_time;
-        if (cc_ass_has_text(ass)) {
-            /* DEBOUNCE (see PTV_CC_DEBOUNCE_US): buffer it. Only a CHANGE restarts the
-             * silence timer — an identical retransmission must not keep the caption
-             * pending forever. */
-            if (!t->pend_ass || strcmp(t->pend_ass, ass)) {
-                if (!t->pend_ass)
-                    t->pend_first_us = cur_us;        /* new pending cycle */
-                av_freep(&t->pend_ass);
-                t->pend_ass = av_strdup(ass);
-                t->pend_changed_us = cur_us;
-                t->pend_end_ms = end_ms;
+        int settled = 0, ri;
+
+        if (sub.num_rects > 1) {
+            atomic_fetch_add_explicit(&g_cc_mrect, 1, memory_order_relaxed);
+            if (!t->mrect_warned) {
+                t->mrect_warned = 1;
+                av_log(NULL, AV_LOG_INFO,
+                       "[PTV-CC]%s cc_dec emitted %d rects for one frame — all of them are "
+                       "processed in order (see mrect= on the done line)\n",
+                       cc_tap_tag(t, ttag, sizeof ttag), sub.num_rects);
             }
-            /* New text supersedes a deferred clear: the page is about to be replaced, so
-             * emitting the erase first would only insert a blank flash. */
-            av_freep(&t->erase_ass);
-        } else {
-            /* Source erase (EDM/EOC). DEFER it if the page has not had its minimum time on
-             * screen: a roll-up clears rows constantly, and obeying every clear reduced real
-             * captions to 0.3-0.6s of display. Deferring, not dropping — dropping left the
-             * page up until the next caption arrived (measured max page life 6.6s vs the
-             * source's 3.5s, blank-gap median 0.04s vs 0.34s), i.e. we kept showing text the
-             * source had already cleared. The timer below emits it; a real caption cancels
-             * it. */
-            /* NOTE shown_since_us is AV_NOPTS_VALUE until a page has actually gone up (and
-             * again after a timeline rebase): no page on screen => no minimum to enforce. */
-            if (t->shown_since_us != AV_NOPTS_VALUE &&
-                cur_us - t->shown_since_us < PTV_CC_MIN_DISPLAY_US) {
-                cc_tap_hold_erase(t, ass, end_ms,
-                                  t->shown_since_us + PTV_CC_MIN_DISPLAY_US);
-                avsubtitle_free(&sub);
-                goto strip;
-            }
-            /* Whatever is pending was on screen up to now, so it must go out BEFORE the
-             * clear, otherwise a caption that ends the moment it completes is never seen.
-             * Sending both back-to-back is not enough: that gave the caption ZERO display
-             * time (measured on the wire, caption and clear 90 ticks = 1ms apart, 2/61 cues
-             * on TruBLU). Put the page up now and hold the clear for its minimum display,
-             * exactly like an early erase. */
-            if (t->pend_ass) {
-                cc_tap_flush_pending(t, cur_us, ttag);
-                cc_tap_hold_erase(t, ass, end_ms, cur_us + PTV_CC_MIN_DISPLAY_US);
-                avsubtitle_free(&sub);
-                goto strip;
-            }
-            av_freep(&t->erase_ass);          /* this erase supersedes any deferred one */
-            ev.ass    = av_strdup(ass);
-            ev.kind   = PTV_CC_ERASE;
-            ev.end_ms = end_ms;
-            ev.src_us = cur_us;
-            avsubtitle_free(&sub);
-            cc_tap_send(t, &ev, ttag);
-            goto strip;
+        }
+        /* ANY rect settling settles the frame — `|=`, not `=`. Plain assignment made the
+         * decision belong to whichever rect happened to come LAST, which is an accident, not a
+         * rule: on the reachable [erase, text] pair the erase settled and the text then reset
+         * the flag to 0. The timers below are per-FRAME, and the point of `settled` is "this
+         * frame's rects have already been acted on, do not also run them" — so it must be
+         * sticky. Behaviourally this only delays a debounce/erase check by one frame (~33ms)
+         * in the mixed case; the pending text still flushes on the next frame's timers. */
+        for (ri = 0; ri < sub.num_rects; ri++) {
+            if (!sub.rects[ri]->ass)
+                continue;
+            settled |= cc_tap_rect(t, sub.rects[ri]->ass, end_ms, cur_us, ttag);
         }
         avsubtitle_free(&sub);
+        if (settled)
+            goto strip;
     } else {
         /* Belt-and-braces. avcodec_decode_subtitle2 already frees on its own error paths
          * (and avsubtitle_free memsets, so this is a no-op, never a double free); what it
@@ -1527,6 +1637,7 @@ static void *decode_thread(void *arg)
     int     gov_strikes = 0;
     int64_t hb_t0 = av_gettime_relative();   /* 1.0.1-pre21: heartbeat + test-stall runtime anchor */
     int     hb_test_done = 0;
+    int64_t cctest_seen = 0;   /* TEST ONLY (F6 gate): frames seen, for PTV_CCTEST_CORRUPT_EVERY */
 
     if (!frame || !filt)
         goto done;
@@ -1874,7 +1985,37 @@ static void *decode_thread(void *arg)
             ret = avcodec_receive_frame(d->vdec, frame);
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) { ret = 0; break; }
             if (ret < 0) goto done;
-            if (frame->flags & AV_FRAME_FLAG_CORRUPT) { d->vcorrupt++; av_frame_unref(frame); continue; }
+            /* TEST ONLY (F6 gate, PTV_CCTEST_CORRUPT_EVERY): real slice damage never reaches
+             * here — the demuxer's own corrupt-packet path discards it first — so the only way
+             * to exercise the branch below on demand is to set the flag ourselves. Inert
+             * unless the env var is set. */
+            if (g_cctest_corrupt && ++cctest_seen % g_cctest_corrupt == 0)
+                frame->flags |= AV_FRAME_FLAG_CORRUPT;
+            if (frame->flags & AV_FRAME_FLAG_CORRUPT) {
+                d->vcorrupt++;
+                /* The FRAME is unusable for video; its A53 side data is fed to the tap anyway,
+                 * because cc_dec is STATEFUL and skipping the frame silently violated its
+                 * "every frame's 608 pair, exactly once, in order" invariant, losing
+                 * mid-caption bytes. MEASURED with PTV_CCTEST_CORRUPT_EVERY=7 on NTD: skipping
+                 * gave a53=2305 caps=76 with mangled text ("everyone h access to psonal"),
+                 * feeding gives a53=2689 caps=79 and text identical to the clean run.
+                 *
+                 * What is NOT claimed: that the CC bytes of a GENUINELY damaged frame are
+                 * intact. The fixture flags frames the decoder produced cleanly, so it proves
+                 * the ordering invariant, not SEI survival. What actually guards the decoder
+                 * against garbage is inside cc_dec (ccaption_dec.c validate_cc_data_pair):
+                 * a triplet with cc_valid clear is discarded; for EIA-608 types the LOW byte
+                 * must pass odd parity or the pair is discarded, and a HIGH byte failing parity
+                 * is replaced by 0x7F (a blank) with the pair still processed. That is ONE bit
+                 * of protection per byte — it catches single-bit errors only. RESIDUAL RISK: a
+                 * two-bit corruption that preserves parity in both bytes is executed as
+                 * whatever control code it now spells (a spurious EDM/EOC/RCL, i.e. a wrongly
+                 * cleared or re-based caption). Nothing here or in cc_dec can detect that;
+                 * ccerr= counts only the pairs cc_dec rejects outright. */
+                if (d->cc.on || d->cc.strip) cc_tap_frame(&d->cc, frame, d->ist_tb);
+                av_frame_unref(frame);
+                continue;
+            }
             /* -cc_extract: EIA-608 tap. HERE — before the h0 anchor and before emit_video —
              * because cc_dec must see each frame's 608 pair exactly once in order, and this
              * is the last point upstream of the frame_q drop-oldest / dup / QSHED paths.
@@ -2012,7 +2153,11 @@ static void *decode_thread(void *arg)
     /* flush decoder */
     avcodec_send_packet(d->vdec, NULL);
     while (avcodec_receive_frame(d->vdec, frame) >= 0) {
-        if (frame->flags & AV_FRAME_FLAG_CORRUPT) { av_frame_unref(frame); continue; }
+        if (frame->flags & AV_FRAME_FLAG_CORRUPT) {
+            if (d->cc.on || d->cc.strip) cc_tap_frame(&d->cc, frame, d->ist_tb);  /* see above */
+            av_frame_unref(frame);
+            continue;
+        }
         if (d->cc.on || d->cc.strip) cc_tap_frame(&d->cc, frame, d->ist_tb);
         d->dec_frames++;
         PTV_HB_VDEC(d->hb_slot, d->hold ? PTV_HB_VDEC_FQSEND : PTV_HB_VDEC_HWUP);
@@ -2169,6 +2314,13 @@ static void *mux_thread(void *arg)
                             _exit(1);
                         }
                     }
+                    /* WIRE TRUTH FOR THE CC PATH. caps=/cclate= are counted where the
+                     * encoder produced a page, which is upstream of here: a teletext packet
+                     * the guard refuses was counted as delivered and vanished silently
+                     * (that is how the REANCHOR2 caption loss stayed invisible). Count it. */
+                    if (m->ofmt->streams[stream_index]->codecpar->codec_id ==
+                        AV_CODEC_ID_DVB_TELETEXT)
+                        atomic_fetch_add_explicit(&g_cc_mux, 1, memory_order_relaxed);
                     if (now - mg_warn_last >= 1000000) {
                         mg_warn_last = now;
                         av_log(NULL, AV_LOG_WARNING,
@@ -2401,6 +2553,23 @@ static int cc_setup(CcCtx *cc, CcTap *tap, AVThreadMessageQueue **cc_q,
     }
     if (!cclang || !cclang[0]) cclang = "eng";
     subset = lang_to_g0_subset(cclang);
+    if (subset < 0) {
+        av_log(NULL, AV_LOG_WARNING,
+               "[PTV-CC] language \"%s\" has no teletext G0 national option subset — falling "
+               "back to English. Accented characters will be de-accented on the wire; pass "
+               "-cc_lang with one of eng/deu/swe/fin/hun/ita/fra/spa/por/cze/ces/slk/slo if "
+               "that is wrong.\n",
+               cclang);
+        subset = 0;
+    }
+    /* The wire truth for the character set, in one line: what we derived, what the encoder
+     * will transmit, and the raw header nibble a wire dump shows. Silence here is what let a
+     * Spanish channel run for months announcing Swedish/Finnish. */
+    av_log(NULL, AV_LOG_INFO,
+           "[PTV-CC] language \"%s\" -> G0 subset %d (%s), ETS national option code %d "
+           "(page header nibble 0x%X)\n",
+           cclang, subset, g0_subset_info[subset].name,
+           g0_subset_info[subset].ets, g0_subset_info[subset].ets << 1);
 
     /* --- the dvb_teletext encoder. magazine/page are operator-settable (base-0 parse, so
      * both 0x88 and 136 work); the defaults are the encoder's own 8 / 0x88 = page 888. --- */
@@ -2490,6 +2659,7 @@ static int cc_setup(CcCtx *cc, CcTap *tap, AVThreadMessageQueue **cc_q,
     av_thread_message_queue_set_free_func(*cc_q, free_cc_msg);
     cc->last_dts        = AV_NOPTS_VALUE;
     cc->last_caption_us = AV_NOPTS_VALUE;
+    cc->last_cap_dts    = AV_NOPTS_VALUE;   /* no caption yet => no erase floor */
     cc->slot            = slot;
     cc->multi           = multi;
 
@@ -2718,7 +2888,11 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
     memset(inputs, 0, sizeof inputs); memset(as, 0, sizeof as); memset(rung, 0, sizeof rung);
     memset(&comp, 0, sizeof comp); memset(&house_rate, 0, sizeof house_rate);
     memset(cc, 0, sizeof cc);
-    for (k = 0; k < PTV_MAX_INPUT; k++) { cc[k].last_dts = AV_NOPTS_VALUE; cc_slot[k] = 0; }
+    for (k = 0; k < PTV_MAX_INPUT; k++) {
+        cc[k].last_dts     = AV_NOPTS_VALUE;
+        cc[k].last_cap_dts = AV_NOPTS_VALUE;
+        cc_slot[k] = 0;
+    }
     for (k = 0; k < n_input; k++) {
         inputs[k].url = ins->groups[k].arg;
         inputs[k].h0  = AV_NOPTS_VALUE;
@@ -4110,6 +4284,15 @@ int main(int argc, char **argv)
       if (s) g_muxtest_back_type = s[0] == 's' ? AVMEDIA_TYPE_SUBTITLE :
                                    s[0] == 'd' ? AVMEDIA_TYPE_DATA : AVMEDIA_TYPE_AUDIO; }
     if (getenv("PTV_MUXDIAG")) g_muxdiag = 1;        /* pre26 D3: gated emission-point backward-label instrumentation */
+    { const char *s = getenv("PTV_CCTEST_CORRUPT_EVERY");                                                      /* TEST ONLY (F6 gate) */
+      if (s && atoi(s) > 0) {
+          g_cctest_corrupt = atoi(s);
+          /* Announce it: a knob that silently rewrites frame flags and leaves no trace in the
+           * log is indistinguishable from a real decode fault when someone reads the run later. */
+          av_log(NULL, AV_LOG_WARNING,
+                 "[PTV-CCTEST] marking every %dth decoded video frame corrupt — TEST ONLY\n",
+                 g_cctest_corrupt);
+      } }
     if (getenv("PTV_NO_MUXTOL")) g_muxtol = 0;       /* 1.0.1-pre27 #62: any mux write error = fatal (pre26 behavior) */
     { const char *s = getenv("PTV_MUXFAIL_SIM");     /* TEST ONLY (pre27 #62 gates): <errno>:<start_s>:<dur_s> */
       if (s) {

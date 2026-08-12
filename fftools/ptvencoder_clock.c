@@ -243,10 +243,13 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
                  : idx * v->tick_dur_us;
     }
     if (c->last_dts != AV_NOPTS_VALUE) {
-        if (house_us < c->last_dts - PTV_CC_BACKSTEP_US) {
-            /* the source timeline was rebased under us: adopt the new baseline rather than
-             * ratcheting every future caption off a now-stale high-water (the muxer's own
-             * [PTV-MUXGUARD] drops whatever is still backward — SUBTITLE is non-fatal there) */
+        if (house_us < c->last_dts - PTV_CC_REBASE_US) {
+            /* A step THIS large is a genuine rebase of the timeline under us: adopt the new
+             * baseline rather than ratcheting every future caption off a now-stale
+             * high-water. Anything smaller (see PTV_CC_REBASE_US — the REANCHOR2 h0-shift
+             * band) falls through to the monotone bump below instead, because the muxer's
+             * high-water does NOT rebase with us and every backward packet would be dropped
+             * by [PTV-MUXGUARD] while the counters here claimed a delivery. */
             atomic_fetch_add_explicit(&g_cc_reset, 1, memory_order_relaxed);
             av_log(NULL, AV_LOG_INFO,
                    "[PTV-CC]%s house stamp stepped back %"PRId64"ms — subtitle dts baseline reset\n",
@@ -256,9 +259,27 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
              * OLD (higher) house time makes house_us - last_caption_us negative for as long
              * as the step was, silently disarming it. Re-baseline on the next event. */
             c->last_caption_us = AV_NOPTS_VALUE;
+            c->last_cap_dts    = AV_NOPTS_VALUE;  /* the erase floor below is on that dead axis */
         } else if (house_us <= c->last_dts) {
             house_us = c->last_dts + 1000;        /* strictly increasing (1ms == 90 @90kHz) */
             atomic_fetch_add_explicit(&g_cc_bump, 1, memory_order_relaxed);
+            /* MINIMUM-DISPLAY FLOOR for an erase, inside the bump band only.
+             *
+             * The bump makes the stamp merely monotone, not spaced: a caption and the erase
+             * that follows it can both land in the same collapsed instant and go out 1ms
+             * apart, which is a caption with ZERO display time. That is the same zero-display
+             * bug the tap's deferred-erase rule fixed, arriving through a different door —
+             * the tap decides WHEN to hand us the erase on the SOURCE axis, and it is this
+             * function that then collapses the two stamps together on the house axis.
+             *
+             * Only ERASE, and only while bumping. When house_us is genuinely monotone this
+             * branch is not reached at all, so normal operation is untouched: the tap has
+             * already held early erases for their 1.2s and their house stamps are naturally
+             * that far apart. Bounded by construction — the floor is one PTV_CC_MIN_DISPLAY_US
+             * past the caption, never a running ratchet. */
+            if (ev->kind == PTV_CC_ERASE && c->last_cap_dts != AV_NOPTS_VALUE &&
+                house_us < c->last_cap_dts + PTV_CC_MIN_DISPLAY_US)
+                house_us = c->last_cap_dts + PTV_CC_MIN_DISPLAY_US;
         }
     }
 
@@ -320,6 +341,10 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
     pkt->duration = (int64_t)ev->end_ms * 1000;
     pkt->pos      = -1;
     c->last_dts     = house_us;
+    /* AFTER the encode: ev->kind may have been rewritten to KEEPALIVE by the retry above, and
+     * only a page that really went out is a floor for the next erase. */
+    if (ev->kind == PTV_CC_CAPTION)
+        c->last_cap_dts = house_us;
     c->last_emit_wc = av_gettime_relative();
     for (r = 0; r < c->n_out; r++) {              /* fan out to every rung's muxer */
         AVPacket *o = av_packet_clone(pkt);
@@ -331,8 +356,14 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
         o->stream_index = c->ost[r]->index;
         /* NO delivery gate: the gate holds DENSE audio for the video front; a sparse
          * subtitle's wire-arrival lead is a feature (same rule as copied DVB-subs). */
-        if (av_thread_message_queue_send(c->mux_q[r], &o, 0) < 0)
+        if (av_thread_message_queue_send(c->mux_q[r], &o, 0) < 0) {
+            /* COUNTED. This is the last loss path on the way to a muxer (the queue is closed
+             * because that rung's mux thread has gone), and it was the one place a caption
+             * could vanish with every counter flat — the exact failure mode the observability
+             * design rules out. Per rung, like ccmux=. */
+            atomic_fetch_add_explicit(&g_cc_dropped, 1, memory_order_relaxed);
             av_packet_free(&o);
+        }
     }
     av_packet_free(&pkt);
     /* counted APART: caps= must mean "pages of text went out". Folding erases in would make
@@ -436,7 +467,7 @@ void *cc_thread(void *arg)
     av_log(NULL, AV_LOG_INFO,
            "[PTV-CC]%s done — %sa53=%"PRId64" caps=%"PRId64" erase=%"PRId64" keep=%"PRId64
            " err=%"PRId64" drop=%"PRId64" bump=%"PRId64" reset=%"PRId64" eheld=%"PRId64
-           " elate=%"PRId64"\n",
+           " elate=%"PRId64" mrect=%"PRId64" ccmux=%"PRId64"\n",
            cc_tag(c, tag, sizeof tag), per,
            atomic_load_explicit(&g_cc_a53,     memory_order_relaxed),
            atomic_load_explicit(&g_cc_caps,    memory_order_relaxed),
@@ -447,7 +478,9 @@ void *cc_thread(void *arg)
            atomic_load_explicit(&g_cc_bump,    memory_order_relaxed),
            atomic_load_explicit(&g_cc_reset,   memory_order_relaxed),
            atomic_load_explicit(&g_cc_eskip,   memory_order_relaxed),
-           atomic_load_explicit(&g_cc_elate,   memory_order_relaxed));
+           atomic_load_explicit(&g_cc_elate,   memory_order_relaxed),
+           atomic_load_explicit(&g_cc_mrect,   memory_order_relaxed),
+           atomic_load_explicit(&g_cc_mux,     memory_order_relaxed));
     return NULL;
 }
 
@@ -1234,7 +1267,16 @@ void *output_thread(void *arg)
                             cn += snprintf(ccs + cn, sizeof ccs - cn, " ccheld=%lld",
                                            (long long)ck);
                         if (cl > 0 && cn > 0 && cn < (int)sizeof ccs)
-                            snprintf(ccs + cn, sizeof ccs - cn, " cclate=%lld", (long long)cl);
+                            cn += snprintf(ccs + cn, sizeof ccs - cn, " cclate=%lld",
+                                           (long long)cl);
+                    }
+                    {   /* WIRE TRUTH PAST THE ENCODER: teletext packets the muxer's
+                         * backward-dts guard refused. Everything else here is counted where
+                         * the page was produced, so a nonzero ccmux= is the only signal that
+                         * captions counted as delivered never reached the wire. */
+                        int64_t cx = atomic_load_explicit(&g_cc_mux, memory_order_relaxed);
+                        if (cx > 0 && cn > 0 && cn < (int)sizeof ccs)
+                            snprintf(ccs + cn, sizeof ccs - cn, " ccmux=%lld", (long long)cx);
                     }
                 }
                 av_log(NULL, AV_LOG_INFO,
