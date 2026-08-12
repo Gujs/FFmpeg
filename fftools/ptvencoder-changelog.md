@@ -5,6 +5,50 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 1.2.0-pre3 (2026-08-12) — languages render correctly; captions sit where the source put them
+
+**Needs BOTH patches (`0001` + `0006`) — the language fix lives in the encoder.** Until this is
+deployed, every non-English channel broadcasts the WRONG ALPHABET.
+
+- **⭐ The G0 national subset was signalled one bit low (C11-C13 instead of C12-C14)** — the row
+  bytes were always correct, only the label was wrong, so Spanish/Portuguese decoded as **Swedish**
+  on a real receiver (Daystar on air: `Señor→Seöor`, `qué→quÖ`, `¿→é`), German as English, French
+  as Swedish, Italian as French. After: **zero wrong glyphs** for eng/spa/por/fra/deu/swe/ita +
+  cze/slk, verified by real-libzvbi unicode render on the wire.
+  ⚠ The encoder's own mislabelled comment caused it, and `ttxwire.py` had COPIED that comment, so
+  the auditor was blind to it — the suite now decodes from ETS 300 706 directly and `check.sh`
+  cross-checks the signalled table against the 0x56 descriptor language.
+  ⚠ Receiver-region caveat: code 3 = Czech/Slovak in ETS region 0 but **Turkish in libzvbi's
+  default region 16** (codes 0/1/2/4/5/6 agree in both). An intermediate fix deleted Czech from a
+  region-16 measurement mislabelled region 0 — restored, caveat documented.
+- **English/Italian G0 tables corrected** (10/13 and 6/13 positions were ASCII where the wire
+  renders `← ½ → ↑ — ¼ ‖ ¾ ÷`: `[MUSIC]` rendered `←MUSIC→` on every English channel) and the 13
+  national wire bytes now come only from the table lookup, with documented fallbacks
+  (`[`→`(`, `♪`→`*`, `£`→GBP on non-£ subsets).
+- **Caption row position honoured**: news feeds place captions top-of-screen to avoid their own
+  lower-third (Law&Crime: 7 of 22 top-positioned) — those now sit on top teletext rows. 608 rows
+  ≥11 pin to the bottom band exactly as before (roll-up base rows alternate within 12–14; a
+  narrower band made one feed's block jump rows 38×/90 s with a C4 flash each — caught in review,
+  wire byte-identical now on every bottom-anchored source). Non-contiguous top+bottom screens
+  split correctly.
+- **Corrupt frames feed cc_dec before being dropped** (a lost EOC/EDM pair wedged a page);
+  **REANCHOR2-band backsteps (≤3 s) keep captions instead of deleting them at the muxer**, with an
+  erase floor so a caption→clear pair can't hit the wire 1 ms apart; **`ccmux=`** extends counter
+  truth to the wire (teletext-only, per rung per packet, same name on single/MV stats + done lines).
+- Multi-rect A53 payloads no longer let an erase discard same-frame text (`mrect=`); `{\` in
+  caption text no longer kills the caption; literal `<b>/<i>/<u>` tags one source embeds in its own
+  608 stream are stripped (`x < y` survives); per-channel INFO logs the language→subset→nibble
+  choice and unmapped languages WARN (⚠ **RAV_Espanol's audio is tagged `eng`** — it needs
+  `-cc_lang spa` in its channel config).
+- Viewer-visible beyond the fixes: `[MUSIC]`→`(MUSIC)`, `♪`→`*`, `£`→`GBP` on non-£ subsets,
+  English gains real `½ ÷ —` glyphs.
+
+**Verified:** per-language round trips (0 wrong glyphs ×8 languages); all 7 live-source encodes
+pass `check.sh` (events == transmissions, PES 139/323 only, one 0x56, 0 hamming/framing); NTD /
+TruBLU / Weather_nation / Newsmax2 wires byte-identical where unchanged; 7-min sustained run flat.
+**Not verified:** the erase floor engages only on >1.2 s re-anchor excursions, which cannot be
+provoked locally (measured cap ~965 ms) — fleet soak watches `ccmux=` and caption→C4 wire gaps.
+
 ## 1.2.0-pre2 (2026-08-10) — teletext page model: the away-switch, and captions that stay up
 
 pre1 put captions on the wire; pre2 makes them appear on a real decoder and stay readable. **This
