@@ -32,6 +32,8 @@
  * data units suitable for direct insertion into a DVB teletext PES packet.
  */
 
+#include <assert.h>     /* static_assert (the subset-table coupling below) */
+#include <stdio.h>      /* sscanf in text_extract_naive() */
 #include <string.h>
 
 #include "avcodec.h"
@@ -50,12 +52,13 @@
 #define TELETEXT_DATA_UNIT_LENGTH   0x2C  /* 44 bytes per data unit */
 #define TELETEXT_FRAMING_CODE       0xE4  /* clock run-in + framing code */
 #define TELETEXT_CHARS_PER_ROW      40    /* characters per teletext row */
-/* Subtitle rows sit at the BOTTOM of the page and grow upwards from row 23, so a 1-row
- * caption is on 23, a 2-row one on 22+23, and a 4-row roll-up on 20..23 — the conventional
- * DVB-subtitle band. EIA-608 carries up to 4 rows (roll-up 4, multi-line pop-on); anything
- * beyond that is dropped rather than pushed further up the screen. */
+/* The block of caption rows grows UPWARDS from its last row, so a 1-row caption occupies one
+ * row, a 2-row one two, and a 4-row roll-up four. Which row it ends on follows the SOURCE's
+ * own vertical position (ttx_row_from_cea_row()); a bottom-third caption — very nearly
+ * everything — ends on row 23, the conventional DVB-subtitle band. EIA-608 carries up to 4
+ * rows (roll-up 4, multi-line pop-on); anything beyond that is dropped. */
 #define TELETEXT_SUBTITLE_LAST_ROW  23    /* bottom subtitle row */
-#define TELETEXT_MAX_SUBTITLE_ROWS  4     /* rows 20..23 */
+#define TELETEXT_MAX_SUBTITLE_ROWS  4     /* at most 4 rows per caption */
 #define TELETEXT_DATA_UNIT_STUFFING 0xFF  /* stuffing data unit, EN 300 472 */
 /* Page 0xFF in our own magazine is the "filler"/time-filling page (ETS 300 706 9.3.1): a
  * header no receiver displays, used to switch AWAY from the subtitle page. It MUST differ
@@ -170,65 +173,173 @@ static const uint8_t vbi_reverse_8[256] = {
  * characters. The positions (in order) correspond to ASCII codes:
  *   0x23 0x24 0x40 0x5B 0x5C 0x5D 0x5E 0x5F 0x60 0x7B 0x7C 0x7D 0x7E
  * Each subset maps these 13 positions to different Unicode codepoints.
- * Selected via C12-C14 control bits in the page header.
+ * Selected via C12-C14 in the page header — see write_page_header().
+ *
+ * MEASURED, not derived: every row below is what a real libzvbi (Homebrew 0.2.44 — the
+ * library VLC links) RENDERS for those 13 bytes under the matching ETS national option
+ * code, i.e. the glyphs a viewer actually sees. Two rows were wrong until 2026-08-12
+ * (English claimed plain ASCII for 0x5B..0x7E; Italian was shifted in 6 of 13), which put
+ * a different LETTER on screen than the caption asked for. Re-measure with
+ * test-scripts/teletext-oracle before editing a row.
+ *
+ * WHICH REGION you measure under matters, and measuring under the wrong one is how the Czech
+ * row came to be deleted: ETS 300 706 indexes the G0 subsets by region as well as by code, and
+ * libzvbi's default region is 16. Codes 0,1,2,4,5,6 render IDENTICALLY under regions 0 and 16
+ * (measured), so only subset 6 (code 3) is region-sensitive — set the region explicitly when
+ * re-measuring it.
  */
 #define G0_NATIONAL_POSITIONS 13
+#define G0_NATIONAL_SUBSETS   7
 
 static const uint8_t g0_position_bytes[G0_NATIONAL_POSITIONS] = {
     0x23, 0x24, 0x40, 0x5B, 0x5C, 0x5D, 0x5E, 0x5F,
     0x60, 0x7B, 0x7C, 0x7D, 0x7E
 };
 
-/* Unicode codepoints for each national subset's 13 positions.
- * 0 means same as default Latin G0 (no override). */
-static const uint32_t g0_national_subsets[7][G0_NATIONAL_POSITIONS] = {
-    /* Subset 0: English — default G0, no special chars */
-    { 0x00A3, 0x0024, 0x0040, 0x005B, 0x005C, 0x005D,  /* £ $ @ [ \ ]  */
-      0x005E, 0x005F, 0x0060, 0x007B, 0x007C, 0x007D,  /* ^ _ ` { | }  */
-      0x007E },                                          /* ~            */
-    /* Subset 1: German */
+/* our g0_subset index -> the ETS 300 706 national option code transmitted in C12-C14.
+ * The two numberings are BIT-REVERSALS of each other (ETS transmits C12 first, our index
+ * reads that bit last), so they can never be used interchangeably:
+ *   0 English->0, 1 German->4, 2 Swedish->2, 3 Italian->6, 4 French->1, 5 Spa/Por->5,
+ *   6 Czech/Slovak->3. */
+static const uint8_t g0_subset_ets_code[G0_NATIONAL_SUBSETS] = { 0, 4, 2, 6, 1, 5, 3 };
+
+/* Unicode codepoints for each national subset's 13 positions. */
+static const uint32_t g0_national_subsets[G0_NATIONAL_SUBSETS][G0_NATIONAL_POSITIONS] = {
+    /* Subset 0: English (ETS code 0) */
+    { 0x00A3, 0x0024, 0x0040, 0x2190, 0x00BD, 0x2192,  /* £ $ @ ← ½ →  */
+      0x2191, 0x0023, 0x2014, 0x00BC, 0x2016, 0x00BE,  /* ↑ # — ¼ ‖ ¾  */
+      0x00F7 },                                          /* ÷            */
+    /* Subset 1: German (ETS code 4) */
     { 0x0023, 0x0024, 0x00A7, 0x00C4, 0x00D6, 0x00DC,  /* # $ § Ä Ö Ü  */
       0x005E, 0x005F, 0x00B0, 0x00E4, 0x00F6, 0x00FC,  /* ^ _ ° ä ö ü  */
       0x00DF },                                          /* ß            */
-    /* Subset 2: Swedish/Finnish/Hungarian */
+    /* Subset 2: Swedish/Finnish/Hungarian (ETS code 2) */
     { 0x0023, 0x00A4, 0x00C9, 0x00C4, 0x00D6, 0x00C5,  /* # ¤ É Ä Ö Å  */
       0x00DC, 0x005F, 0x00E9, 0x00E4, 0x00F6, 0x00E5,  /* Ü _ é ä ö å  */
       0x00FC },                                          /* ü            */
-    /* Subset 3: Italian */
-    { 0x00A3, 0x0024, 0x00B0, 0x00E7, 0x2192, 0x00E9,  /* £ $ ° ç → é  */
-      0x005E, 0x005F, 0x00F9, 0x00E0, 0x00F2, 0x00E8,  /* ^ _ ù à ò è  */
+    /* Subset 3: Italian (ETS code 6) */
+    { 0x00A3, 0x0024, 0x00E9, 0x00B0, 0x00E7, 0x2192,  /* £ $ é ° ç →  */
+      0x2191, 0x0023, 0x00F9, 0x00E0, 0x00F2, 0x00E8,  /* ↑ # ù à ò è  */
       0x00EC },                                          /* ì            */
-    /* Subset 4: French */
+    /* Subset 4: French (ETS code 1) */
     { 0x00E9, 0x00EF, 0x00E0, 0x00EB, 0x00EA, 0x00F9,  /* é ï à ë ê ù  */
       0x00EE, 0x0023, 0x00E8, 0x00E2, 0x00F4, 0x00FB,  /* î # è â ô û  */
       0x00E7 },                                          /* ç            */
-    /* Subset 5: Spanish/Portuguese */
+    /* Subset 5: Spanish/Portuguese (ETS code 5) */
     { 0x00E7, 0x0024, 0x00A1, 0x00E1, 0x00E9, 0x00ED,  /* ç $ ¡ á é í  */
       0x00F3, 0x00FA, 0x00BF, 0x00FC, 0x00F1, 0x00E8,  /* ó ú ¿ ü ñ è  */
       0x00E0 },                                          /* à            */
-    /* Subset 6: Czech/Slovak */
+    /* Subset 6: Czech/Slovak (ETS code 3) — the one REGION-DEPENDENT row.
+     *
+     * ETS 300 706 numbers the G0 subsets per REGION (Table 33 is indexed by region AND code),
+     * and code 3 is the one our set uses where the regions disagree:
+     *   region 0  -> Czech/Slovak. MEASURED with a raw libzvbi (vbi_teletext_set_default_region
+     *                (dec, 0)): the 13 bytes below render "#ůčťžýířéáěúš", byte-for-byte this
+     *                row.
+     *   region 16 -> Turkish, rendering "ğİŞÖÇÜĞışöçü". 16 is libzvbi's own DEFAULT region, so
+     *                a receiver that never sets one shows Turkish letters.
+     * The 2026-08-12 removal of this row was made off a region-16 reading of code 3 and was
+     * wrong: the pre-existing `-cc_lang cze` was accidentally correct for region-0 receivers.
+     * Every other subset we transmit renders identically in both regions (measured across
+     * codes 0,1,2,4,5,6), so this row is the only one whose glyphs depend on the receiver. */
     { 0x0023, 0x016F, 0x010D, 0x0165, 0x017E, 0x00FD,  /* # ů č ť ž ý  */
       0x00ED, 0x0159, 0x00E9, 0x00E1, 0x011B, 0x00FA,  /* í ř é á ě ú  */
       0x0161 },                                          /* š            */
 };
 
+/* MASTER COPY of the subset numbering. Four things must agree on it, and three of them are in
+ * other files, so they are tied here rather than left to be noticed:
+ *   - g0_national_subsets[] / g0_subset_ets_code[] / subset_names[] and the g0_subset option's
+ *     maximum, all below (the static asserts);
+ *   - g0_subset_info[] and lang_to_g0_subset() in fftools/ptvencoder.c;
+ *   - NAT_NAME[] / NAT_LANGS[] in test-scripts/teletext-oracle/ttxwire.py, which cross-checks
+ *     the wire against the descriptor language.
+ * A subset added here without the others silently mislabels a channel's charset. */
+static_assert(FF_ARRAY_ELEMS(g0_subset_ets_code) == G0_NATIONAL_SUBSETS,
+              "g0_subset_ets_code[] must cover every G0 subset");
+static_assert(FF_ARRAY_ELEMS(g0_national_subsets) == G0_NATIONAL_SUBSETS,
+              "g0_national_subsets[] must cover every G0 subset");
+
 /**
  * Look up a Unicode codepoint in a G0 national option subset.
  *
  * @param cp      Unicode codepoint to look up
- * @param subset  Subset index (0-6)
+ * @param subset  Subset index (0 .. G0_NATIONAL_SUBSETS-1)
  * @return The teletext byte position (0x23-0x7E), or 0 if not found
  */
 static uint8_t g0_national_lookup(uint32_t cp, int subset)
 {
     int i;
-    if (subset < 0 || subset > 6)
+    if (subset < 0 || subset >= G0_NATIONAL_SUBSETS)
         return 0;
     for (i = 0; i < G0_NATIONAL_POSITIONS; i++) {
         if (g0_national_subsets[subset][i] == cp)
             return g0_position_bytes[i];
     }
     return 0;
+}
+
+/*
+ * Substitutions for the 13 national-option positions when the current subset cannot render
+ * that character at all. Those 13 bytes are NOT plain ASCII on the wire: whatever we put
+ * there renders as the subset's national glyph (measured: 0x23 => £ on English, ç on
+ * Spanish, é on French; 0x7C => ‖ / ò / û). Emitting one raw therefore puts a different
+ * LETTER on screen than the caption asked for, which is what g0_put_ascii() below prevents.
+ *
+ *   src  subst   why
+ *   ---  -----   -------------------------------------------------------------------------
+ *    #   "No."   number sign; only unreachable on Spanish/Portuguese
+ *    $   "USD"   unreachable on French (0x24 is ï there) and on Swedish/Finnish/Hungarian
+ *                (0x24 is ¤ there) — measured, not only French as this used to claim
+ *    @   "(a)"   every subset except English puts a letter at 0x40
+ *    [   "("     keep the bracketing, lose the shape
+ *    ]   ")"
+ *    {   "("     cc_dec emits { } \ ^ _ | ~ from its extended charset (0x29..0x2F)
+ *    }   ")"
+ *    \   "/"
+ *    |   "/"     also where the ¦ fallback lands
+ *    ~   "-"
+ *    `   "'"
+ *    _   "-"     '_' exists on German/Swedish only
+ *    ^   " "     decoration; no letter stands in for a caret
+ */
+static const struct { char c; const char *sub; } g0_ascii_fallback[] = {
+    { '#', "No." }, { '$', "USD" }, { '@', "(a)" }, { '[', "("  }, { ']', ")" },
+    { '{', "("   }, { '}', ")"   }, { '\\', "/"  }, { '|', "/"  }, { '~', "-" },
+    { '`', "'"   }, { '_', "-"   }, { '^', " "   },
+};
+
+/**
+ * Append one ASCII character so that it RENDERS as itself under this G0 subset.
+ *
+ * Characters outside the 13 national positions go out unchanged. The 13 go through the
+ * subset's own table first (e.g. '#' is at 0x5F on English/French/Italian but at 0x23 on
+ * German/Swedish), and only fall back to the substitution table above when the subset has
+ * no position for them.
+ */
+static void g0_put_ascii(AVBPrint *bp, uint32_t cp, int subset)
+{
+    uint8_t nb;
+    int i;
+
+    for (i = 0; i < G0_NATIONAL_POSITIONS; i++)
+        if (g0_position_bytes[i] == cp)
+            break;
+    if (i == G0_NATIONAL_POSITIONS) {          /* not a national position: safe as-is */
+        av_bprint_chars(bp, (char)cp, 1);
+        return;
+    }
+    nb = g0_national_lookup(cp, subset);       /* does this subset show that glyph? */
+    if (nb) {
+        av_bprint_chars(bp, (char)nb, 1);
+        return;
+    }
+    for (i = 0; i < FF_ARRAY_ELEMS(g0_ascii_fallback); i++)
+        if ((uint32_t)(unsigned char)g0_ascii_fallback[i].c == cp) {
+            av_bprintf(bp, "%s", g0_ascii_fallback[i].sub);
+            return;
+        }
+    av_bprint_chars(bp, ' ', 1);               /* the two tables cover the same 13 bytes */
 }
 
 typedef struct DVBTeletextEncContext {
@@ -239,6 +350,9 @@ typedef struct DVBTeletextEncContext {
     int g0_subset;          /* G0 national option subset (0-6), default 0 (English) */
     int content_active;     /* 1 if display has content (needs erase eventually) */
     int last_nb_lines;      /* number of content rows in previous subtitle */
+    int last_base_row;      /* teletext row the previous subtitle's LAST line landed on */
+    uint32_t last_rows_mask; /* bitmap of the rows the previous subtitle drew */
+    int last_contig;        /* previous subtitle's source rows were one unbroken band */
     int64_t last_content_pts; /* PTS (AV_TIME_BASE) of last content subtitle */
 } DVBTeletextEncContext;
 
@@ -367,28 +481,50 @@ static int write_page_header(uint8_t *buf, DVBTeletextEncContext *ctx,
     buf[6] = hamming84_encode[page_units];
     buf[7] = hamming84_encode[page_tens];
 
-    /* Sub-code bytes (S1, S2, S3, S4) + control bits
-     * Per ETS 300 706 section 9.3.1.2
-     * S1=0, S2=0 (sub-code), C4=erase flag
+    /* Sub-code bytes (S1-S4) + control bits C4-C14, per ETS 300 706 section 9.3.1.1.
+     * Each byte below carries ONE Hamming 8/4 nibble whose bits are D1..D4, with D1 the LSB
+     * of the value we index hamming84_encode[] with. The layout — get this wrong and the
+     * bits land on the neighbouring control (which is exactly what happened here before
+     * 2026-08-12, see buf[13]):
      *
-     * For subtitle pages: C6=0, C7=1 (Suppress Header), C8=1 (Update Indicator)
-     * libzvbi (used by VLC/ffplay) identifies subtitle pages via:
-     *   !(C6) && C7 && C8  (C6 must be 0!)
-     * CCExtractor/telxcc checks C7 bit for subtitle detection, not C6.
-     * Nibble for byte[11]: D1=S4, D2=C5(Newsflash), D3=C6(Subtitle), D4=C7(SuppressHdr)
-     * Nibble for byte[12]: D1=C8(Update), D2=C9, D3=C10, D4=C11 */
-    buf[8]  = hamming84_encode[0];               /* S1 */
-    buf[9]  = hamming84_encode[(erase ? 0x08 : 0x00)]; /* S2 + C4 (erase page) */
-    buf[10] = hamming84_encode[0];               /* S3 */
-    buf[11] = hamming84_encode[subtitle_page ? 0x08 : 0x00]; /* S4=0, C5=0, C6=0, C7=1(SuppressHdr) */
-    /* C8 MUST STAY 1. ETS 300 706 calls it an Update Indicator that inverts on change, but
-     * libavcodec's libzvbi teletext decoder — i.e. ffplay and VLC — classifies a page as a
-     * SUBTITLE with
-     *     !(C6) && C7 && C8            (libzvbi-teletextdec.c, subtitle_map[])
-     * so toggling it de-classifies every other page and the decoder ignores it outright.
-     * Tried and measured; do not "fix" this again. */
-    buf[12] = hamming84_encode[subtitle_page ? 0x01 : 0x00]; /* C8=1 (Update Indicator), C9..C11=0 */
-    buf[13] = hamming84_encode[ctx->g0_subset & 0x07]; /* C12-C14: national option subset */
+     *   buf[8]   D1..D4 = S1
+     *   buf[9]   D1..D3 = S2,          D4 = C4  erase page
+     *   buf[10]  D1..D4 = S3
+     *   buf[11]  D1,D2  = S4,          D3 = C5  newsflash,  D4 = C6  SUBTITLE
+     *   buf[12]  D1 = C7 suppress header, D2 = C8 update, D3 = C9 interrupted sequence,
+     *            D4 = C10 inhibit display
+     *   buf[13]  D1 = C11 magazine serial, D2..D4 = C12..C14 national option subset
+     *
+     * So the two nibbles below transmit C6=1 (subtitle page) and C7=1 (suppress header) and
+     * nothing else — C5=0, C8=C9=C10=0. That combination is precisely what libavcodec's
+     * libzvbi wrapper tests for (libzvbi-teletextdec.c: "!(flags1 & 0x40) && flags1 & 0x80
+     * && flags2 & 0x01" reading these same two bytes = !newsflash && subtitle &&
+     * suppress_header), it is what TSDuck and a raw libzvbi accept as a subtitle page, and
+     * it is what production has been shipping. DO NOT CHANGE THESE BITS — in particular
+     * there is no "Update Indicator must stay 1" rule here: C8 is 0 and always has been.
+     * The earlier version of this comment named these bits one position off. */
+    buf[8]  = hamming84_encode[0];                             /* S1 */
+    buf[9]  = hamming84_encode[(erase ? 0x08 : 0x00)];         /* S2 + C4 erase page */
+    buf[10] = hamming84_encode[0];                             /* S3 */
+    buf[11] = hamming84_encode[subtitle_page ? 0x08 : 0x00];   /* S4=0, C5=0, C6=subtitle */
+    buf[12] = hamming84_encode[subtitle_page ? 0x01 : 0x00];   /* C7=suppress hdr, C8..C10=0 */
+    /* C11=0 (magazine serial), C12-C14 = the ETS national option code.
+     *
+     * MEASURED with a raw libzvbi across all 16 nibble values: the table it renders is
+     * nibble >> 1 — D1 is C11 and charset-irrelevant. That is
+     *   0x0 English  0x2 French  0x4 Swedish/Finnish  0x6 Turkish
+     *   0x8 German   0xA Portuguese/Spanish  0xC Italian  0xE reserved
+     * and our subset numbering is the bit-reversal of the ETS code (g0_subset_ets_code[]),
+     * so the nibble is code << 1 (subset 5 Spanish -> code 5 -> 0x0A).
+     *
+     * Until 2026-08-12 this line wrote the raw subset index, which both mis-shifted it (the
+     * code landed on C11-C13) and skipped the reversal, so the two errors did not cancel:
+     * -cc_lang spa announced Swedish/Finnish and put "Se#or" / "qu@" on air. */
+    {
+        int s = (ctx->g0_subset >= 0 && ctx->g0_subset < G0_NATIONAL_SUBSETS)
+              ? ctx->g0_subset : 0;
+        buf[13] = hamming84_encode[(g0_subset_ets_code[s] << 1) & 0x0F];
+    }
 
     /* Header display area: 26 bytes (positions 14-39 in data unit payload,
      * 8..33 in the character area after the 8 control bytes).
@@ -464,9 +600,13 @@ static char *utf8_to_teletext_g0(const char *src, int g0_subset)
          *
          * First try the G0 national option subset — if the codepoint has
          * a native representation, emit it directly. Otherwise fall
-         * through to accent-stripping for best-effort ASCII output. */
+         * through to accent-stripping for best-effort ASCII output.
+         *
+         * ASCII is NOT a free pass: 13 of those codes are national-option positions whose
+         * rendered glyph depends on the subset, so they go through g0_put_ascii(). Before
+         * 2026-08-12 they were emitted raw and "[MUSIC]" rendered "←MUSIC→" on English. */
         if (cp >= 0x20 && cp < 0x7F) {
-            av_bprint_chars(&bp, (char)cp, 1);
+            g0_put_ascii(&bp, cp, g0_subset);
         } else {
             uint8_t national_byte = g0_national_lookup(cp, g0_subset);
             if (national_byte) {
@@ -528,13 +668,19 @@ static char *utf8_to_teletext_g0(const char *src, int g0_subset)
             case 0x00B0: av_bprint_chars(&bp, 'o', 1); break; /* ° degree */
             case 0x00BD: av_bprintf(&bp, "1/2");       break; /* ½ */
             case 0x00F7: av_bprint_chars(&bp, '/', 1); break; /* ÷ */
-            case 0x266A: av_bprint_chars(&bp, '#', 1); break; /* ♪ music note */
+            /* ♪ -> '*', which is the same glyph in every subset. '#' (what this used to
+             * emit) is a national position and rendered £ on English, ç on Spanish,
+             * é on French — a music note turning into a currency symbol. */
+            case 0x266A: av_bprint_chars(&bp, '*', 1); break; /* ♪ music note */
             /* Currency */
             case 0x00A2: av_bprint_chars(&bp, 'c', 1); break; /* ¢ */
-            case 0x00A3: av_bprint_chars(&bp, '#', 1); break; /* £ (teletext G0 0x23) */
+            /* £ is at 0x23 on English/Italian and the national lookup above already took
+             * it there; the subsets that have no £ get the currency code spelled out
+             * rather than a byte that renders as some other letter. */
+            case 0x00A3: av_bprintf(&bp, "GBP");       break; /* £ */
             case 0x00A5: av_bprint_chars(&bp, 'Y', 1); break; /* ¥ */
-            case 0x00A4: av_bprint_chars(&bp, '$', 1); break; /* ¤ generic currency */
-            case 0x00A6: av_bprint_chars(&bp, '|', 1); break; /* ¦ broken bar */
+            case 0x00A4: g0_put_ascii(&bp, '$', g0_subset);  break; /* ¤ generic currency */
+            case 0x00A6: g0_put_ascii(&bp, '|', g0_subset);  break; /* ¦ broken bar */
             /* Whitespace */
             case 0x00A0: av_bprint_chars(&bp, ' ', 1); break; /* NBSP */
             /* Box drawing, full block → space (not displayable) */
@@ -557,10 +703,37 @@ static char *utf8_to_teletext_g0(const char *src, int g0_subset)
 
 /**
  * Extract plain text from ASS dialog, stripping override codes.
+ *
+ * cc_dec (real_time=1) prefixes EVERY caption row with "{\an7}{\pos(x,y)}" — one \pos per
+ * '\N'-separated row, carrying where that row sat on the 608 screen. \pos reaches us as the
+ * .move callback, so we record each row's y while extracting and can put the caption back
+ * on the band the source chose. Without it everything was bottom-anchored: measured on
+ * Law_Crime, 7 of 22 caption rows are TOP-of-screen in the source and were slammed onto the
+ * lower third, on top of the channel's own lower-third graphics.
  */
+#define TT_MAX_SEGMENTS 24     /* 15 rows on a 608 screen + slack for multi-rect captions */
+
 typedef struct {
     AVBPrint buf;
+    int nb_seg;                     /* segment being built == newlines emitted so far */
+    int seg_y[TT_MAX_SEGMENTS];     /* ASS y per segment; -1 = this row carried no \pos */
 } TextExtractCtx;
+
+static void text_extract_init(TextExtractCtx *ctx)
+{
+    int i;
+    ctx->nb_seg = 0;
+    for (i = 0; i < TT_MAX_SEGMENTS; i++)
+        ctx->seg_y[i] = -1;
+}
+
+/* one row ends: the next \pos belongs to the next segment */
+static void text_extract_nl(TextExtractCtx *ctx)
+{
+    av_bprint_chars(&ctx->buf, '\n', 1);
+    if (ctx->nb_seg < TT_MAX_SEGMENTS - 1)
+        ctx->nb_seg++;
+}
 
 static void text_extract_cb(void *priv, const char *text, int len)
 {
@@ -576,7 +749,7 @@ static void text_extract_cb(void *priv, const char *text, int len)
                 i++;
                 continue;
             } else if (text[i + 1] == 'n') {
-                av_bprint_chars(&ctx->buf, '\n', 1);
+                text_extract_nl(ctx);
                 i++;
                 continue;
             }
@@ -587,14 +760,180 @@ static void text_extract_cb(void *priv, const char *text, int len)
 
 static void text_newline_cb(void *priv, int forced)
 {
+    text_extract_nl(priv);
+}
+
+/* \pos(x,y) arrives here as move(x,y,x,y,-1,-1). cc_dec emits exactly one per row and never
+ * a real (animated) \move, so the start point is the row position; first one per segment
+ * wins. */
+static void text_move_cb(void *priv, int x1, int y1, int x2, int y2, int t1, int t2)
+{
     TextExtractCtx *ctx = priv;
-    av_bprint_chars(&ctx->buf, '\n', 1);
+    if (ctx->nb_seg < TT_MAX_SEGMENTS && ctx->seg_y[ctx->nb_seg] < 0)
+        ctx->seg_y[ctx->nb_seg] = y1;
 }
 
 static const ASSCodesCallbacks text_extract_callbacks = {
     .text     = text_extract_cb,
     .new_line = text_newline_cb,
+    .move     = text_move_cb,
 };
+
+/**
+ * Fallback text extraction for a dialog ff_ass_split_override_codes refuses.
+ *
+ * That function returns AVERROR_INVALIDDATA when it meets a "{\" it cannot parse as an
+ * override block, and it stops there — everything after is lost. This is reachable from
+ * CAPTION TEXT, not from malformed markup: cc_dec's extended charset maps 0x29 to '{' and
+ * 0x2B to '\' and does no ASS escaping, so a caption containing "{\" truncates. Measured
+ * 2026-08-12 with the real cc_dec: "AB{\CD" reached the wire as "AB", and a caption that
+ * BEGINS that way extracted to nothing at all — which this encoder reads as a source erase
+ * and clears the page.
+ *
+ * So: skip balanced {...} override blocks (keeping \pos for the row), honour \N \n \h, and
+ * treat an UNTERMINATED block as the literal text it is. A '{' from caption text followed by
+ * a later '}' elsewhere in the line still loses the run between them — bounded, and far from
+ * losing the rest of the caption. Fixed in our own layer deliberately: ass_split.c is stock.
+ */
+static void text_extract_naive(TextExtractCtx *ctx, const char *s)
+{
+    while (*s) {
+        if (s[0] == '{' && s[1] == '\\') {
+            const char *e = strchr(s, '}');
+            int x, y;
+            if (!e) {                          /* unterminated => literal caption text */
+                av_bprint_chars(&ctx->buf, *s++, 1);
+                continue;
+            }
+            /* %9d, not %d: the field width bounds what an ARBITRARY caption-text "{\pos(" can
+             * feed sscanf. 9 digits cannot overflow an int, so no input reaches undefined
+             * behaviour; a longer run of digits simply stops matching. */
+            if (sscanf(s, "{\\pos(%9d,%9d)", &x, &y) == 2)
+                text_move_cb(ctx, x, y, x, y, -1, -1);
+            s = e + 1;
+            continue;
+        }
+        if (s[0] == '\\' && (s[1] == 'N' || s[1] == 'n')) {
+            text_extract_nl(ctx);
+            s += 2;
+            continue;
+        }
+        if (s[0] == '\\' && s[1] == 'h') {
+            av_bprint_chars(&ctx->buf, ' ', 1);
+            s += 2;
+            continue;
+        }
+        av_bprint_chars(&ctx->buf, *s++, 1);
+    }
+}
+
+/**
+ * Remove the six HTML-ish tags that arrive inside CAPTION TEXT.
+ *
+ * MEASURED 2026-08-12 on TruBLU: 20 caption rows carry a literal "</b>" and 20 a "<b>", and
+ * they come from the SOURCE's own EIA-608 character stream, not from our pipeline. Two
+ * independent proofs: ccextractor (an entirely separate 608 decoder) reads the same tags out of
+ * the same capture, and the raw 608 byte dump spells them out in the character positions
+ * ("...the rest of his family.</b>"). cc_dec is NOT the origin — it expresses styling as ASS
+ * override blocks ({\i1} {\u0} {\c&H...&}, see ccaption_dec.c:512-600) and its
+ * charset_overrides[] entries are single codepoints, so it cannot emit a tag at all. Some
+ * upstream captioner is leaking its own markup into the caption.
+ *
+ * Whatever the origin, "</b>" is not text a viewer should read, and teletext has no styling to
+ * convert it into. EXACTLY these six tags, whole and case-insensitive, and nothing broader:
+ * '<' is an ordinary caption character, so a caption reading "x < y" or "<<< BREAKING" must
+ * survive untouched. No "skip to the next '>'" rule for that reason.
+ *
+ * Applied once to the fully extracted text, so it covers both the ff_ass_split_override_codes
+ * path and text_extract_naive() — this is the single place it happens.
+ */
+static void strip_markup_tags(char *s)
+{
+    static const char *const tags[] = { "<b>", "</b>", "<i>", "</i>", "<u>", "</u>" };
+    char *w = s;
+
+    while (*s) {
+        int i;
+        size_t n = 0;
+
+        for (i = 0; i < FF_ARRAY_ELEMS(tags); i++) {
+            size_t l = strlen(tags[i]);
+            if (!av_strncasecmp(s, tags[i], l)) {
+                n = l;
+                break;
+            }
+        }
+        if (n) {
+            s += n;
+            continue;
+        }
+        *w++ = *s++;
+    }
+    *w = '\0';
+}
+
+/**
+ * Invert cc_dec's row -> ASS y mapping (ccaption_dec.c:
+ * y = ASS_DEFAULT_PLAYRESY * (0.1 + 0.0533 * row), so rows 0..14 give y 28..243).
+ *
+ * @return the 608 screen row 0..14, or -1 if the row carried no position
+ */
+static int cea_row_from_ass_y(int y)
+{
+    int row;
+
+    if (y < 0)
+        return -1;
+    row = (int)((y / (double)ASS_DEFAULT_PLAYRESY - 0.1) / 0.0533 + 0.5);
+    if (row < 0)
+        row = 0;
+    if (row > 14)
+        row = 14;
+    return row;
+}
+
+/* 608 rows TTX_BOTTOM_BAND_CEA..14 are the lower third — the subtitle band — and they ALL
+ * bottom-anchor to row 23 rather than mapping proportionally.
+ *
+ * Not a taste call: a roll-up's lowest occupied row alternates INSIDE that band from one
+ * snapshot to the next as rows scroll, so a proportional map moves the whole block between
+ * transmissions. Measured 2026-08-12 on Newsmax2 (RU2, all 60 PACs at 608 row 12) with the
+ * band starting at 13: the 1-row snapshot landed on teletext 18 and the 2-row one on 19/20,
+ * the base row jumped 38 times in 90 s, and each move forces a C4 full-page erase (C4 rate
+ * 12.0% -> 23.4%) — a visible flash and a caption leaving the band viewers read.
+ *
+ * The band's lower edge is where the corpus puts every roll-up base: Newsmax2 12, TruBLU 13,
+ * NTD and Weather_nation 14 (0-based, measured from the sources' own PACs). 11 is the first
+ * row below all of them, so the whole band is stable and only genuinely-higher captions
+ * (608 row <= 10, i.e. Law_Crime's top pair and its mid-screen pair) depart from row 23. */
+#define TTX_BOTTOM_BAND_CEA 11
+
+/* How far apart two of a caption's 608 rows must be before the caption is laid out as separate
+ * BANDS instead of one block — more than half the 15-row screen, i.e. a real upper-vs-lower
+ * third change. See the split site in dvb_teletext_encode() for why "any gap" is wrong. */
+#define TTX_SPLIT_GAP_CEA 7
+
+/**
+ * 608 screen row 0..14 -> teletext row 1..23, keeping the caption in the same vertical band.
+ *
+ * The bottom BAND (see TTX_BOTTOM_BAND_CEA) maps to 23 exactly, so the overwhelmingly common
+ * lower-third caption produces byte-identical rows to the plain bottom anchoring this replaces
+ * (measured: NTD 3-row roll-up on 21/22/23, TruBLU on 22/23, Newsmax2 on 22/23). Rows 0..10
+ * map proportionally onto teletext 1..17. Row 0 is the page header and can never be used.
+ */
+static int ttx_row_from_cea_row(int cea)
+{
+    int row;
+
+    if (cea >= TTX_BOTTOM_BAND_CEA)
+        return TELETEXT_SUBTITLE_LAST_ROW;
+    row = 1 + (cea * 22 + 7) / 14;             /* 1 + round(cea * 22/14) */
+    if (row < 1)
+        row = 1;
+    if (row > TELETEXT_SUBTITLE_LAST_ROW)
+        row = TELETEXT_SUBTITLE_LAST_ROW;
+    return row;
+}
 
 static av_cold int dvb_teletext_encode_init(AVCodecContext *avctx)
 {
@@ -629,17 +968,28 @@ static av_cold int dvb_teletext_encode_init(AVCodecContext *avctx)
     avctx->extradata_size = 2;
 
     {
-        static const char *subset_names[] = {
-            "English", "German", "Swedish/Finnish", "Italian",
-            "French", "Spanish/Portuguese", "Czech/Slovak"
+        /* names AND the ETS national option code actually transmitted in C12-C14, because
+         * the two numberings differ (see g0_subset_ets_code[]) and a log line that shows
+         * only our index cannot be checked against the wire */
+        static const char *subset_names[G0_NATIONAL_SUBSETS] = {
+            "English", "German", "Swedish/Finnish/Hungarian", "Italian",
+            "French", "Spanish/Portuguese",
+            "Czech/Slovak (region-0) / Turkish (region-16)"
         };
+        int s = (ctx->g0_subset >= 0 && ctx->g0_subset < G0_NATIONAL_SUBSETS)
+              ? ctx->g0_subset : 0;
+        static_assert(FF_ARRAY_ELEMS(subset_names) == G0_NATIONAL_SUBSETS,
+                      "subset_names[] must cover every G0 subset");
         av_log(avctx, AV_LOG_INFO,
                "DVB Teletext encoder: magazine %d, page %02X, "
-               "G0 subset %d (%s)\n",
-               ctx->magazine, ctx->page, ctx->g0_subset,
-               (ctx->g0_subset >= 0 && ctx->g0_subset <= 6)
-                   ? subset_names[ctx->g0_subset] : "unknown");
+               "G0 subset %d (%s) = ETS national option code %d, header nibble 0x%X\n",
+               ctx->magazine, ctx->page, s, subset_names[s],
+               g0_subset_ets_code[s], g0_subset_ets_code[s] << 1);
     }
+
+    ctx->last_content_pts = AV_NOPTS_VALUE;   /* no content yet: the stale-erase guard below
+                                               * must be REAL, not decorative (a 0 here made
+                                               * every first timeout fire off pts - 0) */
 
     return 0;
 }
@@ -709,7 +1059,12 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
     TextExtractCtx extract = { 0 };
     ASSDialog *dialog;
     char *lines[TELETEXT_MAX_SUBTITLE_ROWS] = { NULL };
+    int line_y[TELETEXT_MAX_SUBTITLE_ROWS];      /* each line's ASS y, -1 = unpositioned */
+    int line_row[TELETEXT_MAX_SUBTITLE_ROWS];    /* each line's teletext row, ascending */
     int nb_lines = 0;
+    int base_row = TELETEXT_SUBTITLE_LAST_ROW;   /* teletext row of the LAST content line */
+    uint32_t rows_mask = 0;                      /* bitmap of the rows used, for the C4 test */
+    int contig = 1;                              /* source rows form ONE unbroken band */
     uint8_t row_text[TELETEXT_CHARS_PER_ROW];
     int offset = 0;
     int i, ret;
@@ -728,6 +1083,13 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
      * preserving the currently displayed text while satisfying the
      * MPEG-TS muxer's interleaving requirements. */
     if (sub->num_rects == 0) {
+        /* A BACKWARD pts (the emitter's house-stamp baseline moved: timeline rebase, mv
+         * REANCHOR2) must RE-BASE this timer, not disarm it. Left alone, the difference
+         * below stays negative for the whole size of the step and the 10 s stale erase
+         * never fires — the last caption sits on screen through the ad break. */
+        if (sub->pts != AV_NOPTS_VALUE && ctx->last_content_pts != AV_NOPTS_VALUE &&
+            sub->pts < ctx->last_content_pts)
+            ctx->last_content_pts = sub->pts;
         if (ctx->content_active && sub->pts != AV_NOPTS_VALUE &&
             ctx->last_content_pts != AV_NOPTS_VALUE &&
             sub->pts - ctx->last_content_pts >= TELETEXT_ERASE_TIMEOUT_US)
@@ -748,9 +1110,12 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
     /* UNLIMITED: see utf8_to_teletext_g0().  A capped buffer turns a long caption
      * into an encode failure rather than a truncated page. */
     av_bprint_init(&extract.buf, 0, AV_BPRINT_SIZE_UNLIMITED);
+    text_extract_init(&extract);
 
     for (i = 0; i < sub->num_rects; i++) {
         const char *ass = sub->rects[i]->ass;
+        unsigned mark_len;
+        int mark_seg, k;
 
         if (sub->rects[i]->type != SUBTITLE_ASS) {
             av_log(avctx, AV_LOG_WARNING, "Non-ASS subtitle rect, skipping\n");
@@ -762,7 +1127,22 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
             ret = AVERROR(ENOMEM);
             goto fail;
         }
-        ff_ass_split_override_codes(&text_extract_callbacks, &extract, dialog->text);
+        mark_len = extract.buf.len;
+        mark_seg = extract.nb_seg;
+        if (ff_ass_split_override_codes(&text_extract_callbacks, &extract, dialog->text) < 0) {
+            /* Roll this rect's partial extraction back and redo it ourselves — see
+             * text_extract_naive(). The truncation is the same operation av_bprint_clear()
+             * performs, at an offset; guarded on is_complete so it cannot touch a buffer that
+             * failed to allocate. */
+            if (av_bprint_is_complete(&extract.buf) && extract.buf.len > mark_len) {
+                extract.buf.str[mark_len] = '\0';
+                extract.buf.len = mark_len;
+            }
+            for (k = mark_seg; k < TT_MAX_SEGMENTS; k++)
+                extract.seg_y[k] = -1;
+            extract.nb_seg = mark_seg;
+            text_extract_naive(&extract, dialog->text);
+        }
         ff_ass_free_dialog(&dialog);
     }
 
@@ -783,17 +1163,24 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
         return 0;
     }
 
-    /* Split text into lines (max 2 for subtitle rows 22-23) */
+    /* Split text into lines, keeping each line's source position.
+     * Walked by hand rather than with av_strtok because av_strtok SKIPS empty tokens: a
+     * blanked caption row would then shift every following row onto the wrong \pos. */
     {
         char *text_str = NULL;
-        char *p, *saveptr = NULL;
+        char *p;
+        int seg = 0;
 
         av_bprint_finalize(&extract.buf, &text_str);
         if (!text_str)
             return AVERROR(ENOMEM);
+        strip_markup_tags(text_str);       /* source-leaked <b>/<i>/<u>, see the function */
 
-        p = av_strtok(text_str, "\n", &saveptr);
+        p = text_str;
         while (p && nb_lines < TELETEXT_MAX_SUBTITLE_ROWS) {
+            char *nl = strchr(p, '\n');
+            if (nl)
+                *nl = '\0';
             /* Map into the teletext G0 repertoire FIRST, then decide whether the
              * line still shows anything.  The mapping turns every codepoint it
              * cannot represent into a space — including NBSP and the U+2588 full
@@ -807,11 +1194,13 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
 
             while (*q && *q <= ' ')
                 q++;
-            if (*q != '\0')
-                lines[nb_lines++] = mapped ? mapped : av_strdup(p);
-            else
+            if (*q != '\0') {
+                line_y[nb_lines]   = seg < TT_MAX_SEGMENTS ? extract.seg_y[seg] : -1;
+                lines[nb_lines++]  = mapped ? mapped : av_strdup(p);
+            } else
                 av_free(mapped);
-            p = av_strtok(NULL, "\n", &saveptr);
+            seg++;
+            p = nl ? nl + 1 : NULL;
         }
         av_free(text_str);
     }
@@ -823,6 +1212,90 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
         if (ctx->content_active)
             return write_erase_page(ctx, buf, bufsize);
         return 0;
+    }
+
+    /* WHERE the block goes — computed BEFORE the page header, because a block that lands on
+     * different rows than the last one needs C4 (see below).
+     *
+     * The LAST line lands on base_row and the block grows upwards, one teletext row per
+     * caption row, in order (1 row => base, 2 => base-1 + base, ...).
+     *
+     * base_row is the row the SOURCE's lowest caption row maps to, so a top-of-screen caption
+     * stays at the top instead of being slammed onto the lower third (measured on Law_Crime:
+     * 7 of 22 caption rows are at 608 rows 0-1). The bottom BAND maps to 23, so
+     * bottom-third captions — very nearly everything — are byte-identical to the old
+     * unconditional bottom anchoring. A caption whose rows carry no \pos at all (not cc_dec,
+     * or a rect we could not position) keeps the plain bottom anchoring. */
+    {
+        int cea[TELETEXT_MAX_SUBTITLE_ROWS];
+        int max_cea = -1, positioned = 1;
+
+        for (i = 0; i < nb_lines; i++) {
+            cea[i] = cea_row_from_ass_y(line_y[i]);
+            if (cea[i] < 0)
+                positioned = 0;
+            if (cea[i] > max_cea)
+                max_cea = cea[i];
+        }
+        /* SPLIT a caption whose lines sit in genuinely different SCREEN REGIONS. One block
+         * cannot express that: base_row comes from the LOWEST row and the lines are laid
+         * consecutively upwards, so a caption occupying 608 rows {0, 14} lands entirely at the
+         * bottom, its top line one row above its bottom one, straight over the channel's
+         * lower-third graphics — the exact bug honouring \pos exists to prevent, reintroduced
+         * inside a single caption.
+         *
+         * The threshold is a gap of TTX_SPLIT_GAP_CEA, not "any gap", and that is measured, not
+         * cautious. cc_dec initialises AND resets its cursor to screen row 10
+         * (ccaption_dec.c:293,322) and uses it for anything written before the first PAC
+         * arrives, so at the start of a capture it reports row 10 — or 9 after one roll-up
+         * shift — for text the SOURCE placed at row 13/14. Measured 2026-08-12: RAV_Espanol's
+         * PACs are ALL at 608 row 14 (RU3) and Daystar_esp's at 13/14 only, yet cc_dec's first
+         * transmissions reported {9,14} and {10,13}. Splitting on those apparent gaps of 3-5
+         * tore two lines of one roll-up sentence 8 teletext rows apart. A gap this large is a
+         * decoder start-up artifact; more than half the 15-row screen is a real region change,
+         * and it is also more than a 4-row block can absorb. */
+        if (positioned)
+            for (i = 1; i < nb_lines; i++)
+                if (cea[i] - cea[i - 1] >= TTX_SPLIT_GAP_CEA)
+                    contig = 0;
+
+        if (contig) {
+            /* ONE block, growing upwards from base_row, in source order. */
+            if (max_cea >= 0)
+                base_row = ttx_row_from_cea_row(max_cea);
+            if (base_row < nb_lines)           /* row 0 is the page header: never a content row */
+                base_row = nb_lines;
+            if (base_row > TELETEXT_SUBTITLE_LAST_ROW)
+                base_row = TELETEXT_SUBTITLE_LAST_ROW;
+            for (i = 0; i < nb_lines; i++)
+                line_row[i] = base_row - (nb_lines - 1 - i);
+        } else {
+            /* One mapped row per line, then each contiguous BAND collapsed so its lines sit
+             * directly on top of each other, then pushed apart upwards until the rows are
+             * strictly ascending — a band whose mapped row collides with the band below it
+             * moves UP, never down, so the lower (and lower-third) band keeps its place. */
+            for (i = 0; i < nb_lines; i++)
+                line_row[i] = ttx_row_from_cea_row(cea[i]);
+            for (i = nb_lines - 1; i > 0; i--)
+                if (cea[i] - cea[i - 1] < TTX_SPLIT_GAP_CEA)   /* same band: directly above */
+                    line_row[i - 1] = line_row[i] - 1;
+            if (line_row[nb_lines - 1] > TELETEXT_SUBTITLE_LAST_ROW)
+                line_row[nb_lines - 1] = TELETEXT_SUBTITLE_LAST_ROW;
+            for (i = nb_lines - 1; i > 0; i--)
+                if (line_row[i - 1] >= line_row[i])
+                    line_row[i - 1] = line_row[i] - 1;
+            /* The top line can now be above row 1 (row 0 is the page header). Slide the whole
+             * caption down; it cannot run off the bottom, because reaching row 0 at all means
+             * the lowest row is at most TELETEXT_MAX_SUBTITLE_ROWS. */
+            if (line_row[0] < 1) {
+                int d = 1 - line_row[0];
+                for (i = 0; i < nb_lines; i++)
+                    line_row[i] += d;
+            }
+            base_row = line_row[nb_lines - 1];
+        }
+        for (i = 0; i < nb_lines; i++)
+            rows_mask |= 1u << line_row[i];
     }
 
     /* Build teletext PES payload */
@@ -848,19 +1321,30 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
          * whose header carries C4. Without the away-switch, 17 of 61 caption updates on
          * TruBLU raised NO event at all — 28% of updates invisible on a real receiver.
          * Do not remove the filler header while C4 is conditional. */
-        int erase = !ctx->content_active || nb_lines < ctx->last_nb_lines;
+        /* base_row is in the condition because a page is only ever PARTIALLY overwritten: the
+         * rows this transmission does not carry keep whatever was on them. Fewer rows than
+         * last time, or the same rows shifted to a different band, leaves the leftovers on
+         * screen — measured on the fixed Daystar encode before this clause: caption 1 on row
+         * 17, caption 2 on rows 22/23, and libzvbi showed all three at once. */
+        /* The rows_mask term covers the non-contiguous layout above, where the bottom row and
+         * the line count no longer determine WHICH rows are drawn: two captions can share both
+         * and still leave orphans. It is gated on either caption being non-contiguous so that
+         * the contiguous case — the whole measured corpus — keeps the exact C4 pattern it had
+         * (a 2-row caption growing to 3 rows on the same base row must NOT start erasing). */
+        int erase = !ctx->content_active || nb_lines < ctx->last_nb_lines ||
+                    base_row != ctx->last_base_row ||
+                    ((!contig || !ctx->last_contig) && rows_mask != ctx->last_rows_mask);
         offset += write_page_header(buf + offset, ctx, ctx->page, erase, 7);
     }
 
-    /* Content rows: bottom-anchored, so the LAST line always lands on row 23 and the block
-     * grows upwards (1 row => 23, 2 => 22+23, 3 => 21..23, 4 => 20..23). A source caption
-     * with more rows than this used to be silently truncated to two: measured 4 of 56
-     * captions on TruBLU lost their third row ("Send me the" without "address.").
+    /* Content rows. A source caption with more rows than TELETEXT_MAX_SUBTITLE_ROWS used to
+     * be silently truncated to two: measured 4 of 56 captions on TruBLU lost their third row
+     * ("Send me the" without "address.").
      * Each data unit gets a unique VBI line offset (8, 9, ...) per EN 300 472. */
     for (i = 0; i < nb_lines; i++) {
         const char *line = lines[i];   /* already G0-mapped at split time */
         int len, pad_left, j;
-        int row = TELETEXT_SUBTITLE_LAST_ROW - (nb_lines - 1 - i);
+        int row = line_row[i];
 
         /* Build row text: center the text in 40-char row, wrapped in
          * Start Box (0x0B) / End Box (0x0A) markers. Teletext subtitle
@@ -906,6 +1390,9 @@ static int dvb_teletext_encode(AVCodecContext *avctx, unsigned char *buf,
 
     ctx->content_active    = 1;
     ctx->last_nb_lines     = nb_lines;
+    ctx->last_base_row     = base_row;
+    ctx->last_rows_mask    = rows_mask;
+    ctx->last_contig       = contig;
     ctx->last_content_pts  = sub->pts;
 
     /* Pad with stuffing data units to reach TELETEXT_CONTENT_DATA_UNITS total.
@@ -945,9 +1432,14 @@ static const AVOption dvbteletextenc_options[] = {
       AV_OPT_TYPE_INT, { .i64 = 8 }, 1, 8, SE },
     { "page", "teletext page number (hex, e.g. 0x88)", OFFSET(page),
       AV_OPT_TYPE_INT, { .i64 = 0x88 }, 0x00, 0xFF, SE },
-    { "g0_subset", "G0 national option subset (0=English, 1=German, 2=Swedish/Finnish, "
-      "3=Italian, 4=French, 5=Spanish/Portuguese, 6=Czech/Slovak)", OFFSET(g0_subset),
-      AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 6, SE },
+    /* Our index, NOT the ETS code (they are bit-reversals of each other, see
+     * g0_subset_ets_code[]); the ETS code each one transmits is in parentheses. Subset 6 is
+     * the only region-dependent one — see the Czech/Slovak row in g0_national_subsets[]. */
+    { "g0_subset", "G0 national option subset (0=English[ETS 0], 1=German[4], "
+      "2=Swedish/Finnish/Hungarian[2], 3=Italian[6], 4=French[1], "
+      "5=Spanish/Portuguese[5], 6=Czech/Slovak[3], Turkish on a region-16 receiver)",
+      OFFSET(g0_subset),
+      AV_OPT_TYPE_INT, { .i64 = 0 }, 0, G0_NATIONAL_SUBSETS - 1, SE },
     { NULL },
 };
 
