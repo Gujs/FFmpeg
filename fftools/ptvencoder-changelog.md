@@ -5,6 +5,34 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 1.2.0-pre4 (2026-08-12) — the source's EIT stops poisoning our output
+
+**pre4 = pre3 + this one exclusion. Only patch `0001` needs a refresh; `0006` is unchanged.**
+
+- **A source carrying DVB EIT (PID 0x12) made every prober of our output hang.** lavf synthesizes
+  an `epg` data stream for that PID, `-map 0:d?` copied it, and the muxer re-emitted it as a private
+  bin_data PID: an EIT with the wrong service context that no receiver reads as EIT, on a PID that
+  never yields codec parameters — so an `ffprobe` with default options burns its whole probesize
+  (~118 s) before reporting anything. That is what turned the fleet's sync_check into a restart loop
+  on healthy channels: RAV 7×, Weather_nation 15× in 6 days (measured cor-1 2026-08-12, where the
+  copied PID had also gone near-silent, 231 packets in 27 h against a 3.3 pkt/s source EIT).
+- **EPG/EIT is now never copied** — wildcard-mapped (`-map 0:d?`, logged INFO) or named explicitly
+  (`-map 0:d:1`, logged WARNING; the output is broken junk either way). SCTE-35 and every other data
+  codec ride the copy path exactly as before: on an EIT source the PMT keeps its SCTE PID unchanged
+  and only the EIT PID disappears, and on a source with real splice sections the sections still reach
+  the wire. Non-EIT channels are untouched (identical stream lists and PMTs).
+- ⚠ On an EIT channel the output carries one stream fewer, so anything counting *physical* output
+  stream indexes past the data streams shifts down by one. Audio/subtitle specifiers are unaffected
+  — data streams never numbered them, so `-metadata:s:s:N` / `-disposition:a:N` still land where
+  they did — and input-side maps (`SV_SCTE35=<idx>` → `-map 0:d:<idx>`) resolve against the input,
+  which is unchanged. Precise about the one exception: OUTPUT-side *data* numbering
+  (`-metadata:s:d:N` / `-disposition:d:N`) compacts when the EPG stream disappears — unobservable
+  on the TS wire (mpegtsenc writes no metadata/disposition for DATA streams) and unused anywhere in
+  the fleet, but if a d:N output specifier is ever introduced, it counts the compacted list.
+- `PTV_ALLOW_EPG_COPY=1` restores the old copy behaviour (runtime escape hatch — this refusal is
+  the one that overrides an explicit operator `-map`, so it gets one). After an EPG refusal the
+  `passthrough N stream(s)` line still prints (with 0) so its absence never looks like a fault.
+
 ## 1.2.0-pre3 (2026-08-12) — languages render correctly; captions sit where the source put them
 
 **Needs BOTH patches (`0001` + `0006`) — the language fix lives in the encoder.** Until this is

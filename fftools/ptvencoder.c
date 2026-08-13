@@ -42,7 +42,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.2.0-pre3"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.2.0-pre4"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -874,6 +874,9 @@ int     g_cc = 1;
 /* atomic because the "emitter thread create failed" path clears it AFTER the output threads
  * (which read it for the stats line) are already running */
 _Atomic int g_cc_on;
+static int g_epg_refused;   /* an EPG/EIT copy was refused (1.2.0-pre4): keeps the
+                             * "passthrough N stream(s)" narration printed even when the
+                             * EIT was the ONLY data stream (n_pass == 0) */
 _Atomic int64_t g_cc_a53, g_cc_caps, g_cc_erase, g_cc_keep, g_cc_err, g_cc_dropped,
                 g_cc_bump, g_cc_reset;
 _Atomic int64_t g_cc_caps_in[PTV_MAX_INPUT], g_cc_a53_in[PTV_MAX_INPUT];
@@ -2460,7 +2463,7 @@ typedef struct Sel {
 static const char *og_get(OptionGroup *g, const char *key);
 static void apply_stream_meta(OptionGroup *g, char t, int idx, AVStream *ost);
 struct Input;
-static int resolve_plan(struct Input *inputs, int n_input, OptionGroup *outg, Sel *s);
+static int resolve_plan(struct Input *inputs, int n_input, OptionGroup *outg, Sel *s, int verbose);
 
 /* One ABR ladder rung = one output: its own muxer, video encoder, queues and
  * threads. Audio + passthrough are shared (decoded/copied once, fanned out). */
@@ -2941,9 +2944,10 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         }
     }
 
-    /* resolve each output group's -map/-c into its transcode/copy selection */
+    /* resolve each output group's -map/-c into its transcode/copy selection.
+     * Every rung resolves the same input streams, so only the first one narrates. */
     for (r = 0; r < n_rung; r++)
-        if ((ret = resolve_plan(inputs, n_input, &outs->groups[r], &sel[r])) < 0) goto end;
+        if ((ret = resolve_plan(inputs, n_input, &outs->groups[r], &sel[r], r == 0)) < 0) goto end;
 
     /* per-input video decoder. Ladder/mosaic rungs map filter labels [vN]; each
      * input's source video is the best video stream (single-input may also map an
@@ -3348,7 +3352,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         }
         if (inputs[kk].da.n_pass > 0) n_copy_inputs++;
     }
-    if (n_pass)
+    if (n_pass || g_epg_refused)   /* refusals keep the line: "passthrough 0" after an EPG
+                                    * refusal is information, silence would look like a fault */
         av_log(NULL, AV_LOG_INFO, "ptvencoder: passthrough %d stream(s) per output (copy), %d input(s)\n",
                n_pass, n_copy_inputs);
 
@@ -4009,12 +4014,53 @@ static const char *map_spec(const char *v, char *buf, size_t bufsz, int *optiona
     return buf;
 }
 
+/* EIT/EPG is the one data stream ptvencoder refuses to copy (1.2.0-pre4).
+ *
+ * lavf's mpegts demuxer synthesizes an AV_CODEC_ID_EPG stream for PID 0x12, so a
+ * type-wildcard data map (`-map 0:d?`) picks it up on every EIT-carrying source.
+ * Copying it is wrong twice over: the muxer re-emits the EIT sections on a private
+ * bin_data PID that no receiver reads as EIT (and whose service context is the
+ * source's, not ours), and a bin_data PID never yields codec parameters, so every
+ * downstream prober burns its entire probesize before it reports anything (~118 s
+ * for ffprobe's defaults). That is what turned the fleet's sync_check into a restart
+ * loop on healthy channels — RAV 7x, Weather_nation 15x in 6 days, measured on cor-1
+ * 2026-08-12, where the copied PID also went near-silent (231 packets in 27 h against
+ * a source EIT running at 3.3 pkt/s).
+ *
+ * SCTE-35 and every other data codec are untouched — they ride the copy path exactly
+ * as before. Returns 1 when the stream must be dropped from the copy list.
+ *
+ * PTV_ALLOW_EPG_COPY=1 restores the old copy behaviour (runtime escape hatch — this
+ * is the one refusal that overrides an explicit operator -map, so it gets one). */
+static int epg_copy_allowed(void)
+{
+    static int allowed = -1;
+    if (allowed < 0)
+        allowed = getenv("PTV_ALLOW_EPG_COPY") != NULL;
+    return allowed;
+}
+
+static int data_copy_refused(const AVStream *ist, int fidx, int si, int targeted, int verbose)
+{
+    if (ist->codecpar->codec_id != AV_CODEC_ID_EPG || epg_copy_allowed())
+        return 0;
+    g_epg_refused = 1;
+    if (verbose)
+        av_log(NULL, targeted ? AV_LOG_WARNING : AV_LOG_INFO,
+               "ptvencoder: input EPG/EIT stream #%d:%d not copied%s — a re-muxed EIT is junk on "
+               "the output and the copied PID never yields codec parameters, stalling downstream probers\n",
+               fidx, si, targeted ? " despite being mapped explicitly" : "");
+    return 1;
+}
+
 /* PTV_PLAN_DEBUG=1: parse an ffmpeg-style command, open the input, resolve each
  * -map to an input stream + its copy/encode decision (and applied opts), print. */
 /* Resolve an output group's -map/-c into a Sel (transcode vs copy decision).
  * No -map -> auto (best video + first <=2ch audio + copy the rest), back-compat
- * (single-input only). Explicit -map K:... selects from input K (multiview). */
-static int resolve_plan(Input *inputs, int n_input, OptionGroup *outg, Sel *s)
+ * (single-input only). Explicit -map K:... selects from input K (multiview).
+ * verbose: narrate selection decisions (set on the first rung only — every rung
+ * resolves the same input streams). */
+static int resolve_plan(Input *inputs, int n_input, OptionGroup *outg, Sel *s, int verbose)
 {
     AVFormatContext *ifmt = inputs[0].ifmt;
     int o, si, tcnt[5] = {0}, nmap = 0, astream = -1;
@@ -4044,6 +4090,7 @@ static int resolve_plan(Input *inputs, int n_input, OptionGroup *outg, Sel *s)
             enum AVMediaType mt = ifmt->streams[si]->codecpar->codec_type;
             if (si == s->vstream || si == astream) continue;
             if (mt == AVMEDIA_TYPE_AUDIO && no_audio) continue;   /* -an: drop audio copy too */
+            if (data_copy_refused(ifmt->streams[si], 0, si, 0, verbose)) continue;
             if ((mt == AVMEDIA_TYPE_AUDIO || mt == AVMEDIA_TYPE_SUBTITLE || mt == AVMEDIA_TYPE_DATA)
                 && s->n_copy < PTV_MAX_PASS) { s->copy_input[s->n_copy] = 0; s->copy[s->n_copy++] = si; }
         }
@@ -4053,7 +4100,7 @@ static int resolve_plan(Input *inputs, int n_input, OptionGroup *outg, Sel *s)
     }
 
     for (o = 0; o < outg->nb_opts; o++) {              /* explicit -map plan */
-        char buf[64]; int optional, fidx; const char *spec, *mv = outg->opts[o].val;
+        char buf[64]; int optional, fidx, targeted; const char *spec, *mv = outg->opts[o].val;
         AVFormatContext *kfmt;
         if (strcmp(outg->opts[o].key, "map")) continue;
         if (mv[0] == '[') {                            /* filter-output label = this rung's video */
@@ -4068,6 +4115,16 @@ static int resolve_plan(Input *inputs, int n_input, OptionGroup *outg, Sel *s)
             return AVERROR(EINVAL);
         }
         kfmt = inputs[fidx].ifmt;
+        /* a spec whose LAST colon-token is numeric picks one stream (-map 0:3, -map 0:d:1);
+         * a bare type letter (-map 0:d?) — or a whole-input map (-map 0, where the digit is
+         * the input index, not a stream) — is a wildcard. Only picks the EPG log level. */
+        {
+            const char *lt = strrchr(spec, ':');
+            const char *p  = lt ? lt + 1 : spec;
+            int alldig = *p != 0;
+            for (; *p; p++) if (*p < '0' || *p > '9') { alldig = 0; break; }
+            targeted = alldig && (lt != NULL || strchr(mv, ':') != NULL);
+        }
         for (si = 0; si < (int)kfmt->nb_streams; si++) {
             enum AVMediaType mt; char t; int ti, idx; const char *codec;
             if (avformat_match_stream_specifier(kfmt, kfmt->streams[si], spec) <= 0) continue;
@@ -4078,6 +4135,12 @@ static int resolve_plan(Input *inputs, int n_input, OptionGroup *outg, Sel *s)
                   mt==AVMEDIA_TYPE_SUBTITLE?2:mt==AVMEDIA_TYPE_DATA?3:4;
             idx = tcnt[ti]++;
             codec = og_spec(outg, "c", t, idx);
+            /* after tcnt/og_spec so refusing EPG keeps INPUT-side -c:d:N numbering stable.
+             * OUTPUT-side data numbering (copy_didx: -metadata:s:d:N/-disposition:d:N) still
+             * compacts when EPG disappears — unobservable on the wire, because mpegtsenc
+             * writes no metadata/disposition for DATA streams, and nothing in the fleet
+             * uses d:N output specifiers. -b:d:N is never read for data at all. */
+            if (data_copy_refused(kfmt->streams[si], fidx, si, targeted, verbose)) continue;
             if (codec && !strcmp(codec, "copy")) {
                 if (s->n_copy < PTV_MAX_PASS) { s->copy_input[s->n_copy] = fidx; s->copy[s->n_copy++] = si; }
             } else if (mt == AVMEDIA_TYPE_VIDEO && s->vstream < 0 && fidx == 0) {
@@ -4144,7 +4207,12 @@ static int plan_resolve_and_print(int argc, char **argv)
             idx = tcnt[ti]++;
             codec = og_spec(outg, "c", t, idx);
             br    = og_spec(outg, "b", t, idx);
-            if (codec && !strcmp(codec, "copy"))
+            /* same predicate as the real plan (incl. the PTV_ALLOW_EPG_COPY override) so the
+             * PTV_PLAN_DEBUG output can never diverge from what the encoder actually does */
+            if (data_copy_refused(ifmt->streams[si], 0, si, 0, 0))
+                av_log(NULL, AV_LOG_INFO, "  map %-9s -> in#%d %-9s : SKIPPED (EPG/EIT never copied)\n",
+                       outg->opts[o].val, si, av_get_media_type_string(mt));
+            else if (codec && !strcmp(codec, "copy"))
                 av_log(NULL, AV_LOG_INFO, "  map %-9s -> in#%d %-9s : COPY (passthrough)\n",
                        outg->opts[o].val, si, av_get_media_type_string(mt));
             else
