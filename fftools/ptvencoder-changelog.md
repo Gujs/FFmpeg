@@ -5,6 +5,137 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 1.2.0-pre5 (2026-08-26) — `-cc_style`: the teletext page mirrors the CC (default), block mode opt-in
+
+**Patch `0001` only** (`ptvencoder.c` / `.h` / `_clock.c` / `_legend.c`); the teletext encoder is
+unchanged.
+
+- **`-cc_style faithful|block`, default `faithful`** (env `PTV_CC_STYLE` overrides; one value for
+  the whole run, like `-cc_lang`, with every multiview slot assembling independently).
+
+  **Owner-directed (2026-08-26): the teletext subtitles stay the SAME as the CC** — the captions
+  are American and their viewers are the source's viewers, so the default transmits every cc_dec
+  snapshot verbatim: words type out and lines scroll exactly as on the source channel. `>>` /
+  `>>>` speaker and topic markers, music-note rows, indentation and the source's own line breaks
+  all reach the wire exactly as the channel wrote them under EITHER style; `-cc_style` only picks
+  WHEN a roll-up line is transmitted, never what it says.
+
+  `block` (opt-in, per channel) exists for downstream renderers that turn the per-snapshot page
+  churn into visual artefacts (e.g. a teletext→WebVTT conversion): cc_dec hands us a snapshot of
+  the whole 608 screen on every caption-memory change, and a roll-up window grows word by word,
+  so transmitting every snapshot puts a HALF-WRITTEN line on the wire every ~300 ms. `block`
+  transmits only lines the source has FINISHED.
+  - a line is finished when the window SCROLLS, or when it has not grown for 2.5 s (a speech pause;
+    the line stays open, so a resuming speaker extends it in place instead of starting a new one);
+  - the growing bottom row is NEVER transmitted;
+  - **the block holds the SOURCE's own window depth minus the row being typed** — `hold =
+    clip(depth - 1, 1, 3)`, so RU3 (the common US news window) shows 2 completed lines, RU4 shows
+    3 and RU2 shows 1 — and it SCROLLS UP as the source's window does: the oldest line drops off
+    the top, the newly finished one enters at the bottom. The depth is measured, not assumed: it
+    is the DEEPEST carriage-return snapshot the input has produced, and two returns are required
+    before that measurement displaces the RU3 default. A window that has just restarted shows two
+    rows whatever its RU setting is, so the instantaneous count is not the depth: reading it as
+    one cost AWE its opening line (`>> Welcome to Travel in Style,` vanished from the wire at
+    54.888 s until this was fixed). Measured on AWE (RU3 by its own 608 control codes): 23
+    carriage returns show 3 rows, 4 show 2, and all 4 of those are the first return of a burst;
+  - no caption activity for 5 s clears the block, through the existing deferred-erase path, so the
+    last block still gets its 1.2 s minimum display. An explicit source EDM still clears at once —
+    and the line being typed when it arrives is published FIRST, so a paragraph's closing line is
+    not lost;
+  - the block rides the newest line's own position, so the encoder still stacks one contiguous
+    band: a two-line bottom-band block lands on teletext rows 22+23 (three lines: 21+22+23), a
+    source-positioned one stays put.
+- **POP-ON SOURCES ARE UNTOUCHED.** Block assembly engages only after a roll-up CARRIAGE RETURN has
+  been positively observed — the bottom row seen to GROW, and that exact text then reappearing on
+  the row above. A pop-on source cannot produce the first half (it flips whole screens from
+  non-displayed memory) and paint-on cannot produce the second. Measured: TruBLU and Daystar_esp
+  are BYTE-IDENTICAL to pre4 under `-cc_style block` (teletext wire md5 over the whole capture),
+  and `-cc_style faithful` on a roll-up source is identical to pre4 as well (the one snapshot that
+  differs across 274 is the truncated final partial line, and the pre4 binary differs from ITSELF
+  there between two runs).
+  A pop-on caption **flipped in over live roll-up content** — an ad break on a US news channel —
+  is a different thing, and it DOES reach block assembly. It is finished text by definition, so it
+  goes out whole and at once; see the completeness rule below.
+- Measured on AWE (roll-up, 300 s, local capture, pre4 → pre5 `block`): transmissions
+  **274 → 158** (82.2 → 47.4 per 90 s), rows on the wire **751 → 297**, snapshots showing an
+  unfinished line **122 → 1** (the one is pre-latch), roll-up window `{21,22,23}`×215 → blocks
+  `{22,23}`×130 + `{23}`×16. `>>` rows on the wire **17 → 8** — fewer only because block mode
+  transmits far fewer snapshots of the same dialogue; every `>>` line still carries its marker.
+  `check.sh` PASSes on every output: hamming 0, framing 0, away-switch intact (page 8FF headers ==
+  page 888 headers), and raw-libzvbi page events == transmissions under both timestamp models
+  (block 169==169, faithful 289==289).
+- **CC rebase survival: the wire is RECONCILED TO THE ENCODER.** After a `> PTV_CC_REBASE_US`
+  backward house step every packet we emit sits at or below the stamp the muxer still holds, so
+  `[PTV-MUXGUARD]` refuses it — while the ENCODER, which is upstream of the drop, processes it and
+  advances its display state anyway. The two diverge for the whole window, and the divergence
+  outlives it. So the emitter remembers that stamp, notes that packets were dropped, and at the
+  first ACCEPTED stamp re-asserts whatever the encoder's own state says the viewer should be
+  seeing: the page if one is up, an ERASE if it is blank. **This is unconditional** — it no longer
+  rides the keepalive, which is why the review measured the pre-fix re-transmission firing in only
+  10 of 16 forced-rebase trials; all 16 now reconcile (11 by substitution, 5 because the crossing
+  event was a CAPTION, or an ERASE against a page the encoder still had up, and settled the screen
+  itself).
+  The `!page_up` half is what could freeze a viewer's page for good: a source EDM
+  accepted-but-dropped inside the window leaves the receiver on the pre-rebase caption AND disarms
+  the encoder's 10 s stale backstop, which only fires while it believes content is up. It takes two
+  events, forced by the encoder: it will not write an erase page for a page it thinks is already
+  down (`if (ctx->content_active) return write_erase_page(); return 0`), so the page is re-asserted
+  first — invisible to a viewer who is looking at exactly that page — and the erase rides the next
+  keepalive (≤ 1 s), with the re-armed 10 s stale timer underneath. Measured on TruBLU with the
+  rebase forced at 60 s: pre-fix the receiver held a caption the encoder had already erased from
+  93.864 s to 98.465 s (4.6 s); post-fix the owed page goes out at 95.562 s and the page is BLANK
+  at 96.563 s.
+  ⚠ **`ccmux=` on a rebase is NOT fixed, and deliberately so.** The obvious companion change — have
+  the mux threads clear `mg_last` for the teletext stream — was built and live-fired on 2026-08-26
+  and **kills the channel**: `mg_last` is only ptvencoder's MIRROR of the authority, which is lavf's
+  own `sti->cur_dts`. Clearing the mirror does not move lavf's high-water, it only removes
+  `[PTV-MUXGUARD]`'s protection, so the backward packet reaches the muxer and EINVALs it. Measured
+  on a forced 29.3 s rebase: with the reset, `non monotonically increasing dts to muxer in stream 2`
+  → `[PTV-MUX] rung 0 write failed ... exiting for supervised respawn`; without it, `ccmux=40` and
+  the channel carries on. Driving ccmux to zero across a rebase needs the STAMPS held above lavf's
+  high-water — a clock-design change, not a silenced guard.
+- `PTV_CCTEST_REBASE_AT_S=<t>` (TEST ONLY, 0 = off and byte-inert) forces one baseline rebase. It
+  exists because the live trigger is an h0 move and a source PTS jump cannot stand in for it:
+  `[PTV-LAYERA]` absorbs those upstream (measured, −8.0 s jump → `applied_offset=7.829s`, `reset=0`).
+
+### Adversarial review round (2026-08-26)
+
+The review confirmed clean, by measurement: the default `faithful` flip is **byte-inert** (AWE
+300 s teletext wire md5 identical to pre4 across repeat runs), pop-on identity holds (TruBLU and
+Daystar_esp byte-identical under `block`), zero leaks, and the block state is per-tap and
+thread-clean. Six findings were fixed in the same working tree:
+
+1. **Block mode swallowed pop-on flips inside a latched roll-up channel.** The screen-replacement
+   branch held the bottom row back unconditionally, so a one-line ad-break caption reached the
+   viewer 2.5 s late and a two-line one arrived half now, half 2.6 s later. It is now COMPLETE
+   CONTENT when a roll-up row was being tracked AND the new bottom row is not a continuation of
+   it. The obvious rule — "≥ 2 rows means pop-on" — was tried and **rejected on measurement**: it
+   takes AWE's unfinished-line count from 1 to 4, because (a) after any `cc_block_reset()` the
+   source's 608 screen still holds rows and its next snapshot can be 2 rows with a mid-word bottom
+   (`an` → `and also, a ry`), and (b) cc_dec **re-renders** characters — a typewriter apostrophe
+   delivered as U+2019 and re-sent as U+2018, three times in 300 s — which breaks the prefix test
+   in the growth branch and drops a still-growing row into this one (`in the late ’` →
+   `in the late ‘70s`). The new `cc_str_continues()` (UTF-8 aware, last character of the prefix
+   allowed to differ) catches that class. Result: AWE `block` unfinished-line rows stay at **1**
+   (pre-latch), transmissions stay at **158**, and the wire is byte-identical to the pre-review
+   build — no local fixture carries a mid-latch flip, so the behaviour change is proven by the
+   unit rig (`blocktest` T12/T14/T15), not by a stream.
+2. **A dropped ERASE could freeze the viewer's page.** See the rebase-survival entry above.
+3. **The synthesised 5 s block clear inflated `eheld=`.** It entered the deferred-erase hold as if
+   the source had asked for a blank screen; `eheld=` is defined as source erases held by the
+   minimum-display rule. It no longer counts (AWE `block` 300 s: `eheld=17 → 16`). Deferral,
+   re-arming and the wire are unchanged.
+4. **`[PTV-CC] presentation style:` never printed on some multiviews.** It was gated on the input
+   index, so a run whose `-cc_slots` excluded input 0 logged nothing. Gated on the extraction index.
+5. **Dead code removed:** `consumed` in `cc_block_feed()` (never reassigned) and
+   `CcTap.last_emit_src_us` (no readers or writers anywhere in the tree).
+6. **Stale comments corrected:** the push loop's "a source that narrowed its window" (it cannot —
+   the depth measurement is a running max), "the source's own EDM still clears immediately" (it is
+   deferred against minimum display like any other), the "POP-ON SOURCES ARE UNTOUCHED" /
+   "byte for byte" claims (qualified per 1), the help text's vestigial style-translation sentence
+   and the `- ` rows line, and `PTV_CC_STYLE` is now documented as OVERRIDING the CLI flag. The
+   `blk_y == -1` sentinel is now guarded identically at all three writers.
+
 ## 1.2.0-pre4 (2026-08-12) — the source's EIT stops poisoning our output
 
 **pre4 = pre3 + this one exclusion. Only patch `0001` needs a refresh; `0006` is unchanged.**

@@ -524,6 +524,53 @@ typedef struct VideoHold {
 #define PTV_CC_QUIET_US        60000000  /* captions absent this long while A53 keeps arriving
                                           * => one [PTV-CC] QUIET line (and one on recovery) */
 
+/* ---- PRESENTATION STYLE (-cc_style, 1.2.0-pre5) ----------------------------------------
+ * THE CAPTIONS STAY AMERICAN. Our viewers are the source's viewers: '>>' speaker markers,
+ * music-note rows, the source's own roll-up window depth and its line breaks all go on the
+ * wire exactly as the channel wrote them. What this style fixes is not the convention, it is
+ * an ARTEFACT OF THE TAP.
+ *
+ * cc_dec hands us a SNAPSHOT of the 608 screen on every caption-memory change. In a roll-up
+ * window that means a snapshot of a HALF-TYPED row every DEADLINE (~300ms), so a teletext
+ * viewer reads partial words and watches the page churn — nobody chose that presentation, it
+ * is just what transmitting every snapshot does. `faithful` (the DEFAULT — owner-directed
+ * 2026-08-26: the teletext page should stay the SAME as the CC) is that behaviour: the page
+ * mirrors the CC update for update, so words type out and scroll exactly as they do on the
+ * source channel, which is what its viewers are used to.
+ *
+ * `block` (opt-in) transmits only what the source has actually FINISHED: a line goes on
+ * the wire when the window scrolls it up (or when it has stalled long enough to be done), and
+ * the completed lines the source is still showing are held on screen and scroll upwards
+ * together, American roll-up style, at the SOURCE's own window depth — see cc_block_hold().
+ * The row currently being typed is never transmitted. Nothing below the tap changes: the same
+ * ASS goes to the same encoder, the same rows, the same away-switch page model.
+ *
+ * A POP-ON source is already whole-line and must not be touched (adding latency to a channel
+ * that is already correct is a regression, not a feature), so block assembly only starts once
+ * the tap has POSITIVELY IDENTIFIED a roll-up window — see cc_block_feed(). A source that
+ * never rolls up therefore never latches and is byte-identical under either style (measured
+ * on TruBLU and Daystar_esp). A pop-on caption FLIPPED IN over live roll-up content — an ad
+ * break on a US news channel — does reach block assembly, and goes out whole and at once:
+ * see the completeness rule in cc_block_feed()'s screen-replacement branch. */
+enum {
+    PTV_CC_STYLE_BLOCK = 0,   /* opt-in: assemble roll-up into whole-line blocks */
+    PTV_CC_STYLE_FAITHFUL     /* default: teletext mirrors the CC, snapshot for snapshot */
+};
+/* Storage bound for the held lines. The number ACTUALLY held is decided per source from its
+ * roll-up window depth (cc_block_hold): RU2 => 1, RU3 => 2, RU4 => 3. EIA-608 has no RU5, so
+ * 3 is the real ceiling and not merely a clamp. */
+#define PTV_CC_BLOCK_MAX_LINES 3
+/* A roll-up line is finished when the window SCROLLS. Speech pauses mid-line, though, and a
+ * half-written line must not sit un-emitted through the pause — so a line whose text has not
+ * grown for this long is flushed as complete. It stays OPEN: if the speaker resumes and the
+ * same row grows again, the block's bottom line is updated in place rather than pushed. */
+#define PTV_CC_BLOCK_STALL_US  2500000
+/* No new characters anywhere for this long => clear the block. A source EDM (roll-up sources
+ * rarely send one) still takes the unchanged pre4 path — which means it is DEFERRED against
+ * the block's minimum display, exactly as it is in `faithful`, not applied instantly — and
+ * the encoder's 10s stale-content timer remains the backstop underneath both. */
+#define PTV_CC_BLOCK_CLEAR_US  5000000
+
 /* What a queued event MEANS. All three reach the encoder — an empty/zero-rect subtitle is
  * how the teletext encoder is told to keep or clear the page, so it must never be filtered
  * out here; the kind exists for the counters and the state log. CAPTION and ERASE differ
@@ -568,7 +615,6 @@ typedef struct CcTap {
     int              pend_end_ms;
     int64_t          pend_changed_us;  /* source pts when the text last CHANGED */
     int64_t          pend_first_us;    /* source pts when this pending cycle began */
-    int64_t          last_emit_src_us; /* source pts of the last event QUEUED (1 Hz floor) */
     int64_t          shown_since_us;   /* source pts the current page went up (min-display) */
     /* DEFERRED source erase (see PTV_CC_MIN_DISPLAY_US): an erase that arrived before the
      * page had its minimum on-screen time is held here, not thrown away, and emitted once
@@ -577,6 +623,38 @@ typedef struct CcTap {
     uint32_t         erase_end_ms;
     int64_t          erase_due_us;     /* source pts the deferred erase may go out at */
     int              mrect_warned;     /* the "this source emits >1 rect per subtitle" line, once */
+    /* ---- -cc_style block: roll-up -> whole-line block assembly (all unused in `faithful`,
+     * which never enters cc_block_feed() at all) ---- */
+    int              style;            /* PTV_CC_STYLE_* (resolved once in cc_setup) */
+    int              blk_rollup;       /* LATCH: this input has been positively identified as
+                                        * a roll-up window. Until it sets, block mode is a
+                                        * no-op and events take the pre4 path unchanged. */
+    int              blk_grew;         /* pre-latch: the row we are watching has been seen to
+                                        * grow character-by-character (half of the latch test) */
+    int              blk_latch_logged;
+    char            *blk_line[PTV_CC_BLOCK_MAX_LINES]; /* completed lines, [n-1] = newest (owned) */
+    int              blk_lx[PTV_CC_BLOCK_MAX_LINES];   /* each line's own ASS x (its indent) */
+    int              blk_n;            /* completed lines currently held (0..cc_block_hold()) */
+    int              blk_depth;        /* the SOURCE's roll-up window depth, in rows, as counted
+                                        * off the snapshot at a carriage return (RU2/RU3/RU4 =>
+                                        * 2/3/4). 0 until one has been seen. cc_block_hold()
+                                        * turns it into the number of COMPLETED lines held. */
+    int              blk_depth_obs;    /* carriage returns measured so far (see cc_block_hold:
+                                        * one is not yet evidence of the window's depth) */
+    int              blk_y;            /* ASS y of the NEWEST line — the whole block rides it,
+                                        * so the encoder sees one contiguous band and stacks it
+                                        * upwards from the source's own row (rows 22+23 for a
+                                        * two-line bottom-band block, 21+22+23 for three). */
+    char            *blk_cur;          /* the growing bottom row, NOT yet complete (owned) */
+    int              blk_cur_x, blk_cur_y;
+    int64_t          blk_grow_us;      /* source pts blk_cur last GREW (the stall timer) */
+    int              blk_cur_open;     /* blk_cur was stall-flushed into the block and may still
+                                        * grow: further growth UPDATES the bottom line in place
+                                        * instead of pushing a new one */
+    int64_t          blk_act_us;       /* source pts of the last caption activity (5s clear) */
+    char            *blk_sent;         /* last block ASS actually queued — re-emit suppression */
+    char            *blk_pfx;          /* the "<readorder>,<layer>,<style>,...,," dialog prefix
+                                        * of the last event, reused when we synthesise ours */
 } CcTap;
 
 /* Shared decode side of the ABR ladder (the ffmpeg model: decode the source
@@ -711,6 +789,37 @@ typedef struct CcCtx {
      * first event of ANY kind for the QUIET watchdog, so it is not a caption position.
      * AV_NOPTS_VALUE until a caption has gone out, and reset by a baseline rebase. */
     int64_t          last_cap_dts;
+    /* ---- REBASE SURVIVAL (1.2.0-pre5) ----
+     * A > PTV_CC_REBASE_US backward house step re-baselines our stamps, but the page a
+     * viewer is looking at was transmitted on the OLD baseline and the muxer's high-water
+     * still sits there. Before pre5 the consequence was measured on air as ccmux= (894/week
+     * on Azorse, 72 on NTD, 35 on Daystar_esp): every teletext packet dropped until content
+     * climbed back past the old high-water, i.e. the caption vanished for the length of the
+     * step.
+     *
+     * The mux high-water CANNOT be dropped — it is lavf's own sti->cur_dts and clearing our
+     * mirror of it only removes [PTV-MUXGUARD]'s protection and EINVALs the muxer (measured;
+     * see the note in cc_emit). So the packets inside the window really are lost, and what
+     * pre5 does instead is RECONCILE THE WIRE TO THE ENCODER at the far edge of the window:
+     * the encoder's display state advanced through every dropped packet, so at the first
+     * accepted stamp we re-assert whatever that state says the viewer should be seeing. */
+    char            *last_cap_ass;            /* ASS of the page currently on screen (owned);
+                                               * NULL when the page is blank */
+    int              page_up;                 /* 1 = last thing emitted put text on screen */
+    int64_t          rebase_hw;               /* stamp the MUXER still held when our baseline
+                                               * rebased (== our last emitted dts). Everything
+                                               * at or below it is refused by [PTV-MUXGUARD];
+                                               * the wire is reconciled on the first event
+                                               * above it. AV_NOPTS_VALUE = not rebasing. */
+    int              rebase_dropped;          /* 1 = at least one packet was emitted inside
+                                               * that window, so the wire is BEHIND the
+                                               * encoder and the crossing must reconcile it */
+    int              rebase_erase_pending;    /* 1 = the reconciliation re-asserted the page
+                                               * only to get the encoder out of its blank
+                                               * state (an erase through a blank encoder
+                                               * encodes to nothing), and the erase the
+                                               * viewer is owed rides the next keepalive */
+    int              rebase_test_fired;       /* TEST ONLY: PTV_CCTEST_REBASE_AT_S, once */
 } CcCtx;
 
 typedef struct AudioState {
@@ -1679,6 +1788,7 @@ extern int64_t g_muxtest_back_at_us;     /* TEST ONLY (pre26 gates): one injecte
                                           * dts at the mux feed, t µs after mux start (0 = off) */
 extern int64_t g_muxtest_back_ms;        /* TEST ONLY: injected backward magnitude (ms) */
 extern int     g_muxdiag;                /* pre26 D3: gated emission-point backward-label instrumentation */
+extern int64_t g_cctest_rebase_at_us;    /* TEST ONLY (pre5): force one CC baseline rebase at t */
 extern int     g_cctest_corrupt;         /* TEST ONLY (F6 gate): mark every Nth decoded video frame
                                           * AV_FRAME_FLAG_CORRUPT (0 = off) */
 extern int     g_prog_off;

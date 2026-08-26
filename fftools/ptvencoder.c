@@ -16,6 +16,7 @@
 #include <unistd.h>   /* getpid() — 1.0.1-pre10 (g) per-PID phase jitter */
 
 #include "libavutil/avutil.h"
+#include "libavutil/bprint.h"
 #include "libavutil/log.h"
 #include "libavutil/opt.h"
 #include "libavutil/time.h"
@@ -42,7 +43,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.2.0-pre4"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.2.0-pre5"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -226,6 +227,13 @@ int     g_muxtest_back_type = AVMEDIA_TYPE_AUDIO; /* TEST ONLY (pre27 #62 GH gat
                                         * PTV_MUXTEST_BACK_TYPE=a|s|d — stream type the injection
                                         * targets (audio default; s/d = sparse guarded streams, to
                                         * verify the ceiling does NOT fire there). */
+/* TEST ONLY (1.2.0-pre5 rebase-survival gate): PTV_CCTEST_REBASE_AT_S=<t> forces ONE
+ * subtitle-baseline rebase in the CC emitter once its house time passes <t>. The live
+ * trigger is an h0 move larger than PTV_CC_REBASE_US, which needs a multiview slot outage
+ * to reproduce — and a source PTS jump cannot stand in for it: [PTV-LAYERA] absorbs those
+ * upstream and the CC tap never sees them (measured, -8.0s jump -> applied_offset 7.829s,
+ * reset=0). 0 = off (default), and the whole path is then byte-inert. */
+int64_t g_cctest_rebase_at_us = 0;
 int     g_cctest_corrupt = 0;      /* TEST ONLY (F6 gate): PTV_CCTEST_CORRUPT_EVERY=N marks every Nth
                                         * decoded video frame AV_FRAME_FLAG_CORRUPT, which is the one
                                         * thing a file fixture cannot produce on demand (real slice
@@ -886,7 +894,6 @@ _Atomic int64_t g_cc_mrect;   /* cc_dec subtitles carrying MORE THAN ONE rect (a
 _Atomic int64_t g_cc_mux;     /* teletext pkts the mux backward-dts guard dropped (wire truth
                                * past the encoder: caps= counts what we handed the muxer, this
                                * counts what the muxer refused) */
-
 /* PTV_LOG_TS=1: prefix every log line with a local wall-clock timestamp
  * [YYYY-MM-DD HH:MM:SS.mmm], so production logs are self-dated natively
  * (replaces piping through `ts`). Wraps libav's line formatter; serialized so
@@ -1326,17 +1333,27 @@ static void cc_tap_flush_pending(CcTap *t, int64_t cur_us, char *ttag)
     t->shown_since_us = cur_us;               /* min-display clock starts now */
 }
 
-/* Hold a source erase back until due_us (see PTV_CC_MIN_DISPLAY_US).
- *   ass != NULL — a clear from the source enters the hold. ccheld counts it ONCE, on entry:
- *                 a roll-up repeats its EDM/EOC, and counting every repeat made ccheld >
- *                 cclate structurally even when nothing was ever lost.
+/* Hold an erase back until due_us (see PTV_CC_MIN_DISPLAY_US).
+ *   ass != NULL — a clear enters the hold. ccheld counts it ONCE, on entry: a roll-up
+ *                 repeats its EDM/EOC, and counting every repeat made ccheld > cclate
+ *                 structurally even when nothing was ever lost.
  *   ass == NULL — RE-ARM: the held clear stays, only its deadline moves. Used whenever a
  *                 page goes up underneath it, so the clear applies to the NEW page's
- *                 minimum display and cannot wipe it after a few ms. */
-static void cc_tap_hold_erase(CcTap *t, const char *ass, uint32_t end_ms, int64_t due_us)
+ *                 minimum display and cannot wipe it after a few ms.
+ *   src         — 1 when the clear came FROM THE SOURCE (an EDM/EOC rect). eheld= is
+ *                 defined as source erases entered into the min-display hold, so block
+ *                 mode's own 5 s silence clear (cc_block_timers) passes 0: it is our
+ *                 synthesis, and counting it made eheld= report source caption-off activity
+ *                 that never happened — on a roll-up source, which almost never sends an
+ *                 EDM, ALL of it. Deferral, re-arming and the wire are identical either
+ *                 way; only the counter differs. (elate=, counted in the emitter off
+ *                 CcEvent.deferred, stays honest by construction: it is the erases that
+ *                 really went out late, whoever asked for them.) */
+static void cc_tap_hold_erase(CcTap *t, const char *ass, uint32_t end_ms, int64_t due_us,
+                              int src)
 {
     if (ass) {
-        if (!t->erase_ass)
+        if (src && !t->erase_ass)
             atomic_fetch_add_explicit(&g_cc_eskip, 1, memory_order_relaxed);
         av_freep(&t->erase_ass);
         t->erase_ass    = av_strdup(ass);
@@ -1344,6 +1361,608 @@ static void cc_tap_hold_erase(CcTap *t, const char *ass, uint32_t end_ms, int64_
     } else if (!t->erase_ass)
         return;                               /* nothing held: nothing to re-arm */
     t->erase_due_us = due_us;
+}
+
+/* ==================== -cc_style block: transmit FINISHED roll-up lines ====================
+ *
+ * See the PTV_CC_STYLE_* header in ptvencoder.h for WHY. This is the HOW, and all of it is
+ * dead code in `faithful` — cc_block_feed() is the single entry point and the only caller
+ * gates on t->style.
+ *
+ * cc_dec (real_time=1) hands us a SNAPSHOT of the whole 608 screen on every caption-memory
+ * change, serialised by screen_to_ass() as one "{\an7}{\pos(x,y)}TEXT" segment per used row,
+ * joined by "\N" (ccaption_dec.c:504). In a roll-up window the LAST segment is the row being
+ * typed and the ones above it are finished lines; a carriage return shifts them all up. So
+ * the whole transformation is: watch the bottom row, publish a line only once the source has
+ * finished it, and hold the completed lines the source is still showing — cc_block_hold() of
+ * them — as one block that scrolls upwards exactly as the source's window does.
+ *
+ * THE TEXT ITSELF IS NEVER REWRITTEN. '>>' speaker markers, music-note rows, indentation and
+ * the source's own line breaks go out verbatim; the only transformation on this path is WHEN
+ * a row is transmitted and which rows are on screen together. (The ♪ -> '*' substitution a
+ * viewer sees happens downstream in the teletext encoder's G0 mapping, because the teletext
+ * character set has no note — that is a charset necessity, not a style choice, and it applies
+ * to `faithful` identically.) */
+
+#define CC_BLK_MAX_ROWS 24     /* 15 rows on a 608 screen + slack for multi-rect captions */
+#define CC_BLK_DEPTH_MIN_OBS 2 /* carriage returns needed before a measured window depth is
+                                * believed over the RU3 assumption (see cc_block_hold) */
+#define CC_BLK_MAX_WINDOW 4    /* EIA-608 roll-up is RU2/RU3/RU4 — no window is deeper, so a
+                                * carriage-return snapshot with more rows than this is not a
+                                * window at all (text an earlier pop-on caption left elsewhere
+                                * on the 608 screen is still in the snapshot) and must not be
+                                * read as depth. See cc_block_observe_depth(). */
+
+typedef struct CcRows {
+    char *buf;                       /* owned; the row texts are NUL-terminated inside it */
+    char *text[CC_BLK_MAX_ROWS];     /* per row, past its position prefix */
+    int   x[CC_BLK_MAX_ROWS];
+    int   y[CC_BLK_MAX_ROWS];
+    int   n;
+} CcRows;
+
+/* Start of the text field of a cc_dec ASS dialog line: past the 8th comma of
+ * "<readorder>,<layer>,<style>,<speaker>,0,0,0,,<text>" (ff_ass_get_dialog) — the same
+ * boundary cc_ass_has_text() uses. NULL when the line is not that shape. */
+static const char *cc_ass_text(const char *ass)
+{
+    const char *p = ass;
+    int commas = 0;
+
+    for (; *p && commas < 8; p++)
+        if (*p == ',')
+            commas++;
+    return commas < 8 ? NULL : p;
+}
+
+/* Step over the leading "{\an..}" / "{\pos(x,y)}" blocks cc_dec puts at the head of every
+ * row, returning the first byte after them and reporting the position it announced. Any
+ * OTHER override block ({\i1}, colours) is left in place — it is part of the row's text and
+ * we re-emit it verbatim. x/y are set to -1 when the row carried no \pos. */
+static char *cc_row_strip_pos(char *row, int *x, int *y)
+{
+    *x = *y = -1;
+    while (row[0] == '{' && row[1] == '\\') {
+        char *close = strchr(row, '}');
+        int rx, ry;
+        if (!close)
+            break;
+        if (!strncmp(row + 1, "\\pos(", 5) &&
+            sscanf(row + 6, "%d,%d", &rx, &ry) == 2) {
+            *x = rx;
+            *y = ry;
+        } else if (strncmp(row + 1, "\\an", 3)) {
+            break;                     /* neither \an nor \pos: real markup, keep it */
+        }
+        row = close + 1;
+    }
+    return row;
+}
+
+/* Split one cc_dec ASS dialog line into its rows. Returns 0 on success (rows->n may be 0). */
+static int cc_rows_parse(CcRows *rows, const char *ass)
+{
+    const char *txt = cc_ass_text(ass);
+    char *p;
+
+    memset(rows, 0, sizeof(*rows));
+    if (!txt)
+        return -1;
+    rows->buf = av_strdup(txt);
+    if (!rows->buf)
+        return AVERROR(ENOMEM);
+    for (p = rows->buf; *p && rows->n < CC_BLK_MAX_ROWS; ) {
+        char *nl = strstr(p, "\\N");
+        if (nl)
+            *nl = 0;
+        rows->text[rows->n] = cc_row_strip_pos(p, &rows->x[rows->n], &rows->y[rows->n]);
+        rows->n++;
+        if (!nl)
+            break;
+        p = nl + 2;
+    }
+    return 0;
+}
+
+static void cc_rows_free(CcRows *rows) { av_freep(&rows->buf); }
+
+/* First byte of REAL CONTENT in a row: past override blocks, the \h/\N/\n escapes and
+ * whitespace. NULL when the row has none. Deliberately the same markup vocabulary
+ * cc_ass_has_text() knows — the two must agree on what "empty" means. */
+static const char *cc_row_content(const char *s)
+{
+    for (; *s; s++) {
+        if (s[0] == '{' && s[1] == '\\') {
+            while (*s && *s != '}')
+                s++;
+            if (!*s)
+                return NULL;
+            continue;
+        }
+        if (s[0] == '\\' && (s[1] == 'N' || s[1] == 'n' || s[1] == 'h')) {
+            s++;
+            continue;
+        }
+        if (*s != ' ' && *s != '\t')
+            return s;
+    }
+    return NULL;
+}
+
+/* Does `s` continue `pfx` — i.e. is the row still the same line, with more typed onto it?
+ * Equality counts (a repeated snapshot is still the same line). */
+static int cc_str_extends(const char *s, const char *pfx)
+{
+    size_t n = strlen(pfx);
+    return !strncmp(s, pfx, n);
+}
+
+/* Same question, asked of a row cc_dec RE-RENDERED: does `s` continue `pfx` if the LAST
+ * CHARACTER of `pfx` is allowed to have changed?
+ *
+ * cc_dec does re-render. Measured on AWE (300 s, 3 occurrences): a typewriter apostrophe is
+ * delivered as U+2019 at the end of one snapshot and re-sent as U+2018 in the next —
+ * `in the late ’` then `in the late ‘70s`. cc_str_extends() says no, and the still-growing
+ * row falls out of the growth branch into screen-replacement handling, where it must NOT be
+ * mistaken for finished text. UTF-8 aware: the last character is stepped over as a whole, so
+ * a multi-byte codepoint counts once and a one-character `pfx` is never a match (nothing is
+ * left to agree on). */
+static int cc_str_continues(const char *s, const char *pfx)
+{
+    size_t n = strlen(pfx);
+
+    if (strlen(s) < n)
+        return 0;                          /* shorter: not a continuation of anything */
+    while (n > 0 && ((unsigned char)pfx[--n] & 0xC0) == 0x80)
+        ;                                  /* step back over UTF-8 continuation bytes */
+    return n > 0 && !strncmp(s, pfx, n);
+}
+
+/* Forget the assembly, keep the latch. Used by a source erase, a timeline rebase, and
+ * shutdown. The LATCH survives on purpose: a glued timeline or an ad break does not change
+ * how the channel captions, and re-earning the latch costs a whole line of dialogue. */
+static void cc_block_reset(CcTap *t)
+{
+    int i;
+    for (i = 0; i < PTV_CC_BLOCK_MAX_LINES; i++)
+        av_freep(&t->blk_line[i]);
+    t->blk_n = 0;
+    av_freep(&t->blk_cur);
+    av_freep(&t->blk_sent);
+    t->blk_cur_open = 0;
+    t->blk_grew     = 0;
+}
+
+/* HOW MANY COMPLETED LINES THE BLOCK HOLDS — the rule, verbatim:
+ *
+ *   hold = clip(the SOURCE's roll-up window depth - 1, 1, PTV_CC_BLOCK_MAX_LINES)
+ *
+ * The window depth is the source's own RU2/RU3/RU4 choice, counted off the snapshot at a
+ * carriage return (cc_block_feed) rather than assumed. Subtracting one removes the row that
+ * is being typed right now — the only row of the window a teletext viewer must not see — so
+ * what goes on the wire is exactly what an American viewer of this channel has on screen
+ * minus the half-written line. RU3 (the common US news window) => 2 completed lines, RU4 =>
+ * 3, RU2 => 1. Until the depth has been MEASURED the RU3 shape is assumed, because it is by
+ * far the commonest and because erring towards it errs towards holding a line too long rather
+ * than dropping one the viewer can see.
+ *
+ * ONE carriage return is not a measurement: a window that has just started shows two rows
+ * whatever its RU setting is (one completed line plus the row being typed), so trusting the
+ * first return would drop the opening line of a channel — measured on AWE, `>> Welcome to
+ * Travel in Style,` disappeared from the wire at 54.888s. CC_BLK_DEPTH_MIN_OBS returns are
+ * required before the measurement displaces the assumption, which costs one more line of
+ * dialogue and converges at the same carriage return for RU2 and RU3 alike.
+ *
+ * hold is a CEILING, not a quota: the block only ever contains lines the source has actually
+ * finished, so a window that has just restarted shows one line even where hold is 2. */
+static int cc_block_hold(const CcTap *t)
+{
+    int depth = t->blk_depth_obs >= CC_BLK_DEPTH_MIN_OBS ? t->blk_depth : 3;
+
+    return av_clip(depth - 1, 1, PTV_CC_BLOCK_MAX_LINES);
+}
+
+/* Learn the source's window depth from a carriage-return snapshot: the DEEPEST such snapshot
+ * this input has produced.
+ *
+ * The instantaneous row count is NOT the depth. A roll-up window starts empty and fills, so
+ * the first carriage return after a clear shows two rows (one completed line plus the row
+ * being typed) whatever the source's RU setting is — reading that as "RU2" would drop a line
+ * the viewer can see as soon as the window fills. The deepest snapshot, on the other hand,
+ * IS the RU setting: the window cannot show more rows than it has. Measured on AWE (RU3,
+ * confirmed against its EIA-608 control codes): 23 carriage returns show 3 rows, 4 show 2,
+ * and every one of those 4 is the first return of a caption burst.
+ *
+ * The alternative — assuming RU3 and never lowering — cannot see a two-row source at all, and
+ * RU2 channels exist (Newsmax2, measured). See cc_block_hold() for why the first return does
+ * not count. */
+static void cc_block_observe_depth(CcTap *t, int rows_n)
+{
+    if (rows_n < 2 || rows_n > CC_BLK_MAX_WINDOW)
+        return;                        /* not a window: nothing to learn from it */
+    if (t->blk_depth_obs < CC_BLK_DEPTH_MIN_OBS)
+        t->blk_depth_obs++;
+    if (rows_n > t->blk_depth)
+        t->blk_depth = rows_n;
+}
+
+/* Append one FINISHED line to the block, keeping at most `hold` of them. The stack SCROLLS
+ * UP: when it is already holding that many the oldest drops off the top and the new line
+ * enters at the bottom, which is the source window's own motion. The loop (rather than a
+ * single shift) is what makes a REDUCED hold take effect on the next line rather than over
+ * several. It is NOT there for "a source that narrowed its window": cc_block_observe_depth()
+ * keeps a running MAX and never lowers blk_depth. The two reachable ways the hold drops are
+ *   (a) the ONE-TIME assumption-to-measurement transition — hold is 2 until the RU3 default
+ *       is displaced (cc_block_hold), so a measured 2-row window takes it to 1 with two
+ *       lines already held, and
+ *   (b) block mode's own screen-replacement branch, which fills the block to the storage
+ *       bound (PTV_CC_BLOCK_MAX_LINES) for a pop-on flip — deeper than the roll-up hold —
+ *       and the very next roll-up push trims it back in one step.
+ *
+ * The text is stored EXACTLY as the source wrote it. */
+static void cc_block_push_n(CcTap *t, const char *text, int x, int hold)
+{
+    int i;
+    char *line;
+
+    if (!cc_row_content(text))
+        return;
+    line = av_strdup(text);
+    if (!line)
+        return;
+    while (t->blk_n >= hold) {
+        av_freep(&t->blk_line[0]);
+        for (i = 1; i < t->blk_n; i++) {
+            t->blk_line[i - 1] = t->blk_line[i];
+            t->blk_lx[i - 1]   = t->blk_lx[i];
+        }
+        t->blk_n--;
+        t->blk_line[t->blk_n] = NULL;
+    }
+    t->blk_line[t->blk_n] = line;
+    t->blk_lx[t->blk_n]   = x;
+    t->blk_n++;
+}
+
+/* The roll-up push: bounded by the source's own window depth (cc_block_hold). */
+static void cc_block_push(CcTap *t, const char *text, int x)
+{
+    cc_block_push_n(t, text, x, cc_block_hold(t));
+}
+
+/* Replace the bottom line in place — a stall-flushed line that the speaker then continued. */
+static void cc_block_update_bottom(CcTap *t, const char *text, int x)
+{
+    char *line;
+
+    if (t->blk_n <= 0 || !cc_row_content(text))
+        return;
+    line = av_strdup(text);
+    if (!line)
+        return;
+    av_freep(&t->blk_line[t->blk_n - 1]);
+    t->blk_line[t->blk_n - 1] = line;
+    t->blk_lx[t->blk_n - 1]   = x;
+}
+
+/* Render the block as one cc_dec-shaped ASS dialog line.
+ *
+ * Every line is given the SAME y — the newest line's. That is what makes the encoder treat
+ * the block as one contiguous band: ttx_row_from_cea_row() maps that y to a base row and the
+ * lines are laid consecutively upwards from it (dvbteletextenc.c), so a bottom-band block
+ * lands on rows 22+23 (three lines: 21+22+23) exactly like a multi-row caption does today,
+ * and a block the source put at the top of the screen still lands at the top. Each line keeps
+ * its OWN x, so indentation survives. */
+static char *cc_block_build(CcTap *t)
+{
+    AVBPrint bp;
+    char *out = NULL;
+    int i;
+
+    if (t->blk_n <= 0)
+        return NULL;
+    av_bprint_init(&bp, 0, AV_BPRINT_SIZE_UNLIMITED);
+    av_bprintf(&bp, "%s", t->blk_pfx ? t->blk_pfx : "0,0,Default,,0,0,0,,");
+    for (i = 0; i < t->blk_n; i++) {
+        if (i)
+            av_bprintf(&bp, "\\N");
+        av_bprintf(&bp, "{\\an7}{\\pos(%d,%d)}%s",
+                   t->blk_lx[i] >= 0 ? t->blk_lx[i] : 0,
+                   t->blk_y      >= 0 ? t->blk_y      : 0,
+                   t->blk_line[i]);
+    }
+    if (av_bprint_finalize(&bp, &out) < 0)
+        return NULL;
+    return out;
+}
+
+/* Put the current block on the wire. Goes through the SAME flush the debounce path uses, so
+ * the minimum-display clock starts and any clear held from the previous page is re-armed
+ * against this one — none of that machinery knows or cares that block mode built the text. */
+static void cc_block_emit(CcTap *t, int64_t cur_us, char *ttag)
+{
+    char *ass = cc_block_build(t);
+
+    if (!ass)
+        return;
+    if (t->blk_sent && !strcmp(t->blk_sent, ass)) {
+        av_freep(&ass);                    /* nothing changed: no wire update */
+        return;
+    }
+    av_freep(&t->blk_sent);
+    t->blk_sent = av_strdup(ass);
+    av_freep(&t->pend_ass);
+    t->pend_ass    = ass;                  /* ownership moves to the tap, then to the event */
+    t->pend_end_ms = PTV_CC_MAX_DISPLAY_MS;
+    cc_tap_flush_pending(t, cur_us, ttag);
+    cc_tap_hold_erase(t, NULL, 0, cur_us + PTV_CC_MIN_DISPLAY_US, 0);
+}
+
+/* ---- the state machine ----
+ *
+ * ROLL-UP DETECTION RULE (verbatim, because getting it wrong would add latency to channels
+ * that are already correct):
+ *
+ *   A tap enters block assembly only after it has POSITIVELY OBSERVED A ROLL-UP CARRIAGE
+ *   RETURN, which is two things together in consecutive snapshots:
+ *     (1) GROWTH  — the bottom row's text was seen to gain characters while keeping its
+ *                   existing text as a prefix, and
+ *     (2) SCROLL  — that exact text then reappeared verbatim on the row DIRECTLY ABOVE the
+ *                   new bottom row.
+ *   Only a scrolling window produces both. A POP-ON source cannot produce (1) at all: it
+ *   builds its caption in the non-displayed memory and flips the whole screen on EOC, so
+ *   cc_dec serialises the ACTIVE screen and successive text events never extend one another.
+ *   A PAINT-ON source can produce (1) but never (2) — it writes onto the displayed screen
+ *   without ever shifting it. And (2) alone can happen on pop-on by coincidence (a caption
+ *   whose first line repeats the previous caption's last line), which is why neither half is
+ *   sufficient on its own.
+ *
+ * The latch is per-tap (so multiview slots decide independently), arms once, and does not
+ * disarm — see cc_block_reset(). Until it arms, this function returns 0 for every event and
+ * the tap behaves exactly as `faithful` does.
+ *
+ * Returns 1 when block assembly consumed the event (the caller must not also run the
+ * faithful debounce on it), 0 to fall through to the pre4 path. */
+static int cc_block_feed(CcTap *t, const char *ass, int64_t cur_us, char *ttag)
+{
+    CcRows rows;
+    const char *bottom;
+    int bx, by;
+
+    if (cc_rows_parse(&rows, ass) < 0 || rows.n <= 0) {
+        cc_rows_free(&rows);
+        return 0;                          /* not a shape we understand: leave it alone */
+    }
+    /* keep the dialog prefix of the real events so ours look identical to cc_dec's */
+    {
+        const char *txt = cc_ass_text(ass);
+        if (txt && (!t->blk_pfx || strncmp(t->blk_pfx, ass, (size_t)(txt - ass)))) {
+            av_freep(&t->blk_pfx);
+            t->blk_pfx = av_strndup(ass, (size_t)(txt - ass));
+        }
+    }
+    bottom = rows.text[rows.n - 1];
+    bx     = rows.x[rows.n - 1];
+    by     = rows.y[rows.n - 1];
+
+    if (!t->blk_rollup) {
+        /* --- pre-latch: watch only, emit nothing of our own --- */
+        if (t->blk_cur && cc_str_extends(bottom, t->blk_cur) &&
+            strlen(bottom) > strlen(t->blk_cur))
+            t->blk_grew = 1;                                        /* (1) GROWTH */
+        if (t->blk_cur && t->blk_cur[0] && t->blk_grew && rows.n >= 2 &&
+            cc_str_extends(rows.text[rows.n - 2], t->blk_cur)) {    /* (2) SCROLL */
+            t->blk_rollup = 1;
+            if (!t->blk_latch_logged) {
+                t->blk_latch_logged = 1;
+                av_log(NULL, AV_LOG_INFO,
+                       "[PTV-CC]%s roll-up window detected — assembling whole-line blocks "
+                       "(-cc_style block)\n", cc_tap_tag(t, ttag, sizeof(char[16])));
+            }
+            /* This very snapshot IS the carriage return: the line we watched grow is
+             * finished and sits above the new bottom row. It is therefore also the first
+             * sight of the SOURCE'S WINDOW DEPTH — the rows the window occupies — which is
+             * what cc_block_hold() turns into the number of completed lines we hold. Seed
+             * the block from the rows already on screen, oldest first, then start watching
+             * the new bottom row. */
+            {
+                int first, i;
+                cc_block_observe_depth(t, rows.n);
+                first = rows.n - 1 - cc_block_hold(t);
+                if (first < 0)
+                    first = 0;
+                /* by == -1 = "this row carried no \pos" (cc_row_strip_pos). Keep the last
+                 * known y rather than storing the sentinel — cc_block_build() would turn it
+                 * into an explicit \pos(0,0) and move the whole block to the top of the
+                 * screen. Unreachable from today's cc_dec, which positions every row; the
+                 * same guard is on the other two writers of blk_y. */
+                t->blk_y = by >= 0 ? by : t->blk_y;
+                for (i = first; i < rows.n - 1; i++)
+                    cc_block_push(t, rows.text[i], rows.x[i]);
+            }
+            av_freep(&t->blk_cur);
+            t->blk_cur      = av_strdup(bottom);
+            t->blk_cur_x    = bx;
+            t->blk_cur_y    = by;
+            t->blk_cur_open = 0;
+            t->blk_grow_us  = cur_us;
+            t->blk_act_us   = cur_us;
+            cc_block_emit(t, cur_us, ttag);
+            cc_rows_free(&rows);
+            return 1;
+        }
+        av_freep(&t->blk_cur);
+        t->blk_cur   = av_strdup(bottom);
+        t->blk_cur_x = bx;
+        t->blk_cur_y = by;
+        cc_rows_free(&rows);
+        return 0;                          /* faithful path handles it until we are sure */
+    }
+
+    /* --- latched: assemble --- */
+    if (t->blk_cur && cc_str_extends(bottom, t->blk_cur)) {
+        /* STILL GROWING (or an identical retransmission). The partial NEVER goes on the
+         * wire — this is the whole point of the mode. */
+        if (strcmp(bottom, t->blk_cur)) {
+            av_freep(&t->blk_cur);
+            t->blk_cur     = av_strdup(bottom);
+            t->blk_grow_us = cur_us;
+            t->blk_act_us  = cur_us;
+            if (t->blk_cur_open) {
+                /* already published by the stall rule and the speaker resumed: update the
+                 * bottom line in place rather than pushing a second line for one sentence */
+                cc_block_update_bottom(t, bottom, bx);
+                cc_block_emit(t, cur_us, ttag);
+            }
+        }
+        t->blk_cur_x = bx;
+        t->blk_cur_y = by;
+    } else if (t->blk_cur && t->blk_cur[0] && rows.n >= 2 &&
+               cc_str_extends(rows.text[rows.n - 2], t->blk_cur)) {
+        /* SCROLLED: the row we were watching moved up, so it is finished. Advance the
+         * block — this is the one place a wire update is due in steady-state roll-up, and
+         * it is why the cadence becomes line-completion instead of 0.4s.
+         *
+         * EXTENDS, not equals, and the text that goes into the block is the ROW ABOVE — not
+         * blk_cur. cc_dec routinely delivers the last characters of a line together with the
+         * carriage return that ends it, so the finished line is usually LONGER than the
+         * partial we last saw. Testing for equality there missed the scroll entirely, fell
+         * through to the screen-replacement branch and dropped a line out of the block
+         * (caught by blocktest T1: "AND WELCOME" vanished between two updates).
+         *
+         * A carriage return is also where the SOURCE'S WINDOW DEPTH is visible — the number
+         * of rows the window occupies — so every scroll feeds cc_block_observe_depth(). */
+        cc_block_observe_depth(t, rows.n);
+        if (!t->blk_cur_open)
+            cc_block_push(t, rows.text[rows.n - 2], rows.x[rows.n - 2]);
+        else
+            cc_block_update_bottom(t, rows.text[rows.n - 2], rows.x[rows.n - 2]);
+        t->blk_y = by >= 0 ? by : t->blk_y;
+        av_freep(&t->blk_cur);
+        t->blk_cur      = av_strdup(bottom);
+        t->blk_cur_x    = bx;
+        t->blk_cur_y    = by;
+        t->blk_cur_open = 0;
+        t->blk_grow_us  = cur_us;
+        t->blk_act_us   = cur_us;
+        cc_block_emit(t, cur_us, ttag);
+    } else {
+        /* SCREEN REPLACEMENT — the snapshot has no relation to the row we were watching.
+         * Reachable as a pop-on flip inside an otherwise roll-up channel (ad breaks do this),
+         * as a scene/programme change, and as the first snapshot after a source erase.
+         *
+         * COMPLETENESS RULE, verbatim:
+         *
+         *   A screen replacement is COMPLETE CONTENT — every row of it, the bottom one
+         *   included, goes on the wire at once — when and only when BOTH of these hold:
+         *
+         *     (1) A ROLL-UP ROW WAS BEING TRACKED (blk_cur non-empty). After
+         *         cc_block_reset() — a source EDM, block mode's own 5 s clear, a rebase —
+         *         we know nothing about the state of the source's window, and its next
+         *         snapshot routinely arrives with the rows the 608 screen still holds plus
+         *         a bottom row that is mid-word (measured on AWE: 2 rows, bottom `an`,
+         *         which grew to `and also, a ry`). Nothing tracked => the bottom row is a
+         *         partial. This is also what a roll-up window RESTART looks like.
+         *
+         *     (2) THE NEW BOTTOM ROW IS NOT A CONTINUATION of the tracked row
+         *         (cc_str_continues). cc_dec re-renders characters — measured on AWE, a
+         *         typewriter apostrophe arrives as U+2019 and is re-sent as U+2018, three
+         *         times in 300 s — which breaks the prefix test in the growth branch and
+         *         drops a row that is STILL BEING TYPED into this one:
+         *         `in the late ’` -> `in the late ‘70s`. Publishing that is a half-written
+         *         line on the wire, the one thing this mode exists to prevent.
+         *
+         *   Otherwise the bottom row is held as a partial and only the rows above it go up,
+         *   which is what this branch did before.
+         *
+         * A pop-on flip was previously held back a row unconditionally: only rows[..n-2]
+         * went up and the caption's LAST line waited for the 2.5 s stall timer, so an ad
+         * break's one-line "CLOSED CAPTIONING BY..." reached the viewer 2.5 s late and a
+         * two-line caption arrived half now, half 2.6 s later. A flip over live roll-up
+         * content is finished text by definition, and now goes out whole, at once.
+         *
+         * RESIDUAL, stated rather than hidden: a pop-on flip arriving when nothing was being
+         * tracked (the first caption after an EDM or after the 5 s clear) fails (1) and is
+         * still held for the stall timer. Rule (1) is what keeps the no-partials invariant
+         * honest, and holding is the safe direction — the cost is latency on a caption, the
+         * alternative is a half-word on the wire.
+         *
+         * The COMPLETE case fills the block to its STORAGE bound rather than the roll-up
+         * hold, so a 2-line pop-on survives on an RU2 channel (hold 1) instead of losing its
+         * first line; the next roll-up push trims the block back to the hold.
+         *
+         * blk_depth is NOT re-read here: a screen replacement is not a carriage return, so
+         * its row count says nothing about the roll-up window (a pop-on flip inside a
+         * roll-up channel routinely shows a different number of rows). The next real scroll
+         * measures it again. */
+        int complete = t->blk_cur && t->blk_cur[0] &&
+                       !cc_str_continues(bottom, t->blk_cur);
+        int last     = complete ? rows.n : rows.n - 1;   /* rows that count as FINISHED */
+        int hold     = complete ? PTV_CC_BLOCK_MAX_LINES : cc_block_hold(t);
+        int first    = last - hold;
+        int i;
+        if (first < 0)
+            first = 0;
+        cc_block_reset(t);
+        t->blk_y = by >= 0 ? by : t->blk_y;
+        for (i = first; i < last; i++)
+            cc_block_push_n(t, rows.text[i], rows.x[i], hold);
+        t->blk_cur      = av_strdup(bottom);
+        t->blk_cur_x    = bx;
+        t->blk_cur_y    = by;
+        /* OPEN when the bottom row already went up: a flip the source then extends (it does
+         * happen — a pop-on caption corrected in place) updates that line rather than
+         * pushing a duplicate, and neither the stall timer nor a source EDM re-publishes it. */
+        t->blk_cur_open = complete;
+        t->blk_grow_us  = cur_us;
+        t->blk_act_us   = cur_us;
+        if (t->blk_n > 0)
+            cc_block_emit(t, cur_us, ttag);
+    }
+    cc_rows_free(&rows);
+    return 1;
+}
+
+/* The two block-mode timers, run once per frame from cc_tap_frame's timer section.
+ * Returns 1 when it emitted something (the caller stops there, like the other timers). */
+static int cc_block_timers(CcTap *t, int64_t cur_us, char *ttag)
+{
+    /* STALL: a line that stopped growing mid-sentence is finished as far as the viewer is
+     * concerned — publish it, but keep it open so a resuming speaker extends it in place
+     * instead of starting a second line. */
+    if (t->blk_cur && !t->blk_cur_open && cc_row_content(t->blk_cur) &&
+        t->blk_grow_us && cur_us - t->blk_grow_us >= PTV_CC_BLOCK_STALL_US) {
+        cc_block_push(t, t->blk_cur, t->blk_cur_x);
+        if (t->blk_cur_y >= 0)
+            t->blk_y = t->blk_cur_y;
+        t->blk_cur_open = 1;
+        cc_block_emit(t, cur_us, ttag);
+        return 1;
+    }
+    /* CLEAR: no new characters anywhere for PTV_CC_BLOCK_CLEAR_US. A roll-up source almost
+     * never sends an EDM (measured on NTD/Weather_nation/Newsmax2: zero), so without this the
+     * block would sit on screen until the next speaker — or until the encoder's 10s stale
+     * timer, which is a backstop, not a presentation rule. Synthesised as a source-shaped
+     * erase and handed to the SAME deferred-erase machinery, so the minimum-display rule
+     * still protects the last block — but NOT counted as a source erase (the `src` argument
+     * of cc_tap_hold_erase): eheld= means "the source asked for a blank screen early", and
+     * this one is ours. */
+    if (t->blk_n > 0 && t->blk_act_us &&
+        cur_us - t->blk_act_us >= PTV_CC_BLOCK_CLEAR_US) {
+        /* the dialog prefix with an EMPTY text field = what a source erase looks like coming
+         * out of cc_dec (see cc_ass_has_text). Roomy: a truncated prefix would lose the 8th
+         * comma and then read as CONTENT, not as an erase. */
+        char erase[160];
+        snprintf(erase, sizeof erase, "%s", t->blk_pfx ? t->blk_pfx : "0,0,Default,,0,0,0,,");
+        cc_block_reset(t);
+        t->blk_act_us = 0;                 /* armed once per block */
+        cc_tap_hold_erase(t, erase, 0,
+                          t->shown_since_us != AV_NOPTS_VALUE
+                              ? t->shown_since_us + PTV_CC_MIN_DISPLAY_US : cur_us,
+                          0);          /* OURS, not the source's: eheld= must not count it */
+        return 0;                          /* the erase timer below puts it on the wire */
+    }
+    return 0;
 }
 
 /* Classify and act on ONE cc_dec rect (see the two branches' own comments).
@@ -1357,6 +1976,17 @@ static int cc_tap_rect(CcTap *t, const char *ass, int end_ms, int64_t cur_us, ch
     CcEvent ev = { NULL, cur_us, (uint32_t)end_ms, PTV_CC_ERASE };
 
     if (cc_ass_has_text(ass)) {
+        /* -cc_style block: new text supersedes a deferred clear here exactly as it does
+         * below, and it must be dropped BEFORE the block emits — otherwise cc_block_emit's
+         * re-arm would park that stale clear on the block that just went up. Once the
+         * roll-up latch has armed, cc_block_feed() owns this path entirely; before it arms
+         * it only watches and returns 0, so `faithful` and an unlatched source run the
+         * identical pre4 code below. */
+        if (t->style == PTV_CC_STYLE_BLOCK) {
+            av_freep(&t->erase_ass);
+            if (cc_block_feed(t, ass, cur_us, ttag))
+                return 1;
+        }
         /* DEBOUNCE (see PTV_CC_DEBOUNCE_US): buffer it. Only a CHANGE restarts the
          * silence timer — an identical retransmission must not keep the caption
          * pending forever. */
@@ -1385,9 +2015,32 @@ static int cc_tap_rect(CcTap *t, const char *ass, int end_ms, int64_t cur_us, ch
      * cancels it. */
     /* NOTE shown_since_us is AV_NOPTS_VALUE until a page has actually gone up (and
      * again after a timeline rebase): no page on screen => no minimum to enforce. */
+    /* -cc_style block: the source asked for a blank screen.
+     *
+     * The row still being typed when that clear arrived is the LAST LINE THE VIEWER HEARD,
+     * and it has not been published yet — a roll-up paragraph's closing line never scrolls,
+     * so nothing but the 2.5s stall rule would ever finish it, and the source's EDM
+     * routinely beats that. Publish it FIRST, which is the same rule the faithful path
+     * applies to its pending caption below. Without this the closing line of every
+     * paragraph was silently dropped: measured on AWE, 7 sentence-final lines ('the very
+     * best of the best.', 'on the border of Argentina.', ...) present in the faithful wire
+     * and absent from the block one.
+     *
+     * The clear itself then takes the unchanged pre4 path below, so it is still deferred
+     * against this block's minimum display — an explicit EDM clears exactly as it does
+     * today, block mode or not. */
+    if (t->style == PTV_CC_STYLE_BLOCK) {
+        if (t->blk_rollup && t->blk_cur && !t->blk_cur_open && cc_row_content(t->blk_cur)) {
+            cc_block_push(t, t->blk_cur, t->blk_cur_x);
+            if (t->blk_cur_y >= 0)
+                t->blk_y = t->blk_cur_y;
+            cc_block_emit(t, cur_us, ttag);
+        }
+        cc_block_reset(t);
+    }
     if (t->shown_since_us != AV_NOPTS_VALUE &&
         cur_us - t->shown_since_us < PTV_CC_MIN_DISPLAY_US) {
-        cc_tap_hold_erase(t, ass, end_ms, t->shown_since_us + PTV_CC_MIN_DISPLAY_US);
+        cc_tap_hold_erase(t, ass, end_ms, t->shown_since_us + PTV_CC_MIN_DISPLAY_US, 1);
         return 1;
     }
     /* Whatever is pending was on screen up to now, so it must go out BEFORE the
@@ -1398,7 +2051,7 @@ static int cc_tap_rect(CcTap *t, const char *ass, int end_ms, int64_t cur_us, ch
      * exactly like an early erase. */
     if (t->pend_ass) {
         cc_tap_flush_pending(t, cur_us, ttag);
-        cc_tap_hold_erase(t, ass, end_ms, cur_us + PTV_CC_MIN_DISPLAY_US);
+        cc_tap_hold_erase(t, ass, end_ms, cur_us + PTV_CC_MIN_DISPLAY_US, 1);
         return 1;
     }
     av_freep(&t->erase_ass);              /* this erase supersedes any deferred one */
@@ -1444,6 +2097,11 @@ static void cc_tap_frame(CcTap *t, AVFrame *frame, AVRational ist_tb)
          * timeout — ccheld climbing with cclate flat. */
         av_freep(&t->erase_ass);
         t->shown_since_us = AV_NOPTS_VALUE;
+        /* -cc_style block: the half-assembled block belongs to the old timeline too, and its
+         * stall/clear deadlines are on that dead axis. The roll-up LATCH deliberately
+         * survives — a glued timeline does not change how the channel captions. */
+        cc_block_reset(t);
+        t->blk_grow_us = t->blk_act_us = 0;
         atomic_fetch_add_explicit(&g_cc_reset, 1, memory_order_relaxed);
         av_log(NULL, AV_LOG_INFO,
                "[PTV-CC]%s source pts stepped back %"PRId64"ms — cc_dec state reset\n",
@@ -1530,6 +2188,12 @@ static void cc_tap_frame(CcTap *t, AVFrame *frame, AVRational ist_tb)
     }
 
     /* --- the timers --- */
+    /* -cc_style block, FIRST: the stall rule can finish a line and put the block up, and the
+     * 5s clear rule arms a synthesised erase that the erase timer immediately below then
+     * delivers under the normal minimum-display rule. */
+    if (t->style == PTV_CC_STYLE_BLOCK && t->blk_rollup &&
+        cc_block_timers(t, cur_us, ttag))
+        goto strip;
     /* A deferred source erase whose minimum-display time has now elapsed. A caption CAN be
      * pending at the same time — the clear was deferred against the OUTGOING page's clock,
      * so its deadline can fall before the debounce timer of text that arrived after it. The
@@ -1538,7 +2202,7 @@ static void cc_tap_frame(CcTap *t, AVFrame *frame, AVRational ist_tb)
     if (t->erase_ass && cur_us >= t->erase_due_us) {
         if (t->pend_ass) {
             cc_tap_flush_pending(t, cur_us, ttag);
-            cc_tap_hold_erase(t, NULL, 0, cur_us + PTV_CC_MIN_DISPLAY_US);
+            cc_tap_hold_erase(t, NULL, 0, cur_us + PTV_CC_MIN_DISPLAY_US, 0);
         } else {
             CcEvent ee = { t->erase_ass, cur_us, t->erase_end_ms, PTV_CC_ERASE, 1 };
             t->erase_ass = NULL;
@@ -1555,7 +2219,7 @@ static void cc_tap_frame(CcTap *t, AVFrame *frame, AVRational ist_tb)
          * the new page's own minimum display. Without this, an erase that arrived while
          * this text was already buffered fired at the old page's deadline and the new
          * caption lasted as little as 50ms. */
-        cc_tap_hold_erase(t, NULL, 0, cur_us + PTV_CC_MIN_DISPLAY_US);
+        cc_tap_hold_erase(t, NULL, 0, cur_us + PTV_CC_MIN_DISPLAY_US, 0);
         goto strip;
     }
     if (t->last_evt_us == AV_NOPTS_VALUE) {
@@ -2514,8 +3178,34 @@ static int cc_setup(CcCtx *cc, CcTap *tap, AVThreadMessageQueue **cc_q,
     const char *cclang = og_get(&outs->groups[0], "cc_lang");
     const char *ccpage = og_get(&outs->groups[0], "cc_page");
     const char *ccmag  = og_get(&outs->groups[0], "cc_magazine");
+    const char *ccsty  = getenv("PTV_CC_STYLE");
     AVCodecContext *ce;
     int subset, page, magazine, r, k, ret;
+
+    /* --- presentation style (-cc_style, env PTV_CC_STYLE wins so a box can be flipped
+     * without touching its channel config). ONE value for the whole run, exactly like
+     * -cc_lang: on multiview every slot assembles independently (the latch and the block
+     * live in each slot's own CcTap) but they all run the same style. --- */
+    if (!ccsty || !ccsty[0])
+        ccsty = og_get(&outs->groups[0], "cc_style");
+    if (!ccsty || !ccsty[0] || !strcmp(ccsty, "faithful"))
+        tap->style = PTV_CC_STYLE_FAITHFUL;
+    else if (!strcmp(ccsty, "block"))
+        tap->style = PTV_CC_STYLE_BLOCK;
+    else {
+        av_log(NULL, AV_LOG_ERROR,
+               "[PTV-CC] -cc_style \"%s\": expected \"faithful\" (default — transmit every "
+               "cc_dec snapshot verbatim, the teletext page mirrors the CC) or \"block\" "
+               "(opt-in — transmit only lines the source has finished, roll-up sources "
+               "only)\n", ccsty);
+        return AVERROR(EINVAL);
+    }
+    /* ONCE per run, not once per input: `sidx` is the EXTRACTION index, which is 0 for the
+     * first participating input whatever its input index is. Gating on `slot` (the input
+     * index) printed nothing at all on a multiview whose -cc_slots excludes input 0. */
+    if (!sidx)
+        av_log(NULL, AV_LOG_INFO, "[PTV-CC] presentation style: %s\n",
+               tap->style == PTV_CC_STYLE_BLOCK ? "block" : "faithful");
 
     /* --- cc_dec, on the video input's decode thread (see the CcTap header) --- */
     tap->dec = avcodec_alloc_context3(cdec);
@@ -2663,6 +3353,7 @@ static int cc_setup(CcCtx *cc, CcTap *tap, AVThreadMessageQueue **cc_q,
     cc->last_dts        = AV_NOPTS_VALUE;
     cc->last_caption_us = AV_NOPTS_VALUE;
     cc->last_cap_dts    = AV_NOPTS_VALUE;   /* no caption yet => no erase floor */
+    cc->rebase_hw       = AV_NOPTS_VALUE;   /* not rebasing */
     cc->slot            = slot;
     cc->multi           = multi;
 
@@ -2789,9 +3480,10 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                 og_get(&outs->groups[gi], "cc_slots")     ||
                 og_get(&outs->groups[gi], "cc_lang")      ||
                 og_get(&outs->groups[gi], "cc_page")      ||
+                og_get(&outs->groups[gi], "cc_style")     ||
                 og_get(&outs->groups[gi], "cc_magazine")) {
                 av_log(NULL, AV_LOG_WARNING,
-                       "[PTV-CC] -cc_extract/-cc_slots/-cc_lang/-cc_page/-cc_magazine on output %d are "
+                       "[PTV-CC] -cc_extract/-cc_slots/-cc_lang/-cc_page/-cc_style/-cc_magazine on output %d are "
                        "IGNORED — the extraction is shared by the whole ladder and is "
                        "configured on the first output only%s\n", gi,
                        cc_on ? "" : " (and the first output does not enable it, so no CC "
@@ -2894,6 +3586,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
     for (k = 0; k < PTV_MAX_INPUT; k++) {
         cc[k].last_dts     = AV_NOPTS_VALUE;
         cc[k].last_cap_dts = AV_NOPTS_VALUE;
+        cc[k].rebase_hw    = AV_NOPTS_VALUE;
         cc_slot[k] = 0;
     }
     for (k = 0; k < n_input; k++) {
@@ -3828,6 +4521,8 @@ end:
         avcodec_free_context(&inputs[k].dc.cc.dec);  /* -cc_extract (NULL when off) */
         av_freep(&inputs[k].dc.cc.pend_ass);         /* a caption still inside the debounce */
         av_freep(&inputs[k].dc.cc.erase_ass);        /* a clear still inside the min-display hold */
+        cc_block_reset(&inputs[k].dc.cc);            /* -cc_style block: the assembly */
+        av_freep(&inputs[k].dc.cc.blk_pfx);
         avcodec_free_context(&inputs[k].vdec);
         av_thread_message_queue_free(&inputs[k].video_q);
         av_thread_message_queue_free(&inputs[k].hold.q);
@@ -3895,6 +4590,7 @@ static const OptionDef ptv_options[] = {
     { "cc_slots",         OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "multiview: which inputs to extract CC from (default: all)", "list" },
     { "cc_lang",          OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "language of the extracted CC stream (default: from audio)", "iso639-2" },
     { "cc_page",          OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "teletext page for the extracted CC (default 0x88)", "page" },
+    { "cc_style",         OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "CC presentation: faithful (default, teletext mirrors the CC snapshot for snapshot) or block (opt-in, whole finished lines only)", "style" },
     { "cc_magazine",      OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "teletext magazine for the extracted CC (1-8, default 8)", "n" },
     { "f",                OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "force format", "fmt" },
     { NULL },
@@ -4352,6 +5048,13 @@ int main(int argc, char **argv)
       if (s) g_muxtest_back_type = s[0] == 's' ? AVMEDIA_TYPE_SUBTITLE :
                                    s[0] == 'd' ? AVMEDIA_TYPE_DATA : AVMEDIA_TYPE_AUDIO; }
     if (getenv("PTV_MUXDIAG")) g_muxdiag = 1;        /* pre26 D3: gated emission-point backward-label instrumentation */
+    { const char *s = getenv("PTV_CCTEST_REBASE_AT_S");                                                        /* TEST ONLY (pre5 rebase-survival gate) */
+      if (s && atof(s) > 0) {
+          g_cctest_rebase_at_us = (int64_t)(atof(s) * 1000000);
+          av_log(NULL, AV_LOG_WARNING,
+                 "[PTV-CCTEST] PTV_CCTEST_REBASE_AT_S=%s — ONE forced subtitle baseline rebase "
+                 "at that output time. TEST ONLY: never set this in production.\n", s);
+      } }
     { const char *s = getenv("PTV_CCTEST_CORRUPT_EVERY");                                                      /* TEST ONLY (F6 gate) */
       if (s && atoi(s) > 0) {
           g_cctest_corrupt = atoi(s);

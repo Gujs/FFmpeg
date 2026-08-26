@@ -195,6 +195,12 @@ static const char *cc_tag(CcCtx *c, char *buf, size_t n)
     return buf;
 }
 
+/* A cc_dec-shaped ASS dialog line with an EMPTY text field — what a source erase looks like
+ * coming out of cc_dec, and the only thing the teletext encoder reads as "clear the page".
+ * Used ONLY by the rebase reconciliation, which has to erase a page no source asked about.
+ * Not const: AVSubtitleRect.ass is char *, and nothing on this path writes through it. */
+static char cc_reconcile_erase_ass[] = "0,0,Default,,0,0,0,,";
+
 static void cc_emit(CcCtx *c, CcEvent *ev)
 {
     VideoCtx *v = c->vc;
@@ -205,7 +211,12 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
     AVPacket *pkt;
     int64_t idx, house_us;
     int n, r;
+    /* What actually goes into the rect. Normally ev->ass; on a rebase it can be swapped for
+     * the page currently on screen (see the rebase branch). BORROWED either way — the queue
+     * owns ev->ass and c owns last_cap_ass, so this is never freed here. */
+    char *use_ass;
 
+    use_ass = ev->ass;
     if (ev->src_us == AV_NOPTS_VALUE) {
         /* SYNTHETIC keepalive (see cc_thread): this input stopped delivering frames, so there
          * is no source pts to map. Stamp it as a pure MONOTONE EXTRAPOLATION of our own last
@@ -242,6 +253,24 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
                  ? av_rescale(idx, 1000000LL * v->out_fps.den, v->out_fps.num)
                  : idx * v->tick_dur_us;
     }
+    /* TEST ONLY (PTV_CCTEST_REBASE_AT_S — see the declaration). Emit a 5s window of stamps
+     * shifted 30s FORWARD, then stop shifting. Because those packets really are muxed at the
+     * high value, the muxer's high-water ratchets up with them, and the first unshifted event
+     * afterwards is a genuine 30s backward step — an h0 move's exact shape, including the
+     * [PTV-MUXGUARD] collision that the survival fix exists to prevent. Shifting only our own
+     * internal high-water (the first version of this gate) does NOT reproduce it: no packet
+     * ever carries the inflated value, so nothing collides and the gate passes vacuously. */
+    if (g_cctest_rebase_at_us > 0 && !c->rebase_test_fired) {
+        if (house_us >= g_cctest_rebase_at_us &&
+            house_us <  g_cctest_rebase_at_us + 5000000) {
+            house_us += 10 * PTV_CC_REBASE_US;
+        } else if (house_us >= g_cctest_rebase_at_us + 5000000) {
+            c->rebase_test_fired = 1;
+            av_log(NULL, AV_LOG_WARNING,
+                   "[PTV-CCTEST]%s test window over — the next stamp steps back 30s "
+                   "(PTV_CCTEST_REBASE_AT_S)\n", cc_tag(c, tag, sizeof tag));
+        }
+    }
     if (c->last_dts != AV_NOPTS_VALUE) {
         if (house_us < c->last_dts - PTV_CC_REBASE_US) {
             /* A step THIS large is a genuine rebase of the timeline under us: adopt the new
@@ -254,12 +283,38 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
             av_log(NULL, AV_LOG_INFO,
                    "[PTV-CC]%s house stamp stepped back %"PRId64"ms — subtitle dts baseline reset\n",
                    cc_tag(c, tag, sizeof tag), (c->last_dts - house_us) / 1000);
+            /* BEFORE last_dts is cleared: this is the stamp the MUXER still holds (see the
+             * REBASE SURVIVAL note below). Reading it afterwards yields AV_NOPTS_VALUE and
+             * silently disables the re-transmission. */
+            c->rebase_hw = c->last_dts;
             c->last_dts = AV_NOPTS_VALUE;
             /* the QUIET watchdog measures on this same axis: leaving last_caption_us on the
              * OLD (higher) house time makes house_us - last_caption_us negative for as long
              * as the step was, silently disarming it. Re-baseline on the next event. */
             c->last_caption_us = AV_NOPTS_VALUE;
             c->last_cap_dts    = AV_NOPTS_VALUE;  /* the erase floor below is on that dead axis */
+            /* 1.2.0-pre5 REBASE SURVIVAL. Everything we now emit is BELOW the muxer's
+             * high-water, so [PTV-MUXGUARD] refuses it until content climbs back past the
+             * pre-rebase stamp — that is what ccmux= has been counting on air (Azorse
+             * 894/week, NTD 72, Daystar_esp 35). The high-water is exactly the last stamp we
+             * emitted, so remember it and RECONCILE THE WIRE the moment we are above it
+             * again (below). Without that the viewer's page stays frozen not just for the
+             * length of the step but until the SOURCE happens to produce its next caption,
+             * which on a sparse feed is minutes — or, when what was dropped was an erase,
+             * for good.
+             *
+             * NOT ALSO CLEARING THE GUARD'S mg_last, and that is a measured decision rather
+             * than an omission. That companion fix was built and live-fired here on
+             * 2026-08-26 and it KILLS THE CHANNEL: mg_last is only ptvencoder's MIRROR of
+             * the authority, which is lavf's own per-stream sti->cur_dts (mux.c). Clearing
+             * the mirror does not move lavf's high-water — it merely removes the guard's
+             * protection, so the backward packet reaches the muxer and EINVALs it. Measured
+             * on a forced 29.3s rebase: with the reset in place, "non monotonically
+             * increasing dts to muxer in stream 2" and "[PTV-MUX] rung 0 write failed ...
+             * exiting for supervised respawn"; without it, ccmux=40 and the channel carries
+             * on. A refused sparse packet is a stale caption; a dead mux is a dead channel.
+             * Driving ccmux to zero across a rebase needs the STAMPS kept above lavf's
+             * high-water — a clock-design change, not a silenced guard. */
         } else if (house_us <= c->last_dts) {
             house_us = c->last_dts + 1000;        /* strictly increasing (1ms == 90 @90kHz) */
             atomic_fetch_add_explicit(&g_cc_bump, 1, memory_order_relaxed);
@@ -282,6 +337,76 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
                 house_us = c->last_cap_dts + PTV_CC_MIN_DISPLAY_US;
         }
     }
+    /* The SECOND EVENT of a !page_up reconciliation (see the block below, which arms it): the
+     * encoder is holding a page the viewer is not owed, so clear it on the first event that
+     * has nothing else to say. Placed BEFORE the crossing block deliberately — the crossing
+     * rewrites ev->kind to CAPTION as it re-asserts the page, so running this afterwards
+     * would see that rewritten kind and disarm the erase in the very call that armed it
+     * (measured: 3 of 22 TruBLU trials armed the clear and none ever sent it). The two can
+     * never fire in the same call anyway: arming happens only where rebase_hw is cleared. */
+    if (c->rebase_erase_pending) {
+        if (ev->kind == PTV_CC_KEEPALIVE) {
+            use_ass    = cc_reconcile_erase_ass;
+            ev->kind   = PTV_CC_ERASE;
+            ev->end_ms = 0;
+            av_log(NULL, AV_LOG_INFO,
+                   "[PTV-CC]%s reconciliation complete — erasing the page the rebase stranded\n",
+                   cc_tag(c, tag, sizeof tag));
+        }
+        c->rebase_erase_pending = 0;       /* either we sent it, or the source settled it */
+    }
+    /* REBASE SURVIVAL, second half: RECONCILE THE WIRE TO THE ENCODER.
+     *
+     * Inside the window every packet we emit is at or below the stamp the muxer still holds,
+     * so [PTV-MUXGUARD] refuses it — while the ENCODER, which sits upstream of the drop,
+     * processes it and advances its display state anyway. The two therefore diverge for the
+     * whole window, and the divergence outlives it: whatever the encoder believes is on
+     * screen is what it will incrementally update from, and what the RECEIVER is showing is
+     * the pre-rebase page nobody has been able to replace.
+     *
+     * So at the first ACCEPTED stamp, if anything was dropped, we re-assert the encoder's
+     * own state rather than waiting for the source:
+     *   page_up  => the page (last_cap_ass). This is NOT contingent on the crossing event
+     *               being a keepalive any more — riding the keepalive is why the pre-fix
+     *               re-transmission fired in only 10 of 16 forced-rebase trials (measured;
+     *               all 16 reconcile now).
+     *   !page_up => an ERASE. This is the case that could freeze a viewer's page for good:
+     *               a source EDM accepted-but-dropped inside the window leaves the receiver
+     *               on the old caption AND disarms the encoder's 10 s stale backstop, which
+     *               only fires while it believes content is up.
+     *
+     * A CAPTION at the crossing needs nothing — it carries fresh text and reconciles by
+     * itself, and so does an ERASE while the encoder still believes a page is up. An ERASE
+     * against an ALREADY-BLANK encoder does not: it encodes to nothing (dvbteletextenc:
+     * `if (ctx->content_active) return write_erase_page(); return 0`) and the retry below
+     * turns it into a keepalive, so it needs the same help a keepalive does.
+     *
+     * THE ERASE IS TWO EVENTS, and that is forced by the same encoder rule: it will not
+     * write an erase page for a page it thinks is already down. So we re-assert the page
+     * first — invisible to the viewer, who is looking at exactly that page — and the erase
+     * rides the next keepalive (<= 1 s), with the encoder's now-re-armed 10 s stale timer
+     * underneath it as the backstop. Any real CAPTION or ERASE arriving in between settles
+     * the screen itself and disarms it. */
+    if (c->rebase_hw != AV_NOPTS_VALUE) {
+        if (house_us > c->rebase_hw) {
+            /* the two kinds that would otherwise leave the receiver on the stranded page */
+            int mute = ev->kind == PTV_CC_KEEPALIVE ||
+                       (ev->kind == PTV_CC_ERASE && !c->page_up);
+            if (c->rebase_dropped && c->last_cap_ass && mute) {
+                use_ass    = c->last_cap_ass;
+                ev->kind   = PTV_CC_CAPTION;
+                ev->end_ms = PTV_CC_MAX_DISPLAY_MS;
+                c->rebase_erase_pending = !c->page_up;
+                av_log(NULL, AV_LOG_INFO,
+                       "[PTV-CC]%s past the pre-rebase mux high-water — reconciling the wire: "
+                       "re-transmitting the page%s\n", cc_tag(c, tag, sizeof tag),
+                       c->rebase_erase_pending ? " to clear it (erase follows)" : "");
+            }
+            c->rebase_hw      = AV_NOPTS_VALUE;
+            c->rebase_dropped = 0;
+        } else
+            c->rebase_dropped = 1;   /* at or below the muxer's high-water: this one is lost */
+    }
 
     pkt = av_packet_alloc();
     if (!pkt) {                                   /* counted: a silent CC path with every
@@ -297,9 +422,9 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
     }
     sub.pts              = house_us;              /* the encoder's erase timer reads this */
     sub.end_display_time = ev->end_ms;
-    if (ev->ass) {
+    if (use_ass) {
         rect.type    = SUBTITLE_ASS;
-        rect.ass     = ev->ass;
+        rect.ass     = use_ass;
         sub.rects    = rects;
         sub.num_rects = 1;
     }
@@ -343,8 +468,19 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
     c->last_dts     = house_us;
     /* AFTER the encode: ev->kind may have been rewritten to KEEPALIVE by the retry above, and
      * only a page that really went out is a floor for the next erase. */
-    if (ev->kind == PTV_CC_CAPTION)
+    if (ev->kind == PTV_CC_CAPTION) {
         c->last_cap_dts = house_us;
+        /* 1.2.0-pre5 REBASE SURVIVAL: remember the page that is now on screen, so a rebase
+         * can put it back. Kept only for CAPTIONs that the encoder actually accepted — the
+         * retry above rewrites a rejected one to KEEPALIVE, and re-transmitting text the
+         * encoder already declined would just fail again. */
+        if (use_ass && (!c->last_cap_ass || strcmp(c->last_cap_ass, use_ass))) {
+            av_freep(&c->last_cap_ass);
+            c->last_cap_ass = av_strdup(use_ass);
+        }
+        c->page_up = 1;
+    } else if (ev->kind == PTV_CC_ERASE)
+        c->page_up = 0;                           /* the page is blank: nothing to restore */
     c->last_emit_wc = av_gettime_relative();
     for (r = 0; r < c->n_out; r++) {              /* fan out to every rung's muxer */
         AVPacket *o = av_packet_clone(pkt);
@@ -460,6 +596,7 @@ void *cc_thread(void *arg)
         AVPacket *eof = NULL;
         av_thread_message_queue_send(c->mux_q[r], &eof, 0);
     }
+    av_freep(&c->last_cap_ass);                   /* the page kept for rebase re-transmission */
     if (c->multi)
         snprintf(per, sizeof per, "a53=%lld caps=%lld on this input | all inputs: ",
                  (long long)atomic_load_explicit(&g_cc_a53_in[c->slot],  memory_order_relaxed),
