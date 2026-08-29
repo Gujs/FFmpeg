@@ -43,7 +43,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.2.0-pre5"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.2.0-pre6"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -1937,6 +1937,13 @@ static int cc_block_timers(CcTap *t, int64_t cur_us, char *ttag)
             t->blk_y = t->blk_cur_y;
         t->blk_cur_open = 1;
         cc_block_emit(t, cur_us, ttag);
+        /* This publication IS screen activity: without this, the CLEAR below measures its
+         * 5 s from the last source character and fires exactly CLEAR-STALL = 2.5 s after
+         * the block just put up — and a speaker resuming around then repaints the same
+         * block, a viewer-visible text->blank->same-text blink (measured on NTD, first
+         * live block-mode channel: 4 blinks/150 s, every one at +2.502 s). The clear rule
+         * is "5 s after the last screen CHANGE", and this is one. */
+        t->blk_act_us = cur_us;
         return 1;
     }
     /* CLEAR: no new characters anywhere for PTV_CC_BLOCK_CLEAR_US. A roll-up source almost

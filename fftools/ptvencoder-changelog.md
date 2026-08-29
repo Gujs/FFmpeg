@@ -5,6 +5,31 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 1.2.0-pre6 (2026-08-29) — block mode: the stall-flushed block no longer blinks off
+
+**Patch `0001` only, one line + comments** (`ptvencoder.c`). Found by the owner on NTD within
+hours of block mode's first live run (`PTV_CC_STYLE=block` via supervisor env — the env override
+path worked as designed).
+
+- **Symptom (owner-measured, exact):** the same two-line block goes out, blanks after **exactly
+  2.502 s**, and comes straight back 0.17–1.14 s later — a viewer-visible text→blank→same-text
+  blink, 3–4 per 150 s. Metropolitan's behaviour (erase ends the cue; text after a clear is new
+  text, not deduplicated) is correct and unchanged.
+- **Mechanism:** the STALL branch (`cc_block_timers`) publishes a line that stopped growing at
+  2.5 s — but did not refresh `blk_act_us`. The 5 s CLEAR therefore kept counting from the last
+  SOURCE character and fired `CLEAR−STALL = 2.5 s` after the stall-published block went up. A
+  speaker resuming a natural ~6 s pause then repainted the identical window. Every one of the 4
+  live blanks and 6/6 fixture blanks sat at +2.502 s — `CLEAR−STALL` plus one frame.
+- **Fix:** a stall publication counts as screen activity (`blk_act_us = cur_us` in the stall
+  branch). The clear rule is now uniformly "5 s after the last screen CHANGE": typing-driven
+  emissions already refreshed it; the stall flush was the one screen change that did not.
+- Verified on the captured NTD source that produced the live blinks: **6/6 blinks → 0 blanks**,
+  oracle PASS (89/89 page events, hamming 0, away-switch intact). Legitimate clears preserved
+  (AWE 300 s block run: 10 blanks — source EDMs + real caption silences — all still there).
+  Unit rig updated: T4 now asserts the clear at 5 s after the last screen change (its old
+  expectation WAS the blink), new T4b regression pins text→blank→same-text = never; 58/58 PASS.
+  `faithful` untouched (the change is inside the block-only timer path).
+
 ## 1.2.0-pre5 (2026-08-26) — `-cc_style`: the teletext page mirrors the CC (default), block mode opt-in
 
 **Patch `0001` only** (`ptvencoder.c` / `.h` / `_clock.c` / `_legend.c`); the teletext encoder is
