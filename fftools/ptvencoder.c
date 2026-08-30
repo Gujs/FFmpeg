@@ -43,7 +43,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.2.0-pre6"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.2.0-pre7"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -1518,6 +1518,42 @@ static int cc_str_continues(const char *s, const char *pfx)
     return n > 0 && !strncmp(s, pfx, n);
 }
 
+/* Drop everything still waiting for the pacing floor (see PTV_CC_BLOCK_HOLD_MS). Only ever
+ * called from cc_block_reset(), i.e. where the assembly itself is being abandoned.
+ *
+ * THIS IS THE ONE PLACE A QUEUED LINE IS DISCARDED, and it is deliberate: cc_block_reset()'s
+ * callers are a TIMELINE BREAK (the pts-backstep/rebase path), block mode's own 5 s clear —
+ * which cannot run with a non-empty queue at all — and shutdown. A rebase means the half
+ * assembled caption AND its pending lines belong to a dead timeline: their source stamps are
+ * on that axis, cc_dec has been flushed, and showing them against the new one would place old
+ * dialogue over new pictures. Everywhere else the rule holds without exception — pacing never
+ * drops a line to make room or to go faster. */
+static void cc_block_q_free(CcTap *t)
+{
+    int i;
+    for (i = 0; i < t->blk_q_n; i++)
+        av_freep(&t->blk_q[i].text);
+    t->blk_q_n = 0;
+}
+
+/* Is the pacing queue holding lines the viewer has not seen yet? Both the 5 s clear and the
+ * deferred-erase timer stand down while it is: queued lines ARE pending screen activity, and
+ * blanking the page underneath them would lose the text they are waiting to show. Always 0
+ * in `faithful` and with the floor disabled, where nothing is ever queued. */
+static int cc_block_q_busy(const CcTap *t) { return t->blk_q_n > 0; }
+
+/* Stop tracking the row the source was typing. Split out of cc_block_reset() because a source
+ * erase must do THIS half at once — the source has stopped typing, and leaving blk_cur behind
+ * lets the 2.5 s stall rule publish that row a SECOND time while the pacing queue is still
+ * draining (measured in the unit rig: the closing line went out twice) — while the DISPLAY
+ * half waits for the queue. */
+static void cc_block_reset_tracking(CcTap *t)
+{
+    av_freep(&t->blk_cur);
+    t->blk_cur_open = 0;
+    t->blk_grew     = 0;
+}
+
 /* Forget the assembly, keep the latch. Used by a source erase, a timeline rebase, and
  * shutdown. The LATCH survives on purpose: a glued timeline or an ad break does not change
  * how the channel captions, and re-earning the latch costs a whole line of dialogue. */
@@ -1527,10 +1563,11 @@ static void cc_block_reset(CcTap *t)
     for (i = 0; i < PTV_CC_BLOCK_MAX_LINES; i++)
         av_freep(&t->blk_line[i]);
     t->blk_n = 0;
-    av_freep(&t->blk_cur);
     av_freep(&t->blk_sent);
-    t->blk_cur_open = 0;
-    t->blk_grew     = 0;
+    cc_block_reset_tracking(t);
+    cc_block_q_free(t);
+    t->blk_erase_pending = 0;
+    t->blk_disp_us       = 0;
 }
 
 /* HOW MANY COMPLETED LINES THE BLOCK HOLDS — the rule, verbatim:
@@ -1624,12 +1661,6 @@ static void cc_block_push_n(CcTap *t, const char *text, int x, int hold)
     t->blk_n++;
 }
 
-/* The roll-up push: bounded by the source's own window depth (cc_block_hold). */
-static void cc_block_push(CcTap *t, const char *text, int x)
-{
-    cc_block_push_n(t, text, x, cc_block_hold(t));
-}
-
 /* Replace the bottom line in place — a stall-flushed line that the speaker then continued. */
 static void cc_block_update_bottom(CcTap *t, const char *text, int x)
 {
@@ -1678,16 +1709,17 @@ static char *cc_block_build(CcTap *t)
 
 /* Put the current block on the wire. Goes through the SAME flush the debounce path uses, so
  * the minimum-display clock starts and any clear held from the previous page is re-armed
- * against this one — none of that machinery knows or cares that block mode built the text. */
-static void cc_block_emit(CcTap *t, int64_t cur_us, char *ttag)
+ * against this one — none of that machinery knows or cares that block mode built the text.
+ * Returns 1 when the block ACTUALLY reached the wire (the pacing floor restarts only then). */
+static int cc_block_emit(CcTap *t, int64_t cur_us, char *ttag)
 {
     char *ass = cc_block_build(t);
 
     if (!ass)
-        return;
+        return 0;
     if (t->blk_sent && !strcmp(t->blk_sent, ass)) {
         av_freep(&ass);                    /* nothing changed: no wire update */
-        return;
+        return 0;
     }
     av_freep(&t->blk_sent);
     t->blk_sent = av_strdup(ass);
@@ -1696,6 +1728,193 @@ static void cc_block_emit(CcTap *t, int64_t cur_us, char *ttag)
     t->pend_end_ms = PTV_CC_MAX_DISPLAY_MS;
     cc_tap_flush_pending(t, cur_us, ttag);
     cc_tap_hold_erase(t, NULL, 0, cur_us + PTV_CC_MIN_DISPLAY_US, 0);
+    return 1;
+}
+
+/* ==================== the PACING FLOOR ====================
+ *
+ * See the PTV_CC_BLOCK_HOLD_MS header in ptvencoder.h for WHY. The rule, verbatim:
+ *
+ *   A completed line does NOT advance the displayed block. It joins a FIFO, and the display
+ *   advances ONE STEP at a time, never sooner than the floor since the last DISPLAYED
+ *   advance — with three exceptions, each of which is "the screen is not asking the viewer
+ *   to re-read anything":
+ *     (a) NOTHING IS ON SCREEN (blk_n == 0). A caption must never be delayed onto an empty
+ *         screen; the floor exists to protect what is already up, and there is nothing to
+ *         protect.
+ *     (b) THE STEP IS A COMPLETED POP-ON FLIP (`now`). A flip is the source's own deliberate
+ *         presentation of finished text and goes up the moment it reaches the front of the
+ *         queue. A roll-up backlog queued ahead of it still drains first, at catch-up pace —
+ *         those lines are dialogue and are not thrown away to make the flip arrive sooner.
+ *     (c) THE FLOOR IS DISABLED (blk_hold_us == 0). Every enqueue is then applied and emitted
+ *         at exactly the point pre6 pushed and emitted, which is what makes
+ *         PTV_CC_BLOCK_HOLD_MS=0 byte-identical to pre6.
+ *
+ * An IN-PLACE update of the bottom line (the stall-flushed line a speaker resumed, a pop-on
+ * correction) is NOT an advance: no text moves under the viewer's eye, so it goes out at once
+ * and does not restart the floor. See cc_block_update_open().
+ *
+ * WORST-CASE LAG. A line queued with k lines ahead of it displays after the sum of the k+1
+ * step intervals in force as the queue drains:
+ *
+ *     lag(k) = SUM over i = k..0 of step_us(i + 1)
+ *
+ * where step_us(d) is cc_block_step_us() at depth d. With the shipped constants (HOLD 1500,
+ * >=3 => 800, >=6 => 400) an instantaneous burst of 4 lines onto a non-empty screen shows its
+ * last line at 0.8 + 0.8 + 1.5 + 1.5 = 4.6 s. The queue can only GROW while the source's
+ * sustained line rate exceeds 1/step_us; NTD's is one line per 1.7-5 s against a 1.5 s floor,
+ * so it drains in every quiet period and the depth never reaches the second catch-up rung.
+ *
+ * AT SATURATION (a source completing lines faster than 1/400 ms for long enough to fill
+ * PTV_CC_BLOCK_QUEUE_MAX) the depth pegs at 32 and each further enqueue force-emits the oldest
+ * step, so the display advances at the ARRIVAL rate with a fixed 32-line backlog: the tail of
+ * that backlog reaches the screen 26*0.4 + 3*0.8 + 2*1.5 = ~16 s after the source finished it.
+ * No line is discarded even there. This is a storage bound, not a policy, and it is not
+ * reachable on any measured channel (adv2 B4 has to synthesise 5 lines/s for 40 s to hit it). */
+
+/* The display half of cc_block_reset(): drop the lines that are up, keep the row being
+ * tracked and the queue. blk_sent goes with the lines so an identical block after a
+ * replacement still reaches the wire. */
+static void cc_block_clear_display(CcTap *t)
+{
+    int i;
+    for (i = 0; i < PTV_CC_BLOCK_MAX_LINES; i++)
+        av_freep(&t->blk_line[i]);
+    t->blk_n = 0;
+    av_freep(&t->blk_sent);
+}
+
+/* The floor in force RIGHT NOW: it drops as the backlog grows so the queue drains inside the
+ * source's own quiet periods. Never RAISES the configured hold. */
+static int64_t cc_block_step_us(const CcTap *t)
+{
+    if (t->blk_q_n >= PTV_CC_BLOCK_CATCHUP2_N)
+        return FFMIN(t->blk_hold_us, PTV_CC_BLOCK_CATCHUP2_US);
+    if (t->blk_q_n >= PTV_CC_BLOCK_CATCHUP1_N)
+        return FFMIN(t->blk_hold_us, FFMAX(PTV_CC_BLOCK_CATCHUP1_US, t->blk_hold_us / 2));
+    return t->blk_hold_us;
+}
+
+/* Put the step at the front of the queue on screen: its head entry plus every entry chained
+ * to it (head == 0), so a multi-line pop-on flip appears whole. Always returns having freed
+ * and removed those entries. */
+static void cc_block_apply_step(CcTap *t, int64_t cur_us, char *ttag)
+{
+    int i, n = 1;
+
+    while (n < t->blk_q_n && !t->blk_q[n].head)
+        n++;
+    if (t->blk_q[0].replace)
+        cc_block_clear_display(t);
+    for (i = 0; i < n; i++) {
+        cc_block_push_n(t, t->blk_q[i].text, t->blk_q[i].x, t->blk_q[i].hold);
+        if (t->blk_q[i].y >= 0)
+            t->blk_y = t->blk_q[i].y;
+        av_freep(&t->blk_q[i].text);
+    }
+    memmove(t->blk_q, t->blk_q + n, (size_t)(t->blk_q_n - n) * sizeof(t->blk_q[0]));
+    /* clear the vacated tail: the memmove leaves ALIASES of the pointers it just moved down
+     * there, and a stale alias past blk_q_n is a double free waiting for someone to widen a
+     * loop bound one day. */
+    memset(t->blk_q + t->blk_q_n - n, 0, (size_t)n * sizeof(t->blk_q[0]));
+    t->blk_q_n -= n;
+    /* An advance is a screen CHANGE, so it refreshes the 5 s clear exactly as a stall
+     * publication does (1.2.0-pre6): the clear rule is "5 s after the last screen change". */
+    t->blk_act_us = cur_us;
+    /* The floor restarts only on a step that actually REACHED THE WIRE. A step that emitted
+     * nothing — a display-clear step (see the replacement branch), or a push whose rendered
+     * block is identical to the one already up — moved no text under the viewer's eye, so
+     * making the next real advance wait a full floor behind it would be latency for nothing. */
+    if (t->blk_n > 0 && cc_block_emit(t, cur_us, ttag))
+        t->blk_disp_us = cur_us;
+}
+
+/* Release whatever the floor now allows. Called from every path that can change the state:
+ * a frame that carries a caption rect never reaches cc_tap_frame's timers (cc_tap_rect
+ * settles it), so the pump cannot live in the timers alone.
+ * Returns the number of display steps it released. */
+static int cc_block_pump(CcTap *t, int64_t cur_us, char *ttag)
+{
+    int steps = 0;
+
+    while (t->blk_q_n > 0) {
+        if (t->blk_n > 0 && !t->blk_q[0].now && t->blk_hold_us > 0 && t->blk_disp_us &&
+            cur_us - t->blk_disp_us < cc_block_step_us(t))
+            break;
+        cc_block_apply_step(t, cur_us, ttag);
+        steps++;
+    }
+    /* THE DRAIN A SOURCE EDM IS WAITING BEHIND (see cc_tap_rect). The erase itself sits in
+     * the deferred-erase slot with the erase timer standing down while cc_block_q_busy();
+     * now that the last queued line is on screen the assembly may be dropped and the erase is
+     * free to go out at its minimum-display deadline, which the final emit re-armed.
+     *
+     * THE DISPLAY, AND ONLY THE DISPLAY. cc_block_reset() here was a shipped-in-review bug: it
+     * also freed blk_cur and blk_sent, so a source that started a NEW caption while the drain
+     * was still running had that caption's tracked row destroyed and its just-displayed block
+     * wiped (adv2 B1/B2: the page was left with neither text nor an erase, stuck until the
+     * encoder's 10 s backstop). blk_cur is already NULL here — cc_block_reset_tracking() ran at
+     * the EDM — and the guard says so out loud: if anything IS tracked, new text arrived, which
+     * supersedes the erase, and cc_tap_rect has already cancelled blk_erase_pending. */
+    if (t->blk_erase_pending && !t->blk_q_n) {
+        t->blk_erase_pending = 0;
+        if (!t->blk_cur)
+            cc_block_clear_display(t);
+    }
+    return steps;
+}
+
+/* Queue one completed line. `head` starts a new display step (see cc_block_apply_step).
+ * The text is stored EXACTLY as the source wrote it; empty rows are kept rather than
+ * filtered, because cc_block_push_n() is the one place that decides what "empty" means and
+ * a filtered row would break a step's head/replace chain. */
+static void cc_block_queue(CcTap *t, const char *text, int x, int y, int hold,
+                           int head, int replace, int now, int64_t cur_us, char *ttag)
+{
+    CcBlkLine *e;
+    char *dup;
+
+    /* Storage bound only, and unreachable at any measured line rate (see the WORST-CASE LAG
+     * note above). Forcing the oldest step out is the one direction that keeps the no-drop
+     * invariant, and it always frees at least one slot, so no second check is needed.
+     * RESIDUAL, stated: a multi-row step queued while the queue is already full can have its
+     * head forced out before its remaining rows are queued, splitting one pop-on flip across
+     * two display steps. It costs a repaint, never a line, and needs a 32-line backlog. */
+    if (t->blk_q_n >= PTV_CC_BLOCK_QUEUE_MAX)
+        cc_block_apply_step(t, cur_us, ttag);
+    if (!(dup = av_strdup(text)))
+        return;
+    e = &t->blk_q[t->blk_q_n++];
+    e->text    = dup;
+    e->x       = x;
+    e->y       = y;
+    e->hold    = hold;
+    e->head    = head;
+    e->replace = replace;
+    e->now     = now;
+}
+
+/* Replace the OPEN bottom line wherever it currently lives: still queued (nothing on screen
+ * moves, so nothing is emitted) or already displayed (the pre6 in-place update). Returns 1
+ * when the caller must emit. */
+static int cc_block_update_open(CcTap *t, const char *text, int x, int y)
+{
+    CcBlkLine *e;
+    char *dup;
+
+    if (t->blk_q_n > 0) {
+        e = &t->blk_q[t->blk_q_n - 1];
+        if (!(dup = av_strdup(text)))
+            return 0;
+        av_freep(&e->text);
+        e->text = dup;
+        e->x    = x;
+        if (y >= 0)
+            e->y = y;
+        return 0;
+    }
+    cc_block_update_bottom(t, text, x);
+    return 1;
 }
 
 /* ---- the state machine ----
@@ -1771,14 +1990,17 @@ static int cc_block_feed(CcTap *t, const char *ass, int64_t cur_us, char *ttag)
                 first = rows.n - 1 - cc_block_hold(t);
                 if (first < 0)
                     first = 0;
-                /* by == -1 = "this row carried no \pos" (cc_row_strip_pos). Keep the last
-                 * known y rather than storing the sentinel — cc_block_build() would turn it
-                 * into an explicit \pos(0,0) and move the whole block to the top of the
-                 * screen. Unreachable from today's cc_dec, which positions every row; the
-                 * same guard is on the other two writers of blk_y. */
-                t->blk_y = by >= 0 ? by : t->blk_y;
+                /* ONE display step (head on the first row only): the rows the source already
+                 * has on screen are what the viewer is looking at, and nothing of ours is up
+                 * yet, so the pacing floor lets it through at once (blk_n == 0).
+                 *
+                 * by == -1 = "this row carried no \pos" (cc_row_strip_pos). cc_block_apply_step
+                 * keeps the last known y rather than storing the sentinel — cc_block_build()
+                 * would turn it into an explicit \pos(0,0) and move the whole block to the top
+                 * of the screen. Unreachable from today's cc_dec, which positions every row. */
                 for (i = first; i < rows.n - 1; i++)
-                    cc_block_push(t, rows.text[i], rows.x[i]);
+                    cc_block_queue(t, rows.text[i], rows.x[i], by, cc_block_hold(t),
+                                   i == first, 0, 0, cur_us, ttag);
             }
             av_freep(&t->blk_cur);
             t->blk_cur      = av_strdup(bottom);
@@ -1787,7 +2009,7 @@ static int cc_block_feed(CcTap *t, const char *ass, int64_t cur_us, char *ttag)
             t->blk_cur_open = 0;
             t->blk_grow_us  = cur_us;
             t->blk_act_us   = cur_us;
-            cc_block_emit(t, cur_us, ttag);
+            cc_block_pump(t, cur_us, ttag);
             cc_rows_free(&rows);
             return 1;
         }
@@ -1800,6 +2022,10 @@ static int cc_block_feed(CcTap *t, const char *ass, int64_t cur_us, char *ttag)
     }
 
     /* --- latched: assemble --- */
+    /* The pacing floor may have elapsed since the last frame, and a frame carrying a caption
+     * rect never reaches cc_tap_frame's timers (cc_tap_rect settles it), so release here
+     * BEFORE this snapshot changes the state. */
+    cc_block_pump(t, cur_us, ttag);
     if (t->blk_cur && cc_str_extends(bottom, t->blk_cur)) {
         /* STILL GROWING (or an identical retransmission). The partial NEVER goes on the
          * wire — this is the whole point of the mode. */
@@ -1810,9 +2036,13 @@ static int cc_block_feed(CcTap *t, const char *ass, int64_t cur_us, char *ttag)
             t->blk_act_us  = cur_us;
             if (t->blk_cur_open) {
                 /* already published by the stall rule and the speaker resumed: update the
-                 * bottom line in place rather than pushing a second line for one sentence */
-                cc_block_update_bottom(t, bottom, bx);
-                cc_block_emit(t, cur_us, ttag);
+                 * bottom line in place rather than pushing a second line for one sentence.
+                 * IN-PLACE GROWTH IS NOT AN ADVANCE — no text moves under the viewer's eye —
+                 * so it goes out immediately and does not restart the pacing floor. If that
+                 * line is itself still queued, the queued entry is what grows and nothing
+                 * reaches the wire yet. */
+                if (cc_block_update_open(t, bottom, bx, -1))
+                    cc_block_emit(t, cur_us, ttag);
             }
         }
         t->blk_cur_x = bx;
@@ -1832,12 +2062,19 @@ static int cc_block_feed(CcTap *t, const char *ass, int64_t cur_us, char *ttag)
          *
          * A carriage return is also where the SOURCE'S WINDOW DEPTH is visible — the number
          * of rows the window occupies — so every scroll feeds cc_block_observe_depth(). */
+        int shown = 0;
         cc_block_observe_depth(t, rows.n);
-        if (!t->blk_cur_open)
-            cc_block_push(t, rows.text[rows.n - 2], rows.x[rows.n - 2]);
-        else
-            cc_block_update_bottom(t, rows.text[rows.n - 2], rows.x[rows.n - 2]);
-        t->blk_y = by >= 0 ? by : t->blk_y;
+        if (!t->blk_cur_open) {
+            /* A NEW completed line = an ADVANCE, so it goes through the pacing queue rather
+             * than onto the screen (see the PACING FLOOR header). This is the burst path:
+             * a captioner flushing three finished lines inside a second queues three and the
+             * viewer gets them one floor apart. */
+            cc_block_queue(t, rows.text[rows.n - 2], rows.x[rows.n - 2], by,
+                           cc_block_hold(t), 1, 0, 0, cur_us, ttag);
+        } else if (cc_block_update_open(t, rows.text[rows.n - 2], rows.x[rows.n - 2], by)) {
+            t->blk_y = by >= 0 ? by : t->blk_y;    /* in place: not an advance */
+            shown = 1;
+        }
         av_freep(&t->blk_cur);
         t->blk_cur      = av_strdup(bottom);
         t->blk_cur_x    = bx;
@@ -1845,7 +2082,9 @@ static int cc_block_feed(CcTap *t, const char *ass, int64_t cur_us, char *ttag)
         t->blk_cur_open = 0;
         t->blk_grow_us  = cur_us;
         t->blk_act_us   = cur_us;
-        cc_block_emit(t, cur_us, ttag);
+        if (shown)
+            cc_block_emit(t, cur_us, ttag);
+        cc_block_pump(t, cur_us, ttag);
     } else {
         /* SCREEN REPLACEMENT — the snapshot has no relation to the row we were watching.
          * Reachable as a pop-on flip inside an otherwise roll-up channel (ad breaks do this),
@@ -1903,10 +2142,37 @@ static int cc_block_feed(CcTap *t, const char *ass, int64_t cur_us, char *ttag)
         int i;
         if (first < 0)
             first = 0;
-        cc_block_reset(t);
-        t->blk_y = by >= 0 ? by : t->blk_y;
+        /* PACING POLICY FOR A FLIP, verbatim: a completed pop-on flip is the SOURCE'S OWN
+         * deliberate presentation of finished text, so it ignores the floor (`now`) and goes
+         * up the moment it reaches the front of the queue — but it does NOT jump the queue.
+         * A roll-up backlog queued ahead of it is dialogue the viewer has not seen yet and
+         * drains first, at catch-up pace; nothing is dropped in either direction. The whole
+         * replacement is ONE display step (head on the first row only), so a two-line pop-on
+         * still appears whole.
+         *
+         * Only the DISPLAY half of pre6's cc_block_reset() is deferred into that step
+         * (`replace`); the rest of it described the row being tracked, not the screen, and
+         * happens now. The queue is deliberately NOT flushed here — cc_block_reset() would
+         * free it. */
+        av_freep(&t->blk_cur);
+        t->blk_grew = 0;
         for (i = first; i < last; i++)
-            cc_block_push_n(t, rows.text[i], rows.x[i], hold);
+            cc_block_queue(t, rows.text[i], rows.x[i], by, hold,
+                           i == first, i == first, complete, cur_us, ttag);
+        if (first >= last) {
+            /* NOTHING IN THIS REPLACEMENT IS FINISHED (a one-row snapshot whose bottom row is
+             * still a partial — what a roll-up RESTART, and the first snapshot after an EDM,
+             * both look like). pre6 dropped the assembly here and emitted nothing.
+             *
+             * It must NOT be dropped out from under a drain. Clearing it immediately zeroed
+             * blk_n while queued lines were still pending, which made the pump's empty-screen
+             * rule fire (0.167 s advance, measured on AWE at 77.8/136.7/148.9 s) and put a
+             * paragraph's closing line on screen ALONE instead of paired with the line above
+             * it. So the clear is queued like everything else — a step that carries `replace`
+             * and no text: it clears the assembly after the backlog has been seen, emits
+             * nothing itself, and (emitting nothing) does not restart the floor. */
+            cc_block_queue(t, "", -1, by, hold, 1, 1, 0, cur_us, ttag);
+        }
         t->blk_cur      = av_strdup(bottom);
         t->blk_cur_x    = bx;
         t->blk_cur_y    = by;
@@ -1916,8 +2182,7 @@ static int cc_block_feed(CcTap *t, const char *ass, int64_t cur_us, char *ttag)
         t->blk_cur_open = complete;
         t->blk_grow_us  = cur_us;
         t->blk_act_us   = cur_us;
-        if (t->blk_n > 0)
-            cc_block_emit(t, cur_us, ttag);
+        cc_block_pump(t, cur_us, ttag);
     }
     cc_rows_free(&rows);
     return 1;
@@ -1927,16 +2192,22 @@ static int cc_block_feed(CcTap *t, const char *ass, int64_t cur_us, char *ttag)
  * Returns 1 when it emitted something (the caller stops there, like the other timers). */
 static int cc_block_timers(CcTap *t, int64_t cur_us, char *ttag)
 {
+    /* PACING FIRST: a queued line whose floor has elapsed goes up before the stall and clear
+     * rules look at the state. Returning 1 on a release costs at most one frame of the other
+     * timers and keeps the "one emission settles the frame" shape the callers rely on. */
+    if (cc_block_pump(t, cur_us, ttag))
+        return 1;
     /* STALL: a line that stopped growing mid-sentence is finished as far as the viewer is
      * concerned — publish it, but keep it open so a resuming speaker extends it in place
-     * instead of starting a second line. */
+     * instead of starting a second line. Like any completed line it is an ADVANCE and joins
+     * the pacing queue; the OPEN flag is set now, so a speaker resuming while it is still
+     * queued extends the queued entry (cc_block_update_open) rather than adding a line. */
     if (t->blk_cur && !t->blk_cur_open && cc_row_content(t->blk_cur) &&
         t->blk_grow_us && cur_us - t->blk_grow_us >= PTV_CC_BLOCK_STALL_US) {
-        cc_block_push(t, t->blk_cur, t->blk_cur_x);
-        if (t->blk_cur_y >= 0)
-            t->blk_y = t->blk_cur_y;
+        cc_block_queue(t, t->blk_cur, t->blk_cur_x, t->blk_cur_y, cc_block_hold(t),
+                       1, 0, 0, cur_us, ttag);
         t->blk_cur_open = 1;
-        cc_block_emit(t, cur_us, ttag);
+        cc_block_pump(t, cur_us, ttag);
         /* This publication IS screen activity: without this, the CLEAR below measures its
          * 5 s from the last source character and fires exactly CLEAR-STALL = 2.5 s after
          * the block just put up — and a speaker resuming around then repaints the same
@@ -1954,7 +2225,11 @@ static int cc_block_timers(CcTap *t, int64_t cur_us, char *ttag)
      * still protects the last block — but NOT counted as a source erase (the `src` argument
      * of cc_tap_hold_erase): eheld= means "the source asked for a blank screen early", and
      * this one is ours. */
-    if (t->blk_n > 0 && t->blk_act_us &&
+    /* NOT while lines are still queued: queued lines are pending screen activity, and the
+     * clear would blank the page the moment before they reach it. blk_act_us is refreshed by
+     * every displayed advance (cc_block_apply_step), so the 5 s is measured from the last
+     * screen CHANGE under pacing exactly as it is without it. */
+    if (t->blk_n > 0 && t->blk_act_us && !cc_block_q_busy(t) &&
         cur_us - t->blk_act_us >= PTV_CC_BLOCK_CLEAR_US) {
         /* the dialog prefix with an EMPTY text field = what a source erase looks like coming
          * out of cc_dec (see cc_ass_has_text). Roomy: a truncated prefix would lose the 8th
@@ -1991,6 +2266,12 @@ static int cc_tap_rect(CcTap *t, const char *ass, int end_ms, int64_t cur_us, ch
          * identical pre4 code below. */
         if (t->style == PTV_CC_STYLE_BLOCK) {
             av_freep(&t->erase_ass);
+            /* ...and with it the DRAIN that erase was waiting for. blk_erase_pending outliving
+             * the erase it belongs to was a shipped-in-review bug: the drain then completed
+             * against an erase that no longer existed and dropped the assembly under the new
+             * caption. The queued lines themselves are untouched — they are dialogue, and they
+             * keep advancing into whatever block this new text builds. */
+            t->blk_erase_pending = 0;
             if (cc_block_feed(t, ass, cur_us, ttag))
                 return 1;
         }
@@ -2038,12 +2319,27 @@ static int cc_tap_rect(CcTap *t, const char *ass, int end_ms, int64_t cur_us, ch
      * today, block mode or not. */
     if (t->style == PTV_CC_STYLE_BLOCK) {
         if (t->blk_rollup && t->blk_cur && !t->blk_cur_open && cc_row_content(t->blk_cur)) {
-            cc_block_push(t, t->blk_cur, t->blk_cur_x);
-            if (t->blk_cur_y >= 0)
-                t->blk_y = t->blk_cur_y;
-            cc_block_emit(t, cur_us, ttag);
+            cc_block_queue(t, t->blk_cur, t->blk_cur_x, t->blk_cur_y, cc_block_hold(t),
+                           1, 0, 0, cur_us, ttag);
+            cc_block_pump(t, cur_us, ttag);
         }
-        cc_block_reset(t);
+        /* DRAIN, THEN ERASE (pacing floor). Lines still queued are a paragraph's closing
+         * lines that the viewer has never seen — they keep advancing at catch-up pace and
+         * the erase waits its turn behind them: the deferred-erase slot holds it, the erase
+         * timer stands down while cc_block_q_busy(), and cc_block_pump() drops the assembly
+         * once the last one is on screen. Without the floor the queue is empty here and this
+         * is pre6's unconditional reset. */
+        cc_block_reset_tracking(t);        /* at once, drain or no drain: see its comment */
+        if (cc_block_q_busy(t))
+            t->blk_erase_pending = 1;
+        else
+            cc_block_reset(t);
+    }
+    if (t->blk_erase_pending) {
+        cc_tap_hold_erase(t, ass, end_ms,
+                          t->shown_since_us != AV_NOPTS_VALUE
+                              ? t->shown_since_us + PTV_CC_MIN_DISPLAY_US : cur_us, 1);
+        return 1;
     }
     if (t->shown_since_us != AV_NOPTS_VALUE &&
         cur_us - t->shown_since_us < PTV_CC_MIN_DISPLAY_US) {
@@ -2206,7 +2502,10 @@ static void cc_tap_frame(CcTap *t, AVFrame *frame, AVRational ist_tb)
      * so its deadline can fall before the debounce timer of text that arrived after it. The
      * pending page goes out FIRST (source order: the text preceded the clear) and the clear
      * is re-armed against it, same rule as the immediate-erase path above. */
-    if (t->erase_ass && cur_us >= t->erase_due_us) {
+    /* cc_block_q_busy(): -cc_style block with the pacing floor holding completed lines the
+     * viewer has not seen yet. The clear waits for them (see cc_tap_rect's drain rule); it is
+     * always 0 in `faithful` and with the floor disabled. */
+    if (t->erase_ass && cur_us >= t->erase_due_us && !cc_block_q_busy(t)) {
         if (t->pend_ass) {
             cc_tap_flush_pending(t, cur_us, ttag);
             cc_tap_hold_erase(t, NULL, 0, cur_us + PTV_CC_MIN_DISPLAY_US, 0);
@@ -3207,12 +3506,34 @@ static int cc_setup(CcCtx *cc, CcTap *tap, AVThreadMessageQueue **cc_q,
                "only)\n", ccsty);
         return AVERROR(EINVAL);
     }
+    /* --- block mode's PACING FLOOR (env only: it is a readability trim, not a channel
+     * property, and the owner tunes it per box). 0 disables pacing entirely. --- */
+    {
+        const char *hs = getenv("PTV_CC_BLOCK_HOLD_MS");
+        long ms = PTV_CC_BLOCK_HOLD_MS;
+
+        if (hs && hs[0]) {
+            char *end;
+            ms = strtol(hs, &end, 10);
+            if (*end || ms < 0 || ms > 10000) {
+                av_log(NULL, AV_LOG_ERROR,
+                       "[PTV-CC] PTV_CC_BLOCK_HOLD_MS=\"%s\": expected 0-10000 ms (0 = no "
+                       "pacing)\n", hs);
+                return AVERROR(EINVAL);
+            }
+        }
+        tap->blk_hold_us = (int64_t)ms * 1000;
+    }
     /* ONCE per run, not once per input: `sidx` is the EXTRACTION index, which is 0 for the
      * first participating input whatever its input index is. Gating on `slot` (the input
      * index) printed nothing at all on a multiview whose -cc_slots excludes input 0. */
-    if (!sidx)
+    if (!sidx) {
         av_log(NULL, AV_LOG_INFO, "[PTV-CC] presentation style: %s\n",
                tap->style == PTV_CC_STYLE_BLOCK ? "block" : "faithful");
+        if (tap->style == PTV_CC_STYLE_BLOCK)
+            av_log(NULL, AV_LOG_INFO, "[PTV-CC] block pacing floor: %"PRId64" ms%s\n",
+                   tap->blk_hold_us / 1000, tap->blk_hold_us ? "" : " (pacing OFF)");
+    }
 
     /* --- cc_dec, on the video input's decode thread (see the CcTap header) --- */
     tap->dec = avcodec_alloc_context3(cdec);

@@ -5,6 +5,98 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 1.2.0-pre7 (2026-08-29) — block mode: a PACING FLOOR under the advances
+
+**Patch `0001` only** (`ptvencoder.c` / `.h` / `_legend.c`). `faithful` is byte-identical to
+pre6 on the wire, and so is `block` with the floor disabled.
+
+- **Symptom (owner, watching block mode live on NTD):** *"it looks too fast to read for me."*
+  Measured on the live pre6 wire (3 min): **54% of block advances arrived less than a second
+  after the previous one**, p10 line-visible **1.4 s**, minimum **1.0 s**.
+- **Mechanism:** NTD's captioner flushes whole sentences in BURSTS — several completed lines
+  inside ~1 s, then 3-6 s of quiet. pre6 advanced the displayed window the instant a line
+  completed, so a burst became a rapid-fire repaint. The lines were right; their *rate* was the
+  source's, not the reader's.
+- **Fix — pace the ADVANCES, never the text.** A completed line (scroll-detected, stall-flushed
+  or derived from a screen replacement) joins a per-tap FIFO instead of moving the window. The
+  display advances ONE step at a time, no sooner than **`PTV_CC_BLOCK_HOLD_MS` (default 1500 ms,
+  env override, 0 = off)** since the last displayed advance. During a burst the queue absorbs the
+  lines and the window trails the source by a bounded amount; the quiet periods drain it.
+  - **Nothing is ever dropped.** Latency is bounded by advancing FASTER, not by discarding
+    dialogue: at **3** queued lines the floor drops to `max(800 ms, HOLD/2)`, at **6** to 400 ms
+    (both clamped to the configured hold, never raised). An instantaneous 4-line burst onto a
+    non-empty screen shows its last line at 0.8+0.8+1.5+1.5 = **4.6 s**; the queue can only grow
+    while the sustained line rate beats the floor, and NTD's is one line per 1.7-5 s.
+  - **Three things are never delayed:** a line onto an EMPTY screen (the floor protects what is
+    already up, and there is nothing to protect); an IN-PLACE update of the bottom line (the
+    stall-flushed line a speaker resumed, a pop-on correction — no text moves under the viewer's
+    eye), which also does not restart the floor; and a completed POP-ON FLIP, which is the
+    source's own deliberate presentation and goes up the moment it reaches the front of the queue
+    (a roll-up backlog queued ahead of it still drains first, at catch-up pace).
+  - **A source EDM DRAINS, then erases:** the paragraph's closing lines keep advancing and the
+    erase waits behind them in the deferred-erase slot (the erase timer stands down while the
+    queue is non-empty), so a paragraph's last lines still reach the screen. The 5 s clear is
+    gated the same way — queued lines are pending screen activity.
+  - A source erase now stops tracking the typed row IMMEDIATELY even while the display drain is
+    still running; without that split the 2.5 s stall rule published the closing line a SECOND
+    time behind the erase (caught by the new unit case P2).
+- **Measured, pre6 -> pre7 on the captured NTD source (120 s, same fixture the owner's channel
+  produced):** advances <1 s **51% -> 14%** and every remaining one is the documented catch-up
+  band (0.80-0.97 s) or an in-place growth — **zero paced advances below the 800 ms catch-up
+  floor**; p10 line-visible **1.00 s -> 2.30 s**, p25 1.43 -> 3.00; **68/68 distinct lines present,
+  in order** (nothing dropped), worst display lag **4.0 s**. AWE 300 s: 151/151 lines in order,
+  page lives <1.2 s **23% -> 6%**, all **10** legitimate blanks preserved at identical positions,
+  zero text->blank->same-text blinks. TruBLU + Daystar_esp (pop-on, never latch): teletext wire
+  **byte-identical** to pre6. `-cc_style faithful` and `PTV_CC_BLOCK_HOLD_MS=0` block: teletext
+  wire **byte-identical** to pre6. Oracle PASS on all six runs (hamming 0, bad framing 0).
+  Unit rig: 57 pre6 assertions byte-identical with the floor off, plus 25 new pacing assertions
+  (burst pacing, catch-up at depth 3, EDM drain-then-erase, clear waits for the queue,
+  empty-screen immediacy, queued in-place growth, `HOLD_MS=0` = pre6, queue release on reset)
+  — **82/82 PASS**, clean under AddressSanitizer.
+
+  **REVIEW ROUND (adversarial review, verdict FIX-FIRST — all findings applied before ship).**
+  The reviewer found that **a source EDM arriving INSIDE the floor destroyed the block**, and
+  built the repro that proves it (`adv6` E1/E2, `adv2` B1/B2). The chain: the EDM queued the
+  paragraph's closing line and nulled `blk_cur`; the source's next one-row snapshot then had
+  nothing to match, fell into the screen-replacement branch with no finished rows, and cleared
+  the DISPLAYED block while queued lines were still pending; the pump's empty-screen rule then
+  fired (0.167 s advance — below every documented rung) and put the closing line on screen
+  ALONE; and because `blk_erase_pending` outlived the erase that new text had superseded, the
+  drain-completion `cc_block_reset()` went on to wipe the block, `blk_sent` and the freshly
+  tracked row — leaving the page with neither text nor an erase until the encoder's 10 s
+  backstop. Three fixes, all needed: **(a)** new text supersedes the erase AND the drain waiting
+  for it (`blk_erase_pending = 0` in `cc_tap_rect`); **(b)** the "nothing finished in this
+  replacement" clear is queued as a `replace` step instead of firing under a drain; **(c)** the
+  drain-completion reset clears the DISPLAY only, and only when nothing new is tracked. A step
+  that emits nothing (a clear step, or a push whose block is unchanged) no longer restarts the
+  floor, since it moved no text. Also from the review: the queue-full bound is now documented
+  (~16 s of backlog at saturation, unreachable on measured channels), the dead second cap check
+  in `cc_block_queue` is gone, `blk_y` parity is restored in the no-finished-rows case, and the
+  **"nothing is ever dropped"** claim is corrected everywhere — a **timeline rebase** flushes the
+  queue with the rest of the assembly (correct: those lines are stamped on a dead timeline), and
+  the queue advances on VIDEO FRAMES, so a frameless input freezes both the queue and a pending
+  erase (accepted; the 10 s stale timer is the backstop).
+
+  **Re-gated after the fixes.** AWE 300 s: the three wire sites the reviewer found
+  (77.244 / 136.103 / 148.281 s) now show the closing line **paired with the line above it, 2
+  rows, exactly as pre6** — 'of the same name.', 'through the eerie mist.', 'for that perfect
+  picture.'; **all 10 clears present**, each preceded by identical text (two land 0.87 s / 0.43 s
+  later, purely because pacing shifted the advances ahead of them); advance-composition histogram
+  **identical to pre6**; 150/150 lines in order once the still-being-typed final partial the
+  300 s cut lands inside is trimmed from both (the only whole-run difference, and it is not a
+  completed line). NTD 120 s unchanged by the fixes: advances <1 s **51% → 14%**, and every one
+  of the 10 is a catch-up-band advance (0.80-0.97 s) except a single 0.40 s in-place growth;
+  p10 line-visible **1.00 → 2.30 s**; 68/68 lines in order; GATE-2 row-count parity clean; worst
+  lag 4.0 s. `faithful`, `PTV_CC_BLOCK_HOLD_MS=0` (NTD **and** AWE), TruBLU and Daystar_esp:
+  **sliced-VBI byte-identical** to pre6. check.sh PASS ×7, hamming 0, bad framing 0. Rig
+  **92/92 PASS** with the two regressions pinned as P8/P9. `leaks -atExit`: **0 leaks** on both
+  the rig and a 45 s block+pacing encoder run (the earlier "no report" was the shell wrapper;
+  ASan cannot answer this — LeakSanitizer does not exist on Darwin). The measurement harness was
+  itself at fault and is fixed: the old set-based completeness gate reported 151/151 OK on the
+  very pair that carried the regression, and now also compares **per-line page composition** and
+  the **advance-composition histogram** — re-run against the pre-fix wire it reproduces all three
+  sites exactly.
+
 ## 1.2.0-pre6 (2026-08-29) — block mode: the stall-flushed block no longer blinks off
 
 **Patch `0001` only, one line + comments** (`ptvencoder.c`). Found by the owner on NTD within

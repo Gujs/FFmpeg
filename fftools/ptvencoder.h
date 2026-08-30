@@ -571,6 +571,57 @@ enum {
  * the encoder's 10s stale-content timer remains the backstop underneath both. */
 #define PTV_CC_BLOCK_CLEAR_US  5000000
 
+/* ---- the PACING FLOOR (1.2.0-pre7) ----
+ *
+ * A completed line is not the same thing as a line the viewer can read. Measured on the live
+ * pre6 wire (NTD, 3 min): 54% of block advances arrived LESS THAN A SECOND after the previous
+ * one, p10 line-visible 1.4 s, minimum 1.0 s — because NTD's captioner flushes whole sentences
+ * in bursts (several completed lines inside ~1 s, then 3-6 s of quiet) and pre6 advanced the
+ * window the instant a line completed. Owner verdict, watching it on air: "it looks too fast
+ * to read for me."
+ *
+ * So the ADVANCES are paced, not the source: a completed line enters a per-tap FIFO and the
+ * displayed block advances ONE step at a time, never sooner than this floor since the last
+ * DISPLAYED change. During a burst the queue absorbs the lines and the window trails the
+ * source by a bounded amount; the quiet periods drain it. NO LINE IS DROPPED TO PACE IT —
+ * latency is bounded by advancing FASTER (see the catch-up thresholds), never by discarding
+ * dialogue. The single exception, stated rather than hidden: a TIMELINE REBASE flushes the
+ * whole assembly, queue included (cc_block_q_free), because those lines are stamped on a dead
+ * timeline; that is a break, not pacing.
+ *
+ * THE QUEUE ADVANCES ON VIDEO FRAMES, like every other timer in the tap: an input that stops
+ * delivering frames freezes the queue AND any source erase waiting behind it, so a page can
+ * outlive its erase for as long as the freeze lasts. Accepted — the teletext encoder's 10 s
+ * stale-content timer is the backstop underneath it, and a frameless input has larger problems
+ * than a caption — but it is a real property, not an oversight.
+ *
+ * 0 = pacing off = pre6 behaviour, byte for byte (the queue is then a pass-through: every
+ * enqueue is applied and emitted at the same point pre6 pushed and emitted). Env override
+ * PTV_CC_BLOCK_HOLD_MS. */
+#define PTV_CC_BLOCK_HOLD_MS   1500
+/* Catch-up: with a backlog the floor drops so the queue drains inside the source's own quiet
+ * periods instead of accumulating. Both are CEILINGS applied to the configured hold, never
+ * raises — a box configured with a 500 ms hold keeps 500 ms. */
+#define PTV_CC_BLOCK_CATCHUP1_N   3        /* queued lines => */
+#define PTV_CC_BLOCK_CATCHUP1_US  800000   /*   max(this, HOLD/2) */
+#define PTV_CC_BLOCK_CATCHUP2_N   6        /* queued lines => */
+#define PTV_CC_BLOCK_CATCHUP2_US  400000   /*   this */
+/* FIFO depth. NTD's sustained line rate is one per 1.7-5 s and its measured bursts are ~3
+ * lines, so the reachable depth is a handful; this is a storage bound, not a policy. When it
+ * is somehow hit the oldest step is forced out immediately rather than dropped. */
+#define PTV_CC_BLOCK_QUEUE_MAX 32
+
+/* One completed line waiting for its turn on the display (see PTV_CC_BLOCK_HOLD_MS). */
+typedef struct CcBlkLine {
+    char *text;      /* owned; EXACTLY as the source wrote it */
+    int   x, y;      /* the line's own ASS x; y is the value blk_y takes when it is displayed */
+    int   hold;      /* cc_block_push_n bound in force when it was queued */
+    int   head;      /* 1 = this entry STARTS a display step; the entries behind it with
+                      * head == 0 belong to the SAME step (a pop-on flip goes up whole) */
+    int   replace;   /* head only: clear the displayed block before pushing this step */
+    int   now;       /* head only: this step ignores the floor once it reaches the front */
+} CcBlkLine;
+
 /* What a queued event MEANS. All three reach the encoder — an empty/zero-rect subtitle is
  * how the teletext encoder is told to keep or clear the page, so it must never be filtered
  * out here; the kind exists for the counters and the state log. CAPTION and ERASE differ
@@ -655,6 +706,15 @@ typedef struct CcTap {
     char            *blk_sent;         /* last block ASS actually queued — re-emit suppression */
     char            *blk_pfx;          /* the "<readorder>,<layer>,<style>,...,," dialog prefix
                                         * of the last event, reused when we synthesise ours */
+    /* pacing floor (see PTV_CC_BLOCK_HOLD_MS) */
+    int64_t          blk_hold_us;      /* the floor, resolved once in cc_setup. 0 = OFF, and
+                                        * then every path below is pre6 byte for byte. */
+    CcBlkLine        blk_q[PTV_CC_BLOCK_QUEUE_MAX];  /* completed lines awaiting display */
+    int              blk_q_n;          /* entries in blk_q (NOT display steps) */
+    int64_t          blk_disp_us;      /* source pts of the last displayed ADVANCE. 0 = none.
+                                        * An in-place update of the bottom line does NOT move
+                                        * it: that text does not move under the viewer's eye. */
+    int              blk_erase_pending;/* a source EDM is waiting for the queue to drain */
 } CcTap;
 
 /* Shared decode side of the ABR ladder (the ffmpeg model: decode the source
