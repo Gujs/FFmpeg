@@ -1,11 +1,12 @@
 AVPROGS-$(CONFIG_FFMPEG)   += ffmpeg
 AVPROGS-$(CONFIG_FFPLAY)   += ffplay
 AVPROGS-$(CONFIG_FFPROBE)  += ffprobe
+AVPROGS-$(CONFIG_PTVENCODER) += ptvencoder
 
 AVPROGS     := $(AVPROGS-yes:%=%$(PROGSSUF)$(EXESUF))
 PROGS       += $(AVPROGS)
 
-AVBASENAMES  = ffmpeg ffplay ffprobe
+AVBASENAMES  = ffmpeg ffplay ffprobe ptvencoder
 ALLAVPROGS   = $(AVBASENAMES:%=%$(PROGSSUF)$(EXESUF))
 ALLAVPROGS_G = $(AVBASENAMES:%=%$(PROGSSUF)_g$(EXESUF))
 
@@ -37,6 +38,14 @@ OBJS-ffmpeg +=                  \
     fftools/textformat/tw_stdout.o    \
     $(OBJS-resman)                    \
     $(RESOBJS)                        \
+
+OBJS-ptvencoder +=                    \
+    fftools/ptvencoder_audio.o        \
+    fftools/ptvencoder_clock.o        \
+    fftools/ptvencoder_demux.o        \
+    fftools/ptvencoder_gate.o         \
+    fftools/ptvencoder_legend.o       \
+    fftools/ptvencoder_mv.o           \
 
 OBJS-ffprobe +=                       \
     fftools/textformat/avtextformat.o \

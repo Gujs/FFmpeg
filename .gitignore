@@ -40,6 +40,8 @@
 /ffmpeg
 /ffplay
 /ffprobe
+/ptvencoder
+/ptvencoder_g
 /checkasm_config_generated.asm
 /checkasm_config_generated.h
 /checkasm_header_config_generated.h
