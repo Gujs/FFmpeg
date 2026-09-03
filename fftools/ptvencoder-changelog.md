@@ -5,6 +5,105 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 1.2.0-pre8 (2026-09-02) — `-pid_plan`: the output PID layout is a function of the CONTENT
+
+**Patch `0001` only** (`ptvencoder.c` / `_legend.c`). libav* untouched: mpegtsenc already honours
+`AVStream.id >= 16` as the PID (`mpegtsenc.c:1190-1224`, the same path `ffmpeg -streamid` uses).
+`-pid_plan off` restores the pre7 behaviour exactly — same PIDs, same PMT, same stream order.
+
+- **Symptom (owner, Cinestar):** the four DVB-subtitle languages landed on DIFFERENT output PIDs
+  between restarts. The CDN is about to key on our PIDs, so this had to stop being possible.
+- **Measured cause:** the SOURCE alternates between two mux variants carrying the same four
+  languages — PIDs `0x475-0x478` ordered hrv,slv,mkd,srp, and PIDs `0x12d-0x130` ordered
+  slv,hrv,mkd,srp. `resolve_plan` expands `-map 0:s?` in INPUT INDEX order and nothing ever set
+  `st->id`, so mpegtsenc numbered the output `start_pid + i` = **the source's order**.
+- **Fix — a class-based decimal plan, ON BY DEFAULT.** Each class owns a 100-PID window:
+  **video 200, audio 300+, subtitle 400+, data (incl. SCTE-35) 500+**. Applied per output; every
+  ABR rung is its own SPTS and gets the identical plan (multiview too). `st->id` is set on every
+  output stream before `avformat_write_header`, and the streams are REORDERED into plan order so
+  the **PMT ES loop reads in PID order**. PCR needs no configuration — mpegtsenc puts it on the
+  first video stream, which is now PID 200. The PMT stays on the muxer default 4096, outside
+  every window (a base that did collide is already a hard error inside mpegtsenc).
+- **The order within a class is a TOTAL order**, so two runs over the same content always agree:
+  1. tracks this run mapped or synthesised, in their own order — the rung's video; transcoded
+     audio in `-map` order; CC→teletext tracks in `-cc_slots` slot order;
+  2. then COPIED tracks, by: SCTE-35 first (data class) → **source language** (absent last) →
+     a **content sub-key** (subtitles: plain before hearing-impaired, from
+     `AV_DISPOSITION_HEARING_IMPAIRED`, which lavf derives from the DVB `subtitling_type`,
+     `mpegts.c:2223-2231`; audio: **more channels first**) → codec name → **input index** →
+     source PID → source stream index.
+  The language key is the **SOURCE** `language` tag, deliberately not what `-metadata:s:<t>:N`
+  puts on the wire — an operator relabel must never renumber PIDs. The input index precedes
+  every source-side key, so renumbering one multiview slot's source cannot move another slot's
+  PIDs. Source PID / source stream index are the **residual tie only**.
+- **What it guarantees, and what it does not.** A provider that RE-ORDERS or RENUMBERS its mux
+  cannot move a language to a different output PID. It does **not** cover: (a) two copied tracks
+  identical in every key above — they are indistinguishable by content and keep the source's
+  relative order, so swapping *their* source PIDs swaps their output PIDs; (b) a track that
+  DISAPPEARS — PIDs are packed densely, so losing `mkd` shifts `slv`/`srp` down one PID each. A
+  language→PID pin is the tracked follow-up; until then a CDN-keyed channel needs a source whose
+  track SET is stable.
+- **Option:** `-pid_plan video=200,audio=300,subtitle=400,data=500` overrides any subset of the
+  bases; `-pid_plan off` is the legacy layout. **`PTV_PID_PLAN` wins over the flag** (same
+  precedence as `PTV_CC_STYLE`). Bases must be 32..8000 and the windows must not overlap, else
+  `EINVAL` with the reason, before anything is opened. A class overflowing its 100 PIDs is a hard
+  error at plan time — it never silently wraps into the next class.
+- **Startup `[PTV-PID]` lines** print the plan source and, per stream,
+  `pid=<n> <class>/<codec>/<language> <- in#K:S` (or `mosaic` / `cc in#K`), for ops and the CDN.
+- **Unchanged, deliberately:** the per-type OPTION indices. `-c:a:N`, `-metadata:s:s:N`,
+  `-disposition:a:N` still count in `-map`/resolve order (CC tracks own `s:0..s:(n_cc-1)`, copied
+  subs follow), because they are applied at stream creation, before the plan runs. Verified:
+  `-metadata:s:a:1 language=…` / `-disposition:a:1` still land on the copied AC-3, now PID 301.
+- **CHANGED, and downstream-visible:** the PHYSICAL output stream order. The plan reorders the
+  muxer's stream array, so CC→teletext now LEADS the subtitle class instead of trailing the
+  copied subs. Anything selecting a track by output stream POSITION (`0:s:0`) rather than by PID
+  or language sees a different track. Select by PID or language.
+- **Gate:** Cinestar source variant A (hrv-first, PIDs 0x475+) and variant B (slv-first, PIDs
+  0x100+) through the same command produce a **byte-equal PMT** — 200 video / 300 aac eng /
+  301 ac3 / 400 hrv / 401 mkd / 402 slv / 403 srp, PCR PID 200. `-pid_plan off` is PMT-identical
+  to a pre7 binary on Cinestar, NTD (`-cc_extract`) and AWE (SCTE-35); the NTD teletext wire and
+  `[PTV-CC] done` counters are identical in all three modes and the oracle passes (hamming 0,
+  bad framing 0, 115 page events).
+
+### review round (adversarial review, FIX-FIRST) — 7 findings, all addressed
+
+The stream REORDER itself passed review: every emission site takes `pkt->stream_index` from
+`ost->index` live, and every per-stream table is either built after `write_header` or indexed by
+INPUT stream. What did not pass was the sort key and the promise made for it.
+
+- **F1 (ship-blocker) — multiview cross-slot bleed.** `pid_ent_cmp` compared `src_pid` before
+  `in_idx`, so same-language tracks interleaved by SOURCE PID across inputs: renumbering only
+  slot 1's source moved slot 0's four subtitle PIDs (402→403, 406→407, 408→409). **Fix:** input
+  index is compared BEFORE any source-side key. Re-gate — slot 0 fixed, slot 1 fully reordered
+  *and* renumbered (0x100→0x300 block): the two runs' PMTs are **byte-equal**, slot 0 keeps
+  402/404/406/408 and slot 1's languages keep 403/405/407/409.
+- **F2 — same (language, codec) pair flipped on a renumber.** `twohrv_C` vs `twohrv_D` (two `hrv`
+  subtitles with their source PIDs swapped) flipped 400↔401. **Fix:** a CONTENT sub-key before
+  the source keys — subtitles: plain before hearing-impaired (`AV_DISPOSITION_HEARING_IMPAIRED`,
+  which lavf derives from the DVB `subtitling_type`, `mpegts.c:2223-2231`); audio: more channels
+  first. Re-gate: with one of the two `hrv` streams marked hearing-impaired (`subtitling_type`
+  0x10→0x20, injected with TSDuck), C and D produce a **byte-equal PMT** and the same source
+  stream owns 400 in both. Isolated audio proof — two AC-3/eng tracks differing ONLY in channel
+  count: the 6-channel track takes 300 in both source orders. **Residual, documented:** two
+  copied tracks identical in every content key still fall to source order, so the plain C/D pair
+  still flips (and only that pair — slv/srp stay on 402/403 in all four runs).
+- **F3 — dense packing is not stable against a MISSING track** (lose `mkd` and slv/srp shift down
+  one). Not fixed this round; the legend and this entry now say so instead of promising more than
+  the sort delivers. A language→PID pin is the tracked follow-up.
+- **F4 — `snprintf` into `buf[256]` silently truncated a long spec** (`data=5001` → `500`, a
+  valid-looking DIFFERENT plan). Now `EINVAL` with the length and the limit.
+- **F5 — the PHYSICAL output stream order changed vs pre7** (CC teletext leads the subtitle class
+  instead of trailing the copied subs). Called out above and in the legend.
+- **F6 — `[PTV-PID]` printed the WIRE language while the sort used the SOURCE tag.** The column
+  now prints the source tag and, when an override differs, both: `eng(wire:mva)`.
+- **F7 — a duplicate class key silently last-won.** Now `EINVAL`.
+- **Review-round gate numbers:** single-input A vs B PMT byte-equal (unchanged); MV A/B PMT
+  byte-equal (F1); `twohrv_CH` vs `twohrv_DH` PMT byte-equal (F2); AC-3 6ch→300 in both orders;
+  SCTE-35 keeps 500 against an alphabetically-earlier `bin_data` on the other slot; `-pid_plan
+  off` PMT-identical to pre7 on Cinestar/NTD/AWE with zero `[PTV-PID]` lines; NTD oracle
+  unchanged (115 headers, C4 20, hamming 0, framing 0, libzvbi events 115) and `[PTV-CC] done`
+  identical; 9-case parse matrix all correct; zero warnings; `leaks -atExit` 0 leaks.
+
 ## 1.2.0-pre7 (2026-08-29) — block mode: a PACING FLOOR under the advances
 
 **Patch `0001` only** (`ptvencoder.c` / `.h` / `_legend.c`). `faithful` is byte-identical to

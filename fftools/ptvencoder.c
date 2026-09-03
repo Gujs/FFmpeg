@@ -16,6 +16,7 @@
 #include <unistd.h>   /* getpid() — 1.0.1-pre10 (g) per-PID phase jitter */
 
 #include "libavutil/avutil.h"
+#include "libavutil/avstring.h"
 #include "libavutil/bprint.h"
 #include "libavutil/log.h"
 #include "libavutil/opt.h"
@@ -43,7 +44,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.2.0-pre7"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.2.0-pre8"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -3723,6 +3724,256 @@ static int is_net_url(const char *u)
     return u && (!strncmp(u, "udp://", 6) || !strncmp(u, "rtp://", 6) || !strncmp(u, "srt://", 6));
 }
 
+/* ==================== deterministic output PID plan (-pid_plan) ====================
+ *
+ * WHY. mpegtsenc numbers an output stream `start_pid + i` unless the application sets
+ * AVStream.id (>= 16), so with no plan the output PID of a track is a function of the
+ * SOURCE's stream ORDER. Cinestar's provider alternates between two mux variants that carry
+ * the same four subtitle languages in a different order (and on different source PIDs), so
+ * hrv/slv/mkd/srp landed on different output PIDs from one restart to the next. A CDN that
+ * keys on our PIDs cannot live with that: the output layout must be keyed on the CONTENT
+ * (class, language, and the content properties below) and fall back to source order ONLY to
+ * separate tracks that are indistinguishable by content.
+ *
+ * WHAT. Each class gets a decimal window of 100: video 200, audio 300+, subtitle 400+,
+ * data (incl. SCTE-35) 500+. The plan is per OUTPUT and every ABR rung is its own SPTS, so
+ * the same plan is written to every rung. Streams are also REORDERED into plan order before
+ * avformat_write_header, so the PMT ES loop reads in PID order. PCR needs no configuration:
+ * mpegtsenc picks the first video stream (select_pcr_streams) = PID 200. The PMT itself stays
+ * on the muxer default (4096) — outside every class window; a base that did collide with it
+ * is already a hard error inside mpegtsenc ("PID %d cannot be both elementary and PMT PID").
+ *
+ * ORDER WITHIN A CLASS — a total order, so two runs over the same CONTENT always agree:
+ *   1. tracks this run MAPPED or SYNTHESISED first, in their own order (the rung's video;
+ *      then transcoded audio in -map order; then CC->teletext tracks in -cc_slots slot order);
+ *   2. then COPIED tracks, by these keys in order:
+ *        a. SCTE-35 first (data class only);
+ *        b. SOURCE language tag (absent sorts last);
+ *        c. the class CONTENT sub-key `ckey` — subtitles: plain before hearing-impaired
+ *           (lavf derives AV_DISPOSITION_HEARING_IMPAIRED from the DVB subtitling_type,
+ *           mpegts.c:2223-2231); audio: MORE channels first (5.1 before stereo);
+ *        d. codec name;
+ *        e. INPUT INDEX — before any source-side key, so renumbering ONE multiview slot's
+ *           source cannot move another slot's PIDs (review F1);
+ *        f. source PID, then source stream index — the RESIDUAL TIE ONLY. Two copied tracks
+ *           that are identical in (a..e) are indistinguishable by content, and their relative
+ *           order is the source's; a provider that swaps such a pair's PIDs swaps their output
+ *           PIDs too. Known and documented, not fixed by sorting.
+ * The language key is the SOURCE stream's `language` tag, deliberately NOT the value a
+ * -metadata:s:<t>:N override puts on the wire — an operator relabel must never renumber PIDs.
+ *
+ * WHAT THIS DOES *NOT* PROMISE: PIDs are packed densely from each class base, so the plan is
+ * stable against a source REORDER or RENUMBER but NOT against a track that DISAPPEARS — lose
+ * mkd and slv/srp shift down one PID each. A language->slot pin is the tracked follow-up; for
+ * now a CDN-keyed channel must be fed a source whose track SET is stable.
+ *
+ * WHAT DOES *NOT* CHANGE: the per-type option indices. -metadata:s:s:N / -disposition:a:N /
+ * -c:a:N still count in RESOLVE order (CC tracks s:0..s:(n_cc-1), then copied subs), because
+ * they are applied at stream creation, before this runs. Only the wire layout is planned.
+ * The PHYSICAL output stream order DOES change (the plan reorders the muxer's array), so a
+ * downstream consumer that selects by output stream position rather than by PID or language
+ * sees a different track — CC teletext now leads the subtitle class instead of trailing it. */
+#define PTV_PID_CLASSES  4
+#define PTV_PID_SPAN     100          /* PIDs reserved per class */
+
+typedef struct PidPlan {
+    int  on;                          /* 0 = -pid_plan off (legacy start_pid + i) */
+    int  base[PTV_PID_CLASSES];       /* video, audio, subtitle, data */
+    const char *src;                  /* "default" / "-pid_plan" / "env PTV_PID_PLAN" */
+} PidPlan;
+
+/* one LOGICAL track = one output stream in EVERY rung (they are created in lock-step, so
+ * the creation index is the same in each muxer) — hence one entry plans all rungs at once. */
+typedef struct PidEnt {
+    AVStream   *ost[PTV_MAX_RUNG];
+    int         cls;                  /* 0 video, 1 audio, 2 subtitle, 3 data */
+    int         mapped;               /* 1 = mapped/synthesised (keeps `ord`), 0 = copied */
+    int         ord;                  /* mapped order: video 0, audio track k, CC slot ci */
+    int         scte;                 /* data class: SCTE-35 leads it */
+    const char *lang;                 /* SOURCE language tag (NULL = none, sorts last) — SORT KEY */
+    /* class content sub-key, PRE-NORMALISED so plain ASCENDING is the wire order: subtitles =
+     * the hearing-impaired flag (plain first); audio = -nb_channels (5.1 before stereo);
+     * 0 for every other class. Keeps the comparator one line and the direction in one place. */
+    int         ckey;
+    const char *codec;
+    int         src_pid, in_idx, src_idx;
+    char        srcs[32];             /* "in#0:3" / "mosaic" / "cc in#0" — for the log */
+    int         pid;
+} PidEnt;
+
+static const char *const pid_cls_name[PTV_PID_CLASSES] = { "video", "audio", "subtitle", "data" };
+static const int         pid_cls_default[PTV_PID_CLASSES] = { 200, 300, 400, 500 };
+
+static int pid_cls_of(enum AVMediaType t)
+{
+    return t == AVMEDIA_TYPE_VIDEO ? 0 : t == AVMEDIA_TYPE_AUDIO ? 1 :
+           t == AVMEDIA_TYPE_SUBTITLE ? 2 : 3;
+}
+
+/* NULL / empty sorts AFTER every real language */
+static int pid_lang_cmp(const char *a, const char *b)
+{
+    int na = !a || !a[0], nb = !b || !b[0];
+    if (na || nb) return na - nb;
+    return strcmp(a, b);
+}
+
+static int pid_ent_cmp(const void *pa, const void *pb)
+{
+    const PidEnt *a = pa, *b = pb;
+    int d;
+    if ((d = a->cls    - b->cls))    return d;
+    if ((d = b->mapped - a->mapped)) return d;        /* mapped/synthesised tracks lead */
+    if (a->mapped)     return a->ord - b->ord;
+    if ((d = b->scte   - a->scte))   return d;        /* data: SCTE-35 owns the class base */
+    if ((d = pid_lang_cmp(a->lang, b->lang))) return d;
+    if ((d = a->ckey   - b->ckey))   return d;        /* content: HI flag / channel count */
+    if ((d = strcmp(a->codec, b->codec)))     return d;
+    /* input index BEFORE any source-side key: renumbering one multiview slot's source must
+     * not renumber another slot's output PIDs (review F1). */
+    if ((d = a->in_idx  - b->in_idx))  return d;
+    /* residual tie only — content-identical duplicates keep the source's relative order */
+    if ((d = a->src_pid - b->src_pid)) return d;
+    return a->src_idx - b->src_idx;
+}
+
+/* -pid_plan "off" | "video=200,audio=300,subtitle=400,data=500" (any subset; the rest keep
+ * their defaults). PTV_PID_PLAN wins over the flag, so a box can be flipped without touching
+ * its channel config — same precedence as PTV_CC_STYLE. */
+static int pid_plan_parse(OptionGroupList *outs, PidPlan *p)
+{
+    const char *spec = getenv("PTV_PID_PLAN");
+    char buf[256], *tok, *save = NULL;
+    int seen[PTV_PID_CLASSES] = {0};
+    int c, gi;
+
+    p->on  = 1;
+    p->src = "default";
+    for (c = 0; c < PTV_PID_CLASSES; c++) p->base[c] = pid_cls_default[c];
+
+    if (spec && spec[0]) p->src = "env PTV_PID_PLAN";
+    else {
+        spec = og_get(&outs->groups[0], "pid_plan");
+        if (spec && spec[0]) p->src = "-pid_plan";
+    }
+    /* one plan per RUN: every rung is the same SPTS layout, so it is read from output 0 */
+    for (gi = 1; gi < outs->nb_groups; gi++) {
+        const char *o = og_get(&outs->groups[gi], "pid_plan");
+        if (o && (!spec || strcmp(o, spec)))
+            av_log(NULL, AV_LOG_WARNING,
+                   "[PTV-PID] -pid_plan on output %d is IGNORED — one plan applies to the "
+                   "whole ladder and is read from the first output\n", gi);
+    }
+    if (!spec || !spec[0]) return 0;
+    if (!strcmp(spec, "off")) { p->on = 0; return 0; }
+
+    /* refuse rather than truncate: a spec cut mid-number would silently become another plan
+     * (review F4 — "data=5001" losing its last digit is a valid-looking 500) */
+    if (strlen(spec) >= sizeof buf) {
+        av_log(NULL, AV_LOG_ERROR,
+               "[PTV-PID] -pid_plan is %zu characters, the limit is %zu — a plan this long is "
+               "a mistake, and truncating it would silently produce a DIFFERENT plan\n",
+               strlen(spec), sizeof buf - 1);
+        return AVERROR(EINVAL);
+    }
+    snprintf(buf, sizeof buf, "%s", spec);
+    for (tok = av_strtok(buf, ",", &save); tok; tok = av_strtok(NULL, ",", &save)) {
+        char *eq = strchr(tok, '=');
+        long v;
+        char *end;
+        if (!eq) goto bad;
+        *eq = 0;
+        for (c = 0; c < PTV_PID_CLASSES; c++) if (!strcmp(tok, pid_cls_name[c])) break;
+        if (c == PTV_PID_CLASSES) goto bad;
+        if (seen[c]++) {                          /* review F7: last-wins was a silent trap */
+            av_log(NULL, AV_LOG_ERROR,
+                   "[PTV-PID] -pid_plan names class \"%s\" more than once — say it once\n",
+                   pid_cls_name[c]);
+            return AVERROR(EINVAL);
+        }
+        v = strtol(eq + 1, &end, 10);
+        if (*end || v < 32 || v > 8000) {
+            av_log(NULL, AV_LOG_ERROR,
+                   "[PTV-PID] -pid_plan %s=%s: base PID must be 32-8000 (PIDs below 32 are "
+                   "reserved, and a class needs its %d-PID window below 8191)\n",
+                   tok, eq + 1, PTV_PID_SPAN);
+            return AVERROR(EINVAL);
+        }
+        p->base[c] = (int)v;
+    }
+    for (c = 0; c < PTV_PID_CLASSES; c++) {
+        int c2;
+        for (c2 = c + 1; c2 < PTV_PID_CLASSES; c2++)
+            if (FFABS(p->base[c] - p->base[c2]) < PTV_PID_SPAN) {
+                av_log(NULL, AV_LOG_ERROR,
+                       "[PTV-PID] -pid_plan: %s=%d and %s=%d overlap — each class owns a "
+                       "%d-PID window\n", pid_cls_name[c], p->base[c],
+                       pid_cls_name[c2], p->base[c2], PTV_PID_SPAN);
+                return AVERROR(EINVAL);
+            }
+    }
+    return 0;
+bad:
+    av_log(NULL, AV_LOG_ERROR,
+           "[PTV-PID] -pid_plan \"%s\": expected \"off\" or a comma-separated list of "
+           "<class>=<base> (video/audio/subtitle/data), e.g. "
+           "video=200,audio=300,subtitle=400,data=500\n", spec);
+    return AVERROR(EINVAL);
+}
+
+/* Sort `ent` into plan order, assign the PIDs, then REWRITE each rung's stream array so the
+ * PMT ES loop matches. Safe here and only here: every runtime packet takes its
+ * pkt->stream_index from ost->index live (clock/demux), nothing has cached an index yet, and
+ * write_header has not run. */
+static int pid_plan_apply(const PidPlan *p, PidEnt *ent, int n, Rung *rung, int n_rung)
+{
+    int i, r, cnt[PTV_PID_CLASSES] = {0};
+
+    qsort(ent, n, sizeof *ent, pid_ent_cmp);
+    for (i = 0; i < n; i++) {
+        if (cnt[ent[i].cls] >= PTV_PID_SPAN) {
+            av_log(NULL, AV_LOG_ERROR,
+                   "[PTV-PID] more than %d %s streams — the class window %d..%d is full; "
+                   "widen it with -pid_plan or drop streams (never silently wrapping into "
+                   "the next class)\n", PTV_PID_SPAN, pid_cls_name[ent[i].cls],
+                   p->base[ent[i].cls], p->base[ent[i].cls] + PTV_PID_SPAN - 1);
+            return AVERROR(EINVAL);
+        }
+        ent[i].pid = p->base[ent[i].cls] + cnt[ent[i].cls]++;
+    }
+    for (r = 0; r < n_rung; r++) {
+        if ((int)rung[r].ofmt->nb_streams != n) {
+            av_log(NULL, AV_LOG_ERROR, "[PTV-PID] output %d has %d streams, planned %d\n",
+                   r, rung[r].ofmt->nb_streams, n);
+            return AVERROR_BUG;
+        }
+        for (i = 0; i < n; i++) {
+            rung[r].ofmt->streams[i]        = ent[i].ost[r];
+            rung[r].ofmt->streams[i]->index = i;
+            rung[r].ofmt->streams[i]->id    = ent[i].pid;
+        }
+    }
+    av_log(NULL, AV_LOG_INFO,
+           "[PTV-PID] deterministic PID plan (%s): video %d, audio %d+, subtitle %d+, data "
+           "%d+ — identical on all %d output(s), PMT ES loop in this order, PCR on the video "
+           "PID\n", p->src, p->base[0], p->base[1], p->base[2], p->base[3], n_rung);
+    /* Language column: the SORT used the SOURCE tag, the WIRE carries whatever a
+     * -metadata:s:<t>:N override put there. Print the source tag, and when the two differ show
+     * both — "hrv(wire:mva)" — so the line can never be read as "this PID was placed by mva". */
+    for (i = 0; i < n; i++) {
+        const AVDictionaryEntry *w = av_dict_get(ent[i].ost[0]->metadata, "language", NULL, 0);
+        const char *src  = ent[i].lang && ent[i].lang[0] ? ent[i].lang : NULL;
+        const char *wire = w && w->value[0] ? w->value : NULL;
+        char lang[48];
+        if (src && wire && strcmp(src, wire)) snprintf(lang, sizeof lang, "%s(wire:%s)", src, wire);
+        else if (!src && wire)                snprintf(lang, sizeof lang, "--(wire:%s)", wire);
+        else                                  snprintf(lang, sizeof lang, "%s", src ? src : "--");
+        av_log(NULL, AV_LOG_INFO, "[PTV-PID] pid=%d %s/%s/%s <- %s\n",
+               ent[i].pid, pid_cls_name[ent[i].cls], ent[i].codec, lang, ent[i].srcs);
+    }
+    return 0;
+}
+
 /* transcode: ins = parsed input group list (1/2/4 inputs; >1 = multiview);
  * outs = the list of output groups (one per ABR rung); fcomplex = the shared
  * -filter_complex. The ffmpeg model — decode each input once, one filter graph
@@ -3770,6 +4021,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
     int aborted = 0, r, si, k, kk, n_copy_inputs = 0;
     AVRational out_fps;
     PassStream pass[PTV_MAX_PASS]; int n_pass = 0;
+    PidPlan          pidp;                        /* deterministic output PID plan (-pid_plan) */
     /* -cc_extract: EIA-608 -> DVB-teletext (all inert unless the option is given). One
      * INDEPENDENT extraction per participating input — single-input is simply n_cc == 1. */
     CcCtx            cc[PTV_MAX_INPUT];
@@ -3889,6 +4141,9 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
             }
         }
     }
+    /* the PID plan is resolved up front too: an invalid one must fail before anything is
+     * opened, and it can only be applied once every output stream exists (below). */
+    if ((ret = pid_plan_parse(outs, &pidp)) < 0) return ret;
     if (g_degraded && multiview) {
         /* rr10 review fix (D2): PTV_DEGRADED is SINGLE-INPUT ONLY. On multiview the entry's
          * backlog flush (g_selfheal_req) has NO consumer — mv slot decode threads run with
@@ -4394,6 +4649,74 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
             ci++;
         }
         g_cc_on = 1;
+    }
+
+    /* ---- deterministic output PID plan: every output stream now exists, none has been
+     * written yet. See the pid_plan_* header for the rule. ---- */
+    if (pidp.on) {
+        PidEnt ent[1 + PTV_MAX_AUDIO + PTV_MAX_PASS + PTV_MAX_INPUT];
+        int n = 0, tsonly = 1;
+
+        for (r = 0; r < n_rung; r++)
+            if (strcmp(rung[r].ofmt->oformat->name, "mpegts")) tsonly = 0;
+        if (!tsonly)
+            av_log(NULL, AV_LOG_WARNING,
+                   "[PTV-PID] output is not mpegts — the PID plan is an MPEG-TS layout and is "
+                   "skipped (use -pid_plan off to silence this)\n");
+        else {
+            memset(ent, 0, sizeof ent);
+            {   /* the rung's video: PID base of the video class, and mpegtsenc puts PCR on it */
+                PidEnt *e = &ent[n++];
+                for (r = 0; r < n_rung; r++) e->ost[r] = rung[r].vc.ost;
+                e->cls = 0; e->mapped = 1; e->ord = 0;
+                e->codec   = avcodec_get_name(rung[0].vc.ost->codecpar->codec_id);
+                e->src_pid = inputs[0].vist->id;
+                e->src_idx = multiview ? -1 : inputs[0].vstream;
+                if (multiview) snprintf(e->srcs, sizeof e->srcs, "mosaic");
+                else           snprintf(e->srcs, sizeof e->srcs, "in#0:%d", inputs[0].vstream);
+            }
+            for (k = 0; k < n_audio; k++) {          /* transcoded audio, in -map order */
+                AVStream *ist = inputs[asrc_in[k]].ifmt->streams[asrc[k]];
+                AVDictionaryEntry *lg = av_dict_get(ist->metadata, "language", NULL, 0);
+                PidEnt *e = &ent[n++];
+                for (r = 0; r < n_rung; r++) e->ost[r] = as[k].ost[r];
+                e->cls = 1; e->mapped = 1; e->ord = k;
+                e->codec   = avcodec_get_name(as[k].ost[0]->codecpar->codec_id);
+                e->lang    = lg ? lg->value : NULL;
+                e->src_pid = ist->id; e->in_idx = asrc_in[k]; e->src_idx = asrc[k];
+                snprintf(e->srcs, sizeof e->srcs, "in#%d:%d", asrc_in[k], asrc[k]);
+            }
+            for (k = 0; k < n_cc; k++) {             /* CC->teletext, in -cc_slots slot order */
+                PidEnt *e = &ent[n++];
+                for (r = 0; r < n_rung; r++) e->ost[r] = cc[k].ost[r];
+                e->cls = 2; e->mapped = 1; e->ord = k;
+                e->codec   = avcodec_get_name(cc[k].ost[0]->codecpar->codec_id);
+                e->src_pid = inputs[cc_slot[k]].vist->id;
+                e->in_idx  = cc_slot[k]; e->src_idx = -1;
+                snprintf(e->srcs, sizeof e->srcs, "cc in#%d", cc_slot[k]);
+            }
+            for (k = 0; k < n_pass; k++) {           /* copies: sorted by CONTENT, not by source order */
+                AVStream *ist = inputs[pass[k].input].ifmt->streams[pass[k].in_index];
+                AVDictionaryEntry *lg = av_dict_get(ist->metadata, "language", NULL, 0);
+                PidEnt *e = &ent[n++];
+                for (r = 0; r < n_rung; r++) e->ost[r] = pass[k].ost[r];
+                e->cls    = pid_cls_of(ist->codecpar->codec_type);
+                e->scte   = ist->codecpar->codec_id == AV_CODEC_ID_SCTE_35;
+                e->codec  = avcodec_get_name(ist->codecpar->codec_id);
+                e->lang   = lg ? lg->value : NULL;
+                /* content sub-key, ascending (see PidEnt): a plain subtitle before the
+                 * hearing-impaired one of the same language; 5.1 audio before its stereo
+                 * downmix. Both are properties of the CONTENT, so they survive a source
+                 * renumber that would otherwise flip the pair. */
+                if (e->cls == 2)
+                    e->ckey = !!(ist->disposition & AV_DISPOSITION_HEARING_IMPAIRED);
+                else if (e->cls == 1)
+                    e->ckey = -ist->codecpar->ch_layout.nb_channels;
+                e->src_pid = ist->id; e->in_idx = pass[k].input; e->src_idx = pass[k].in_index;
+                snprintf(e->srcs, sizeof e->srcs, "in#%d:%d", pass[k].input, pass[k].in_index);
+            }
+            if ((ret = pid_plan_apply(&pidp, ent, n, rung, n_rung)) < 0) goto end;
+        }
     }
 
     /* per-rung: open the output, bound the interleave (sparse-sub smoothing),
@@ -4920,6 +5243,7 @@ static const OptionDef ptv_options[] = {
     { "cc_page",          OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "teletext page for the extracted CC (default 0x88)", "page" },
     { "cc_style",         OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "CC presentation: faithful (default, teletext mirrors the CC snapshot for snapshot) or block (opt-in, whole finished lines only)", "style" },
     { "cc_magazine",      OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "teletext magazine for the extracted CC (1-8, default 8)", "n" },
+    { "pid_plan",         OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "output PID plan: class bases (default video=200,audio=300,subtitle=400,data=500) or \"off\" for source-order PIDs", "plan" },
     { "f",                OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "force format", "fmt" },
     { NULL },
 };
