@@ -958,7 +958,16 @@ int ff_interleave_packet_per_dts(AVFormatContext *s, AVPacket *pkt,
         const FFStream *const sti = cffstream(st);
         const AVCodecParameters *const par = st->codecpar;
         if (sti->last_in_packet_buffer) {
-            ++stream_count;
+            /* A QUEUED DATA packet must not count as an interleaved stream either:
+             * nb_interleaved_streams excludes DATA, so counting it here breaks the
+             * stream_count + noninterleaved_count equality that arms the
+             * max_interleave_delta flush. With a 1 Hz SCTE-35 heartbeat the 200 ms
+             * bound was off almost permanently and the sparsest subtitle stream
+             * gated every rung (measured: 2.8 s wire gaps -> 45 s+ holds -> udp fifo
+             * overflow on the release burst). Same treatment for SMPTE-2038. */
+            if (par->codec_type != AVMEDIA_TYPE_DATA &&
+                par->codec_id != AV_CODEC_ID_SMPTE_2038)
+                ++stream_count;
         } else if (par->codec_type != AVMEDIA_TYPE_ATTACHMENT &&
                    par->codec_type != AVMEDIA_TYPE_DATA &&
                    par->codec_id != AV_CODEC_ID_VP8 &&
