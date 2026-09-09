@@ -5,6 +5,50 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 1.2.0-pre9 (2026-09-09) — interleaver: a queued SCTE-35 packet no longer disarms the 200 ms flush
+
+**Patch `0002` (`libavformat/mux.c`, one hunk) + this banner bump.** No ptvencoder.c behaviour change.
+
+- **Symptom (NOCTOCODE-GB_News-AI_SUBS, glo-2, since the channel was added on 2026-09-04):**
+  `[PTV-MUX] rung N egress dead 60s` exits at the SAME three wall-clock slots every day
+  (11:2x / 14:2x / 19:1x BST), `[PTV-MEMCAP]` 8 GB kills every 5–6 h with 4 of 6 rungs silent on
+  the wire, and permanently chunked delivery (1–3 s wire gaps + catch-up bursts at the `bitrate=`
+  ceiling). Log signature of the leak state: exactly ONE `[PTV-MUXTOL] … ENOMEM (1 tolerated)` per
+  dead rung, then silence while RSS grows at the rung's mux bitrate.
+- **Measured cause:** `mux.c ff_interleave_packet_per_dts()`. Patch 0002 excludes
+  `AVMEDIA_TYPE_DATA` from `nb_interleaved_streams` and from `noninterleaved_count`, but a QUEUED
+  DATA packet still counted in `stream_count`. The `max_interleave_delta` (ptvencoder: 200 ms)
+  flush is guarded by `nb_interleaved_streams == stream_count + noninterleaved_count`, which is
+  then off by one — so whenever an SCTE-35 packet sits in the queue the bound is OFF and the only
+  remaining flush rule is "every interleaved stream has a packet queued". This source sends an
+  SCTE-35 heartbeat every second, NVENC holds video ~1 s (subs/DATA bypass the delivery gate and
+  lead at the interleaver), and the output carries four sparse interleaved streams (three DVB-sub
+  tracks with 3–4.5 s gaps + an intermittent teletext PID): the interleaver flushed only when the
+  sparse tracks coincided (3–4 s chunks); when they paused at programme junctions the hold lasted
+  the pause (~75 s, RSS +110 MB) and the release burst overran the 5.4 MB udp fifos (fixed
+  `fifo_size=28672` per rung while the burst scales with rung bitrate → high rungs die, 2000/3000
+  survive) → ENOMEM → the 60 s death. Once ALL streams including DATA were queued at once
+  (`stream_count` 8 vs 7 interleaved) nothing could ever be popped again → unbounded queue → the
+  RSS leak. Onset captured live 14:24:38–14:27:28 BST: wire dark on all six rungs for 75 s while
+  `muxed` kept climbing, `udp-tx` idle, kernel send queues empty — a hold inside libavformat.
+- **Fix:** exclude DATA (and SMPTE-2038, which upstream already treats the same way in the other
+  two counters) from `stream_count` too. DATA packets are still queued and popped in DTS order
+  exactly as before; SCTE-35 timing on the wire is unchanged.
+- **Evidence (Rule 0, `ptv-v2` build, 100 s capture of the real source, `libx264 -rc-lookahead 25`
+  as the NVENC-latency stand-in — VideoToolbox realtime has no ~1 s hold and hides the effect):**
+  DATA mapped: 17/191 silent 0.5 s bins, max gap 2.79 s; DATA unmapped: 0/191, 190 ms; a 45 s
+  pause of the three sparse subs reproduced the whole production signature (92/161 silent bins,
+  23.6 s gap, one ENOMEM, dead rung, RSS +47 MB); the same fixture on this fix: 0/191 silent bins,
+  188 ms max gap, no ENOMEM. Instrumented diag run named both phases (`stream_count=6 nonilv=2`
+  during the pause, `stream_count=8 have=11111111` after the burst).
+  Report: `test-results/noctocode-interleaver-20260909.md`.
+- **Exposure:** any channel whose output has a DATA stream AND a sparse interleaved (DVB-sub /
+  teletext) stream, since 0002 (2026-06-19). MV_2x2_RAV (cor-3) has no DATA stream — its 02:17
+  egress-dead exits are a different, still-open mechanism.
+- **Still open, tracked:** the aviobuf write error is sticky (`writeout()` never retries after
+  `s->error`), so a rung that ever hits ENOMEM keeps failing every write until the 60 s exit —
+  "pkt dropped, channel survives" is only true for the fifo-full blip if the bound above holds.
+
 ## 1.2.0-pre8 (2026-09-02) — `-pid_plan`: the output PID layout is a function of the CONTENT
 
 **Patch `0001` only** (`ptvencoder.c` / `_legend.c`). libav* untouched: mpegtsenc already honours
