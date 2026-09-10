@@ -44,7 +44,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.2.0-pre9"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.2.0-pre10"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -3342,6 +3342,16 @@ static void *mux_thread(void *arg)
                  * PTV_NO_MUXTOL=1 reverts. */
                 int64_t now = av_gettime_relative();
                 tol_count++;
+                /* 1.2.0-pre10: the ENOMEM came through the muxer's AVIOContext, whose
+                 * writeout() is STICKY — once s->error is set it never calls udp_write
+                 * again and write_packet() returns that error for every later packet, so
+                 * a single real fifo-full blip became a guaranteed 60 s "egress dead" exit
+                 * (cor-3 MV_2x2_RAV daily 02:17, MV_2x2_Curiosity; reproduced locally:
+                 * 10 s pause → one ENOMEM → 5651 failures with the wire dark). Clear it so
+                 * the next write actually reaches udp_write; the chunk that overflowed is
+                 * lost either way (that is the tolerated blip). */
+                if (m->ofmt->pb && m->ofmt->pb->error == ret)
+                    m->ofmt->pb->error = 0;
                 if (!tol_fail_since)
                     tol_fail_since = now;
                 else if (now - tol_fail_since >= 60000000) {

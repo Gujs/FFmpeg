@@ -5,6 +5,37 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 1.2.0-pre10 (2026-09-10) — a tolerated ENOMEM no longer leaves the muxer's aviobuf dead
+
+**Patch `0001` only** (`ptvencoder.c`, mux thread, `[PTV-MUXTOL]` path — 2 lines + comment).
+
+- **Symptom:** cor-3 `MV_2x2_RAV_Newsmax_OAN_Salem` exited with `[PTV-MUX] rung 0 egress dead 60s` at
+  02:17 CDT on 15 of the last 16 days (25 exits total in the retained logs, since 2026-08-26), still on
+  pre9; `MV_2x2_Curiosity_Channels` once (2026-09-09 22:01). Log shape every time: one `[PTV-MUXTOL] …
+  ENOMEM (1 tolerated)` then a tolerated count climbing by ~2230 per 10 s = **every single write
+  failing at the normal mux rate** until the 60 s exit — the drain never "freed a slot".
+- **Measured cause:** the ENOMEM arrives through the muxer's `AVIOContext`. `aviobuf.c writeout()`
+  is sticky: once `s->error` is set it never calls the protocol write again, and `mux.c
+  write_packet()` returns `pb->error` for every later packet. So the FIRST genuine fifo-full blip
+  (a catch-up burst after a source stall) turned into a guaranteed death 60 s later; "pkt dropped,
+  channel survives" was only ever true when there was no aviobuf in between. Reproduced locally on
+  the pre9 build (output `fifo_size=8000` = 1.5 MB, `SIGSTOP` 10 s at t=30 → catch-up burst): one
+  real ENOMEM at the resume, then 5651 failures in 60 s, `muxed` frozen, wire dark once the fifo had
+  drained; the exit would have fired 2 s after the fixture ended.
+- **Fix:** after counting a tolerated ENOMEM/EAGAIN, clear `m->ofmt->pb->error` when it equals that
+  errno, so the next write reaches `udp_write` again. The chunk that overflowed is lost either way
+  (that IS the tolerated blip; TS continuity counters jump once). Everything else in the MUXTOL
+  path — the 60 s dead-egress escalation, `PTV_NO_MUXTOL`, the fatal path for other errnos — is
+  unchanged.
+- **Evidence:** same test on the fixed build: exactly ONE `[PTV-MUXTOL]` line, wire back immediately
+  after the 10 s pause (224–362 pkts per 0.5 s, continuous), `muxed` 8025 vs 2450 frozen before.
+- **What triggers it in production (cor-3):** the RAV source stops for ~15 s at 02:15 CDT every day
+  (`video_q refilled after 15793ms empty`, BANK escalated to its 12 s ceiling); the multiview slot
+  holds, then catches up faster than the `bitrate=` egress ceiling → the fifo fills once → ENOMEM.
+  Surviving that blip is the intent; the source event itself is the provider's.
+- **Sweep lesson recorded in the tracker:** a soak scan must start at the FIRST pre-N banner of the
+  window — starting at the latest banner hides any death that was followed by a respawn.
+
 ## 1.2.0-pre9 (2026-09-09) — interleaver: a queued SCTE-35 packet no longer disarms the 200 ms flush
 
 **Patch `0002` (`libavformat/mux.c`, one hunk) + this banner bump.** No ptvencoder.c behaviour change.
