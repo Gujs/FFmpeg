@@ -38,7 +38,16 @@ typedef void ID3D11Device;
 
 #include "avcodec.h"
 
-#define MAX_REGISTERED_FRAMES 64
+/* ptvencoder scale fix (2026-07-06): 64 -> 512. A deep decode->output cushion (frame_q up to
+ * 160 frames + in-flight) cycles more distinct CUDA buffers through the encoder than a
+ * 64-entry cache holds, so every frame evicted + re-registered a resource = 2 Resource-
+ * Manager WRITE-lock ioctls per frame per rung; at fleet scale (56ch x 6 rungs) the driver
+ * rwlock collapsed into osq_lock spinning = 32% of box CPU (perf + /proc kernel stacks,
+ * 2026-07-06). 512 covers the largest cushion (PTV_FRAMEQ cap 160 + in-flight + margin) so
+ * steady state re-registers nothing. Entries are small per-encoder records; registrations
+ * map ALREADY-allocated pool VRAM. PTV_NVENC_REG_CAP clamps the logical cap at runtime
+ * (64 = byte-identical upstream behavior, for A/B). */
+#define MAX_REGISTERED_FRAMES 512
 
 #define NVENCAPI_CHECK_VERSION(major, minor) \
     ((major) < NVENCAPI_MAJOR_VERSION || ((major) == NVENCAPI_MAJOR_VERSION && (minor) <= NVENCAPI_MINOR_VERSION))

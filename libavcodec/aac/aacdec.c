@@ -60,6 +60,7 @@
 #include "libavutil/macros.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
+#include "libavutil/samplefmt.h"
 #include "libavutil/tx.h"
 #include "libavutil/version.h"
 #include "libavutil/refstruct.h"
@@ -202,6 +203,14 @@ static int frame_configure_elements(AVCodecContext *avctx)
     ac->frame->nb_samples = 2048;
     if ((ret = ff_get_buffer(avctx, ac->frame, 0)) < 0)
         return ret;
+
+    /* Under tolerant_ch_alloc the transmitted element set may be a subset of the
+     * configured layout (that mismatch is the tolerated condition), leaving the
+     * planes of absent elements unwritten — silence them instead of emitting
+     * uninitialized buffer contents. */
+    if (ac->tolerant_ch_alloc)
+        av_samples_set_silence(ac->frame->extended_data, 0, ac->frame->nb_samples,
+                               avctx->ch_layout.nb_channels, avctx->sample_fmt);
 
     /* map output channel pointers to AVFrame data */
     for (ch = 0; ch < avctx->ch_layout.nb_channels; ch++) {
@@ -767,6 +776,84 @@ ChannelElement *ff_aac_get_che(AACDecContext *ac, int type, int elem_id)
     default:
         return NULL;
     }
+}
+
+/**
+ * Number of consecutive fully-parsed frames the same unexpected element
+ * pattern must repeat before tolerant_ch_alloc releases tolerated output.
+ */
+#define TOLERANT_QUAL_FRAMES 3
+
+/**
+ * Tolerant fallback for ff_aac_get_che() (the tolerant_ch_alloc option): map a
+ * channel element transmitted outside the configured mapping by its own
+ * type/id — to the element the current configuration already allocated for
+ * that tag if there is one, else to one allocated on demand (which decodes
+ * into its internal buffer and joins the output map on the next
+ * reconfiguration). Mirrors the per-frame reconfiguration behaviour of
+ * FAAD-style decoders on broadcast streams whose declared
+ * channel_configuration does not match the transmitted element sequence
+ * (e.g. 7.1-signalled streams carrying a plain CPE-first layout).
+ *
+ * Records the addition in the frame's pattern signature; whether the decoded
+ * frame is actually released is decided at end of frame by the
+ * persistence-before-trust qualification (tolerant_qualify()). Tolerance
+ * covers ALLOCATION only — payload parse errors keep failing the frame
+ * through the existing paths.
+ */
+static ChannelElement *tolerant_get_che(AACDecContext *ac, int type, int elem_id)
+{
+    if (type > TYPE_LFE || elem_id >= MAX_ELEM_ID)
+        return NULL;
+    if (ac->tol_n < 0 || ac->tol_n >= FF_ARRAY_ELEMS(ac->tol_sig)) {
+        ac->tol_n = -1;                        /* pattern overflow: frame invalid */
+        return NULL;
+    }
+    if (!ac->che[type][elem_id]) {
+        if (ac->proc.sbr_ctx_alloc_init(ac, &ac->che[type][elem_id], type) < 0)
+            return NULL;
+        ac->che[type][elem_id]->ch[0].output = ac->che[type][elem_id]->ch[0].ret_buf;
+        ac->che[type][elem_id]->ch[1].output = ac->che[type][elem_id]->ch[1].ret_buf;
+    }
+    ac->tol_sig[ac->tol_n++] = (type << 4) | elem_id;
+    ac->tags_mapped++;
+    return ac->tag_che_map[type][elem_id] = ac->che[type][elem_id];
+}
+
+/**
+ * End-of-frame persistence check for tolerant_ch_alloc. Called only after the
+ * whole frame parsed and rendered (windowing/overlap state stays continuous
+ * across discarded qualification frames). Returns 0 to release the frame,
+ * <0 to discard it (behaves like the strict rejection).
+ */
+static int tolerant_qualify(AACDecContext *ac)
+{
+    if (ac->tol_n < 0) {                       /* overflowed pattern: never trust */
+        ac->tol_consec = 0;
+        ac->tol_prev_n = 0;
+        return AVERROR_INVALIDDATA;
+    }
+    if (!ac->tol_n) {                          /* clean frame: stream healed, forget */
+        ac->tol_consec = 0;
+        ac->tol_prev_n = 0;
+        return 0;
+    }
+    if (ac->tol_n == ac->tol_prev_n &&
+        !memcmp(ac->tol_sig, ac->tol_prev_sig, ac->tol_n)) {
+        if (ac->tol_consec < INT_MAX)
+            ac->tol_consec++;
+    } else {                                   /* new/changed pattern: restart qualification */
+        memcpy(ac->tol_prev_sig, ac->tol_sig, ac->tol_n);
+        ac->tol_prev_n  = ac->tol_n;
+        ac->tol_consec  = 1;
+    }
+    if (ac->tol_consec < TOLERANT_QUAL_FRAMES)
+        return AVERROR_INVALIDDATA;            /* still qualifying: strict outcome */
+    if (!ac->warned_tolerant_alloc++)
+        av_log(ac->avctx, AV_LOG_WARNING,
+               "unexpected channel element pattern persisted %d frames — "
+               "mapped on demand (tolerant_ch_alloc)\n", ac->tol_consec);
+    return 0;
 }
 
 /**
@@ -2334,6 +2421,7 @@ static int decode_frame_ga(AVCodecContext *avctx, AACDecContext *ac,
     AVFrame *frame = ac->frame;
 
     int payload_alignment = get_bits_count(gb);
+    ac->tol_n = 0;                             /* tolerant_ch_alloc: fresh pattern per frame */
     // parse
     while ((elem_type = get_bits(gb, 3)) != TYPE_END) {
         elem_id = get_bits(gb, 4);
@@ -2355,9 +2443,13 @@ static int decode_frame_ga(AVCodecContext *avctx, AACDecContext *ac,
             che_presence[elem_type][elem_id]++;
 
             if (!(che=ff_aac_get_che(ac, elem_type, elem_id))) {
-                av_log(ac->avctx, AV_LOG_ERROR, "channel element %d.%d is not allocated\n",
-                       elem_type, elem_id);
-                return AVERROR_INVALIDDATA;
+                if (ac->tolerant_ch_alloc)
+                    che = tolerant_get_che(ac, elem_type, elem_id);
+                if (!che) {
+                    av_log(ac->avctx, AV_LOG_ERROR, "channel element %d.%d is not allocated\n",
+                           elem_type, elem_id);
+                    return AVERROR_INVALIDDATA;
+                }
             }
             samples = ac->oc[1].m4ac.frame_length_short ? 960 : 1024;
             che->present = 1;
@@ -2460,6 +2552,19 @@ static int decode_frame_ga(AVCodecContext *avctx, AACDecContext *ac,
     samples <<= multiplier;
 
     spectral_to_sample(ac, samples);
+
+    /* tolerant_ch_alloc persistence-before-trust: an unexpected element pattern
+     * must repeat across TOLERANT_QUAL_FRAMES fully-parsed frames before its
+     * output is released; qualifying frames are discarded like the strict
+     * rejection (after spectral_to_sample, so overlap state stays continuous). */
+    if (ac->tolerant_ch_alloc) {
+        int tol = tolerant_qualify(ac);
+        if (tol < 0) {
+            av_frame_unref(ac->frame);
+            *got_frame_ptr = 0;
+            return tol;
+        }
+    }
 
     if (ac->oc[1].status && audio_found) {
         avctx->sample_rate = ac->oc[1].m4ac.sample_rate << multiplier;
@@ -2650,6 +2755,9 @@ static const AVOption options[] = {
 
     { "target_level", "Target output loudness in dBFS for xHE-AAC normalization (0 = disabled)",
         OFF(target_level), AV_OPT_TYPE_INT, { .i64 = 0 }, -70, 0, AACDEC_FLAGS },
+
+    { "tolerant_ch_alloc", "Allocate channel elements missing from the configured layout on demand instead of failing the frame",
+        OFF(tolerant_ch_alloc), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, AACDEC_FLAGS },
 
     {NULL},
 };

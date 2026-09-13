@@ -22,6 +22,8 @@
 #include "config.h"
 #include "config_components.h"
 
+#include <stdlib.h>
+
 #include "nvenc.h"
 #include "hevc/sei.h"
 #if CONFIG_AV1_NVENC_ENCODER
@@ -2195,7 +2197,18 @@ static int nvenc_find_free_reg_resource(AVCodecContext *avctx)
 
     int i, first_round;
 
-    if (ctx->nb_registered_frames == FF_ARRAY_ELEMS(ctx->registered_frames)) {
+    /* ptvencoder scale fix: logical cache cap, runtime-clamped. PTV_NVENC_REG_CAP=64 restores
+     * the byte-identical upstream eviction behavior for A/B; default = the full (enlarged)
+     * array. See MAX_REGISTERED_FRAMES in nvenc.h for the measured RM-lock failure mode. */
+    static int reg_cap;
+    if (!reg_cap) {
+        const char *e = getenv("PTV_NVENC_REG_CAP");
+        int v = e ? atoi(e) : 0;
+        reg_cap = (v >= 64 && v <= (int)FF_ARRAY_ELEMS(ctx->registered_frames))
+                  ? v : (int)FF_ARRAY_ELEMS(ctx->registered_frames);
+    }
+
+    if (ctx->nb_registered_frames == reg_cap) {
         for (first_round = 1; first_round >= 0; first_round--) {
             for (i = 0; i < ctx->nb_registered_frames; i++) {
                 if (!ctx->registered_frames[i].mapped) {

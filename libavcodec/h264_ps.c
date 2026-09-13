@@ -710,6 +710,31 @@ int ff_h264_decode_picture_parameter_set(GetBitContext *gb, AVCodecContext *avct
         return AVERROR_INVALIDDATA;
     }
 
+    /* An identical re-sent PPS keeps the existing object — the PPS mirror of the
+     * SPS same-content shortcut above. In-band header-repeating streams otherwise
+     * churn a fresh ~170KB PPS refstruct per PPS NAL in BOTH the avformat parser
+     * and the decoder; under a fragmented heap (storm-state live channels) that
+     * churn never reuses and grows process RSS without bound (memhunt #67: the
+     * HTTV 40GB anon-heap runaway — dominant allocator measured at exactly
+     * sizeof(PPS)+refstruct header per NAL). Skip only when the raw PPS bits
+     * match AND the referenced SPS object is unchanged (dequant/derived state
+     * depends on it). */
+    if (ps->pps_list[pps_id]) {
+        const PPS *old = ps->pps_list[pps_id];
+        size_t raw  = get_bits_bytesize(gb, 1);
+        size_t cmp  = FFMIN(raw, sizeof(old->data));
+        int    stop = !(bit_length & 7) && cmp < sizeof(old->data);
+        if (old->data_size == cmp + stop &&
+            !memcmp(old->data, gb->buffer, cmp) &&
+            (!stop || old->data[cmp] == 0x80) &&
+            (unsigned)old->sps_id < MAX_SPS_COUNT &&
+            old->sps == ps->sps_list[old->sps_id]) {
+            av_log(avctx, AV_LOG_DEBUG,
+                   "identical re-sent PPS %u — existing object kept\n", pps_id);
+            return 0;
+        }
+    }
+
     pps = av_refstruct_alloc_ext(sizeof(*pps), 0, NULL, pps_free);
     if (!pps)
         return AVERROR(ENOMEM);
