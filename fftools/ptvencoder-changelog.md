@@ -5,6 +5,52 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 🏁 1.2.0 (2026-09-13) — RELEASED. Content-identical to `1.2.0-pre10` (banner bump only).
+
+**What 1.2.0 adds over 1.1.0** (pre1 → pre10, 2026-08-08 → 09-10, each entry below):
+- **CC (EIA-608) → DVB-teletext** (`-cc_extract`, pre1–pre3): single-input and multiview, one extraction
+  per slot, teletext page model with the mandatory away-switch, G0 subset signalled correctly (every
+  non-English language rendered the wrong alphabet before), captions placed where the source put them.
+- **`-cc_style faithful|block`** (pre5–pre7): default FAITHFUL (the page mirrors the CC snapshot for
+  snapshot); `block` opt-in for downstream renderers that choke on snapshot churn (Metropolitan → WebVTT),
+  with the 5 s clear after the last screen change and the ≥1.5 s pacing floor (`PTV_CC_BLOCK_HOLD_MS`).
+- **The source's EIT no longer poisons our output** (pre4): the lavf-synthesized bin_data PID that made
+  ffprobe wait 118 s and sync_check false-restart healthy channels is refused.
+- **Deterministic output PID plan** (pre8, `-pid_plan`, DEFAULT ON): video 200, audio 300+, subtitle 400+,
+  data 500+, keyed on CONTENT (source language, disposition, codec) so a provider re-ordering its mux
+  cannot move a language to a different PID. `-pid_plan off` = legacy.
+- **Interleaver: a queued SCTE-35 packet no longer disarms the 200 ms flush** (pre9, patch 0002): the
+  cause of chunked delivery, fixed-time "egress dead" exits and the dead-rung RSS leak on every channel
+  with a DATA stream plus sparse subtitles (NOCTOCODE glo-2 was the loud case).
+- **A tolerated udp ENOMEM no longer leaves the muxer's aviobuf dead** (pre10): one real fifo-full blip
+  after a source stall used to become a guaranteed 60 s "egress dead" exit (cor-3 MV_2x2_RAV daily at
+  02:17 CDT for 16 days; the three live-transcoder mosaics during the 2026-09-10 relay outage).
+
+**Release gate PASSED — canary soak 2026-09-09 → 09-13 (pre9 from 09-09 19:20 BST, pre10 from 09-11 00:58
+CDT; live-transcoder 9 + cor-3 32 processes), glo-1/2/3 on pre9 from 09-10 06:21 BST, pre10 adopted by
+natural restarts (52 of 100 channels by 09-13 08:53 BST):**
+- **Zero fatal markers attributable to pre9/pre10** in seven read-only sweeps (egress-dead, memory
+  runaway, write-failed, MUXGUARD span, MUXTOL escalation) across all six boxes; the scan covers every
+  run from its first pre9 banner, including runs that died and respawned and runs spanning log rotation.
+- **The pre10 class was seen surviving live three days running:** MV_2x2_RAV rode through its 02:16 CDT
+  catch-up overflow on 09-11, 09-12 and 09-13 with one to two `[PTV-MUXTOL]` lines and no exit — the
+  first survivals since 2026-08-26.
+- **The pre9 class is gone on the wire:** every DATA+subtitle channel checked (NOCTOCODE, GBN, GB_News,
+  RAV) delivers with ≤154 ms maximum inter-datagram gap and zero silent half-seconds (was 2.8 s gaps).
+- **GB_News 32-minute output watch (owner ask, 09-11):** 0 continuity errors, 0 PCR steps (40 ms
+  interval exact), 0 DTS reordering faults, 0 wire gaps >200 ms on all five rungs; PCR delivery jitter
+  ±50 ms (p5–p95). `test-results/gbnews-output-watch-20260911.md`.
+- **RSS** medians 408–530 MB on every box; the only growth is the known slow multiview residual
+  (~200 MB/day on the RAV-slot mosaics, restart-bounded; tracker A17).
+
+**Known limitations shipped (contained, each tracked in `analysis/ptvencoder-progress.md`):**
+#53 async-pad bound (A4: a video-dead feed with audio flowing pads to the 8 GB MEMCAP in minutes —
+Avivando, Riff_TV, Stingray; provider tickets + fix queued first in 1.2.x) · input TIMEOUT ends the run
+instead of re-opening (A1) · `video_size 0x0` when the probe finds no SPS/PPS (A2) · mid-run PMT /
+stream-set change not handled and not logged (A19) · data-copy whitelist and language→PID pin map (A5,
+A6, slipped from 1.2.0) · multiview RSS step residual (A17). Release patch set:
+`patches/v2/release-1.2.0/` (0001–0006, chain-verified on clean upstream `master fc4b523596`).
+
 ## 1.2.0-pre10 (2026-09-10) — a tolerated ENOMEM no longer leaves the muxer's aviobuf dead
 
 **Patch `0001` only** (`ptvencoder.c`, mux thread, `[PTV-MUXTOL]` path — 2 lines + comment).
