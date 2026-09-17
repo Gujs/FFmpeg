@@ -40,11 +40,12 @@
 
 #include "cmdutils.h"
 #include "ptvencoder.h"
+#include "ptvencoder_lang.h"
 
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.2.0"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.2.1-pre1"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -883,7 +884,7 @@ int     g_cc = 1;
 /* atomic because the "emitter thread create failed" path clears it AFTER the output threads
  * (which read it for the stats line) are already running */
 _Atomic int g_cc_on;
-static int g_epg_refused;   /* an EPG/EIT copy was refused (1.2.0-pre4): keeps the
+static int g_data_refused;   /* a data copy was refused (whitelist, 1.2.1-pre1): keeps the
                              * "passthrough N stream(s)" narration printed even when the
                              * EIT was the ONLY data stream (n_pass == 0) */
 _Atomic int64_t g_cc_a53, g_cc_caps, g_cc_erase, g_cc_keep, g_cc_err, g_cc_dropped,
@@ -3685,6 +3686,7 @@ static int cc_setup(CcCtx *cc, CcTap *tap, AVThreadMessageQueue **cc_q,
         apply_stream_meta(&outs->groups[r], 's', sidx, os);
         cc->ost[r] = os;
     }
+    cc->lang = cclang;
 
     if ((ret = av_thread_message_queue_alloc(cc_q, PTV_CC_QDEPTH, sizeof(CcEvent))) < 0)
         return ret;
@@ -3736,24 +3738,56 @@ static int is_net_url(const char *u)
 
 /* ==================== deterministic output PID plan (-pid_plan) ====================
  *
- * WHY. mpegtsenc numbers an output stream `start_pid + i` unless the application sets
- * AVStream.id (>= 16), so with no plan the output PID of a track is a function of the
- * SOURCE's stream ORDER. Cinestar's provider alternates between two mux variants that carry
- * the same four subtitle languages in a different order (and on different source PIDs), so
- * hrv/slv/mkd/srp landed on different output PIDs from one restart to the next. A CDN that
- * keys on our PIDs cannot live with that: the output layout must be keyed on the CONTENT
- * (class, language, and the content properties below) and fall back to source order ONLY to
- * separate tracks that are indistinguishable by content.
+ * v2 — CONTENT-KEYED STATIC MAP (1.2.1-pre1, DEFAULT). Owner requirement 2026-09-17: when a
+ * source gains (or loses) an audio or subtitle track, no OTHER track's output PID may change,
+ * across restarts, with no state on the box and no per-channel setup. That is only possible
+ * when a track's PID is a pure function of the track's OWN identity — never of which other
+ * tracks are present. v1 (below) packed each class densely from a base, so adding `ara` to a
+ * channel carrying `deu`,`eng` shifted both. v2 maps identity -> PID statically:
  *
- * WHAT. Each class gets a decimal window of 100: video 200, audio 300+, subtitle 400+,
- * data (incl. SCTE-35) 500+. The plan is per OUTPUT and every ABR rung is its own SPTS, so
- * the same plan is written to every rung. Streams are also REORDERED into plan order before
- * avformat_write_header, so the PMT ES loop reads in PID order. PCR needs no configuration:
- * mpegtsenc picks the first video stream (select_pcr_streams) = PID 200. The PMT itself stays
- * on the muxer default (4096) — outside every class window; a base that did collide with it
- * is already a hard error inside mpegtsenc ("PID %d cannot be both elementary and PMT PID").
+ *   identity = (class, variant, language);   PID = block(class, variant) + rank(language)
  *
- * ORDER WITHIN A CLASS — a total order, so two runs over the same CONTENT always agree:
+ *   200          video (PCR rides it)
+ *   500..599     data, by codec: scte_35 500, timed_id3 501, smpte_2038 502, smpte_klv 503
+ *   1000..1999   audio, <= 2 channels (the transcoded track, or a copied stereo/mono track)
+ *   2000..2999   audio, > 2 channels (multichannel passthrough, e.g. AC-3 5.1)
+ *   3000..3999   DVB subtitle, plain
+ *   5000..5999   DVB subtitle, hearing-impaired      (the 4000s are skipped: PMT = 4096)
+ *   6000..6999   teletext copied from the source
+ *   7000..7999   teletext synthesised from CC (-cc_extract), keyed on the resolved -cc_lang
+ *
+ * Inside a 1000-block: offset 0..483 = the 484 ISO 639-2/B languages in the FROZEN
+ * alphabetical order of ptvencoder_lang.h (generated once from lavf's avlanguage.c, never
+ * regenerated — a change would move PIDs fleet-wide); 484..499 = RESERVED for future ISO
+ * 639-2 additions, each APPENDED by hand to ptvencoder_lang.h at the next free rank (lavf's
+ * own table is not consulted at run time, so an upstream change moves nothing here);
+ * 500..915 = the private-use codes qaa..qpz (16*26 = 416); 916..979 = OVERFLOW for
+ * malformed tags and same-identity duplicates, packed in the v1 comparator order (the ONE
+ * place a PID can still move, and it says so on its log row); 980..999 unused. The language key is the SOURCE tag normalised:
+ * two-letter and 639-2/T spellings fold onto the /B code (deu=ger, fra=fre, mkd=mac, en=eng),
+ * the deprecated scc/scr onto srp/hrv, an absent tag is `und`, a comma list (multi-language
+ * teletext descriptor) keys on its first entry. A `-metadata` relabel never moves a PID.
+ * Variant defines identity, codec does not: a stereo `eng` track keeps 1122 whether it is our
+ * AAC or a copied AC-3 stereo, so two stereo `eng` tracks on one channel are duplicates and
+ * the second goes to overflow.
+ *
+ * MULTIVIEW: the SLOT is the identity, not the language. The driver emits one stereo audio and
+ * at most one subtitle per slot and relabels them mva/mvb/mvc/mvd (SV_MULTIVIEW_CODES); slots
+ * often share a source language (four `eng` news feeds, four `slv` Cinestar feeds). So in a
+ * mosaic: audio 1000+slot, DVB sub 3000+slot, source teletext 6000+slot, CC teletext
+ * 7000+slot, slot = input index. Changing the virtual codes moves only the wire tag.
+ *
+ * v1 — PACKED PLAN (1.2.0-pre8, `-pid_plan v1`, kept for rollback and for channels whose
+ * consumer still keys on the 1.2.0 layout). mpegtsenc numbers an output stream
+ * `start_pid + i` unless the application sets AVStream.id (>= 16), so with no plan the output
+ * PID of a track is a function of the SOURCE's stream ORDER. Cinestar's provider alternates
+ * between two mux variants that carry the same four subtitle languages in a different order
+ * (and on different source PIDs), so hrv/slv/mkd/srp landed on different output PIDs from one
+ * restart to the next. v1 gives each class a decimal window of 100 (video 200, audio 300+,
+ * subtitle 400+, data 500+), sorts each class by CONTENT and packs from the base.
+ *
+ * ORDER WITHIN A CLASS (v1 placement; v2 uses it only to decide who wins a duplicate and how
+ * the overflow area is packed) — a total order, so two runs over the same CONTENT agree:
  *   1. tracks this run MAPPED or SYNTHESISED first, in their own order (the rung's video;
  *      then transcoded audio in -map order; then CC->teletext tracks in -cc_slots slot order);
  *   2. then COPIED tracks, by these keys in order:
@@ -3765,30 +3799,40 @@ static int is_net_url(const char *u)
  *        d. codec name;
  *        e. INPUT INDEX — before any source-side key, so renumbering ONE multiview slot's
  *           source cannot move another slot's PIDs (review F1);
- *        f. source PID, then source stream index — the RESIDUAL TIE ONLY. Two copied tracks
- *           that are identical in (a..e) are indistinguishable by content, and their relative
- *           order is the source's; a provider that swaps such a pair's PIDs swaps their output
- *           PIDs too. Known and documented, not fixed by sorting.
- * The language key is the SOURCE stream's `language` tag, deliberately NOT the value a
- * -metadata:s:<t>:N override puts on the wire — an operator relabel must never renumber PIDs.
+ *        f. source PID, then source stream index — the RESIDUAL TIE ONLY.
  *
- * WHAT THIS DOES *NOT* PROMISE: PIDs are packed densely from each class base, so the plan is
- * stable against a source REORDER or RENUMBER but NOT against a track that DISAPPEARS — lose
- * mkd and slv/srp shift down one PID each. A language->slot pin is the tracked follow-up; for
- * now a CDN-keyed channel must be fed a source whose track SET is stable.
+ * Both versions REORDER the muxer's stream array into PID order before avformat_write_header,
+ * so the PMT ES loop reads in PID order. PCR needs no configuration: mpegtsenc picks the first
+ * video stream (select_pcr_streams) = PID 200. The PMT stays on the muxer default (4096).
  *
  * WHAT DOES *NOT* CHANGE: the per-type option indices. -metadata:s:s:N / -disposition:a:N /
  * -c:a:N still count in RESOLVE order (CC tracks s:0..s:(n_cc-1), then copied subs), because
  * they are applied at stream creation, before this runs. Only the wire layout is planned.
- * The PHYSICAL output stream order DOES change (the plan reorders the muxer's array), so a
+ * The PHYSICAL output stream order DOES change (both plans reorder the muxer's array), so a
  * downstream consumer that selects by output stream position rather than by PID or language
- * sees a different track — CC teletext now leads the subtitle class instead of trailing it. */
+ * sees a different track. */
 #define PTV_PID_CLASSES  4
-#define PTV_PID_SPAN     100          /* PIDs reserved per class */
+#define PTV_PID_SPAN     100          /* v1: PIDs reserved per class */
+
+/* v2 layout */
+#define PTV_V2_VIDEO     200
+#define PTV_V2_DATA      500
+#define PTV_V2_AUDIO     1000         /* <= 2 channels */
+#define PTV_V2_AUDIO_MC  2000         /* >  2 channels */
+#define PTV_V2_SUB       3000         /* DVB subtitle, plain */
+#define PTV_V2_SUB_HI    5000         /* DVB subtitle, hearing-impaired */
+#define PTV_V2_TTX       6000         /* teletext copied from the source */
+#define PTV_V2_CCTTX     7000         /* teletext synthesised from CC */
+#define PTV_V2_PRIV      500          /* offset of the private-use codes qaa..qpz (416) */
+#define PTV_V2_OVER      916          /* offset of the overflow area in a 1000-block */
+#define PTV_V2_OVER_N    64
+#define PTV_V2_DATA_OVER 90           /* data block: overflow 590..599 */
+#define PTV_V2_DATA_OVER_N 10
 
 typedef struct PidPlan {
-    int  on;                          /* 0 = -pid_plan off (legacy start_pid + i) */
-    int  base[PTV_PID_CLASSES];       /* video, audio, subtitle, data */
+    int  ver;                         /* 0 = off (legacy start_pid + i), 1 = packed plan, 2 = static map */
+    int  on;                          /* ver > 0 */
+    int  base[PTV_PID_CLASSES];       /* v1 only: video, audio, subtitle, data */
     const char *src;                  /* "default" / "-pid_plan" / "env PTV_PID_PLAN" */
 } PidPlan;
 
@@ -3806,9 +3850,15 @@ typedef struct PidEnt {
      * 0 for every other class. Keeps the comparator one line and the direction in one place. */
     int         ckey;
     const char *codec;
+    enum AVCodecID cid;
     int         src_pid, in_idx, src_idx;
     char        srcs[32];             /* "in#0:3" / "mosaic" / "cc in#0" — for the log */
     int         pid;
+    /* v2 identity */
+    int         ch;                   /* OUTPUT channel count (audio) */
+    int         rank;                 /* language rank, -1 = malformed */
+    char        norm[4];              /* normalised /B code (or private-use code) */
+    char        why[80];              /* row annotation: "rank 122 (eng)" / "slot 2" / "OVERFLOW: ..." */
 } PidEnt;
 
 static const char *const pid_cls_name[PTV_PID_CLASSES] = { "video", "audio", "subtitle", "data" };
@@ -3847,9 +3897,52 @@ static int pid_ent_cmp(const void *pa, const void *pb)
     return a->src_idx - b->src_idx;
 }
 
-/* -pid_plan "off" | "video=200,audio=300,subtitle=400,data=500" (any subset; the rest keep
- * their defaults). PTV_PID_PLAN wins over the flag, so a box can be flipped without touching
- * its channel config — same precedence as PTV_CC_STYLE. */
+static int pid_ent_cmp_pid(const void *pa, const void *pb)
+{
+    return ((const PidEnt *)pa)->pid - ((const PidEnt *)pb)->pid;
+}
+
+/* v2 language key: normalise the SOURCE tag and return its rank in the frozen table
+ * (0..PTV_LANG_N-1), a private-use offset (500..915), or -1 for a malformed tag. `norm` receives the
+ * normalised code (the /B spelling for any alias) — NUL-terminated, for the log. */
+static int pid_lang_rank(const char *tag, char norm[4])
+{
+    char c[4] = { 0 };
+    int i, len = 0, lo, hi;
+
+    if (tag)
+        for (i = 0; tag[i] && tag[i] != ','; i++) {   /* multi-language teletext: first entry */
+            if (len < 3) c[len] = av_tolower((unsigned char)tag[i]);
+            len++;
+        }
+    if (len == 0) { memcpy(c, "und", 4); len = 3; }
+    memcpy(norm, c, 4);
+    if (len > 3 || len < 2) return -1;
+    for (i = 0; i < len; i++)
+        if (c[i] < 'a' || c[i] > 'z') return -1;
+    if (len == 3) {
+        lo = 0; hi = PTV_LANG_NSORTED - 1;            /* the /B list is alphabetical ... */
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2, d = strcmp(c, ptv_lang_bibl[mid]);
+            if (!d) return mid;
+            if (d < 0) hi = mid - 1; else lo = mid + 1;
+        }
+        for (i = PTV_LANG_NSORTED; i < PTV_LANG_N; i++)  /* ... appended additions are not */
+            if (!strcmp(c, ptv_lang_bibl[i])) return i;
+        if (c[0] == 'q' && c[1] >= 'a' && c[1] <= 'p')  /* private use qaa..qpz */
+            return PTV_V2_PRIV + (c[1] - 'a') * 26 + (c[2] - 'a');
+    }
+    for (i = 0; i < PTV_LANG_NALIAS; i++)
+        if (!strcmp(c, ptv_lang_alias[i].from)) {
+            memcpy(norm, ptv_lang_bibl[ptv_lang_alias[i].rank], 4);
+            return ptv_lang_alias[i].rank;
+        }
+    return -1;
+}
+
+/* -pid_plan "v2" (default) | "v1[,<class>=<base>,...]" | "<class>=<base>,..." (= v1) | "off".
+ * PTV_PID_PLAN wins over the flag, so a box or one channel can be flipped without touching
+ * the driver — same precedence as PTV_CC_STYLE. */
 static int pid_plan_parse(OptionGroupList *outs, PidPlan *p)
 {
     const char *spec = getenv("PTV_PID_PLAN");
@@ -3857,6 +3950,7 @@ static int pid_plan_parse(OptionGroupList *outs, PidPlan *p)
     int seen[PTV_PID_CLASSES] = {0};
     int c, gi;
 
+    p->ver = 2;
     p->on  = 1;
     p->src = "default";
     for (c = 0; c < PTV_PID_CLASSES; c++) p->base[c] = pid_cls_default[c];
@@ -3875,7 +3969,17 @@ static int pid_plan_parse(OptionGroupList *outs, PidPlan *p)
                    "whole ladder and is read from the first output\n", gi);
     }
     if (!spec || !spec[0]) return 0;
-    if (!strcmp(spec, "off")) { p->on = 0; return 0; }
+    if (!strcmp(spec, "off")) { p->ver = 0; p->on = 0; return 0; }
+    if (!strcmp(spec, "v2")) return 0;
+    if (!strncmp(spec, "v2,", 3)) {
+        av_log(NULL, AV_LOG_ERROR,
+               "[PTV-PID] -pid_plan v2 takes no parameters — the layout is fixed by design "
+               "(PID = block + language rank); use v1,<class>=<base>,... for a custom base\n");
+        return AVERROR(EINVAL);
+    }
+    p->ver = 1;
+    if (!strcmp(spec, "v1")) return 0;
+    if (!strncmp(spec, "v1,", 3)) spec += 3;
 
     /* refuse rather than truncate: a spec cut mid-number would silently become another plan
      * (review F4 — "data=5001" losing its last digit is a valid-looking 500) */
@@ -3925,19 +4029,51 @@ static int pid_plan_parse(OptionGroupList *outs, PidPlan *p)
     return 0;
 bad:
     av_log(NULL, AV_LOG_ERROR,
-           "[PTV-PID] -pid_plan \"%s\": expected \"off\" or a comma-separated list of "
-           "<class>=<base> (video/audio/subtitle/data), e.g. "
-           "video=200,audio=300,subtitle=400,data=500\n", spec);
+           "[PTV-PID] -pid_plan \"%s\": expected \"v2\", \"off\", or \"v1\" optionally followed "
+           "by a comma-separated list of <class>=<base> (video/audio/subtitle/data), e.g. "
+           "v1,video=200,audio=300,subtitle=400,data=500\n", spec);
     return AVERROR(EINVAL);
 }
 
-/* Sort `ent` into plan order, assign the PIDs, then REWRITE each rung's stream array so the
- * PMT ES loop matches. Safe here and only here: every runtime packet takes its
- * pkt->stream_index from ost->index live (clock/demux), nothing has cached an index yet, and
- * write_header has not run. */
-static int pid_plan_apply(const PidPlan *p, PidEnt *ent, int n, Rung *rung, int n_rung)
+/* Language column shared by both plans: the SORT/KEY used the SOURCE tag, the WIRE carries
+ * whatever a -metadata:s:<t>:N override put there. Print the source tag, and when the two
+ * differ show both — "hrv(wire:mva)" — so the line can never be read as "this PID was placed
+ * by mva". */
+static void pid_lang_col(const PidEnt *e, char *out, size_t n)
 {
-    int i, r, cnt[PTV_PID_CLASSES] = {0};
+    const AVDictionaryEntry *w = av_dict_get(e->ost[0]->metadata, "language", NULL, 0);
+    const char *src  = e->lang && e->lang[0] ? e->lang : NULL;
+    const char *wire = w && w->value[0] ? w->value : NULL;
+    if (src && wire && strcmp(src, wire)) snprintf(out, n, "%s(wire:%s)", src, wire);
+    else if (!src && wire)                snprintf(out, n, "--(wire:%s)", wire);
+    else                                  snprintf(out, n, "%s", src ? src : "--");
+}
+
+/* REWRITE each rung's stream array in `ent` order so the PMT ES loop matches. Safe here and
+ * only here: every runtime packet takes its pkt->stream_index from ost->index live
+ * (clock/demux), nothing has cached an index yet, and write_header has not run. */
+static int pid_plan_commit(const PidEnt *ent, int n, Rung *rung, int n_rung)
+{
+    int i, r;
+    for (r = 0; r < n_rung; r++) {
+        if ((int)rung[r].ofmt->nb_streams != n) {
+            av_log(NULL, AV_LOG_ERROR, "[PTV-PID] output %d has %d streams, planned %d\n",
+                   r, rung[r].ofmt->nb_streams, n);
+            return AVERROR_BUG;
+        }
+        for (i = 0; i < n; i++) {
+            rung[r].ofmt->streams[i]        = ent[i].ost[r];
+            rung[r].ofmt->streams[i]->index = i;
+            rung[r].ofmt->streams[i]->id    = ent[i].pid;
+        }
+    }
+    return 0;
+}
+
+/* v1: sort into plan order, pack each class from its base. */
+static int pid_plan_apply_v1(const PidPlan *p, PidEnt *ent, int n, Rung *rung, int n_rung)
+{
+    int i, ret, cnt[PTV_PID_CLASSES] = {0};
 
     qsort(ent, n, sizeof *ent, pid_ent_cmp);
     for (i = 0; i < n; i++) {
@@ -3951,37 +4087,112 @@ static int pid_plan_apply(const PidPlan *p, PidEnt *ent, int n, Rung *rung, int 
         }
         ent[i].pid = p->base[ent[i].cls] + cnt[ent[i].cls]++;
     }
-    for (r = 0; r < n_rung; r++) {
-        if ((int)rung[r].ofmt->nb_streams != n) {
-            av_log(NULL, AV_LOG_ERROR, "[PTV-PID] output %d has %d streams, planned %d\n",
-                   r, rung[r].ofmt->nb_streams, n);
-            return AVERROR_BUG;
-        }
-        for (i = 0; i < n; i++) {
-            rung[r].ofmt->streams[i]        = ent[i].ost[r];
-            rung[r].ofmt->streams[i]->index = i;
-            rung[r].ofmt->streams[i]->id    = ent[i].pid;
-        }
-    }
+    if ((ret = pid_plan_commit(ent, n, rung, n_rung)) < 0) return ret;
     av_log(NULL, AV_LOG_INFO,
-           "[PTV-PID] deterministic PID plan (%s): video %d, audio %d+, subtitle %d+, data "
+           "[PTV-PID] deterministic PID plan v1 (%s): video %d, audio %d+, subtitle %d+, data "
            "%d+ — identical on all %d output(s), PMT ES loop in this order, PCR on the video "
            "PID\n", p->src, p->base[0], p->base[1], p->base[2], p->base[3], n_rung);
-    /* Language column: the SORT used the SOURCE tag, the WIRE carries whatever a
-     * -metadata:s:<t>:N override put there. Print the source tag, and when the two differ show
-     * both — "hrv(wire:mva)" — so the line can never be read as "this PID was placed by mva". */
     for (i = 0; i < n; i++) {
-        const AVDictionaryEntry *w = av_dict_get(ent[i].ost[0]->metadata, "language", NULL, 0);
-        const char *src  = ent[i].lang && ent[i].lang[0] ? ent[i].lang : NULL;
-        const char *wire = w && w->value[0] ? w->value : NULL;
         char lang[48];
-        if (src && wire && strcmp(src, wire)) snprintf(lang, sizeof lang, "%s(wire:%s)", src, wire);
-        else if (!src && wire)                snprintf(lang, sizeof lang, "--(wire:%s)", wire);
-        else                                  snprintf(lang, sizeof lang, "%s", src ? src : "--");
+        pid_lang_col(&ent[i], lang, sizeof lang);
         av_log(NULL, AV_LOG_INFO, "[PTV-PID] pid=%d %s/%s/%s <- %s\n",
                ent[i].pid, pid_cls_name[ent[i].cls], ent[i].codec, lang, ent[i].srcs);
     }
     return 0;
+}
+
+/* v2: PID = block(class, variant) + identity offset; duplicates and malformed tags overflow. */
+static int pid_plan_apply_v2(const PidPlan *p, PidEnt *ent, int n, Rung *rung, int n_rung,
+                             int multiview)
+{
+    uint8_t used[8192 / 8] = {0};
+    int over[8] = {0};                /* overflow fill per 1000-block (index = block/1000) */
+    int i, ret;
+
+    /* comparator order decides who wins a same-identity duplicate and how overflow packs */
+    qsort(ent, n, sizeof *ent, pid_ent_cmp);
+    for (i = 0; i < n; i++) {
+        PidEnt *e = &ent[i];
+        int block, off = -1, pid, over_off = PTV_V2_OVER, over_n = PTV_V2_OVER_N;
+
+        e->why[0] = 0;
+        switch (e->cls) {
+        case 0:
+            block = PTV_V2_VIDEO; off = 0;
+            snprintf(e->why, sizeof e->why, "video, PCR");
+            break;
+        case 3:
+            block = PTV_V2_DATA; over_off = PTV_V2_DATA_OVER; over_n = PTV_V2_DATA_OVER_N;
+            switch (e->cid) {
+            case AV_CODEC_ID_SCTE_35:    off = 0; snprintf(e->why, sizeof e->why, "(0x86 CUEI)"); break;
+            case AV_CODEC_ID_TIMED_ID3:  off = 1; snprintf(e->why, sizeof e->why, "(0x15 ID3)");  break;
+            case AV_CODEC_ID_SMPTE_2038: off = 2; snprintf(e->why, sizeof e->why, "(0x06 VANC)"); break;
+            case AV_CODEC_ID_SMPTE_KLV:  off = 3; snprintf(e->why, sizeof e->why, "(KLVA)");      break;
+            default:
+                snprintf(e->why, sizeof e->why, "OVERFLOW: data codec %s has no fixed PID", e->codec);
+            }
+            break;
+        case 1:
+            block = e->ch > 2 ? PTV_V2_AUDIO_MC : PTV_V2_AUDIO;
+            break;
+        default:
+            block = e->mapped                        ? PTV_V2_CCTTX :
+                    e->cid == AV_CODEC_ID_DVB_TELETEXT ? PTV_V2_TTX :
+                    e->ckey                          ? PTV_V2_SUB_HI : PTV_V2_SUB;
+        }
+        if (e->cls == 1 || e->cls == 2) {
+            if (multiview) {
+                off = e->in_idx;
+                snprintf(e->why, sizeof e->why, "slot %d", off);
+            } else if (e->rank >= 0) {
+                off = e->rank;
+                snprintf(e->why, sizeof e->why, "rank %d (%s)%s", off, e->norm,
+                         e->cls == 1 ? (e->ch > 2 ? ", multichannel" : "") : "");
+            } else
+                snprintf(e->why, sizeof e->why, "OVERFLOW: language \"%s\" is not ISO 639-2",
+                         e->lang ? e->lang : "");
+        }
+        pid = block + off;
+        if (off >= 0 && (used[pid >> 3] & (1 << (pid & 7)))) {
+            snprintf(e->why, sizeof e->why, "OVERFLOW: same identity as pid=%d", pid);
+            off = -1;
+        }
+        if (off < 0) {
+            int k = over[block / 1000]++;
+            if (k >= over_n) {
+                av_log(NULL, AV_LOG_ERROR,
+                       "[PTV-PID] more than %d overflow streams in the %d block — a source "
+                       "with that many unidentifiable or duplicate tracks is not a channel we "
+                       "can lay out; drop streams with -map\n", over_n, block);
+                return AVERROR(EINVAL);
+            }
+            pid = block + over_off + k;
+        }
+        used[pid >> 3] |= 1 << (pid & 7);
+        e->pid = pid;
+    }
+    qsort(ent, n, sizeof *ent, pid_ent_cmp_pid);      /* PMT ES loop in ascending PID order */
+    if ((ret = pid_plan_commit(ent, n, rung, n_rung)) < 0) return ret;
+    av_log(NULL, AV_LOG_INFO,
+           "[PTV-PID] deterministic PID plan v2 (%s, content-keyed): video %d, data %d+, audio "
+           "%d+ (>2ch %d+), subtitle DVB %d+ / HI %d+ / teletext %d+ / CC %d+ — PID = block + "
+           "%s; identical on all %d output(s), PMT ES loop in PID order, PCR on the video PID\n",
+           p->src, PTV_V2_VIDEO, PTV_V2_DATA, PTV_V2_AUDIO, PTV_V2_AUDIO_MC, PTV_V2_SUB,
+           PTV_V2_SUB_HI, PTV_V2_TTX, PTV_V2_CCTTX,
+           multiview ? "slot (mosaic)" : "ISO 639-2 rank", n_rung);
+    for (i = 0; i < n; i++) {
+        char lang[48];
+        pid_lang_col(&ent[i], lang, sizeof lang);
+        av_log(NULL, AV_LOG_INFO, "[PTV-PID] pid=%d %s/%s/%s <- %s  %s\n",
+               ent[i].pid, pid_cls_name[ent[i].cls], ent[i].codec, lang, ent[i].srcs, ent[i].why);
+    }
+    return 0;
+}
+
+static int pid_plan_apply(const PidPlan *p, PidEnt *ent, int n, Rung *rung, int n_rung, int multiview)
+{
+    return p->ver == 2 ? pid_plan_apply_v2(p, ent, n, rung, n_rung, multiview)
+                       : pid_plan_apply_v1(p, ent, n, rung, n_rung);
 }
 
 /* transcode: ins = parsed input group list (1/2/4 inputs; >1 = multiview);
@@ -4638,7 +4849,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         }
         if (inputs[kk].da.n_pass > 0) n_copy_inputs++;
     }
-    if (n_pass || g_epg_refused)   /* refusals keep the line: "passthrough 0" after an EPG
+    if (n_pass || g_data_refused)   /* refusals keep the line: "passthrough 0" after an EPG
                                     * refusal is information, silence would look like a fault */
         av_log(NULL, AV_LOG_INFO, "ptvencoder: passthrough %d stream(s) per output (copy), %d input(s)\n",
                n_pass, n_copy_inputs);
@@ -4691,8 +4902,11 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                 PidEnt *e = &ent[n++];
                 for (r = 0; r < n_rung; r++) e->ost[r] = as[k].ost[r];
                 e->cls = 1; e->mapped = 1; e->ord = k;
-                e->codec   = avcodec_get_name(as[k].ost[0]->codecpar->codec_id);
+                e->cid     = as[k].ost[0]->codecpar->codec_id;
+                e->codec   = avcodec_get_name(e->cid);
                 e->lang    = lg ? lg->value : NULL;
+                e->ch      = as[k].ost[0]->codecpar->ch_layout.nb_channels;   /* OUTPUT layout */
+                e->rank    = pid_lang_rank(e->lang, e->norm);
                 e->src_pid = ist->id; e->in_idx = asrc_in[k]; e->src_idx = asrc[k];
                 snprintf(e->srcs, sizeof e->srcs, "in#%d:%d", asrc_in[k], asrc[k]);
             }
@@ -4700,7 +4914,10 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                 PidEnt *e = &ent[n++];
                 for (r = 0; r < n_rung; r++) e->ost[r] = cc[k].ost[r];
                 e->cls = 2; e->mapped = 1; e->ord = k;
-                e->codec   = avcodec_get_name(cc[k].ost[0]->codecpar->codec_id);
+                e->cid     = cc[k].ost[0]->codecpar->codec_id;
+                e->codec   = avcodec_get_name(e->cid);
+                e->lang    = cc[k].lang;                 /* the resolved -cc_lang, not the wire relabel */
+                e->rank    = pid_lang_rank(e->lang, e->norm);
                 e->src_pid = inputs[cc_slot[k]].vist->id;
                 e->in_idx  = cc_slot[k]; e->src_idx = -1;
                 snprintf(e->srcs, sizeof e->srcs, "cc in#%d", cc_slot[k]);
@@ -4711,9 +4928,12 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                 PidEnt *e = &ent[n++];
                 for (r = 0; r < n_rung; r++) e->ost[r] = pass[k].ost[r];
                 e->cls    = pid_cls_of(ist->codecpar->codec_type);
-                e->scte   = ist->codecpar->codec_id == AV_CODEC_ID_SCTE_35;
-                e->codec  = avcodec_get_name(ist->codecpar->codec_id);
+                e->cid    = ist->codecpar->codec_id;
+                e->scte   = e->cid == AV_CODEC_ID_SCTE_35;
+                e->codec  = avcodec_get_name(e->cid);
                 e->lang   = lg ? lg->value : NULL;
+                e->ch     = e->cls == 1 ? ist->codecpar->ch_layout.nb_channels : 0;  /* copy: out == in */
+                e->rank   = pid_lang_rank(e->lang, e->norm);
                 /* content sub-key, ascending (see PidEnt): a plain subtitle before the
                  * hearing-impaired one of the same language; 5.1 audio before its stereo
                  * downmix. Both are properties of the CONTENT, so they survive a source
@@ -4725,7 +4945,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                 e->src_pid = ist->id; e->in_idx = pass[k].input; e->src_idx = pass[k].in_index;
                 snprintf(e->srcs, sizeof e->srcs, "in#%d:%d", pass[k].input, pass[k].in_index);
             }
-            if ((ret = pid_plan_apply(&pidp, ent, n, rung, n_rung)) < 0) goto end;
+            if ((ret = pid_plan_apply(&pidp, ent, n, rung, n_rung, multiview)) < 0) goto end;
         }
     }
 
@@ -5253,7 +5473,7 @@ static const OptionDef ptv_options[] = {
     { "cc_page",          OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "teletext page for the extracted CC (default 0x88)", "page" },
     { "cc_style",         OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "CC presentation: faithful (default, teletext mirrors the CC snapshot for snapshot) or block (opt-in, whole finished lines only)", "style" },
     { "cc_magazine",      OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "teletext magazine for the extracted CC (1-8, default 8)", "n" },
-    { "pid_plan",         OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "output PID plan: class bases (default video=200,audio=300,subtitle=400,data=500) or \"off\" for source-order PIDs", "plan" },
+    { "pid_plan",         OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "output PID plan: v2 (default; content-keyed: PID = block + ISO 639-2 rank), v1[,<class>=<base>,...] (1.2.0 packed plan), or off (source-order PIDs)", "plan" },
     { "f",                OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "force format", "fmt" },
     { NULL },
 };
@@ -5372,42 +5592,78 @@ static const char *map_spec(const char *v, char *buf, size_t bufsz, int *optiona
     return buf;
 }
 
-/* EIT/EPG is the one data stream ptvencoder refuses to copy (1.2.0-pre4).
+/* DATA-COPY WHITELIST (1.2.1-pre1; generalises the 1.2.0-pre4 EIT refusal).
  *
- * lavf's mpegts demuxer synthesizes an AV_CODEC_ID_EPG stream for PID 0x12, so a
- * type-wildcard data map (`-map 0:d?`) picks it up on every EIT-carrying source.
- * Copying it is wrong twice over: the muxer re-emits the EIT sections on a private
- * bin_data PID that no receiver reads as EIT (and whose service context is the
- * source's, not ours), and a bin_data PID never yields codec parameters, so every
- * downstream prober burns its entire probesize before it reports anything (~118 s
- * for ffprobe's defaults). That is what turned the fleet's sync_check into a restart
- * loop on healthy channels — RAV 7x, Weather_nation 15x in 6 days, measured on cor-1
- * 2026-08-12, where the copied PID also went near-silent (231 packets in 27 h against
- * a source EIT running at 3.3 pkt/s).
+ * A copied data stream is only useful if mpegtsenc can SIGNAL it in the PMT so a receiver
+ * knows what the PID is. It can for exactly four codecs: scte_35 (stream_type 0x86 + CUEI,
+ * patch 0002), timed_id3 (0x15 + "ID3 " metadata descriptor), smpte_2038 (private_data +
+ * "VANC" registration) and smpte_klv ("KLVA"). Everything else — the lavf-synthesised EIT
+ * (AV_CODEC_ID_EPG), a private stream the demuxer could not identify (bin_data / none) — is
+ * re-emitted as an anonymous private_data PID with no descriptor, which no receiver reads and
+ * on which every downstream prober burns its whole probesize (~118 s for ffprobe's defaults).
+ * That is what turned the fleet's sync_check into a restart loop on healthy channels (RAV 7x,
+ * Weather_nation 15x in 6 days, measured on cor-1 2026-08-12) via the copied EIT; pre4
+ * refused the EIT, but the fault class is "unsignalled data PID on our output", so the rule is
+ * now positive: copy only what we can signal.
  *
- * SCTE-35 and every other data codec are untouched — they ride the copy path exactly
- * as before. Returns 1 when the stream must be dropped from the copy list.
- *
- * PTV_ALLOW_EPG_COPY=1 restores the old copy behaviour (runtime escape hatch — this
- * is the one refusal that overrides an explicit operator -map, so it gets one). */
-static int epg_copy_allowed(void)
+ * The refusal overrides an explicit -map 0:d:N too (WARNING instead of INFO) — an
+ * explicitly mapped unidentifiable PID is almost always a mistake, and the damage is not
+ * local to that PID. PTV_ALLOW_DATA_COPY=all, or a comma list of lavf codec names
+ * (PTV_ALLOW_DATA_COPY=bin_data,epg), restores the copy; PTV_ALLOW_EPG_COPY=1 stays as the
+ * documented alias for the EIT. Returns 1 when the stream must be dropped from the copy list. */
+static int data_copy_allowed_env(enum AVCodecID id)
 {
-    static int allowed = -1;
-    if (allowed < 0)
-        allowed = getenv("PTV_ALLOW_EPG_COPY") != NULL;
-    return allowed;
+    static const char *spec = NULL;
+    static int init = 0;
+    const char *name = avcodec_get_name(id);
+    if (!init) {
+        spec = getenv("PTV_ALLOW_DATA_COPY");
+        init = 1;
+    }
+    if (id == AV_CODEC_ID_EPG && getenv("PTV_ALLOW_EPG_COPY"))
+        return 1;
+    if (!spec || !spec[0])
+        return 0;
+    if (!strcmp(spec, "all"))
+        return 1;
+    {
+        const char *q = spec;
+        size_t nl = strlen(name);
+        while (*q) {
+            const char *e = strchr(q, ',');
+            size_t l = e ? (size_t)(e - q) : strlen(q);
+            if (l == nl && !strncmp(q, name, l)) return 1;
+            if (!e) break;
+            q = e + 1;
+        }
+    }
+    return 0;
 }
 
 static int data_copy_refused(const AVStream *ist, int fidx, int si, int targeted, int verbose)
 {
-    if (ist->codecpar->codec_id != AV_CODEC_ID_EPG || epg_copy_allowed())
+    enum AVCodecID id = ist->codecpar->codec_id;
+    if (ist->codecpar->codec_type != AVMEDIA_TYPE_DATA)
         return 0;
-    g_epg_refused = 1;
+    switch (id) {
+    case AV_CODEC_ID_SCTE_35:
+    case AV_CODEC_ID_TIMED_ID3:
+    case AV_CODEC_ID_SMPTE_2038:
+    case AV_CODEC_ID_SMPTE_KLV:
+        return 0;
+    default:
+        break;
+    }
+    if (data_copy_allowed_env(id))
+        return 0;
+    g_data_refused = 1;
     if (verbose)
         av_log(NULL, targeted ? AV_LOG_WARNING : AV_LOG_INFO,
-               "ptvencoder: input EPG/EIT stream #%d:%d not copied%s — a re-muxed EIT is junk on "
-               "the output and the copied PID never yields codec parameters, stalling downstream probers\n",
-               fidx, si, targeted ? " despite being mapped explicitly" : "");
+               "ptvencoder: input data stream #%d:%d (%s) not copied%s — mpegtsenc cannot signal "
+               "it in the PMT; an unsignalled private PID stalls downstream probers "
+               "(PTV_ALLOW_DATA_COPY=%s to force)\n",
+               fidx, si, avcodec_get_name(id), targeted ? " despite being mapped explicitly" : "",
+               id == AV_CODEC_ID_EPG ? "epg or PTV_ALLOW_EPG_COPY=1" : avcodec_get_name(id));
     return 1;
 }
 

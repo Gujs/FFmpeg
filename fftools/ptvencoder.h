@@ -880,6 +880,9 @@ typedef struct CcCtx {
                                                * encodes to nothing), and the erase the
                                                * viewer is owed rides the next keepalive */
     int              rebase_test_fired;       /* TEST ONLY: PTV_CCTEST_REBASE_AT_S, once */
+    const char      *lang;                    /* the resolved -cc_lang (the REAL language,
+                                               * before any -metadata relabel) — the PID
+                                               * plan keys the track on it (1.2.1-pre1) */
 } CcCtx;
 
 typedef struct AudioState {

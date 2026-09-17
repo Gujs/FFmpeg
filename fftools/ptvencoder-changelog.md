@@ -5,6 +5,46 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 1.2.1-pre1 (2026-09-17) — output stream plan v2: content-keyed static PID map + data-copy whitelist (T-009)
+
+**Why.** Owner requirement: when a source gains or loses an audio/subtitle track, no OTHER track's
+output PID may change, across restarts, with no state on the box and no per-channel setup. pre8's
+plan packed each class densely from a base, so adding `ara` to a `deu`,`eng` channel shifted both.
+Fleet census 2026-09-17 (live-transcoder, cor-3, glo-2) + the NOCTOCODE pattern (AI subtitle
+languages appear and disappear) made this concrete.
+
+- **`-pid_plan v2` (DEFAULT): PID = block(class, variant) + rank(language).** Identity is (class,
+  variant, language) — never source PID, source order, codec or the other tracks. Blocks: video 200
+  (PCR); data 500+ by codec (scte_35 500, timed_id3 501, smpte_2038 502, smpte_klv 503); audio ≤2ch
+  1000+, audio >2ch 2000+; DVB subtitle 3000+, DVB hearing-impaired 5000+, source teletext 6000+,
+  CC→teletext 7000+ (4000s skipped: PMT 4096). Rank = position in a FROZEN copy of lavf's 484-entry
+  ISO 639-2/B list (`fftools/ptvencoder_lang.h`, generated once, never regenerated); 639-2/T and
+  two-letter spellings fold onto the /B code (deu=ger 149, mkd=mac 261), deprecated scc/scr onto
+  srp/hrv, absent tag = und (452), multi-language teletext keys on its first entry. Offsets 484–499
+  reserved for appended ISO additions, 500–915 private-use qaa..qpz, 916–979 overflow (malformed
+  tags, same-identity duplicates — the one place a PID can still move, said on the log row).
+  Examples: eng audio 1122 fleet-wide; Cinestar subs hrv 3180 / slv 3384 / mkd 3261 / srp 3402; AC-3
+  5.1 eng 2122; CC→teletext spa 7399. Variant defines identity, codec does not.
+- **Multiview: the slot is the identity** — audio 1000+slot, DVB sub 3000+slot, source teletext
+  6000+slot, CC→teletext 7000+slot (slot = input index). The driver's `mva..mvd` relabels are wire
+  tags only; changing `SV_MULTIVIEW_CODES` moves nothing.
+- **`-pid_plan v1[,<class>=<base>,...]`** keeps the 1.2.0 packed plan (rollback / consumers not yet
+  updated); the old base-only syntax and an existing `PTV_PID_PLAN=video=…` env mean v1. `off` = legacy.
+  `PTV_PID_PLAN` env still wins over the flag; no `ptvencoder.sh` change needed.
+- **Data-copy WHITELIST** (generalises pre4's EIT refusal): copy a data stream only if mpegtsenc can
+  signal it in the PMT — scte_35, timed_id3, smpte_2038, smpte_klv. epg / bin_data / unknown are
+  refused (INFO; WARNING when mapped explicitly) so no anonymous private PID can stall downstream
+  probers again. `PTV_ALLOW_DATA_COPY=all|<codec,...>` (and the old `PTV_ALLOW_EPG_COPY=1`) restore.
+- **One-time relayout on deploy:** audio 300+→1000+/2000+, subs 400+→3000+/5000+/6000+/7000+; video
+  and data unchanged. Consumers keyed on the 1.2.0 PIDs update in lockstep (T-049), or run
+  `PTV_PID_PLAN=v1` per channel until they can.
+- Local fixture matrix (VideoToolbox): Cinestar A / reordered B / no-mkd C / +ara D → identical PIDs
+  per language, D adds only 3020; duplicate stereo eng → 1916; deu→2149, scr→3180 (relabel to mva did
+  not move it), xzq→3916 overflow; v1 and legacy env byte-identical to 1.2.0 (200/300/301/400–403);
+  off = legacy; EPG and bin_data refused (explicit map warns), escapes copy to 590; CC eng 7122 /
+  spa 7399; 4-slot mosaic 1000–1003 / 3000, 3002 with default and changed codes. Spec + results:
+  `analysis/ptvencoder-spec-T009-output-stream-plan-v2.md`.
+
 ## 🏁 1.2.0 (2026-09-13) — RELEASED. Content-identical to `1.2.0-pre10` (banner bump only).
 
 **What 1.2.0 adds over 1.1.0** (pre1 → pre10, 2026-08-08 → 09-10, each entry below):
