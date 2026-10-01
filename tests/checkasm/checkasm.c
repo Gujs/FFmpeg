@@ -103,9 +103,6 @@ static const CheckasmTest tests[] = {
     #if CONFIG_FLAC_DECODER
         { "flacdsp", checkasm_check_flacdsp },
     #endif
-    #if CONFIG_FMTCONVERT
-        { "fmtconvert", checkasm_check_fmtconvert },
-    #endif
     #if CONFIG_G722DSP
         { "g722dsp", checkasm_check_g722dsp },
     #endif
@@ -181,6 +178,9 @@ static const CheckasmTest tests[] = {
     #if CONFIG_PNG_DECODER
         { "png", checkasm_check_png },
     #endif
+    #if CONFIG_PRORES_DECODER
+        { "proresdsp", checkasm_check_proresdsp },
+    #endif
     #if CONFIG_QPELDSP
         { "qpeldsp", checkasm_check_qpeldsp },
     #endif
@@ -201,6 +201,12 @@ static const CheckasmTest tests[] = {
     #endif
     #if CONFIG_TAK_DECODER
         { "takdsp", checkasm_check_takdsp },
+    #endif
+    #if CONFIG_TTA_DECODER
+        { "ttadsp", checkasm_check_ttadsp },
+    #endif
+    #if CONFIG_TTA_ENCODER
+        { "ttaencdsp", checkasm_check_ttaencdsp },
     #endif
     #if CONFIG_UTVIDEO_DECODER
         { "utvideodsp", checkasm_check_utvideodsp },
@@ -224,11 +230,7 @@ static const CheckasmTest tests[] = {
         { "vp8dsp", checkasm_check_vp8dsp },
     #endif
     #if CONFIG_VP9_DECODER
-        { "vp9dsp", checkasm_check_vp9dsp }, // all of the below
-        { "vp9_ipred", checkasm_check_vp9_ipred },
-        { "vp9_itxfm", checkasm_check_vp9_itxfm },
-        { "vp9_loopfilter", checkasm_check_vp9_loopfilter },
-        { "vp9_mc", checkasm_check_vp9_mc },
+        { "vp9dsp", checkasm_check_vp9dsp },
     #endif
     #if CONFIG_VIDEODSP
         { "videodsp", checkasm_check_videodsp },
@@ -304,14 +306,15 @@ static const CheckasmTest tests[] = {
 #endif
 #if CONFIG_AVUTIL
         { "aes",       checkasm_check_aes },
-        { "crc",       checkasm_check_crc },
+        { "base64",    checkasm_check_base64 },
+        { "crc",       checkasm_check_crc,   .uninit = checkasm_uninit_crc },
         { "fixed_dsp", checkasm_check_fixed_dsp },
         { "float_dsp", checkasm_check_float_dsp },
         { "lls",       checkasm_check_lls },
 #if CONFIG_PIXELUTILS
         { "pixelutils",checkasm_check_pixelutils },
 #endif
-        { "av_tx",     checkasm_check_av_tx },
+        { "av_tx",     checkasm_check_av_tx, .uninit = checkasm_uninit_tx },
 #endif
     { NULL }
     /* NOTE: When adding a new test to this list here, it also needs to be
@@ -332,7 +335,9 @@ static const CheckasmCpuInfo cpuflags[] = {
     { "SME-I16I64", "sme_i16i64", AV_CPU_FLAG_SME_I16I64 },
     { "CRC",      "crc",      AV_CPU_FLAG_ARM_CRC },
     { "SME2",     "sme2",      AV_CPU_FLAG_SME2 },
-    { "PMULL",    "pmull_eor3", AV_CPU_FLAG_PMULL|AV_CPU_FLAG_EOR3 },
+    { "PMULL",    "pmull_eor3", AV_CPU_FLAG_PMULL|AV_CPU_FLAG_EOR3, .mask = AV_CPU_FLAG_ARM_CRC },
+    { "PMULL+CRC","pmull_eor3_crc", AV_CPU_FLAG_PMULL|AV_CPU_FLAG_EOR3|AV_CPU_FLAG_ARM_CRC },
+    { "AES",      "aes",      AV_CPU_FLAG_ARM_AES },
 #elif ARCH_ARM
     { "ARMV5TE",  "armv5te",  AV_CPU_FLAG_ARMV5TE },
     { "ARMV6",    "armv6",    AV_CPU_FLAG_ARMV6 },

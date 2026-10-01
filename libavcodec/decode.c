@@ -356,6 +356,8 @@ static int discard_samples(AVCodecContext *avctx, AVFrame *frame, int64_t *disca
 
     if ((frame->flags & AV_FRAME_FLAG_DISCARD)) {
         avci->skip_samples = FFMAX(0, avci->skip_samples - frame->nb_samples);
+        av_log(avctx, AV_LOG_DEBUG, "discard whole frame due to discard frame flag, skip left: %d\n",
+               avci->skip_samples);
         *discarded_samples += frame->nb_samples;
         return AVERROR(EAGAIN);
     }
@@ -374,12 +376,18 @@ static int discard_samples(AVCodecContext *avctx, AVFrame *frame, int64_t *disca
                 int64_t diff_ts = av_rescale_q(avci->skip_samples,
                                                (AVRational){1, avctx->sample_rate},
                                                avctx->pkt_timebase);
-                if (frame->pts != AV_NOPTS_VALUE)
-                    frame->pts += diff_ts;
-                if (frame->pkt_dts != AV_NOPTS_VALUE)
-                    frame->pkt_dts += diff_ts;
-                if (frame->duration >= diff_ts)
-                    frame->duration -= diff_ts;
+                if (diff_ts != AV_NOPTS_VALUE) {
+                    if (frame->pts != AV_NOPTS_VALUE)
+                        frame->pts = av_sat_add64(frame->pts, diff_ts);
+                    if (frame->pkt_dts != AV_NOPTS_VALUE)
+                        frame->pkt_dts = av_sat_add64(frame->pkt_dts, diff_ts);
+                    if (frame->duration >= diff_ts)
+                        frame->duration = av_sat_sub64(frame->duration, diff_ts);
+                } else {
+                    frame->pts = AV_NOPTS_VALUE;
+                    frame->pkt_dts = AV_NOPTS_VALUE;
+                    frame->duration = 0;
+                }
             } else
                 av_log(avctx, AV_LOG_WARNING, "Could not update timestamps for skipped samples.\n");
 
@@ -393,6 +401,7 @@ static int discard_samples(AVCodecContext *avctx, AVFrame *frame, int64_t *disca
 
     if (discard_padding > 0 && discard_padding <= frame->nb_samples) {
         if (discard_padding == frame->nb_samples) {
+            av_log(avctx, AV_LOG_DEBUG, "discard whole frame\n");
             *discarded_samples += frame->nb_samples;
             return AVERROR(EAGAIN);
         } else {
@@ -400,7 +409,7 @@ static int discard_samples(AVCodecContext *avctx, AVFrame *frame, int64_t *disca
                 int64_t diff_ts = av_rescale_q(frame->nb_samples - discard_padding,
                                                (AVRational){1, avctx->sample_rate},
                                                avctx->pkt_timebase);
-                frame->duration = diff_ts;
+                frame->duration = diff_ts == AV_NOPTS_VALUE ? 0 : diff_ts;
             } else
                 av_log(avctx, AV_LOG_WARNING, "Could not update timestamps for discarded samples.\n");
 
@@ -468,8 +477,9 @@ static inline int decode_simple_internal(AVCodecContext *avctx, AVFrame *frame, 
         av_frame_unref(frame);
 
     // FF_CODEC_CB_TYPE_DECODE decoders must not return AVERROR EAGAIN
+    // or AVERROR_EOF.
     // code later will add AVERROR(EAGAIN) to a pointer
-    av_assert0(consumed != AVERROR(EAGAIN));
+    av_assert0(consumed != AVERROR(EAGAIN) && consumed != AVERROR_EOF);
     if (consumed < 0)
         ret = consumed;
     if (consumed >= 0 && avctx->codec->type == AVMEDIA_TYPE_VIDEO)
