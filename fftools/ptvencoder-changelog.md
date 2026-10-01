@@ -5,6 +5,27 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 🏁 1.2.1 (2026-10-01) — RELEASED. Content-identical to `1.2.1-pre1` (banner bump only).
+
+**What 1.2.1 adds over 1.2.0:** T-009, the output stream plan v2 (details in the pre1 entry below):
+- **Static content-keyed PID map, default ON** (`-pid_plan v2`): a track's PID depends only on its class,
+  variant and language, so a source adding or dropping a track never moves another one, across restarts,
+  with no state on the box. `-pid_plan v1` / `PTV_PID_PLAN=v1` keeps the 1.2.0 layout.
+- **Data-copy whitelist:** only scte_35, timed_id3, smpte_2038 and smpte_klv are copied.
+- **One-time relayout on deploy:** audio 300+ → 1000+/2000+, subtitles 400+ → 3000+/5000+/6000+/7000+.
+  Owner 2026-10-01: no consumer maps PIDs today, so no lockstep update is needed; the static map is what
+  lets the CDN start mapping them.
+
+**Spec amended at release (owner 2026-10-01):** a hearing-impaired DVB subtitle in a mosaic is 5000 + slot,
+plain is 3000 + slot — the same plain/HI split as single input, then the slot offset. This is what pre1
+already did on air (Grid_2x1 slot-0 HI sub at 5000; Grid_2x2 plain subs at 3000–3003), so no code change.
+
+**Release gate (canary, 2026-09-22 → 10-01, build N-126628):** live-transcoder 9 channels, cor-3 32,
+glo-2 NOCTOCODE. 0 fatal markers attributable to the release; the v2 layout and the whitelist are live as
+specified (RAV 500/1452/7122 with EPG refused, Law&Crime 1122/7122, Cinestar subs by language rank,
+mosaics by slot). The one SIGSEGV on pre1 (Cinestar_Premiere 09-24) has the same stack as the 09-22 one on
+1.2.0, so it predates this release (T-053). Evidence: `test-results/soak-20260927.md`.
+
 ## 1.2.1-pre1 (2026-09-17) — output stream plan v2: content-keyed static PID map + data-copy whitelist (T-009)
 
 **Why.** Owner requirement: when a source gains or loses an audio/subtitle track, no OTHER track's
