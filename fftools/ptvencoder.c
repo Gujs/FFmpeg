@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.2.1"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.2.2-pre1"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -4489,6 +4489,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         if (!inputs[k].wrap_off || !inputs[k].wrap_last || !inputs[k].wrap_wall_last || !inputs[k].edit_us || !inputs[k].gap_vsnap ||
             !inputs[k].wall_cad_us || !inputs[k].pkt_wall_gap_us) { ret = AVERROR(ENOMEM); goto end; }
         for (si = 0; si < (int)inputs[k].ifmt->nb_streams; si++) inputs[k].wrap_last[si] = AV_NOPTS_VALUE;
+        inputs[k].da.nb_streams_open = inputs[k].ifmt->nb_streams;   /* 1.2.2 T-064: the size above */
+        inputs[k].da.late_stream_max = -1;
         if (g_layera) {   /* legacy-0004 buffer-classify-discard state (only when enabled) */
             if ((ret = ptv_disc_init(&inputs[k].disc, PTV_DISC_CAPACITY,
                                      inputs[k].ifmt->nb_streams)) < 0) goto end;

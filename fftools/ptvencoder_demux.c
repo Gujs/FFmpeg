@@ -2233,6 +2233,25 @@ void *demux_thread(void *arg)
             }
             break;
         }
+        /* 1.2.2 T-064: lavf adds an AVStream mid-run for every new PMT PID and, with auto_guess,
+         * for any unknown PID that starts a PES — one corrupt TS header after an outage is enough.
+         * The per-stream arrays are sized to the stream count at open, and a late-born stream is
+         * routed nowhere (dispatch matches only the streams bound at open): drop its packets here,
+         * before any bookkeeping indexes them (was a heap overflow in demux_unwrap). */
+        if (pkt->stream_index >= d->nb_streams_open) {
+            if (pkt->stream_index > d->late_stream_max) {
+                const AVStream *ls = d->ifmt->streams[pkt->stream_index];
+                d->late_stream_max = pkt->stream_index;
+                av_log(NULL, AV_LOG_WARNING,
+                       "[PTV-DEMUX] input '%s': stream #%d (pid 0x%x, %s) appeared after open "
+                       "(%d at open) — ignored\n", d->url, pkt->stream_index, ls->id,
+                       av_get_media_type_string(ls->codecpar->codec_type) ?
+                       av_get_media_type_string(ls->codecpar->codec_type) : "unknown",
+                       d->nb_streams_open);
+            }
+            av_packet_unref(pkt);
+            continue;
+        }
         if (g_diag) {
             int64_t now = av_gettime_relative();
             if (now - diag_last >= 1000000) {

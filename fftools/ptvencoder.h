@@ -1600,6 +1600,10 @@ typedef struct DemuxArgs {
     int                   reopen;         /* live && multiview && net input */
     AVFormatContext     **ifmt_home;      /* -> Input.ifmt (teardown's close target follows the swap) */
     int64_t               reopen_cnt;     /* successful reopens (log) */
+    int                   nb_streams_open; /* 1.2.2 T-064: stream count the per-stream arrays
+                                            * (wrap_*, edit_us, gap_vsnap, wall_cad_us, pkt_wall_gap_us,
+                                            * disc) were sized for at open */
+    int                   late_stream_max; /* 1.2.2 T-064: highest late-born stream index logged */
     PtvDiscBuf           *disc;           /* legacy-0004 buffer-classify-discard (g_layera only; NULL otherwise) */
     int64_t               video_fwd_us;   /* wall-clock (us) of the last VIDEO forward-discontinuity crossing (whole-program-splice indicator) */
     int64_t               prog_off;       /* P2 (§7.1): program-level discontinuity offset (90kHz, detected on the

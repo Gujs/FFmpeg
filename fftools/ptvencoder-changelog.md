@@ -5,6 +5,28 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 1.2.2-pre1 (2026-10-02) — hotfix: heap overflow when a stream appears mid-run (T-064)
+
+**Bug (1.0 → 1.2.1):** the per-input-stream arrays (`wrap_off`, `wrap_last`, `wrap_wall_last`, `edit_us`,
+`gap_vsnap`, `wall_cad_us`, `pkt_wall_gap_us`) are sized to the stream count at open, but lavf adds an
+AVStream mid-run whenever the source PMT lists a new PID and, because mpegts sets `auto_guess` after the
+header, for any unknown PID that starts a PES — one corrupt TS header after an outage is enough. The demux
+thread then indexed those arrays with the new `stream_index` in `demux_unwrap` (`ptvencoder_demux.c:1666`,
+`:2112-2117`): ASan heap-buffer-overflow; the plain debug build crashed 7 of 7 local runs, the victim an
+invalid read in the audio-encoder worker about 1 s after the switch, preceded by fake huge `[PTV-LAYERA]`
+jumps on stream 0. Same shape as T-053 (Cinestar_Premiere SIGSEGV after outage + corrupt resume) — the lead
+candidate, to be confirmed against the next symbolised core.
+
+**Fix:** the demux loop records the open-time stream count and drops packets of later-born streams before
+any bookkeeping. Those streams were already routed nowhere (dispatch matches only the streams bound at
+open), so the output is unchanged. One `[PTV-DEMUX] … appeared after open … ignored` line per new stream
+— grep for it on the T-053 channels. Following such streams is T-056 2.1/2.2.
+
+**Gate:** the ASan repro (`test-results/oob-stream-index-20261002/`) clean on every variant (PMT superset,
+renumber, reverse, outage + renumber, PID bit flips); plain build 0 crashes on the same runs (7/7 before);
+5-min Cinestar A/B against 1.2.1 from the same tree identical (PIDs, languages, per-stream packet counts on
+every rung, warning classes).
+
 ## 🏁 1.2.1 (2026-10-01) — RELEASED. Content-identical to `1.2.1-pre1` (banner bump only).
 
 **What 1.2.1 adds over 1.2.0:** T-009, the output stream plan v2 (details in the pre1 entry below):
