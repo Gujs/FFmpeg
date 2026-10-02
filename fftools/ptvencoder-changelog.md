@@ -5,6 +5,33 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre2 (2026-10-02) — single input waits for its source (T-056 §3/§4, wait-then-build)
+
+A single live (udp/rtp/srt) input no longer exits when the source is dead at start or has no SPS/PPS
+in the probe window. Open + probe is retried until a video stream has known geometry (width, height,
+pixel format); then setup runs exactly as before, so a healthy start is unchanged (attempt #1, same
+timing). Fixes the Riff_TV `video_size 0x0` exit loop on its own, and is the ptvencoder half of the
+dead-at-start fix (the wrapper half — launching without a successful probe — is pre7).
+
+- `[PTV-SRC] in0 WAITING` (no data) / `PROBING` (packets, no video geometry yet) on every transition,
+  then once a minute for 10 minutes and every 10 minutes after; `[PTV-SRC] in0 LIVE: video … (after N s,
+  attempt #K)` when accepted, also on a normal start.
+- New global options: `-start_on video` (the only value in 2.0.0; `any|all|now` are rejected with a
+  "comes in 2.1" message), `-wait_input <dur|inf>` (default inf: give up with exit 1 after that long),
+  `-reopen_backoff <list>` (default `1,2,5,10,30` s, the last repeats).
+- Packets flowing but no usable video for 300 s (PROBING, the NOVIDEO bound) → exit 1, so a source that
+  can never be decoded is not held silently forever.
+- Mosaics and file inputs are unchanged (parallel open, exit on failure).
+
+**Gate (local, VideoToolbox/x264):** healthy start = attempt #1, output identical in shape; dead source,
+sender started at +25 s → WAITING then LIVE after 33.5 s, output produced; first 10 s without SPS/PPS
+(NAL types rewritten at the TS level, so the probe sees 0x0 like Riff_TV) → 1.2.2 exits 1 with
+`unspecified size` and no output, 2.0.0-pre2 PROBING then LIVE after 11.1 s; `-wait_input 8` → exit 1
+after 8 s; `PTV_NO_WAIT_START=1` → 1.2.x behaviour; a looping source that never carries SPS → PROBING
+reminders, then exit 1 after 308 s of PROBING.
+
+**Kill switch:** `PTV_NO_WAIT_START=1`.
+
 ## 2.0.0-pre1 (2026-10-02) — static map 2.0: PMT on PID 100, audio-description block 4000+rank (T-068, T-056 D14/D21)
 
 First pre of 2.0.0 (T-056 adaptive source; spec `analysis/ptvencoder-spec-adaptive-source.md`). Static-map

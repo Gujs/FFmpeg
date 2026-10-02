@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.0-pre1"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.0-pre2"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -3736,6 +3736,107 @@ static int is_net_url(const char *u)
     return u && (!strncmp(u, "udp://", 6) || !strncmp(u, "rtp://", 6) || !strncmp(u, "srt://", 6));
 }
 
+/* 2.0.0-pre2 (T-056 spec §3/§4): a single live input WAITS for its source instead of exiting.
+ * -start_on video (the only value in 2.0.0) = outputs start once the input has a video stream with
+ * known geometry; until then open + probe is retried with -reopen_backoff, and -wait_input bounds
+ * the wait (default: forever). The source is accepted on the first attempt exactly as before, so a
+ * healthy start is unchanged; what changes is that "no packets" and "no SPS/PPS yet" (video 0x0) no
+ * longer end the run. Kill switch: PTV_NO_WAIT_START=1 (1.2.x: one attempt, exit on failure). */
+#define PTV_PROBING_MAX_US 300000000           /* = the NOVIDEO startup bound */
+static const char *g_start_on   = "video";
+static int64_t     g_wait_input_us;              /* 0 = wait forever */
+static int         g_backoff_s[8] = { 1, 2, 5, 10, 30 };
+static int         g_backoff_n    = 5;
+
+static int parse_backoff(const char *spec)
+{
+    int n = 0;
+    while (spec && *spec && n < 8) {
+        char *end; long v = strtol(spec, &end, 10);
+        if (end == spec || v < 1 || v > 3600 || (*end && *end != ',')) return AVERROR(EINVAL);
+        g_backoff_s[n++] = (int)v;
+        spec = *end ? end + 1 : end;
+    }
+    if (!n) return AVERROR(EINVAL);
+    g_backoff_n = n;
+    return 0;
+}
+
+static int input_acquire(Input *in, int idx, const AVDictionary *opts)
+{
+    int64_t t0 = av_gettime_relative(), next_note = 0, probing_since = 0;
+    int attempt = 0, state = -1;                  /* 0 = WAITING (no data), 1 = PROBING (no video geometry) */
+
+    for (;;) {
+        AVDictionary *o = NULL;
+        char what[192];
+        int ret, st, vs, wait_s;
+        int64_t now, waited;
+
+        attempt++;
+        av_dict_copy(&o, opts, 0);                /* open consumes recognized entries: fresh copy per try */
+        ret = avformat_open_input(&in->ifmt, in->url, NULL, &o);
+        av_dict_free(&o);
+        if (ret >= 0) ret = ptv_find_stream_info(in->ifmt);   /* pre19.1: tolerant AUDIO probe */
+        if (ret >= 0) {
+            vs = av_find_best_stream(in->ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
+            if (vs >= 0) {
+                const AVStream *vst = in->ifmt->streams[vs];
+                const AVCodecParameters *par = vst->codecpar;
+                if (par->width > 0 && par->height > 0 && par->format != AV_PIX_FMT_NONE) {
+                    int na = 0, ns = 0, nd = 0; unsigned i;
+                    for (i = 0; i < in->ifmt->nb_streams; i++) {
+                        enum AVMediaType t = in->ifmt->streams[i]->codecpar->codec_type;
+                        na += t == AVMEDIA_TYPE_AUDIO; ns += t == AVMEDIA_TYPE_SUBTITLE; nd += t == AVMEDIA_TYPE_DATA;
+                    }
+                    av_log(NULL, AV_LOG_INFO,
+                           "[PTV-SRC] in%d LIVE: video %s %dx%d, audio %d, subtitle %d, data %d "
+                           "(after %.1f s, attempt #%d)\n", idx, avcodec_get_name(par->codec_id),
+                           par->width, par->height, na, ns, nd,
+                           (av_gettime_relative() - t0) / 1e6, attempt);
+                    in->open_ret = 0;
+                    return 0;
+                }
+                snprintf(what, sizeof what, "video %s pid 0x%x has no known geometry yet (no SPS/PPS "
+                         "or keyframe in the probe window)", avcodec_get_name(par->codec_id), vst->id);
+            } else
+                snprintf(what, sizeof what, "no video stream in the program yet");
+            st = 1;
+        } else {
+            snprintf(what, sizeof what, "no data (%s)", av_err2str(ret));
+            st = 0;
+        }
+        if (in->ifmt) avformat_close_input(&in->ifmt);
+
+        now    = av_gettime_relative();
+        waited = now - t0;
+        /* packets flowing but never a decodable video for 300 s = the NOVIDEO class (today's startup
+         * check): exit for a supervised respawn rather than wait silently forever (silent-zombie guard) */
+        if (st == 1 && !probing_since) probing_since = now;
+        if (st == 0) probing_since = 0;
+        if (probing_since && now - probing_since >= PTV_PROBING_MAX_US) {
+            av_log(NULL, AV_LOG_ERROR, "[PTV-SRC] in%d PROBING for %.0f s with packets flowing but no usable "
+                   "video: %s on %s — exiting\n", idx, (now - probing_since) / 1e6, what, in->url);
+            in->open_ret = AVERROR_INVALIDDATA;
+            return in->open_ret;
+        }
+        if (g_wait_input_us > 0 && waited >= g_wait_input_us) {
+            av_log(NULL, AV_LOG_ERROR, "[PTV-SRC] in%d gave up after %.0f s (-wait_input): %s on %s\n",
+                   idx, waited / 1e6, what, in->url);
+            in->open_ret = AVERROR(ETIMEDOUT);
+            return in->open_ret;
+        }
+        wait_s = g_backoff_s[FFMIN(attempt, g_backoff_n) - 1];
+        if (st != state || now >= next_note) {     /* every transition, then 1/min for 10 min, then 1/10 min */
+            av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in%d %s: %s, %.0f s on %s (attempt #%d, next in %d s)\n",
+                   idx, st ? "PROBING" : "WAITING", what, waited / 1e6, in->url, attempt, wait_s);
+            state     = st;
+            next_note = now + (waited < 600000000 ? 60000000 : 600000000);
+        }
+        av_usleep((unsigned)wait_s * 1000000);
+    }
+}
+
 /* ==================== deterministic output PID plan (-pid_plan) ====================
  *
  * v2 — CONTENT-KEYED STATIC MAP (1.2.1-pre1, DEFAULT). Owner requirement 2026-09-17: when a
@@ -4425,6 +4526,12 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         av_dict_set(&ins->groups[k].format_opts, "correct_ts_overflow", "0", AV_DICT_DONT_OVERWRITE);
     }
 
+    /* 2.0.0-pre2: a single live input waits for its source (input_acquire) */
+    if (n_input == 1 && !multiview && is_net_url(inputs[0].url) && !getenv("PTV_NO_WAIT_START")) {
+        av_dict_copy(&inputs[0].da.reopen_opts, ins->groups[0].format_opts, 0);
+        if ((ret = input_acquire(&inputs[0], 0, ins->groups[0].format_opts)) < 0) goto end;
+        av_dump_format(inputs[0].ifmt, 0, inputs[0].url, 0);
+    } else
     /* open ALL inputs in parallel: a dead/slow slot must not delay the others,
      * and a serial open would block on its (long, multiview) rw_timeout. */
     {
@@ -5472,6 +5579,9 @@ static const OptionDef ptv_options[] = {
     { "init_hw_device",   OPT_TYPE_STRING, 0,                        { .off = 0 }, "init hw device", "args" },
     { "filter_hw_device", OPT_TYPE_STRING, 0,                        { .off = 0 }, "filter hw device", "name" },
     { "filter_complex",   OPT_TYPE_STRING, 0,                        { .off = 0 }, "filtergraph", "graph" },
+    { "start_on",         OPT_TYPE_STRING, 0,                        { .off = 0 }, "when outputs start: video (2.0.0; any/all/now come in 2.1)", "when" },
+    { "wait_input",       OPT_TYPE_STRING, 0,                        { .off = 0 }, "give up if the input has no video after this long (default inf)", "dur" },
+    { "reopen_backoff",   OPT_TYPE_STRING, 0,                        { .off = 0 }, "seconds between input attempts, the last repeats (default 1,2,5,10,30)", "list" },
     { "abort_on",         OPT_TYPE_STRING, 0,                        { .off = 0 }, "abort conditions", "flags" },
     /* per-output structural options (walked from g->opts[]) */
     { "map",              OPT_TYPE_STRING, OPT_PERFILE | OPT_OUTPUT, { .off = 0 }, "stream map", "spec" },
@@ -6178,6 +6288,29 @@ int main(int argc, char **argv)
             int64_t p; if (av_parse_time(&p, octx.global_opts.opts[gi].val, 1) >= 0 && p > 0) g_stats_period_us = p;
         }
         if (!strcmp(octx.global_opts.opts[gi].key, "hide_banner")) hide_banner = 1; /* suppress startup banner */
+        if (!strcmp(octx.global_opts.opts[gi].key, "start_on")) {                   /* 2.0.0-pre2 */
+            g_start_on = octx.global_opts.opts[gi].val;
+            if (strcmp(g_start_on, "video")) {
+                av_log(NULL, AV_LOG_ERROR, "-start_on %s: %s\n", g_start_on,
+                       !strcmp(g_start_on, "any") || !strcmp(g_start_on, "all") || !strcmp(g_start_on, "now")
+                       ? "comes in 2.1; 2.0.0 supports only 'video'" : "unknown value (video|any|all|now)");
+                uninit_parse_context(&octx); return 1;
+            }
+        }
+        if (!strcmp(octx.global_opts.opts[gi].key, "wait_input")) {
+            const char *v = octx.global_opts.opts[gi].val;
+            if (strcmp(v, "inf") && (av_parse_time(&g_wait_input_us, v, 1) < 0 || g_wait_input_us <= 0)) {
+                av_log(NULL, AV_LOG_ERROR, "-wait_input %s: expected a duration or inf\n", v);
+                uninit_parse_context(&octx); return 1;
+            }
+            if (!strcmp(v, "inf")) g_wait_input_us = 0;
+        }
+        if (!strcmp(octx.global_opts.opts[gi].key, "reopen_backoff") &&
+            parse_backoff(octx.global_opts.opts[gi].val) < 0) {
+            av_log(NULL, AV_LOG_ERROR, "-reopen_backoff %s: expected a comma list of seconds (1..3600)\n",
+                   octx.global_opts.opts[gi].val);
+            uninit_parse_context(&octx); return 1;
+        }
     }
     if (!hide_banner) {
         ptv_show_banner();
