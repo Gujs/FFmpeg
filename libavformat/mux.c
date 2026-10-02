@@ -324,7 +324,10 @@ static int init_muxer(AVFormatContext *s, AVDictionary **options)
                 par->codec_tag = av_codec_get_tag(of->p.codec_tag, par->codec_id);
         }
 
+        /* DATA streams (e.g. SCTE-35) carry sparse, modular-DTS metadata and
+         * must never gate A/V interleaving; exclude them like SMPTE-2038. */
         if (par->codec_type != AVMEDIA_TYPE_ATTACHMENT &&
+            par->codec_type != AVMEDIA_TYPE_DATA &&
             par->codec_id != AV_CODEC_ID_SMPTE_2038)
             fci->nb_interleaved_streams++;
     }
@@ -955,8 +958,18 @@ int ff_interleave_packet_per_dts(AVFormatContext *s, AVPacket *pkt,
         const FFStream *const sti = cffstream(st);
         const AVCodecParameters *const par = st->codecpar;
         if (sti->last_in_packet_buffer) {
-            ++stream_count;
+            /* A QUEUED DATA packet must not count as an interleaved stream either:
+             * nb_interleaved_streams excludes DATA, so counting it here breaks the
+             * stream_count + noninterleaved_count equality that arms the
+             * max_interleave_delta flush. With a 1 Hz SCTE-35 heartbeat the 200 ms
+             * bound was off almost permanently and the sparsest subtitle stream
+             * gated every rung (measured: 2.8 s wire gaps -> 45 s+ holds -> udp fifo
+             * overflow on the release burst). Same treatment for SMPTE-2038. */
+            if (par->codec_type != AVMEDIA_TYPE_DATA &&
+                par->codec_id != AV_CODEC_ID_SMPTE_2038)
+                ++stream_count;
         } else if (par->codec_type != AVMEDIA_TYPE_ATTACHMENT &&
+                   par->codec_type != AVMEDIA_TYPE_DATA &&
                    par->codec_id != AV_CODEC_ID_VP8 &&
                    par->codec_id != AV_CODEC_ID_VP9 &&
                    par->codec_id != AV_CODEC_ID_SMPTE_2038) {
@@ -985,7 +998,10 @@ int ff_interleave_packet_per_dts(AVFormatContext *s, AVPacket *pkt,
             const PacketListEntry *const last = sti->last_in_packet_buffer;
             int64_t last_dts;
 
-            if (!last || st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE)
+            /* Exclude sparse modular-DTS DATA (e.g. SCTE-35) from the delay
+             * metric: its 33-bit DTS must not perturb the extended-time delta. */
+            if (!last || st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE ||
+                st->codecpar->codec_type == AVMEDIA_TYPE_DATA)
                 continue;
 
             last_dts = av_rescale_q(last->pkt.dts,

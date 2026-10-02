@@ -1,0 +1,1442 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>   /* _exit() — 1.0.1-pre26 wedge-free fatal path */
+#include <pthread.h>
+#include <stdatomic.h>
+#include <time.h>
+
+#include "libavutil/avutil.h"
+#include "libavutil/log.h"
+#include "libavutil/opt.h"
+#include "libavutil/time.h"
+#include "libavutil/parseutils.h"
+#include "libavutil/mathematics.h"
+#include "libavutil/crc.h"
+#include "libavutil/bswap.h"
+#include "libavutil/samplefmt.h"
+#include "libavutil/pixdesc.h"
+#include "libavutil/channel_layout.h"
+#include "libavutil/audio_fifo.h"
+#include "libavutil/threadmessage.h"
+#include "libavutil/hwcontext.h"
+#include "libavformat/avformat.h"
+#include "libavcodec/avcodec.h"
+#include "libavfilter/avfilter.h"
+#include "libavfilter/buffersrc.h"
+#include "libavfilter/buffersink.h"
+#include "libswresample/swresample.h"
+
+#include "ptvencoder.h"
+
+/* PTV-EMPTY: edge-triggered per-queue starvation logger. Logs a refill line with the empty duration
+ * for episodes >=200ms, plus (only when hb != NULL) a 5s chronic heartbeat while empty. Returns the
+ * episode duration (us) when a >=200ms episode just ended, else 0 — the adaptive cushion feeds on
+ * frame_q episodes. v0.9.10: no heartbeat for video_q/mux_q (empty is their NORMAL state — the
+ * consumer drains them instantly; a healthy channel reads "empty" at every sample. Only frame_q
+ * empty means real starvation → it keeps the heartbeat). */
+static int64_t ptv_empty_watch(const char *name, int depth, int64_t now,
+                               int64_t *since, int64_t *hb, int64_t log_thresh_us)
+{
+    if (depth == 0) {
+        if (*since == 0) { *since = now; if (hb) *hb = now; }  /* enter empty silently (normal 0-crossings are noise) */
+        else if (hb && now - *hb >= 5000000) {                 /* chronic: heartbeat every 5s so "empty now" is visible */
+            *hb = now;
+            av_log(NULL, AV_LOG_INFO, "[PTV-EMPTY] %s still empty %lldms\n",
+                   name, (long long)((now - *since) / 1000));
+        }
+    } else if (*since) {
+        int64_t dur = now - *since;
+        *since = 0;
+        if (dur >= 200000) {                                   /* episodes >=200ms are real starvation, not tick jitter */
+            if (dur >= log_thresh_us)                          /* 0.9.10.1: per-episode line only above the caller's threshold
+                                                                * (frame_q passes 2s — sub-2s episodes go to the 60s SUMMARY;
+                                                                * a 23.976-film segment produced one line every few seconds) */
+                av_log(NULL, AV_LOG_INFO, "[PTV-EMPTY] %s refilled after %lldms empty\n",
+                       name, (long long)(dur / 1000));
+            return dur;
+        }
+    }
+    return 0;
+}
+/* PTV_NVENC_SERIALIZE (2026-07-06 scale incident, opt-in): serialize all rung threads' video
+ * encoder calls behind ONE process-wide mutex. Rationale: each avcodec_send/receive on NVENC
+ * enters the NVIDIA Resource-Manager rwlock via ioctl; 6 rung threads x N processes contending
+ * it collapses the driver lock into osq_lock spinning (measured 32% of box CPU at 56 channels;
+ * ffmpeg drives the same encoders from ONE thread per process at sys=5%). Serializing cuts this
+ * process's concurrent RM callers 6 -> 1. Costs sub-tick wall jitter only: pacing sleeps, PTS
+ * math and the delivery gate are untouched (the gate drain runs OUTSIDE the lock so a full
+ * mux_q can never stall sibling rungs behind the mutex). Default OFF until soaked. */
+int             g_nvenc_serialize = 0;
+static pthread_mutex_t g_enc_serial_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Drain an encoder, pushing packets to the mux queue. frame=NULL flushes. When `gate` is set, the
+ * video front (the newest emitted DTS) is published and the held audio/copy is released in lockstep
+ * (§7.5a). Video packets ALWAYS go straight to mux_q — they are the gating front, never held. */
+static int encode_push_inner(AVThreadMessageQueue *mux_q, AVCodecContext *enc,
+                             AVStream *ost, AVFrame *frame, DlvGate *gate, int *need_drain)
+{
+    int ret;
+    /* Let the ENCODER choose the GOP: clear the decoder's leftover I/P/B
+     * classification. Otherwise mpeg2video (and any pict_type-honoring encoder)
+     * tries to replicate the source's frame types — h264's long B-runs trip
+     * "too many B-frames in a row" and stall; NVENC's forced-IDR GOP can misalign. */
+    if (frame)
+        frame->pict_type = AV_PICTURE_TYPE_NONE;
+    ret = avcodec_send_frame(enc, frame);
+    if (ret < 0)
+        return ret;
+    for (;;) {
+        AVPacket *pkt = av_packet_alloc();
+        if (!pkt)
+            return AVERROR(ENOMEM);
+        ret = avcodec_receive_packet(enc, pkt);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+            av_packet_free(&pkt);
+            if (gate) *need_drain = 1;    /* video front advanced this call → release caught-up audio/copy (outside the serialize lock) */
+            return 0;
+        }
+        if (ret < 0) {
+            av_packet_free(&pkt);
+            return ret;
+        }
+        av_packet_rescale_ts(pkt, enc->time_base, ost->time_base);
+        pkt->stream_index = ost->index;
+        {
+            int64_t dts_us = gate && pkt->dts != AV_NOPTS_VALUE
+                           ? av_rescale_q(pkt->dts, ost->time_base, AV_TIME_BASE_Q) : AV_NOPTS_VALUE;
+            /* §7.5b invariant: publish the encoder front BEFORE the packet can be held — the
+             * audio gate's release key (v_enc_dts_hi) must never depend on video DELIVERY
+             * (see the symmetric-gate header in ptvencoder_gate.c). Timing-invisible when the
+             * video hold is off: the only v_enc_dts_hi reader is dlv_drain, which runs after
+             * this whole call. */
+            if (gate && dts_us != AV_NOPTS_VALUE) dlv_publish_video(gate, dts_us);
+            if (gate && gate->v_on && dts_us != AV_NOPTS_VALUE) {
+                ret = dlv_video_deliver(gate, pkt, dts_us);       /* §7.5b: send now, or hold EARLY video */
+                if (ret < 0)
+                    return ret;                                   /* mux gone */
+            } else {
+                ret = av_thread_message_queue_send(mux_q, &pkt, 0);   /* blocking; video bypasses the gate */
+                if (ret < 0) {
+                    av_packet_free(&pkt);
+                    return ret;                                   /* mux gone */
+                }
+            }
+        }
+    }
+}
+
+static int encode_push(AVThreadMessageQueue *mux_q, AVCodecContext *enc,
+                       AVStream *ost, AVFrame *frame, DlvGate *gate)
+{
+    int need_drain = 0, ret;
+    if (g_nvenc_serialize) pthread_mutex_lock(&g_enc_serial_lock);
+    ret = encode_push_inner(mux_q, enc, ost, frame, gate, &need_drain);
+    if (g_nvenc_serialize) pthread_mutex_unlock(&g_enc_serial_lock);
+    if (need_drain && gate) {
+        dlv_drain(gate);
+        dlv_video_drain(gate);   /* §7.5b: the drain above advanced a_dlv_dts_hi — release caught-up video */
+    }
+    return ret;
+}
+
+/* Content index of a source pts on the house grid — THE single copy of the stamping arithmetic
+ * (EXACTTICK exact-rational, integer-tick fallback). The v0.9.11 pulldown lookahead uses the SAME
+ * function for its hold decision so lookahead and stamp can never disagree (a diverging second
+ * copy would reintroduce the monotonic-guard ratchet). Returns -1 when not computable. */
+static int64_t content_index(VideoCtx *v, int64_t src_pts)
+{
+    int64_t house_us;
+    if (src_pts == AV_NOPTS_VALUE || *v->h0 == AV_NOPTS_VALUE) return -1;
+    house_us = av_rescale_q(src_pts, v->out_tb, AV_TIME_BASE_Q) - *v->h0;
+    /* 1.0.1-pre30 #69 (item B) vskip label-neutrality: a resync video IDR-skip deleted
+     * content upstream (video_q head); subtract the published skip offset so the output
+     * labels CONTINUE monotonically while the content jumps — the video mirror of the
+     * audio-late skip seam. src-keyed two-tier: post-boundary content gets the new total,
+     * frames of earlier epochs still in flight through frame_q keep the previous one (skips
+     * are ≥ max(chunk_gap, seam_hold) apart, far above any frame_q residence). Every rung
+     * shares this function, so all rungs stay label-coherent. Inert until a skip fires
+     * (off_total stays 0). */
+    {
+        /* rr30 (T2a): acquire pairs with the executor's release on off_total — a reader
+         * that sees the new total is guaranteed the new from/off_before (relaxed loads
+         * below are ordered by this acquire). */
+        int64_t off = atomic_load_explicit(&g_vskip_off_total, memory_order_acquire);
+        if (off) {
+            int64_t src_us = house_us + *v->h0;   /* back on the source-time axis */
+            if (src_us < atomic_load_explicit(&g_vskip_from_us, memory_order_relaxed))
+                off = atomic_load_explicit(&g_vskip_off_before, memory_order_relaxed);
+            house_us -= off;
+        }
+    }
+    if (house_us < 0) house_us = 0;
+    if (g_exacttick && v->out_fps.num > 0)
+        return av_rescale_rnd(house_us, v->out_fps.num, 1000000LL * v->out_fps.den, AV_ROUND_NEAR_INF);
+    return (house_us + v->tick_dur_us / 2) / v->tick_dur_us;
+}
+
+/* ---- -cc_extract: EIA-608 -> DVB-teletext emitter (see the CcTap header in ptvencoder.h) ----
+ * This lives in this file for ONE reason: content_index() above is the single copy of the
+ * house-clock stamping arithmetic, and the captions must ride exactly it. The decode thread
+ * shipped us the caption plus the SOURCE pts of the frame that carried it; we map that pts
+ * through content_index() — the same call, the same h0, the same EXACTTICK rational — so the
+ * teletext page lands on the video frame it belongs to no matter how much house-vs-content
+ * skew has accumulated. Stamping once is rung-coherent by construction (every rung shares
+ * h0/out_tb/out_fps), and the resulting packet is cloned per rung.
+ *
+ * Emits one packet per event, including the zero-rect keepalive (the dvb_teletext encoder
+ * turns that into stuffing units, or a page-erase once its 10s content timeout expires). */
+/* "" for single-input, " in2" for multiview — every [PTV-CC] runtime line carries it so a
+ * per-slot QUIET/reset is attributable on a mosaic. */
+static const char *cc_tag(CcCtx *c, char *buf, size_t n)
+{
+    if (!c->multi) { buf[0] = 0; return buf; }
+    snprintf(buf, n, " in%d", c->slot);
+    return buf;
+}
+
+/* A cc_dec-shaped ASS dialog line with an EMPTY text field — what a source erase looks like
+ * coming out of cc_dec, and the only thing the teletext encoder reads as "clear the page".
+ * Used ONLY by the rebase reconciliation, which has to erase a page no source asked about.
+ * Not const: AVSubtitleRect.ass is char *, and nothing on this path writes through it. */
+static char cc_reconcile_erase_ass[] = "0,0,Default,,0,0,0,,";
+
+static void cc_emit(CcCtx *c, CcEvent *ev)
+{
+    VideoCtx *v = c->vc;
+    char tag[16];
+    AVSubtitle sub = { 0 };
+    AVSubtitleRect rect = { 0 };
+    AVSubtitleRect *rects[1] = { &rect };
+    AVPacket *pkt;
+    int64_t idx, house_us;
+    int n, r;
+    /* What actually goes into the rect. Normally ev->ass; on a rebase it can be swapped for
+     * the page currently on screen (see the rebase branch). BORROWED either way — the queue
+     * owns ev->ass and c owns last_cap_ass, so this is never freed here. */
+    char *use_ass;
+
+    use_ass = ev->ass;
+    if (ev->src_us == AV_NOPTS_VALUE) {
+        /* SYNTHETIC keepalive (see cc_thread): this input stopped delivering frames, so there
+         * is no source pts to map. Stamp it as a pure MONOTONE EXTRAPOLATION of our own last
+         * stamp — one keepalive interval on from wherever we last were.
+         *
+         * It must NOT come from any other clock. Deriving it from the master rung's emitted
+         * count (the OUTPUT position) or from the wall clock puts keepalives on a different
+         * axis than captions, which content_index() maps from SOURCE content: the two differ
+         * by whatever the pipeline is buffering, so every caption/keepalive alternation looks
+         * like a timeline jump. Measured on air with the emitted-count version: subtitle DTS
+         * thrashing backward 6.5s typically and up to 79s, 2721 resets on TruBLU and 6799 on
+         * Newsmax2, every backward packet silently dropped by the muxer's monotonic guard —
+         * so the counters reported captions while the wire carried no teletext PID at all.
+         * Extrapolating our own stamp is monotone by construction, so nothing is dropped, and
+         * since keepalives fire at ~1 Hz it tracks real time closely enough for the encoder's
+         * 10s stale-content timer. */
+        if (c->last_dts == AV_NOPTS_VALUE)
+            return;                      /* nothing has ever been on screen: nothing to keep alive */
+        house_us = c->last_dts + PTV_CC_KEEPALIVE_US;
+    } else {
+        /* content_index() wants the source pts in the rung's own out_tb. h0_lock is held
+         * because on multiview the compositor's REANCHOR2 mutates this slot's h0 at runtime
+         * (every other reader of it takes the lock too). */
+        pthread_mutex_lock(v->h0_lock);
+        idx = content_index(v, av_rescale_q(ev->src_us, AV_TIME_BASE_Q, v->out_tb));
+        pthread_mutex_unlock(v->h0_lock);
+        if (idx < 0) {                   /* h0 not anchored yet (pre-first-video caption) */
+            atomic_fetch_add_explicit(&g_cc_dropped, 1, memory_order_relaxed);
+            return;
+        }
+        /* the exact-rational house time of that content index — the same axis the video pts
+         * ride (the integer-tick divisor would re-import the ~10ppm EXACTTICK error) */
+        house_us = v->out_fps.num > 0
+                 ? av_rescale(idx, 1000000LL * v->out_fps.den, v->out_fps.num)
+                 : idx * v->tick_dur_us;
+    }
+    /* TEST ONLY (PTV_CCTEST_REBASE_AT_S — see the declaration). Emit a 5s window of stamps
+     * shifted 30s FORWARD, then stop shifting. Because those packets really are muxed at the
+     * high value, the muxer's high-water ratchets up with them, and the first unshifted event
+     * afterwards is a genuine 30s backward step — an h0 move's exact shape, including the
+     * [PTV-MUXGUARD] collision that the survival fix exists to prevent. Shifting only our own
+     * internal high-water (the first version of this gate) does NOT reproduce it: no packet
+     * ever carries the inflated value, so nothing collides and the gate passes vacuously. */
+    if (g_cctest_rebase_at_us > 0 && !c->rebase_test_fired) {
+        if (house_us >= g_cctest_rebase_at_us &&
+            house_us <  g_cctest_rebase_at_us + 5000000) {
+            house_us += 10 * PTV_CC_REBASE_US;
+        } else if (house_us >= g_cctest_rebase_at_us + 5000000) {
+            c->rebase_test_fired = 1;
+            av_log(NULL, AV_LOG_WARNING,
+                   "[PTV-CCTEST]%s test window over — the next stamp steps back 30s "
+                   "(PTV_CCTEST_REBASE_AT_S)\n", cc_tag(c, tag, sizeof tag));
+        }
+    }
+    if (c->last_dts != AV_NOPTS_VALUE) {
+        if (house_us < c->last_dts - PTV_CC_REBASE_US) {
+            /* A step THIS large is a genuine rebase of the timeline under us: adopt the new
+             * baseline rather than ratcheting every future caption off a now-stale
+             * high-water. Anything smaller (see PTV_CC_REBASE_US — the REANCHOR2 h0-shift
+             * band) falls through to the monotone bump below instead, because the muxer's
+             * high-water does NOT rebase with us and every backward packet would be dropped
+             * by [PTV-MUXGUARD] while the counters here claimed a delivery. */
+            atomic_fetch_add_explicit(&g_cc_reset, 1, memory_order_relaxed);
+            av_log(NULL, AV_LOG_INFO,
+                   "[PTV-CC]%s house stamp stepped back %"PRId64"ms — subtitle dts baseline reset\n",
+                   cc_tag(c, tag, sizeof tag), (c->last_dts - house_us) / 1000);
+            /* BEFORE last_dts is cleared: this is the stamp the MUXER still holds (see the
+             * REBASE SURVIVAL note below). Reading it afterwards yields AV_NOPTS_VALUE and
+             * silently disables the re-transmission. */
+            c->rebase_hw = c->last_dts;
+            c->last_dts = AV_NOPTS_VALUE;
+            /* the QUIET watchdog measures on this same axis: leaving last_caption_us on the
+             * OLD (higher) house time makes house_us - last_caption_us negative for as long
+             * as the step was, silently disarming it. Re-baseline on the next event. */
+            c->last_caption_us = AV_NOPTS_VALUE;
+            c->last_cap_dts    = AV_NOPTS_VALUE;  /* the erase floor below is on that dead axis */
+            /* 1.2.0-pre5 REBASE SURVIVAL. Everything we now emit is BELOW the muxer's
+             * high-water, so [PTV-MUXGUARD] refuses it until content climbs back past the
+             * pre-rebase stamp — that is what ccmux= has been counting on air (Azorse
+             * 894/week, NTD 72, Daystar_esp 35). The high-water is exactly the last stamp we
+             * emitted, so remember it and RECONCILE THE WIRE the moment we are above it
+             * again (below). Without that the viewer's page stays frozen not just for the
+             * length of the step but until the SOURCE happens to produce its next caption,
+             * which on a sparse feed is minutes — or, when what was dropped was an erase,
+             * for good.
+             *
+             * NOT ALSO CLEARING THE GUARD'S mg_last, and that is a measured decision rather
+             * than an omission. That companion fix was built and live-fired here on
+             * 2026-08-26 and it KILLS THE CHANNEL: mg_last is only ptvencoder's MIRROR of
+             * the authority, which is lavf's own per-stream sti->cur_dts (mux.c). Clearing
+             * the mirror does not move lavf's high-water — it merely removes the guard's
+             * protection, so the backward packet reaches the muxer and EINVALs it. Measured
+             * on a forced 29.3s rebase: with the reset in place, "non monotonically
+             * increasing dts to muxer in stream 2" and "[PTV-MUX] rung 0 write failed ...
+             * exiting for supervised respawn"; without it, ccmux=40 and the channel carries
+             * on. A refused sparse packet is a stale caption; a dead mux is a dead channel.
+             * Driving ccmux to zero across a rebase needs the STAMPS kept above lavf's
+             * high-water — a clock-design change, not a silenced guard. */
+        } else if (house_us <= c->last_dts) {
+            house_us = c->last_dts + 1000;        /* strictly increasing (1ms == 90 @90kHz) */
+            atomic_fetch_add_explicit(&g_cc_bump, 1, memory_order_relaxed);
+            /* MINIMUM-DISPLAY FLOOR for an erase, inside the bump band only.
+             *
+             * The bump makes the stamp merely monotone, not spaced: a caption and the erase
+             * that follows it can both land in the same collapsed instant and go out 1ms
+             * apart, which is a caption with ZERO display time. That is the same zero-display
+             * bug the tap's deferred-erase rule fixed, arriving through a different door —
+             * the tap decides WHEN to hand us the erase on the SOURCE axis, and it is this
+             * function that then collapses the two stamps together on the house axis.
+             *
+             * Only ERASE, and only while bumping. When house_us is genuinely monotone this
+             * branch is not reached at all, so normal operation is untouched: the tap has
+             * already held early erases for their 1.2s and their house stamps are naturally
+             * that far apart. Bounded by construction — the floor is one PTV_CC_MIN_DISPLAY_US
+             * past the caption, never a running ratchet. */
+            if (ev->kind == PTV_CC_ERASE && c->last_cap_dts != AV_NOPTS_VALUE &&
+                house_us < c->last_cap_dts + PTV_CC_MIN_DISPLAY_US)
+                house_us = c->last_cap_dts + PTV_CC_MIN_DISPLAY_US;
+        }
+    }
+    /* The SECOND EVENT of a !page_up reconciliation (see the block below, which arms it): the
+     * encoder is holding a page the viewer is not owed, so clear it on the first event that
+     * has nothing else to say. Placed BEFORE the crossing block deliberately — the crossing
+     * rewrites ev->kind to CAPTION as it re-asserts the page, so running this afterwards
+     * would see that rewritten kind and disarm the erase in the very call that armed it
+     * (measured: 3 of 22 TruBLU trials armed the clear and none ever sent it). The two can
+     * never fire in the same call anyway: arming happens only where rebase_hw is cleared. */
+    if (c->rebase_erase_pending) {
+        if (ev->kind == PTV_CC_KEEPALIVE) {
+            use_ass    = cc_reconcile_erase_ass;
+            ev->kind   = PTV_CC_ERASE;
+            ev->end_ms = 0;
+            av_log(NULL, AV_LOG_INFO,
+                   "[PTV-CC]%s reconciliation complete — erasing the page the rebase stranded\n",
+                   cc_tag(c, tag, sizeof tag));
+        }
+        c->rebase_erase_pending = 0;       /* either we sent it, or the source settled it */
+    }
+    /* REBASE SURVIVAL, second half: RECONCILE THE WIRE TO THE ENCODER.
+     *
+     * Inside the window every packet we emit is at or below the stamp the muxer still holds,
+     * so [PTV-MUXGUARD] refuses it — while the ENCODER, which sits upstream of the drop,
+     * processes it and advances its display state anyway. The two therefore diverge for the
+     * whole window, and the divergence outlives it: whatever the encoder believes is on
+     * screen is what it will incrementally update from, and what the RECEIVER is showing is
+     * the pre-rebase page nobody has been able to replace.
+     *
+     * So at the first ACCEPTED stamp, if anything was dropped, we re-assert the encoder's
+     * own state rather than waiting for the source:
+     *   page_up  => the page (last_cap_ass). This is NOT contingent on the crossing event
+     *               being a keepalive any more — riding the keepalive is why the pre-fix
+     *               re-transmission fired in only 10 of 16 forced-rebase trials (measured;
+     *               all 16 reconcile now).
+     *   !page_up => an ERASE. This is the case that could freeze a viewer's page for good:
+     *               a source EDM accepted-but-dropped inside the window leaves the receiver
+     *               on the old caption AND disarms the encoder's 10 s stale backstop, which
+     *               only fires while it believes content is up.
+     *
+     * A CAPTION at the crossing needs nothing — it carries fresh text and reconciles by
+     * itself, and so does an ERASE while the encoder still believes a page is up. An ERASE
+     * against an ALREADY-BLANK encoder does not: it encodes to nothing (dvbteletextenc:
+     * `if (ctx->content_active) return write_erase_page(); return 0`) and the retry below
+     * turns it into a keepalive, so it needs the same help a keepalive does.
+     *
+     * THE ERASE IS TWO EVENTS, and that is forced by the same encoder rule: it will not
+     * write an erase page for a page it thinks is already down. So we re-assert the page
+     * first — invisible to the viewer, who is looking at exactly that page — and the erase
+     * rides the next keepalive (<= 1 s), with the encoder's now-re-armed 10 s stale timer
+     * underneath it as the backstop. Any real CAPTION or ERASE arriving in between settles
+     * the screen itself and disarms it. */
+    if (c->rebase_hw != AV_NOPTS_VALUE) {
+        if (house_us > c->rebase_hw) {
+            /* the two kinds that would otherwise leave the receiver on the stranded page */
+            int mute = ev->kind == PTV_CC_KEEPALIVE ||
+                       (ev->kind == PTV_CC_ERASE && !c->page_up);
+            if (c->rebase_dropped && c->last_cap_ass && mute) {
+                use_ass    = c->last_cap_ass;
+                ev->kind   = PTV_CC_CAPTION;
+                ev->end_ms = PTV_CC_MAX_DISPLAY_MS;
+                c->rebase_erase_pending = !c->page_up;
+                av_log(NULL, AV_LOG_INFO,
+                       "[PTV-CC]%s past the pre-rebase mux high-water — reconciling the wire: "
+                       "re-transmitting the page%s\n", cc_tag(c, tag, sizeof tag),
+                       c->rebase_erase_pending ? " to clear it (erase follows)" : "");
+            }
+            c->rebase_hw      = AV_NOPTS_VALUE;
+            c->rebase_dropped = 0;
+        } else
+            c->rebase_dropped = 1;   /* at or below the muxer's high-water: this one is lost */
+    }
+
+    pkt = av_packet_alloc();
+    if (!pkt) {                                   /* counted: a silent CC path with every
+                                                   * counter flat is the one thing the
+                                                   * observability design rules out */
+        atomic_fetch_add_explicit(&g_cc_dropped, 1, memory_order_relaxed);
+        return;
+    }
+    if (av_new_packet(pkt, PTV_CC_ENC_BUF) < 0) {
+        atomic_fetch_add_explicit(&g_cc_dropped, 1, memory_order_relaxed);
+        av_packet_free(&pkt);
+        return;
+    }
+    sub.pts              = house_us;              /* the encoder's erase timer reads this */
+    sub.end_display_time = ev->end_ms;
+    if (use_ass) {
+        rect.type    = SUBTITLE_ASS;
+        rect.ass     = use_ass;
+        sub.rects    = rects;
+        sub.num_rects = 1;
+    }
+    n = avcodec_encode_subtitle(c->enc, pkt->data, pkt->size, &sub);
+    if (n <= 0 && sub.num_rects) {
+        /* The encoder had nothing to say about this caption (n == 0: no printable text and
+         * no page up to erase) or could not encode it at all (n < 0). Send the keepalive in
+         * its place: the tap phases its 1 Hz floor on events SENT, so swallowing this one
+         * would let the CC PID go silent for as long as such captions keep arriving — the
+         * very failure this retry exists to prevent. One event in => one packet out. */
+        if (n < 0) {
+            int64_t nw = av_gettime_relative();
+            atomic_fetch_add_explicit(&g_cc_err, 1, memory_order_relaxed);
+            if (nw - c->err_log_us > 10000000) {
+                c->err_log_us = nw;
+                av_log(NULL, AV_LOG_WARNING, "[PTV-CC]%s teletext encode failed: %s\n",
+                       cc_tag(c, tag, sizeof tag), av_err2str(n));
+            }
+        }
+        sub.num_rects = 0;
+        sub.rects     = NULL;
+        ev->kind      = PTV_CC_KEEPALIVE;
+        ev->end_ms    = 0;                        /* stuffing has no on-screen life */
+        sub.end_display_time = 0;
+        n = avcodec_encode_subtitle(c->enc, pkt->data, pkt->size, &sub);
+    }
+    if (n <= 0) {
+        /* the encoder declined even the keepalive (n == 0 => buffer too small, see
+         * PTV_CC_ENC_BUF) or failed it outright */
+        if (n < 0)
+            atomic_fetch_add_explicit(&g_cc_err, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_cc_dropped, 1, memory_order_relaxed);
+        av_packet_free(&pkt);
+        return;
+    }
+    av_shrink_packet(pkt, n);
+    pkt->pts      = house_us;                     /* AV_TIME_BASE_Q; rescaled per rung below */
+    pkt->dts      = house_us;
+    pkt->duration = (int64_t)ev->end_ms * 1000;
+    pkt->pos      = -1;
+    c->last_dts     = house_us;
+    /* AFTER the encode: ev->kind may have been rewritten to KEEPALIVE by the retry above, and
+     * only a page that really went out is a floor for the next erase. */
+    if (ev->kind == PTV_CC_CAPTION) {
+        c->last_cap_dts = house_us;
+        /* 1.2.0-pre5 REBASE SURVIVAL: remember the page that is now on screen, so a rebase
+         * can put it back. Kept only for CAPTIONs that the encoder actually accepted — the
+         * retry above rewrites a rejected one to KEEPALIVE, and re-transmitting text the
+         * encoder already declined would just fail again. */
+        if (use_ass && (!c->last_cap_ass || strcmp(c->last_cap_ass, use_ass))) {
+            av_freep(&c->last_cap_ass);
+            c->last_cap_ass = av_strdup(use_ass);
+        }
+        c->page_up = 1;
+    } else if (ev->kind == PTV_CC_ERASE)
+        c->page_up = 0;                           /* the page is blank: nothing to restore */
+    c->last_emit_wc = av_gettime_relative();
+    for (r = 0; r < c->n_out; r++) {              /* fan out to every rung's muxer */
+        AVPacket *o = av_packet_clone(pkt);
+        if (!o) {
+            atomic_fetch_add_explicit(&g_cc_dropped, 1, memory_order_relaxed);
+            continue;
+        }
+        av_packet_rescale_ts(o, AV_TIME_BASE_Q, c->ost[r]->time_base);
+        o->stream_index = c->ost[r]->index;
+        /* NO delivery gate: the gate holds DENSE audio for the video front; a sparse
+         * subtitle's wire-arrival lead is a feature (same rule as copied DVB-subs). */
+        if (av_thread_message_queue_send(c->mux_q[r], &o, 0) < 0) {
+            /* COUNTED. This is the last loss path on the way to a muxer (the queue is closed
+             * because that rung's mux thread has gone), and it was the one place a caption
+             * could vanish with every counter flat — the exact failure mode the observability
+             * design rules out. Per rung, like ccmux=. */
+            atomic_fetch_add_explicit(&g_cc_dropped, 1, memory_order_relaxed);
+            av_packet_free(&o);
+        }
+    }
+    av_packet_free(&pkt);
+    /* counted APART: caps= must mean "pages of text went out". Folding erases in would make
+     * a source that only ever clears its captions look like a working extraction, and would
+     * keep last_caption_us fresh so the QUIET watchdog below could never fire. */
+    if (ev->kind == PTV_CC_CAPTION) {
+        atomic_fetch_add_explicit(&g_cc_caps, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_cc_caps_in[c->slot], 1, memory_order_relaxed);
+    } else if (ev->kind == PTV_CC_ERASE) {
+        atomic_fetch_add_explicit(&g_cc_erase, 1, memory_order_relaxed);
+        /* cclate= is WIRE TRUTH, like every counter around it: a deferred clear only counts
+         * once the encoder has actually produced a clear page for it. Counting it where it
+         * was queued would credit events the queue dropped and events the encoder answered
+         * with a keepalive instead (an already-blank page => n == 0 => kind rewritten above). */
+        if (ev->deferred)
+            atomic_fetch_add_explicit(&g_cc_elate, 1, memory_order_relaxed);
+    } else
+        atomic_fetch_add_explicit(&g_cc_keep, 1, memory_order_relaxed);
+
+    /* --- state log: the two transitions an operator actually needs --- */
+    if (ev->kind == PTV_CC_CAPTION) {
+        /* clear the quiet latch UNCONDITIONALLY: a run that starts inside an ad break goes
+         * QUIET before its first caption, and leaving the latch set there would make every
+         * LATER outage — the interesting one — unreportable. */
+        if (c->quiet) {
+            c->quiet = 0;
+            if (c->seen_caption)
+                av_log(NULL, AV_LOG_INFO, "[PTV-CC]%s captions RESUMED at output time %.3fs\n",
+                       cc_tag(c, tag, sizeof tag), house_us / 1000000.0);
+        }
+        if (!c->seen_caption) {
+            c->seen_caption = 1;
+            av_log(NULL, AV_LOG_INFO,
+                   "[PTV-CC]%s first caption emitted at output time %.3fs\n",
+                   cc_tag(c, tag, sizeof tag), house_us / 1000000.0);
+        }
+        c->last_caption_us = house_us;
+    } else if (c->last_caption_us == AV_NOPTS_VALUE) {
+        /* Baseline on the FIRST event of any kind, not on the first caption: a run that
+         * never produces one is precisely the "extraction is broken" case this watchdog
+         * exists for, and anchoring on captions alone would make it unreportable. */
+        c->last_caption_us = house_us;
+    } else if (!c->quiet && house_us - c->last_caption_us > PTV_CC_QUIET_US) {
+        /* CC bytes are still arriving (a53= keeps climbing) but nothing decodes to text —
+         * either the source genuinely stopped captioning, or the extraction is broken.
+         * One line either way; the counters say which. */
+        c->quiet = 1;
+        /* THIS SLOT's a53/caps, not the fleet totals: on a mosaic "in3 QUIET ... caps=264"
+         * read as if in3 had produced 264 captions when its own count was 0 — the line was
+         * reporting the very thing it exists to contradict. ccerr stays a total (errors are
+         * not attributed per slot). */
+        av_log(NULL, AV_LOG_WARNING,
+               "[PTV-CC]%s QUIET — no caption for %"PRId64"s (a53=%"PRId64" frames seen, "
+               "caps=%"PRId64" on this input; ccerr=%"PRId64" total)\n",
+               cc_tag(c, tag, sizeof tag), (house_us - c->last_caption_us) / 1000000,
+               atomic_load_explicit(&g_cc_a53_in[c->slot],  memory_order_relaxed),
+               atomic_load_explicit(&g_cc_caps_in[c->slot], memory_order_relaxed),
+               atomic_load_explicit(&g_cc_err,              memory_order_relaxed));
+    }
+}
+
+void *cc_thread(void *arg)
+{
+    CcCtx *c = arg;
+    char tag[16], per[80] = "";   /* the "(this input)" half — multiview only, where the
+                                   * fleet totals cannot say which slot went dark */
+    int r;
+
+    /* NON-BLOCKING poll rather than a blocking recv: every real event is produced from a
+     * decoded frame of this input, so an input that stops delivering frames (a dead slot on
+     * a mosaic — the channel survives, the cell goes black) would otherwise stop producing
+     * events entirely. No events means no encoder call, which means the encoder's stale-
+     * content erase never runs and the QUIET watchdog never fires: the slot's last caption
+     * freezes on air, silently. Synthesising the keepalive here on the WALL clock restores
+     * both, and keeps the sparse PID advancing for lavf's interleaver. */
+    for (;;) {
+        CcEvent ev;
+        int ret = av_thread_message_queue_recv(c->q, &ev, AV_THREAD_MESSAGE_NONBLOCK);
+        if (ret == AVERROR(EAGAIN)) {
+            int64_t now_wc = av_gettime_relative();
+            if (c->last_emit_wc && now_wc - c->last_emit_wc >= PTV_CC_KEEPALIVE_US) {
+                CcEvent ka = { NULL, AV_NOPTS_VALUE, 0, PTV_CC_KEEPALIVE };
+                cc_emit(c, &ka);
+            } else
+                av_usleep(20000);                 /* 20ms: 1 Hz floor without a busy loop */
+            continue;
+        }
+        if (ret < 0)
+            break;                                /* decode thread EOF'd the queue */
+        cc_emit(c, &ev);
+        av_freep(&ev.ass);
+    }
+    for (r = 0; r < c->n_out; r++) {              /* our own producer EOF marker per muxer */
+        AVPacket *eof = NULL;
+        av_thread_message_queue_send(c->mux_q[r], &eof, 0);
+    }
+    av_freep(&c->last_cap_ass);                   /* the page kept for rebase re-transmission */
+    if (c->multi)
+        snprintf(per, sizeof per, "a53=%lld caps=%lld on this input | all inputs: ",
+                 (long long)atomic_load_explicit(&g_cc_a53_in[c->slot],  memory_order_relaxed),
+                 (long long)atomic_load_explicit(&g_cc_caps_in[c->slot], memory_order_relaxed));
+    av_log(NULL, AV_LOG_INFO,
+           "[PTV-CC]%s done — %sa53=%"PRId64" caps=%"PRId64" erase=%"PRId64" keep=%"PRId64
+           " err=%"PRId64" drop=%"PRId64" bump=%"PRId64" reset=%"PRId64" eheld=%"PRId64
+           " elate=%"PRId64" mrect=%"PRId64" ccmux=%"PRId64"\n",
+           cc_tag(c, tag, sizeof tag), per,
+           atomic_load_explicit(&g_cc_a53,     memory_order_relaxed),
+           atomic_load_explicit(&g_cc_caps,    memory_order_relaxed),
+           atomic_load_explicit(&g_cc_erase,   memory_order_relaxed),
+           atomic_load_explicit(&g_cc_keep,    memory_order_relaxed),
+           atomic_load_explicit(&g_cc_err,     memory_order_relaxed),
+           atomic_load_explicit(&g_cc_dropped, memory_order_relaxed),
+           atomic_load_explicit(&g_cc_bump,    memory_order_relaxed),
+           atomic_load_explicit(&g_cc_reset,   memory_order_relaxed),
+           atomic_load_explicit(&g_cc_eskip,   memory_order_relaxed),
+           atomic_load_explicit(&g_cc_elate,   memory_order_relaxed),
+           atomic_load_explicit(&g_cc_mrect,   memory_order_relaxed),
+           atomic_load_explicit(&g_cc_mux,     memory_order_relaxed));
+    return NULL;
+}
+
+/* 0.9.18 R2 (map §2.4): the house-rate correction LADDER, extracted verbatim from
+ * output_thread's master block. Returns the correction (ppm; positive = slow the house)
+ * the master publishes and every rung applies. Priority order, unchanged:
+ *   P-servo → reprime override → +1.5% sustained cap → hard ±6% clamp →
+ *   gentle zone ±0.6% → bank top-up floor → clock-follow subtraction.
+ * Inputs are the parameters plus the published bank atomics; the servo EMA, reprime
+ * state machine and clock-follow latch live in *hr, the published estimator rates in
+ * *est (0.9.18 R3/R4). Master thread only — non-reentrant. */
+static int64_t house_rate_corr_ppm(HouseRateState *hr, const RateEstimator *est,
+                                   int occ, int sp, int base_sp, int64_t tick_dur_us)
+{
+    /* PROPORTIONAL occupancy servo (v0.9.6). The earlier INTEGRAL servo (corr += K·err)
+     * oscillated: the buffer is itself an integrator (ρ → consume-rate → ∫ → occupancy),
+     * so an integrating CONTROLLER on top makes a type-2 loop that limit-cycles (the
+     * ±7-13k ppm ρ wobble), and a series EMA only added phase lag = worse. A PROPORTIONAL
+     * controller of an integrator plant is unconditionally stable — no windup, no limit
+     * cycle. ρ = Kp·(setpoint − occ): buffer filling → ρ<0 → house faster → drains it.
+     * Steady state parks at err = −mismatch/Kp (sub-frame for any real crystal) and
+     * ρ ≈ −(source rate offset) — i.e. ρ now READS the true per-source rate, smooth and
+     * non-hunting. Wide ±6% clamp keeps drain authority (the old ±150ppm proportional try
+     * SATURATED → couldn't drain → crept to 42f → dlvforced; ±6% never saturates on a real
+     * source). A light EMA gives fractional occ so ρ doesn't step on integer-frame
+     * quantization; with P-control its lag is harmless. */
+    int repriming = 0;
+    if (!hr->occ_ema_seeded) { hr->occ_ema_milli = (int64_t)occ * 1000; hr->occ_ema_seeded = 1; }
+    hr->occ_ema_milli += ((int64_t)occ * 1000 - hr->occ_ema_milli) / 16;   /* EMA N=16 → smooth fractional occ */
+    int64_t err_milli = (int64_t)sp * 1000 - hr->occ_ema_milli;          /* setpoint − occ (milli-frames) */
+    int64_t corr = (err_milli * 500) / 1000;                           /* ρ = Kp·err, Kp=500 ppm/frame (PROPORTIONAL, no accumulation) */
+    int64_t hi = 60000;                                            /* +6% normal positive clamp */
+    if (g_reprime && occ <= (base_sp + 1) / 2) {                   /* RE-PRIME: drained below half the BASE floor (true starvation —
+                                                                    * NOT the adaptive raised target). Slow the house HARD to refill fast.
+                                                                    * 0.9.10.1 state machine: an engagement lasts AT MOST 10s, then a 300s
+                                                                    * cooldown applies unconditionally — occupancy oscillating around the
+                                                                    * trigger must NOT re-arm (the 0.9.10 flaw: AWE 23.976-film segments
+                                                                    * kept occ at the threshold → reprime pinned the house at 0.77x for
+                                                                    * the whole segment → downstream underrun). */
+        int64_t nw2 = av_gettime_relative();
+        if (hr->reprime_start == 0 &&
+            (hr->reprime_last_end == 0 || nw2 - hr->reprime_last_end > 300LL * 1000000))
+            hr->reprime_start = nw2;                               /* begin a new engagement (cooldown clear) */
+        if (hr->reprime_start && nw2 - hr->reprime_start <= 10LL * 1000000) {
+            corr = 300000; hi = 300000;                            /* ≈ house 0.77x, bounded to 10s */
+            repriming = 1;
+        } else if (hr->reprime_start) {
+            hr->reprime_last_end = nw2; hr->reprime_start = 0;     /* cap hit → end + cooldown */
+        }
+    } else if (hr->reprime_start) {
+        hr->reprime_last_end = av_gettime_relative(); hr->reprime_start = 0;   /* occ recovered → end + cooldown */
+    }
+    if (!repriming && corr > 15000) corr = 15000;                  /* 0.9.10.1: sustained positive (slow-down) authority capped at 1.5%
+                                                                    * — the proven pre-0.9.10 level (Kp x base_sp). The servo must never
+                                                                    * RATE-MATCH a sustained content-rate deficit (23.976 film in a 29.97
+                                                                    * container = 24 AU/s is LEGITIMATE; dups there are 3:2 pulldown).
+                                                                    * Real source-clock offsets are ppm-scale; 1.5% covers any crystal. */
+    if (corr >  hi)     corr =  hi;
+    if (corr < -60000)  corr = -60000;
+    /* v0.9.10 gentle zone: above the BASE safety floor the servo only nudges (±0.6%) —
+     * an adaptive GROW fills lazily from the source's natural catch-up bursts and a
+     * SHRINK drains at ppm scale, so tier transitions never jerk downstream delivery.
+     * Full authority below the floor (real starvation) and under re-prime. */
+    if (g_adapt_cushion && !repriming && hr->occ_ema_milli >= (int64_t)base_sp * 1000) {
+        if (corr >  6000) corr =  6000;
+        if (corr < -6000) corr = -6000;
+    }
+    /* v0.9.14 AUTO-BANK top-up: deficit retention alone converges to BREAK-EVEN only
+     * (each cycle starves by gap−coverage and retains exactly that; the 1.5x margin
+     * never builds — measured: dup trickle persists at the boundary). Fill the margin
+     * actively: above the safety floor, bias the gentle zone to slow-fill (+0.6%,
+     * imperceptible) until video_q holds the bank target; normal servo resumes there. */
+    {
+        int64_t bt = atomic_load_explicit(&g_bank_us, memory_order_relaxed);
+        /* margin = TOTAL buffered content: compressed video_q + decoded frame_q
+         * (counting video_q alone would overshoot by frame_q's depth, ~5s) */
+        int64_t have = ((int64_t)atomic_load_explicit(&g_vq_elems, memory_order_relaxed) + occ)
+                       * tick_dur_us;
+        if (bt > 0 && !repriming && hr->occ_ema_milli >= (int64_t)base_sp * 1000 &&
+            have < bt && corr < 6000)
+            corr = 6000;
+    }
+    /* v0.9.15 CLOCK-FOLLOW: a locked coarse-FLL offset beyond the arm threshold is a
+     * real source-clock fault — follow it beyond the gentle zone, else the servo pegs
+     * at +-0.6%, buffers pin and aresample churns forever. Hysteresis latch (arm
+     * >5000, release <2000); capped +-2%. The tick pacing (and thus output PCR) runs
+     * at the source's true rate — receivers slave to PCR, so the chain simply runs at
+     * source pace, as with any PCR-locked feed. v0.9.15.5: arm 3000->5000 — NewsNation's
+     * clock WANDERS -700..-3400ppm and chattered arm/release across 3000 (~15/day);
+     * sub-5000 offsets are handled fine unfollowed (WUCR + decimation, proven live),
+     * so follow engages only for the genuinely-broken-clock class it was built for. */
+    if (g_clockfollow && atomic_load_explicit(&est->cf_locked, memory_order_relaxed)) {
+        int64_t cf_ppm = ((atomic_load_explicit(&est->cf_rate_q20, memory_order_relaxed)
+                           - (1 << 20)) * 1000000) >> 20;
+        /* v0.9.15.3: a BURSTY-classified channel (auto-bank armed) violates the coarse
+         * estimator's smooth-delivery assumption — its clump windows alias into a bogus
+         * offset (Unique TV latched cf=+28450ppm -> followed +2% fast -> drained the very
+         * bank that absorbs the clumps). Never follow while the bank is armed. */
+        if (atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0) {
+            if (hr->cf_following) {
+                hr->cf_following = 0;
+                av_log(NULL, AV_LOG_WARNING,
+                       "[PTV-CLOCK] BURSTY channel (bank armed) — follow released, estimator untrusted\n");
+            }
+        } else
+        if (!hr->cf_following && llabs(cf_ppm) > 5000) {
+            hr->cf_following = 1;
+            av_log(NULL, AV_LOG_WARNING,
+                   "[PTV-CLOCK] source clock runs %+lldppm off realtime — FOLLOWING it "
+                   "(output+PCR pace at the source's true rate; PTV_NO_CLOCKFOLLOW reverts)\n",
+                   (long long)cf_ppm);
+        } else if (hr->cf_following && llabs(cf_ppm) < 2000) {
+            hr->cf_following = 0;
+            av_log(NULL, AV_LOG_WARNING,
+                   "[PTV-CLOCK] source clock back within normal range (%+lldppm) — released\n",
+                   (long long)cf_ppm);
+        }
+        if (hr->cf_following)
+            corr -= av_clip64(cf_ppm, -20000, 20000);
+    }
+    return corr;
+}
+
+void *output_thread(void *arg)
+{
+    VideoCtx *v = arg;
+    AVFrame *held = av_frame_alloc();
+    AVFrame *f;
+    int have = 0, ret = 0;
+    int64_t tick = 0, wall0 = 0, last_vpts = -1, gl_phase = 0;   /* gl_phase: v0.9.0 genlock-scaled cumulative wall span */
+    int64_t last_content_vpts = -1;  /* v0.9.15.3: content index of the last REAL frame emitted. Decimation must
+                                      * compare against PLAYED CONTENT, not last_vpts: each dup bumps last_vpts one
+                                      * tick past content (monotonic guard), so after a delivery stall last_vpts sits
+                                      * N ticks ahead and the refill clump all reads as "surplus" -> decimation eats
+                                      * the very latency AUTO-BANK retains -> dup/decim oscillation (Unique TV,
+                                      * dup=615K = decim=613K over 10h45m, 6s pause/fast-forward cycle). */
+    int64_t held_src_pts = AV_NOPTS_VALUE;   /* ORIGINAL source pts of held frame (held->pts gets
+                                                overwritten to vpts on emit; dups must not re-read it) */
+    int64_t diag_t0 = av_gettime_relative(), diag_last = diag_t0;
+    int64_t stat_last = diag_t0, stat_prev = 0;
+
+    if (!held)
+        goto done;
+
+    if (!v->live) {
+        /* offline: media clock — encode every decoded frame 1:1, no pacing/dup */
+        for (;;) {
+            ret = av_thread_message_queue_recv(v->frame_q, &f, 0);
+            if (ret < 0) break;
+            f->pts = tick++; f->pkt_dts = AV_NOPTS_VALUE; f->duration = 0;
+            ret = encode_push(v->mux_q, v->venc, v->ost, f, NULL);   /* offline: no delivery gate */
+            v->emitted++; v->last_emit_us = av_gettime_relative();
+            if (g_t_us > 0 && v->is_master && v->emitted * v->tick_dur_us >= g_t_us)
+                atomic_store_explicit(&g_t_stop, 1, memory_order_relaxed);   /* rider (b): -t */
+            av_frame_free(&f);
+            if (ret < 0) break;
+        }
+        encode_push(v->mux_q, v->venc, v->ost, NULL, NULL);
+        goto done;
+    }
+
+    if (v->passthrough) {
+        /* multiview: the compositor IS the house clock — it paced this frame and
+         * already stamped pts (in venc tb). Encode 1:1, no re-pace / dup / skew
+         * (the compositor owns all of that, and the stats/diag line). */
+        for (;;) {
+            ret = av_thread_message_queue_recv(v->frame_q, &f, 0);
+            if (ret < 0) break;
+            f->pkt_dts = AV_NOPTS_VALUE; f->duration = 0;
+            ret = encode_push(v->mux_q, v->venc, v->ost, f, v->gate);   /* gate slot audio/copy to this composite video */
+            v->emitted++; v->last_emit_us = av_gettime_relative();
+            av_frame_free(&f);
+            if (ret < 0) break;
+        }
+        encode_push(v->mux_q, v->venc, v->ost, NULL, v->gate);
+        goto done;
+    }
+
+    /* live: free-running master clock at the house rate. Pop ONE frame per tick;
+     * the frame_q is a jitter buffer that absorbs decoder delivery bursts, so at
+     * matched rates this is a smooth 1:1 (CFR). A genuine source gap -> dup; a
+     * genuine overflow (source faster / output stalled) -> drop-oldest at decode.
+     *
+     * Pre-roll: decode delivery is bursty (OS scheduling, network read batching)
+     * even when the source cadence is perfectly steady, while the master clock
+     * consumes at a matched average rate. With no cushion the buffer sits near
+     * empty, so any momentary decode gap starves a tick -> a repeated frame (dup)
+     * -> visible micro-stutter. Priming frame_q to ~PTV_PREROLL_MS worth before
+     * starting the clock gives the gaps something to draw down instead. The video
+     * PTS stays content-anchored to h0, so the cushion only shifts WHEN frames
+     * emit, never their timestamps -> A/V sync is unchanged. */
+    {
+        int preroll_ms = g_cp.preroll_ms;   /* v0.9.1: single-input frame_q cushion tracks the resolved prime (genlock default ~1s); was a separate getenv→350 read */
+        int n_prime = (preroll_ms > 0 && v->tick_dur_us > 0)
+                          ? (int)((int64_t)preroll_ms * 1000 / v->tick_dur_us) : 0;
+        int primed;
+        int64_t eq_vq_s = 0, eq_fq_s = 0, eq_fq_h = 0, eq_mq_s = 0;  /* PTV-EMPTY per-queue empty-since (+ frame_q heartbeat) state */
+        int64_t corr_wd_last = 0;   /* pre14: stale-track corrector watchdog rate limit (1s) */
+        int64_t ep_agg_cnt = 0, ep_agg_min = 0, ep_agg_max = 0, ep_agg_t0 = 0;  /* 0.9.10.1: frame_q sub-2s episode aggregator (60s summary) */
+        if (n_prime > g_cp.frameq_cap - 8) n_prime = g_cp.frameq_cap - 8;
+        if (n_prime < 0) n_prime = 0;
+        primed = (n_prime == 0);
+        /* v0.9.10 adaptive cushion (master only): two discrete frame_q targets, lazy transitions. */
+        int base_sp   = n_prime > 2 ? n_prime : 4;                    /* safety floor = the resolved preroll */
+        int raised_sp = (v->tick_dur_us > 0) ? (int)(g_cp.cushion_raised_us / v->tick_dur_us) : base_sp;
+        int64_t ep_last_us = 0, ep_prev_us = 0;                       /* starvation-episode wall times (grow gate) */
+        int64_t rr_starve_since = 0, rr_last_rel = 0;                 /* 1.0.1-pre8 (b): ratchet-release detector state */
+        int64_t sh_starve_since = 0, sh_last = 0;                     /* 1.0.1-pre8 (c): self-heal detector state */
+        int64_t cr_starve_since = 0, cr_ok_since = 0, cr_last_rel = 0;/* 1.0.1-pre10 (e): cushion-release detector state */
+        int64_t heal_refire_us = av_rescale(300000000, g_jit_milli, 1000); /* 1.0.1-pre10 (g): jittered SELFHEAL re-fire (4-6min per PID) */
+        if (raised_sp > g_cp.frameq_cap - 8) raised_sp = g_cp.frameq_cap - 8;
+        if (raised_sp < base_sp) raised_sp = base_sp;                 /* explicit deep preroll >= cushion -> adaptive no-op */
+        if (v->is_master) {                                           /* 0.9.18 M3: register the adaptive tier with the
+                                                                       * escalation runtime — cushion_escalate() owns
+                                                                       * cur_sp from here (mutated only by the master's
+                                                                       * own GROW/SHRINK calls, so the unlocked reads
+                                                                       * below are same-thread-ordered) */
+            g_curt.base_sp = base_sp; g_curt.raised_sp = raised_sp;
+            g_curt.cur_sp  = base_sp;
+        }
+        /* 1.0.1-pre9 residual sensor: video-side EMA state (master rung; τ ≈ 30s of ticks) */
+        int64_t rs_mv_ema = 0, rs_mv_div = v->tick_dur_us > 0 ? 30000000 / v->tick_dur_us : 750;
+        int     rs_mv_seed = 0;
+        int     rs_mv_vskip_ep = 0;   /* 1.0.1-pre30: last vskip epoch this EMA re-seeded for */
+        if (rs_mv_div < 8) rs_mv_div = 8;
+        /* v0.9.11 pulldown state: 1-frame lookahead + film-mode detector (see g_pulldown comment) */
+        AVFrame *nextf = NULL;
+        int next_have = 0, film_arm = 0, held_extra = 0;
+        unsigned rff_bits = 0;
+        int64_t cad_ema_us   = v->tick_dur_us;      /* M7: fresh-frame source-spacing EMA (tau ~8f); seeded real-time */
+        int64_t cad_prev_src = AV_NOPTS_VALUE;      /* previous fresh frame's SOURCE pts (held_src_pts domain) */
+        int     cad_dropouts = 0, cad_in_drop = 0;  /* flag-dropout EVENTS ridden this engagement + in-a-dropout flag */
+        int64_t nv_wait0 = av_gettime_relative();   /* 1.0.1-pre23 startup sanity: thread-start wall (time-to-first-frame) */
+        int64_t nv_chk_last = 0;                    /* rate-limits the post-deadline flow check (~1/s) */
+
+    for (;;) {
+        int fresh = 0, cadence_hold = 0;
+        if (v->is_master)
+            PTV_HB_OUT(PTV_HB_OUT_LOOP);   /* 1.0.1-pre21 heartbeat: stats-thread loop top */
+        if (g_pulldown && film_arm && have) {       /* film cadence: pop via content-projected lookahead */
+            if (!next_have) {
+                ret = av_thread_message_queue_recv(v->frame_q, &f, AV_THREAD_MESSAGE_NONBLOCK);
+                if (ret >= 0) { nextf = f; next_have = 1; }
+                else if (ret == AVERROR_EOF) break; /* pending nextf was already promoted (recv only when empty) */
+            }
+            if (next_have) {
+                int64_t nc = content_index(v, nextf->pts);
+                if (nc < 0 || nc <= last_vpts + 1 || held_extra >= 1) {   /* due, unstampable, or residence CAP hit */
+                    av_frame_unref(held); av_frame_move_ref(held, nextf); av_frame_free(&nextf);
+                    next_have = 0; fresh = 1; held_src_pts = held->pts; held_extra = 0;
+                } else
+                    cadence_hold = 1;               /* held frame legitimately occupies this tick (3-field residence) */
+            }
+            /* queue empty + no lookahead: fall through = dup-on-empty exactly as today */
+        } else if (next_have) {
+            /* v0.9.16.2 (defensive): drain a PARKED pulldown lookahead first. If cadence ever
+             * disarms with a frame still in nextf, that frame would sit orphaned until the next
+             * arm promoted it STALE (out-of-order emission + a one-tick house-skew spike the
+             * audio path samples via AVLOCK). In the normal flow disarm lands on promote ticks
+             * (nextf just consumed), so this is a rare-path guard, NOT a lip-sync fix: a 46-flap
+             * flash+beep A/B (synthetic soft-telecine flapping, the AWE profile) measured
+             * byte-identical A/V alignment with and without it — flap transitions are A/V-neutral.
+             * The promoted frame is the NEXT content frame, so no decim check needed (mirrors the
+             * film path's own promotion). */
+            av_frame_unref(held); av_frame_move_ref(held, nextf); av_frame_free(&nextf);
+            next_have = 0; have = 1; fresh = 1; held_src_pts = held->pts; held_extra = 0;
+        } else {
+            /* v0.9.15.2 CADENCE DECIMATION (single-input mirror of the 0.9.13 mosaic multi-pop):
+             * a frame whose content index does NOT advance past the last emitted tick is SURPLUS —
+             * a stream delivering more real frames than its declared rate (NewsNation: ~25.3-25.5
+             * real fps stamped truly, declared 25/1; cadence WANDERS so no fixed house rate fits).
+             * Take the next frame instead and display only the newest due one: the output samples
+             * the source's own timeline at the house rate, so lip-sync stays exact and frame_q
+             * stays level (before: +0.45f/s surplus pinned it at 160 -> bursty drop-oldest +
+             * async churn). Never fires for <=house-rate content (indices always advance) — film
+             * pulldown, exact-rate and slow sources are untouched. Bounded 3 pops/tick (+8%).
+             * PTV_NO_DECIMATE reverts. */
+            int pops = 0, got_eof = 0;
+            for (;;) {
+                ret = av_thread_message_queue_recv(v->frame_q, &f, AV_THREAD_MESSAGE_NONBLOCK);
+                if (ret >= 0) {
+                    av_frame_unref(held); av_frame_move_ref(held, f); av_frame_free(&f);
+                    have = 1; fresh = 1; held_src_pts = held->pts;   /* capture before emit overwrites it */
+                    held_extra = 0;
+                    pops++;
+                    if (g_decimate && pops < 3) {
+                        int64_t hc = content_index(v, held->pts);
+                        /* v0.9.15.3: surplus = maps to already-PLAYED content (last_content_vpts), NOT to the
+                         * dup-advanced output cursor (last_vpts) — post-stall refill frames are new content and
+                         * must play at 1x with the latency retained (the AUTO-BANK posture); only a genuinely
+                         * >house-rate cadence decimates. Catch-up fast-forward is gone by construction. */
+                        if (hc >= 0 && hc <= last_content_vpts) { v->decim++; continue; }   /* surplus: take a fresher one */
+                    }
+                    break;
+                } else if (ret == AVERROR_EOF) {
+                    if (!fresh) got_eof = 1;        /* terminal only if nothing taken this tick */
+                    break;
+                } else
+                    break;                          /* queue empty */
+            }
+            if (got_eof)
+                break;                              /* decode finished, queue drained */
+        }
+        if (!have) {                                /* await first frame (no startup dups) */
+            /* 1.0.1-pre23 STARTUP SANITY (PTV_NOVIDEO_EXIT_S, default 300s; 0 disables): a
+             * video stream that probes OK but never decodes (#60 arm D — SPS/PPS intact,
+             * every slice corrupt) parks this thread HERE forever: zero stats lines (the
+             * stats block is below), demux pumping, process alive — the log-silent wedged
+             * startup shape from the glo-1 incident. If input packets are demonstrably
+             * FLOWING (any input's demux heartbeat fresh — a dead source is rw_timeout /
+             * [PTV-REOPEN]'s job, not ours) and no video frame has arrived in the whole
+             * window since thread start, die loud for a supervised respawn. Master rung
+             * only (one judge); the mv compositor path never parks here. */
+            if (v->is_master && g_novideo_exit_us > 0) {
+                int64_t nvnow = av_gettime_relative();
+                if (nvnow - nv_wait0 > g_novideo_exit_us && nvnow - nv_chk_last > 1000000) {
+                    int sl, flowing = 0;
+                    nv_chk_last = nvnow;
+                    for (sl = 0; sl < PTV_MAX_INPUT; sl++) {
+                        int64_t hb = atomic_load_explicit(&g_hb_demux_wall[sl], memory_order_relaxed);
+                        if (hb && nvnow - hb < 10000000) { flowing = 1; break; }
+                    }
+                    if (flowing) {
+                        av_log(NULL, AV_LOG_FATAL,
+                               "[PTV-NOVIDEO] input packets flowing but no video frame decoded in the "
+                               "%ds since start — undecodable video; exiting for supervised respawn "
+                               "(PTV_NOVIDEO_EXIT_S)\n", (int)(g_novideo_exit_us / 1000000));
+                        fflush(NULL);
+                        /* 1.0.1-pre26: _exit, not exit — same wedge class as the [PTV-MUX]
+                         * fatal path (exit() from a non-main thread runs atexit/cleanup
+                         * handlers while demux/CUDA threads hold locks; live-captured
+                         * futex_do_wait zombie). fflush(NULL) above lands the line. */
+                        _exit(1);
+                    }
+                }
+            }
+            av_usleep(2000); continue;
+        }
+
+        if (fresh && g_pulldown) {                  /* film-mode detector: progressive frames with rff==1 only
+                                                     * (==1 excludes doubling/tripling 2/4 — the bogus pic_struct=7
+                                                     * class; interlaced-flagged rff never arms) */
+            if (cad_prev_src != AV_NOPTS_VALUE && held_src_pts != AV_NOPTS_VALUE) {
+                int64_t dt = av_rescale_q(held_src_pts - cad_prev_src, v->out_tb, AV_TIME_BASE_Q);
+                if (dt > 0 && dt < 200000)          /* skip splices/jumps/wraps; keep the EMA honest */
+                    cad_ema_us += (dt - cad_ema_us) / 8;
+            }
+            cad_prev_src = held_src_pts;
+            rff_bits = (rff_bits << 1) |
+                       (held->repeat_pict == 1 && !(held->flags & AV_FRAME_FLAG_INTERLACED));
+            int rn = av_popcount(rff_bits & 0xffu);
+            if (!film_arm && rn >= 3) {
+                film_arm = 1; cad_dropouts = 0; cad_in_drop = 0;
+                if (v->is_master)
+                    av_log(NULL, AV_LOG_INFO, "[PTV-PULLDOWN] armed (telecine cadence detected: %d/8 rff frames)\n", rn);
+            } else if (film_arm && rn == 0) {
+                /* v0.9.18.1 M7: disarm needs CONTENT-RATE evidence, not just absent flags (see
+                 * g_cad_disarm). Ride flag dropouts while spacing stays film-paced; a real
+                 * film->video transition brings spacing to ~tick within ~10-15 frames (EMA
+                 * tau 8) and disarms then — the few extra pd holds at the boundary are benign. */
+                if (!g_cad_disarm || cad_ema_us <= v->tick_dur_us + v->tick_dur_us / 8) {
+                    film_arm = 0;
+                    if (v->is_master)
+                        av_log(NULL, AV_LOG_INFO, "[PTV-PULLDOWN] disarmed (cadence ended; %"PRId64" holds, %d flag dropouts ridden)\n",
+                               v->pd, cad_dropouts);
+                } else if (!cad_in_drop) {
+                    cad_in_drop = 1;
+                    if (!cad_dropouts++ && v->is_master)
+                        av_log(NULL, AV_LOG_INFO, "[PTV-PULLDOWN] rff flags dropped out at film pacing (%.1fms/frame) — staying armed\n",
+                               cad_ema_us / 1000.0);
+                }
+            } else if (film_arm && rn > 0)
+                cad_in_drop = 0;                    /* flags returned — dropout event closed */
+        }
+
+        if (!primed) {                              /* one-time jitter-buffer pre-roll */
+            int64_t pt0 = av_gettime_relative();
+            while (av_thread_message_queue_nb_elems(v->frame_q) < n_prime &&
+                   av_gettime_relative() - pt0 < (int64_t)preroll_ms * 3000)
+                av_usleep(2000);
+            primed = 1;
+            if (g_diag)
+                av_log(NULL, AV_LOG_INFO,
+                       "[PTV-DIAG] preroll: primed frame_q to %d frames (~%dms target)\n",
+                       av_thread_message_queue_nb_elems(v->frame_q), preroll_ms);
+        }
+
+        if (v->emitted == 0) wall0 = av_gettime_relative();
+        {
+            /* v0.9.0 genlock: pace off a phase accumulator (not tick*tick_dur) so a rate change never
+             * teleports the target. per_tick scales by the recovered source rate (ALL single-input rungs,
+             * once locked); otherwise == tick_dur_us → gl_phase == tick*tick_dur → byte-identical free-run. */
+            if (v->is_master) {  /* DIAG: publish frame_q depth so the demux-thread discontinuity logs can show the drain */
+                int64_t nw = av_gettime_relative();
+                int64_t ep;
+                atomic_store_explicit(&g_frameq_depth, av_thread_message_queue_nb_elems(v->frame_q), memory_order_relaxed);
+                if (g_diag) {   /* video_q/mux_q: log only >=2s episodes — empty is their NORMAL state (consumer
+                                 * drains instantly; sub-2s "refills" are sampling noise — the Cinestar lesson).
+                                 * A >=2s video_q episode = a real input stall, still event-worthy. */
+                    if (v->dbg_video_q) ptv_empty_watch("video_q", av_thread_message_queue_nb_elems(v->dbg_video_q), nw, &eq_vq_s, NULL, 2000000);
+                    if (v->mux_q) ptv_empty_watch("mux_q", av_thread_message_queue_nb_elems(v->mux_q), nw, &eq_mq_s, NULL, 2000000);
+                }
+                /* frame_q starvation watch runs UNGATED — it feeds the adaptive cushion. Per-episode
+                 * lines only >=2s; sub-2s episodes aggregate into one summary line per minute. */
+                ep = ptv_empty_watch("frame_q", av_thread_message_queue_nb_elems(v->frame_q), nw, &eq_fq_s, &eq_fq_h, 2000000);
+                if (ep > 0 && ep < 2000000) {
+                    if (!ep_agg_cnt) { ep_agg_min = ep_agg_max = ep; ep_agg_t0 = ep_agg_t0 ? ep_agg_t0 : nw; }
+                    else { if (ep < ep_agg_min) ep_agg_min = ep; if (ep > ep_agg_max) ep_agg_max = ep; }
+                    ep_agg_cnt++;
+                    if (!ep_agg_t0) ep_agg_t0 = nw;
+                }
+                if (ep_agg_cnt && nw - ep_agg_t0 >= 60LL * 1000000) {
+                    av_log(NULL, AV_LOG_INFO, "[PTV-EMPTY] frame_q: %lld episodes in %llds (%lld-%lldms)\n",
+                           (long long)ep_agg_cnt, (long long)((nw - ep_agg_t0) / 1000000),
+                           (long long)(ep_agg_min / 1000), (long long)(ep_agg_max / 1000));
+                    ep_agg_cnt = 0; ep_agg_t0 = nw;
+                }
+                /* pre14 corrector stale-track watchdog — body shared with the mv compositor
+                 * since 1.0.1-pre17 (rscorr_stale_watchdog, ptvencoder_audio.c): a
+                 * DWELL/ENGAGED track whose audio thread stopped emitting cannot log its
+                 * own disarm; the cadence owner does it. ~1s rate limit here. */
+                if (g_rsync_corr && nw - corr_wd_last >= 1000000) {
+                    corr_wd_last = nw;
+                    rscorr_stale_watchdog(nw);
+                }
+                if (g_adapt_cushion && !v->passthrough) {
+                    /* 0.9.18 M3: trigger conditions stay here; the write bodies (tier store,
+                     * cap delta, maxq, log) moved verbatim to cushion_escalate(). */
+                    if (ep > 0) {                                     /* a >=200ms starvation episode just ended */
+                        ep_prev_us = ep_last_us; ep_last_us = nw;
+                        /* 1.0.1-pre10 (e): 10min GROW suppression after a CUSHION_RELEASE —
+                         * under a persistent decode deficit the very next episode pair would
+                         * re-GROW seconds after the release and the pair would flap once a
+                         * minute; while the contradiction persists the tier belongs at base.
+                         * cr_last_rel stays 0 when PTV_NO_CUSHREL (condition unchanged). */
+                        if (g_curt.cur_sp < raised_sp && ep_prev_us && nw - ep_prev_us < 3600LL * 1000000 &&
+                            (!cr_last_rel || nw - cr_last_rel >= 600LL * 1000000))
+                            cushion_escalate(CUSHION_GROW, nw - ep_prev_us, ep);
+                    } else if (g_curt.cur_sp > base_sp && ep_last_us && nw - ep_last_us > 6LL * 3600 * 1000000) {
+                        cushion_escalate(CUSHION_SHRINK, 0, 0);
+                    }
+                }
+                /* 1.0.1-pre8 (b)+(c) — the #32 wedge starvation-contradiction detectors.
+                 * "Starved while input flows" is the contradiction state: frame_q pinned ≤2
+                 * frames while the demux keeps receiving video (clean wire). Normal deep-bank
+                 * operation never looks like this (a delivery gap means input is NOT flowing;
+                 * a catch-up refill means frame_q is NOT starved), so banks working as
+                 * designed are untouched.
+                 *   (b) ≥5s of it with an ARMED bank → release the ratchet (BANK_RELEASE)
+                 *       instead of the 6h decay; 60s re-fire limit.
+                 *   (c) ≥30s of it regardless of bank → the decode path is wedged on stale/
+                 *       undecodable backlog: request the in-process re-prime (the decode
+                 *       thread flushes video_q + decoder and resumes at the next IDR — what a
+                 *       supervisor restart achieves without the restart); one attempt per 5min. */
+                if ((g_ratchrel || g_selfheal || g_cushrel) && v->live && !v->passthrough) {
+                    int fqd = av_thread_message_queue_nb_elems(v->frame_q);
+                    int64_t arr = atomic_load_explicit(&g_v_arrive_wc, memory_order_relaxed);
+                    int flowing = arr && (nw - arr) < 2000000;
+                    /* 1.0.1-pre10 (e) CUSHION RELEASE — the (b)/(c) contradiction applied to the
+                     * adaptive TIER: it armed at birth (2 episodes/60min — birth under contention
+                     * trips it in ~6s) and its only release is 6h of ZERO starvation episodes,
+                     * which the churn itself makes unreachable (Phase A: cushion=2535ms + fqhw=160
+                     * + grown caps still held 12min post-recovery; in production that pins the
+                     * frame pool + NVENC registration set at maximum forever). >=60s of the
+                     * contradiction with the tier raised -> step it back to base (CUSHION_RELEASE,
+                     * same stores as SHRINK). Unlike (b)/(c) this timer FORGIVES <=5s refill
+                     * blips: the ~6s shed cycle refills frame_q for ~1-2s every cycle (starved
+                     * fraction 0.88-0.97 measured), so a hard reset would make 60s continuous
+                     * unreachable under exactly the symptom this targets. A genuine outage
+                     * (input NOT flowing) hard-resets — a real stall keeps its cushion. */
+                    if (g_cushrel) {
+                        if (fqd <= 2 && flowing) {
+                            if (!cr_starve_since) cr_starve_since = nw;
+                            cr_ok_since = 0;
+                            if (nw - cr_starve_since >= 60LL * 1000000 &&
+                                g_curt.cur_sp > base_sp &&
+                                (!cr_last_rel || nw - cr_last_rel >= 60LL * 1000000)) {
+                                cr_last_rel = nw;
+                                cushion_escalate(CUSHION_RELEASE, nw - cr_starve_since, 0);
+                                cr_starve_since = 0;        /* a further step needs a fresh 60s */
+                            }
+                        } else if (!flowing) {
+                            cr_starve_since = 0; cr_ok_since = 0;   /* outage: keep the cushion */
+                        } else if (cr_starve_since) {       /* flowing + refilled: 5s blip forgiveness */
+                            if (!cr_ok_since) cr_ok_since = nw;
+                            else if (nw - cr_ok_since > 5000000) { cr_starve_since = 0; cr_ok_since = 0; }
+                        }
+                    }
+                    if (fqd <= 2 && flowing) {
+                        if (g_ratchrel) {
+                            if (!rr_starve_since) rr_starve_since = nw;
+                            else if (nw - rr_starve_since >= 5000000 &&
+                                     (rr_last_rel == 0 || nw - rr_last_rel >= 60000000) &&
+                                     atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0) {
+                                rr_last_rel = nw;
+                                cushion_escalate(BANK_RELEASE, nw - rr_starve_since, 0);
+                            }
+                        }
+                        if (g_selfheal) {
+                            if (!sh_starve_since) sh_starve_since = nw;
+                            else if (nw - sh_starve_since >= 30000000 &&
+                                     (sh_last == 0 || nw - sh_last >= heal_refire_us)) {   /* 1.0.1-pre10 (g): per-PID
+                                                                                            * jittered 5min re-fire —
+                                                                                            * co-located heal/refill
+                                                                                            * bursts de-phase */
+                                int64_t starved_s = (nw - sh_starve_since) / 1000000;
+                                sh_last = nw;
+                                sh_starve_since = nw;   /* a re-fire needs a fresh 30s of starvation */
+                                av_log(NULL, AV_LOG_WARNING,
+                                       "[PTV-SELFHEAL] frame_q starved %llds with input flowing — requesting "
+                                       "internal re-prime (flush video_q + decoder, resume at next IDR; "
+                                       "PTV_NO_SELFHEAL disables)\n", (long long)starved_s);
+                                atomic_store_explicit(&g_selfheal_req, 1, memory_order_relaxed);
+                            }
+                        }
+                    } else {
+                        rr_starve_since = 0;
+                        sh_starve_since = 0;
+                    }
+                }
+            }
+            int64_t per_tick = v->tick_dur_us;
+            if (g_wucr) {
+                /* WUCR ρ (W0): PROPORTIONAL occupancy controller. corr = Kp·(setpoint − occ_ema).
+                 * occ above setpoint = buffer filling = source faster than house consumes → corr<0 →
+                 * house faster (rate-match). NO integrator → no windup, no pegging: ρ self-settles at the
+                 * source rate with the buffer floating a frame or two off setpoint (steady-state offset =
+                 * rate/Kp, e.g. +15ppm → ~+1.9 frames). A slow EMA smooths jitter AND delivery bursts (a
+                 * burst moves occ_ema gradually, never spikes ρ). ±150ppm hard clamp = physical crystal
+                 * bound → runaway impossible. Zero-steady-offset (PI + anti-windup) is the W1 refinement.
+                 * Master computes; all rungs apply hr->rho_corr_ppm identically. */
+                if (v->is_master) {
+                    /* 0.9.18 R2: the ladder body moved verbatim to house_rate_corr_ppm() above;
+                     * g_curt.cur_sp = adaptive tier target (base preroll unless grown; M3 moved it
+                     * into the escalation runtime). Master computes; all rungs apply the published
+                     * hr->rho_corr_ppm identically. */
+                    int occ = av_thread_message_queue_nb_elems(v->frame_q);
+                    atomic_store_explicit(&v->hr->rho_corr_ppm,
+                        house_rate_corr_ppm(v->hr, v->est, occ, g_curt.cur_sp, base_sp, v->tick_dur_us),
+                        memory_order_relaxed);
+                }
+                int64_t corr = atomic_load_explicit(&v->hr->rho_corr_ppm, memory_order_relaxed);
+                per_tick = av_rescale(per_tick, 1000000, 1000000 - corr);
+            } else if (g_genlock &&
+                atomic_load_explicit(&v->est->src_rate_locked, memory_order_relaxed)) {
+                int64_t rate = atomic_load_explicit(&v->est->src_rate_q20, memory_order_relaxed);
+                if (rate > 0) per_tick = av_rescale(v->tick_dur_us, 1 << 20, rate);  /* source faster (rate>nominal) → shorter span → consume faster */
+            }
+            int64_t target = wall0 + gl_phase;
+            int64_t now = av_gettime_relative();
+            if (now < target) av_usleep((unsigned)(target - now));
+            gl_phase += per_tick;
+        }
+        /* Stamp output PTS from the frame's SOURCE time on the shared house
+         * anchor (h0) — the SAME mapping audio uses — so dropped/duped frames
+         * never skew the timeline and A/V stays locked. (A pure tick counter
+         * drifts by the number of startup/stall-dropped frames -> A/V skew.)
+         * Pacing still rides the wall clock via `tick`; PTS rides content. */
+        {
+            int64_t vpts;
+            int64_t src_ts = held_src_pts;   /* ORIGINAL source pts (out_tb); survives dups */
+            /* EXACTTICK (v0.9.9) content index, via the shared helper (v0.9.11): exact-rational
+             * round-nearest — the integer-us divisor (33367 vs 33366.667 at 30000/1001) compressed
+             * the mapping ~10ppm -> the chronic audio-behind drift. */
+            int64_t content_vpts = content_index(v, src_ts);
+            vpts = (content_vpts >= 0) ? content_vpts : last_vpts + 1;
+            if (vpts <= last_vpts) vpts = last_vpts + 1;   /* monotonic CFR; dup/hold -> next slot */
+            held->pts = vpts; held->pkt_dts = AV_NOPTS_VALUE; held->duration = 0;
+            last_vpts = vpts;
+            if (content_vpts >= 0)
+                last_content_vpts = content_vpts;   /* v0.9.15.3 decimation cursor: real content played
+                                                     * (held_src_pts survives dups -> idempotent on dup/hold) */
+            /* Publish how far the house clock now runs AHEAD of source content
+             * (vpts - content_vpts, in ticks). Each dup bumps vpts past content via
+             * the monotonic guard, so this grows by one tick per dup and persists.
+             * The audio path adds it so audio rides the same house clock instead of
+             * staying source-locked (which is what drifts ~40ms per dup).
+             * v0.9.11: a cadence HOLD is content-legitimate residence, NOT skew — subtract
+             * held_extra so hs stays 0 through film (the 0<->33ms sawtooth that caused
+             * aresample hard-comps = the audible clicks is gone at the SENSOR, not masked).
+             * A genuine starvation dup after a hold still measures +1 tick. */
+            if (cadence_hold) held_extra++;
+            if (v->is_master && v->house_skew && content_vpts >= 0)
+                *v->house_skew = (vpts - content_vpts - held_extra) * v->tick_dur_us;
+            if (src_ts != AV_NOPTS_VALUE)   /* [PTV-CHAIN] video source-content being emitted (us); any rung (same content) */
+                atomic_store_explicit(&g_ch_vout_src, av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q), memory_order_relaxed);
+            /* A/V probe (read-only): record this distinct content's first-display output time so the
+             * audio drain can pair against it (single-input master rung only; multiview → compositor). */
+            if (v->vring && fresh && content_vpts >= 0)
+                vring_put(v->vring, av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q), vpts * v->tick_dur_us);
+            /* 1.0.1-pre9 residual sensor (PASSIVE), video side: m_v = out − src per EMITTED
+             * frame — dups included (a dup presents old content later: that lateness is REAL
+             * and must be measured, not read back from house_skew, a control variable). out on
+             * the exact-rational axis (the mux pts axis; the integer tick would re-import the
+             * ~10ppm EXACTTICK drift into the sensor). EMA ≈ 30s of ticks. Single-input master
+             * rung only; multiview (passthrough) never reaches this block. */
+            if (g_rsync_sense && v->is_master && src_ts != AV_NOPTS_VALUE) {
+                int64_t out_us = v->out_fps.num > 0
+                    ? av_rescale(vpts, 1000000LL * v->out_fps.den, v->out_fps.num)
+                    : vpts * v->tick_dur_us;
+                int64_t m = out_us - av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q);
+                /* 1.0.1-pre30 #69 (item B): a vskip seam redefines the video content↔label
+                 * mapping (m steps by −achieved at the first post-boundary frame) — re-seed
+                 * the EMA there, the exact video mirror of the audio seam's rs_ma_seed=0,
+                 * so the walk's post-hold reading converges instead of slewing 30s. */
+                {
+                    int ep = atomic_load_explicit(&g_vskip_epoch, memory_order_relaxed);
+                    if (ep != rs_mv_vskip_ep &&
+                        av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q) >=
+                            atomic_load_explicit(&g_vskip_from_us, memory_order_relaxed)) {
+                        rs_mv_seed     = 0;
+                        rs_mv_vskip_ep = ep;
+                    }
+                }
+                if (!rs_mv_seed) { rs_mv_ema = m; rs_mv_seed = 1; }
+                else rs_mv_ema += (m - rs_mv_ema) / rs_mv_div;
+                /* pre16: slot 0 of the per-slot arrays — single input IS slot 0 (multiview
+                 * never reaches this block: passthrough rungs return above; the compositor
+                 * owns per-slot publication there). */
+                atomic_store_explicit(&g_rsx.mv_ema[0], rs_mv_ema, memory_order_relaxed);
+                atomic_store_explicit(&g_rsx.mv_wall[0], av_gettime_relative(), memory_order_relaxed);
+            }
+        }
+        if (v->is_master)
+            PTV_HB_OUT(PTV_HB_OUT_ENC);    /* pre21 heartbeat: entering encoder+gate (the NVENC-block position) */
+        ret = encode_push(v->mux_q, v->venc, v->ost, held, v->gate);   /* §7.5a: publish video front + release caught-up audio/copy */
+        v->last_emit_us = av_gettime_relative();
+        tick++; v->emitted++;
+        if (g_t_us > 0 && v->is_master && v->emitted * v->tick_dur_us >= g_t_us &&
+            !atomic_load_explicit(&g_t_stop, memory_order_relaxed))
+            atomic_store_explicit(&g_t_stop, 1, memory_order_relaxed);   /* rider (b): -t of output
+                                                                          * media time reached — every
+                                                                          * demux stops pulling */
+        if (!fresh) { if (cadence_hold) v->pd++; else v->dup++; }   /* pd = intentional cadence residence; dup stays the health alarm */
+        if (g_slow) av_usleep(g_slow);
+        if (ret < 0) break;
+
+        if (g_diag && v->is_master) {
+            int64_t nowd = av_gettime_relative();
+            if (nowd - diag_last >= 1000000) {
+                /* 1.0.1-pre13: gpps=measured/declared + gov= engagement on the headline DIAG —
+                 * the Newsmax2 wedge (dec ≪ fps with vq pinned) was blind without them; a
+                 * `gov=1` with dec far below gpps*1.25 is the governor-misbehaving signature.
+                 * govslip= (printed when >0) counts oversleep strikes (actuator overshoot). */
+                int64_t gslip = atomic_load_explicit(&g_gov_slip, memory_order_relaxed);
+                char gv[40] = "";
+                if (gslip > 0)
+                    snprintf(gv, sizeof gv, " govslip=%"PRId64, gslip);
+                av_log(NULL, AV_LOG_INFO,
+                    "[PTV-DIAG] t=%.1fs dec=%"PRId64" vcorrupt=%"PRId64" emitted=%"PRId64
+                    " muxed=%"PRId64" dup=%"PRId64" pd=%"PRId64" framedrop=%"PRId64" vq=%d frameq=%d muxq=%d gpps=%d/%d gov=%d%s genlock=%d rate=%+.0fppm wucr_rho=%+.0fppm cf=%+.0fppm/%d\n",
+                    (nowd - diag_t0) / 1000000.0, *v->dbg_dec_frames, *v->dbg_vcorrupt, v->emitted,
+                    g_muxed, v->dup, v->pd, v->framedrop,
+                    av_thread_message_queue_nb_elems(v->dbg_video_q),
+                    av_thread_message_queue_nb_elems(v->frame_q),
+                    av_thread_message_queue_nb_elems(v->mux_q),
+                    atomic_load_explicit(&g_gov_gpps, memory_order_relaxed),
+                    atomic_load_explicit(&g_gov_decl, memory_order_relaxed),
+                    atomic_load_explicit(&g_gov_on, memory_order_relaxed), gv,
+                    atomic_load_explicit(&v->est->src_rate_locked, memory_order_relaxed),
+                    (atomic_load_explicit(&v->est->src_rate_q20, memory_order_relaxed) - (1 << 20)) * 1e6 / (1 << 20),
+                    (double)(-atomic_load_explicit(&v->hr->rho_corr_ppm, memory_order_relaxed)),
+                    (atomic_load_explicit(&v->est->cf_rate_q20, memory_order_relaxed) - (1 << 20)) * 1e6 / (1 << 20),
+                    atomic_load_explicit(&v->est->cf_locked, memory_order_relaxed));
+                diag_last = nowd;
+            }
+        }
+
+        if (g_stats && v->is_master) {          /* ffmpeg-style progress line */
+            int64_t nows = av_gettime_relative();
+            PTV_HB_OUT(PTV_HB_OUT_STATS);       /* pre21 heartbeat: stats print section */
+            if (nows - stat_last >= g_stats_period_us) {
+                double dt    = (nows - stat_last) / 1000000.0;
+                double fps   = (v->emitted - stat_prev) / (dt > 0 ? dt : 1);   /* INSTANTANEOUS emit rate — the
+                                                                                * "alive right now" signal (cumulative
+                                                                                * speed= froze at 1.00x after hours and
+                                                                                * hid current wedges; removed v0.9.10) */
+                double secs  = v->emitted * v->tick_dur_us / 1000000.0;   /* CFR output time */
+                int hh = (int)(secs / 3600), mm = ((int)secs % 3600) / 60;
+                double ss = secs - hh * 3600 - mm * 60;
+                int64_t cr = (v->dbg_pcorrupt ? *v->dbg_pcorrupt : 0) + (v->dbg_vcorrupt ? *v->dbg_vcorrupt : 0);  /* corrupt: demux + decode */
+                char dlv[112] = "";                                  /* §7.5a delivery gate: max hold + cap-forced releases */
+                if (v->gate) {
+                    int dn = snprintf(dlv, sizeof dlv, " dlvhold=%"PRId64"ms dlvforced=%"PRId64,
+                             atomic_load_explicit(&v->gate->st_hold_us, memory_order_relaxed) / 1000,
+                             atomic_load_explicit(&v->gate->st_forced, memory_order_relaxed));
+                    if (v->gate->v_on && dn > 0 && dn < (int)sizeof dlv) {
+                        /* §7.5b symmetric gate: EARLY-VIDEO hold (≈ the audio path's wall
+                         * latency, e.g. loudnorm ~3s fill); vdlvforced only when the backstop
+                         * released (audio flowing but behind, or FIFO overflow) */
+                        int64_t vf = atomic_load_explicit(&v->gate->st_vforced, memory_order_relaxed);
+                        dn += snprintf(dlv + dn, sizeof dlv - dn, " vdlvhold=%"PRId64"ms",
+                                 atomic_load_explicit(&v->gate->st_vhold_us, memory_order_relaxed) / 1000);
+                        if (vf > 0 && dn > 0 && dn < (int)sizeof dlv)
+                            snprintf(dlv + dn, sizeof dlv - dn, " vdlvforced=%"PRId64, vf);
+                    }
+                }
+                int64_t aw = atomic_load_explicit(&g_async_ppm, memory_order_relaxed);  /* aresample work (ppm) */
+                /* v0.9.10 cleanup: genlock=/srcppm= dropped — WUCR (default) never paces via the FLL and
+                 * wucr_rho IS the source-ppm readout. size=/bitrate= dropped (CBR is configured; cumulative
+                 * averages carry no signal). speed= (cumulative) replaced by instantaneous fps=. qdrop=
+                 * dropped (PTV_DIAG demux line still carries it). */
+                char wu[144] = "";                                   /* WUCR readout: buffer depth + recovered ρ (go/no-go vs srcppm) */
+                if (g_wucr) {
+                    int occ = av_thread_message_queue_nb_elems(v->frame_q);
+                    int64_t corr = atomic_load_explicit(&v->hr->rho_corr_ppm, memory_order_relaxed);
+                    int64_t hs   = v->house_skew ? *v->house_skew : 0;   /* W1 check: must stay ≈0 (ρ genlock → dups→0 → AVLOCK has nothing to inject) */
+                    int64_t hsr  = v->dbg_disc_resid ? *v->dbg_disc_resid : 0;   /* 0.9.18.7: LAYERA erase-residue ledger (reporting only) */
+                    snprintf(wu, sizeof wu, " wucr_buf=%df/%lldms wucr_rho=%+lldppm hs=%+lldms hsres=%+lldms cushion=%dms fqhw=%d",
+                             occ, (long long)(occ * v->tick_dur_us / 1000), (long long)(-corr), (long long)(hs / 1000),
+                             (long long)(hsr / 1000),
+                             (int)((int64_t)g_curt.cur_sp * v->tick_dur_us / 1000),  /* -corr = recovered source dev (+=faster); cushion = adaptive tier target */
+                             atomic_load_explicit(&g_fq_hw, memory_order_relaxed));
+                }
+                char bk[48] = "";                                    /* v0.9.14 AUTO-BANK: actual/target — actual = TOTAL
+                                                                      * buffered margin (compressed video_q + decoded frame_q) */
+                {
+                    int64_t bt = atomic_load_explicit(&g_bank_us, memory_order_relaxed);
+                    if (bt > 0)
+                        snprintf(bk, sizeof bk, " bank=%lld/%lldms",
+                                 (long long)(((int64_t)atomic_load_explicit(&g_vq_elems, memory_order_relaxed)
+                                              + av_thread_message_queue_nb_elems(v->frame_q)) * v->tick_dur_us / 1000),
+                                 (long long)(bt / 1000));
+                }
+                char cfs[56] = "";                                   /* v0.9.15.1 CLOCK-FOLLOW readout (shown when notable) */
+                {
+                    int64_t cq = atomic_load_explicit(&v->est->cf_rate_q20, memory_order_relaxed);
+                    int64_t cp = ((cq - (1 << 20)) * 1000000) >> 20;
+                    int     lk = atomic_load_explicit(&v->est->cf_locked, memory_order_relaxed);
+                    int     n = 0;
+                    if (lk || llabs(cp) > 500)
+                        n = snprintf(cfs, sizeof cfs, " cf=%+lldppm%s", (long long)cp, lk ? "" : "?");
+                    if (v->decim > 0)                                /* v0.9.15.2: surplus-cadence decimation count */
+                        snprintf(cfs + n, sizeof cfs - n, " decim=%"PRId64, v->decim);
+                }
+                char rsl[24 + PTV_MAX_AUDIO * 16];                   /* pre9 residual sensor: lipsync= (+ = audio early);
+                                                                      * pre16: shared per-slot builder (ptvencoder_legend.c) */
+                ptv_stats_lipsync(rsl, sizeof rsl, nows, 0);
+                char aco[24] = "";                                   /* pre15 #33: corrupt-discarded AUDIO pkts (NBS phase
+                                                                      * visibility; absent while zero — clean line unchanged) */
+                {
+                    int64_t ac = atomic_load_explicit(&g_acorrupt, memory_order_relaxed);
+                    if (ac > 0)
+                        snprintf(aco, sizeof aco, " acor=%lld", (long long)ac);
+                }
+                char crs[10 + PTV_MAX_AUDIO * 20];                   /* pre14 corrector: corr= (cumulative trim; * = integrating);
+                                                                      * shared builder (pre16) — the mv printer calls it too
+                                                                      * since pre17 (mv corrector armed; force_idx there) */
+                ptv_stats_corr(crs, sizeof crs, 0);
+                char cvs[10 + PTV_MAX_AUDIO * 16];                   /* pre23 rr23: conv= (net folded label
+                                                                      * motion; P = seam-parked); absent
+                                                                      * while zero — clean line unchanged */
+                ptv_stats_conv(cvs, sizeof cvs, nows, 0);
+                char rsn[10 + PTV_MAX_AUDIO * 16];                   /* pre29 #69: rsn= (resync fires); absent
+                                                                      * while zero — clean line unchanged */
+                ptv_stats_rsn(rsn, sizeof rsn, 0);
+                char ccs[128] = "";                                  /* -cc_extract: caps/erase/keep/a53 —
+                                                                      * printed WHENEVER the feature is on
+                                                                      * (SUBTITLE streams are exempt from the
+                                                                      * MUXGUARD fatal escalation, so a dead
+                                                                      * CC path would otherwise be silent);
+                                                                      * absent when off — line unchanged.
+                                                                      * ccerr/ccdrop appear only when nonzero. */
+                if (g_cc_on) {
+                    int64_t ce = atomic_load_explicit(&g_cc_err,     memory_order_relaxed);
+                    int64_t cd = atomic_load_explicit(&g_cc_dropped, memory_order_relaxed);
+                    int cn = snprintf(ccs, sizeof ccs, " cc=%lld/%lld/%lld/%lld",
+                             (long long)atomic_load_explicit(&g_cc_caps,  memory_order_relaxed),
+                             (long long)atomic_load_explicit(&g_cc_erase, memory_order_relaxed),
+                             (long long)atomic_load_explicit(&g_cc_keep,  memory_order_relaxed),
+                             (long long)atomic_load_explicit(&g_cc_a53,  memory_order_relaxed));
+                    if (ce > 0 && cn > 0 && cn < (int)sizeof ccs)
+                        cn += snprintf(ccs + cn, sizeof ccs - cn, " ccerr=%lld", (long long)ce);
+                    if (cd > 0 && cn > 0 && cn < (int)sizeof ccs)
+                        cn += snprintf(ccs + cn, sizeof ccs - cn, " ccdrop=%lld", (long long)cd);
+                    {   /* erases deferred by the minimum-display rule, and how many of them
+                         * then went out — holding a caption LONGER than the source asked is a
+                         * deliberate choice, so it must be visible rather than silent, and
+                         * ccheld climbing while cclate stays flat means clears are being lost
+                         * rather than delayed */
+                        int64_t ck = atomic_load_explicit(&g_cc_eskip, memory_order_relaxed);
+                        int64_t cl = atomic_load_explicit(&g_cc_elate, memory_order_relaxed);
+                        if (ck > 0 && cn > 0 && cn < (int)sizeof ccs)
+                            cn += snprintf(ccs + cn, sizeof ccs - cn, " ccheld=%lld",
+                                           (long long)ck);
+                        if (cl > 0 && cn > 0 && cn < (int)sizeof ccs)
+                            cn += snprintf(ccs + cn, sizeof ccs - cn, " cclate=%lld",
+                                           (long long)cl);
+                    }
+                    {   /* WIRE TRUTH PAST THE ENCODER: teletext packets the muxer's
+                         * backward-dts guard refused. Everything else here is counted where
+                         * the page was produced, so a nonzero ccmux= is the only signal that
+                         * captions counted as delivered never reached the wire. */
+                        int64_t cx = atomic_load_explicit(&g_cc_mux, memory_order_relaxed);
+                        if (cx > 0 && cn > 0 && cn < (int)sizeof ccs)
+                            snprintf(ccs + cn, sizeof ccs - cn, " ccmux=%lld", (long long)cx);
+                    }
+                }
+                av_log(NULL, AV_LOG_INFO,
+                    "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f "
+                    "dup=%"PRId64" pd=%"PRId64" drop=%"PRId64" corrupt=%"PRId64" "
+                    "async=%+"PRId64"ppm%s%s%s%s%s%s%s%s%s%s\n",
+                    v->emitted, fps, hh, mm, ss,
+                    v->dup, v->pd, v->framedrop, cr, aw, dlv, wu, bk, cfs, aco, rsl, crs, cvs, rsn, ccs);
+                stat_last = nows; stat_prev = v->emitted;
+            }
+        }
+    }
+    encode_push(v->mux_q, v->venc, v->ost, NULL, v->gate);
+    av_frame_free(&nextf);   /* v0.9.11: pending pulldown lookahead (normally promoted before EOF) */
+    }
+done:
+    av_frame_free(&held);
+    /* release everything still held + close the gate (no held audio/copy lost at shutdown, and
+     * any blocked enqueuer wakes to send direct) — BEFORE the video EOF marker so the muxer sees
+     * the tail audio/copy first. No-op when there is no gate (offline). */
+    if (v->gate) dlv_flush_all(v->gate);
+    v->output_done = 1;
+    { AVPacket *eof = NULL; av_thread_message_queue_send(v->mux_q, &eof, 0); }
+    return NULL;
+}
+
