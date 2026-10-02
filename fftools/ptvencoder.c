@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.2.2-pre1"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.0-pre1"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -3752,7 +3752,9 @@ static int is_net_url(const char *u)
  *   1000..1999   audio, <= 2 channels (the transcoded track, or a copied stereo/mono track)
  *   2000..2999   audio, > 2 channels (multichannel passthrough, e.g. AC-3 5.1)
  *   3000..3999   DVB subtitle, plain
- *   5000..5999   DVB subtitle, hearing-impaired      (the 4000s are skipped: PMT = 4096)
+ *   4000..4999   audio description (source disposition visual_impaired or descriptions;
+ *                single input only — a mosaic slot is keyed by slot)   [2.0.0]
+ *   5000..5999   DVB subtitle, hearing-impaired
  *   6000..6999   teletext copied from the source
  *   7000..7999   teletext synthesised from CC (-cc_extract), keyed on the resolved -cc_lang
  *
@@ -3803,7 +3805,9 @@ static int is_net_url(const char *u)
  *
  * Both versions REORDER the muxer's stream array into PID order before avformat_write_header,
  * so the PMT ES loop reads in PID order. PCR needs no configuration: mpegtsenc picks the first
- * video stream (select_pcr_streams) = PID 200. The PMT stays on the muxer default (4096).
+ * video stream (select_pcr_streams) = PID 200. v2 moves the PMT to PID 100 (2.0.0; the muxer
+ * default 4096 sat in the middle of the 4000 block); v1 and off keep 4096. An explicit
+ * -mpegts_pmt_start_pid on the output wins.
  *
  * WHAT DOES *NOT* CHANGE: the per-type option indices. -metadata:s:s:N / -disposition:a:N /
  * -c:a:N still count in RESOLVE order (CC tracks s:0..s:(n_cc-1), then copied subs), because
@@ -3820,7 +3824,9 @@ static int is_net_url(const char *u)
 #define PTV_V2_AUDIO     1000         /* <= 2 channels */
 #define PTV_V2_AUDIO_MC  2000         /* >  2 channels */
 #define PTV_V2_SUB       3000         /* DVB subtitle, plain */
+#define PTV_V2_AUDIO_AD  4000         /* audio description (single input) */
 #define PTV_V2_SUB_HI    5000         /* DVB subtitle, hearing-impaired */
+#define PTV_V2_PMT       "100"        /* PMT PID under v2 (mpegts_pmt_start_pid) */
 #define PTV_V2_TTX       6000         /* teletext copied from the source */
 #define PTV_V2_CCTTX     7000         /* teletext synthesised from CC */
 #define PTV_V2_PRIV      500          /* offset of the private-use codes qaa..qpz (416) */
@@ -3849,6 +3855,7 @@ typedef struct PidEnt {
      * the hearing-impaired flag (plain first); audio = -nb_channels (5.1 before stereo);
      * 0 for every other class. Keeps the comparator one line and the direction in one place. */
     int         ckey;
+    int         ad;                   /* audio: audio description (SOURCE disposition) */
     const char *codec;
     enum AVCodecID cid;
     int         src_pid, in_idx, src_idx;
@@ -4133,7 +4140,8 @@ static int pid_plan_apply_v2(const PidPlan *p, PidEnt *ent, int n, Rung *rung, i
             }
             break;
         case 1:
-            block = e->ch > 2 ? PTV_V2_AUDIO_MC : PTV_V2_AUDIO;
+            block = e->ad && !multiview ? PTV_V2_AUDIO_AD :
+                    e->ch > 2           ? PTV_V2_AUDIO_MC : PTV_V2_AUDIO;
             break;
         default:
             block = e->mapped                        ? PTV_V2_CCTTX :
@@ -4147,7 +4155,8 @@ static int pid_plan_apply_v2(const PidPlan *p, PidEnt *ent, int n, Rung *rung, i
             } else if (e->rank >= 0) {
                 off = e->rank;
                 snprintf(e->why, sizeof e->why, "rank %d (%s)%s", off, e->norm,
-                         e->cls == 1 ? (e->ch > 2 ? ", multichannel" : "") : "");
+                         e->cls != 1 ? "" : e->ad && !multiview ? ", audio description" :
+                         e->ch > 2 ? ", multichannel" : "");
             } else
                 snprintf(e->why, sizeof e->why, "OVERFLOW: language \"%s\" is not ISO 639-2",
                          e->lang ? e->lang : "");
@@ -4174,10 +4183,11 @@ static int pid_plan_apply_v2(const PidPlan *p, PidEnt *ent, int n, Rung *rung, i
     qsort(ent, n, sizeof *ent, pid_ent_cmp_pid);      /* PMT ES loop in ascending PID order */
     if ((ret = pid_plan_commit(ent, n, rung, n_rung)) < 0) return ret;
     av_log(NULL, AV_LOG_INFO,
-           "[PTV-PID] deterministic PID plan v2 (%s, content-keyed): video %d, data %d+, audio "
-           "%d+ (>2ch %d+), subtitle DVB %d+ / HI %d+ / teletext %d+ / CC %d+ — PID = block + "
+           "[PTV-PID] deterministic PID plan v2 (%s, content-keyed): PMT %s, video %d, data %d+, "
+           "audio %d+ (>2ch %d+, AD %d+), subtitle DVB %d+ / HI %d+ / teletext %d+ / CC %d+ — PID = block + "
            "%s; identical on all %d output(s), PMT ES loop in PID order, PCR on the video PID\n",
-           p->src, PTV_V2_VIDEO, PTV_V2_DATA, PTV_V2_AUDIO, PTV_V2_AUDIO_MC, PTV_V2_SUB,
+           p->src, PTV_V2_PMT, PTV_V2_VIDEO, PTV_V2_DATA, PTV_V2_AUDIO, PTV_V2_AUDIO_MC,
+           PTV_V2_AUDIO_AD, PTV_V2_SUB,
            PTV_V2_SUB_HI, PTV_V2_TTX, PTV_V2_CCTTX,
            multiview ? "slot (mosaic)" : "ISO 639-2 rank", n_rung);
     for (i = 0; i < n; i++) {
@@ -4909,6 +4919,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                 e->lang    = lg ? lg->value : NULL;
                 e->ch      = as[k].ost[0]->codecpar->ch_layout.nb_channels;   /* OUTPUT layout */
                 e->rank    = pid_lang_rank(e->lang, e->norm);
+                e->ad      = !!(ist->disposition & (AV_DISPOSITION_VISUAL_IMPAIRED |
+                                                    AV_DISPOSITION_DESCRIPTIONS));
                 e->src_pid = ist->id; e->in_idx = asrc_in[k]; e->src_idx = asrc[k];
                 snprintf(e->srcs, sizeof e->srcs, "in#%d:%d", asrc_in[k], asrc[k]);
             }
@@ -4942,8 +4954,11 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                  * renumber that would otherwise flip the pair. */
                 if (e->cls == 2)
                     e->ckey = !!(ist->disposition & AV_DISPOSITION_HEARING_IMPAIRED);
-                else if (e->cls == 1)
+                else if (e->cls == 1) {
                     e->ckey = -ist->codecpar->ch_layout.nb_channels;
+                    e->ad   = !!(ist->disposition & (AV_DISPOSITION_VISUAL_IMPAIRED |
+                                                     AV_DISPOSITION_DESCRIPTIONS));
+                }
                 e->src_pid = ist->id; e->in_idx = pass[k].input; e->src_idx = pass[k].in_index;
                 snprintf(e->srcs, sizeof e->srcs, "in#%d:%d", pass[k].input, pass[k].in_index);
             }
@@ -4964,6 +4979,13 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         {   /* forwarded muxer opts (-mpegts_flags/-pat_period/-pcr_period/...) + file -metadata */
             AVDictionary *mopts = NULL; int mi;
             av_dict_copy(&mopts, g->format_opts, 0);
+            if (pidp.ver == 2 && !strcmp(rung[r].ofmt->oformat->name, "mpegts")) {   /* 2.0.0 T-068 */
+                AVDictionaryEntry *pe = av_dict_get(mopts, "mpegts_pmt_start_pid", NULL, 0);
+                if (pe && !r)
+                    av_log(NULL, AV_LOG_INFO, "[PTV-PID] PMT on pid %s (-mpegts_pmt_start_pid "
+                           "overrides the v2 default %s)\n", pe->value, PTV_V2_PMT);
+                av_dict_set(&mopts, "mpegts_pmt_start_pid", PTV_V2_PMT, AV_DICT_DONT_OVERWRITE);
+            }
             for (mi = 0; mi < g->nb_opts; mi++) {
                 char kv[256], *eq;            /* -metadata service_name=CineStar (file-level) */
                 if (strcmp(g->opts[mi].key, "metadata")) continue;

@@ -5,6 +5,24 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre1 (2026-10-02) — static map 2.0: PMT on PID 100, audio-description block 4000+rank (T-068, T-056 D14/D21)
+
+First pre of 2.0.0 (T-056 adaptive source; spec `analysis/ptvencoder-spec-adaptive-source.md`). Static-map
+change only; nothing about input handling changes yet.
+
+- **PMT PID 4096 → 100** under `-pid_plan v2` (mpegts outputs): the muxer default sat in the middle of the 4000
+  block. Receivers find the PMT through the PAT. `-pid_plan v1` / `off` keep 4096; an explicit
+  `-mpegts_pmt_start_pid` on the output wins and is logged.
+- **Audio description → 4000 + language rank** (single input): an audio track whose SOURCE disposition is
+  `visual_impaired` or `descriptions` (an AC-3/E-AC-3 VI service sets only `descriptions`) no longer shares the
+  main audio identity (where it went to overflow 1916+); eng AD = 4122, spa AD = 4399. Copies keep their source
+  disposition, so a copied AD stays flagged; carrying the flag onto a TRANSCODED AD track is 2.1 binder work.
+  Mosaics are unchanged (slot-keyed; the wrapper never emits AD there).
+- Every other PID is unchanged (Cinestar + AD fixture: identical to 1.2.2-pre1 apart from the PMT and the AD row).
+- Test scripts `test-scripts/repro/cc-test*.sh` read tables on PID 100 and 4096.
+
+**Rollback:** `-pid_plan v1` (1.2.0 layout), or `-mpegts_pmt_start_pid 4096` to keep only the old PMT PID.
+
 ## 1.2.2-pre1 (2026-10-02) — hotfix: heap overflow when a stream appears mid-run (T-064)
 
 **Bug (1.0 → 1.2.1):** the per-input-stream arrays (`wrap_off`, `wrap_last`, `wrap_wall_last`, `edit_us`,
