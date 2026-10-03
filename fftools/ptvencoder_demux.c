@@ -2173,6 +2173,8 @@ bad:
     return r;
 }
 
+static void by_count_gap(DemuxArgs *d, int64_t gap, int64_t now);   /* 2.0.0-pre4, defined below */
+
 void *demux_thread(void *arg)
 {
     DemuxArgs *d = arg;
@@ -2346,11 +2348,19 @@ void *demux_thread(void *arg)
                                 if (delta >= m >> 1) delta -= m;
                             }
                             A = av_rescale_q(delta, vst->time_base, AV_TIME_BASE_Q);
-                            av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 rejoin class %s (A=%+.2f s, W=%.2f s) "
-                                   "(observe-only)\n",
-                                   A >= 0 && A < 500000 ? "BURST" :
+                            int burst = A >= 0 && A < 500000;
+                            av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 rejoin class %s (A=%+.2f s, W=%.2f s)%s\n",
+                                   burst ? "BURST" :
                                    llabs(A - W) <= FFMAX(1000000, W / 10) ? "LIVE LOSS" : "NEW DOMAIN",
-                                   A / 1e6, W / 1e6);
+                                   A / 1e6, W / 1e6, g_src_hold_act ? "" : " (observe-only)");
+                            if (g_src_hold_act) {           /* 2.0.0-pre4: settle the hold's arrival gap */
+                                if (d->src_gap_pending) {
+                                    if (burst)
+                                        by_count_gap(d, d->src_gap_pending, now);
+                                    d->src_gap_pending = 0;
+                                } else
+                                    d->src_gap_class = burst ? 1 : 2;   /* the gap packet is still to be dispatched */
+                            }
                             d->src_classified = 1;
                             d->src_pend       = 0;
                         }
@@ -2557,6 +2567,15 @@ static void ptv_autobank_escalate(DemuxArgs *d, int64_t worst_us, int64_t now)
 {
     d->by_bank_last_q = now;
     cushion_escalate(BANK_ESCALATE, worst_us, now);
+}
+
+/* count one completed >=1.5 s video arrival stall toward [PTV-BURSTY] / AUTO-BANK */
+static void by_count_gap(DemuxArgs *d, int64_t gap, int64_t now)
+{
+    d->by_gap_cnt++;
+    if (gap > d->by_max_gap) d->by_max_gap = gap;
+    if (d->autobank && gap >= 3000000)      /* one BIG stall qualifies immediately (sparse-glitch class) */
+        ptv_autobank_escalate(d, gap, now);
 }
 
 /* v0.9.0 genlock estimator: recover the source frame rate as a SLIDING-window FLL. Each ~4s
@@ -2793,10 +2812,20 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                 if (d->by_last_v_wall) {
                     int64_t gap = bw - d->by_last_v_wall;
                     if (gap >= 1500000) {                       /* a completed >=1.5s arrival stall */
-                        d->by_gap_cnt++;
-                        if (gap > d->by_max_gap) d->by_max_gap = gap;
-                        if (d->autobank && gap >= 3000000)      /* one BIG stall qualifies immediately (sparse-glitch class) */
-                            ptv_autobank_escalate(d, gap, bw);
+                        /* 2.0.0-pre4 (T-056 §3): a gap that was a source HOLD counts toward AUTO-BANK
+                         * only if its rejoin class is BURST (delivery paused, content kept); a LIVE
+                         * LOSS / NEW DOMAIN is an outage, not burstiness, and must not bank 12 s of
+                         * latency for hours. The class is decided on the 2nd post-gap packet, which
+                         * may come after this one is dispatched: then the gap waits for it. */
+                        if (g_src_hold_act && (atomic_load_explicit(&g_src_state, memory_order_relaxed) ||
+                                               d->src_pend || d->src_gap_class)) {
+                            if (d->src_gap_class == 1)
+                                by_count_gap(d, gap, bw);
+                            else if (!d->src_gap_class)
+                                d->src_gap_pending = gap;
+                            d->src_gap_class = 0;
+                        } else
+                            by_count_gap(d, gap, bw);
                     }
                 }
                 d->by_last_v_wall = bw;

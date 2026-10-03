@@ -403,6 +403,15 @@ static const char *rscorr_event_active(AudioState *a, int64_t now)
         return "layera buffering";
     if (a->nbs_fill_active)   /* pre15 §5 rule 2: R is synthetic-flat on a filled track — never engage */
         return "nbs silence-fill";
+    /* 2.0.0-pre4 (T-056 §5.5): while the source is held, R grows by the hold length and is no desync;
+     * after the rejoin the readings re-settle — wait out a full quiet window before engaging. */
+    if (ptv_src_holding())
+        return "source hold";
+    if (g_src_hold_act) {
+        int64_t rj = atomic_load_explicit(&g_src_rejoin_wall, memory_order_relaxed);
+        if (rj && now - rj < g_rscorr_quiet_us)
+            return "recent rejoin";
+    }
     /* 1.0.1-pre17 sibling-slate condition (finding 1, grid soak 2026-07-19): while ANY mv
      * slot is black-slated, NO track on the mosaic may engage — a sibling outage disturbs
      * the shared compositor pacing, and the soak measured the healthy slots' readings

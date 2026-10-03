@@ -5,6 +5,25 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre4 (in progress) — act on a source hold (T-056 §3/§5.5)
+
+**pre4b, engine freeze + accounting (2026-10-03):** while input 0 is STALLED (single input):
+- the sync engines that gate on `rscorr_event_active` (corrector, RESYNC, RECANCHOR) see "source hold",
+  then "recent rejoin" for one quiet window after STALLED → LIVE;
+- WUCR ρ = 0 (nominal pacing; no REPRIME, which would run the house at 0.77x then 1.5 % slow for as long
+  as the source is gone);
+- `house_skew` is not written and the residual sensor re-seeds at the first post-hold frame;
+- a frame-queue starvation episode that is a hold (or ends within 2 s of the rejoin) does not GROW the
+  adaptive cushion;
+- the hold's video arrival gap counts toward [PTV-BURSTY]/AUTO-BANK only if its rejoin class is BURST
+  (decided on the 2nd post-gap packet; the gap waits for it): an outage no longer banks up to 12 s of
+  latency for hours.
+`PTV_HOLD_OBSERVE=1` = the pre3 observe-only behaviour; `PTV_NO_HOLD=1` = no watch at all.
+
+Gate (local, x264, A/B vs `PTV_HOLD_OBSERVE=1`): bursty still banks (target 9.0 s both); stop_10 (BURST)
+banks to the 12 s ceiling both; gap_10 (LIVE LOSS) no bank (observe: bank 7.8 s); kill_return and clean
+unchanged.
+
 ## 2.0.0-pre3 (2026-10-03) — source-state watch, OBSERVE-ONLY (T-056 §3/§5.4)
 
 Single live input. No behaviour change: logs and stats only, so the canary can show the detector's

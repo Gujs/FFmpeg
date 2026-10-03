@@ -1048,6 +1048,10 @@ void *output_thread(void *arg)
                 if (g_adapt_cushion && !v->passthrough) {
                     /* 0.9.18 M3: trigger conditions stay here; the write bodies (tier store,
                      * cap delta, maxq, log) moved verbatim to cushion_escalate(). */
+                    int64_t rj = atomic_load_explicit(&g_src_rejoin_wall, memory_order_relaxed);
+                    if (ep > 0 && g_src_hold_act &&                   /* 2.0.0-pre4: a source hold is no decode deficit */
+                        (atomic_load_explicit(&g_src_state, memory_order_relaxed) || (rj && nw - rj < 2000000)))
+                        ep = 0;
                     if (ep > 0) {                                     /* a >=200ms starvation episode just ended */
                         ep_prev_us = ep_last_us; ep_last_us = nw;
                         /* 1.0.1-pre10 (e): 10min GROW suppression after a CUSHION_RELEASE —
@@ -1157,7 +1161,10 @@ void *output_thread(void *arg)
                      * into the escalation runtime). Master computes; all rungs apply the published
                      * hr->rho_corr_ppm identically. */
                     int occ = av_thread_message_queue_nb_elems(v->frame_q);
+                    /* 2.0.0-pre4: a hold is not a rate signal — nominal pacing, no REPRIME (it would run
+                     * the house at 0.77x, then 1.5 % slow, for as long as the source is gone) */
                     atomic_store_explicit(&v->hr->rho_corr_ppm,
+                        ptv_src_holding() ? 0 :
                         house_rate_corr_ppm(v->hr, v->est, occ, g_curt.cur_sp, base_sp, v->tick_dur_us),
                         memory_order_relaxed);
                 }
@@ -1202,7 +1209,7 @@ void *output_thread(void *arg)
              * aresample hard-comps = the audible clicks is gone at the SENSOR, not masked).
              * A genuine starvation dup after a hold still measures +1 tick. */
             if (cadence_hold) held_extra++;
-            if (v->is_master && v->house_skew && content_vpts >= 0)
+            if (v->is_master && v->house_skew && content_vpts >= 0 && !ptv_src_holding())   /* pre4: no growth in a hold */
                 *v->house_skew = (vpts - content_vpts - held_extra) * v->tick_dur_us;
             if (src_ts != AV_NOPTS_VALUE)   /* [PTV-CHAIN] video source-content being emitted (us); any rung (same content) */
                 atomic_store_explicit(&g_ch_vout_src, av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q), memory_order_relaxed);
@@ -1216,7 +1223,9 @@ void *output_thread(void *arg)
              * the exact-rational axis (the mux pts axis; the integer tick would re-import the
              * ~10ppm EXACTTICK drift into the sensor). EMA ≈ 30s of ticks. Single-input master
              * rung only; multiview (passthrough) never reaches this block. */
-            if (g_rsync_sense && v->is_master && src_ts != AV_NOPTS_VALUE) {
+            if (g_rsync_sense && v->is_master && ptv_src_holding())
+                rs_mv_seed = 0;                 /* 2.0.0-pre4: re-seed at the first post-hold frame */
+            else if (g_rsync_sense && v->is_master && src_ts != AV_NOPTS_VALUE) {
                 int64_t out_us = v->out_fps.num > 0
                     ? av_rescale(vpts, 1000000LL * v->out_fps.den, v->out_fps.num)
                     : vpts * v->tick_dur_us;
@@ -1269,15 +1278,17 @@ void *output_thread(void *arg)
                     atomic_store_explicit(&g_src_hold_start, nw, memory_order_relaxed);
                     atomic_store_explicit(&g_src_state, 1, memory_order_relaxed);
                     src_note = nw + 60000000; src_lost_logged = 0;
-                    av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 LIVE \xe2\x86\x92 STALLED (observe-only): frame queue and "
-                           "video_q empty, no video for %.1f s (threshold %.1f s)\n", (nw - arr) / 1e6, thr / 1e6);
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 LIVE \xe2\x86\x92 STALLED%s: frame queue and "
+                           "video_q empty, no video for %.1f s (threshold %.1f s)\n", g_src_hold_act ? "" : " (observe-only)",
+                           (nw - arr) / 1e6, thr / 1e6);
                 }
             } else if (fresh) {
                 int64_t hs0 = atomic_load_explicit(&g_src_hold_start, memory_order_relaxed);
                 atomic_store_explicit(&g_src_state, 0, memory_order_relaxed);
                 atomic_store_explicit(&g_src_hold_start, 0, memory_order_relaxed);
-                av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 STALLED \xe2\x86\x92 LIVE after %.1f s (observe-only)\n",
-                       (nw - hs0) / 1e6);
+                atomic_store_explicit(&g_src_rejoin_wall, nw, memory_order_relaxed);
+                av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 STALLED \xe2\x86\x92 LIVE after %.1f s%s\n",
+                       (nw - hs0) / 1e6, g_src_hold_act ? "" : " (observe-only)");
             } else {
                 int64_t hs0 = atomic_load_explicit(&g_src_hold_start, memory_order_relaxed);
                 if (!src_lost_logged && arr && nw - arr >= g_lost_after_us) {
@@ -1286,7 +1297,7 @@ void *output_thread(void *arg)
                            "packets for %.0f s\n", (nw - arr) / 1e6);
                 }
                 if (nw >= src_note) {   /* reminders: 1/min for 10 min, then every 10 min */
-                    av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 still STALLED after %.0f s (observe-only)\n",
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 still STALLED after %.0f s\n",
                            (nw - hs0) / 1e6);
                     src_note = nw + (nw - hs0 < 600000000 ? 60000000 : 600000000);
                 }

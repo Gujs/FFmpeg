@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.0-pre3"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.0-pre4"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -732,6 +732,8 @@ int64_t         g_lost_after_us = 30000000;
 _Atomic int     g_src_state;
 _Atomic int64_t g_src_hold_start;
 _Atomic int64_t g_src_vread_wc;
+int             g_src_hold_act;
+_Atomic int64_t g_src_rejoin_wall;
 /* 1.0.1-pre17: sibling-slate mask (bit k = input slot k black-slated; compositor writes,
  * rscorr_event_active reads) — no mv corrector engagement while any slot is slated. */
 _Atomic int     g_mv_slate_mask;
@@ -5123,6 +5125,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
     net_input = is_net_url(inputs[0].url);
     live = mode < 0 ? net_input : mode;
     g_src_watch = live && n_input == 1 && !multiview && !getenv("PTV_NO_HOLD");   /* 2.0.0-pre3 */
+    g_src_hold_act = g_src_watch && !getenv("PTV_HOLD_OBSERVE");                 /* 2.0.0-pre4 */
 
     /* 0.9.18 M1: resolve ALL cushion/queue sizing in one place (env parses + genlock default +
      * deep-prime side-cars + per-track audio depth + deep-prime target). Writes the same g_*

@@ -1609,6 +1609,8 @@ typedef struct DemuxArgs {
     int                   src_classified;   /* 2.0.0-pre3: rejoin of the current hold already classified */
     int                   src_pend;         /* 2.0.0-pre3: first post-gap packet (the PES tail) seen */
     int64_t               src_pend_w, src_pend_raw; /* 2.0.0-pre3: its wall gap; the last pre-gap DTS */
+    int64_t               src_gap_pending;  /* 2.0.0-pre4: a hold's arrival gap awaiting its rejoin class */
+    int                   src_gap_class;    /* 2.0.0-pre4: class known before the gap was counted: 1 BURST, 2 other */
     PtvDiscBuf           *disc;           /* legacy-0004 buffer-classify-discard (g_layera only; NULL otherwise) */
     int64_t               video_fwd_us;   /* wall-clock (us) of the last VIDEO forward-discontinuity crossing (whole-program-splice indicator) */
     int64_t               prog_off;       /* P2 (§7.1): program-level discontinuity offset (90kHz, detected on the
@@ -1965,6 +1967,14 @@ extern int64_t         g_lost_after_us;  /* -lost_after (default 30 s); pre3: ob
 extern _Atomic int     g_src_state;      /* 0 = LIVE, 1 = STALLED */
 extern _Atomic int64_t g_src_hold_start; /* wall us the hold began (0 = not holding) */
 extern _Atomic int64_t g_src_vread_wc;   /* wall us of the last video packet READ (before any buffering) */
+extern int             g_src_hold_act;   /* 2.0.0-pre4: act on STALLED (engine freeze, accounting); 0 = observe
+                                          * only (PTV_HOLD_OBSERVE=1, the pre3 behaviour) */
+extern _Atomic int64_t g_src_rejoin_wall; /* 2.0.0-pre4: wall us of the last STALLED -> LIVE (0 = never) */
+/* 2.0.0-pre4: an input-0 hold is in progress and acted on (single input only) */
+static inline int ptv_src_holding(void)
+{
+    return g_src_hold_act && atomic_load_explicit(&g_src_state, memory_order_relaxed);
+}
 extern _Atomic int64_t g_shed_wall;      /* (d) wall us of the last self-inflicted queue drop (ANY input —
                                           * pre16: per-track readers use Input.shed_wall; this aggregate
                                           * stays for the catch-up governor + unwired fallback) */
