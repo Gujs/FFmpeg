@@ -2151,6 +2151,7 @@ static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const uint8_t *old_t
     r = ptv_find_stream_info(nf);   /* pre19.1: tolerant AUDIO probe (same as the initial open) */
     if (r < 0)
         goto bad;
+    nf->max_probe_packets = 1;      /* 1.2.2 T-073: no codec probe for streams born after the open */
     r = AVERROR(EINVAL);
     if (nf->nb_streams != old_nb)
         goto bad;

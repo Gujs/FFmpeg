@@ -3734,6 +3734,12 @@ static void *open_input_thread(void *arg)
     OpenArg *o = arg; Input *in = o->in;
     in->open_ret = avformat_open_input(&in->ifmt, in->url, NULL, o->opts);
     if (in->open_ret >= 0) in->open_ret = ptv_find_stream_info(in->ifmt);   /* pre19.1: tolerant AUDIO probe */
+    /* 1.2.2 T-073: a stream lavf creates AFTER the open (mpegts auto_guess on a corrupt PID after an outage)
+     * starts a codec probe that can never finish, and while it is open ff_read_packet holds back EVERY
+     * stream until probesize (5 MB) is queued — 35 s of frozen input on a 2 Mb/s channel, then the whole
+     * backlog in one burst. Such streams are dropped by T-064 anyway, so they get no probe. Streams that
+     * already exist keep their probe budget (probe_packets is copied at stream creation). */
+    if (in->open_ret >= 0) in->ifmt->max_probe_packets = 1;
     return NULL;
 }
 
@@ -3800,6 +3806,7 @@ static int input_acquire(Input *in, int idx, const AVDictionary *opts)
                            "(after %.1f s, attempt #%d)\n", idx, avcodec_get_name(par->codec_id),
                            par->width, par->height, na, ns, nd,
                            (av_gettime_relative() - t0) / 1e6, attempt);
+                    in->ifmt->max_probe_packets = 1;   /* 1.2.2 T-073: no probe for later-born streams */
                     in->open_ret = 0;
                     return 0;
                 }

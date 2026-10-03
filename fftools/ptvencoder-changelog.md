@@ -71,6 +71,25 @@ change only; nothing about input handling changes yet.
 - Test scripts `test-scripts/repro/cc-test*.sh` read tables on PID 100 and 4096.
 
 **Rollback:** `-pid_plan v1` (1.2.0 layout), or `-mpegts_pmt_start_pid 4096` to keep only the old PMT PID.
+## 1.2.2-pre2 (2026-10-03) — no codec probe for streams born after the open (T-073)
+
+**Bug (found by the T-056 pre0 harness, localised 2026-10-03):** after an outage, a resume whose first
+seconds carry a corrupt TS header (one flipped PID bit: audio 0x101 → 0x109) made the output freeze for
+~44 s and then pad ~21 s of silence, although nothing crashed (T-064 already drops the late stream).
+Cause, measured inside libavformat: mpegts auto-guesses a new stream for the unknown PID and starts a
+codec probe that can never finish (three corrupt fragments ever arrive); while it is open,
+`ff_read_packet` queues every packet of every stream behind it until `probesize` (5 MB) is reached —
+35.1 s on a 2 Mb/s channel — so `av_read_frame` returns nothing, then the whole backlog in one second
+(video_q GOP shed, a +20.97 s audio label step). Plain ffmpeg on a FILE only sees a reorder delay.
+Report: `test-results/t073-corrupt-resume-20261003.md`.
+
+**Fix:** `max_probe_packets = 1` on the input after the open probe (and after every mosaic reopen probe).
+It only affects streams created after that point (lavf copies the budget at stream creation), which are
+dropped by T-064 anyway; streams that exist at open keep their full probe budget.
+
+**Gate (local harness, 150 s runs):** corrupt_resume first live window 54.1 s vs 91.6 s on 1.2.2-pre1
+and 52.1 s for the resume_clean control (outage ends at 44 s); live share after the event 1.00; the T-064
+`[PTV-DEMUX] … appeared after open` lines still appear (pid 0x140 video, 0x109 audio).
 
 ## 1.2.2-pre1 (2026-10-02) — hotfix: heap overflow when a stream appears mid-run (T-064)
 
