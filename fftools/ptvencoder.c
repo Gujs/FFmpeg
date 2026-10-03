@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.2.2-pre1"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.2.2-pre2"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -3728,6 +3728,12 @@ static void *open_input_thread(void *arg)
     OpenArg *o = arg; Input *in = o->in;
     in->open_ret = avformat_open_input(&in->ifmt, in->url, NULL, o->opts);
     if (in->open_ret >= 0) in->open_ret = ptv_find_stream_info(in->ifmt);   /* pre19.1: tolerant AUDIO probe */
+    /* 1.2.2 T-073: a stream lavf creates AFTER the open (mpegts auto_guess on a corrupt PID after an outage)
+     * starts a codec probe that can never finish, and while it is open ff_read_packet holds back EVERY
+     * stream until probesize (5 MB) is queued — 35 s of frozen input on a 2 Mb/s channel, then the whole
+     * backlog in one burst. Such streams are dropped by T-064 anyway, so they get no probe. Streams that
+     * already exist keep their probe budget (probe_packets is copied at stream creation). */
+    if (in->open_ret >= 0) in->ifmt->max_probe_packets = 1;
     return NULL;
 }
 
