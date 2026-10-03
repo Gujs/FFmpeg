@@ -7,6 +7,25 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 2.0.0-pre4 (in progress) — act on a source hold (T-056 §3/§5.5)
 
+**pre4c, PES-tail wall-gap carry (2026-10-04) — fixes the LIVE LOSS +10 s desync, a 1.2.x bug.** The pre4a
+lip-sync baseline (unwrapped marker ruler, `test-results/t056-pre4a-lipsync-baseline-20261003.md`) showed
+1.2.x leaving a channel audio-late by the whole outage (+10.000 s, permanent) after a real outage shorter
+than the read timeout, depending only on where the cut fell; RESYNC then over-corrected to ~441 ms
+audio-early. Cause: lavf completes an unbounded (video) PES only when the next one starts, and a cut that
+splits a bounded (audio) PES is completed by the first post-gap bytes — so the first packet out after the
+gap is the pre-gap TAIL, carrying the wall gap but no content jump, and the jump arrives one packet later
+with a ~1-frame wall gap. The pre24 wall-evidence rule then saw a "flowing" jump on that stream and LAYERA
+erased its hole while the other stream was padded. Now the packet right after a gapped packet inherits that
+gap for the wall-evidence test, per dense stream (`pkt_wall_gap_us` only; cadence unchanged).
+`PTV_NO_PESTAIL=1` reverts. Also: `house_skew` keeps growing through a hold (pre4b froze it; a BURST rejoin
+then went 6 s audio-early because post-gap audio read the stale value — measurement overrules the review).
+
+Gate (local, sync fixtures, unwrapped ruler, ±25 ms of the pre-event baseline both 0–10 s and 30–60 s after
+resume): sync_gap_10 at cuts 20.760 s (+10 000 ms before, `PTV_NO_PESTAIL=1` reproduces it), 20.120 s and
+20.000 s — PASS; sync_stop_10 (BURST), sync_kill_return (NEW DOMAIN), sync_clean — PASS. Open: sync_flapping
+(2 s gaps every 2 s, below stall_min) ends −192 ms after mixed LAYERA flushes, then RESYNC fires on the biased
+post-gap sensor (R −482 ms) → −674 ms (T-075).
+
 **pre4b, engine freeze + accounting (2026-10-03):** while input 0 is STALLED (single input):
 - the sync engines that gate on `rscorr_event_active` (corrector, RESYNC, RECANCHOR) see "source hold",
   then "recent rejoin" for one quiet window after STALLED → LIVE;

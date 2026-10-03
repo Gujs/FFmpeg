@@ -1674,6 +1674,26 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
             int64_t pwl = d->wrap_wall_last[pkt->stream_index];
             int64_t pg  = pwl > 0 ? wall_now - pwl : 0;
             d->pkt_wall_gap_us[pkt->stream_index] = pg;
+            /* 2.0.0-pre4c PES-TAIL carry (measured 2026-10-03): lavf completes a video PES only when
+             * the NEXT one starts (unbounded PES length), so after a real outage the first video
+             * packet out is the pre-gap TAIL frame — it carries the wall gap but no content jump —
+             * and the content jump arrives one packet later with a ~1-frame wall gap. The E1v video
+             * wall-evidence rule then saw a "flowing" jump and LAYERA erased the hole while the
+             * audio leg (bounded PES: jump and wall gap on the same packet) was padded: the output
+             * stayed audio-late by the whole outage. The packet right after a gapped video packet
+             * inherits that gap for the wall-evidence test (pkt_wall_gap_us only; cadence unchanged).
+             * PTV_NO_PESTAIL=1 reverts. */
+            /* Measured on audio too: a cut that splits an audio PES makes lavf complete it with the
+             * first post-gap bytes, so the same tail carries the gap there (fixture cut at 20.000 s:
+             * video kept its hole, audio erased → audio 10 s early). Per dense stream. */
+            if (g_pestail && d->tail_gap_us && pkt->stream_index < d->nb_streams_open) {
+                int64_t *tg = &d->tail_gap_us[pkt->stream_index];
+                if (*tg && pg < *tg) {
+                    d->pkt_wall_gap_us[pkt->stream_index] = *tg + pg;
+                    *tg = 0;
+                } else
+                    *tg = pg >= g_gap_min_us ? pg : 0;
+            }
             if (d->wall_cad_us && pg > 5000 && pg < 2000000) {
                 if (!d->wall_cad_us[pkt->stream_index])
                     d->wall_cad_us[pkt->stream_index] = pg;

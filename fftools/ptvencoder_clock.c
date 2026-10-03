@@ -1209,7 +1209,9 @@ void *output_thread(void *arg)
              * aresample hard-comps = the audible clicks is gone at the SENSOR, not masked).
              * A genuine starvation dup after a hold still measures +1 tick. */
             if (cadence_hold) held_extra++;
-            if (v->is_master && v->house_skew && content_vpts >= 0 && !ptv_src_holding())   /* pre4: no growth in a hold */
+            /* house_skew keeps growing through a hold (measured 2026-10-04: freezing it made a BURST rejoin
+             * 6 s audio-early — post-gap audio read the stale value before the first fresh frame updated it) */
+            if (v->is_master && v->house_skew && content_vpts >= 0)
                 *v->house_skew = (vpts - content_vpts - held_extra) * v->tick_dur_us;
             if (src_ts != AV_NOPTS_VALUE)   /* [PTV-CHAIN] video source-content being emitted (us); any rung (same content) */
                 atomic_store_explicit(&g_ch_vout_src, av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q), memory_order_relaxed);
