@@ -2360,8 +2360,9 @@ void *demux_thread(void *arg)
                     d->src_pend       = 0;
                 }
                 d->src_last_vdts_raw = raw;
+                d->src_last_vwall    = now;   /* timestamped packets only: a broken PES without PTS (corrupt
+                                               * resume) must not reset the gap the next packet measures */
             }
-            d->src_last_vwall = now;
         }
         demux_unwrap(d, out);               /* 33-bit source wrap -> monotonic extended ts (ONCE) */
 

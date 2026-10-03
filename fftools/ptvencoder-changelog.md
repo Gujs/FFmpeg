@@ -26,6 +26,8 @@ false-positive rate (bursty channels must never show `src=stalled`) before pre4 
 **Gate (local harness, sequential runs):** clean and bursty — no STALLED; stop_10 → BURST (A=+0.08 s,
 W=10.2 s); gap_10 → LIVE LOSS (A=W=10.12 s); kill_return (sender restart) → NEW DOMAIN (A=−20.28 s);
 flapping (2 s gaps) — no STALLED; harness verdicts otherwise identical to 1.2.2 and to `PTV_NO_HOLD=1`.
+The rejoin wall gap is measured between timestamped packets only (a broken PES without PTS after a
+corrupt resume had reset it): corrupt_resume and resume_clean → LIVE LOSS (A=12.9/12.1 s, W=13.6/12.8 s).
 
 ## 2.0.0-pre2 (2026-10-02) — single input waits for its source (T-056 §3/§4, wait-then-build)
 
