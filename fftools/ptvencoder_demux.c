@@ -2315,6 +2315,53 @@ void *demux_thread(void *arg)
             d->disc->pair_start_us &&
             av_gettime_relative() - d->disc->pair_start_us > PTV_PAIR_WINDOW_US)
             ptv_aanch_fire(d, d->disc);
+        /* 2.0.0-pre3 (T-056 §3/§5.4), at READ time — before demux_unwrap (which already self-rebases
+         * per-stream discontinuities) and before the LAYERA buffer (which can hold packets while input
+         * flows): (1) stamp video arrival for the STALLED test; (2) classify the rejoin at the first video
+         * packet after a hold on the RAW 33-bit DTS: A = content advance, W = wall gap. BURST = contiguous
+         * content (delivery paused); LIVE LOSS = the source kept running (A ~ W); NEW DOMAIN = anything
+         * else (restart, PTS reset). OBSERVE-ONLY: logged, nothing acts on it yet (pre4). */
+        if (g_src_watch && out->stream_index == d->vstream) {
+            int64_t now = av_gettime_relative();
+            int64_t raw = out->dts != AV_NOPTS_VALUE ? out->dts : out->pts;
+            atomic_store_explicit(&g_src_vread_wc, now, memory_order_relaxed);
+            if (raw != AV_NOPTS_VALUE) {
+                const AVStream *vst = d->ifmt->streams[d->vstream];
+                /* lavf completes a video PES only when the NEXT one starts (unbounded PES length), so the
+                 * first video packet out after a gap is the pre-gap TAIL frame (contiguous content, by
+                 * construction). The first genuinely post-gap frame is the SECOND packet: classify on it,
+                 * against the last packet before the gap (A), with the wall gap of the first (W). */
+                if (atomic_load_explicit(&g_src_state, memory_order_relaxed)) {
+                    if (!d->src_classified && d->src_last_vwall) {
+                        if (!d->src_pend) {                 /* first packet after the gap: the held tail */
+                            d->src_pend     = 1;
+                            d->src_pend_w   = now - d->src_last_vwall;
+                            d->src_pend_raw = d->src_last_vdts_raw;   /* last packet BEFORE the gap */
+                        } else {                            /* second: the first post-gap content */
+                            int64_t delta = raw - d->src_pend_raw, A, W = d->src_pend_w;
+                            if (vst->pts_wrap_bits > 0 && vst->pts_wrap_bits < 63) {   /* nearest 33-bit wrap */
+                                int64_t m = 1LL << vst->pts_wrap_bits;
+                                delta &= m - 1;
+                                if (delta >= m >> 1) delta -= m;
+                            }
+                            A = av_rescale_q(delta, vst->time_base, AV_TIME_BASE_Q);
+                            av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 rejoin class %s (A=%+.2f s, W=%.2f s) "
+                                   "(observe-only)\n",
+                                   A >= 0 && A < 500000 ? "BURST" :
+                                   llabs(A - W) <= FFMAX(1000000, W / 10) ? "LIVE LOSS" : "NEW DOMAIN",
+                                   A / 1e6, W / 1e6);
+                            d->src_classified = 1;
+                            d->src_pend       = 0;
+                        }
+                    }
+                } else {
+                    d->src_classified = 0;
+                    d->src_pend       = 0;
+                }
+                d->src_last_vdts_raw = raw;
+            }
+            d->src_last_vwall = now;
+        }
         demux_unwrap(d, out);               /* 33-bit source wrap -> monotonic extended ts (ONCE) */
 
         /* legacy-0004 TS-discontinuity buffer (g_layera only). Dense V/A get

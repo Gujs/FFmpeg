@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.0-pre2"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.0-pre3"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -726,6 +726,12 @@ int     g_ratchrel = 1;
 int     g_selfheal = 1;
 _Atomic int     g_selfheal_req;
 _Atomic int64_t g_v_arrive_wc;
+int             g_src_watch;                       /* 2.0.0-pre3: see ptvencoder.h */
+int64_t         g_stall_min_us  = 3000000;
+int64_t         g_lost_after_us = 30000000;
+_Atomic int     g_src_state;
+_Atomic int64_t g_src_hold_start;
+_Atomic int64_t g_src_vread_wc;
 /* 1.0.1-pre17: sibling-slate mask (bit k = input slot k black-slated; compositor writes,
  * rscorr_event_active reads) — no mv corrector engagement while any slot is slated. */
 _Atomic int     g_mv_slate_mask;
@@ -5109,6 +5115,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
 
     net_input = is_net_url(inputs[0].url);
     live = mode < 0 ? net_input : mode;
+    g_src_watch = live && n_input == 1 && !multiview && !getenv("PTV_NO_HOLD");   /* 2.0.0-pre3 */
 
     /* 0.9.18 M1: resolve ALL cushion/queue sizing in one place (env parses + genlock default +
      * deep-prime side-cars + per-track audio depth + deep-prime target). Writes the same g_*
@@ -5581,6 +5588,8 @@ static const OptionDef ptv_options[] = {
     { "filter_complex",   OPT_TYPE_STRING, 0,                        { .off = 0 }, "filtergraph", "graph" },
     { "start_on",         OPT_TYPE_STRING, 0,                        { .off = 0 }, "when outputs start: video (2.0.0; any/all/now come in 2.1)", "when" },
     { "wait_input",       OPT_TYPE_STRING, 0,                        { .off = 0 }, "give up if the input has no video after this long (default inf)", "dur" },
+    { "stall_min",        OPT_TYPE_STRING, 0,                        { .off = 0 }, "content gone + input silent this long = STALLED (default 3s)", "dur" },
+    { "lost_after",       OPT_TYPE_STRING, 0,                        { .off = 0 }, "no video packets this long = LOST (default 30s)", "dur" },
     { "reopen_backoff",   OPT_TYPE_STRING, 0,                        { .off = 0 }, "seconds between input attempts, the last repeats (default 1,2,5,10,30)", "list" },
     { "abort_on",         OPT_TYPE_STRING, 0,                        { .off = 0 }, "abort conditions", "flags" },
     /* per-output structural options (walked from g->opts[]) */
@@ -6304,6 +6313,15 @@ int main(int argc, char **argv)
                 uninit_parse_context(&octx); return 1;
             }
             if (!strcmp(v, "inf")) g_wait_input_us = 0;
+        }
+        if (!strcmp(octx.global_opts.opts[gi].key, "stall_min") || !strcmp(octx.global_opts.opts[gi].key, "lost_after")) {
+            int64_t d;                                                              /* 2.0.0-pre3 */
+            if (av_parse_time(&d, octx.global_opts.opts[gi].val, 1) < 0 || d < 500000) {
+                av_log(NULL, AV_LOG_ERROR, "-%s %s: expected a duration of at least 0.5 s\n",
+                       octx.global_opts.opts[gi].key, octx.global_opts.opts[gi].val);
+                uninit_parse_context(&octx); return 1;
+            }
+            if (octx.global_opts.opts[gi].key[0] == 's') g_stall_min_us = d; else g_lost_after_us = d;
         }
         if (!strcmp(octx.global_opts.opts[gi].key, "reopen_backoff") &&
             parse_backoff(octx.global_opts.opts[gi].val) < 0) {

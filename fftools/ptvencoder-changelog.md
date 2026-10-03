@@ -5,6 +5,28 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre3 (2026-10-03) — source-state watch, OBSERVE-ONLY (T-056 §3/§5.4)
+
+Single live input. No behaviour change: logs and stats only, so the canary can show the detector's
+false-positive rate (bursty channels must never show `src=stalled`) before pre4 acts on it.
+
+- **STALLED** (master output thread): no fresh frame, `video_q` empty and no video packet READ, all for
+  max(`-stall_min`, bank target) — default 3 s (fleet measurement). Arrival is stamped at read time, before
+  the LAYERA buffer (a first version used the dispatch watermark and declared a false stall while LAYERA
+  held packets around a discontinuity).
+- **Rejoin class** (demux thread) on the RAW 33-bit DTS (before `demux_unwrap`, which already self-rebases
+  per-stream discontinuities): BURST (content contiguous), LIVE LOSS (A ≈ W), NEW DOMAIN. Classified on the
+  SECOND video packet after the gap: lavf completes a video PES only when the next one starts, so the first
+  packet out after a gap is the pre-gap tail frame.
+- `[PTV-SRC]` lines (LIVE → STALLED, rejoin class, STALLED → LIVE, STALLED → LOST after `-lost_after`,
+  reminders 1/min for 10 min then every 10 min); stats `src=live` / `src=stalled hold=<s>` at the end of
+  the line. New global options `-stall_min <dur>` (3 s), `-lost_after <dur>` (30 s; pre3 observes only, the
+  read timeout is unchanged until pre5). Kill switch `PTV_NO_HOLD=1`.
+
+**Gate (local harness, sequential runs):** clean and bursty — no STALLED; stop_10 → BURST (A=+0.08 s,
+W=10.2 s); gap_10 → LIVE LOSS (A=W=10.12 s); kill_return (sender restart) → NEW DOMAIN (A=−20.28 s);
+flapping (2 s gaps) — no STALLED; harness verdicts otherwise identical to 1.2.2 and to `PTV_NO_HOLD=1`.
+
 ## 2.0.0-pre2 (2026-10-02) — single input waits for its source (T-056 §3/§4, wait-then-build)
 
 A single live (udp/rtp/srt) input no longer exits when the source is dead at start or has no SPS/PPS

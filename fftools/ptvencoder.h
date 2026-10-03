@@ -1604,6 +1604,11 @@ typedef struct DemuxArgs {
                                             * (wrap_*, edit_us, gap_vsnap, wall_cad_us, pkt_wall_gap_us,
                                             * disc) were sized for at open */
     int                   late_stream_max; /* 1.2.2 T-064: highest late-born stream index logged */
+    int64_t               src_last_vdts_raw; /* 2.0.0-pre3: last video DTS, raw 33-bit (stream tb) */
+    int64_t               src_last_vwall;   /* 2.0.0-pre3: wall us of that packet */
+    int                   src_classified;   /* 2.0.0-pre3: rejoin of the current hold already classified */
+    int                   src_pend;         /* 2.0.0-pre3: first post-gap packet (the PES tail) seen */
+    int64_t               src_pend_w, src_pend_raw; /* 2.0.0-pre3: its wall gap; the last pre-gap DTS */
     PtvDiscBuf           *disc;           /* legacy-0004 buffer-classify-discard (g_layera only; NULL otherwise) */
     int64_t               video_fwd_us;   /* wall-clock (us) of the last VIDEO forward-discontinuity crossing (whole-program-splice indicator) */
     int64_t               prog_off;       /* P2 (§7.1): program-level discontinuity offset (90kHz, detected on the
@@ -1951,6 +1956,15 @@ extern int     g_ratchrel;               /* (b) ratchet release on starvation co
 extern int     g_selfheal;               /* (c) self-heal re-prime backstop (PTV_NO_SELFHEAL) */
 extern _Atomic int     g_selfheal_req;   /* (c) master output thread -> decode thread */
 extern _Atomic int64_t g_v_arrive_wc;    /* wall us of the last video pkt at the demux (input-flowing signal) */
+/* 2.0.0-pre3 (T-056 spec §3): input-0 source state, OBSERVE-ONLY in pre3 (logs + stats, no behaviour change).
+ * STALLED = no fresh frame AND video_q empty AND no video arrival, all for max(-stall_min, bank target);
+ * the master output thread owns the transition, the demux thread classifies the rejoin. Single input only. */
+extern int             g_src_watch;      /* detection armed (single live input, !PTV_NO_HOLD) */
+extern int64_t         g_stall_min_us;   /* -stall_min (default 3 s, fleet-measured) */
+extern int64_t         g_lost_after_us;  /* -lost_after (default 30 s); pre3: observe only */
+extern _Atomic int     g_src_state;      /* 0 = LIVE, 1 = STALLED */
+extern _Atomic int64_t g_src_hold_start; /* wall us the hold began (0 = not holding) */
+extern _Atomic int64_t g_src_vread_wc;   /* wall us of the last video packet READ (before any buffering) */
 extern _Atomic int64_t g_shed_wall;      /* (d) wall us of the last self-inflicted queue drop (ANY input —
                                           * pre16: per-track readers use Input.shed_wall; this aggregate
                                           * stays for the catch-up governor + unwired fallback) */

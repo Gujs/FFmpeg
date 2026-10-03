@@ -758,6 +758,8 @@ void *output_thread(void *arg)
                                                 overwritten to vpts on emit; dups must not re-read it) */
     int64_t diag_t0 = av_gettime_relative(), diag_last = diag_t0;
     int64_t stat_last = diag_t0, stat_prev = 0;
+    int64_t src_fresh_wall = 0, src_note = 0;   /* 2.0.0-pre3 source-state watch (master only) */
+    int     src_lost_logged = 0;
 
     if (!held)
         goto done;
@@ -1252,6 +1254,44 @@ void *output_thread(void *arg)
                                                                           * media time reached — every
                                                                           * demux stops pulling */
         if (!fresh) { if (cadence_hold) v->pd++; else v->dup++; }   /* pd = intentional cadence residence; dup stays the health alarm */
+        /* 2.0.0-pre3 (T-056 §3): source-state watch, OBSERVE-ONLY. A hold needs the content gone AND the
+         * input silent: no fresh frame, video_q empty and no video arrival, all for max(-stall_min, bank
+         * target) — shorter underruns are today's dup path (fleet 2026-10-02: 63 % of >=2 s frame-queue-
+         * empty episodes have input flowing; bursty channels pause 5.6 s p50). Logs + stats only. */
+        if (g_src_watch && v->is_master) {
+            int64_t nw  = av_gettime_relative();
+            int64_t arr = atomic_load_explicit(&g_src_vread_wc, memory_order_relaxed);   /* read time, not dispatch */
+            if (fresh) src_fresh_wall = nw;
+            if (!atomic_load_explicit(&g_src_state, memory_order_relaxed)) {
+                int64_t thr = FFMAX(g_stall_min_us, atomic_load_explicit(&g_bank_us, memory_order_relaxed));
+                if (!fresh && src_fresh_wall && nw - src_fresh_wall >= thr && arr && nw - arr >= thr &&
+                    v->dbg_video_q && !av_thread_message_queue_nb_elems(v->dbg_video_q)) {
+                    atomic_store_explicit(&g_src_hold_start, nw, memory_order_relaxed);
+                    atomic_store_explicit(&g_src_state, 1, memory_order_relaxed);
+                    src_note = nw + 60000000; src_lost_logged = 0;
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 LIVE \xe2\x86\x92 STALLED (observe-only): frame queue and "
+                           "video_q empty, no video for %.1f s (threshold %.1f s)\n", (nw - arr) / 1e6, thr / 1e6);
+                }
+            } else if (fresh) {
+                int64_t hs0 = atomic_load_explicit(&g_src_hold_start, memory_order_relaxed);
+                atomic_store_explicit(&g_src_state, 0, memory_order_relaxed);
+                atomic_store_explicit(&g_src_hold_start, 0, memory_order_relaxed);
+                av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 STALLED \xe2\x86\x92 LIVE after %.1f s (observe-only)\n",
+                       (nw - hs0) / 1e6);
+            } else {
+                int64_t hs0 = atomic_load_explicit(&g_src_hold_start, memory_order_relaxed);
+                if (!src_lost_logged && arr && nw - arr >= g_lost_after_us) {
+                    src_lost_logged = 1;
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 STALLED \xe2\x86\x92 LOST (observe-only): no video "
+                           "packets for %.0f s\n", (nw - arr) / 1e6);
+                }
+                if (nw >= src_note) {   /* reminders: 1/min for 10 min, then every 10 min */
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 still STALLED after %.0f s (observe-only)\n",
+                           (nw - hs0) / 1e6);
+                    src_note = nw + (nw - hs0 < 600000000 ? 60000000 : 600000000);
+                }
+            }
+        }
         if (g_slow) av_usleep(g_slow);
         if (ret < 0) break;
 
@@ -1374,6 +1414,14 @@ void *output_thread(void *arg)
                 char rsn[10 + PTV_MAX_AUDIO * 16];                   /* pre29 #69: rsn= (resync fires); absent
                                                                       * while zero — clean line unchanged */
                 ptv_stats_rsn(rsn, sizeof rsn, 0);
+                char srcs[48] = "";                                 /* 2.0.0-pre3: src=/hold= (single input) */
+                if (g_src_watch) {
+                    int64_t hs0 = atomic_load_explicit(&g_src_hold_start, memory_order_relaxed);
+                    if (atomic_load_explicit(&g_src_state, memory_order_relaxed) && hs0)
+                        snprintf(srcs, sizeof srcs, " src=stalled hold=%.1f", (av_gettime_relative() - hs0) / 1e6);
+                    else
+                        snprintf(srcs, sizeof srcs, " src=live");
+                }
                 char ccs[128] = "";                                  /* -cc_extract: caps/erase/keep/a53 —
                                                                       * printed WHENEVER the feature is on
                                                                       * (SUBTITLE streams are exempt from the
@@ -1419,9 +1467,9 @@ void *output_thread(void *arg)
                 av_log(NULL, AV_LOG_INFO,
                     "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f "
                     "dup=%"PRId64" pd=%"PRId64" drop=%"PRId64" corrupt=%"PRId64" "
-                    "async=%+"PRId64"ppm%s%s%s%s%s%s%s%s%s%s\n",
+                    "async=%+"PRId64"ppm%s%s%s%s%s%s%s%s%s%s%s\n",
                     v->emitted, fps, hh, mm, ss,
-                    v->dup, v->pd, v->framedrop, cr, aw, dlv, wu, bk, cfs, aco, rsl, crs, cvs, rsn, ccs);
+                    v->dup, v->pd, v->framedrop, cr, aw, dlv, wu, bk, cfs, aco, rsl, crs, cvs, rsn, ccs, srcs);
                 stat_last = nows; stat_prev = v->emitted;
             }
         }
