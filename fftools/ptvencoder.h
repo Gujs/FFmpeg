@@ -1604,6 +1604,7 @@ typedef struct DemuxArgs {
                                             * (wrap_*, edit_us, gap_vsnap, wall_cad_us, pkt_wall_gap_us,
                                             * disc) were sized for at open */
     int                   late_stream_max; /* 1.2.2 T-064: highest late-born stream index logged */
+    int64_t              *tail_gap_us;      /* 1.2.2 T-074: per stream, wall gap of the last packet if it was a gapped PES tail */
     PtvDiscBuf           *disc;           /* legacy-0004 buffer-classify-discard (g_layera only; NULL otherwise) */
     int64_t               video_fwd_us;   /* wall-clock (us) of the last VIDEO forward-discontinuity crossing (whole-program-splice indicator) */
     int64_t               prog_off;       /* P2 (§7.1): program-level discontinuity offset (90kHz, detected on the
@@ -1708,6 +1709,7 @@ typedef struct Input {
     int64_t              *gap_vsnap;         /* 1.0.1-pre16 #47-A: per-stream d->vpkt snapshot storage */
     int64_t              *wall_cad_us;       /* 1.0.1-pre24 #63: per-stream delivery-cadence EMA storage */
     int64_t              *pkt_wall_gap_us;   /* 1.0.1-pre24 #63: per-stream current-pkt wall-gap storage */
+    int64_t              *tail_gap_us;       /* 1.2.2 T-074: per-stream PES-tail wall-gap carry */
     PtvDiscBuf            disc;              /* legacy-0004 buffer-classify-discard state (used only when g_layera) */
     /* 1.0.1-pre5 shared-flush expected-step handshake storage (D1) — one slot per GLOBAL
      * transcoded track index (only the tracks sourced from this input are wired). Demux thread
@@ -1786,6 +1788,7 @@ extern int64_t g_novideo_exit_us;        /* 1.0.1-pre23 startup sanity: packets 
                                           * (PTV_NOVIDEO_EXIT_S, default 300s; 0 disables) */
 extern int     g_wallev;                 /* 1.0.1-pre24 #63 wall-evidence split (PTV_NO_WALLEV=1 reverts
                                           * the action; provenance measurement stays on) */
+extern int     g_pestail;   /* 1.2.2 T-074: PES-tail wall-gap carry for wall evidence (PTV_NO_PESTAIL=1 off) */
 extern int     g_recanchor;              /* 1.0.1-pre24 #63 corroborated recovery re-anchor
                                           * (PTV_NO_RECANCHOR=1 disables) */
 extern int64_t g_recanchor_settle_us;    /* quiet+stable window before an engage (PTV_RECANCHOR_SETTLE_S, 300s) */

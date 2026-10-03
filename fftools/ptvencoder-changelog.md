@@ -5,6 +5,26 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 1.2.2-pre3 (2026-10-04) — PES-tail wall-gap carry: a short real outage no longer desyncs A/V (T-074)
+
+**Bug (1.0.1-pre24 → 1.2.2-pre2, found by the T-056 pre4a lip-sync baseline with an unwrapped marker
+ruler):** after a real outage shorter than the read timeout (the source kept running, ~10 s of content
+lost), the output could stay **audio-late by the whole outage, permanently** (+10.000 s measured),
+depending only on where the cut fell in the packet interleave; RESYNC then fired on the biased post-gap
+sensor and left it ~441 ms audio-early. Cause: lavf completes an unbounded (video) PES only when the next
+one starts, and a cut that splits a bounded (audio) PES is completed by the first post-gap bytes — so the
+first packet out after the gap is the pre-gap TAIL (wall gap, no content jump) and the content jump arrives
+one packet later with a ~1-frame wall gap. The pre24 wall-evidence rule then classified that stream's jump
+as "flowing" and LAYERA erased its hole while the other stream was padded.
+
+**Fix:** the packet right after a gapped packet inherits that gap for the wall-evidence test, per dense
+stream (`pkt_wall_gap_us` only; the cadence estimate is unchanged). `PTV_NO_PESTAIL=1` reverts.
+
+**Gate (local, sync fixtures, unwrapped ruler, ±25 ms of the pre-event baseline 0–10 s and 30–60 s after
+resume):** see the 2.0.0-pre4c entry in this branch's dev line for the full table; on 1.2.2-pre3 itself:
+sync_gap_10 at the three cut positions, sync_stop_10, sync_kill_return, sync_clean; bursty and
+corrupt_resume unchanged. Known open: 2 s on/off flapping (T-075).
+
 ## 1.2.2-pre2 (2026-10-03) — no codec probe for streams born after the open (T-073)
 
 **Bug (found by the T-056 pre0 harness, localised 2026-10-03):** after an outage, a resume whose first

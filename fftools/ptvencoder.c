@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "1.2.2-pre2"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "1.2.2-pre3"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -119,6 +119,7 @@ int64_t g_novideo_exit_us = 300LL * 1000000; /* 1.0.1-pre23 startup sanity rider
                                            * decoded for this long since start → FATAL exit (a supervised restart beats a
                                            * wedged forever-startup — the probe-OK-never-decodes silent state, #60 arm D).
                                            * PTV_NOVIDEO_EXIT_S overrides; 0 disables. */
+int     g_pestail = 1;             /* 1.2.2 T-074: see ptvencoder_demux.c (PES-TAIL carry) */
 int     g_wallev = 1;              /* 1.0.1-pre24 #63 WALL-EVIDENCE SPLIT (the corrupt-storm desync class): every
                                            * erase engine splits a forward label step J into W = wall-absence-evidenced
                                            * portion (real missing content → PAD) and J−W = flowing/relabel portion
@@ -4492,8 +4493,9 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         inputs[k].gap_vsnap = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].gap_vsnap)); /* pre16 #47-A: vpkt snapshots */
         inputs[k].wall_cad_us     = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].wall_cad_us));     /* pre24 #63: cadence EMA */
         inputs[k].pkt_wall_gap_us = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].pkt_wall_gap_us)); /* pre24 #63: current-pkt gap */
+        inputs[k].tail_gap_us     = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].tail_gap_us));     /* 1.2.2 T-074: PES-tail carry */
         if (!inputs[k].wrap_off || !inputs[k].wrap_last || !inputs[k].wrap_wall_last || !inputs[k].edit_us || !inputs[k].gap_vsnap ||
-            !inputs[k].wall_cad_us || !inputs[k].pkt_wall_gap_us) { ret = AVERROR(ENOMEM); goto end; }
+            !inputs[k].wall_cad_us || !inputs[k].pkt_wall_gap_us || !inputs[k].tail_gap_us) { ret = AVERROR(ENOMEM); goto end; }
         for (si = 0; si < (int)inputs[k].ifmt->nb_streams; si++) inputs[k].wrap_last[si] = AV_NOPTS_VALUE;
         inputs[k].da.nb_streams_open = inputs[k].ifmt->nb_streams;   /* 1.2.2 T-064: the size above */
         inputs[k].da.late_stream_max = -1;
@@ -5202,6 +5204,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         d->gap_vsnap = inputs[kk].gap_vsnap;            /* pre16 #47-A: per-stream vpkt snapshots */
         d->wall_cad_us     = inputs[kk].wall_cad_us;     /* pre24 #63: delivery-cadence EMA */
         d->pkt_wall_gap_us = inputs[kk].pkt_wall_gap_us; /* pre24 #63: current-pkt wall gap */
+        d->tail_gap_us     = inputs[kk].tail_gap_us;     /* 1.2.2 T-074: PES-tail carry */
         d->rsync_slot = kk;                             /* pre16: EVERY input publishes its ledgers to g_rsx,
                                                          * video keyed by this slot (was single-input-only) */
         d->shed_wall = &inputs[kk].shed_wall;           /* pre16: per-input self-shed stamp */
@@ -5422,6 +5425,7 @@ end:
         av_freep(&inputs[k].gap_vsnap);
         av_freep(&inputs[k].wall_cad_us);       /* pre24 #63 */
         av_freep(&inputs[k].pkt_wall_gap_us);   /* pre24 #63 */
+        av_freep(&inputs[k].tail_gap_us);       /* 1.2.2 T-074 */
         av_dict_free(&inputs[k].da.reopen_opts);   /* pre17 R1 */
         ptv_disc_free(&inputs[k].disc);   /* legacy-0004 buffer (no-op if never inited) */
         if (inputs[k].ifmt) avformat_close_input(&inputs[k].ifmt);
@@ -5938,6 +5942,7 @@ int main(int argc, char **argv)
                                                     * (the #60 unbounded swr_inject_silence ladder — A/B only) */
     { const char *s = getenv("PTV_CONV_CAP_S");  if (s && atoi(s) > 0) g_conv_cap_us  = (int64_t)atoi(s) * 1000000; }
     { const char *s = getenv("PTV_SEAM_PARK_S"); if (s && atoi(s) > 0) g_seam_park_us = (int64_t)atoi(s) * 1000000; }  /* TEST ONLY (G4) */
+    if (getenv("PTV_NO_PESTAIL")) g_pestail = 0;   /* 1.2.2 T-074: PES-tail carry off */
     if (getenv("PTV_NO_WALLEV")) g_wallev = 0;     /* 1.0.1-pre24 #63 revert: erase engines back to the pre23
                                                     * whole-step remedies (butt-joint every >1s hole; the
                                                     * corrupt-storm desync counterfactual — A/B only) */
