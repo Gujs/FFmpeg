@@ -1546,6 +1546,23 @@ void *output_thread(void *arg)
                 char rsn[10 + PTV_MAX_AUDIO * 16];                   /* pre29 #69: rsn= (resync fires); absent
                                                                       * while zero — clean line unchanged */
                 ptv_stats_rsn(rsn, sizeof rsn, 0);
+                char afs[16 + (PTV_MAX_AUDIO + PTV_MAX_PASS) * 16] = "";   /* 2.0.0-pre8: afill= — current silence-fill
+                                                                      * run per track (aN transcoded, cN copied AC-3,
+                                                                      * N = input stream index); absent while none fills */
+                {
+                    int t, n = 0;
+                    for (t = 0; t < PTV_MAX_AUDIO; t++) {
+                        int64_t f = atomic_load_explicit(&g_afill_us[t], memory_order_relaxed);
+                        if (f > 0)
+                            n += snprintf(afs + n, sizeof afs - n, "%sa%d:%.1f", n ? "," : " afill=", t, f / 1e6);
+                    }
+                    for (t = 0; t < PTV_MAX_PASS && n < (int)sizeof afs - 24; t++) {
+                        int64_t f = atomic_load_explicit(&g_cfill_us[t], memory_order_relaxed);
+                        if (f > 0)
+                            n += snprintf(afs + n, sizeof afs - n, "%sc%d:%.1f", n ? "," : " afill=",
+                                          atomic_load_explicit(&g_cfill_idx[t], memory_order_relaxed), f / 1e6);
+                    }
+                }
                 char srcs[48] = "";                                 /* 2.0.0-pre3: src=/hold= (single input) */
                 if (g_src_watch) {
                     int64_t hs0 = atomic_load_explicit(&g_src_hold_start, memory_order_relaxed);
@@ -1599,9 +1616,9 @@ void *output_thread(void *arg)
                 av_log(NULL, AV_LOG_INFO,
                     "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f "
                     "dup=%"PRId64" pd=%"PRId64" drop=%"PRId64" corrupt=%"PRId64" "
-                    "async=%+"PRId64"ppm%s%s%s%s%s%s%s%s%s%s%s\n",
+                    "async=%+"PRId64"ppm%s%s%s%s%s%s%s%s%s%s%s%s\n",
                     v->emitted, fps, hh, mm, ss,
-                    v->dup, v->pd, v->framedrop, cr, aw, dlv, wu, bk, cfs, aco, rsl, crs, cvs, rsn, ccs, srcs);
+                    v->dup, v->pd, v->framedrop, cr, aw, dlv, wu, bk, cfs, aco, rsl, crs, cvs, rsn, ccs, srcs, afs);
                 stat_last = nows; stat_prev = v->emitted;
             }
         }

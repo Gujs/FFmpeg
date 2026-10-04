@@ -2942,6 +2942,8 @@ static int audio_feed(AudioState *a, AVFrame *frame)
             }
             if (g_glueclass && a->nbs_fill_active && !a->nbs_feeding) {
                 a->nbs_fill_active = 0;
+                if (a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO && !a->hold_fill_us)
+                    atomic_store_explicit(&g_afill_us[a->dbg_k], 0, memory_order_relaxed);
                 a->nbs_last_wall_us = 0;
                 a->nbs_carry_us     = 0;
                 fill_resumed = 1;
@@ -3378,6 +3380,8 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                                a->dbg_k, a->dbg_in, a->hold_fill_us / 1e6);
                     a->hold_fill_us  = 0;
                     a->hold_fresh_wc = 0;
+                    if (a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO)
+                        atomic_store_explicit(&g_afill_us[a->dbg_k], 0, memory_order_relaxed);
                 }
             }
             a->glue_raw_last_us  = raw_us;
@@ -3815,6 +3819,7 @@ static void nbs_fill_quantum(AudioState *a)
         a->nbs_fill_active = 1;
         a->nbs_last_wall_us = 0;
         a->nbs_carry_us     = 0;
+        a->nbs_engage_wc    = av_gettime_relative();
         av_log(NULL, AV_LOG_WARNING,
                "[PTV-ADISC] a%d(in%d) silence-fill ENGAGED — nothing decoding on this track while "
                "video flows (packets corrupt-discarded, or none arriving for 2 s); synthesizing "
@@ -3862,6 +3867,8 @@ static void nbs_fill_quantum(AudioState *a)
     }
     a->nbs_feeding = 0;
     a->nbs_fills++;
+    if (a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO)   /* 2.0.0-pre8: afill= (NBS run so far) */
+        atomic_store_explicit(&g_afill_us[a->dbg_k], av_gettime_relative() - a->nbs_engage_wc, memory_order_relaxed);
 }
 
 /* 2.0.0-pre6 (T-056 §5.1/§5.2): silence while input 0 holds. This track's door position is
@@ -3919,6 +3926,8 @@ static void hold_fill_quantum(AudioState *a)
         av_frame_free(&s);
     }
     a->hold_feeding = 0;
+    if (a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO)   /* 2.0.0-pre8: afill= */
+        atomic_store_explicit(&g_afill_us[a->dbg_k], a->hold_fill_us, memory_order_relaxed);
 }
 
 void *audio_thread(void *arg)

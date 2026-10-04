@@ -1632,6 +1632,8 @@ static int demux_pass_one(DemuxArgs *d, AVPacket *out)
                            ps->fill_n, ps->drop_n);
                 ps->fill_end = AV_NOPTS_VALUE;
                 ps->fill_n = ps->drop_n = 0;
+                if (pi < PTV_MAX_PASS)
+                    atomic_store_explicit(&g_cfill_us[pi], 0, memory_order_relaxed);
             }
             ps->arr_wc   = av_gettime_relative();
             ps->real_end = out->dts + (out->duration > 0 ? out->duration : ps->sil_dur);
@@ -1759,6 +1761,9 @@ void ptv_copy_fill(DemuxArgs *d, int64_t hs, int64_t now)
                        avcodec_get_name(d->ifmt->streams[ps->in_index]->codecpar->codec_id));
             ps->fill_n  += n;
             ps->fill_end = cur;
+            atomic_store_explicit(&g_cfill_idx[pi], ps->in_index, memory_order_relaxed);   /* 2.0.0-pre8: afill= */
+            atomic_store_explicit(&g_cfill_us[pi], av_rescale_q((int64_t)ps->fill_n * ps->sil_dur, ps->in_tb,
+                                                                AV_TIME_BASE_Q), memory_order_relaxed);
         }
     }
     pthread_mutex_unlock(&d->pass_lock);

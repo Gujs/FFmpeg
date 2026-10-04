@@ -5,6 +5,21 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre8 — afill= and log-volume check (T-056 §5.1/§15)
+
+- **`afill=` on the stats line** (spec §5.1), shown only while some track is being filled: the current silence-fill run
+  per track — `aN` = transcoded track N (hold fill, or the NBS fill for packets absent 2 s with video flowing), `cN` =
+  copied AC-3/E-AC-3 at input stream N. Example during a 20 s outage: `afill=a0:8.8,c2:9.0`. The log legend now also
+  documents `src=` / `hold=` (missing since pre3) and `afill=`.
+- **Log rate limits: none needed (measured).** Fleet read-only scan of sync_check's 256 KB window
+  (`test-results/t056-pre8-log-window-20261004.md`): only PTV_DIAG diagnostics (canary mosaics, NOCTOCODE) and the
+  dead-source restart loop (which 2.0 removes) shorten it, and those still keep >= 12 stats lines; 2.0's own event lines
+  are 1/min reminders and >= 3 s fill lines (busiest local fixture 165 B/s vs a ~640 B/s budget). sync_check's
+  src_state_probe was widened to the same 256 KB tail (transcoder 594ba4d).
+
+Gate (local): sync_ac3_gap_20 PASS with afill= growing on a0 and c2 through the hold, both lip-sync rulers ±25 ms;
+sync_audio_gap afill= a0 during the dropout, lip sync PASS; clean PASS with no afill=.
+
 ## 2.0.0-pre7 — fleet switch: fallback start support + waiting heartbeat (T-056 §4/§15)
 
 - **`-fallback_rebind <dur>`**: for the wrapper's fallback start (its probe failed: source dead at start, or video
