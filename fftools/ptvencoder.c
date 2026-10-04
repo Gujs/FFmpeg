@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.0-pre4"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.0-pre5"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -735,6 +735,7 @@ _Atomic int64_t g_src_hold_start;
 _Atomic int64_t g_src_vread_wc;
 int             g_src_hold_act;
 _Atomic int64_t g_src_rejoin_wall;
+_Atomic int     g_src_icb_armed;
 /* 1.0.1-pre17: sibling-slate mask (bit k = input slot k black-slated; compositor writes,
  * rscorr_event_active reads) — no mv corrector engagement while any slot is slated. */
 _Atomic int     g_mv_slate_mask;
@@ -3760,8 +3761,8 @@ static int is_net_url(const char *u)
 #define PTV_PROBING_MAX_US 300000000           /* = the NOVIDEO startup bound */
 static const char *g_start_on   = "video";
 static int64_t     g_wait_input_us;              /* 0 = wait forever */
-static int         g_backoff_s[8] = { 1, 2, 5, 10, 30 };
-static int         g_backoff_n    = 5;
+int                g_backoff_s[8] = { 1, 2, 5, 10, 30 };   /* also the 2.0.0-pre5 reopen backoff */
+int                g_backoff_n    = 5;
 
 static int parse_backoff(const char *spec)
 {
@@ -3786,10 +3787,12 @@ static int input_acquire(Input *in, int idx, const AVDictionary *opts)
         AVDictionary *o = NULL;
         char what[192];
         int ret, st, vs, wait_s;
-        int64_t now, waited;
+        int64_t now, waited, at0 = av_gettime_relative();
 
         attempt++;
         av_dict_copy(&o, opts, 0);                /* open consumes recognized entries: fresh copy per try */
+        if (!(in->ifmt = avformat_alloc_context())) { av_dict_free(&o); return AVERROR(ENOMEM); }
+        in->ifmt->interrupt_callback = (AVIOInterruptCB){ ptv_src_interrupt, NULL };   /* 2.0.0-pre5 */
         ret = avformat_open_input(&in->ifmt, in->url, NULL, &o);
         av_dict_free(&o);
         if (ret >= 0) ret = ptv_find_stream_info(in->ifmt);   /* pre19.1: tolerant AUDIO probe */
@@ -3843,12 +3846,17 @@ static int input_acquire(Input *in, int idx, const AVDictionary *opts)
             return in->open_ret;
         }
         wait_s = g_backoff_s[FFMIN(attempt, g_backoff_n) - 1];
+        if (st == 0 && ptv_url_passive(in->url))   /* no data on udp/rtp: the open listened the whole read
+                                                    * timeout already — keep only 1 s between attempt starts */
+            wait_s = 0;
         if (st != state || now >= next_note) {     /* every transition, then 1/min for 10 min, then 1/10 min */
             av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in%d %s: %s, %.0f s on %s (attempt #%d, next in %d s)\n",
                    idx, st ? "PROBING" : "WAITING", what, waited / 1e6, in->url, attempt, wait_s);
             state     = st;
             next_note = now + (waited < 600000000 ? 60000000 : 600000000);
         }
+        if (!wait_s && now - at0 < 1000000)
+            av_usleep((unsigned)(1000000 - (now - at0)));
         av_usleep((unsigned)wait_s * 1000000);
     }
 }
@@ -5353,7 +5361,9 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         /* pre17 R1: mv live net inputs reopen-retry on read error (single-input keeps
          * EOF = channel end, supervisor-owned; file inputs keep EOF = media end). */
         d->url       = inputs[kk].url;
-        d->reopen    = live && multiview && is_net_url(inputs[kk].url);
+        d->reopen    = live && is_net_url(inputs[kk].url) &&                     /* 2.0.0-pre5: single input too */
+                       (multiview || !getenv("PTV_NO_REOPEN"));
+        d->single    = !multiview;
         d->ifmt_home = &inputs[kk].ifmt;
         d->disc = g_layera ? &inputs[kk].disc : NULL;   /* legacy-0004 buffer (NULL when off) */
         d->vq_shed_req = &inputs[kk].vq_shed_req;       /* 1.0.1-pre8 (a): overflow -> request head-GOP shed */

@@ -5,6 +5,46 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre5 — single-input reopen (T-056 §3, LOST)
+
+A single live network input now survives losing its source instead of ending the run (1.2.x exits rc=0 at
+the read timeout, so supervisord respawned it — 199 exits/h on a dead source).
+- **Reopen**: the mosaic reopen (`demux_reopen_once`) now also serves a single live udp/rtp/srt input. On a
+  read failure: `[PTV-SRC] in0 LOST: <reason> (no video for N s, K flushed PES tails dropped) — reopening`,
+  retry with `-reopen_backoff`, then `[PTV-SRC] in0 LOST → reopened after N s (attempt #k)`.
+- **udp/rtp attempts are the wait**: such an open only listens, for the whole read timeout, so a failed attempt
+  already waited; the backoff is not slept on top (keeps 1 s between attempt starts). Measured: with the
+  1–30 s backoff slept after each 15 s attempt, stop_300 rejoined 19 s after the source came back. The same
+  rule applies to the start-up wait (pre2 `input_acquire`) while no data arrives. srt keeps the backoff.
+- **Reshaped source exits 4**: a reopened source must match the stream count and types (mosaic rule) and, for
+  single input, also every stream's PID, language, and the video codec and size. On a mismatch:
+  `[PTV-SRC] in0 came back RESHAPED …`, exit 4 — the wrapper re-probes and builds the new plan (in-process
+  re-binding is 2.1). (3 is the wrapper's duplicate refusal.)
+- **No-video watchdogs**: an I/O interrupt callback ends a blocked read when no video packet was read for
+  `-lost_after` (a PSI-only mux keeps bytes flowing, so the read timeout never fires); video gone for
+  2 x `-lost_after` while audio keeps flowing also forces a reopen.
+- **Flushed PES tails dropped**: when a read fails, mpegts hands back its pending PES (one per call) before the
+  error, with `pb->error` already set. These pre-gap tails arrived a read timeout late and were classified as
+  a BURST rejoin — the BANK escalated to its 12 s ceiling on a plain outage. Dropped when a reopen follows.
+- **Fix (mosaic reopen too)**: the reopen validated against the LIVE stream count, so after one corrupt PID
+  (a late-born stream, T-064) a clean source never matched again and the slot retried forever; it now
+  validates against the layout at open.
+- `PTV_NO_REOPEN=1`: single input ends the run on a lost source again (1.2.x).
+
+Gate (local fixtures, 15 s read timeout): stop_20, gap_20, kill_return_20, psi_only, stop_300 survive through a
+reopen (1.2.2: rc=0 exit, or audio lost for good on psi_only); rejoin classes after the reopen BURST / LIVE
+LOSS / NEW DOMAIN as expected; reshaped_return exits 4; sync_gap_20 and sync_kill_return_20 within ±25 ms
+(unwrapped ruler); clean and bursty PASS; dead_start LIVE 0.1 s after the source appears. Still failing: wire
+gaps during the hold (pre6 fill). **pre5 must not ship without pre6 — a hold over 120 s loses audio after the
+rejoin** (gap_300, a real 300 s outage): video resumes 0.1 s after the source (house_skew carried the hole, then
+snaps to 0 = one output PCR jump), but audio emitted nothing during the hold, so its whole +300 s hole is still
+open; padding it would burst 300 s of silence, the 120 s wall-evidence hardcap folds it instead → audio 300 s
+early, never delivered. 1.2.x never reached this (a lost input ended the run at the read timeout). pre6's hold
+fill keeps audio's output position moving through the hold, so only the uncovered seconds remain; gap_300 is a
+pre6 gate. Open (T-076):
+our own audio queue sheds after a reopen — psi_only shows ~4 s of 1–2 s silent windows after video returns,
+stop_20 6.6 s of silence after a 20 s catch-up burst (beyond the 12 s BANK ceiling; tsp regulate artifact).
+
 ## 2.0.0-pre4 (in progress) — act on a source hold (T-056 §3/§5.5)
 
 **pre4c, PES-tail wall-gap carry (2026-10-04) — fixes the LIVE LOSS +10 s desync, a 1.2.x bug.** The pre4a

@@ -1,3 +1,4 @@
+#include <unistd.h>   /* _exit() — 2.0.0-pre5 reshaped-source exit, the pre26 wedge-free fatal path */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2157,12 +2158,60 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
  * dispatch mis-indexed packets. Returns 0 on success (d->ifmt swapped + published), <0 on a
  * failed attempt (caller backs off and retries forever — owner mandate: everything
  * auto-resumes after ANY outage). */
-static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const uint8_t *old_types)
+/* 2.0.0-pre5: what a reopen must find again. Mosaic slots compare count + types (as since pre17);
+ * a single input also compares PID, language and the video codec / coded size — a same-shape PID
+ * swap would otherwise mis-bind tracks, and a size change would break the filtergraph. */
+typedef struct ReopenShape {
+    uint8_t type;
+    int     id, codec_id, w, h;
+    char    lang[8];
+} ReopenShape;
+
+#define PTV_REOPEN_RESHAPED AVERROR(EPROTO)   /* single input: the source came back different */
+
+static void reopen_shape_fill(ReopenShape *sh, const AVStream *st)
+{
+    const AVDictionaryEntry *lg = av_dict_get(st->metadata, "language", NULL, 0);
+    sh->type     = (uint8_t)st->codecpar->codec_type;
+    sh->id       = st->id;
+    sh->codec_id = st->codecpar->codec_id;
+    sh->w        = st->codecpar->width;
+    sh->h        = st->codecpar->height;
+    snprintf(sh->lang, sizeof sh->lang, "%s", lg ? lg->value : "");
+}
+
+/* 2.0.0-pre5: AVIOInterruptCB for the single input. A source that keeps sending PSI / nulls but no
+ * video never returns from av_read_frame and never trips the read timeout (bytes keep arriving):
+ * cut the blocked read once no video packet was read for -lost_after. Armed only while the demux
+ * thread runs (never during the start-up probe); the reopen loop re-stamps the read clock so each
+ * new open gets a full -lost_after. Must be set BEFORE avformat_open_input (the URLContext copies it). */
+int ptv_src_interrupt(void *opaque)
+{
+    int64_t vr;
+    (void)opaque;
+    if (!atomic_load_explicit(&g_src_icb_armed, memory_order_relaxed))
+        return 0;
+    vr = atomic_load_explicit(&g_src_vread_wc, memory_order_relaxed);
+    return vr && av_gettime_relative() - vr > g_lost_after_us;
+}
+
+/* 1.0.1-pre17 fix round (R1): reopen a live mv net input after a read error (2.0.0-pre5: and a single
+ * input). Closes the dead context FIRST (its udp socket must release the port before the re-bind, or the
+ * stale circular-buffer reader keeps draining the datagrams), then open/find with a COPY of the original
+ * format opts, then validate the stream layout against the layout AT OPEN (streams born later — T-064 — are
+ * not part of it): the demux-side per-stream arrays and every consumed index were sized and resolved
+ * against it. Returns 0 on success (d->ifmt swapped + published), PTV_REOPEN_RESHAPED when a single input
+ * came back different, other <0 on a failed attempt (caller backs off and retries). */
+static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const ReopenShape *old)
 {
     AVFormatContext *nf = NULL;
     AVDictionary *o2 = NULL;
     int r;
     unsigned i;
+    if (!(nf = avformat_alloc_context()))
+        return AVERROR(ENOMEM);
+    if (d->single)
+        nf->interrupt_callback = (AVIOInterruptCB){ ptv_src_interrupt, NULL };
     av_dict_copy(&o2, d->reopen_opts, 0);
     r = avformat_open_input(&nf, d->url, NULL, &o2);
     av_dict_free(&o2);
@@ -2172,12 +2221,21 @@ static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const uint8_t *old_t
     if (r < 0)
         goto bad;
     nf->max_probe_packets = 1;      /* 1.2.2 T-073: no codec probe for streams born after the open */
-    r = AVERROR(EINVAL);
+    r = d->single ? PTV_REOPEN_RESHAPED : AVERROR(EINVAL);
     if (nf->nb_streams != old_nb)
         goto bad;
-    for (i = 0; i < old_nb; i++)
-        if ((uint8_t)nf->streams[i]->codecpar->codec_type != old_types[i])
+    for (i = 0; i < old_nb; i++) {
+        ReopenShape now;
+        reopen_shape_fill(&now, nf->streams[i]);
+        if (now.type != old[i].type)
             goto bad;
+        if (d->single &&
+            (now.id != old[i].id || strcmp(now.lang, old[i].lang) ||
+             (now.type == AVMEDIA_TYPE_VIDEO &&
+              (now.codec_id != old[i].codec_id ||
+               (now.w && old[i].w && (now.w != old[i].w || now.h != old[i].h))))))
+            goto bad;
+    }
     d->ifmt = nf;
     if (d->ifmt_home) *d->ifmt_home = nf;      /* teardown close target follows the swap */
     d->reopen_cnt++;
@@ -2189,6 +2247,9 @@ static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const uint8_t *old_t
            "fresh join (slate/recovery machinery downstream)\n", d->url, d->reopen_cnt);
     return 0;
 bad:
+    if (r == PTV_REOPEN_RESHAPED)
+        av_log(NULL, AV_LOG_ERROR, "[PTV-SRC] in0 came back RESHAPED (%u streams, was %u; or a PID, language, "
+               "video codec or size changed) on %s\n", nf->nb_streams, old_nb, d->url);
     avformat_close_input(&nf);
     return r;
 }
@@ -2201,6 +2262,10 @@ void *demux_thread(void *arg)
     AVPacket *pkt = av_packet_alloc();
     int64_t diag_last = av_gettime_relative();
     int ret = 0;
+    int rd_ret = 0, rd_force = 0;   /* 2.0.0-pre5: read result / forced reopen */
+
+    if (d->reopen && d->single)     /* 2.0.0-pre5: the no-video read interrupt goes live with the thread */
+        atomic_store_explicit(&g_src_icb_armed, 1, memory_order_relaxed);
 
     if (!pkt)
         goto end;
@@ -2219,19 +2284,37 @@ void *demux_thread(void *arg)
                                   av_thread_message_queue_nb_elems(d->video_q),
                                   memory_order_relaxed);
         }
-        if (av_read_frame(d->ifmt, pkt) < 0) {
+        {   /* 2.0.0-pre5: video gone while other packets (audio) keep flowing — reopen after 2 x -lost_after */
+            int64_t vr = atomic_load_explicit(&g_src_vread_wc, memory_order_relaxed);
+            rd_force = d->reopen && d->single && vr &&
+                       av_gettime_relative() - vr > 2 * g_lost_after_us;
+        }
+        if (rd_force || (rd_ret = av_read_frame(d->ifmt, pkt)) < 0) {
             /* pre17 R1: a live mv net input must NEVER EOF-latch its slot (rw_timeout expiry
              * on a >=30min outage previously slated the cell forever AND held the corrector
              * mosaic-wide via the slate mask). Reopen-retry with bounded backoff, forever;
              * validation failures (source reshaped) keep retrying too. The old ctx keeps
              * carrying the reads until a validated replacement lands. */
             if (d->reopen) {
-                unsigned old_nb = d->ifmt->nb_streams, oi;
-                uint8_t old_types[64];
-                int64_t backoff = 1000000, rlog = 0;
+                /* the layout AT OPEN: streams lavf added later (T-064) are not part of it — with the
+                 * live count a clean source never matched again after one corrupt PID */
+                unsigned old_nb = d->nb_streams_open, oi;
+                ReopenShape old_shape[64];
+                int64_t backoff = 1000000, rlog = 0, lost_t0 = av_gettime_relative();
+                int attempt = 0;
                 if (old_nb > 64) old_nb = 64;      /* validation window (mpegts programs are small) */
                 for (oi = 0; oi < old_nb; oi++)
-                    old_types[oi] = (uint8_t)d->ifmt->streams[oi]->codecpar->codec_type;
+                    reopen_shape_fill(&old_shape[oi], d->ifmt->streams[oi]);
+                if (d->single) {
+                    int64_t vr = atomic_load_explicit(&g_src_vread_wc, memory_order_relaxed);
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 LOST: %s (no video for %.1f s, %d flushed "
+                           "PES tails dropped) — reopening\n",
+                           rd_force ? "video gone while other packets flow" : av_err2str(rd_ret),
+                           vr ? (lost_t0 - vr) / 1e6 : 0.0, d->tail_flushed);
+                    d->tail_flushed = 0;
+                    atomic_store_explicit(&g_src_icb_armed, 0, memory_order_relaxed);
+                }
+                rd_force = 0;
                 /* Close the dead ctx BEFORE retrying: its udp socket (with the fifo reader
                  * thread) stays bound otherwise and STEALS the datagrams from the re-bind —
                  * measured: the reopen loop failed forever after the source resumed (r1 gate,
@@ -2241,20 +2324,61 @@ void *demux_thread(void *arg)
                 for (;;) {
                     if (g_t_us > 0 && atomic_load_explicit(&g_t_stop, memory_order_relaxed))
                         goto end;                  /* rider (b): -t ends the retry-forever loop too */
-                    if (demux_reopen_once(d, old_nb, old_types) >= 0)
+                    int rr;
+                    int64_t at0;
+                    if (d->single) {   /* each attempt gets a full -lost_after before the no-video cut */
+                        atomic_store_explicit(&g_src_vread_wc, av_gettime_relative(), memory_order_relaxed);
+                        atomic_store_explicit(&g_src_icb_armed, 1, memory_order_relaxed);
+                    }
+                    attempt++;
+                    at0 = av_gettime_relative();
+                    rr = demux_reopen_once(d, old_nb, old_shape);
+                    if (rr >= 0)
                         break;
+                    if (rr == PTV_REOPEN_RESHAPED) {
+                        /* 2.0.0 exits for a supervised respawn: the wrapper re-probes and builds the new
+                         * plan (in-process re-binding is 2.1). Exit 4 (3 = the wrapper's duplicate refusal). */
+                        av_log(NULL, AV_LOG_ERROR, "[PTV-SRC] in0 reshaped source — exiting 4 for a re-probe\n");
+                        fflush(NULL);
+                        _exit(4);
+                    }
+                    if (d->single) {
+                        backoff = (int64_t)g_backoff_s[FFMIN(attempt, g_backoff_n) - 1] * 1000000;
+                        if (ptv_url_passive(d->url))   /* the attempt was the wait; keep 1 s between starts
+                                                          * (measured: stop_300 rejoined 19 s after the source) */
+                            backoff = FFMAX(0, 1000000 - (av_gettime_relative() - at0));
+                        atomic_store_explicit(&g_src_icb_armed, 0, memory_order_relaxed);
+                    }
                     if (!rlog || av_gettime_relative() - rlog > 30000000) {
                         rlog = av_gettime_relative();
-                        av_log(NULL, AV_LOG_WARNING,
-                               "[PTV-REOPEN] input '%s' still down — retrying (backoff %.0fs)\n",
-                               d->url, backoff / 1e6);
+                        if (d->single)
+                            av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 LOST %.0f s on %s — reopen attempt #%d "
+                                   "failed (%s), next in %.0f s\n", (av_gettime_relative() - lost_t0) / 1e6,
+                                   d->url, attempt, av_err2str(rr), backoff / 1e6);
+                        else
+                            av_log(NULL, AV_LOG_WARNING,
+                                   "[PTV-REOPEN] input '%s' still down — retrying (backoff %.0fs)\n",
+                                   d->url, backoff / 1e6);
                     }
-                    av_usleep((unsigned)backoff);
-                    if (backoff < 5000000) backoff += 1000000;
+                    if (backoff > 0)
+                        av_usleep((unsigned)backoff);
+                    if (!d->single && backoff < 5000000) backoff += 1000000;
                 }
+                if (d->single)
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 LOST \xe2\x86\x92 reopened after %.1f s (attempt #%d)\n",
+                           (av_gettime_relative() - lost_t0) / 1e6, attempt);
                 continue;
             }
             break;
+        }
+        /* 2.0.0-pre5: a failed read makes mpegts hand back its pending PES (one per call) BEFORE the
+         * error; pb->error is already set. These are pre-gap tails arriving a read timeout late:
+         * classified as a rejoin they armed a false BURST (BANK to 12 s) and re-stamped video arrival.
+         * The reopen follows, so drop them (a lone stale frame/audio frame under a hold). */
+        if (d->reopen && d->single && d->ifmt->pb && d->ifmt->pb->error) {
+            d->tail_flushed++;
+            av_packet_unref(pkt);
+            continue;
         }
         /* 1.2.2 T-064: lavf adds an AVStream mid-run for every new PMT PID and, with auto_guess,
          * for any unknown PID that starts a PES — one corrupt TS header after an outage is enough.

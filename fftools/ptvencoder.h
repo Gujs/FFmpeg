@@ -1604,6 +1604,8 @@ typedef struct DemuxArgs {
                                             * (wrap_*, edit_us, gap_vsnap, wall_cad_us, pkt_wall_gap_us,
                                             * disc) were sized for at open */
     int                   late_stream_max; /* 1.2.2 T-064: highest late-born stream index logged */
+    int                   single;           /* 2.0.0-pre5: single-input run (strict reshape check, exit 4) */
+    int                   tail_flushed;     /* 2.0.0-pre5: PES tails mpegts flushed at a read error, dropped */
     int64_t               src_last_vdts_raw; /* 2.0.0-pre3: last video DTS, raw 33-bit (stream tb) */
     int64_t               src_last_vwall;   /* 2.0.0-pre3: wall us of that packet */
     int                   src_classified;   /* 2.0.0-pre3: rejoin of the current hold already classified */
@@ -1973,6 +1975,15 @@ extern _Atomic int64_t g_src_vread_wc;   /* wall us of the last video packet REA
 extern int             g_src_hold_act;   /* 2.0.0-pre4: act on STALLED (engine freeze, accounting); 0 = observe
                                           * only (PTV_HOLD_OBSERVE=1, the pre3 behaviour) */
 extern _Atomic int64_t g_src_rejoin_wall; /* 2.0.0-pre4: wall us of the last STALLED -> LIVE (0 = never) */
+extern _Atomic int     g_src_icb_armed;   /* 2.0.0-pre5: the no-video read interrupt is live (single input) */
+extern int             g_backoff_s[8], g_backoff_n;   /* -reopen_backoff (s), 2.0.0-pre2/pre5 */
+int ptv_src_interrupt(void *opaque);     /* 2.0.0-pre5: AVIOInterruptCB — no video read for -lost_after */
+/* 2.0.0-pre5: a udp/rtp open is passive — it listens for the whole read timeout, so a failed attempt
+ * already waited; sleeping a backoff on top only delays the rejoin (no remote peer to spare) */
+static inline int ptv_url_passive(const char *u)
+{
+    return u && (!strncmp(u, "udp://", 6) || !strncmp(u, "rtp://", 6));
+}
 /* 2.0.0-pre4: an input-0 hold is in progress and acted on (single input only) */
 static inline int ptv_src_holding(void)
 {
