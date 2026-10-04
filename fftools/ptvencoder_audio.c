@@ -2695,23 +2695,58 @@ static void ptv_rebuild_reanchor(AudioState *a, const AVFrame *frame)
 }
 
 /* Feed one h0-anchored decoded audio frame into the -af graph (or swr fallback). */
+/* 2.0.0-pre8.1: may the real frames buffered after a filled hold go to the door now? */
+static int rj_release_ok(AudioState *a)
+{
+    int64_t now = av_gettime_relative();
+    int64_t rj  = atomic_load_explicit(&g_src_rejoin_wall, memory_order_relaxed);
+    if (a->rj_t0 && now - a->rj_t0 > 4000000)
+        return 1;                                            /* bounded: never hold audio longer */
+    if (!ptv_src_holding() && rj <= a->hold_fill_wc0)       /* a short repeat run, no hold: a fresh frame after */
+        return atomic_load_explicit(&g_src_fresh_wc, memory_order_acquire) > a->hold_fill_last_wc;   /* the fill */
+    if (ptv_src_holding())
+        return 0;                                            /* the hold is not over */
+    if (atomic_load_explicit(&g_rj_cls_seq, memory_order_acquire) == a->rj_cls_seq0)
+        return 0;                                            /* rejoin not classified yet */
+    switch (atomic_load_explicit(&g_rj_cls, memory_order_relaxed)) {
+    case 1:  return 1;                                       /* BURST: house_skew carries over */
+    case 2:  return atomic_load_explicit(&g_src_jump_wc, memory_order_relaxed) >= rj;   /* LIVE LOSS: the jump shown */
+    default: return atomic_load_explicit(&g_src_jump_wc, memory_order_relaxed) >= rj || now - rj > 200000;   /* NEW
+                                                              * DOMAIN: LAYERA re-bases the new timeline onto the old
+                                                              * one (no jump, no house_skew snap) — 1 s of holding cost
+                                                              * a 0.9 s dark wire (delivery gate) for nothing */
+    }
+}
+
+static void rj_flush(AudioState *a);
+
 static int audio_feed(AudioState *a, AVFrame *frame)
 {
     uint8_t **out = NULL;
     int out_max, got, ret = 0;
     if (frame->best_effort_timestamp != AV_NOPTS_VALUE)
         a->dbg_last_src = frame->best_effort_timestamp;   /* probe: latest fed source pts */
-    /* 2.0.0-pre6: the first REAL frame after a filled hold waits (bounded) for the hold to end. Video
-     * publishes the post-rejoin house_skew on the tick that ends the hold; fed earlier, this frame met the
-     * stale (hold-grown) value — a LIVE LOSS rejoin then counted the hole twice at the door (labels +W and
-     * house_skew +W): aresample padded ~W and dropped it again at the snap, ~18 s of the program's audio
-     * replaced by silence after a 20 s outage (measured, also on pre5 without fill). Waits for the first
-     * fresh frame after the fill began (the hold-ending tick, or the end of a shorter repeat run). */
-    if (!a->hold_feeding && a->hold_fill_us) {
-        int64_t w0 = av_gettime_relative();
-        while (atomic_load_explicit(&g_src_fresh_wc, memory_order_acquire) < a->hold_fill_wc0 &&
-               av_gettime_relative() - w0 < 3000000)
-            av_usleep(5000);
+    /* 2.0.0-pre6/pre8.1: real frames after a filled hold must meet the POST-rejoin house_skew. It is written on the
+     * tick that shows the post-gap content; fed earlier, a LIVE LOSS rejoin counts the hole twice at the door (labels
+     * +W and the hold-grown house_skew +W): aresample pads ~W and drops it again at the snap — the program's audio
+     * replaced by silence for about the outage length (live-transcoder 2026-10-04: GB_News 45 s outage → ~47 s of
+     * silence after the source returned). pre6 BLOCKED until "a fresh frame since the fill began", which the canary
+     * showed is not enough: the fill can start while the frame queue still drains (B), and the first fresh frame
+     * after a hold can be the pre-gap PES tail while the post-gap frames are dropped until the next IDR (A). Now the
+     * frames are BUFFERED (the audio thread keeps serving fill sentinels) until rj_release_ok(). */
+    if (!a->hold_feeding && !a->rj_releasing && a->hold_fill_us && !a->rj_released) {
+        if (!rj_release_ok(a) && a->rj_n < PTV_RJ_BUF) {
+            AVFrame *c = av_frame_clone(frame);
+            if (c) {
+                if (!a->rj_n) {
+                    a->rj_t0 = av_gettime_relative();
+                    atomic_fetch_add_explicit(&g_rj_buffering, 1, memory_order_relaxed);
+                }
+                a->rj_buf[a->rj_n++] = c;
+                return 0;
+            }
+        }
+        rj_flush(a);
     }
 
     /* Source audio format change (stereo↔mono, sample-rate, fmt) at a splice: the graph/swr was
@@ -2942,6 +2977,8 @@ static int audio_feed(AudioState *a, AVFrame *frame)
             }
             if (g_glueclass && a->nbs_fill_active && !a->nbs_feeding) {
                 a->nbs_fill_active = 0;
+                if (a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO && !a->hold_fill_us)
+                    atomic_store_explicit(&g_afill_us[a->dbg_k], 0, memory_order_relaxed);
                 a->nbs_last_wall_us = 0;
                 a->nbs_carry_us     = 0;
                 fill_resumed = 1;
@@ -3378,6 +3415,8 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                                a->dbg_k, a->dbg_in, a->hold_fill_us / 1e6);
                     a->hold_fill_us  = 0;
                     a->hold_fresh_wc = 0;
+                    if (a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO)
+                        atomic_store_explicit(&g_afill_us[a->dbg_k], 0, memory_order_relaxed);
                 }
             }
             a->glue_raw_last_us  = raw_us;
@@ -3815,6 +3854,7 @@ static void nbs_fill_quantum(AudioState *a)
         a->nbs_fill_active = 1;
         a->nbs_last_wall_us = 0;
         a->nbs_carry_us     = 0;
+        a->nbs_engage_wc    = av_gettime_relative();
         av_log(NULL, AV_LOG_WARNING,
                "[PTV-ADISC] a%d(in%d) silence-fill ENGAGED — nothing decoding on this track while "
                "video flows (packets corrupt-discarded, or none arriving for 2 s); synthesizing "
@@ -3862,6 +3902,8 @@ static void nbs_fill_quantum(AudioState *a)
     }
     a->nbs_feeding = 0;
     a->nbs_fills++;
+    if (a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO)   /* 2.0.0-pre8: afill= (NBS run so far) */
+        atomic_store_explicit(&g_afill_us[a->dbg_k], av_gettime_relative() - a->nbs_engage_wc, memory_order_relaxed);
 }
 
 /* 2.0.0-pre6 (T-056 §5.1/§5.2): silence while input 0 holds. This track's door position is
@@ -3874,11 +3916,34 @@ static void nbs_fill_quantum(AudioState *a)
  * max(150 ms, 3 x its arrival cadence)):
  * a PSI-only hold keeps its real audio, and real frames arriving before the hold ends stop the fill.
  * Driven while video only repeats (master: no fresh frame for 1 s, or a hold), not only in a declared hold. */
+/* 2.0.0-pre8.1: release the frames buffered for the post-rejoin mapping (before the frame that ends the wait) */
+static void rj_flush(AudioState *a)
+{
+    a->rj_released  = 1;
+    a->rj_releasing = 1;
+    if (a->rj_n) {
+        atomic_fetch_sub_explicit(&g_rj_buffering, 1, memory_order_relaxed);
+        av_log(NULL, AV_LOG_INFO, "[PTV-SRC] a%d(in%d) %d frames held %.2f s for the post-rejoin mapping\n",
+               a->dbg_k, a->dbg_in, a->rj_n, (av_gettime_relative() - a->rj_t0) / 1e6);
+    }
+    for (int i = 0; i < a->rj_n; i++) {
+        audio_feed(a, a->rj_buf[i]);
+        av_frame_free(&a->rj_buf[i]);
+    }
+    a->rj_n = 0;
+    a->rj_releasing = 0;
+}
+
 static void hold_fill_quantum(AudioState *a)
 {
     int64_t dur_us, door, target, now = av_gettime_relative();
     int n, i, ret = 0;
 
+    /* 2.0.0-pre8.1: the wait can end between real frames — a post-gap burst is often all buffered before the video
+     * shows the jump, and the next frame came 265 ms later (sync_gap_20: a 0.32 s dark wire, video waiting for audio
+     * at the delivery gate). The sentinels keep coming while a track buffers, so look again on each. */
+    if (a->rj_n && !a->rj_released && rj_release_ok(a))
+        rj_flush(a);
     if (!a->pts_set || !a->use_fg || a->multiview || a->fg_in_rate <= 0 ||
         a->glue_raw_last_us == AV_NOPTS_VALUE || a->acomp_exp_us == AV_NOPTS_VALUE ||
         now - a->glue_wall_last_us < FFMAX(150000, 3 * a->glue_cad_us))   /* the track's own arrival cadence */
@@ -3895,7 +3960,10 @@ static void hold_fill_quantum(AudioState *a)
     if (!a->hold_fill_us) {
         a->hold_fill_wc0 = now;
         a->hold_fresh_wc = 0;
+        a->rj_released   = 0;                                /* 2.0.0-pre8.1: this fill's real frames get buffered */
+        a->rj_cls_seq0   = atomic_load_explicit(&g_rj_cls_seq, memory_order_acquire);
     }
+    a->hold_fill_last_wc = now;
     a->hold_feeding = 1;
     for (i = 0; i < n && ret >= 0; i++) {
         AVFrame *s = av_frame_alloc();
@@ -3919,6 +3987,8 @@ static void hold_fill_quantum(AudioState *a)
         av_frame_free(&s);
     }
     a->hold_feeding = 0;
+    if (a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO)   /* 2.0.0-pre8: afill= */
+        atomic_store_explicit(&g_afill_us[a->dbg_k], a->hold_fill_us, memory_order_relaxed);
 }
 
 void *audio_thread(void *arg)

@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.0-pre7"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.0-pre8.1"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -743,6 +743,12 @@ _Atomic int64_t g_src_vread_wc;
 int             g_src_hold_act;
 _Atomic int64_t g_src_rejoin_wall;
 _Atomic int64_t g_src_fresh_wc;          /* 2.0.0-pre6: wall us of the master's last FRESH frame */
+_Atomic int64_t g_afill_us[PTV_MAX_AUDIO];   /* 2.0.0-pre8: afill= */
+_Atomic int     g_rj_cls_seq, g_rj_cls;      /* 2.0.0-pre8.1 */
+_Atomic int     g_rj_buffering;
+_Atomic int64_t g_src_jump_wc;
+_Atomic int64_t g_cfill_us[PTV_MAX_PASS];
+_Atomic int     g_cfill_idx[PTV_MAX_PASS];
 _Atomic int     g_src_icb_armed;
 /* 1.0.1-pre17: sibling-slate mask (bit k = input slot k black-slated; compositor writes,
  * rscorr_event_active reads) — no mv corrector engagement while any slot is slated. */

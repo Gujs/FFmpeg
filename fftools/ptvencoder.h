@@ -1145,6 +1145,15 @@ typedef struct AudioState {
     int64_t          hold_fill_us;                    /* door time this hold's fill covered (us) */
     int64_t          hold_fill_wc0;                   /* wall us this fill began */
     int64_t          hold_fresh_wc;                   /* wall us a fresh video frame was first seen after it */
+    int64_t          nbs_engage_wc;                   /* 2.0.0-pre8: wall us the NBS fill engaged (afill=) */
+    /* 2.0.0-pre8.1: real frames after a filled hold are BUFFERED (not blocked) until video shows the post-gap
+     * content, so they meet the post-rejoin house_skew; the fill keeps running meanwhile. Sized for a BURST rejoin's
+     * catch-up (sync_stop_10: 10 s of audio decoded in 10 ms; 256 overflowed and released early, one tick off) */
+#define PTV_RJ_BUF 1024
+    AVFrame         *rj_buf[PTV_RJ_BUF];
+    int              rj_n, rj_released, rj_releasing, rj_cls_seq0;
+    int64_t          rj_t0;                           /* wall us the first frame was buffered */
+    int64_t          hold_fill_last_wc;               /* wall us of the newest fill frame */
     int64_t          nbs_last_wall_us;                /* rr15 F9: wall of the previous quantum (elapsed base) */
     int64_t          nbs_carry_us;                    /* rr15 F9: sub-frame remainder carried between quanta */
     int64_t          glue_cad_us;                     /* rr15 R2: EMA of nonzero fed-frame wall gaps (PES-burst
@@ -2037,6 +2046,15 @@ extern int             g_backoff_s[8], g_backoff_n;   /* -reopen_backoff (s), 2.
 int ptv_src_interrupt(void *opaque);     /* 2.0.0-pre5: AVIOInterruptCB — no video read for -lost_after */
 void ptv_copy_fill(struct DemuxArgs *d, int64_t hs, int64_t now);   /* 2.0.0-pre6: copied AC-3 silence */
 extern _Atomic int64_t g_acq_since;      /* 2.0.0-pre7: wall us a single input began waiting for its source (0 = not) */
+/* 2.0.0-pre8 (T-056 §5.1): the stats line's afill= — current silence-fill run per transcoded track (hold or NBS fill)
+ * and per copied AC-3/E-AC-3 stream (us; 0 = not filling) */
+extern _Atomic int64_t g_afill_us[PTV_MAX_AUDIO];
+extern _Atomic int     g_rj_buffering;           /* 2.0.0-pre8.1: tracks buffering real frames for the post-rejoin mapping */
+extern _Atomic int     g_rj_cls_seq, g_rj_cls;   /* 2.0.0-pre8.1: rejoin classified (seq++), class 1 BURST 2 LIVE LOSS 3 NEW DOMAIN */
+extern _Atomic int64_t g_src_jump_wc;            /* 2.0.0-pre8.1: wall us the master last showed a fresh frame whose content
+                                                  * jumped > 0.5 s from the previous fresh one (stored after house_skew) */
+extern _Atomic int64_t g_cfill_us[PTV_MAX_PASS];
+extern _Atomic int     g_cfill_idx[PTV_MAX_PASS];   /* input stream index of that copy */
 void ptv_acq_heartbeat(void);            /* 2.0.0-pre7: `src=waiting` stats heartbeat while acquiring */
 /* 2.0.0-pre5: a udp/rtp open is passive — it listens for the whole read timeout, so a failed attempt
  * already waited; sleeping a backoff on top only delays the rejoin (no remote peer to spare) */

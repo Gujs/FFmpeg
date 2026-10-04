@@ -305,7 +305,13 @@ void ptv_print_log_legend(int full)
         "             an encoder error, or a mux queue already closed. A steady climb is a real\n"
         "             fault.\n"
         "             [PTV-CC] also logs the first caption, QUIET/RESUMED, timeline resets and a\n"
-        "             final a53/caps/erase/keep/err/drop/bump/reset/eheld/elate/mrect/ccmux tally.\n");
+        "             final a53/caps/erase/keep/err/drop/bump/reset/eheld/elate/mrect/ccmux tally.\n"
+        "  src        (2.0.0, single input) source state: live | stalled (+ hold=<s> since the hold\n"
+        "             began) | waiting (+ hold=<s>, before the first picture, on a frame=0 heartbeat line).\n"
+        "             sync_check alerts instead of restarting while it is not live.\n"
+        "  afill      (2.0.0, shown while filling) silence-fill run so far, per track: aN = transcoded\n"
+        "             track N (source gone, or its packets absent 2 s with video flowing), cN = copied\n"
+        "             AC-3/E-AC-3 at input stream N (silent frames of its own codec).\n");
     av_log(NULL, AV_LOG_INFO,
         "discontinuity events (always-on since v0.9.13; were PTV_DIAG-only):\n"
         "  [PTV-LAYERA]   jump = a >1s splice detected (buffering starts); flush = the glue applied\n"
