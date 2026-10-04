@@ -5,6 +5,28 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre7 — fleet switch: fallback start support + waiting heartbeat (T-056 §4/§15)
+
+- **`-fallback_rebind <dur>`**: for the wrapper's fallback start (its probe failed: source dead at start, or video
+  without a size yet, so it started us with a minimal plan). Once the input has been continuously LIVE this long (a
+  hold resets the count) ptvencoder exits 5 once: supervisord restarts ptvencoder.sh, which probes the now-live source
+  and starts the full plan (CC, -max_res trim, every audio track, -r). Exits like the reshaped-source path.
+  `[PTV-SRC] in0 live for N s under the fallback start → exiting 5 …`.
+- **`src=waiting` heartbeat**: while a single input waits for its source at start there was no stats line, so
+  sync_check could not tell a channel waiting on purpose from a wedged one. Every -stats_period while acquiring:
+  `frame=    0 fps=0.0 src=waiting hold=N` (printed from the I/O interrupt callback during the blocking open, and
+  between attempts).
+- Fleet side (transcoder repo, branch `t056-pre7`): ptvencoder.sh fallback start (`SV_FALLBACK_START`, default true;
+  a 1.x binary gets the old command), `SV_LOST_AFTER` (read timeout = -lost_after, default 30 s), `SV_HOLD`,
+  `SV_FREEZE_MAX`, `SV_START_ON`; sync_check reads `src=` and alerts instead of restarting a channel whose source is
+  gone (T-006). MET watchdog change note for Alen: `analysis/t056-met-watchdog-change-T067.md` (T-067).
+
+Gate (local): dead_start PASS with the heartbeat every stats period while waiting; clean + `-fallback_rebind 20s` →
+exit 5 at 22.6 s (20 s after output start); gap_20 + `-fallback_rebind 30s` → the hold resets the count, exit 5 30 s
+after the rejoin; gap_20 PASS. sync_check's probe reads these logs as `HOLD waiting 25` / `HOLD stalled 11` / `LIVE`.
+Wrapper: stubbed end-to-end runs (bash 5) — dead and no-size probes start ptvencoder with the minimal plan +
+`-fallback_rebind 60s`, a live probe builds today's plan, a 1.x binary and `SV_FALLBACK_START=false` keep the old exit 2.
+
 ## 2.0.0-pre6.1 — no output PTS jump at a rejoin (T-077)
 
 Measured cause: as the frame queue drains at the start of a real outage, WUCR's rate servo hits its clamp

@@ -2311,10 +2311,31 @@ static void reopen_shape_fill(ReopenShape *sh, const AVStream *st)
  * cut the blocked read once no video packet was read for -lost_after. Armed only while the demux
  * thread runs (never during the start-up probe); the reopen loop re-stamps the read clock so each
  * new open gets a full -lost_after. Must be set BEFORE avformat_open_input (the URLContext copies it). */
+/* 2.0.0-pre7 (T-056 §4/§15): while a single input waits for its source at start there is no stats line, so a channel
+ * waiting on purpose looked like a wedged process to sync_check (it trusts a src= reading newer than 2 x the stats
+ * period). Print a stats-format heartbeat every -stats_period while acquiring. The open blocks for up to the read
+ * timeout, so this runs from the I/O interrupt callback lavf polls during it, and between attempts. */
+_Atomic int64_t g_acq_since;
+static _Atomic int64_t g_acq_hb_last;
+void ptv_acq_heartbeat(void)
+{
+    int64_t t0 = atomic_load_explicit(&g_acq_since, memory_order_relaxed), now, last;
+    if (!t0 || !g_stats)
+        return;
+    now  = av_gettime_relative();
+    last = atomic_load_explicit(&g_acq_hb_last, memory_order_relaxed);
+    if (last && now - last < g_stats_period_us)
+        return;
+    if (!atomic_compare_exchange_strong(&g_acq_hb_last, &last, now))
+        return;
+    av_log(NULL, AV_LOG_INFO, "frame=    0 fps=0.0 src=waiting hold=%.1f\n", (now - t0) / 1e6);
+}
+
 int ptv_src_interrupt(void *opaque)
 {
     int64_t vr;
     (void)opaque;
+    ptv_acq_heartbeat();
     if (!atomic_load_explicit(&g_src_icb_armed, memory_order_relaxed))
         return 0;
     vr = atomic_load_explicit(&g_src_vread_wc, memory_order_relaxed);

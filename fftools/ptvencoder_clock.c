@@ -789,6 +789,7 @@ void *output_thread(void *arg)
     VideoCtx *v = arg;
     AVFrame *held = av_frame_alloc();
     AVFrame *blk  = NULL;                   /* 2.0.0-pre6: black twin of held (-hold black / -freeze_max) */
+    int64_t fb_live_since = 0;              /* 2.0.0-pre7: -fallback_rebind continuous-LIVE start (master) */
     int blk_logged = 0;
     AVFrame *f;
     int have = 0, ret = 0;
@@ -1378,6 +1379,23 @@ void *output_thread(void *arg)
             }
             if (fresh)   /* after this tick's house_skew write and state change (audio waits on it, pre6) */
                 atomic_store_explicit(&g_src_fresh_wc, nw, memory_order_release);
+        }
+        /* 2.0.0-pre7 (T-056 §4): -fallback_rebind — the wrapper started us with the minimal fallback plan because
+         * its probe failed (dead at start, video 0x0). Once the input has been continuously LIVE (no hold) this
+         * long, exit 5 once: the wrapper re-probes the now-live source and starts the full plan (CC, -max_res
+         * trim, every audio track, overrides). Exit like the reshaped-source path (live UDP has no trailer). */
+        if (g_fallback_rebind_us > 0 && v->is_master) {
+            int64_t nw = av_gettime_relative();
+            if (ptv_src_holding())
+                fb_live_since = 0;
+            else if (!fb_live_since)
+                fb_live_since = nw;
+            else if (nw - fb_live_since >= g_fallback_rebind_us) {
+                av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 live for %.0f s under the fallback start \xe2\x86\x92 "
+                       "exiting 5 for a re-probe and the full plan (-fallback_rebind)\n", (nw - fb_live_since) / 1e6);
+                fflush(NULL);
+                _exit(5);
+            }
         }
         /* 2.0.0-pre6 (T-056 §5.1/§5.2): while video only repeats (no fresh frame for 120 ms, or input 0 holds),
          * every transcoded track gets a fill sentinel per 100 ms — its thread is otherwise blocked on an empty

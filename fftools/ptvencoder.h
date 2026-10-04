@@ -2022,6 +2022,7 @@ extern int             g_src_watch;      /* detection armed (single live input, 
 extern int64_t         g_stall_min_us;   /* -stall_min (default 3 s, fleet-measured) */
 extern int             g_hold_black;     /* 2.0.0-pre6: -hold black */
 extern int64_t         g_freeze_max_us;  /* 2.0.0-pre6: -freeze_max, 0 = inf */
+extern int64_t         g_fallback_rebind_us;   /* 2.0.0-pre7: -fallback_rebind, 0 = off */
 extern int64_t         g_lost_after_us;  /* -lost_after (default 30 s); pre3: observe only */
 extern _Atomic int     g_src_state;      /* 0 = LIVE, 1 = STALLED */
 extern _Atomic int64_t g_src_hold_start; /* wall us the hold began (0 = not holding) */
@@ -2035,6 +2036,8 @@ extern _Atomic int     g_src_icb_armed;   /* 2.0.0-pre5: the no-video read inter
 extern int             g_backoff_s[8], g_backoff_n;   /* -reopen_backoff (s), 2.0.0-pre2/pre5 */
 int ptv_src_interrupt(void *opaque);     /* 2.0.0-pre5: AVIOInterruptCB — no video read for -lost_after */
 void ptv_copy_fill(struct DemuxArgs *d, int64_t hs, int64_t now);   /* 2.0.0-pre6: copied AC-3 silence */
+extern _Atomic int64_t g_acq_since;      /* 2.0.0-pre7: wall us a single input began waiting for its source (0 = not) */
+void ptv_acq_heartbeat(void);            /* 2.0.0-pre7: `src=waiting` stats heartbeat while acquiring */
 /* 2.0.0-pre5: a udp/rtp open is passive — it listens for the whole read timeout, so a failed attempt
  * already waited; sleeping a backoff on top only delays the rejoin (no remote peer to spare) */
 static inline int ptv_url_passive(const char *u)

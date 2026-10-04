@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.0-pre6.1"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.0-pre7"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -735,6 +735,7 @@ int             g_src_watch;                       /* 2.0.0-pre3: see ptvencoder
 int64_t         g_stall_min_us  = 3000000;
 int             g_hold_black    = 0;          /* 2.0.0-pre6: -hold black (default freeze) */
 int64_t         g_freeze_max_us = 30000000;   /* 2.0.0-pre6: -freeze_max (0 = inf) */
+int64_t         g_fallback_rebind_us = 0;     /* 2.0.0-pre7: -fallback_rebind (0 = off) */
 int64_t         g_lost_after_us = 30000000;
 _Atomic int     g_src_state;
 _Atomic int64_t g_src_hold_start;
@@ -3890,7 +3891,7 @@ static AVPacket *silent_copy_frame(const AVCodecParameters *par, AVRational tb, 
     return p;
 }
 
-static int input_acquire(Input *in, int idx, const AVDictionary *opts)
+static int input_acquire_loop(Input *in, int idx, const AVDictionary *opts)
 {
     int64_t t0 = av_gettime_relative(), next_note = 0, probing_since = 0;
     int attempt = 0, state = -1;                  /* 0 = WAITING (no data), 1 = PROBING (no video geometry) */
@@ -3969,8 +3970,22 @@ static int input_acquire(Input *in, int idx, const AVDictionary *opts)
         }
         if (!wait_s && now - at0 < 1000000)
             av_usleep((unsigned)(1000000 - (now - at0)));
-        av_usleep((unsigned)wait_s * 1000000);
+        for (; wait_s > 0; wait_s--) {               /* backoff in 1 s steps: the heartbeat keeps going */
+            ptv_acq_heartbeat();
+            av_usleep(1000000);
+        }
+        ptv_acq_heartbeat();
     }
+}
+
+/* 2.0.0-pre7: the acquire loop with the `src=waiting` heartbeat armed for its whole duration */
+static int input_acquire(Input *in, int idx, const AVDictionary *opts)
+{
+    int ret;
+    atomic_store_explicit(&g_acq_since, av_gettime_relative(), memory_order_relaxed);
+    ret = input_acquire_loop(in, idx, opts);
+    atomic_store_explicit(&g_acq_since, 0, memory_order_relaxed);
+    return ret;
 }
 
 /* ==================== deterministic output PID plan (-pid_plan) ====================
@@ -5745,6 +5760,7 @@ static const OptionDef ptv_options[] = {
     { "lost_after",       OPT_TYPE_STRING, 0,                        { .off = 0 }, "no video packets this long = LOST (default 30s)", "dur" },
     { "hold",             OPT_TYPE_STRING, 0,                        { .off = 0 }, "picture while the input is gone: freeze (default) | black", "mode" },
     { "freeze_max",       OPT_TYPE_STRING, 0,                        { .off = 0 }, "frozen picture this long, then black (default 30s; inf = keep)", "dur" },
+    { "fallback_rebind",  OPT_TYPE_STRING, 0,                        { .off = 0 }, "wrapper fallback start: exit 5 once the input has been live this long, for a re-probe", "dur" },
     { "reopen_backoff",   OPT_TYPE_STRING, 0,                        { .off = 0 }, "seconds between input attempts, the last repeats (default 1,2,5,10,30)", "list" },
     { "abort_on",         OPT_TYPE_STRING, 0,                        { .off = 0 }, "abort conditions", "flags" },
     /* per-output structural options (walked from g->opts[]) */
@@ -6496,6 +6512,11 @@ int main(int argc, char **argv)
                 av_log(NULL, AV_LOG_ERROR, "-freeze_max %s: expected a duration or inf\n", v);
                 uninit_parse_context(&octx); return 1;
             }
+        }
+        if (!strcmp(octx.global_opts.opts[gi].key, "fallback_rebind") &&     /* 2.0.0-pre7 */
+            (av_parse_time(&g_fallback_rebind_us, octx.global_opts.opts[gi].val, 1) < 0 || g_fallback_rebind_us <= 0)) {
+            av_log(NULL, AV_LOG_ERROR, "-fallback_rebind %s: expected a duration\n", octx.global_opts.opts[gi].val);
+            uninit_parse_context(&octx); return 1;
         }
         if (!strcmp(octx.global_opts.opts[gi].key, "reopen_backoff") &&
             parse_backoff(octx.global_opts.opts[gi].val) < 0) {
