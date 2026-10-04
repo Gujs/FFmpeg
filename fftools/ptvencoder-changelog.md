@@ -5,6 +5,25 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre8.2 — rejoin trace for the canary GB_News PTS jump (diagnostics only)
+
+No behaviour change. The pre8.1 canary drop tests (live-transcoder 2026-10-04,
+`test-results/t056-canary-drops-pre81-20261004/REPORT.md`) confirmed the audio fix on all three channels, but GB_News
+(B: 45 s outage, LOST → reopen) jumped its output video PTS +2.24 s at the rejoin: house_skew read +40 ms afterwards
+(A/C/pre7-B: about −2.1 s), i.e. the clock emitted the post-gap frames at their RAW position — the rejoin map was logged
+("content 2.40 s ahead … mapped") but did not take effect, and the map decision came 0.9 s after the keyframe resume
+(0.04 s everywhere else). Audio padded the same +2.24 s, so A/V stayed aligned (external oracle on source + output
+captures: introduced −44 ms); viewers got a ~2 s glitch and 1.5–2.2 s of extra silence. Not reproduced locally —
+neither on the fixture media nor on a 190 s capture of the GB_News source (open GOP, 5 leading frames per GOP) with the
+fleet loudnorm chain and a LOST → reopen; the leading B-frames decode in display order and every frame carries the
+offset there (so keying the map lower, the first idea, would not have changed B).
+- **`[PTV-RJTRACE]`** under `PTV_DIAG` (on on the canary boxes): the first 16 frames the rejoin map examines per hold
+  (`dec src pict key pos next lead vs h0 holding`) and the first 16 master emits after each rejoin (`out src fresh content
+  last vpts rj_off from h0 vskip`) — which side drops the offset, and why the decision was late.
+- Harness (`test-scripts/t056/`): `T056_AF` (the -af chain; the fleet's loudnorm adds ~2–3 s of video delivery hold,
+  which reproduces the ~1.5 s onset pause and the post-rejoin ~0.3 s pauses seen on the box) and `T056_RATE` (sender
+  bitrate for a captured source in `T056_MEDIA`).
+
 ## 2.0.0-pre8.1 — program audio survives the rejoin (canary drop tests A/B)
 
 - **Fixed: after an outage the program audio was replaced by silence for about the outage length** (live-transcoder

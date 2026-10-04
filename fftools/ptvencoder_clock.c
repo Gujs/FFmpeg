@@ -791,6 +791,8 @@ void *output_thread(void *arg)
     AVFrame *blk  = NULL;                   /* 2.0.0-pre6: black twin of held (-hold black / -freeze_max) */
     int64_t fb_live_since = 0;              /* 2.0.0-pre7: -fallback_rebind continuous-LIVE start (master) */
     int64_t src_prev_fresh_us = AV_NOPTS_VALUE;   /* 2.0.0-pre8.1: previous fresh frame's source time (jump test) */
+    int64_t rjt_wall = 0;                   /* 2.0.0-pre8.2: [PTV-RJTRACE] rejoin being traced (PTV_DIAG) */
+    int     rjt_n = 0;
     int blk_logged = 0;
     AVFrame *f;
     int have = 0, ret = 0;
@@ -1241,6 +1243,19 @@ void *output_thread(void *arg)
             int64_t content_vpts = content_index(v, src_ts);
             vpts = (content_vpts >= 0) ? content_vpts : last_vpts + 1;
             if (vpts <= last_vpts) vpts = last_vpts + 1;   /* monotonic CFR; dup/hold -> next slot */
+            if (g_diag && v->is_master && src_ts != AV_NOPTS_VALUE) {   /* 2.0.0-pre8.2: [PTV-RJTRACE] */
+                int64_t rjw = atomic_load_explicit(&g_src_rejoin_wall, memory_order_relaxed);
+                if (rjw != rjt_wall) { rjt_wall = rjw; rjt_n = 0; }
+                if (rjw && rjt_n < 16 && (fresh || rjt_n == 0)) {
+                    int64_t su = av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q);
+                    rjt_n++;
+                    av_log(NULL, AV_LOG_INFO, "[PTV-RJTRACE] out src=%.3f fresh=%d content=%"PRId64" last=%"PRId64
+                           " vpts=%"PRId64" rj_off=%.3f from=%.3f h0=%.3f vskip=%.3f\n", su / 1e6, fresh, content_vpts,
+                           last_vpts, vpts, ptv_rj_off(su) / 1e6,
+                           atomic_load_explicit(&g_rj_from_us, memory_order_relaxed) / 1e6, *v->h0 / 1e6,
+                           atomic_load_explicit(&g_vskip_off_total, memory_order_relaxed) / 1e6);
+                }
+            }
             held->pts = vpts; held->pkt_dts = AV_NOPTS_VALUE; held->duration = 0;
             last_vpts = vpts;
             if (content_vpts >= 0)
