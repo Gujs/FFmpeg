@@ -170,6 +170,7 @@ static int64_t content_index(VideoCtx *v, int64_t src_pts)
             house_us -= off;
         }
     }
+    house_us -= ptv_rj_off(av_rescale_q(src_pts, v->out_tb, AV_TIME_BASE_Q));   /* 2.0.0-pre6.1 rejoin map */
     if (house_us < 0) house_us = 0;
     if (g_exacttick && v->out_fps.num > 0)
         return av_rescale_rnd(house_us, v->out_fps.num, 1000000LL * v->out_fps.den, AV_ROUND_NEAR_INF);
@@ -1255,8 +1256,15 @@ void *output_thread(void *arg)
             if (cadence_hold) held_extra++;
             /* house_skew keeps growing through a hold (measured 2026-10-04: freezing it made a BURST rejoin
              * 6 s audio-early — post-gap audio read the stale value before the first fresh frame updated it) */
-            if (v->is_master && v->house_skew && content_vpts >= 0)
-                *v->house_skew = (vpts - content_vpts - held_extra) * v->tick_dur_us;
+            if (v->is_master && v->house_skew && content_vpts >= 0)   /* against RAW content: −rejoin map (pre6.1) */
+                *v->house_skew = (vpts - content_vpts - held_extra) * v->tick_dur_us -
+                                 (src_ts != AV_NOPTS_VALUE ? ptv_rj_off(av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q)) : 0);
+            if (v->is_master) {        /* 2.0.0-pre6.1: the house position the decode thread maps a rejoin onto */
+                atomic_store_explicit(&g_house_out_us, v->out_fps.num > 0
+                                      ? av_rescale(vpts, 1000000LL * v->out_fps.den, v->out_fps.num)
+                                      : vpts * v->tick_dur_us, memory_order_relaxed);
+                atomic_store_explicit(&g_house_tick_us, v->tick_dur_us, memory_order_relaxed);
+            }
             if (src_ts != AV_NOPTS_VALUE)   /* [PTV-CHAIN] video source-content being emitted (us); any rung (same content) */
                 atomic_store_explicit(&g_ch_vout_src, av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q), memory_order_relaxed);
             /* A/V probe (read-only): record this distinct content's first-display output time so the

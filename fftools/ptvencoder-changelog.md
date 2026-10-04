@@ -5,6 +5,25 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre6.1 — no output PTS jump at a rejoin (T-077)
+
+Measured cause: as the frame queue drains at the start of a real outage, WUCR's rate servo hits its clamp
+(`wucr_rho=-300000ppm`, output 20.3 fps for ~4 s before STALLED) — the house clock falls ~1.4 s behind wall time. At a
+LIVE LOSS rejoin the returning content is that far AHEAD of the house, and the output snapped forward to it: video
+PCR/PTS jumped +1.4 s, a copied AC-3 track got a 1.47 s PTS hole, AAC a +1.5 s aresample hard compensation.
+- **Rejoin map**: during a hold (and 2 s after it, so a pre-gap PES-tail frame does not use the decision up), the decode
+  thread maps the first frame whose content lies more than a tick ahead of the master's next house tick onto that tick:
+  a src-keyed two-tier offset (the vskip pattern) read by `content_index()`, so every rung, the CC emitter and the
+  sensors agree. `house_skew` is published against RAW content (it becomes −lead), so transcoded audio (door) and
+  copies (demux_pass) follow without a step. Content BEHIND the house (BURST) is untouched. Once per hold.
+  `[PTV-SRC] in0 rejoin: content X s ahead of the house — mapped onto it`; `PTV_NO_REJOIN_MAP=1` reverts.
+
+Gate (local, same numbers): sync_ac3_gap_20 PCR jump +1.4 s → none, copied AC-3 hole 1.47 s → 0.064 s, AAC door step
++1.5 s → +0.3 s, both lip-sync rulers ±25 ms, full PASS; sync_gap_20, sync_kill_return_20 lip sync PASS, no PCR jump;
+sync_stop_10 (BURST), bursty, clean, gap_300 full PASS. Unchanged and open: the ~330 ms wire pause ~1 s into some outages
+(pre-existing, unlocalized), copied AC-3 −40 ms after a BURST rejoin, flapping (no holds there, so the map never acts;
+RESYNC's −304 ms step on the biased sensor fires in some runs = T-075).
+
 ## 2.0.0-pre6 — fill while the source is gone (T-056 §5.1/§5.2)
 
 The output keeps sound and picture through a source hold, and audio comes back with the video after any outage.

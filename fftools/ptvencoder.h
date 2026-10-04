@@ -734,6 +734,8 @@ typedef struct DecodeCtx {
     pthread_mutex_t *h0_lock;
     int              live;
     VideoHold       *hold;                    /* multiview: stage frames here (NULL = filter inline) */
+    int64_t          rj_hold_id;              /* 2.0.0-pre6.1: the hold the rejoin map last armed for */
+    int              rj_done;                 /* ... and whether it was applied */
     /* filter graph: filtering -> N buffersinks (one per rung); else clone decode */
     int              filtering;
     AVFilterGraph   *fg;
@@ -1889,6 +1891,21 @@ extern _Atomic int     g_vskip_done_gops;/* whole GOPs (key packets) dropped */
 extern _Atomic int64_t g_vskip_off_total;  /* cumulative skipped span (µs) for src ≥ from */
 extern _Atomic int64_t g_vskip_off_before; /* cumulative span before the latest skip */
 extern _Atomic int64_t g_vskip_from_us;    /* latest skip boundary on the source-time axis (µs) */
+/* 2.0.0-pre6.1 (T-077): rejoin map — content that comes back AHEAD of the house after a hold (the WUCR stretch at the
+ * outage onset, measured −30 % for ~4 s = a ~1.4 s PTS debt) is mapped onto the next house tick instead of jumping
+ * the output PTS forward. Same src-keyed two-tier publish as vskip, so every rung agrees; house_skew is published
+ * against RAW content (it becomes −D), so audio and copies follow through the door / demux_pass. */
+extern _Atomic int64_t g_rj_off_total, g_rj_off_before, g_rj_from_us;
+extern _Atomic int     g_rj_epoch;
+extern _Atomic int64_t g_house_out_us, g_house_tick_us;   /* master: last emitted vpts on the output axis, tick */
+extern int             g_rejoin_map;       /* PTV_NO_REJOIN_MAP=1 off */
+static inline int64_t ptv_rj_off(int64_t src_us)
+{
+    int64_t off = atomic_load_explicit(&g_rj_off_total, memory_order_acquire);
+    if (off && src_us < atomic_load_explicit(&g_rj_from_us, memory_order_relaxed))
+        off = atomic_load_explicit(&g_rj_off_before, memory_order_relaxed);
+    return off;
+}
 extern _Atomic int     g_vskip_epoch;      /* bumped per applied skip → master rung re-seeds m_v EMA
                                             * at the first post-boundary emit */
 extern _Atomic int64_t g_vgop_est_us;      /* decode-measured key-to-key span EMA (0 = unknown) */

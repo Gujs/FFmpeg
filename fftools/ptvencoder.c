@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.0-pre6"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.0-pre6.1"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -204,6 +204,10 @@ _Atomic int     g_vskip_done_gops;
 _Atomic int64_t g_vskip_off_total;
 _Atomic int64_t g_vskip_off_before;
 _Atomic int64_t g_vskip_from_us;
+_Atomic int64_t g_rj_off_total, g_rj_off_before, g_rj_from_us;   /* 2.0.0-pre6.1 rejoin map */
+_Atomic int     g_rj_epoch;
+_Atomic int64_t g_house_out_us, g_house_tick_us;
+int             g_rejoin_map = 1;
 _Atomic int     g_vskip_epoch;
 _Atomic int64_t g_vgop_est_us;
 _Atomic int64_t g_vgop_key_wall;
@@ -2572,9 +2576,58 @@ strip:
  *   - back-pressure chains rung0-output -> decoder -> video_q -> demux -> input, so a rung-0
  *     output/mux/gate stall becomes INPUT packet loss on these channels (right trade for bursty inputs).
  * Non-master rungs keep drop-newest (stall-isolated). Default (deep_prime_packets==0) = d->live everywhere. */
+/* 2.0.0-pre6.1 (T-077): during a hold (and for 2 s after it, so a pre-gap PES-tail frame that ends the hold does not
+ * use up the decision), the first decoded frame whose content lies more than a tick AHEAD of the master's next house
+ * tick publishes that lead as a src-keyed offset: content_index() maps it onto the house (no forward output PTS
+ * jump) and house_skew, published against raw content, carries −lead to audio and copies. Measured cause of the lead:
+ * WUCR stretched the house −30 % for the ~4 s before STALLED (fps 20.3), a ~1.4 s PTS debt the rejoin repaid as a
+ * jump (video PCR +1.4 s, a 1.47 s hole on a copied AC-3, +1.5 s aresample hard comp on AAC). Content BEHIND the
+ * house (BURST) is left alone: today's dup / latency-retained posture. Decided here, upstream of the split, so every
+ * rung gets the same map. Once per hold. */
+static void rejoin_map(DecodeCtx *d, const AVFrame *frame)
+{
+    int64_t src_us, h0, pos, next, tick, lead, old, vs;
+
+    if (!g_rejoin_map || !g_src_hold_act || frame->best_effort_timestamp == AV_NOPTS_VALUE)
+        return;
+    if (ptv_src_holding()) {
+        int64_t hid = atomic_load_explicit(&g_src_hold_start, memory_order_relaxed);
+        if (hid != d->rj_hold_id) { d->rj_hold_id = hid; d->rj_done = 0; }
+    } else {
+        int64_t rj = atomic_load_explicit(&g_src_rejoin_wall, memory_order_relaxed);
+        if (!rj || av_gettime_relative() - rj > 2000000)
+            return;
+    }
+    if (d->rj_done || !d->rj_hold_id)
+        return;
+    pthread_mutex_lock(d->h0_lock); h0 = *d->h0; pthread_mutex_unlock(d->h0_lock);
+    tick = atomic_load_explicit(&g_house_tick_us, memory_order_relaxed);
+    if (h0 == AV_NOPTS_VALUE || tick <= 0)
+        return;
+    src_us = av_rescale_q(frame->best_effort_timestamp, d->ist_tb, AV_TIME_BASE_Q);
+    vs = atomic_load_explicit(&g_vskip_off_total, memory_order_acquire);
+    if (vs && src_us < atomic_load_explicit(&g_vskip_from_us, memory_order_relaxed))
+        vs = atomic_load_explicit(&g_vskip_off_before, memory_order_relaxed);
+    pos  = src_us - h0 - vs - ptv_rj_off(src_us);                 /* where content_index() would put it now */
+    next = atomic_load_explicit(&g_house_out_us, memory_order_relaxed) + tick;   /* the next house tick: a frame
+                                                                                   * that misses it costs one dup */
+    lead = pos - next;
+    if (lead <= tick)
+        return;
+    old = atomic_load_explicit(&g_rj_off_total, memory_order_relaxed);
+    atomic_store_explicit(&g_rj_off_before, old, memory_order_relaxed);      /* vskip's write order */
+    atomic_store_explicit(&g_rj_from_us, src_us, memory_order_relaxed);
+    atomic_store_explicit(&g_rj_off_total, old + lead, memory_order_release);
+    atomic_fetch_add_explicit(&g_rj_epoch, 1, memory_order_relaxed);
+    d->rj_done = 1;
+    av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 rejoin: content %.2f s ahead of the house — mapped onto it, no output "
+           "jump (PTV_NO_REJOIN_MAP=1 reverts)\n", lead / 1e6);
+}
+
 static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
 {
     int i;
+    rejoin_map(d, frame);                /* 2.0.0-pre6.1 (single input: emit_video is the non-mosaic path) */
     if (!d->filtering) {                 /* no graph: clone the decoded frame to each rung */
         if (frame->best_effort_timestamp != AV_NOPTS_VALUE)   /* source time in ist_tb (== out_tb) */
             frame->pts = frame->best_effort_timestamp;
@@ -6327,6 +6380,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_ACQ_BACKOFF")) g_acq_backoff = 0;       /* 1.0.1-pre18 #49: no repeated-ACQUIRE threshold backoff */
     if (getenv("PTV_NBS_FILL") && g_glueclass) g_nbs_fill = 1;
     if (getenv("PTV_NO_SRC_FILL")) g_hold_fill = 0;   /* 2.0.0-pre6 kill switch: no fill while holding */
+    if (getenv("PTV_NO_REJOIN_MAP")) g_rejoin_map = 0; /* 2.0.0-pre6.1 kill switch: PTS jumps at a rejoin again */
     { const char *s = getenv("PTV_GLUE_HTOL_PCT");     if (s && atoi(s) > 0) g_glue_htol = atoi(s); }             /* tuning knob (G4) */
     { const char *s = getenv("PTV_PAIR_EXPECT_TTL_US");if (s && atoll(s) > 0) g_pair_ttl_us = atoll(s); }          /* TEST ONLY (G6) */
     { const char *s = getenv("PTV_NBS_QUANTUM_MS");    if (s && atoi(s) > 0) g_nbs_quantum_us = (int64_t)atoi(s) * 1000; }  /* TEST ONLY (G8) */
