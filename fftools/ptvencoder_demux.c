@@ -2658,6 +2658,9 @@ void *demux_thread(void *arg)
                                     d->src_gap_class = burst ? 1 : 2;   /* the gap packet is still to be dispatched */
                             }
                             d->src_classified = 1;
+                            atomic_store_explicit(&g_rj_cls, burst ? 1 :                       /* 2.0.0-pre8.1 */
+                                                  llabs(A - W) <= FFMAX(1000000, W / 10) ? 2 : 3, memory_order_relaxed);
+                            atomic_fetch_add_explicit(&g_rj_cls_seq, 1, memory_order_release);
                             d->src_pend       = 0;
                         }
                     }

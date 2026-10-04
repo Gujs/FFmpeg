@@ -790,6 +790,7 @@ void *output_thread(void *arg)
     AVFrame *held = av_frame_alloc();
     AVFrame *blk  = NULL;                   /* 2.0.0-pre6: black twin of held (-hold black / -freeze_max) */
     int64_t fb_live_since = 0;              /* 2.0.0-pre7: -fallback_rebind continuous-LIVE start (master) */
+    int64_t src_prev_fresh_us = AV_NOPTS_VALUE;   /* 2.0.0-pre8.1: previous fresh frame's source time (jump test) */
     int blk_logged = 0;
     AVFrame *f;
     int have = 0, ret = 0;
@@ -1377,8 +1378,16 @@ void *output_thread(void *arg)
                     src_note = nw + (nw - hs0 < 600000000 ? 60000000 : 600000000);
                 }
             }
-            if (fresh)   /* after this tick's house_skew write and state change (audio waits on it, pre6) */
+            if (fresh) {   /* after this tick's house_skew write and state change (audio waits on it, pre6) */
+                /* 2.0.0-pre8.1: a content jump (> 0.5 s either way) on this fresh frame = the post-gap content of a
+                 * LIVE LOSS / NEW DOMAIN rejoin is on screen and house_skew has its post-rejoin value */
+                int64_t fs = held_src_pts != AV_NOPTS_VALUE ? av_rescale_q(held_src_pts, v->out_tb, AV_TIME_BASE_Q)
+                                                            : AV_NOPTS_VALUE;
+                if (fs != AV_NOPTS_VALUE && src_prev_fresh_us != AV_NOPTS_VALUE && llabs(fs - src_prev_fresh_us) > 500000)
+                    atomic_store_explicit(&g_src_jump_wc, nw, memory_order_relaxed);
+                src_prev_fresh_us = fs;
                 atomic_store_explicit(&g_src_fresh_wc, nw, memory_order_release);
+            }
         }
         /* 2.0.0-pre7 (T-056 §4): -fallback_rebind — the wrapper started us with the minimal fallback plan because
          * its probe failed (dead at start, video 0x0). Once the input has been continuously LIVE (no hold) this
@@ -1405,9 +1414,10 @@ void *output_thread(void *arg)
          * lost audio — the pad hardcap folded it). A track that still receives audio does not fill (its own
          * silence test), so input flowing through a frame-queue underrun fills nothing; a sentinel to such a
          * track is free. 1 s left a 0.9 s dark wire at an outage start (sync_gap_20), 200 ms + a 300 ms track
-         * floor still 333 ms. */
+         * floor still 333 ms. pre8.1: also while a track buffers its post-rejoin frames — the input is LIVE again but
+         * the door must keep filling until they are released, or the wire pauses for the buffering (0.32 s). */
         if (g_hold_fill && (v->n_hold_aq || v->hold_da) && g_src_watch && g_src_hold_act &&
-            (ptv_src_holding() ||
+            (ptv_src_holding() || atomic_load_explicit(&g_rj_buffering, memory_order_relaxed) > 0 ||
              av_gettime_relative() - atomic_load_explicit(&g_src_fresh_wc, memory_order_relaxed) >= 120000)) {
             int64_t nw = av_gettime_relative();
             if (nw - v->hold_fill_wc >= 100000) {

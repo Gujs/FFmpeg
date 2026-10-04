@@ -5,6 +5,34 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre8.1 — program audio survives the rejoin (canary drop tests A/B)
+
+- **Fixed: after an outage the program audio was replaced by silence for about the outage length** (live-transcoder
+  2026-10-04, SRT bridge stopped: Fashion ~13 s, GB_News ~48 s → ~47 s of silence after the source returned; video,
+  PTS and lip sync were fine). The pre6 fix released real audio at "a fresh frame since the fill began", which the
+  canary showed is not the post-gap content: the fill can start while the frame queue still drains, and the first fresh
+  frame after a hold can be a pre-gap PES tail while the post-gap frames are dropped until the next IDR. Fed with the
+  stale house_skew, a LIVE LOSS rejoin counted the hole twice at the door (aresample padded it, then dropped it at the
+  snap). Real frames that arrive during a hold fill are now **buffered** (up to 256, the fill keeps running) and
+  released by rejoin class (buffer 1024 frames ≈ 21 s at 48 kHz: a BURST's catch-up — 10 s of audio decoded in 10 ms —
+  overflowed 256 and was released early, one tick off): BURST at once, LIVE LOSS when the master shows a fresh frame whose source pts jumped
+  (> 0.5 s), NEW DOMAIN at that jump or 200 ms after the rejoin (LAYERA re-bases it, no snap), a fill without an input
+  loss at the first fresh frame after the last fill quantum; 4 s cap. Log: `[PTV-SRC] aN(inM) N frames held X s for the
+  post-rejoin mapping`.
+- While a track buffers, the clock keeps sending it hold-fill sentinels (the input is already LIVE) and each sentinel
+  re-checks the release: a post-gap burst is often buffered whole before the video shows the jump, and waiting for the
+  next real frame (265 ms later in sync_gap_20) held video at the delivery gate — a 0.32 s dark wire at the rejoin.
+- Local repro of the canary race: a mid-GOP cut without a reopen, `T056_GAP_AT_MS=20500 ./fixture.sh sync_gap_10`
+  (pre8: 9 s MOVING SILENT after the return, +10 s door step).
+
+Gate (local, frozen copy of this build): the mid-GOP repro PASS (no silence after the return, lip sync ±25 ms);
+sync_gap_20 / sync_kill_return_20 / sync_stop_10 / sync_ac3_gap_20 lip sync ±25 ms on every ruler, no post-return
+silence, no rejoin wire pause (only the known ~330 ms onset pause, T-077); stop_20 live share 1.0 after the return (pre6:
+6 s of silence after the 20 s catch-up, T-076 — the 960-frame BURST now meets its house_skew); copied AC-3 PTS hole after
+a LIVE LOSS 64 ms (pre6: 1.47 s); gap_300, psi_only, sync_audio_gap, bursty, clean as pre8. Still open: copied AC-3 −40 ms
+for a few s after a BURST (sync_ac3_stop_10, pre-existing); a BURST longer than ~21 s overflows the buffer and is released
+early (one tick, not silence).
+
 ## 2.0.0-pre8 — afill= and log-volume check (T-056 §5.1/§15)
 
 - **`afill=` on the stats line** (spec §5.1), shown only while some track is being filled: the current silence-fill run
