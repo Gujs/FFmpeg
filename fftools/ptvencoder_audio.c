@@ -2701,6 +2701,18 @@ static int audio_feed(AudioState *a, AVFrame *frame)
     int out_max, got, ret = 0;
     if (frame->best_effort_timestamp != AV_NOPTS_VALUE)
         a->dbg_last_src = frame->best_effort_timestamp;   /* probe: latest fed source pts */
+    /* 2.0.0-pre6: the first REAL frame after a filled hold waits (bounded) for the hold to end. Video
+     * publishes the post-rejoin house_skew on the tick that ends the hold; fed earlier, this frame met the
+     * stale (hold-grown) value — a LIVE LOSS rejoin then counted the hole twice at the door (labels +W and
+     * house_skew +W): aresample padded ~W and dropped it again at the snap, ~18 s of the program's audio
+     * replaced by silence after a 20 s outage (measured, also on pre5 without fill). Waits for the first
+     * fresh frame after the fill began (the hold-ending tick, or the end of a shorter repeat run). */
+    if (!a->hold_feeding && a->hold_fill_us) {
+        int64_t w0 = av_gettime_relative();
+        while (atomic_load_explicit(&g_src_fresh_wc, memory_order_acquire) < a->hold_fill_wc0 &&
+               av_gettime_relative() - w0 < 3000000)
+            av_usleep(5000);
+    }
 
     /* Source audio format change (stereo↔mono, sample-rate, fmt) at a splice: the graph/swr was
      * configured for the prior params and abuffersrc rejects the changed frame → the audio path
@@ -2912,7 +2924,7 @@ static int audio_feed(AudioState *a, AVFrame *frame)
             char snr[48];
             ptv_self_shed_note(a, snr, sizeof snr);
         }
-        if (g_aglue_ms > 0 && frame->pts != AV_NOPTS_VALUE) {
+        if (g_aglue_ms > 0 && frame->pts != AV_NOPTS_VALUE && !a->hold_feeding) {   /* pre6: fill is stamped at the door */
             int64_t raw_us = av_rescale_q(frame->pts, a->ist_tb, AV_TIME_BASE_Q);
             int64_t now_wc = av_gettime_relative();
             int fill_resumed = 0;   /* 1.0.1-pre15 §3: first REAL frame after an NBS fill phase */
@@ -3120,7 +3132,10 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                                 int64_t el = a->wev_out_wc ? now_wc - a->wev_out_wc : 0;
                                 a->wev_out_us = FFMAX(a->wev_out_us - el, 0);
                                 a->wev_out_wc = now_wc;
-                                if (a->wev_out_us + step > PTV_WALLEV_HARDCAP_US) {
+                                /* 2.0.0-pre6: the part of the hole a hold fill already covered at the
+                                 * door is not padded again — only the rest counts against the hardcap */
+                                int64_t wstep = FFMAX(step - a->hold_fill_us, 0);
+                                if (a->wev_out_us + wstep > PTV_WALLEV_HARDCAP_US) {
                                     fold_cap = wev_hardcap = 1;   /* the OOM backstop wins */
                                     av_log(NULL, AV_LOG_ERROR,
                                            "[PTV-WALLEV] a%d(in%d) wall-evidenced +%"PRId64"ms gap folded "
@@ -3130,7 +3145,7 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                                            a->wev_out_us / AV_TIME_BASE,
                                            (int)(PTV_WALLEV_HARDCAP_US / AV_TIME_BASE));
                                 } else {
-                                    a->wev_out_us += step;
+                                    a->wev_out_us += wstep;
                                     fold_park = 0;   /* park exemption: real gaps pad even mid-park */
                                 }
                             } else if (!fold_park) {
@@ -3353,6 +3368,18 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                     }
                 }
             }
+            if (a->hold_fill_us &&   /* 2.0.0-pre6: 2 s after video resumed, the rejoin's step verdicts are in */
+                atomic_load_explicit(&g_src_fresh_wc, memory_order_relaxed) >= a->hold_fill_wc0) {
+                if (!a->hold_fresh_wc)
+                    a->hold_fresh_wc = now_wc;
+                else if (now_wc - a->hold_fresh_wc > 2000000) {
+                    if (a->hold_fill_us >= 3000000)
+                        av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] a%d(in%d) hold fill ended: %.1f s of silence\n",
+                               a->dbg_k, a->dbg_in, a->hold_fill_us / 1e6);
+                    a->hold_fill_us  = 0;
+                    a->hold_fresh_wc = 0;
+                }
+            }
             a->glue_raw_last_us  = raw_us;
             a->glue_raw_dur_us   = frame->sample_rate > 0 ?
                 av_rescale(frame->nb_samples, 1000000, frame->sample_rate) : 0;
@@ -3360,7 +3387,8 @@ static int audio_feed(AudioState *a, AVFrame *frame)
             if (a->glue_off_us)
                 frame->pts += av_rescale_q(a->glue_off_us, AV_TIME_BASE_Q, a->ist_tb);
         }
-        if (g_avlock && a->house_skew && !(a->multiview && g_audio_follow) && frame->pts != AV_NOPTS_VALUE) {
+        if (g_avlock && a->house_skew && !(a->multiview && g_audio_follow) && frame->pts != AV_NOPTS_VALUE &&
+            !a->hold_feeding) {
             int64_t sk = *a->house_skew;
             if (sk) frame->pts += av_rescale_q(sk, AV_TIME_BASE_Q, a->ist_tb);
         }
@@ -3379,7 +3407,7 @@ static int audio_feed(AudioState *a, AVFrame *frame)
          * rscorr_update; per-frame deltas ~43µs, three orders under min_hard_comp — the
          * ACOMP proxy below monitors the summed stream and is the click tripwire for any
          * mis-sized bus term). corr_us==0 (default-off / parked-at-zero) skips = byte-inert. */
-        if (a->corr.corr_us && frame->pts != AV_NOPTS_VALUE)
+        if (a->corr.corr_us && frame->pts != AV_NOPTS_VALUE && !a->hold_feeding)
             frame->pts += av_rescale_q(a->corr.corr_us, AV_TIME_BASE_Q, a->ist_tb);
         /* 1.0.1-pre3 [PTV-ACOMP] — swr hard-compensation proxy (always-on, log rate-limited to
          * ~1/10s per track). aresample=async realizes a graph-input pts step beyond
@@ -3788,9 +3816,9 @@ static void nbs_fill_quantum(AudioState *a)
         a->nbs_last_wall_us = 0;
         a->nbs_carry_us     = 0;
         av_log(NULL, AV_LOG_WARNING,
-               "[PTV-ADISC] a%d(in%d) silence-fill ENGAGED — demux is corrupt-discarding this "
-               "track's packets with nothing decoding; synthesizing dense silence until real "
-               "frames resume\n",
+               "[PTV-ADISC] a%d(in%d) silence-fill ENGAGED — nothing decoding on this track while "
+               "video flows (packets corrupt-discarded, or none arriving for 2 s); synthesizing "
+               "dense silence until real frames resume\n",
                a->dbg_k, a->dbg_in);
     }
     dur_us = av_rescale(1024, 1000000, a->fg_in_rate);
@@ -3836,6 +3864,63 @@ static void nbs_fill_quantum(AudioState *a)
     a->nbs_fills++;
 }
 
+/* 2.0.0-pre6 (T-056 §5.1/§5.2): silence while input 0 holds. This track's door position is
+ * label + glue_off + corr + house_skew; in a hold the labels stop and house_skew grows by one tick per held
+ * video tick (house clock minus the frozen content), so filling the door up to the last label's end +
+ * glue_off + corr + house_skew(now) keeps audio's output position on the held video. Frames are stamped AT
+ * the door (hold_feeding: AGLUE and the door additions are skipped) and raw labels stay untouched, so a
+ * LIVE LOSS rejoin (labels +W, house_skew back to ~0) lands where the fill ended and a BURST rejoin (labels
+ * contiguous, house_skew kept) continues it. Only while the track itself is silent (no real frame for
+ * max(150 ms, 3 x its arrival cadence)):
+ * a PSI-only hold keeps its real audio, and real frames arriving before the hold ends stop the fill.
+ * Driven while video only repeats (master: no fresh frame for 1 s, or a hold), not only in a declared hold. */
+static void hold_fill_quantum(AudioState *a)
+{
+    int64_t dur_us, door, target, now = av_gettime_relative();
+    int n, i, ret = 0;
+
+    if (!a->pts_set || !a->use_fg || a->multiview || a->fg_in_rate <= 0 ||
+        a->glue_raw_last_us == AV_NOPTS_VALUE || a->acomp_exp_us == AV_NOPTS_VALUE ||
+        now - a->glue_wall_last_us < FFMAX(150000, 3 * a->glue_cad_us))   /* the track's own arrival cadence */
+        return;
+    dur_us = av_rescale(1024, 1000000, a->fg_in_rate);
+    target = a->glue_raw_last_us + a->glue_raw_dur_us + a->glue_off_us + a->corr.corr_us +
+             ((g_avlock && a->house_skew) ? *a->house_skew : 0);
+    door   = a->acomp_exp_us;
+    if (target - door > 2000000)
+        target = door + 2000000;                 /* catch up at most 2 s per sentinel (100 ms apart) */
+    n = dur_us > 0 ? (int)((target - door) / dur_us) : 0;
+    if (n < 1)
+        return;
+    if (!a->hold_fill_us) {
+        a->hold_fill_wc0 = now;
+        a->hold_fresh_wc = 0;
+    }
+    a->hold_feeding = 1;
+    for (i = 0; i < n && ret >= 0; i++) {
+        AVFrame *s = av_frame_alloc();
+        if (!s)
+            break;
+        s->nb_samples  = 1024;
+        s->format      = a->fg_in_fmt;
+        s->sample_rate = a->fg_in_rate;
+        av_channel_layout_copy(&s->ch_layout, &a->fg_in_chl);
+        if (av_frame_get_buffer(s, 0) >= 0) {
+            av_samples_set_silence(s->extended_data, 0, s->nb_samples,
+                                   s->ch_layout.nb_channels, s->format);
+            s->pts = s->best_effort_timestamp =
+                av_rescale_q(door + i * dur_us, AV_TIME_BASE_Q, a->ist_tb);
+            ret = audio_feed(a, s);
+            if (a->hold_fill_us < 3000000 && a->hold_fill_us + dur_us >= 3000000)   /* short repeat runs stay quiet */
+                av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] a%d(in%d) hold fill: silence aligned to the held video "
+                       "(PTV_NO_SRC_FILL=1 disables)\n", a->dbg_k, a->dbg_in);
+            a->hold_fill_us += dur_us;
+        }
+        av_frame_free(&s);
+    }
+    a->hold_feeding = 0;
+}
+
 void *audio_thread(void *arg)
 {
     AudioState *a = arg;
@@ -3854,6 +3939,11 @@ void *audio_thread(void *arg)
              * a reopen every 45s of a fill phase). */
             av_packet_free(&pkt);
             nbs_fill_quantum(a);
+            continue;
+        }
+        if (pkt && (pkt->flags & PTV_PKT_FLAG_HOLD_FILL)) {   /* 2.0.0-pre6 hold-fill sentinel, not a packet */
+            av_packet_free(&pkt);
+            hold_fill_quantum(a);
             continue;
         }
         a->wd_pkts++;

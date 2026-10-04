@@ -20,6 +20,7 @@
 #include "libavutil/audio_fifo.h"
 #include "libavutil/threadmessage.h"
 #include "libavutil/hwcontext.h"
+#include "libavutil/imgutils.h"
 #include "libavformat/avformat.h"
 #include "libavcodec/avcodec.h"
 #include "libavfilter/avfilter.h"
@@ -741,10 +742,53 @@ static int64_t house_rate_corr_ppm(HouseRateState *hr, const RateEstimator *est,
     return corr;
 }
 
+/* 2.0.0-pre6: a black frame shaped like ref (size, format, hw frames context), with ref's props. Rebuilt only
+ * when the shape changes. A hw frame is filled black in its sw_format and uploaded, as hwupload does. */
+static int black_like(AVFrame **pb, const AVFrame *ref)
+{
+    AVFrame *b = *pb, *sw = NULL;
+    ptrdiff_t ls[4];
+    int ret, i;
+
+    if (b && b->width == ref->width && b->height == ref->height && b->format == ref->format)
+        return av_frame_copy_props(b, ref);
+    av_frame_free(pb);
+    if (!(b = av_frame_alloc()))
+        return AVERROR(ENOMEM);
+    if (ref->hw_frames_ctx) {
+        const AVHWFramesContext *fc = (const AVHWFramesContext *)ref->hw_frames_ctx->data;
+        ret = (sw = av_frame_alloc()) ? 0 : AVERROR(ENOMEM);
+        if (ret >= 0) {
+            sw->format = fc->sw_format; sw->width = ref->width; sw->height = ref->height;
+            ret = av_frame_get_buffer(sw, 0);
+        }
+        if (ret >= 0) {
+            for (i = 0; i < 4; i++) ls[i] = sw->linesize[i];
+            ret = av_image_fill_black(sw->data, ls, sw->format, ref->color_range, sw->width, sw->height);
+        }
+        if (ret >= 0) ret = av_hwframe_get_buffer(ref->hw_frames_ctx, b, 0);
+        if (ret >= 0) ret = av_hwframe_transfer_data(b, sw, 0);
+        av_frame_free(&sw);
+    } else {
+        b->format = ref->format; b->width = ref->width; b->height = ref->height;
+        ret = av_frame_get_buffer(b, 0);
+        if (ret >= 0) {
+            for (i = 0; i < 4; i++) ls[i] = b->linesize[i];
+            ret = av_image_fill_black(b->data, ls, b->format, ref->color_range, b->width, b->height);
+        }
+    }
+    if (ret >= 0) ret = av_frame_copy_props(b, ref);
+    if (ret < 0) { av_frame_free(&b); return ret; }
+    *pb = b;
+    return 0;
+}
+
 void *output_thread(void *arg)
 {
     VideoCtx *v = arg;
     AVFrame *held = av_frame_alloc();
+    AVFrame *blk  = NULL;                   /* 2.0.0-pre6: black twin of held (-hold black / -freeze_max) */
+    int blk_logged = 0;
     AVFrame *f;
     int have = 0, ret = 0;
     int64_t tick = 0, wall0 = 0, last_vpts = -1, gl_phase = 0;   /* gl_phase: v0.9.0 genlock-scaled cumulative wall span */
@@ -1256,7 +1300,27 @@ void *output_thread(void *arg)
         }
         if (v->is_master)
             PTV_HB_OUT(PTV_HB_OUT_ENC);    /* pre21 heartbeat: entering encoder+gate (the NVENC-block position) */
-        ret = encode_push(v->mux_q, v->venc, v->ost, held, v->gate);   /* §7.5a: publish video front + release caught-up audio/copy */
+        {   /* 2.0.0-pre6 (T-056 §5.2): -hold black, or a hold older than -freeze_max → black instead of the
+             * frozen frame. A black DUP: same props and content pts as the held frame, so house_skew, the
+             * sensors and the audio fill see an ordinary repeat. Dropped as soon as fresh content returns. */
+            AVFrame *emit = held;
+            if (!fresh && ptv_src_holding()) {
+                int64_t hs0 = atomic_load_explicit(&g_src_hold_start, memory_order_relaxed);
+                if (g_hold_black || (g_freeze_max_us > 0 && hs0 && av_gettime_relative() - hs0 >= g_freeze_max_us)) {
+                    if (black_like(&blk, held) >= 0) {
+                        emit = blk;
+                        if (!blk_logged && v->is_master)
+                            av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 held picture \xe2\x86\x92 black (%s)\n",
+                                   g_hold_black ? "-hold black" : "-freeze_max reached");
+                        blk_logged = 1;
+                    }
+                }
+            } else if (fresh && blk) {
+                av_frame_free(&blk);
+                blk_logged = 0;
+            }
+            ret = encode_push(v->mux_q, v->venc, v->ost, emit, v->gate);   /* §7.5a: publish video front + release caught-up audio/copy */
+        }
         v->last_emit_us = av_gettime_relative();
         tick++; v->emitted++;
         if (g_t_us > 0 && v->is_master && v->emitted * v->tick_dur_us >= g_t_us &&
@@ -1295,14 +1359,43 @@ void *output_thread(void *arg)
                 int64_t hs0 = atomic_load_explicit(&g_src_hold_start, memory_order_relaxed);
                 if (!src_lost_logged && arr && nw - arr >= g_lost_after_us) {
                     src_lost_logged = 1;
-                    av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 STALLED \xe2\x86\x92 LOST (observe-only): no video "
-                           "packets for %.0f s\n", (nw - arr) / 1e6);
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 STALLED \xe2\x86\x92 LOST%s: no video "
+                           "packets for %.0f s\n", g_src_hold_act ? "" : " (observe-only)", (nw - arr) / 1e6);
                 }
                 if (nw >= src_note) {   /* reminders: 1/min for 10 min, then every 10 min */
                     av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 still STALLED after %.0f s\n",
                            (nw - hs0) / 1e6);
                     src_note = nw + (nw - hs0 < 600000000 ? 60000000 : 600000000);
                 }
+            }
+            if (fresh)   /* after this tick's house_skew write and state change (audio waits on it, pre6) */
+                atomic_store_explicit(&g_src_fresh_wc, nw, memory_order_release);
+        }
+        /* 2.0.0-pre6 (T-056 §5.1/§5.2): while video only repeats (no fresh frame for 120 ms, or input 0 holds),
+         * every transcoded track gets a fill sentinel per 100 ms — its thread is otherwise blocked on an empty
+         * audio_q (the demux is blocked in its read) and audio would stop while house_skew grows: the wire
+         * went dark (the early-video delivery hold waits for audio; it started 1.4 s into an outage, before
+         * STALLED at 4.3 s) and, at the rejoin, the whole hole was still open on audio (a hold over 120 s then
+         * lost audio — the pad hardcap folded it). A track that still receives audio does not fill (its own
+         * silence test), so input flowing through a frame-queue underrun fills nothing; a sentinel to such a
+         * track is free. 1 s left a 0.9 s dark wire at an outage start (sync_gap_20), 200 ms + a 300 ms track
+         * floor still 333 ms. */
+        if (g_hold_fill && (v->n_hold_aq || v->hold_da) && g_src_watch && g_src_hold_act &&
+            (ptv_src_holding() ||
+             av_gettime_relative() - atomic_load_explicit(&g_src_fresh_wc, memory_order_relaxed) >= 120000)) {
+            int64_t nw = av_gettime_relative();
+            if (nw - v->hold_fill_wc >= 100000) {
+                int t;
+                v->hold_fill_wc = nw;
+                for (t = 0; t < v->n_hold_aq; t++) {
+                    AVPacket *fs = av_packet_alloc();
+                    if (!fs) break;
+                    fs->flags |= PTV_PKT_FLAG_HOLD_FILL;
+                    if (av_thread_message_queue_send(v->hold_aq[t], &fs, AV_THREAD_MESSAGE_NONBLOCK) < 0)
+                        av_packet_free(&fs);
+                }
+                if (v->hold_da)              /* copied AC-3 / E-AC-3: silent frames of their own codec (D17) */
+                    ptv_copy_fill(v->hold_da, v->house_skew ? *v->house_skew : 0, nw);
             }
         }
         if (g_slow) av_usleep(g_slow);
@@ -1492,6 +1585,7 @@ void *output_thread(void *arg)
     }
 done:
     av_frame_free(&held);
+    av_frame_free(&blk);
     /* release everything still held + close the gate (no held audio/copy lost at shutdown, and
      * any blocked enqueuer wakes to send direct) — BEFORE the video EOF marker so the muxer sees
      * the tail audio/copy first. No-op when there is no gate (offline). */

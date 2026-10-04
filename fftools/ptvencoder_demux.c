@@ -1566,11 +1566,11 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
  * subtitle, data/SCTE-35) straight to the muxer, rebased onto the same h0 house
  * timeline the encoded streams use so everything stays in sync. Packets that
  * precede the anchor are dropped (exactly like audio_push). */
-static int demux_pass(DemuxArgs *d, AVPacket *out)
+static int demux_pass_one(DemuxArgs *d, AVPacket *out)
 {
     int pi, i;
     for (pi = 0; pi < d->n_pass; pi++) {
-        int64_t h0, h0_tb, ref;
+        int64_t h0, h0_tb, ref, hs_used = 0;
         if (out->stream_index != d->pass[pi].in_index)
             continue;
         pthread_mutex_lock(d->h0_lock); h0 = *d->h0; pthread_mutex_unlock(d->h0_lock);
@@ -1582,8 +1582,10 @@ static int demux_pass(DemuxArgs *d, AVPacket *out)
          * a step (the skew grows in ~40ms tick increments) -> a small periodic A/V hop
          * on dense audio; sparse subs/data ride it invisibly. (Smooth would need rate-
          * discipline so dups -> 0; see option 2.) */
-        if (g_avlock && d->house_skew)   /* WUCR-corrected: AVLOCK kept (copied streams ride house_skew so they stay matched to the dup-lagged video); ρ bounds house_skew so the dup-hop stays small */
-            h0_tb -= av_rescale_q(*d->house_skew, AV_TIME_BASE_Q, d->pass[pi].in_tb);
+        if (g_avlock && d->house_skew) { /* WUCR-corrected: AVLOCK kept (copied streams ride house_skew so they stay matched to the dup-lagged video); ρ bounds house_skew so the dup-hop stays small */
+            hs_used = *d->house_skew;
+            h0_tb -= av_rescale_q(hs_used, AV_TIME_BASE_Q, d->pass[pi].in_tb);
+        }
         if (out->pts != AV_NOPTS_VALUE) out->pts -= h0_tb;
         if (out->dts != AV_NOPTS_VALUE) out->dts -= h0_tb;
         ref = out->dts != AV_NOPTS_VALUE ? out->dts : out->pts;
@@ -1609,6 +1611,32 @@ static int demux_pass(DemuxArgs *d, AVPacket *out)
          * the right rate. Clamp strictly increasing per copied stream, shifting pts by
          * the same amount so pts>=dts still holds. (On-wire SCTE-35 splice timing rides
          * pts_adjustment, not container dts, so a sub-ms nudge is invisible there.) */
+        if (d->pass[pi].sil)                 /* 2.0.0-pre6 D17: the master's AC-3 fill shares this state */
+            pthread_mutex_lock(&d->pass_lock);
+        if (d->pass[pi].sil && out->dts != AV_NOPTS_VALUE) {
+            PassStream *ps = &d->pass[pi];
+            if (ps->fill_end != AV_NOPTS_VALUE) {
+                /* hand-back: real packets below the end of the replayed silence are dropped (a sub-frame gap
+                 * is left), never re-stamped — bounded to 2 s of drops */
+                if (out->dts < ps->fill_end &&
+                    (int64_t)ps->drop_n * ps->sil_dur < av_rescale_q(2000000, AV_TIME_BASE_Q, ps->in_tb)) {
+                    ps->drop_n++;
+                    pthread_mutex_unlock(&d->pass_lock);
+                    av_packet_free(&out);
+                    return 0;
+                }
+                if (ps->fill_n * ps->sil_dur >= av_rescale_q(3000000, AV_TIME_BASE_Q, ps->in_tb))
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] copy #%d (%s) hold fill ended: %d silent frames, "
+                           "%d real packets dropped at hand-back\n", ps->in_index,
+                           avcodec_get_name(d->ifmt->streams[ps->in_index]->codecpar->codec_id),
+                           ps->fill_n, ps->drop_n);
+                ps->fill_end = AV_NOPTS_VALUE;
+                ps->fill_n = ps->drop_n = 0;
+            }
+            ps->arr_wc   = av_gettime_relative();
+            ps->real_end = out->dts + (out->duration > 0 ? out->duration : ps->sil_dur);
+            ps->hs_real  = hs_used;
+        }
         if (out->dts != AV_NOPTS_VALUE) {
             if (d->pass[pi].last_dts != AV_NOPTS_VALUE && out->dts <= d->pass[pi].last_dts) {
                 int64_t bump = d->pass[pi].last_dts + 1 - out->dts;
@@ -1631,11 +1659,109 @@ static int demux_pass(DemuxArgs *d, AVPacket *out)
             } else
                 demux_send(d->mux_q[i], c, d->drop, &d->pdrop);   /* sparse subs/data/SCTE-35 bypass */
         }
+        if (d->pass[pi].sil)
+            pthread_mutex_unlock(&d->pass_lock);
         av_packet_free(&out);
         return 0;
     }
     av_packet_free(&out);
     return 0;
+}
+
+/* 2.0.0-pre6: stamp the parked runs whose wait is over — a fresh frame emitted since the run began (the
+ * hold-ending tick has written the post-rejoin house_skew), or 3 s, or force. */
+static void park_drain(DemuxArgs *d, int force)
+{
+    int64_t fw = atomic_load_explicit(&g_src_fresh_wc, memory_order_acquire), now = av_gettime_relative();
+    int pi, j;
+    for (pi = 0; pi < d->n_pass; pi++) {
+        PassStream *ps = &d->pass[pi];
+        if (!ps->npark || !(force || fw > ps->park_since || now - ps->park_since > 3000000))
+            continue;
+        for (j = 0; j < ps->npark; j++)
+            demux_pass_one(d, ps->park[j]);
+        ps->npark = 0;
+    }
+}
+
+/* Copy fan-out. 2.0.0-pre6: a dense copied audio stream that resumes after >=300 ms of silence waits (parked,
+ * the demux thread keeps reading — it carries the video that ends the hold) until the master has emitted a
+ * fresh frame after that resume; in steady flow that is the next tick. Single input. */
+static int demux_pass(DemuxArgs *d, AVPacket *out)
+{
+    int pi;
+    park_drain(d, 0);
+    if (d->single && g_src_watch) {
+        for (pi = 0; pi < d->n_pass; pi++) {
+            PassStream *ps = &d->pass[pi];
+            int64_t now, prev;
+            if (!ps->gated || out->stream_index != ps->in_index)
+                continue;
+            now = av_gettime_relative();
+            prev = ps->in_wc;
+            ps->in_wc = now;
+            if (ps->npark || (prev && now - prev >= 300000)) {
+                if (!ps->npark)
+                    ps->park_since = now;
+                if (ps->npark < PTV_PARK_MAX) {
+                    ps->park[ps->npark++] = out;
+                    return 0;
+                }
+                park_drain(d, 1);
+            }
+            break;
+        }
+    }
+    return demux_pass_one(d, out);
+}
+
+/* 2.0.0-pre6 (T-056 §5.1, D17), called by the master output thread while video repeats: a copied AC-3 /
+ * E-AC-3 track whose PID has been silent 300 ms gets its pre-encoded silent frame, one per frame duration,
+ * from the end of its last real packet up to that end + the house_skew grown since that packet was stamped
+ * — the same ride-house_skew rule as the transcoded fill, so the silence stays on the held video (never
+ * beyond the video front plus the lead it had). Routed like a real copy (delivery gate or mux_q). */
+void ptv_copy_fill(DemuxArgs *d, int64_t hs, int64_t now)
+{
+    int pi, i;
+    int64_t dropped = 0;
+
+    pthread_mutex_lock(&d->pass_lock);
+    for (pi = 0; pi < d->n_pass; pi++) {
+        PassStream *ps = &d->pass[pi];
+        int64_t target, cur;
+        int n = 0;
+        if (!ps->sil || ps->real_end == AV_NOPTS_VALUE || now - ps->arr_wc < 300000)
+            continue;
+        target = ps->real_end + av_rescale_q(hs - ps->hs_real, AV_TIME_BASE_Q, ps->in_tb);
+        cur    = ps->fill_end != AV_NOPTS_VALUE ? ps->fill_end : ps->real_end;
+        if (ps->last_dts != AV_NOPTS_VALUE && cur <= ps->last_dts)
+            cur = ps->last_dts + 1;
+        while (cur + ps->sil_dur <= target && n < 100) {   /* at most 100 frames (~3 s) per call */
+            for (i = 0; i < d->n_out; i++) {
+                AVPacket *c = av_packet_clone(ps->sil);
+                if (!c) continue;
+                c->pts = c->dts = cur;
+                c->stream_index = ps->ost[i]->index;
+                if (d->gate[i])
+                    dlv_enqueue(d->gate[i], c, av_rescale_q(cur, ps->in_tb, AV_TIME_BASE_Q), 0);
+                else
+                    demux_send(d->mux_q[i], c, d->drop, &dropped);
+            }
+            ps->last_dts = cur;
+            cur += ps->sil_dur;
+            n++;
+        }
+        if (n) {
+            if (ps->fill_n * ps->sil_dur < av_rescale_q(3000000, AV_TIME_BASE_Q, ps->in_tb) &&
+                (ps->fill_n + n) * ps->sil_dur >= av_rescale_q(3000000, AV_TIME_BASE_Q, ps->in_tb))
+                av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] copy #%d (%s) hold fill: silent frames aligned to the "
+                       "held video (PTV_NO_SRC_FILL=1 disables)\n", ps->in_index,
+                       avcodec_get_name(d->ifmt->streams[ps->in_index]->codecpar->codec_id));
+            ps->fill_n  += n;
+            ps->fill_end = cur;
+        }
+    }
+    pthread_mutex_unlock(&d->pass_lock);
 }
 
 /* Unwrap a packet's MPEG-TS PTS/DTS into a monotonic, extended timeline.
@@ -3038,6 +3164,32 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
             atomic_store_explicit(&g_v_arrive_wc, av_gettime_relative(), memory_order_relaxed);
             if (d->v_arrive_wc)
                 atomic_store_explicit(d->v_arrive_wc, av_gettime_relative(), memory_order_relaxed);
+            /* 2.0.0-pre6 (T-056 §5.1, D24/D25): video flows but a transcoded track's packets stopped for
+             * 2 s (measured: above the 1-2 s interleave blips, below the 3 s+ real holes) — the NBS
+             * silence fill, default-on: its thread is blocked on an empty audio_q, so this (the live
+             * demux thread) sends the sentinels; labels advance with wall time (house_skew is not
+             * moving while video flows). Single input; PTV_NO_SRC_FILL=1 off. Only silence DURING a
+             * gap-free video run counts: after an input gap the track's last packet is as old as the gap,
+             * and filling there (pre-gap label continuation) stepped the door back by the gap at a rejoin. */
+            if (g_hold_fill && g_glueclass && d->single) {
+                int64_t nw = av_gettime_relative();
+                int k;
+                if (!d->v_last_arr_us || nw - d->v_last_arr_us > 1000000)
+                    d->v_flow_since_us = nw;
+                d->v_last_arr_us = nw;
+                for (k = 0; k < d->n_audio; k++) {
+                    AVPacket *fs;
+                    if (!d->a_arr_us[k] || nw - FFMAX(d->a_arr_us[k], d->v_flow_since_us) < 2000000 ||
+                        nw - d->nbs_last_fill_us[k] < g_nbs_quantum_us)
+                        continue;
+                    d->nbs_last_fill_us[k] = nw;
+                    if (!(fs = av_packet_alloc())) continue;
+                    fs->stream_index = d->astream[k];
+                    fs->flags |= PTV_PKT_FLAG_NBS_FILL;
+                    if (av_thread_message_queue_send(d->audio_q[k], &fs, AV_THREAD_MESSAGE_NONBLOCK) < 0)
+                        av_packet_free(&fs);
+                }
+            }
             /* 1.0.1-pre10 review fix (rr10 D1): measure THIS input's video arrival rate — the
              * catch-up governor's pacing currency (the master OUT tick was the wrong currency:
              * any input whose pps exceeds 1.25x out-fps was governed below its own arrival
@@ -3244,6 +3396,7 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                 if (d->astream[k] != out->stream_index) continue;
                 if (!(c = av_packet_clone(out))) continue;
                 d->apkt++;
+                d->a_arr_us[k] = av_gettime_relative();   /* 2.0.0-pre6: absence trigger */
                 /* 1.0.1-pre8 (a): audio overflow sheds whole frames OLDEST-first (audio frames
                  * are independent — no GOP structure). The old drop-NEWEST pinned the stalest
                  * content in the queue; keeping the freshest drains latency instead. */

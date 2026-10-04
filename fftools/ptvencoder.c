@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.0-pre5"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.0-pre6"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -729,12 +729,15 @@ _Atomic int     g_selfheal_req;
 _Atomic int64_t g_v_arrive_wc;
 int             g_src_watch;                       /* 2.0.0-pre3: see ptvencoder.h */
 int64_t         g_stall_min_us  = 3000000;
+int             g_hold_black    = 0;          /* 2.0.0-pre6: -hold black (default freeze) */
+int64_t         g_freeze_max_us = 30000000;   /* 2.0.0-pre6: -freeze_max (0 = inf) */
 int64_t         g_lost_after_us = 30000000;
 _Atomic int     g_src_state;
 _Atomic int64_t g_src_hold_start;
 _Atomic int64_t g_src_vread_wc;
 int             g_src_hold_act;
 _Atomic int64_t g_src_rejoin_wall;
+_Atomic int64_t g_src_fresh_wc;          /* 2.0.0-pre6: wall us of the master's last FRESH frame */
 _Atomic int     g_src_icb_armed;
 /* 1.0.1-pre17: sibling-slate mask (bit k = input slot k black-slated; compositor writes,
  * rscorr_event_active reads) — no mv corrector engagement while any slot is slated. */
@@ -832,6 +835,7 @@ _Atomic int64_t g_mux_sent_wc[PTV_MAX_RUNG];
  * second; NBS phases are currently restart-cured, not silent-failing). */
 int     g_glueclass = 1;
 int     g_nbs_fill  = 0;
+int     g_hold_fill = 1;                       /* 2.0.0-pre6: audio fill during a source hold (default-on, D24) */
 int     g_glue_htol = 5;                       /* §2.3 |H−1| tolerance, % (fixture-tuned, G4) */
 int64_t g_pair_ttl_us = PTV_PAIR_EXPECT_TTL_US;
 int64_t g_nbs_quantum_us = 100000;             /* fill quantum: 100ms of silence per sentinel */
@@ -3778,6 +3782,61 @@ static int parse_backoff(const char *spec)
     return 0;
 }
 
+/* 2.0.0-pre6 (T-056 §5.1, D17): one silent frame of a copied AC-3 / E-AC-3 stream's own codec, rate, layout
+ * and bitrate, for the hold fill (a copied track can't be resampled, so its silence must be its own codec).
+ * NULL for other codecs (AAC 7.1, DTS, … stay empty while absent) or when the encoder refuses the params. */
+static AVPacket *silent_copy_frame(const AVCodecParameters *par, AVRational tb, int64_t *dur)
+{
+    const AVCodec *c;
+    AVCodecContext *e = NULL;
+    AVFrame *f = NULL;
+    AVPacket *p = NULL;
+    int ret;
+
+    if ((par->codec_id != AV_CODEC_ID_AC3 && par->codec_id != AV_CODEC_ID_EAC3) || par->sample_rate <= 0 ||
+        !(c = avcodec_find_encoder(par->codec_id)) || !(e = avcodec_alloc_context3(c)))
+        return NULL;
+    e->sample_rate = par->sample_rate;
+    e->sample_fmt  = AV_SAMPLE_FMT_FLTP;
+    e->bit_rate    = par->bit_rate;
+    e->time_base   = (AVRational){ 1, par->sample_rate };
+    if (par->ch_layout.order == AV_CHANNEL_ORDER_UNSPEC)
+        av_channel_layout_default(&e->ch_layout, par->ch_layout.nb_channels);
+    else
+        av_channel_layout_copy(&e->ch_layout, &par->ch_layout);
+    ret = avcodec_open2(e, c, NULL);
+    if (ret >= 0) ret = (f = av_frame_alloc()) && (p = av_packet_alloc()) ? 0 : AVERROR(ENOMEM);
+    if (ret >= 0) {
+        f->nb_samples  = e->frame_size;
+        f->format      = e->sample_fmt;
+        f->sample_rate = e->sample_rate;
+        ret = av_channel_layout_copy(&f->ch_layout, &e->ch_layout);
+    }
+    if (ret >= 0) ret = av_frame_get_buffer(f, 0);
+    if (ret >= 0) {
+        av_samples_set_silence(f->extended_data, 0, f->nb_samples, f->ch_layout.nb_channels, f->format);
+        f->pts = 0;
+        ret = avcodec_send_frame(e, f);
+    }
+    if (ret >= 0) {
+        ret = avcodec_receive_packet(e, p);
+        if (ret == AVERROR(EAGAIN) && (ret = avcodec_send_frame(e, NULL)) >= 0)
+            ret = avcodec_receive_packet(e, p);
+    }
+    if (ret >= 0) {
+        p->pts = p->dts = AV_NOPTS_VALUE;
+        p->duration = *dur = av_rescale_q(e->frame_size, e->time_base, tb);
+    } else {
+        av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] no silent %s frame for the hold fill (%s, %d Hz, %d ch, %"PRId64" b/s): %s\n",
+               avcodec_get_name(par->codec_id), c->name, par->sample_rate, par->ch_layout.nb_channels,
+               par->bit_rate, av_err2str(ret));
+        av_packet_free(&p);
+    }
+    av_frame_free(&f);
+    avcodec_free_context(&e);
+    return p;
+}
+
 static int input_acquire(Input *in, int idx, const AVDictionary *opts)
 {
     int64_t t0 = av_gettime_relative(), next_note = 0, probing_since = 0;
@@ -4539,6 +4598,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         inputs[k].est.src_rate_q20 = 1 << 20;
         inputs[k].est.cf_rate_q20 = 1 << 20;
         pthread_mutex_init(&inputs[k].h0_lock, NULL);
+        pthread_mutex_init(&inputs[k].da.pass_lock, NULL);   /* 2.0.0-pre6 */
         pthread_mutex_init(&inputs[k].hold.lock, NULL);
         pthread_mutex_init(&inputs[k].vring.lock, NULL);
         if (multiview) {                         /* per-input jitter buffer for the compositor */
@@ -4972,11 +5032,16 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                 case AVMEDIA_TYPE_VIDEO:    tlet = 'v'; tidx = copy_vidx++; break;
                 default:                    tlet = 'd'; tidx = copy_didx++; break;
             }
+            memset(&pass[n_pass], 0, sizeof pass[n_pass]);
             pass[n_pass].input    = kk;
             pass[n_pass].in_index = sidx;
             pass[n_pass].in_tb    = ist->time_base;
             pass[n_pass].last_dts = AV_NOPTS_VALUE;
             pass[n_pass].gated    = (ist->codecpar->codec_type == AVMEDIA_TYPE_AUDIO);  /* §7.5a: dense AC-3/MP2 ride the gate; sparse subs/data/SCTE-35 bypass */
+            pass[n_pass].fill_end = AV_NOPTS_VALUE;
+            pass[n_pass].real_end = AV_NOPTS_VALUE;
+            if (pass[n_pass].gated && n_input == 1 && g_hold_fill)   /* 2.0.0-pre6 D17: copied AC-3/E-AC-3 silence */
+                pass[n_pass].sil = silent_copy_frame(ist->codecpar, ist->time_base, &pass[n_pass].sil_dur);
             for (r = 0; r < n_rung; r++) {
                 AVStream *os = avformat_new_stream(rung[r].ofmt, NULL);
                 if (!os) { ret = AVERROR(ENOMEM); goto end; }
@@ -5279,6 +5344,12 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         vc->hr  = &house_rate;                   /* R4: house-rate actuation state, shared by the rung set */
         vc->vring = (!multiview && r == 0) ? &inputs[0].vring : NULL;  /* single-input: master rung feeds the A/V probe ring (multiview: compositor does) */
         vc->is_master = (r == 0);
+        if (!multiview && r == 0) {              /* 2.0.0-pre6: the master fills these while input 0 holds */
+            int t;
+            vc->hold_da = &inputs[0].da;
+            for (t = 0; t < n_audio; t++)
+                if (audio_q[t]) vc->hold_aq[vc->n_hold_aq++] = audio_q[t];
+        }
         vc->dbg_video_q = inputs[0].video_q; vc->dbg_dec_frames = &inputs[0].dc.dec_frames; vc->dbg_vcorrupt = &inputs[0].dc.vcorrupt;
         vc->dbg_vdrop = &inputs[0].da.vdrop; vc->dbg_pcorrupt = &inputs[0].da.vcorrupt;   /* stats: demux video_q drops + corrupt-pkt */
         vc->dbg_disc_resid = &inputs[0].da.disc_resid_us;   /* 0.9.18.7: hsres= (LAYERA erase-residue ledger) */
@@ -5537,6 +5608,11 @@ end:
             avio_closep(&rung[r].ofmt->pb);
     }
     for (k = 0; k < n_audio; k++) av_thread_message_queue_free(&audio_q[k]);
+    for (k = 0; k < n_pass; k++) {                                /* 2.0.0-pre6 */
+        int j;
+        av_packet_free(&pass[k].sil);
+        for (j = 0; j < pass[k].npark; j++) av_packet_free(&pass[k].park[j]);
+    }
     for (k = 0; k < n_cc; k++)                   /* the free func releases any queued ASS lines */
         av_thread_message_queue_free(&cc_q[k]);
     for (k = 0; k < n_cc; k++) avcodec_free_context(&cc[k].enc);
@@ -5614,6 +5690,8 @@ static const OptionDef ptv_options[] = {
     { "wait_input",       OPT_TYPE_STRING, 0,                        { .off = 0 }, "give up if the input has no video after this long (default inf)", "dur" },
     { "stall_min",        OPT_TYPE_STRING, 0,                        { .off = 0 }, "content gone + input silent this long = STALLED (default 3s)", "dur" },
     { "lost_after",       OPT_TYPE_STRING, 0,                        { .off = 0 }, "no video packets this long = LOST (default 30s)", "dur" },
+    { "hold",             OPT_TYPE_STRING, 0,                        { .off = 0 }, "picture while the input is gone: freeze (default) | black", "mode" },
+    { "freeze_max",       OPT_TYPE_STRING, 0,                        { .off = 0 }, "frozen picture this long, then black (default 30s; inf = keep)", "dur" },
     { "reopen_backoff",   OPT_TYPE_STRING, 0,                        { .off = 0 }, "seconds between input attempts, the last repeats (default 1,2,5,10,30)", "list" },
     { "abort_on",         OPT_TYPE_STRING, 0,                        { .off = 0 }, "abort conditions", "flags" },
     /* per-output structural options (walked from g->opts[]) */
@@ -6248,6 +6326,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_REBUILD_REANCHOR")) g_rebuild_reanchor = 0;  /* 1.0.1-pre20: AFMT rebuild carries the old base again (residual + corrector walk) */
     if (getenv("PTV_NO_ACQ_BACKOFF")) g_acq_backoff = 0;       /* 1.0.1-pre18 #49: no repeated-ACQUIRE threshold backoff */
     if (getenv("PTV_NBS_FILL") && g_glueclass) g_nbs_fill = 1;
+    if (getenv("PTV_NO_SRC_FILL")) g_hold_fill = 0;   /* 2.0.0-pre6 kill switch: no fill while holding */
     { const char *s = getenv("PTV_GLUE_HTOL_PCT");     if (s && atoi(s) > 0) g_glue_htol = atoi(s); }             /* tuning knob (G4) */
     { const char *s = getenv("PTV_PAIR_EXPECT_TTL_US");if (s && atoll(s) > 0) g_pair_ttl_us = atoll(s); }          /* TEST ONLY (G6) */
     { const char *s = getenv("PTV_NBS_QUANTUM_MS");    if (s && atoi(s) > 0) g_nbs_quantum_us = (int64_t)atoi(s) * 1000; }  /* TEST ONLY (G8) */
@@ -6347,6 +6426,22 @@ int main(int argc, char **argv)
                 uninit_parse_context(&octx); return 1;
             }
             if (octx.global_opts.opts[gi].key[0] == 's') g_stall_min_us = d; else g_lost_after_us = d;
+        }
+        if (!strcmp(octx.global_opts.opts[gi].key, "hold")) {                 /* 2.0.0-pre6 */
+            const char *v = octx.global_opts.opts[gi].val;
+            if (strcmp(v, "freeze") && strcmp(v, "black")) {
+                av_log(NULL, AV_LOG_ERROR, "-hold %s: expected freeze or black\n", v);
+                uninit_parse_context(&octx); return 1;
+            }
+            g_hold_black = !strcmp(v, "black");
+        }
+        if (!strcmp(octx.global_opts.opts[gi].key, "freeze_max")) {           /* 2.0.0-pre6 */
+            const char *v = octx.global_opts.opts[gi].val;
+            if (!strcmp(v, "inf")) g_freeze_max_us = 0;
+            else if (av_parse_time(&g_freeze_max_us, v, 1) < 0 || g_freeze_max_us <= 0) {
+                av_log(NULL, AV_LOG_ERROR, "-freeze_max %s: expected a duration or inf\n", v);
+                uninit_parse_context(&octx); return 1;
+            }
         }
         if (!strcmp(octx.global_opts.opts[gi].key, "reopen_backoff") &&
             parse_backoff(octx.global_opts.opts[gi].val) < 0) {

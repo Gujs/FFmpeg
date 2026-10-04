@@ -265,6 +265,7 @@ typedef struct DlvGate {
  * blocked on recv and cannot self-detect). Bit chosen above libavcodec's AV_PKT_FLAG_* space;
  * never leaves the process. */
 #define PTV_PKT_FLAG_NBS_FILL (1 << 16)
+#define PTV_PKT_FLAG_HOLD_FILL (1 << 17)  /* 2.0.0-pre6: hold-fill sentinel (master output thread → audio_q) */
 
 /* A/V PLL redesign Phase A probe (PTV_AVSYNC_PROBE): per-input ring recording, for each DISTINCT
  * video content the cell displayed, the output time it went out at — (abs source pts → out_v, both
@@ -783,6 +784,7 @@ typedef struct DecodeCtx {
 
 /* Per-rung output side: pop this rung's frame_q on the house clock, stamp the
  * content-anchored PTS, encode, hand to this rung's mux_q. One per output. */
+struct DemuxArgs;
 typedef struct VideoCtx {
     AVThreadMessageQueue *frame_q;   /* decode -> output  (AVFrame*)  */
     AVThreadMessageQueue *mux_q;     /* output -> mux     (AVPacket*) */
@@ -791,6 +793,11 @@ typedef struct VideoCtx {
     int64_t         *h0;             /* shared A/V input anchor (us) */
     pthread_mutex_t *h0_lock;
     int64_t         *house_skew;     /* master publishes house-vs-content skew (us) here */
+    AVThreadMessageQueue *hold_aq[PTV_MAX_AUDIO];   /* 2.0.0-pre6: transcoded audio queues the master
+                                                     * output thread fills while input 0 holds */
+    int              n_hold_aq;
+    int64_t          hold_fill_wc;   /* wall us of the last hold-fill sentinel round */
+    struct DemuxArgs *hold_da;       /* 2.0.0-pre6: input 0's demux — its copied AC-3/E-AC-3 get silence too */
     RateEstimator   *est;            /* input 0's rate sensor (genlock fallback + cf/diag/stats reads) */
     HouseRateState  *hr;             /* per-house actuation state: master computes+publishes rho, all rungs apply it */
     VOutRing        *vring;          /* A/V probe: single-input video output ring (PTV_AVSYNC_PROBE) */
@@ -1130,6 +1137,12 @@ typedef struct AudioState {
     int              nbs_fill_active;                 /* fill phase open */
     int              nbs_feeding;                     /* inside nbs_fill_quantum's feed loop */
     int              nbs_fills;                       /* quanta synthesized this run (observability) */
+    /* 2.0.0-pre6 (T-056 §5.1/§5.2): silence while input 0 holds, at door positions that ride house_skew
+     * (raw labels untouched), so audio's output position follows the held video */
+    int              hold_feeding;                    /* inside hold_fill_quantum's feed loop */
+    int64_t          hold_fill_us;                    /* door time this hold's fill covered (us) */
+    int64_t          hold_fill_wc0;                   /* wall us this fill began */
+    int64_t          hold_fresh_wc;                   /* wall us a fresh video frame was first seen after it */
     int64_t          nbs_last_wall_us;                /* rr15 F9: wall of the previous quantum (elapsed base) */
     int64_t          nbs_carry_us;                    /* rr15 F9: sub-frame remainder carried between quanta */
     int64_t          glue_cad_us;                     /* rr15 R2: EMA of nonzero fed-frame wall gaps (PES-burst
@@ -1310,6 +1323,24 @@ typedef struct PassStream {
     int        gated;                 /* §7.5a: dense copied AUDIO (AC-3/MP2) → route via the delivery
                                        * gate; sparse subs/data/SCTE-35 bypass (their wire-arrival lead
                                        * is a feature) */
+    /* 2.0.0-pre6 (T-056 §5.1, D17): silence for a copied AC-3/E-AC-3 track whose PID stops while video
+     * repeats — one silent frame of the same codec/layout/bitrate encoded at bind, replayed by the master
+     * output thread. All below under DemuxArgs.pass_lock. */
+    AVPacket  *sil;                   /* the silent frame (NULL = this stream gets no fill) */
+    int64_t    sil_dur;               /* its duration (in_tb) */
+    int64_t    arr_wc;                /* wall us of the last real packet */
+    int64_t    real_end;              /* last real packet's dts + duration (in_tb, output domain) */
+    int64_t    hs_real;               /* house_skew (us) that packet was stamped with */
+    int64_t    fill_end;              /* end of the replayed silence (in_tb); NOPTS = no fill */
+    int        fill_n, drop_n;        /* frames replayed / real packets dropped below fill_end (hand-back) */
+    /* 2.0.0-pre6: a dense copy resuming after >=300 ms of silence is parked (demux thread only) until the master
+     * emits a fresh frame — stamped earlier it met the stale hold-grown house_skew: 18.6 s late after a 20 s
+     * outage, held in the gate until its queue overflowed, ~18.6 s of real AC-3 lost (sync_ac3_gap_20) */
+#define PTV_PARK_MAX 128
+    AVPacket  *park[PTV_PARK_MAX];
+    int        npark;
+    int64_t    park_since;            /* wall us the parked run began */
+    int64_t    in_wc;                 /* wall us of the last packet's arrival here */
 } PassStream;
 
 /* ---- legacy-0004 TS-discontinuity buffer (g_layera / PTV_LAYERA, default OFF) ----
@@ -1549,6 +1580,9 @@ typedef struct DemuxArgs {
     int64_t               adisc_win_us[PTV_MAX_AUDIO];/* [PTV-ADISC] 10s log window start */
     int64_t               adisc_win_n[PTV_MAX_AUDIO]; /* discards in the open window */
     int64_t               nbs_last_fill_us[PTV_MAX_AUDIO]; /* last FILL sentinel sent (quantum pace) */
+    int64_t               a_arr_us[PTV_MAX_AUDIO];   /* 2.0.0-pre6: wall us of each transcoded track's last packet */
+    int64_t               v_last_arr_us;    /* 2.0.0-pre6: last video packet (wall us) */
+    int64_t               v_flow_since_us;  /* 2.0.0-pre6: start of the current gap-free (<1 s) video arrival run */
     int64_t               glue_refuse_cnt;            /* §2.3 F2 refuse ledger (per input) */
     /* 1.0.1-pre16 #47-A: per-stream snapshot of d->vpkt at this stream's last packet — at a
      * gap verdict, (d->vpkt − gap_vsnap[stream]) = video packets that arrived DURING the gap.
@@ -1684,6 +1718,7 @@ typedef struct DemuxArgs {
     int64_t               by_bank_last_q;   /* v0.9.14: wall time of the last QUALIFYING stall (decay reference) */
                                             /* (by_bank_advise_us moved to CushionRt.bank_advise_us — 0.9.18 M3) */
     int64_t               vcorrupt;       /* video packets flagged AV_PKT_FLAG_CORRUPT (discarded if g_discardcorrupt) */
+    pthread_mutex_t       pass_lock;        /* 2.0.0-pre6: copy state shared with the master's AC-3 fill */
 } DemuxArgs;
 
 /* One source input. Single-input uses inputs[0]; multiview uses 1/2/4. Each has
@@ -1968,6 +2003,8 @@ extern _Atomic int64_t g_v_arrive_wc;    /* wall us of the last video pkt at the
  * the master output thread owns the transition, the demux thread classifies the rejoin. Single input only. */
 extern int             g_src_watch;      /* detection armed (single live input, !PTV_NO_HOLD) */
 extern int64_t         g_stall_min_us;   /* -stall_min (default 3 s, fleet-measured) */
+extern int             g_hold_black;     /* 2.0.0-pre6: -hold black */
+extern int64_t         g_freeze_max_us;  /* 2.0.0-pre6: -freeze_max, 0 = inf */
 extern int64_t         g_lost_after_us;  /* -lost_after (default 30 s); pre3: observe only */
 extern _Atomic int     g_src_state;      /* 0 = LIVE, 1 = STALLED */
 extern _Atomic int64_t g_src_hold_start; /* wall us the hold began (0 = not holding) */
@@ -1975,9 +2012,12 @@ extern _Atomic int64_t g_src_vread_wc;   /* wall us of the last video packet REA
 extern int             g_src_hold_act;   /* 2.0.0-pre4: act on STALLED (engine freeze, accounting); 0 = observe
                                           * only (PTV_HOLD_OBSERVE=1, the pre3 behaviour) */
 extern _Atomic int64_t g_src_rejoin_wall; /* 2.0.0-pre4: wall us of the last STALLED -> LIVE (0 = never) */
+extern _Atomic int64_t g_src_fresh_wc;    /* 2.0.0-pre6: wall us of the master's last fresh (non-dup) frame,
+                                           * stored after that tick's house_skew write */
 extern _Atomic int     g_src_icb_armed;   /* 2.0.0-pre5: the no-video read interrupt is live (single input) */
 extern int             g_backoff_s[8], g_backoff_n;   /* -reopen_backoff (s), 2.0.0-pre2/pre5 */
 int ptv_src_interrupt(void *opaque);     /* 2.0.0-pre5: AVIOInterruptCB — no video read for -lost_after */
+void ptv_copy_fill(struct DemuxArgs *d, int64_t hs, int64_t now);   /* 2.0.0-pre6: copied AC-3 silence */
 /* 2.0.0-pre5: a udp/rtp open is passive — it listens for the whole read timeout, so a failed attempt
  * already waited; sleeping a backoff on top only delays the rejoin (no remote peer to spare) */
 static inline int ptv_url_passive(const char *u)
@@ -2041,6 +2081,7 @@ extern _Atomic int64_t g_mux_sent_wc[PTV_MAX_RUNG];
  * analysis/ptvencoder-33-glue-classification.md) */
 extern int     g_glueclass;              /* the whole classifier; PTV_NO_GLUECLASS=1 reverts wholesale */
 extern int     g_nbs_fill;               /* §3 starvation silence-fill — OPT-IN (PTV_NBS_FILL=1; owner Q2) */
+extern int     g_hold_fill;              /* 2.0.0-pre6: audio silence while input 0 holds (PTV_NO_SRC_FILL=1 off) */
 extern int     g_glue_htol;              /* §2.3 label-health tolerance, percent (5; PTV_GLUE_HTOL_PCT — TEST/tuning) */
 extern int64_t g_pair_ttl_us;            /* pair-expect TTL (30s; PTV_PAIR_EXPECT_TTL_US — TEST ONLY, G6) */
 extern int64_t g_nbs_quantum_us;         /* fill quantum (100ms; PTV_NBS_QUANTUM_MS — TEST ONLY, G8) */

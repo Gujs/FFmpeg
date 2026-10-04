@@ -5,6 +5,49 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre6 — fill while the source is gone (T-056 §5.1/§5.2)
+
+The output keeps sound and picture through a source hold, and audio comes back with the video after any outage.
+- **Transcoded audio fill**: while video only repeats (no fresh frame for 120 ms, or input 0 holds) every transcoded
+  track that is itself silent (no frame for max(150 ms, 3 x its arrival cadence)) gets silence from the master
+  output thread (the demux is blocked in its read). The silence is stamped AT the graph door riding house_skew (raw
+  labels untouched), so audio's output position stays on the held video: a LIVE LOSS rejoin (labels +W, house_skew
+  back to ~0) lands where the fill ended, a BURST rejoin continues it. The wall-evidence pad hardcap is credited with
+  what the fill covered. `[PTV-SRC] aN hold fill …` (fills of 3 s or more).
+- **Stale house_skew at a rejoin (also a 1.2.x/pre5 bug)**: post-gap audio reached the graph door before video
+  published the post-rejoin house_skew, so a LIVE LOSS counted the hole twice (labels +W and house_skew +W) —
+  aresample padded ~W and dropped it again: ~18 s of program audio replaced by silence after a 20 s outage. The first
+  real frame after a fill now waits (bounded 3 s) for the first fresh video frame since the fill began. Copies: a
+  dense copied audio stream resuming after >= 300 ms of silence is parked (demux keeps reading) until that frame —
+  stamped earlier, its packets sat 18.6 s ahead in the delivery gate until its queue overflowed: ~18.6 s of real
+  copied AC-3 lost after a 20 s outage.
+- **Audio absent while video flows** (D24/D25): a transcoded track whose packets stop for 2 s during a gap-free video
+  run gets the NBS silence fill, now default-on (was corrupt-discard only, opt-in).
+- **Copied AC-3 / E-AC-3** (D17): one silent frame of the stream's own codec, layout and bitrate is encoded at bind and
+  replayed by the master on the same ride-house_skew rule (never beyond the video front plus its lead); at hand-back
+  real packets below the end of the silence are dropped. Other copied codecs stay empty while absent.
+  `[PTV-SRC] copy #N (ac3) hold fill …`.
+- **`-hold freeze|black`, `-freeze_max <dur|inf>`** (default freeze, 30 s): after -freeze_max of a hold (or from the
+  first held tick with -hold black) the frozen frame is replaced by black — a black DUP with the held frame's props and
+  content pts (house_skew, sensors and fills see an ordinary repeat); hw frames are filled in their sw_format and
+  uploaded. `[PTV-SRC] in0 held picture → black (…)`.
+- `PTV_NO_SRC_FILL=1` turns all source fill off (pre5 behaviour).
+
+Gate (local fixtures, VideoToolbox, unwrapped ruler, new audio-PID PTS-continuity check): gap_300 (real 300 s
+outage) PASS — frozen 32 s, black 266 s, silence, live 0.1 s after the source, audio PID continuous (pre5: audio lost
+for good); sync_gap_20 / sync_stop_10 / sync_kill_return_20 lip sync ±25 ms, no silence after the return (pre5: 18 s);
+sync_stop_10, sync_kill_return_20, kill_return_20 full PASS incl. wire; sync_ac3_gap/stop/kill_return lip sync ±25 ms on
+AAC and on the copied AC-3, AC-3 PID filled through the hold (583–600 silent frames, 0 hand-back drops); sync_audio_gap
+silence through a 10 s audio-only dropout, lip sync PASS; psi_only black after 30 s with its real audio kept; -hold black
+and -freeze_max 5 as specified; bursty and clean PASS. Wire: the 1.5–5.7 s dark wire of every hold is gone; flapping A/B
+(PTV_NO_SRC_FILL=1): 14 gaps up to 5.8 s → 7 up to 0.57 s.
+Open: a LIVE LOSS rejoin still jumps the output PTS forward by the lost cushion (~1.4 s; video, and a 1.47 s hole on a
+copied track; AAC pads it) — needs a non-blocking re-prime (T-077); copied AC-3 one tick (−40 ms) early for ~10 s after a
+BURST rejoin (pre-existing, tick-stepped house_skew); a ~330 ms wire pause ~1 s into some outages (pre-existing,
+unlocalized); a 0.7 s dark wire at the start of an audio-only dropout (the agreed 2 s trigger); flapping −192 ms + PCR
+intervals up to 600 ms (pre-existing, unchanged by fill — T-075); `afill=` stats token not yet (pre8); the hw (CUDA)
+black path is untested locally.
+
 ## 2.0.0-pre5 — single-input reopen (T-056 §3, LOST)
 
 A single live network input now survives losing its source instead of ending the run (1.2.x exits rc=0 at
