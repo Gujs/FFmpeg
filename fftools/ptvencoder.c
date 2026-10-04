@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.0-pre8.1"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.0-pre8.2"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -2599,7 +2599,7 @@ static void rejoin_map(DecodeCtx *d, const AVFrame *frame)
         return;
     if (ptv_src_holding()) {
         int64_t hid = atomic_load_explicit(&g_src_hold_start, memory_order_relaxed);
-        if (hid != d->rj_hold_id) { d->rj_hold_id = hid; d->rj_done = 0; }
+        if (hid != d->rj_hold_id) { d->rj_hold_id = hid; d->rj_done = 0; d->rj_dbg_n = 0; }
     } else {
         int64_t rj = atomic_load_explicit(&g_src_rejoin_wall, memory_order_relaxed);
         if (!rj || av_gettime_relative() - rj > 2000000)
@@ -2619,6 +2619,13 @@ static void rejoin_map(DecodeCtx *d, const AVFrame *frame)
     next = atomic_load_explicit(&g_house_out_us, memory_order_relaxed) + tick;   /* the next house tick: a frame
                                                                                    * that misses it costs one dup */
     lead = pos - next;
+    if (g_diag && d->rj_dbg_n < 16) {   /* 2.0.0-pre8.2: [PTV-RJTRACE] (canary B: the map cancelled — localize) */
+        d->rj_dbg_n++;
+        av_log(NULL, AV_LOG_INFO, "[PTV-RJTRACE] dec src=%.3f pict=%c key=%d pos=%.3f next=%.3f lead=%+.3f vs=%.3f "
+               "h0=%.3f holding=%d\n", src_us / 1e6, av_get_picture_type_char(frame->pict_type),
+               !!(frame->flags & AV_FRAME_FLAG_KEY), pos / 1e6, next / 1e6, lead / 1e6, vs / 1e6, h0 / 1e6,
+               ptv_src_holding());
+    }
     if (lead <= tick)
         return;
     old = atomic_load_explicit(&g_rj_off_total, memory_order_relaxed);

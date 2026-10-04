@@ -736,6 +736,7 @@ typedef struct DecodeCtx {
     VideoHold       *hold;                    /* multiview: stage frames here (NULL = filter inline) */
     int64_t          rj_hold_id;              /* 2.0.0-pre6.1: the hold the rejoin map last armed for */
     int              rj_done;                 /* ... and whether it was applied */
+    int              rj_dbg_n;                /* 2.0.0-pre8.2: [PTV-RJTRACE] lines left this hold (PTV_DIAG) */
     /* filter graph: filtering -> N buffersinks (one per rung); else clone decode */
     int              filtering;
     AVFilterGraph   *fg;
