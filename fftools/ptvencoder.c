@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.0-pre8.2"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.0-pre8.3"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -2591,6 +2591,8 @@ strip:
  * jump (video PCR +1.4 s, a 1.47 s hole on a copied AC-3, +1.5 s aresample hard comp on AAC). Content BEHIND the
  * house (BURST) is left alone: today's dup / latency-retained posture. Decided here, upstream of the split, so every
  * rung gets the same map. Once per hold. */
+#define PTV_RJ_KEY_MARGIN_US 1000000
+
 static void rejoin_map(DecodeCtx *d, const AVFrame *frame)
 {
     int64_t src_us, h0, pos, next, tick, lead, old, vs;
@@ -2630,7 +2632,12 @@ static void rejoin_map(DecodeCtx *d, const AVFrame *frame)
         return;
     old = atomic_load_explicit(&g_rj_off_total, memory_order_relaxed);
     atomic_store_explicit(&g_rj_off_before, old, memory_order_relaxed);      /* vskip's write order */
-    atomic_store_explicit(&g_rj_from_us, src_us, memory_order_relaxed);
+    /* 2.0.0-pre8.3: key the map 1 s BELOW the deciding frame. The clock sees the filter graph's output, not the
+     * decoder's: on the canary (GB_News, 1080i through hwupload + bwdif_cuda) the frame after the deciding one came out
+     * stamped 20 ms below it, missed the offset, landed 2.56 s ahead and the monotonic house jumped +2.32 s onto it —
+     * cancelling the map for everything after ([PTV-RJTRACE], live-transcoder 2026-10-05). Safe: content before the gap
+     * is at least the outage (>= the 3 s stall threshold) below, and frames below the key keep the previous offset. */
+    atomic_store_explicit(&g_rj_from_us, src_us - PTV_RJ_KEY_MARGIN_US, memory_order_relaxed);
     atomic_store_explicit(&g_rj_off_total, old + lead, memory_order_release);
     atomic_fetch_add_explicit(&g_rj_epoch, 1, memory_order_relaxed);
     d->rj_done = 1;
