@@ -5,6 +5,23 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre8.3 — the rejoin map keyed 1 s below the deciding frame (canary GB_News +2.32 s PTS jump)
+
+- **Fixed: on an interlaced source the rejoin map could be cancelled by one frame, jumping the output video PTS forward**
+  (GB_News on live-transcoder, 45 s outage: +2.24 s on pre8.1, +2.32 s on pre8.2; audio padded the same, so A/V stayed
+  aligned — a ~2 s glitch and extra silence at the return). Localized with pre8.2's `[PTV-RJTRACE]` on the canary
+  (2026-10-05): the map was decided on the decoder's frame at src 86480.688 (from = that src, offset 2.56 s); the clock's
+  NEXT frame — after hwupload + bwdif_cuda, the 1080i path — carried src 86480.668, 20 ms below the key, so it got the
+  old offset (0), landed 2.56 s ahead, and the monotonic house jumped +2.32 s onto it; every later frame was mapped but
+  could no longer pull the house back (house_skew ≈ 0 afterwards instead of −2.5 s). Progressive channels (Fashion,
+  TruBLU) never showed it; the CPU bwdif in the fixture does not produce the early stamp (not reproducible locally). The
+  key now sits 1 s below the deciding frame: content from before the gap is at least the outage (>= the 3 s stall
+  threshold) below it, and frames below the key keep the previous offset as before.
+
+Gate (local, frozen copy): sync_gap_20 / sync_kill_return_20 / sync_stop_10 / sync_ac3_gap_20 lip sync ±25 ms, no
+post-return silence; stop_20, clean PASS; the mid-GOP canary repro PASS; GB_News source capture + bwdif + loudnorm 45 s
+outage: key 1 s below, pre-gap tail frames unmapped, no video PTS step. Box verification = drop test B on GB_News.
+
 ## 2.0.0-pre8.2 — rejoin trace for the canary GB_News PTS jump (diagnostics only)
 
 No behaviour change. The pre8.1 canary drop tests (live-transcoder 2026-10-04,
