@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.0-pre9.1"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.0-pre9.2"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -4787,9 +4787,13 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         inputs[k].wall_cad_us     = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].wall_cad_us));     /* pre24 #63: cadence EMA */
         inputs[k].pkt_wall_gap_us = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].pkt_wall_gap_us)); /* pre24 #63: current-pkt gap */
         inputs[k].tail_gap_us     = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].tail_gap_us));     /* 2.0.0-pre4c: PES-tail carry */
+        inputs[k].ts_outl         = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].ts_outl));         /* 2.0.0-pre9.2 (T-080 B) */
         if (!inputs[k].wrap_off || !inputs[k].wrap_last || !inputs[k].wrap_wall_last || !inputs[k].edit_us || !inputs[k].gap_vsnap ||
-            !inputs[k].wall_cad_us || !inputs[k].pkt_wall_gap_us || !inputs[k].tail_gap_us) { ret = AVERROR(ENOMEM); goto end; }
-        for (si = 0; si < (int)inputs[k].ifmt->nb_streams; si++) inputs[k].wrap_last[si] = AV_NOPTS_VALUE;
+            !inputs[k].wall_cad_us || !inputs[k].pkt_wall_gap_us || !inputs[k].tail_gap_us || !inputs[k].ts_outl) { ret = AVERROR(ENOMEM); goto end; }
+        for (si = 0; si < (int)inputs[k].ifmt->nb_streams; si++) {
+            inputs[k].wrap_last[si] = AV_NOPTS_VALUE;
+            inputs[k].ts_outl[si].last2 = inputs[k].ts_outl[si].pend_last = AV_NOPTS_VALUE;
+        }
         inputs[k].da.nb_streams_open = inputs[k].ifmt->nb_streams;   /* 1.2.2 T-064: the size above */
         inputs[k].da.late_stream_max = -1;
         if (g_layera) {   /* legacy-0004 buffer-classify-discard state (only when enabled) */
@@ -5520,6 +5524,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         d->est = &inputs[kk].est;                       /* R4: this input's rate sensor (demux thread feeds it) */
         d->wrap_off = inputs[kk].wrap_off; d->wrap_last = inputs[kk].wrap_last;
         d->wrap_wall_last = inputs[kk].wrap_wall_last; d->video_fwd_us = 0;
+        d->ts_outl = inputs[kk].ts_outl;                /* 2.0.0-pre9.2 (T-080 B) */
         d->edit_us = inputs[kk].edit_us;                /* pre9 sensor: per-stream label-edit ledger */
         d->gap_vsnap = inputs[kk].gap_vsnap;            /* pre16 #47-A: per-stream vpkt snapshots */
         d->wall_cad_us     = inputs[kk].wall_cad_us;     /* pre24 #63: delivery-cadence EMA */
@@ -5748,6 +5753,7 @@ end:
         av_freep(&inputs[k].wrap_off);
         av_freep(&inputs[k].wrap_last);
         av_freep(&inputs[k].wrap_wall_last);
+        av_freep(&inputs[k].ts_outl);
         av_freep(&inputs[k].edit_us);
         av_freep(&inputs[k].gap_vsnap);
         av_freep(&inputs[k].wall_cad_us);       /* pre24 #63 */

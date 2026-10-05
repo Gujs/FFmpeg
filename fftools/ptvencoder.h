@@ -726,6 +726,17 @@ typedef struct CcTap {
  * Multiview: `hold` is set and `filtering` is 0 — the decode thread stages each
  * frame into the per-input hold instead of running the graph; the compositor
  * owns the (N-input) graph and the frame_q fan. */
+/* 2.0.0-pre9.2 (T-080 B): a single packet with a corrupt PES timestamp (PES headers carry no CRC — one bit error
+ * upstream) must not move a stream's timeline. Per stream, the demux remembers enough to tell a one-packet outlier from
+ * a real step: the packet before last, the normal step, and a just-absorbed backward step it can still undo. */
+typedef struct PtvTsOutlier {
+    int64_t last2;          /* raw ts of the packet before wrap_last (AV_NOPTS_VALUE = none) */
+    int64_t nom;            /* EMA of this stream's normal forward step (stream tb; 0 = unknown) */
+    int64_t pend_last;      /* a backward step was absorbed: the raw ts before it (AV_NOPTS_VALUE = none) */
+    int64_t pend_dw;        /* ... what it added to wrap_off */
+    int64_t pend_dprog;     /* ... and to prog_off (video) */
+} PtvTsOutlier;
+
 typedef struct DecodeCtx {
     AVThreadMessageQueue *video_q;            /* demux -> decode (AVPacket*) */
     AVCodecContext  *vdec;
@@ -1133,6 +1144,8 @@ typedef struct AudioState {
     int64_t          pad_led_us[PTV_GLUE_PAD_LED];    /* pad size (us, >0) per slot */
     int64_t          pad_led_wc[PTV_GLUE_PAD_LED];    /* wall us the pad was verdicted */
     int              pad_led_n;                       /* ring cursor (monotonic) */
+    int64_t          rl_last_us, rl_last_wc;          /* 2.0.0-pre9.2 (T-080 B2): last backward RELABEL erase (us, >0)
+                                                       * and when — a matching forward step is its return leg */
     /* §2.4 realization tripwire: the last GAP/FLUSH-APPLY verdict's step, awaiting the
      * resampler's hard comp (instantaneous by design). Checked against the pre11 slip probe
      * ~2s after arming; a parked slip means the pad/drop was NOT realized — synthesize the
@@ -1625,6 +1638,7 @@ typedef struct DemuxArgs {
     int64_t              *wrap_off;       /* per input stream: cumulative 33-bit wrap offset (stream tb) */
     int64_t              *wrap_last;      /* per input stream: last RAW ts seen (wrap detection) */
     int64_t              *wrap_wall_last; /* per input stream: wall-clock (us) of this stream's last packet — gap-vs-splice discriminator */
+    PtvTsOutlier         *ts_outl;        /* 2.0.0-pre9.2: per input stream one-packet timestamp outlier state */
     /* 1.0.1-pre24 #63 wall-evidence (g_wallev): per-stream delivery-cadence EMA (µs between
      * good dense packets, quiet gaps only) + the CURRENT packet's pre-update wall gap —
      * demux_unwrap updates wrap_wall_last before the LAYERA loop runs, so jump detection
@@ -1769,6 +1783,7 @@ typedef struct Input {
     int64_t              *wrap_off;          /* per stream: 33-bit wrap offset (stream tb) */
     int64_t              *wrap_last;         /* per stream: last RAW ts (wrap detection) */
     int64_t              *wrap_wall_last;    /* per stream: wall-clock (us) of last packet (gap-vs-splice discriminator) */
+    PtvTsOutlier         *ts_outl;           /* 2.0.0-pre9.2: per stream one-packet timestamp outlier state */
     int64_t              *edit_us;           /* pre9 sensor: per-stream label-edit ledger storage (µs) */
     int64_t              *gap_vsnap;         /* 1.0.1-pre16 #47-A: per-stream d->vpkt snapshot storage */
     int64_t              *wall_cad_us;       /* 1.0.1-pre24 #63: per-stream delivery-cadence EMA storage */
