@@ -789,6 +789,8 @@ void *output_thread(void *arg)
     VideoCtx *v = arg;
     AVFrame *held = av_frame_alloc();
     AVFrame *blk  = NULL;                   /* 2.0.0-pre6: black twin of held (-hold black / -freeze_max) */
+    AVFrame *hpic = NULL;                   /* 2.0.0-pre9: the newest hold picture rendered through the graph */
+    int64_t hpic_wc = 0;                    /* ... and when it arrived */
     int64_t fb_live_since = 0;              /* 2.0.0-pre7: -fallback_rebind continuous-LIVE start (master) */
     int64_t src_prev_fresh_us = AV_NOPTS_VALUE;   /* 2.0.0-pre8.1: previous fresh frame's source time (jump test) */
     int64_t rjt_wall = 0;                   /* 2.0.0-pre8.2: [PTV-RJTRACE] rejoin being traced (PTV_DIAG) */
@@ -1331,7 +1333,19 @@ void *output_thread(void *arg)
             AVFrame *emit = held;
             if (!fresh && ptv_src_holding()) {
                 int64_t hs0 = atomic_load_explicit(&g_src_hold_start, memory_order_relaxed);
-                if (g_hold_black || (g_freeze_max_us > 0 && hs0 && av_gettime_relative() - hs0 >= g_freeze_max_us)) {
+                int64_t nw  = av_gettime_relative();
+                /* 2.0.0-pre9 (T-078/T-079): the decode thread renders the hold picture through the graph once per
+                 * tick (frozen frame, then black / bars / slate, with every per-frame filter — the drawtext clock —
+                 * live). Shown with the held frame's timing, so this is still an ordinary repeat to every sensor.
+                 * None fresh for 1 s (graph stalled, PTV_NO_HOLD_RENDER, hw decode, mosaic) → the pre9 path below. */
+                if (v->hold_pic) {
+                    AVFrame *np = atomic_exchange_explicit(v->hold_pic, NULL, memory_order_acq_rel);
+                    if (np) { av_frame_free(&hpic); hpic = np; hpic_wc = nw; }
+                }
+                if (hpic && nw - hpic_wc < 1000000) {
+                    hpic->pts = held->pts; hpic->pkt_dts = AV_NOPTS_VALUE; hpic->duration = 0; hpic->opaque = NULL;
+                    emit = hpic;
+                } else if (g_hold_black || (g_freeze_max_us > 0 && hs0 && nw - hs0 >= g_freeze_max_us)) {
                     if (black_like(&blk, held) >= 0) {
                         emit = blk;
                         if (!blk_logged && v->is_master)
@@ -1340,8 +1354,11 @@ void *output_thread(void *arg)
                         blk_logged = 1;
                     }
                 }
-            } else if (fresh && blk) {
+            } else if (fresh && (blk || hpic || (v->hold_pic && atomic_load_explicit(v->hold_pic, memory_order_relaxed)))) {
+                AVFrame *np = v->hold_pic ? atomic_exchange_explicit(v->hold_pic, NULL, memory_order_acq_rel) : NULL;
+                av_frame_free(&np);         /* a picture rendered just before the rejoin must not open the next hold */
                 av_frame_free(&blk);
+                av_frame_free(&hpic);
                 blk_logged = 0;
             }
             ret = encode_push(v->mux_q, v->venc, v->ost, emit, v->gate);   /* §7.5a: publish video front + release caught-up audio/copy */
@@ -1656,6 +1673,7 @@ void *output_thread(void *arg)
 done:
     av_frame_free(&held);
     av_frame_free(&blk);
+    av_frame_free(&hpic);
     /* release everything still held + close the gate (no held audio/copy lost at shutdown, and
      * any blocked enqueuer wakes to send direct) — BEFORE the video EOF marker so the muxer sees
      * the tail audio/copy first. No-op when there is no gate (offline). */
