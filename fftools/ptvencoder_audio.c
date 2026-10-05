@@ -3085,6 +3085,19 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                             }
                         }
                     }
+                    /* 2.0.0-pre9.2 (T-080 B2): the RETURN leg of a backward relabel-erase — the mirror of the pad
+                     * round-trip above. One corrupt PES timestamp (no CRC) labels a frame (or a PES of frames) X early:
+                     * it was erased (+X into glue_off_us), then the next correct frame reads +X and was padded as a GAP,
+                     * leaving audio X late for good (local sync_bitflip_100 seed 2/3: one −64 ms erase → +64 ms). A −X/+X
+                     * pair of label moves nets to zero in the source, so undoing the erase is right whatever caused it. */
+                    int erase_undo = g_glueclass && !exp_hit && step > 0 && !fill_resumed && a->rl_last_us > 0 &&
+                                     now_wc - a->rl_last_wc <= 5000000 &&
+                                     step - a->rl_last_us >= -10000 &&
+                                     step - a->rl_last_us <= 10000 + 3 * a->glue_raw_dur_us / 2;
+                    /* (the return may carry ONE lost frame with it — seed 3: +85 = +64 + a dropped 21 ms frame; the
+                     * remainder stays in the labels and is padded as the real gap it is. A return merged into a larger
+                     * loss is NOT matched: indistinguishable from a real relabel followed by a real gap — erasing that
+                     * would reopen the 0.9.16.4 audio-early class on AWE-type sources.) */
                     char sn[48];   /* 1.0.1-pre8 (d): self-shed honesty note ("" when nothing shed) */
                     if (llabs(step) > (int64_t)g_aglue_max_ms * 1000) {
                         /* ==========================================================================
@@ -3282,6 +3295,15 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                                a->dbg_k, a->dbg_in, step / 1000, exp_step / 1000,
                                exp_late ? " [late match — TTL had expired]" : "",
                                ptv_self_shed_note(a, sn, sizeof sn));
+                    } else if (erase_undo) {
+                        a->glue_off_us -= a->rl_last_us;
+                        av_log(NULL, AV_LOG_WARNING,
+                               "[PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms returns the %+"PRId64"ms relabel erased "
+                               "%"PRId64"ms ago — ONE corrupt timestamp: erase undone, no pad (glue total %+"PRId64"ms)%s\n",
+                               a->dbg_k, a->dbg_in, step / 1000, -a->rl_last_us / 1000,
+                               (now_wc - a->rl_last_wc) / 1000, a->glue_off_us / 1000,
+                               ptv_self_shed_note(a, sn, sizeof sn));
+                        a->rl_last_us = 0;
                     } else if (pad_cancel) {
                         a->glue_events++;   /* corrector freeze set (§5 rule 3) */
                         av_log(NULL, AV_LOG_WARNING,
@@ -3326,6 +3348,8 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                         } else {
                             a->glue_off_us -= step;
                             a->glue_events++;
+                            a->rl_last_us = -step;   /* 2.0.0-pre9.2: a matching forward step undoes it */
+                            a->rl_last_wc = now_wc;
                             if (allow)
                                 av_log(NULL, AV_LOG_WARNING,
                                        "[PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms (wall gap %"PRId64"ms) — backward RELABEL erased (glue total %+"PRId64"ms, event %d)%s\n",
@@ -3344,7 +3368,7 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                          * backward RELABEL erase, which nets the fold to zero — treating it as
                          * a pad round-trip would DROP content we never padded), and no >10s
                          * in-flight alert (nothing is in flight). */
-                        int erased_here = conv_folded ||
+                        int erased_here = conv_folded || erase_undo ||
                                           (step < 0 && !exp_hit && !pad_cancel && !fill_resumed &&
                                           llabs(step) <= (int64_t)g_aglue_max_ms * 1000);
                         if (!erased_here) {
@@ -3353,7 +3377,7 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                             a->pend_comp_us = step;
                             a->pend_comp_wc = now_wc;
                         }
-                        if (step > 0 && !exp_hit && !conv_folded &&
+                        if (step > 0 && !exp_hit && !conv_folded && !erase_undo &&
                             wall_gap < step / 2 + FFMAX(a->glue_cad_us, 40000)) {
                             /* E5 pad ledger: an open GAP-pad awaiting a possible return leg (3a).
                              * Registered (flush-routed) forward steps are alignment, not gaps —

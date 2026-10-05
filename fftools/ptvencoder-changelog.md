@@ -5,6 +5,37 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre9.2 — one corrupt timestamp no longer moves a stream's timeline (T-080 mechanism B)
+
+PES headers carry no CRC: one upstream bit error makes ONE packet's PTS/DTS lie. The T-081 corrupted-input fixtures
+(`sync_bitflip_100`: one random payload bit in 10 % of the packets for 30 s, 5 seeds) showed three layers turning that
+single bad value into a permanent change — measured, each confirmed by a trace, each A/B'd against pre9.1:
+- **B1, packet layer (80 ms–1 s):** a video DTS 142 ms behind its predecessor was absorbed as a backward source step
+  (+182 ms on every later packet); the next packet was back on the old timeline, read +182 ms "ahead" under the 1 s
+  forward threshold, and nothing undid it → audio 200 ms early for good. Now the absorption is reverted when the next
+  packet lands back on the pre-step timeline (within 3 normal steps), and a backward step that returns from a one-packet
+  FORWARD outlier is not absorbed. `[PTV-DISCONT] … was ONE corrupt timestamp … absorption reverted`.
+- **B3, LAYERA (> 1 s):** a 2^30-tick bit flip (11,930 s) opened a LAYERA cycle; the flush always kept NEW when both
+  timelines had packets — old=32 new=1 → it discarded the good packets and re-based video by −11,930 s: **content dead
+  for the rest of the run**. Now, if the jumping stream had ≤ 2 packets on the new timeline and ≥ 3 of its own packets
+  came back on the old one (arrival order), the outlier is dropped and nothing is offset.
+  `[PTV-LAYERA] the jump on stream N was K corrupt packet(s) … outlier dropped, no offset`.
+- **B2, audio glue (< 80 ms):** a −64 ms audio label (one corrupt PES) was erased as a relabel; the next correct frame read
+  +64 ms and was padded as a GAP → audio 64 ms late for good. Now a forward step matching a recent backward erase (its
+  return leg, ± one lost frame, within 5 s) undoes the erase — the mirror of the existing pad round-trip cancel.
+  `[PTV-AGLUE] … returns the −N ms relabel … erase undone, no pad`. Residual (documented): a return merged into a larger
+  loss is not matched (indistinguishable from a real relabel + a real gap; erasing that would reopen the 0.9.16.4
+  audio-early class) — seed 4 keeps +64 ms (audio late, within lip-sync tolerance).
+
+Real splices are untouched: TruBLU capture replay (2 unflagged splices +513.9 s / −393.8 s, 7 min) — every LAYERA and
+absorber decision byte-identical to pre9.1, the new rules never fired.
+
+Gate (local, frozen copy, 30 runs): the pre9.1 set (two mid-GOP outages ± AC-3, gap/stop/kill_return, psi_only, stop_20,
+bursty, clean, corrupt_resume, bwdif + clock + bars) PASS or unchanged; sync_bitflip_100 seeds 1/2/3/5 + AC-3 PASS (were:
+−200 ms, +64 ms, content DEAD, PASS), seed 4 the documented +64 ms residual; loss 1/10 % lip sync PASS. Pre-existing and
+identical on pre9.1 (A/B): sync_flapping −192/−478 ms (T-075), PCR 600–640 ms on flapping / fwd_pts_jump, the known
+onset pauses; reshaped_return exits 4 by design.
+
 ## 2.0.0-pre9.1 — bars are the default hold picture
 
 - Owner 2026-10-05: no-signal bars replace black on every channel. `-hold` now defaults to `bars` (frozen picture for

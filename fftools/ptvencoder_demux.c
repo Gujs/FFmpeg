@@ -821,7 +821,7 @@ static void ptv_disc_cancel(DemuxArgs *d, PtvDiscBuf *b)
 static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
 {
     int i, ret = 0;
-    int old_count = 0, new_count = 0, keep_timeline;
+    int old_count = 0, new_count = 0, keep_timeline, outlier = 0;
     int cont_count = 0;          /* 1.0.1-pre7: continuing-stream packets kept at offset 0 */
     int any_started = 0;
     int64_t vid_off = 0, aud_off = 0;
@@ -998,14 +998,36 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
         else if (dp->timeline == 2) cont_count++;
     }
 
+    /* 2.0.0-pre9.2 (T-080 B3): was the "jump" ONE corrupt timestamp? In ARRIVAL order (before the sort below), a
+     * real splice leaves every later packet of the jumping stream on the new timeline; a corrupt PES header (no CRC)
+     * puts one or two packets there and the stream carries on where it was. Keeping NEW then discarded the good
+     * packets and re-based the stream onto the outlier — measured locally (sync_bitflip_100, seed 3): a 2^30-tick bit
+     * flip, flush old=32 new=1 keep=NEW applied −11930 s, content dead for the rest of the run. */
+    {
+        int t = b->cycle_trigger, first_new = -1, new_t = 0, old_after = 0;
+        for (i = 0; t >= 0 && i < b->nb_packets; i++) {
+            PtvDiscPacket *dp = b->packets[i];
+            if (!dp || dp->stream_idx != t)
+                continue;
+            if (dp->timeline == 1) { new_t++; if (first_new < 0) first_new = i; }
+            else if (dp->timeline == 0 && first_new >= 0) old_after++;
+        }
+        outlier = new_t >= 1 && new_t <= 2 && old_after >= 3;
+        if (outlier)
+            av_log(NULL, AV_LOG_WARNING, "[PTV-LAYERA] the jump on stream %d was %d corrupt packet(s): %d of its packets "
+                   "came back on the old timeline — outlier dropped, no offset\n", t, new_t, old_after);
+    }
+
     qsort(b->packets, b->nb_packets, sizeof(PtvDiscPacket *), ptv_disc_compare);
 
     for (i = 0; i < b->nb_streams; i++)
         if (b->stream_state[i].last_sent_dts != AV_NOPTS_VALUE) { any_started = 1; break; }
 
     /* Always keep NEW when both timelines have packets (the continued content);
-     * if only one timeline buffered, keep that one. */
-    if (old_count == 0 && new_count > 0)
+     * if only one timeline buffered, keep that one. pre9.2: unless the new one is a corrupt-timestamp outlier. */
+    if (outlier)
+        keep_timeline = 0;
+    else if (old_count == 0 && new_count > 0)
         keep_timeline = 1;
     else if (new_count == 0 && old_count > 0)
         keep_timeline = 0;
@@ -1853,6 +1875,27 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
         if (last != AV_NOPTS_VALUE) {
             int64_t delta = raw - last;
             int ct = st->codecpar->codec_type;
+            /* 2.0.0-pre9.2 (T-080 B): a one-packet timestamp outlier. PES headers carry no CRC, so one upstream bit
+             * error makes ONE packet's DTS lie. Measured (sync_bitflip_100): a video DTS 142 ms behind its predecessor was
+             * absorbed below as a backward source step (+182 ms on every later packet); the next packet was back on the
+             * old timeline (+2 frames after the one before the outlier), read +182 ms "ahead", under the 1 s forward
+             * threshold — nothing undid it: A/V −200 ms for good. A real step continues on its new timeline. */
+            PtvTsOutlier *ol = d->ts_outl && pkt->stream_index < d->nb_streams_open ? &d->ts_outl[pkt->stream_index] : NULL;
+            if (ol && ol->pend_last != AV_NOPTS_VALUE) {
+                int64_t from_pre = raw - ol->pend_last;
+                if (ol->nom > 0 && from_pre > 0 && from_pre <= 3 * ol->nom) {   /* back on the pre-step timeline */
+                    d->wrap_off[pkt->stream_index] -= ol->pend_dw;
+                    d->prog_off -= ol->pend_dprog;
+                    d->splice_adj_us = 0;                    /* no sibling may adopt the bogus amount */
+                    rsync_post_edit(d, pkt->stream_index, -av_rescale_q(ol->pend_dw, st->time_base, AV_TIME_BASE_Q));
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-DISCONT] stream %d: the absorbed %+"PRId64"ms step was ONE corrupt "
+                           "timestamp (the next packet is back on the old timeline) — absorption reverted\n",
+                           pkt->stream_index, -av_rescale_q(ol->pend_dw, st->time_base, (AVRational){1,1000}));
+                }
+                ol->pend_last = AV_NOPTS_VALUE;
+            }
+            if (ol && delta > 0 && delta <= av_rescale(250, st->time_base.den, (int64_t)st->time_base.num * 1000))
+                ol->nom = ol->nom ? ol->nom + (delta - ol->nom) / 8 : delta;   /* the normal step */
             /* v0.9.16.1 sparse-PID wrap guard: past HALF the wrap period (13.26h @90kHz) of wall
              * silence, the ±half delta heuristic ALIASES both ways — a no-wrap gap >13.26h reads
              * as "late pre-roll" (−2^33 → the PID lands 26.5h in the past and demux_pass drops it
@@ -1910,6 +1953,19 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                     int64_t nominal = pkt->duration > 0 ? pkt->duration : thresh / 4;
                     int64_t adj = delta - nominal;
                     int is_gap = 0;
+                    /* 2.0.0-pre9.2 (T-080 B): the mirror case — the PREVIOUS packet was a one-packet FORWARD outlier (under
+                     * the 1 s forward threshold, so it flowed) and this packet is back where the timeline was before it.
+                     * Absorbing this "backward step" would shift every later packet by the outlier's amount. Only in the
+                     * absorber's own band: a >1 s return belongs to LAYERA, which buffered the outlier (taking it from
+                     * LAYERA broke its cycle — local, a 2^30-tick bit flip: content dead after the damage). */
+                    if (delta < 0 && ol && ol->nom > 0 && ol->last2 != AV_NOPTS_VALUE &&
+                        av_rescale_q(-delta, st->time_base, AV_TIME_BASE_Q) <= PTV_DISC_THRESHOLD_US &&   /* >1 s: LAYERA's */
+                        raw - ol->last2 > 0 && raw - ol->last2 <= 3 * ol->nom && last - ol->last2 > 3 * ol->nom) {
+                        av_log(NULL, AV_LOG_WARNING, "[PTV-DISCONT] stream %d: %+"PRId64"ms backward step returns from ONE "
+                               "corrupt forward timestamp — NOT absorbed\n", pkt->stream_index,
+                               av_rescale_q(delta, st->time_base, (AVRational){1,1000}));
+                        goto absorb_done;
+                    }
                     /* gap-fix (2026-06-26): a FORWARD jump on a dense AUDIO stream is an audio-only SOURCE GAP
                      * (not a whole-program splice) when (a) the VIDEO stream did NOT also forward-cross recently
                      * (content signal — a real splice jumps video too) AND (b) this stream's packets were
@@ -2242,6 +2298,11 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                         else { d->splice_adj = adj; d->splice_adj_us = nowb; }     /* first crosser sets the shared amount */
                     }
                     d->wrap_off[pkt->stream_index] -= adj;   /* per-stream rebase AT OWN CROSSING (audio-derived common offset when g_layera) */
+                    if (ol && delta < 0) {                   /* 2.0.0-pre9.2: undoable if the next packet says "outlier" */
+                        ol->pend_last  = last;
+                        ol->pend_dw    = -adj;
+                        ol->pend_dprog = ct == AVMEDIA_TYPE_VIDEO ? -adj : 0;
+                    }
                     rsync_post_edit(d, pkt->stream_index,    /* pre9 sensor: a label EDIT (−adj added to this stream's labels) */
                                     -av_rescale_q(adj, st->time_base, AV_TIME_BASE_Q));
                     /* pre24 #63 provenance (measurement only): this absorb ERASES the step; if
@@ -2277,6 +2338,8 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                 }
             }
         }
+        if (d->ts_outl && pkt->stream_index < d->nb_streams_open)
+            d->ts_outl[pkt->stream_index].last2 = d->wrap_last[pkt->stream_index];   /* 2.0.0-pre9.2 */
         d->wrap_last[pkt->stream_index] = raw;
         d->wrap_wall_last[pkt->stream_index] = wall_now;   /* gap-fix: per-stream packet arrival wall-clock */
         if (d->gap_vsnap)                                  /* pre16 #47-A: video-progress ref for the gap guard */
