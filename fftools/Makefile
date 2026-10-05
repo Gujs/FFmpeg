@@ -44,6 +44,7 @@ OBJS-ptvencoder +=                    \
     fftools/ptvencoder_clock.o        \
     fftools/ptvencoder_demux.o        \
     fftools/ptvencoder_gate.o         \
+    fftools/ptvencoder_hold.o         \
     fftools/ptvencoder_legend.o       \
     fftools/ptvencoder_mv.o           \
 

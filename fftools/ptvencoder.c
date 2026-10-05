@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.0-pre8.5"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.0-pre9"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -2651,6 +2651,7 @@ static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
 {
     int i;
     rejoin_map(d, frame);                /* 2.0.0-pre6.1 (single input: emit_video is the non-mosaic path) */
+    ptv_hold_note_frame(d, frame);       /* 2.0.0-pre9: the freeze picture + render timeline (T-078/T-079) */
     if (!d->filtering) {                 /* no graph: clone the decoded frame to each rung */
         if (frame->best_effort_timestamp != AV_NOPTS_VALUE)   /* source time in ist_tb (== out_tb) */
             frame->pts = frame->best_effort_timestamp;
@@ -2668,7 +2669,13 @@ static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
         return;
     for (i = 0; i < d->n_rung; i++) {                 /* split branch -> each rung's frame_q */
         while (av_buffersink_get_frame(d->fsink[i], filt) >= 0) {
-            AVFrame *out = av_frame_alloc();
+            AVFrame *out;
+            if (filt->opaque == &ptv_hold_tag) {   /* 2.0.0-pre9: a hold picture a temporal filter released at
+                                                    * the rejoin — not content */
+                av_frame_unref(filt);
+                continue;
+            }
+            out = av_frame_alloc();
             if (out) { av_frame_move_ref(out, filt); push_frame_q(d->frame_q[i], ((d->deep_prime_packets > 0 || atomic_load_explicit(&g_bank_pkts, memory_order_relaxed) > 0) && i == 0) ? 0 : d->live, &d->framedrop[i], out); }
             else     { av_frame_unref(filt); }
         }
@@ -2946,6 +2953,7 @@ static void *decode_thread(void *arg)
                            "[PTV-SELFHEAL] re-prime (video_q empty): decoder resets at the "
                            "next IDR\n");
                 }
+                ptv_hold_render(d);                             /* 2.0.0-pre9 (T-078/T-079): input 0 holds */
                 av_usleep(5000);
             }
             if (ret < 0) break;
@@ -3234,7 +3242,7 @@ static void *decode_thread(void *arg)
         int fr = av_buffersrc_add_frame(d->fsrc, NULL); (void)fr;
         for (i = 0; i < d->n_rung; i++)
             while (av_buffersink_get_frame(d->fsink[i], filt) >= 0) {
-                AVFrame *out = av_frame_alloc();
+                AVFrame *out = filt->opaque == &ptv_hold_tag ? NULL : av_frame_alloc();   /* pre9: no hold picture */
                 if (out) { av_frame_move_ref(out, filt); push_frame_q(d->frame_q[i], ((d->deep_prime_packets > 0 || atomic_load_explicit(&g_bank_pkts, memory_order_relaxed) > 0) && i == 0) ? 0 : d->live, &d->framedrop[i], out); }
                 else     { av_frame_unref(filt); }
             }
@@ -3242,6 +3250,7 @@ static void *decode_thread(void *arg)
 done:
     av_frame_free(&filt);
     av_frame_free(&frame);
+    ptv_hold_uninit(d);                     /* 2.0.0-pre9 */
     if (d->hold) {                          /* multiview: signal terminal EOF to the compositor */
         pthread_mutex_lock(&d->hold->lock);
         d->hold->eof = 1;
@@ -5291,6 +5300,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
     live = mode < 0 ? net_input : mode;
     g_src_watch = live && n_input == 1 && !multiview && !getenv("PTV_NO_HOLD");   /* 2.0.0-pre3 */
     g_src_hold_act = g_src_watch && !getenv("PTV_HOLD_OBSERVE");                 /* 2.0.0-pre4 */
+    g_hold_render  = !getenv("PTV_NO_HOLD_RENDER");                             /* 2.0.0-pre9 */
 
     /* 0.9.18 M1: resolve ALL cushion/queue sizing in one place (env parses + genlock default +
      * deep-prime side-cars + per-track audio depth + deep-prime target). Writes the same g_*
@@ -5434,6 +5444,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         vc->hr  = &house_rate;                   /* R4: house-rate actuation state, shared by the rung set */
         vc->vring = (!multiview && r == 0) ? &inputs[0].vring : NULL;  /* single-input: master rung feeds the A/V probe ring (multiview: compositor does) */
         vc->is_master = (r == 0);
+        vc->hold_pic = multiview ? NULL : &g_hold_pic[r];   /* 2.0.0-pre9: rendered hold pictures (T-078/T-079) */
         if (!multiview && r == 0) {              /* 2.0.0-pre6: the master fills these while input 0 holds */
             int t;
             vc->hold_da = &inputs[0].da;
@@ -5780,8 +5791,10 @@ static const OptionDef ptv_options[] = {
     { "wait_input",       OPT_TYPE_STRING, 0,                        { .off = 0 }, "give up if the input has no video after this long (default inf)", "dur" },
     { "stall_min",        OPT_TYPE_STRING, 0,                        { .off = 0 }, "content gone + input silent this long = STALLED (default 3s)", "dur" },
     { "lost_after",       OPT_TYPE_STRING, 0,                        { .off = 0 }, "no video packets this long = LOST (default 30s)", "dur" },
-    { "hold",             OPT_TYPE_STRING, 0,                        { .off = 0 }, "picture while the input is gone: freeze (default) | black", "mode" },
-    { "freeze_max",       OPT_TYPE_STRING, 0,                        { .off = 0 }, "frozen picture this long, then black (default 30s; inf = keep)", "dur" },
+    { "hold",             OPT_TYPE_STRING, 0,                        { .off = 0 }, "picture while the input is gone: freeze (default, then black) | black | bars | slate:<image> (frozen, then EBU 75 % bars / the image)", "mode" },
+    { "freeze_max",       OPT_TYPE_STRING, 0,                        { .off = 0 }, "frozen picture this long, then black / bars / slate (default 30s; inf = keep)", "dur" },
+    { "bars_shift",       OPT_TYPE_STRING, 0,                        { .off = 0 }, "move the bars / slate 4 px once per this period, 8 positions (default 60s; 0 = off)", "dur" },
+    { "bars_dim_after",   OPT_TYPE_STRING, 0,                        { .off = 0 }, "bars at 50 % after this much hold (default off)", "dur" },
     { "fallback_rebind",  OPT_TYPE_STRING, 0,                        { .off = 0 }, "wrapper fallback start: exit 5 once the input has been live this long, for a re-probe", "dur" },
     { "reopen_backoff",   OPT_TYPE_STRING, 0,                        { .off = 0 }, "seconds between input attempts, the last repeats (default 1,2,5,10,30)", "list" },
     { "abort_on",         OPT_TYPE_STRING, 0,                        { .off = 0 }, "abort conditions", "flags" },
@@ -6521,11 +6534,31 @@ int main(int argc, char **argv)
         }
         if (!strcmp(octx.global_opts.opts[gi].key, "hold")) {                 /* 2.0.0-pre6 */
             const char *v = octx.global_opts.opts[gi].val;
-            if (strcmp(v, "freeze") && strcmp(v, "black")) {
-                av_log(NULL, AV_LOG_ERROR, "-hold %s: expected freeze or black\n", v);
+            if (!strcmp(v, "freeze"))      g_hold_mode = PTV_HOLD_FREEZE;
+            else if (!strcmp(v, "black"))  g_hold_mode = PTV_HOLD_BLACK;
+            else if (!strcmp(v, "bars"))   g_hold_mode = PTV_HOLD_BARS;              /* 2.0.0-pre9 (T-079) */
+            else if (!strncmp(v, "slate:", 6)) {
+                int r = ptv_hold_slate_load(v + 6);
+                if (r < 0) {
+                    av_log(NULL, AV_LOG_ERROR, "-hold %s: cannot read the slate image: %s\n", v, av_err2str(r));
+                    uninit_parse_context(&octx); return 1;
+                }
+                g_hold_mode = PTV_HOLD_SLATE;
+            } else {
+                av_log(NULL, AV_LOG_ERROR, "-hold %s: expected freeze, black, bars or slate:<image>\n", v);
                 uninit_parse_context(&octx); return 1;
             }
-            g_hold_black = !strcmp(v, "black");
+            g_hold_black = g_hold_mode == PTV_HOLD_BLACK;
+        }
+        if (!strcmp(octx.global_opts.opts[gi].key, "bars_shift") ||               /* 2.0.0-pre9 (T-079) */
+            !strcmp(octx.global_opts.opts[gi].key, "bars_dim_after")) {
+            int64_t d;
+            if (av_parse_time(&d, octx.global_opts.opts[gi].val, 1) < 0 || d < 0) {
+                av_log(NULL, AV_LOG_ERROR, "-%s %s: expected a duration (0 = off)\n",
+                       octx.global_opts.opts[gi].key, octx.global_opts.opts[gi].val);
+                uninit_parse_context(&octx); return 1;
+            }
+            if (octx.global_opts.opts[gi].key[5] == 's') g_bars_shift_us = d; else g_bars_dim_after_us = d;
         }
         if (!strcmp(octx.global_opts.opts[gi].key, "freeze_max")) {           /* 2.0.0-pre6 */
             const char *v = octx.global_opts.opts[gi].val;

@@ -737,6 +737,11 @@ typedef struct DecodeCtx {
     int64_t          rj_hold_id;              /* 2.0.0-pre6.1: the hold the rejoin map last armed for */
     int              rj_done;                 /* ... and whether it was applied */
     int              rj_dbg_n;                /* 2.0.0-pre8.2: [PTV-RJTRACE] lines left this hold (PTV_DIAG) */
+    /* 2.0.0-pre9 (T-078/T-079): hold pictures rendered through the graph while input 0 holds */
+    AVFrame         *hr_last;                 /* ref of the last decoded frame (single input; shape + freeze picture) */
+    int64_t          hr_pts, hr_dur;          /* next render pts / one frame, in ist_tb */
+    int64_t          hr_next;                 /* wall us of the next render */
+    struct HoldPic  *hr_pic;                  /* bars / slate / black picture cache */
     /* filter graph: filtering -> N buffersinks (one per rung); else clone decode */
     int              filtering;
     AVFilterGraph   *fg;
@@ -801,6 +806,7 @@ typedef struct VideoCtx {
     int              n_hold_aq;
     int64_t          hold_fill_wc;   /* wall us of the last hold-fill sentinel round */
     struct DemuxArgs *hold_da;       /* 2.0.0-pre6: input 0's demux — its copied AC-3/E-AC-3 get silence too */
+    _Atomic(AVFrame *) *hold_pic;    /* 2.0.0-pre9: this rung's latest rendered hold picture (single input) */
     RateEstimator   *est;            /* input 0's rate sensor (genlock fallback + cf/diag/stats reads) */
     HouseRateState  *hr;             /* per-house actuation state: master computes+publishes rho, all rungs apply it */
     VOutRing        *vring;          /* A/V probe: single-input video output ring (PTV_AVSYNC_PROBE) */
@@ -2033,6 +2039,22 @@ extern _Atomic int64_t g_v_arrive_wc;    /* wall us of the last video pkt at the
 extern int             g_src_watch;      /* detection armed (single live input, !PTV_NO_HOLD) */
 extern int64_t         g_stall_min_us;   /* -stall_min (default 3 s, fleet-measured) */
 extern int             g_hold_black;     /* 2.0.0-pre6: -hold black */
+/* 2.0.0-pre9 (T-078/T-079): while input 0 holds, the decode thread feeds a picture through the filter graph once per
+ * house tick — the held decoded frame, then black / bars / a slate — so per-frame filters (the SV_TIMESTAMP drawtext
+ * clock) keep running and every rung gets the picture scaled like content. The output thread shows it in place of
+ * its repeat; the downstream repeat / black stays the fallback when no rendered picture is fresh. */
+enum { PTV_HOLD_FREEZE, PTV_HOLD_BLACK, PTV_HOLD_BARS, PTV_HOLD_SLATE };
+extern int             g_hold_mode;      /* -hold freeze|black|bars|slate:<png> */
+extern int             g_hold_render;    /* PTV_NO_HOLD_RENDER=1 → 0: the pre9 downstream repeat / black only */
+extern int64_t         g_bars_shift_us;  /* -bars_shift: one 4 px step per period over 8 positions (0 = off) */
+extern int64_t         g_bars_dim_after_us; /* -bars_dim_after: bars at 50 % after this much hold (0 = off) */
+extern _Atomic(AVFrame *) g_hold_pic[PTV_MAX_RUNG];
+extern const char      ptv_hold_tag;     /* &ptv_hold_tag in AVFrame.opaque marks a rendered hold picture */
+int  ptv_hold_slate_load(const char *path);
+void ptv_hold_render(DecodeCtx *d);      /* decode thread, video_q empty: render one picture when due */
+void ptv_hold_note_frame(DecodeCtx *d, const AVFrame *frame);   /* emit_video: a real decoded frame */
+void ptv_hold_route(AVFrame *out, int rung);   /* a rendered picture leaving the graph → the rung's slot */
+void ptv_hold_uninit(DecodeCtx *d);
 extern int64_t         g_freeze_max_us;  /* 2.0.0-pre6: -freeze_max, 0 = inf */
 extern int64_t         g_fallback_rebind_us;   /* 2.0.0-pre7: -fallback_rebind, 0 = off */
 extern int64_t         g_lost_after_us;  /* -lost_after (default 30 s); pre3: observe only */

@@ -5,6 +5,41 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre9 — the hold picture is rendered through the filter graph: live clock overlay, no-signal bars (T-078, T-079)
+
+- **The hold picture now goes through the filter graph once per house tick** (`fftools/ptvencoder_hold.c`). Before,
+  a hold repeated the last FILTERED frame downstream of the graph, so per-frame filters stopped: the SV_TIMESTAMP
+  `drawtext %{localtime}` clock (test channels) froze for the whole outage (owner, GB_News 2026-10-05). The decode
+  thread, idle on the empty video_q while input 0 holds, now feeds the held DECODED frame (during `-freeze_max`), then
+  the no-signal picture, into the graph; the frames leave the graph into one slot per rung and the output thread shows
+  the newest in place of its repeat, with the held frame's timing — house_skew, the sensors and the audio fill still see
+  an ordinary repeat. Every rung gets the picture scaled like content, on the CUDA path too. Frames a temporal filter
+  (bwdif) still holds at the rejoin carry a marker (`AVFrame.opaque`) and are dropped, never emitted as content. The
+  pre9 repeat / black stays the fallback when no rendered picture is fresh (1 s): graph stalled, hw decode, mosaic,
+  `PTV_NO_HOLD_RENDER=1`. Rendering pauses 0.5 s after every real decoded frame: at a rejoin the hold lasts until the
+  master shows a fresh frame, and a picture pushed between real frames carried the real frame bwdif delays by one into
+  the hold slot instead of frame_q — the hold never ended (caught by the local gate: bwdif + two mid-GOP outages,
+  STALLED 97.5 s; `bwdif_cuda` on GB_News / Cinestar has the same one-frame delay). Known: the clock still stops for
+  the ~4 s before STALLED is declared.
+- **`-hold bars`**: frozen frame for `-freeze_max`, then EBU 75/0/75/0 colour bars (every bar incl. white at 75 % —
+  no full white; owner 2026-10-05) for the whole outage; **`-hold slate:<image>`**: the same with a still image
+  (PNG/JPEG, scaled to the source size). Built in yuv444p in the source's matrix and range (BT.709 above 576 lines,
+  else BT.601, unless the stream says otherwise) and converted to the decoded format, so the graph never reconfigures.
+  OLED / plasma: the whole picture moves 4 px once per **`-bars_shift`** (default 60 s, 0 = off) around 8 positions;
+  **`-bars_dim_after <dur>`** (default off) drops the bars to 50 %. Audio stays silence. `-hold freeze` (default) and
+  `-hold black` keep their meaning (now with the clock live over black too). Wrapper: `SV_HOLD=bars` already passes
+  through (`-hold "$SV_HOLD"`).
+- One `[PTV-SRC] in0 hold: N pictures rendered through the filter graph` line per hold.
+
+Gate (local, frozen copy): the pre8.5 set on default options (two mid-GOP outages ± copied AC-3, gap_10/20, stop_10,
+kill_return_20, psi_only, stop_20, bursty, clean) PASS or unchanged (the known ~330 ms onset pause); with bwdif +
+drawtext clock + `-hold bars -freeze_max 5s`: sync_ac3_gap2_10 (the case the 0.5 s render pause fixed), gap_20,
+stop_10, kill_return_20 lip sync ±25 ms. Pictures: clock ticks over the frozen frame, the bars and the slate (contact
+sheets); bar luma at 75 % 180/162/131/112/84/65/35/16 and at 50 % 126/113/93/80/61/49/28/16 = EBU (BT.601, limited).
+Pre-existing, unchanged by pre9 (A/B, 3 runs each: pre9 1/3, pre9 + PTV_NO_HOLD_RENDER 1/3, pre8.5 1/3): after a NEW
+DOMAIN return with a copied AC-3 track the AAC track sometimes lands +96..147 ms late (one backward RELABEL erase at
+the resume; sync_ac3_kill_return_20) — T-082.
+
 ## 2.0.0-pre8.5 — copied AC-3 and the mid-GOP rejoin (two-outage fixture)
 
 The pre8.4 two-outage fixture with a copied AC-3 track and a mid-GOP cut (`T056_GAP_AT_MS=20500 ./fixture.sh
