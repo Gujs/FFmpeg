@@ -1400,7 +1400,9 @@ void *output_thread(void *arg)
                                                             : AV_NOPTS_VALUE;
                 if (fs != AV_NOPTS_VALUE && src_prev_fresh_us != AV_NOPTS_VALUE && llabs(fs - src_prev_fresh_us) > 500000)
                     atomic_store_explicit(&g_src_jump_wc, nw, memory_order_relaxed);
-                src_prev_fresh_us = fs;
+                if (fs != AV_NOPTS_VALUE)   /* 2.0.0-pre8.5: a pts-less frame (decoded across a mid-GOP cut) is no
+                                             * reference — it erased the pre-gap time and no jump was ever seen */
+                    src_prev_fresh_us = fs;
                 atomic_store_explicit(&g_src_fresh_wc, nw, memory_order_release);
             }
         }

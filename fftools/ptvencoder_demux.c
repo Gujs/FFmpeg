@@ -1670,15 +1670,27 @@ static int demux_pass_one(DemuxArgs *d, AVPacket *out)
     return 0;
 }
 
-/* 2.0.0-pre6: stamp the parked runs whose wait is over — a fresh frame emitted since the run began (the
- * hold-ending tick has written the post-rejoin house_skew), or 3 s, or force. */
+/* 2.0.0-pre6: stamp the parked runs whose wait is over, or 4 s, or force. A copy that was filled through a hold waits
+ * until house_skew has its post-rejoin value (2.0.0-pre8.5, ptv_rj_settled — the transcoded rule); a plain pause with
+ * video flowing still releases at the next fresh frame. */
 static void park_drain(DemuxArgs *d, int force)
 {
     int64_t fw = atomic_load_explicit(&g_src_fresh_wc, memory_order_acquire), now = av_gettime_relative();
     int pi, j;
     for (pi = 0; pi < d->n_pass; pi++) {
         PassStream *ps = &d->pass[pi];
-        if (!ps->npark || !(force || fw > ps->park_since || now - ps->park_since > 3000000))
+        int ready;
+        if (!ps->npark)
+            continue;
+        pthread_mutex_lock(&d->pass_lock);
+        if (ps->fill_end == AV_NOPTS_VALUE ||                                      /* plain pause, no fill */
+            (!ptv_src_holding() &&                                                 /* filled, but no rejoin since */
+             atomic_load_explicit(&g_src_rejoin_wall, memory_order_relaxed) <= ps->fill_wc0))
+            ready = fw > ps->park_since;
+        else
+            ready = ptv_rj_settled(ps->fill_cls_seq0, now);                        /* 2.0.0-pre8.5 */
+        pthread_mutex_unlock(&d->pass_lock);
+        if (!(force || ready || now - ps->park_since > 4000000))
             continue;
         for (j = 0; j < ps->npark; j++)
             demux_pass_one(d, ps->park[j]);
@@ -1754,6 +1766,10 @@ void ptv_copy_fill(DemuxArgs *d, int64_t hs, int64_t now)
             n++;
         }
         if (n) {
+            if (!ps->fill_n) {   /* 2.0.0-pre8.5: the rejoin that ends this fill is the next classification */
+                ps->fill_cls_seq0 = atomic_load_explicit(&g_rj_cls_seq, memory_order_acquire);
+                ps->fill_wc0      = now;
+            }
             if (ps->fill_n * ps->sil_dur < av_rescale_q(3000000, AV_TIME_BASE_Q, ps->in_tb) &&
                 (ps->fill_n + n) * ps->sil_dur >= av_rescale_q(3000000, AV_TIME_BASE_Q, ps->in_tb))
                 av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] copy #%d (%s) hold fill: silent frames aligned to the "
@@ -2630,7 +2646,10 @@ void *demux_thread(void *arg)
                  * first video packet out after a gap is the pre-gap TAIL frame (contiguous content, by
                  * construction). The first genuinely post-gap frame is the SECOND packet: classify on it,
                  * against the last packet before the gap (A), with the wall gap of the first (W). */
-                if (atomic_load_explicit(&g_src_state, memory_order_relaxed)) {
+                /* 2.0.0-pre8.5: a classification in progress finishes even if the hold ended between its two
+                 * packets (copied AC-3 + mid-GOP cut: the state flipped back to LIVE after the tail, the class was
+                 * never set, the audio waiting for it ran into its 4 s cap and video waited at the gate: 1.9 s dark) */
+                if (atomic_load_explicit(&g_src_state, memory_order_relaxed) || d->src_pend) {
                     if (!d->src_classified && d->src_last_vwall) {
                         if (!d->src_pend) {                 /* first packet after the gap: the held tail */
                             d->src_pend     = 1;
