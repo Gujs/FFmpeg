@@ -1352,6 +1352,8 @@ typedef struct PassStream {
     AVPacket  *park[PTV_PARK_MAX];
     int        npark;
     int64_t    park_since;            /* wall us the parked run began */
+    int        fill_cls_seq0;         /* 2.0.0-pre8.5: g_rj_cls_seq when this copy's hold fill began */
+    int64_t    fill_wc0;              /* 2.0.0-pre8.5: wall us it began */
     int64_t    in_wc;                 /* wall us of the last packet's arrival here */
 } PassStream;
 
@@ -2067,6 +2069,23 @@ static inline int ptv_url_passive(const char *u)
 static inline int ptv_src_holding(void)
 {
     return g_src_hold_act && atomic_load_explicit(&g_src_state, memory_order_relaxed);
+}
+/* 2.0.0-pre8.5: has house_skew taken its post-rejoin value? (cls_seq0 = g_rj_cls_seq when the fill began.) BURST at
+ * once; LIVE LOSS when the master showed the content jump; NEW DOMAIN at the jump or 200 ms after the rejoin (LAYERA
+ * re-bases it). Shared by the transcoded rejoin buffer and the copied-audio park, so the two cannot drift apart again
+ * (pre6's "a fresh frame since" let copies meet the stale house_skew after a mid-GOP cut: a 10 s AC-3 hole). */
+static inline int ptv_rj_settled(int cls_seq0, int64_t now)
+{
+    int64_t rj = atomic_load_explicit(&g_src_rejoin_wall, memory_order_relaxed);
+    if (ptv_src_holding())
+        return 0;
+    if (atomic_load_explicit(&g_rj_cls_seq, memory_order_acquire) == cls_seq0)
+        return 0;
+    switch (atomic_load_explicit(&g_rj_cls, memory_order_relaxed)) {
+    case 1:  return 1;
+    case 2:  return atomic_load_explicit(&g_src_jump_wc, memory_order_relaxed) >= rj;
+    default: return atomic_load_explicit(&g_src_jump_wc, memory_order_relaxed) >= rj || now - rj > 200000;
+    }
 }
 extern _Atomic int64_t g_shed_wall;      /* (d) wall us of the last self-inflicted queue drop (ANY input —
                                           * pre16: per-track readers use Input.shed_wall; this aggregate

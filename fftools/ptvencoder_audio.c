@@ -2704,18 +2704,8 @@ static int rj_release_ok(AudioState *a)
         return 1;                                            /* bounded: never hold audio longer */
     if (!ptv_src_holding() && rj <= a->hold_fill_wc0)       /* a short repeat run, no hold: a fresh frame after */
         return atomic_load_explicit(&g_src_fresh_wc, memory_order_acquire) > a->hold_fill_last_wc;   /* the fill */
-    if (ptv_src_holding())
-        return 0;                                            /* the hold is not over */
-    if (atomic_load_explicit(&g_rj_cls_seq, memory_order_acquire) == a->rj_cls_seq0)
-        return 0;                                            /* rejoin not classified yet */
-    switch (atomic_load_explicit(&g_rj_cls, memory_order_relaxed)) {
-    case 1:  return 1;                                       /* BURST: house_skew carries over */
-    case 2:  return atomic_load_explicit(&g_src_jump_wc, memory_order_relaxed) >= rj;   /* LIVE LOSS: the jump shown */
-    default: return atomic_load_explicit(&g_src_jump_wc, memory_order_relaxed) >= rj || now - rj > 200000;   /* NEW
-                                                              * DOMAIN: LAYERA re-bases the new timeline onto the old
-                                                              * one (no jump, no house_skew snap) — 1 s of holding cost
-                                                              * a 0.9 s dark wire (delivery gate) for nothing */
-    }
+    return ptv_rj_settled(a->rj_cls_seq0, now);   /* hold over, rejoin classified, its house_skew shown (NEW DOMAIN:
+                                                   * 200 ms — 1 s of holding cost a 0.9 s dark wire for nothing) */
 }
 
 static void rj_flush(AudioState *a);

@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.0-pre8.4"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.0-pre8.5"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -2597,9 +2597,11 @@ static void rejoin_map(DecodeCtx *d, const AVFrame *frame)
 {
     int64_t src_us, h0, pos, next, tick, lead, old, vs;
 
-    if (!g_rejoin_map || !g_src_hold_act || frame->best_effort_timestamp == AV_NOPTS_VALUE)
+    if (!g_rejoin_map || !g_src_hold_act)
         return;
-    if (ptv_src_holding()) {
+    if (ptv_src_holding()) {   /* 2.0.0-pre8.5: arm on ANY frame of the hold — the only one may carry no pts (a frame
+                                * decoded across a mid-GOP cut), and returning before this left the map unarmed:
+                                * the house jumped +2.24 s at the rejoin */
         int64_t hid = atomic_load_explicit(&g_src_hold_start, memory_order_relaxed);
         if (hid != d->rj_hold_id) { d->rj_hold_id = hid; d->rj_done = 0; d->rj_dbg_n = 0; }
     } else {
@@ -2607,7 +2609,7 @@ static void rejoin_map(DecodeCtx *d, const AVFrame *frame)
         if (!rj || av_gettime_relative() - rj > 2000000)
             return;
     }
-    if (d->rj_done || !d->rj_hold_id)
+    if (d->rj_done || !d->rj_hold_id || frame->best_effort_timestamp == AV_NOPTS_VALUE)
         return;
     pthread_mutex_lock(d->h0_lock); h0 = *d->h0; pthread_mutex_unlock(d->h0_lock);
     tick = atomic_load_explicit(&g_house_tick_us, memory_order_relaxed);

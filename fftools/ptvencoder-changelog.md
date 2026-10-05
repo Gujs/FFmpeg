@@ -5,6 +5,30 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre8.5 — copied AC-3 and the mid-GOP rejoin (two-outage fixture)
+
+The pre8.4 two-outage fixture with a copied AC-3 track and a mid-GOP cut (`T056_GAP_AT_MS=20500 ./fixture.sh
+sync_ac3_gap2_10`, also failing on pre8.3) showed four gaps, each localized with a temporary trace:
+- **A frame without a pts broke the rejoin.** After a mid-GOP cut the decoder can output one frame with no timestamp
+  (`corrupt=`), and it was the first fresh frame after the hold. It overwrote the clock's "previous fresh frame" time,
+  so the post-gap content jump (21.78 → 32.42 s) was never seen — `g_src_jump_wc` stayed 0 and the LIVE LOSS audio
+  release ran into its 4 s cap (the video then waited at the delivery gate: 1.7 + 1.9 s dark wire). And `rejoin_map()`
+  returned on that pts-less frame before recording the hold, so the map was never armed: the house jumped +2.24 s
+  (one PCR jump). Now a pts-less frame neither replaces the jump reference nor stops the hold from arming the map.
+- **The rejoin class was lost when the hold ended between its two packets** (the class is taken on the 2nd post-gap
+  video packet): a pending classification now completes.
+- **Copied AC-3 met the stale house_skew** (a 10 s PTS hole = the content jump, at every outage): parked copies were
+  released at "a fresh frame since parking" — the rule pre8.1 replaced for transcoded audio. A copy that was filled
+  through a hold now waits for the same evidence (`ptv_rj_settled()`, shared by both paths); a copy that only paused
+  with video flowing keeps the fresh-frame rule; 4 s cap.
+- Result on that fixture: no wire gaps, no PCR jump, copied AC-3 hole 56 ms, both outages mapped, audio held
+  0.67 / 0.56 s, lip sync ±25 ms on AAC and AC-3.
+
+Gate (local, frozen copy): sync_ac3_gap2_10 / sync_gap2_10 / sync_gap_10 / sync_ac3_gap_10 (mid-GOP) PASS;
+sync_ac3_gap_20 / sync_ac3_kill_return_20 / sync_gap_20 / sync_stop_10 / sync_kill_return_20 lip sync ±25 ms on every
+ruler; psi_only, stop_20, bursty, clean PASS. Unchanged known items: the ~330 ms onset pause (sync_gap_20), the 0.7 s
+NBS onset (sync_audio_gap), copied AC-3 −40 ms after a BURST (sync_ac3_stop_10), psi_only's 3 s silence (T-076).
+
 ## 2.0.0-pre8.4 — the rejoin buffer works on every outage, not only the first
 
 - **Fixed: from a channel's SECOND outage on, the program audio came back late** — silence after the picture returned
