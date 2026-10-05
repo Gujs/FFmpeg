@@ -5,6 +5,26 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre8.4 — the rejoin buffer works on every outage, not only the first
+
+- **Fixed: from a channel's SECOND outage on, the program audio came back late** — silence after the picture returned
+  for about the outage length (canary NTD 2026-10-05, watched by the owner: 10 s outage → audio ~12 s late, 90 s outage
+  → ~2 min of silence and the audio queue self-shed 2704 packets before the track recovered on its own; A/V in sync
+  afterwards, oracle +1 ms). The pre8.1 rejoin buffer's 4 s cap timed from `rj_t0`, the start of the FIRST buffering,
+  which was never reset: on the next outage the cap read "held > 4 s" and released at once, so post-gap audio met the
+  stale house_skew again (the pre6/pre8.1 race: `[PTV-ASTEP] +13673 ms` / `+93343 ms`, no "frames held" line). Every
+  fixture and every earlier canary drop had one outage per process. `rj_t0` is now reset at each release and at the
+  start of each fill.
+- Harness: `gap2_N` / `sync_gap2_N` (two outages of N s, 30 s apart; `T056_GAP_AT_MS` moves the first cut —
+  `T056_GAP_AT_MS=20500 ./fixture.sh sync_gap2_10` reproduces it: pre8.3 9 s MOVING SILENT after the 2nd return,
+  pre8.4 none).
+
+Gate (local, frozen copy): two mid-GOP outages — pre8.3 9 s MOVING SILENT after the 2nd return, pre8.4 none, lip sync
+±25 ms; sync_gap_20 / sync_kill_return_20 / sync_stop_10 / sync_ac3_gap_20 / the mid-GOP repro lip sync ±25 ms, no
+post-return silence; clean PASS. Found on the way, PRE-EXISTING (identical on pre8.3), open for pre8.5: with a copied
+AC-3 track and a mid-GOP cut the 1st outage's buffer runs into the 4 s cap (1.7 + 1.9 s dark wire, one PCR jump) and the
+2nd outage leaves a 10 s PTS hole on the copied AC-3 (`T056_GAP_AT_MS=20500 ./fixture.sh sync_ac3_gap2_10`).
+
 ## 2.0.0-pre8.3 — the rejoin map keyed 1 s below the deciding frame (canary GB_News +2.32 s PTS jump)
 
 - **Fixed: on an interlaced source the rejoin map could be cancelled by one frame, jumping the output video PTS forward**

@@ -3931,6 +3931,8 @@ static void rj_flush(AudioState *a)
         av_frame_free(&a->rj_buf[i]);
     }
     a->rj_n = 0;
+    a->rj_t0 = 0;        /* 2.0.0-pre8.4: the 4 s cap times THIS buffering — a stale start released the next outage's
+                          * frames at once (canary NTD 2026-10-05: 2nd outage → audio ~12 s late after the return) */
     a->rj_releasing = 0;
 }
 
@@ -3961,6 +3963,7 @@ static void hold_fill_quantum(AudioState *a)
         a->hold_fill_wc0 = now;
         a->hold_fresh_wc = 0;
         a->rj_released   = 0;                                /* 2.0.0-pre8.1: this fill's real frames get buffered */
+        a->rj_t0         = 0;                                /* 2.0.0-pre8.4: ... timed from their own first frame */
         a->rj_cls_seq0   = atomic_load_explicit(&g_rj_cls_seq, memory_order_acquire);
     }
     a->hold_fill_last_wc = now;
