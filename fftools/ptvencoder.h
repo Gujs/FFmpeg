@@ -2044,7 +2044,7 @@ extern int             g_hold_black;     /* 2.0.0-pre6: -hold black */
  * clock) keep running and every rung gets the picture scaled like content. The output thread shows it in place of
  * its repeat; the downstream repeat / black stays the fallback when no rendered picture is fresh. */
 enum { PTV_HOLD_FREEZE, PTV_HOLD_BLACK, PTV_HOLD_BARS, PTV_HOLD_SLATE };
-extern int             g_hold_mode;      /* -hold freeze|black|bars|slate:<png> */
+extern int             g_hold_mode;      /* -hold bars (default, pre9.1)|freeze|black|slate:<png> */
 extern int             g_hold_render;    /* PTV_NO_HOLD_RENDER=1 → 0: the pre9 downstream repeat / black only */
 extern int64_t         g_bars_shift_us;  /* -bars_shift: one 4 px step per period over 8 positions (0 = off) */
 extern int64_t         g_bars_dim_after_us; /* -bars_dim_after: bars at 50 % after this much hold (0 = off) */

@@ -18,7 +18,7 @@
 #include "libavutil/imgutils.h"
 #include "libswscale/swscale.h"
 
-int     g_hold_mode         = PTV_HOLD_FREEZE;
+int     g_hold_mode         = PTV_HOLD_BARS;     /* 2.0.0-pre9.1: bars by default (owner 2026-10-05) */
 int     g_hold_render       = 1;
 int64_t g_bars_shift_us     = 60000000;
 int64_t g_bars_dim_after_us = 0;

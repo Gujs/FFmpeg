@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.0-pre9"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.0-pre9.1"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -734,7 +734,7 @@ _Atomic int64_t g_v_arrive_wc;
 int             g_src_watch;                       /* 2.0.0-pre3: see ptvencoder.h */
 int64_t         g_stall_min_us  = 3000000;
 int             g_hold_black    = 0;          /* 2.0.0-pre6: -hold black (default freeze) */
-int64_t         g_freeze_max_us = 30000000;   /* 2.0.0-pre6: -freeze_max (0 = inf) */
+int64_t         g_freeze_max_us = 5000000;    /* 2.0.0-pre6: -freeze_max (0 = inf); pre9.1: 30 s -> 5 s */
 int64_t         g_fallback_rebind_us = 0;     /* 2.0.0-pre7: -fallback_rebind (0 = off) */
 int64_t         g_lost_after_us = 30000000;
 _Atomic int     g_src_state;
@@ -5791,8 +5791,8 @@ static const OptionDef ptv_options[] = {
     { "wait_input",       OPT_TYPE_STRING, 0,                        { .off = 0 }, "give up if the input has no video after this long (default inf)", "dur" },
     { "stall_min",        OPT_TYPE_STRING, 0,                        { .off = 0 }, "content gone + input silent this long = STALLED (default 3s)", "dur" },
     { "lost_after",       OPT_TYPE_STRING, 0,                        { .off = 0 }, "no video packets this long = LOST (default 30s)", "dur" },
-    { "hold",             OPT_TYPE_STRING, 0,                        { .off = 0 }, "picture while the input is gone: freeze (default, then black) | black | bars | slate:<image> (frozen, then EBU 75 % bars / the image)", "mode" },
-    { "freeze_max",       OPT_TYPE_STRING, 0,                        { .off = 0 }, "frozen picture this long, then black / bars / slate (default 30s; inf = keep)", "dur" },
+    { "hold",             OPT_TYPE_STRING, 0,                        { .off = 0 }, "picture while the input is gone: bars (default: frozen, then EBU 75 % bars) | freeze (frozen, then black) | black | slate:<image> (frozen, then the image)", "mode" },
+    { "freeze_max",       OPT_TYPE_STRING, 0,                        { .off = 0 }, "frozen picture this long, then bars / black / slate (default 5s; inf = keep)", "dur" },
     { "bars_shift",       OPT_TYPE_STRING, 0,                        { .off = 0 }, "move the bars / slate 4 px once per this period, 8 positions (default 60s; 0 = off)", "dur" },
     { "bars_dim_after",   OPT_TYPE_STRING, 0,                        { .off = 0 }, "bars at 50 % after this much hold (default off)", "dur" },
     { "fallback_rebind",  OPT_TYPE_STRING, 0,                        { .off = 0 }, "wrapper fallback start: exit 5 once the input has been live this long, for a re-probe", "dur" },
