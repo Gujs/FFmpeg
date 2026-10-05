@@ -5,6 +5,21 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre9.1 — bars are the default hold picture
+
+- Owner 2026-10-05: no-signal bars replace black on every channel. `-hold` now defaults to `bars` (frozen picture for
+  `-freeze_max`, 30 s, then EBU 75/0/75/0 bars, shifting, for the rest of the outage); `-hold freeze` keeps the pre9
+  default (frozen, then black), `-hold black` / `slate:<image>` unchanged. Mosaics are unaffected (their dead-cell slate
+  is separate). Without a rendered picture (graph stalled, hw decode, `PTV_NO_HOLD_RENDER=1`) the fallback stays black.
+- `-freeze_max` default 30 s → **5 s** (owner 2026-10-05): the hold starts ~4.3 s after video stops (stall threshold),
+  so bars are on screen ~9 s into an outage — in line with common broadcast-encoder input-loss practice (a short
+  repeat to bridge a glitch, then an obvious "offline" picture within ~10 s). Short dropouts below the stall threshold
+  never hold. Per channel: `SV_FREEZE_MAX` / `-freeze_max`.
+
+Gate (local, frozen copy, DEFAULT options = bars after 5 s): sync_gap2_10 / sync_ac3_gap2_10 (mid-GOP), sync_gap_20,
+sync_ac3_gap_20, sync_kill_return_20, stop_20, psi_only, clean PASS or unchanged (the ~330 ms onset pause); bwdif +
+drawtext clock, two mid-GOP outages with copied AC-3: PASS, lip sync ±25 ms on AAC and AC-3; bars on every outage.
+
 ## 2.0.0-pre9 — the hold picture is rendered through the filter graph: live clock overlay, no-signal bars (T-078, T-079)
 
 - **The hold picture now goes through the filter graph once per house tick** (`fftools/ptvencoder_hold.c`). Before,
