@@ -3090,6 +3090,18 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                      * it was erased (+X into glue_off_us), then the next correct frame reads +X and was padded as a GAP,
                      * leaving audio X late for good (local sync_bitflip_100 seed 2/3: one −64 ms erase → +64 ms). A −X/+X
                      * pair of label moves nets to zero in the source, so undoing the erase is right whatever caused it. */
+                    /* 2.0.0-pre9.3 (T-080 A2): a BACKWARD step within 3 s of damaged audio on this track (decode error,
+                     * corrupt-discarded packet, silence-fill) is overlap from the damage — with packets missing inside a
+                     * PES the parser emits frames from corrupt data and extrapolates their pts, so the next intact PES
+                     * lands BEHIND that cursor. Erasing it (relabel) kept the garbage and pushed all later audio LATE
+                     * (local Cinestar 10 % loss: 6 erases, +1429 ms → audio −1.39 s, RESYNC needed). Drop the overlap
+                     * instead (aresample), exactly like the fill-resume overlap. Outside damage the 0.9.16.4 rule (a
+                     * backward step is a relabel → erase) is unchanged — AWE-class sources step back on clean audio. */
+                    int64_t dmg_last = a->dmg_wc;
+                    if (a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO)
+                        dmg_last = FFMAX(dmg_last, atomic_load_explicit(&g_adamage_wc[a->dbg_k], memory_order_relaxed));
+                    int dmg_overlap = g_glueclass && !exp_hit && step < 0 && !fill_resumed && !pad_cancel &&
+                                      dmg_last && now_wc - dmg_last <= 3000000;
                     int erase_undo = g_glueclass && !exp_hit && step > 0 && !fill_resumed && a->rl_last_us > 0 &&
                                      now_wc - a->rl_last_wc <= 5000000 &&
                                      step - a->rl_last_us >= -10000 &&
@@ -3155,6 +3167,19 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                                        "exemption (pre23 remedy)\n",
                                        a->dbg_k, a->dbg_in);
                             }
+                        }
+                        /* 2.0.0-pre9.3 (T-080 A): a forward step at a silence-fill RESUME is a real gap by
+                         * construction — the fill engaged because nothing on this track decoded (packets lost or
+                         * corrupt-discarded). The fill's own frames pass through this door and refresh its wall
+                         * clock, so the door saw wall_gap ≈ 0 and lost the evidence; and the fill starts after
+                         * 2 s of nothing, leaving a ~2 s resume step. Two such resumes a few seconds apart looked
+                         * like the non-converging ladder and were FOLDED — deleting real missing time → audio early
+                         * (canary L3 Cinestar 10 % loss +1.67 s; local Cinestar capture +3.2 s, glue −3253 ms from
+                         * two folds). Evidence from the decoder, not delivery timing: unaffected by the bank gate. */
+                        if (fill_resumed && step > 0 && !wev_meas) {
+                            wev_meas = 1;
+                            av_log(NULL, AV_LOG_INFO, "[PTV-AGLUE] a%d(in%d) +%"PRId64"ms at the silence-fill resume = "
+                                   "real missing audio — padded, never folded\n", a->dbg_k, a->dbg_in, step / 1000);
                         }
                         wev_gap  = g_wallev && wev_meas;
                         if (g_convcap && !pad_cancel && !(fill_resumed && step < 0)) {
@@ -3312,6 +3337,12 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                                "silence (not erased)%s\n",
                                a->dbg_k, a->dbg_in, step / 1000, pc_pad / 1000,
                                ptv_self_shed_note(a, sn, sizeof sn));
+                    } else if (dmg_overlap) {
+                        av_log(NULL, AV_LOG_WARNING,
+                               "[PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms %"PRId64"ms after damaged audio — overlap "
+                               "from the damage, dropped (aresample), not erased%s\n",
+                               a->dbg_k, a->dbg_in, step / 1000, (now_wc - dmg_last) / 1000,
+                               ptv_self_shed_note(a, sn, sizeof sn));
                     } else if (fill_resumed && step < 0) {
                         /* §3 resume-anchor: the overlap is OUR OWN synthesized silence — dropping
                          * it is free; erasing would relabel real content onto the fill. */
@@ -3369,7 +3400,7 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                          * a pad round-trip would DROP content we never padded), and no >10s
                          * in-flight alert (nothing is in flight). */
                         int erased_here = conv_folded || erase_undo ||
-                                          (step < 0 && !exp_hit && !pad_cancel && !fill_resumed &&
+                                          (step < 0 && !exp_hit && !pad_cancel && !fill_resumed && !dmg_overlap &&
                                           llabs(step) <= (int64_t)g_aglue_max_ms * 1000);
                         if (!erased_here) {
                             /* §2.4 realization tripwire: hard comp is instantaneous by design —
@@ -3651,6 +3682,7 @@ static void adec_error(AudioState *a, int err)
 {
     int64_t now = av_gettime_relative();
     a->dec_errs++;
+    a->dmg_wc = now;                   /* 2.0.0-pre9.3 (T-080 A2): damaged audio */
     a->dec_ts_carry = AV_NOPTS_VALUE;  /* pre19.1 [PTV-ASTAMP]: never extrapolate across a decode error —
                                         * a garbage-tail NOPTS frame next to a tolerated error keeps being
                                         * dropped (the rule the audio_push NOPTS guard was added for) */
@@ -3884,6 +3916,7 @@ static void nbs_fill_quantum(AudioState *a)
      * PES 120ms vs the 100ms quantum), leaving a +14.5s resume step after a 40s phase.
      * Clamped so a sentinel drought can never dump a burst. */
     now     = av_gettime_relative();
+    a->dmg_wc = now;                 /* 2.0.0-pre9.3 (T-080 A2): a silence-fill phase is damaged audio */
     want_us = (a->nbs_last_wall_us ? now - a->nbs_last_wall_us : g_nbs_quantum_us)
             + a->nbs_carry_us;
     a->nbs_last_wall_us = now;

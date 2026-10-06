@@ -1004,15 +1004,21 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
      * packets and re-based the stream onto the outlier — measured locally (sync_bitflip_100, seed 3): a 2^30-tick bit
      * flip, flush old=32 new=1 keep=NEW applied −11930 s, content dead for the rest of the run. */
     {
-        int t = b->cycle_trigger, first_new = -1, new_t = 0, old_after = 0;
+        int t = b->cycle_trigger, first_new = -1, new_t = 0, old_after = 0, last_tl = -1;
         for (i = 0; t >= 0 && i < b->nb_packets; i++) {
             PtvDiscPacket *dp = b->packets[i];
             if (!dp || dp->stream_idx != t)
                 continue;
             if (dp->timeline == 1) { new_t++; if (first_new < 0) first_new = i; }
             else if (dp->timeline == 0 && first_new >= 0) old_after++;
+            last_tl = dp->timeline;
         }
-        outlier = new_t >= 1 && new_t <= 2 && old_after >= 3;
+        /* pre9.3: one corrupt AUDIO PES carries its bad pts into every frame the parser cuts from it (extrapolated) —
+         * measured on AWE (10 % bit flips): 4 frames on the "new" timeline, then 20 back on the old one, and a video
+         * outlier in the same window → keep NEW baked vid_err 279 s. So: up to ~one PES of frames (8), more back on
+         * the old timeline than on the new, and the stream's LAST buffered packet back on the old one. A real splice
+         * never returns. */
+        outlier = new_t >= 1 && new_t <= 8 && old_after >= 3 && old_after > new_t && last_tl == 0;
         if (outlier)
             av_log(NULL, AV_LOG_WARNING, "[PTV-LAYERA] the jump on stream %d was %d corrupt packet(s): %d of its packets "
                    "came back on the old timeline — outlier dropped, no offset\n", t, new_t, old_after);
@@ -3127,6 +3133,8 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                 nw = av_gettime_relative();
                 d->acorrupt[k]++;
                 atomic_fetch_add_explicit(&g_acorrupt, 1, memory_order_relaxed);
+                if (d->aglobal[k] >= 0 && d->aglobal[k] < PTV_MAX_AUDIO)   /* 2.0.0-pre9.3 (T-080 A2) */
+                    atomic_store_explicit(&g_adamage_wc[d->aglobal[k]], nw, memory_order_relaxed);
                 if (nw - d->adisc_win_us[k] >= 10000000) {
                     if (d->adisc_win_n[k])
                         av_log(NULL, AV_LOG_WARNING,

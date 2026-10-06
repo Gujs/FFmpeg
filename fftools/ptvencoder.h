@@ -1144,6 +1144,8 @@ typedef struct AudioState {
     int64_t          pad_led_us[PTV_GLUE_PAD_LED];    /* pad size (us, >0) per slot */
     int64_t          pad_led_wc[PTV_GLUE_PAD_LED];    /* wall us the pad was verdicted */
     int              pad_led_n;                       /* ring cursor (monotonic) */
+    int64_t          dmg_wc;                          /* 2.0.0-pre9.3 (T-080 A2): wall us of this track's last decode error
+                                                       * or silence-fill quantum (damaged audio) */
     int64_t          rl_last_us, rl_last_wc;          /* 2.0.0-pre9.2 (T-080 B2): last backward RELABEL erase (us, >0)
                                                        * and when — a matching forward step is its return leg */
     /* §2.4 realization tripwire: the last GAP/FLUSH-APPLY verdict's step, awaiting the
@@ -2181,6 +2183,8 @@ extern int     g_glue_htol;              /* §2.3 label-health tolerance, percen
 extern int64_t g_pair_ttl_us;            /* pair-expect TTL (30s; PTV_PAIR_EXPECT_TTL_US — TEST ONLY, G6) */
 extern int64_t g_nbs_quantum_us;         /* fill quantum (100ms; PTV_NBS_QUANTUM_MS — TEST ONLY, G8) */
 extern _Atomic int64_t g_acorrupt;                        /* total corrupt-discarded AUDIO pkts (acor= stats) */
+extern _Atomic int64_t g_adamage_wc[PTV_MAX_AUDIO];      /* 2.0.0-pre9.3 (T-080 A2): per global track, wall us of the
+                                                           * last corrupt-discarded packet (demux → audio thread) */
 extern _Atomic int64_t g_adec_frame_wc[PTV_MAX_AUDIO];    /* wall µs of track k's last DECODED frame (audio
                                                            * thread stamps; demux reads = the E6 starvation
                                                            * discriminator: packets arrive, nothing decodes) */

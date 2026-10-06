@@ -5,6 +5,44 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre9.3 — heavy packet loss no longer desyncs the audio (T-080 mechanism A)
+
+Canary L3 (Cinestar, 10 % random datagram loss for 30 s): audio +1.67 s early, fixed by RESYNC only after 7.5 min.
+Reproduced locally on a 4-minute Cinestar capture with the production audio path (AC-3 decoded → AAC through the
+fleet loudnorm chain, AC-3 also copied, bwdif): audio **+3.2 s** early. Localized in the audio glue layer, two halves:
+- **A1 (audio early): real gaps were FOLDED.** With most audio packets lost, the track goes undecodable and NBS
+  silence-fill engages after 2 s; its synthesized frames pass the glue door and refresh its wall clock, so the real
+  frame that resumes carries a ~2 s forward step with NO wall evidence. Two such resumes seconds apart looked like the
+  non-converging "doubling ladder" (`[PTV-CONV] backlog grew … folded label-neutrally`) and were folded — real missing
+  time deleted from the audio timeline (local: two folds, glue −3253 ms = R +3218 ms; canary L3 logged the same line).
+  Now a forward step at a silence-fill resume counts as wall-evidenced (decoder evidence, not delivery timing): padded,
+  never folded. `[PTV-AGLUE] … at the silence-fill resume = real missing audio — padded, never folded`.
+- **A2 (audio late): damage overlap was ERASED as a relabel.** With packets missing inside an AC-3 PES the parser emits
+  frames from corrupt data with extrapolated pts; the next intact PES lands behind that cursor. The 0.9.16.4 rule erased
+  each such backward step as a relabel — keeping the garbage and pushing later audio late (local, after A1: 6 erases,
+  audio −1.39 s, RESYNC needed). Now a backward step within 3 s of damaged audio on that track (decode error, corrupt-
+  discarded packet — published per track by the demux, `g_adamage_wc` — or silence-fill) is dropped as overlap
+  (aresample), not erased. Clean audio keeps the 0.9.16.4 rule: a genuine 70 ms relabel on clean audio is still erased
+  (fixture `sync_arelabel_70`, identical to pre9.2).
+- **LAYERA outlier rule widened (B3 follow-up):** a corrupt AUDIO PES carries its bad pts into every frame the parser
+  cuts from it — AWE capture, 10 % bit flips: 4 frames on the "new" timeline then 20 back on the old one, with a video
+  outlier in the same window → keep NEW baked vid_err 279 s (pre9.2: lipsync +280 s for good). Now ≤ 8 packets on the
+  new timeline, more back on the old one, and the stream's last buffered packet back on the old one = outlier.
+
+Results (local, pre9.2 → pre9.3): Cinestar 10 % loss +3.2 s → −28…+20 ms, no RESYNC; AWE 10 % bit flips +280 s →
+−18…0 ms; fixture `sync_bitflip_100` 4/5 → 5/5 seeds (seed 4's +64 ms residual is a damage overlap now dropped); AWE /
+Cinestar clean identical; TruBLU real splices (x264 replay, 12,275 frames) every LAYERA decision identical.
+Gate (30 runs, sequential, VideoToolbox; same set as pre9.2): equal or better on every line — `sync_bitflip_100` seed 4
+FAIL (+64 ms) → PASS, `sync_ac3_gap_10` wire gap gone, fewer outlier hits on seeds 2/3; every remaining flag identical
+to pre9.2 (`sync_flapping` T-075, the 330 ms / 755 ms rejoin wire pauses, `fwd_pts_jump` 640 ms PCR step,
+`reshaped_return` exit 4 by design, the loss PCR > 40 ms flags).
+Unchanged known: AWE heavy-loss transient (−623 ms, converges in ~2 min, no bake), the 60–80 ms relabel dead zone
+(below both the 80 ms absorber and the 60 ms glue threshold), and the OUTPUT STRUCTURE under loss — now localized
+(`test-scripts/t056/structcheck.py`): the "PCR stutter" is video PTS holes (content_index stamps a content gap inside
+frame_q as a leap; PCR max == max hole, 0.88 s), copied AC-3 holes (corrupt-discarded, no fill while video flows; 8.5 s
+on Cinestar), plus wire pauses 0.3–1.1 s still to trace — the pre9.4 target (linear output whatever the input). Harness: `T056_AMAP` /
+`T056_COPYA` (the source track the AAC is made from / an extra copied track), scenario `arelabel_<ms>`.
+
 ## 2.0.0-pre9.2 — one corrupt timestamp no longer moves a stream's timeline (T-080 mechanism B)
 
 PES headers carry no CRC: one upstream bit error makes ONE packet's PTS/DTS lie. The T-081 corrupted-input fixtures
