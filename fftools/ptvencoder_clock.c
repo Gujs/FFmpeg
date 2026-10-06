@@ -1304,6 +1304,11 @@ void *output_thread(void *arg)
             }
             held->pts = vpts; held->pkt_dts = AV_NOPTS_VALUE; held->duration = 0;
             last_vpts = vpts;
+            /* 2.0.0-pre9.4 (T-083): the hold fills' clock — output time on ticks whose content did not advance (dups,
+             * hold pictures; not cadence residence or the gap fill's repeats, whose content is still to come). It is
+             * what house_skew grows by, but a rejoin map never steps it back. */
+            if (v->is_master && !cadence_hold && (content_vpts < 0 || content_vpts <= last_content_vpts))
+                atomic_fetch_add_explicit(&g_dup_out_us, v->tick_dur_us, memory_order_relaxed);
             if (content_vpts >= 0)
                 last_content_vpts = content_vpts;   /* v0.9.15.3 decimation cursor: real content played
                                                      * (held_src_pts survives dups -> idempotent on dup/hold) */
@@ -1515,7 +1520,7 @@ void *output_thread(void *arg)
                         av_packet_free(&fs);
                 }
                 if (v->hold_da)              /* copied AC-3 / E-AC-3: silent frames of their own codec (D17) */
-                    ptv_copy_fill(v->hold_da, v->house_skew ? *v->house_skew : 0, nw);
+                    ptv_copy_fill(v->hold_da, nw);
             }
         }
         if (g_slow) av_usleep(g_slow);

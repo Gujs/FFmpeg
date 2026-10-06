@@ -2725,6 +2725,18 @@ static int audio_feed(AudioState *a, AVFrame *frame)
      * after a hold can be the pre-gap PES tail while the post-gap frames are dropped until the next IDR (A). Now the
      * frames are BUFFERED (the audio thread keeps serving fill sentinels) until rj_release_ok(). */
     if (!a->hold_feeding && !a->rj_releasing && a->hold_fill_us && !a->rj_released) {
+        /* 2.0.0-pre9.4 (T-083): while the source still HOLDS, a real frame is a fragment that survived the damage (the
+         * video is dead, bars are on air). Fed — at once or from this buffer after its 4 s cap — it met the hold-grown
+         * house_skew AND its own label jump (Cinestar 50 % loss: one AAC frame 88 s after the last, +95 s of
+         * house_skew → aresample padded ~1000 frames ahead of the video, the delivery FIFO filled and the copied AC-3
+         * was dropped for 30 s); kept for after the rejoin it is stale (−29 s re-label). The fill already covers its
+         * time: drop it; the return is buffered below once the hold has ended, as before. */
+        if (ptv_src_holding()) {
+            if (!a->hold_drop_n++)
+                av_log(NULL, AV_LOG_INFO, "[PTV-SRC] a%d(in%d) real frames during the hold are dropped — the fill "
+                       "covers the track until the rejoin\n", a->dbg_k, a->dbg_in);
+            return 0;
+        }
         if (!rj_release_ok(a) && a->rj_n < PTV_RJ_BUF) {
             AVFrame *c = av_frame_clone(frame);
             if (c) {
@@ -2732,6 +2744,7 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                     a->rj_t0 = av_gettime_relative();
                     atomic_fetch_add_explicit(&g_rj_buffering, 1, memory_order_relaxed);
                 }
+
                 a->rj_buf[a->rj_n++] = c;
                 return 0;
             }
@@ -3468,6 +3481,8 @@ static int audio_feed(AudioState *a, AVFrame *frame)
             a->glue_raw_dur_us   = frame->sample_rate > 0 ?
                 av_rescale(frame->nb_samples, 1000000, frame->sample_rate) : 0;
             a->glue_wall_last_us = now_wc;
+            a->hf_hs_real  = (g_avlock && a->house_skew) ? *a->house_skew : 0;
+            a->hf_dup_real = atomic_load_explicit(&g_dup_out_us, memory_order_relaxed);
             if (a->glue_off_us)
                 frame->pts += av_rescale_q(a->glue_off_us, AV_TIME_BASE_Q, a->ist_tb);
         }
@@ -3978,6 +3993,7 @@ static void rj_flush(AudioState *a)
         av_frame_free(&a->rj_buf[i]);
     }
     a->rj_n = 0;
+    a->hold_drop_n = 0;
     a->rj_t0 = 0;        /* 2.0.0-pre8.4: the 4 s cap times THIS buffering — a stale start released the next outage's
                           * frames at once (canary NTD 2026-10-05: 2nd outage → audio ~12 s late after the return) */
     a->rj_releasing = 0;
@@ -3998,8 +4014,14 @@ static void hold_fill_quantum(AudioState *a)
         now - a->glue_wall_last_us < FFMAX(150000, 3 * a->glue_cad_us))   /* the track's own arrival cadence */
         return;
     dur_us = av_rescale(1024, 1000000, a->fg_in_rate);
-    target = a->glue_raw_last_us + a->glue_raw_dur_us + a->glue_off_us + a->corr.corr_us +
-             ((g_avlock && a->house_skew) ? *a->house_skew : 0);
+    /* 2.0.0-pre9.4 (T-083): ride the output time on ticks whose content did not advance (dups, hold pictures) since this
+     * track's last real frame (g_dup_out_us), not the house_skew. Both grow alike; but a LIVE LOSS rejoin map pulls house_skew back by the outage
+     * while this track's last label stays where it was if no real audio came back (Cinestar 50 % loss: all AAC
+     * corrupt-discarded) — the target fell 67 s behind the door and the track was absent from the wire for 75 s. The
+     * clock never steps back. (Not the whole output position: that also counts fresh ticks, and every routine
+     * 120 ms video stall then filled the time since the last real frame over the real frames about to arrive.) */
+    target = a->glue_raw_last_us + a->glue_raw_dur_us + a->glue_off_us + a->corr.corr_us + a->hf_hs_real +
+             (atomic_load_explicit(&g_dup_out_us, memory_order_relaxed) - a->hf_dup_real);
     door   = a->acomp_exp_us;
     if (target - door > 2000000)
         target = door + 2000000;                 /* catch up at most 2 s per sentinel (100 ms apart) */

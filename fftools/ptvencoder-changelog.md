@@ -66,7 +66,25 @@ clean. Measured with `test-scripts/t056/structcheck.py`.
   cursor, up to 2 s over the count); clean sources and film cadence keep the count. Loss onset 1.2 → 1.38 s (was 1.86;
   pre9.3 dropped to 0.42 s by leaping); the remaining +0.18 s is a real ~0.9 s decoder-output stall under loss that the
   cushion re-prime refills by design. Ruler lip sync PASS, structcheck PASS (fixture + Cinestar).
-- Still open: long-hold A/V PTS divergence. Seen, not T-083: bursty Cinestar lip sync swings −45…−1,082 ms on every build (pre9.3 too).
+- **Step 2 fix — B-frame video keeps its opening IDR.** The before-the-start drop is keyed on the presentation time:
+  B-frame video (production NVENC -bf 2) opens with its IDR at pts 0 and dts one frame earlier, and the dts-keyed drop
+  removed that IDR (output began on a non-IDR; HLS segmenter 144 warnings). Found by the new production-graph fixture.
+- **Step 6, long damage with holds — every audio track stays on the wire.** Cinestar, 50 % datagram loss over 180 s
+  (three holds of 55–107 s with LIVE phases between): AAC was absent from the wire for 75 s and the copied AC-3 for good
+  after the last rejoin (wire A/V spread +68 / +148 s — the sync_check DESYNC class). Measured causes, in turn:
+  (a) the hold fills rode house_skew, which a LIVE LOSS rejoin map pulls back while a dead track's last real label
+  stays put (all AAC corrupt) — the target fell 67 s behind the door. The fills now ride g_dup_out_us: the output time
+  on ticks whose content did not advance (dups, hold pictures) — what house_skew grows by, never stepped back. (The
+  whole output position was tried first: it also counts fresh ticks, so every routine 120 ms stall filled over real
+  frames about to arrive.) (b) real audio fragments surviving the damage while the source HOLDS were stamped with the
+  hold's house_skew: AC-3 108 s ahead of the output, and one AAC frame 88 s after the last double-counted the outage —
+  aresample padded ~1000 frames ahead of the video, the delivery FIFO (1024) filled and the non-blocking AC-3 copies were
+  dropped for 30 s. While the source holds and a track is being filled, its real frames are dropped (the fill covers
+  that time; damage shows as bars + silence); buffering them for after the rejoin was measured worse (stale: −29 s
+  re-label). (c) copy frames behind what is already on the wire (≤ 5 s) are dropped instead of stacked on one instant
+  by the monotonic guard (127 after a parked run), and the fills start a full frame after the frame on the wire (they
+  started 1 tick into it — one doubled frame every ~2 s). Structure PASS on the standard and the production graph.
+- Still open: none of the step 1–6 symptoms. Seen, not T-083: bursty Cinestar lip sync swings −45…−1,082 ms on every build (pre9.3 too).
 
 ## 2.0.0-pre9.3 — heavy packet loss no longer desyncs the audio (T-080 mechanism A)
 

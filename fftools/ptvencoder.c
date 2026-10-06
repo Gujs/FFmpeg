@@ -207,6 +207,7 @@ _Atomic int64_t g_vskip_from_us;
 _Atomic int64_t g_rj_off_total, g_rj_off_before, g_rj_from_us;   /* 2.0.0-pre6.1 rejoin map */
 _Atomic int     g_rj_epoch;
 _Atomic int64_t g_house_out_us, g_house_tick_us;
+_Atomic int64_t g_dup_out_us;   /* 2.0.0-pre9.4 (T-083): output time on ticks whose content did not advance */
 int             g_rejoin_map = 1;
 _Atomic int     g_vskip_epoch;
 _Atomic int64_t g_vgop_est_us;

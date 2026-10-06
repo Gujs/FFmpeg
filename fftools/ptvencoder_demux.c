@@ -1696,7 +1696,12 @@ static int demux_pass_one(DemuxArgs *d, AVPacket *out)
             if (g_copy_gapfill && exp != AV_NOPTS_VALUE) {
                 int64_t gap = out->dts - exp, half = ps->sil_dur / 2, now = av_gettime_relative();
                 int64_t hsd = av_rescale_q(hs_used - ps->hs_real, AV_TIME_BASE_Q, ps->in_tb);
-                if (gap <= -half && gap >= -av_rescale_q(1000000, AV_TIME_BASE_Q, ps->in_tb) + FFMIN(hsd, 0)) {
+                /* ... and a frame more than half a frame behind what is already on the wire (last_dts: real or
+                 * silent), up to 5 s: the monotonic guard below would stack it on one instant (Cinestar 50 % loss:
+                 * a parked run released behind the fill — 127 frames on one pts) */
+                int64_t wire_behind = ps->last_dts != AV_NOPTS_VALUE ? ps->last_dts + ps->sil_dur - out->dts : 0;
+                if ((gap <= -half && gap >= -av_rescale_q(1000000, AV_TIME_BASE_Q, ps->in_tb) + FFMIN(hsd, 0)) ||
+                    (wire_behind > half && wire_behind <= av_rescale_q(5000000, AV_TIME_BASE_Q, ps->in_tb))) {
                     ps->ovl_n++;
                     pthread_mutex_unlock(&d->pass_lock);
                     av_packet_free(&out);
@@ -1704,8 +1709,8 @@ static int demux_pass_one(DemuxArgs *d, AVPacket *out)
                 }
                 if (gap > half && gap <= av_rescale_q(3000000, AV_TIME_BASE_Q, ps->in_tb) + FFMAX(hsd, 0)) {
                     int64_t cur = exp;
-                    if (ps->last_dts != AV_NOPTS_VALUE && cur <= ps->last_dts)
-                        cur = ps->last_dts + 1;
+                    if (ps->last_dts != AV_NOPTS_VALUE && cur < ps->last_dts + ps->sil_dur)
+                        cur = ps->last_dts + ps->sil_dur;   /* after the frame on the wire (2.0.0-pre9.4) */
                     for (; cur + half < out->dts; cur += ps->sil_dur, ps->gap_n++)
                         copy_emit_sil(d, ps, cur);
                 }
@@ -1720,6 +1725,7 @@ static int demux_pass_one(DemuxArgs *d, AVPacket *out)
             ps->arr_wc   = av_gettime_relative();
             ps->real_end = out->dts + (out->duration > 0 ? out->duration : ps->sil_dur);
             ps->hs_real  = hs_used;
+            ps->dup_real = atomic_load_explicit(&g_dup_out_us, memory_order_relaxed);
         }
         if (out->dts != AV_NOPTS_VALUE) {
             if (d->pass[pi].last_dts != AV_NOPTS_VALUE && out->dts <= d->pass[pi].last_dts) {
@@ -1791,7 +1797,7 @@ static int demux_pass(DemuxArgs *d, AVPacket *out)
         for (pi = 0; pi < d->n_pass; pi++) {
             PassStream *ps = &d->pass[pi];
             int64_t now, prev;
-            int unanchored;
+            int unanchored, holding;
             if (!ps->gated || out->stream_index != ps->in_index)
                 continue;
             now = av_gettime_relative();
@@ -1804,6 +1810,21 @@ static int demux_pass(DemuxArgs *d, AVPacket *out)
             pthread_mutex_lock(d->h0_lock);
             unanchored = *d->h0 == AV_NOPTS_VALUE;
             pthread_mutex_unlock(d->h0_lock);
+            /* 2.0.0-pre9.4 (T-083): while the source HOLDS and this copy is being filled, a real packet is a fragment
+             * that survived the damage (the video is dead): stamped now it rode the hold's house_skew — 108 s ahead of
+             * the output at a 107 s hold (Cinestar 50 % loss); the track's timeline stayed there and every real frame
+             * after the rejoin sat behind it (bumped, held by the delivery gate: AC-3 absent for good). The fill
+             * covers its time: drop it (the transcoded track's rule, audio_feed). */
+            holding = ptv_src_holding();
+            if (holding) {
+                pthread_mutex_lock(&d->pass_lock);
+                holding = ps->fill_end != AV_NOPTS_VALUE;          /* ... and this copy is being filled */
+                pthread_mutex_unlock(&d->pass_lock);
+            }
+            if (holding && !ps->npark) {
+                av_packet_free(&out);
+                return 0;
+            }
             if (ps->npark || (prev && now - prev >= 300000) || unanchored) {
                 if (!ps->npark)
                     ps->park_since = now;
@@ -1821,10 +1842,10 @@ static int demux_pass(DemuxArgs *d, AVPacket *out)
 
 /* 2.0.0-pre6 (T-056 §5.1, D17), called by the master output thread while video repeats: a copied AC-3 /
  * E-AC-3 track whose PID has been silent 300 ms gets its pre-encoded silent frame, one per frame duration,
- * from the end of its last real packet up to that end + the house_skew grown since that packet was stamped
- * — the same ride-house_skew rule as the transcoded fill, so the silence stays on the held video (never
- * beyond the video front plus the lead it had). Routed like a real copy (delivery gate or mux_q). */
-void ptv_copy_fill(DemuxArgs *d, int64_t hs, int64_t now)
+ * from the end of its last real packet up to that end + the output time on ticks whose content did not advance since
+ * that packet was stamped (pre9.4; was the house_skew grown since — the same rule as the transcoded fill), so the silence
+ * stays on the held video (never beyond the video front plus the lead it had). Routed like a real copy (delivery gate or mux_q). */
+void ptv_copy_fill(DemuxArgs *d, int64_t now)
 {
     int pi;
 
@@ -1835,10 +1856,12 @@ void ptv_copy_fill(DemuxArgs *d, int64_t hs, int64_t now)
         int n = 0;
         if (!ps->sil || ps->real_end == AV_NOPTS_VALUE || now - ps->arr_wc < 300000)
             continue;
-        target = ps->real_end + av_rescale_q(hs - ps->hs_real, AV_TIME_BASE_Q, ps->in_tb);
+        /* 2.0.0-pre9.4 (T-083): the dup clock, not house_skew — see hold_fill_quantum() */
+        target = ps->real_end + av_rescale_q(atomic_load_explicit(&g_dup_out_us, memory_order_relaxed) -
+                                             ps->dup_real, AV_TIME_BASE_Q, ps->in_tb);
         cur    = ps->fill_end != AV_NOPTS_VALUE ? ps->fill_end : ps->real_end;
-        if (ps->last_dts != AV_NOPTS_VALUE && cur <= ps->last_dts)
-            cur = ps->last_dts + 1;
+        if (ps->last_dts != AV_NOPTS_VALUE && cur < ps->last_dts + ps->sil_dur)
+            cur = ps->last_dts + ps->sil_dur;   /* 2.0.0-pre9.4: after the frame on the wire, not 1 tick into it */
         while (cur + ps->sil_dur <= target && n < 100) {   /* at most 100 frames (~3 s) per call */
             copy_emit_sil(d, ps, cur);
             cur += ps->sil_dur;
@@ -1882,8 +1905,8 @@ static void copy_gap_watch(DemuxArgs *d, int64_t now)
             continue;
         target = ps->real_end + av_rescale_q(now - ps->arr_wc - 200000, AV_TIME_BASE_Q, ps->in_tb);
         cur    = ps->fill_end != AV_NOPTS_VALUE ? ps->fill_end : ps->real_end;
-        if (ps->last_dts != AV_NOPTS_VALUE && cur <= ps->last_dts)
-            cur = ps->last_dts + 1;
+        if (ps->last_dts != AV_NOPTS_VALUE && cur < ps->last_dts + ps->sil_dur)
+            cur = ps->last_dts + ps->sil_dur;   /* 2.0.0-pre9.4: after the frame on the wire, not 1 tick into it */
         for (; cur + ps->sil_dur <= target && n < 100; cur += ps->sil_dur, n++)
             copy_emit_sil(d, ps, cur);
         if (!n)
