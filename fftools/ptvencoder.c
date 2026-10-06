@@ -3365,12 +3365,16 @@ static void *mux_thread(void *arg)
             /* 2.0.0-pre9.4 (T-083): nothing goes on the wire stamped before the house anchor. A negative dts wraps
              * to ~95,443 s in the 33-bit field — the first AAC packet carries the encoder's priming (1024 samples
              * = −21.3 ms), negative whenever audio starts within 21 ms of the anchor (Cinestar: −18.7 ms; the
-             * 2026-10-06 sync_check DESYNC −95,274 s readings). A live decoder joins mid-stream anyway. */
-            if (pkt->dts != AV_NOPTS_VALUE && pkt->dts < 0) {
+             * 2026-10-06 sync_check DESYNC −95,274 s readings). A live decoder joins mid-stream anyway. Keyed on
+             * the PRESENTATION time: B-frame video (production NVENC -bf 2) opens with its IDR at pts 0 and dts one
+             * frame earlier — dropping on dts removed that IDR and the muxer failed on the next packet (exit at 3.8 s
+             * in the production-graph fixture). */
+            if ((pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts) < 0 && pkt->dts != AV_NOPTS_VALUE) {
                 if (!neg_dropped++)
                     av_log(NULL, AV_LOG_WARNING, "[PTV-MUX] rung %d stream %d: dropped a packet stamped before the "
                            "start (%.1f ms) — it would wrap to ~95443 s on the wire\n", m->rung, stream_index,
-                           pkt->dts * av_q2d(m->ofmt->streams[stream_index]->time_base) * 1000);
+                           (pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts) *
+                           av_q2d(m->ofmt->streams[stream_index]->time_base) * 1000);
                 av_packet_free(&pkt);
                 continue;
             }
