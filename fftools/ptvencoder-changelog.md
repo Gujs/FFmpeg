@@ -5,11 +5,19 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
-## 2.0.0-pre9.4 (in progress) — linear output whatever the input (T-083)
+## 2.0.0-pre9.4 — linear output whatever the input (T-083)
 
 Owner rule (2026-10-06): the output is always fluent and linear — video one frame per tick, every audio track
 continuous, PCR in spec, no pauses; damage shows only as content — and lip sync is back within ±25 ms once the input is
 clean. Measured with `test-scripts/t056/structcheck.py`.
+
+Gate (2026-10-07, `test-scripts/t056`, 43 runs on the standard AND the production filter graph — T056_PROD=1: bwdif,
+720p, loudnorm, x264 with 2 B-frames like NVENC -bf 2): ACCEPTANCE (exit/wire/content/structure/lip sync) PASS on every
+outage, loss and bit-flip fixture incl. copied AC-3 and bit-flip seeds 1–5 (seed 4's +64 ms residual since pre9.2 is
+gone) and Cinestar 50 % loss / 180 s; misses: sync_flapping −192 ms (T-075, every build), Cinestar loss content share
+0.88 (still shots in the film: clean Cinestar shows the same FROZEN windows), psi_only extra 2 s silence in 2 of 3 runs
+(video_q GOP shed after the reopen, T-076 class, pre9.3 has the 3 s part), audio_format_switch one 0.23 s AAC hole at
+the rebuild (pre9.3 identical; its video hole is gone), reshaped_return exit 4 (by design).
 - **Step 1, copied AC-3 continuous through damage while video flows.** A copied frame up to 1 s behind where the track
   already is (the overlap a damaged PES leaves) is dropped — it used to be bumped 1 tick past the previous frame,
   stacking frames on one instant; a frame up to 3 s ahead gets the gap filled with silent frames first (nothing real
