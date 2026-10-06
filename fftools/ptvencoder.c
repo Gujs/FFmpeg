@@ -5291,7 +5291,13 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
             if ((ret = avio_open(&rung[r].ofmt->pb, out_url, AVIO_FLAG_WRITE)) < 0) {
                 av_log(NULL, AV_LOG_ERROR, "open output '%s': %s\n", out_url, av_err2str(ret)); goto end;
             }
-        rung[r].ofmt->max_interleave_delta = 200000;   /* 200 ms */
+        /* 2.0.0-pre9.4 (T-083): 200 → 50 ms. The interleaver waits this long for a stream that stopped (the
+         * source just went away: audio ends with it, the hold fill starts seconds later) while holding every
+         * other stream — the ~330 ms wire pause at an outage onset (T-077, ~1.5 s on the fleet), measured 331 →
+         * 108 ms at 50 ms on sync_gap_20. The delivery gates (§7.5a/§7.5b) already align audio with video, so
+         * the muxer gets each audio packet right after the video packet that releases it; the 200 ms was a bound
+         * on waiting for sparse subtitles, which a smaller value only shortens. */
+        rung[r].ofmt->max_interleave_delta = 50000;
         {   /* forwarded muxer opts (-mpegts_flags/-pat_period/-pcr_period/...) + file -metadata */
             AVDictionary *mopts = NULL; int mi;
             av_dict_copy(&mopts, g->format_opts, 0);

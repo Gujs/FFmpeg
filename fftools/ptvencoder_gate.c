@@ -347,8 +347,22 @@ void dlv_video_drain(DlvGate *g)
         int due  = a_hi != INT64_MIN && p->dts_us <= a_hi + g->v_band_us;
         int aged = (now - p->enq_us) > g->v_cap_us;   /* audio flowing but permanently behind (label spread):
                                                        * clamp the added latency at ~v_cap_us */
-        if (!due && !aged)
+        /* 2.0.0-pre9.4 (T-083): an audio STALL (nothing delivered for 150 ms — the track lost or undecodable,
+         * before its silence fill delivers at 2 s) froze the key, so held video piled up and the WHOLE wire went
+         * dark (725 ms measured, sync_audio_gap; the hold exists for a late-but-flowing audio path). While stalled,
+         * video keeps leaving at the latency it had just before: the wire stays continuous, the steady hold and
+         * the 6 s audio-death escape are untouched. */
+        int stall = now - adv > 150000 && (now - p->enq_us) > g->v_rel_age + 80000;
+        if (!due && !aged && !stall)
             break;
+        if (due) {
+            int64_t age = now - p->enq_us;
+            g->v_rel_age += (age - g->v_rel_age) / 16;
+        } else if (stall && !aged && now - g->v_stall_log_wc > 60000000) {
+            g->v_stall_log_wc = now;
+            av_log(NULL, AV_LOG_INFO, "[PTV-VDLV] audio delivery stalled %.1fs — held video keeps flowing at its "
+                   "steady latency (%.0f ms), the wire stays continuous\n", (now - adv) / 1e6, g->v_rel_age / 1e3);
+        }
         if (aged && !due)
             atomic_fetch_add_explicit(&g->st_vforced, 1, memory_order_relaxed);
         g->vhead = p->next;

@@ -41,8 +41,18 @@ clean. Measured with `test-scripts/t056/structcheck.py`.
   Copies are now parked while the video is unanchored (the existing park; released at the first fresh frame, what
   precedes the anchor still dropped). Fixture AC-3 start 0.965 → 0.027 s, structcheck PASS; Cinestar bursty 6.58 →
   0.86 s; Cinestar clean unchanged (0.024 s).
-- Still open: wire pauses at rejoins (330 ms sync_gap_20, 755 ms sync_audio_gap, flapping), long-hold A/V PTS
-  divergence. Seen, not T-083: bursty Cinestar lip sync swings −45…−1,082 ms on every build (pre9.3 too).
+- **Step 5, no wire pauses.** Localized with temporary probes (clock loop, pacing, encode, mux queue, writes): (a) the
+  video delivery hold (§7.5b) froze the WHOLE wire while audio delivery stalled — the track lost, before its silence
+  fill delivers at 2 s (sync_audio_gap: mux queue empty 725 ms, the only vdlvhold=603 ms of the run); while audio
+  delivery has been stalled 150 ms, held video now keeps leaving at its steady latency (EMA of the hold age at normal
+  releases + 80 ms; `[PTV-VDLV] audio delivery stalled … the wire stays continuous`); the steady hold of a late-but-
+  flowing audio path and the 6 s audio-death escape are unchanged (Cinestar loudnorm: vdlvhold 2168 ms, no stall line).
+  (b) the ~330 ms pause at an outage ONSET (T-077, ~1.5 s on the fleet) was lavf's interleaver holding video up to
+  max_interleave_delta (200 ms) for the audio that had stopped — no stage of ours stalled; 200 → 50 ms (331 → 108 ms;
+  the delivery gates already align audio with video). sync_gap_20 331 → 103 ms, sync_audio_gap 721 → 151 ms, flapping
+  331 → 275 ms, stop_20 280 → 112 ms; 10 fixtures + Cinestar clean/loss: structure PASS (loss: 3 residual 0.16 s video
+  holes at the loss start, open), PCR ≤ 40 ms on the fixtures, lip sync PASS.
+- Still open: long-hold A/V PTS divergence; Cinestar loss residual video holes. Seen, not T-083: bursty Cinestar lip sync swings −45…−1,082 ms on every build (pre9.3 too).
 
 ## 2.0.0-pre9.3 — heavy packet loss no longer desyncs the audio (T-080 mechanism A)
 
