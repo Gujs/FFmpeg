@@ -1376,6 +1376,9 @@ typedef struct PassStream {
     int        fill_cls_seq0;         /* 2.0.0-pre8.5: g_rj_cls_seq when this copy's hold fill began */
     int64_t    fill_wc0;              /* 2.0.0-pre8.5: wall us it began */
     int64_t    in_wc;                 /* wall us of the last packet's arrival here */
+    /* 2.0.0-pre9.4 (T-083): damage while video flows — silent frames put into gaps, overlapping frames dropped */
+    int        gap_n, ovl_n;          /* since the last [PTV-SRC] copy damage line */
+    int64_t    dmg_log_wc;            /* wall us of that line */
 } PassStream;
 
 /* ---- legacy-0004 TS-discontinuity buffer (g_layera / PTV_LAYERA, default OFF) ----
@@ -2179,6 +2182,8 @@ extern _Atomic int64_t g_mux_sent_wc[PTV_MAX_RUNG];
 extern int     g_glueclass;              /* the whole classifier; PTV_NO_GLUECLASS=1 reverts wholesale */
 extern int     g_nbs_fill;               /* §3 starvation silence-fill — OPT-IN (PTV_NBS_FILL=1; owner Q2) */
 extern int     g_hold_fill;              /* 2.0.0-pre6: audio silence while input 0 holds (PTV_NO_SRC_FILL=1 off) */
+extern int     g_copy_gapfill;           /* 2.0.0-pre9.4 (T-083): copied AC-3 stays continuous while video flows
+                                          * (PTV_NO_COPY_GAPFILL=1 off) */
 extern int     g_glue_htol;              /* §2.3 label-health tolerance, percent (5; PTV_GLUE_HTOL_PCT — TEST/tuning) */
 extern int64_t g_pair_ttl_us;            /* pair-expect TTL (30s; PTV_PAIR_EXPECT_TTL_US — TEST ONLY, G6) */
 extern int64_t g_nbs_quantum_us;         /* fill quantum (100ms; PTV_NBS_QUANTUM_MS — TEST ONLY, G8) */

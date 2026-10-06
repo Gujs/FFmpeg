@@ -1590,6 +1590,25 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
     return ret;
 }
 
+/* One silent frame of a copied AC-3 / E-AC-3 stream at ts (in_tb), routed like a real copy (delivery gate or mux_q).
+ * Caller holds pass_lock and keeps ts above ps->last_dts. */
+static void copy_emit_sil(DemuxArgs *d, PassStream *ps, int64_t ts)
+{
+    int64_t dropped = 0;
+    int i;
+    for (i = 0; i < d->n_out; i++) {
+        AVPacket *c = av_packet_clone(ps->sil);
+        if (!c) continue;
+        c->pts = c->dts = ts;
+        c->stream_index = ps->ost[i]->index;
+        if (d->gate[i])
+            dlv_enqueue(d->gate[i], c, av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q), 0);
+        else
+            demux_send(d->mux_q[i], c, d->drop, &dropped);
+    }
+    ps->last_dts = ts;
+}
+
 /* Copy-passthrough: route an input packet we don't transcode (extra audio, DVB
  * subtitle, data/SCTE-35) straight to the muxer, rebased onto the same h0 house
  * timeline the encoded streams use so everything stays in sync. Packets that
@@ -1643,6 +1662,7 @@ static int demux_pass_one(DemuxArgs *d, AVPacket *out)
             pthread_mutex_lock(&d->pass_lock);
         if (d->pass[pi].sil && out->dts != AV_NOPTS_VALUE) {
             PassStream *ps = &d->pass[pi];
+            int64_t exp = ps->real_end;              /* where this track's next frame belongs */
             if (ps->fill_end != AV_NOPTS_VALUE) {
                 /* hand-back: real packets below the end of the replayed silence are dropped (a sub-frame gap
                  * is left), never re-stamped — bounded to 2 s of drops */
@@ -1658,10 +1678,44 @@ static int demux_pass_one(DemuxArgs *d, AVPacket *out)
                            "%d real packets dropped at hand-back\n", ps->in_index,
                            avcodec_get_name(d->ifmt->streams[ps->in_index]->codecpar->codec_id),
                            ps->fill_n, ps->drop_n);
+                exp = ps->fill_end;
                 ps->fill_end = AV_NOPTS_VALUE;
                 ps->fill_n = ps->drop_n = 0;
                 if (pi < PTV_MAX_PASS)
                     atomic_store_explicit(&g_cfill_us[pi], 0, memory_order_relaxed);
+            }
+            /* 2.0.0-pre9.4 (T-083): the copied track stays continuous through damage. A real frame up to 1 s
+             * BEHIND where the track already is (the overlap a damaged PES leaves: the parser cut frames from
+             * corrupt data and ran ahead) is dropped — the transcoded track's pre9.3 rule; it used to be bumped
+             * 1 tick past the previous one, stacking frames on one instant. A frame up to 3 s AHEAD (frames lost
+             * or corrupt-discarded, or a house_skew dup step) gets the gap filled with silent frames first —
+             * nothing real is ever dropped for it. Longer gaps: the hold fill / copy_gap_watch. Both windows widen
+             * by the house_skew change since the last real frame: the copy rides it, so a house_skew drop (the
+             * video leapt over content: 1.08 s → 0 measured under loss) is an overlap of exactly the content the
+             * video skipped, and a rise is time the video spent repeating frames. */
+            if (g_copy_gapfill && exp != AV_NOPTS_VALUE) {
+                int64_t gap = out->dts - exp, half = ps->sil_dur / 2, now = av_gettime_relative();
+                int64_t hsd = av_rescale_q(hs_used - ps->hs_real, AV_TIME_BASE_Q, ps->in_tb);
+                if (gap <= -half && gap >= -av_rescale_q(1000000, AV_TIME_BASE_Q, ps->in_tb) + FFMIN(hsd, 0)) {
+                    ps->ovl_n++;
+                    pthread_mutex_unlock(&d->pass_lock);
+                    av_packet_free(&out);
+                    return 0;
+                }
+                if (gap > half && gap <= av_rescale_q(3000000, AV_TIME_BASE_Q, ps->in_tb) + FFMAX(hsd, 0)) {
+                    int64_t cur = exp;
+                    if (ps->last_dts != AV_NOPTS_VALUE && cur <= ps->last_dts)
+                        cur = ps->last_dts + 1;
+                    for (; cur + half < out->dts; cur += ps->sil_dur, ps->gap_n++)
+                        copy_emit_sil(d, ps, cur);
+                }
+                if ((ps->gap_n || ps->ovl_n) && now - ps->dmg_log_wc >= 10000000) {
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] copy #%d (%s) kept continuous: %d silent frames put into "
+                           "gaps, %d overlapping frames dropped (PTV_NO_COPY_GAPFILL=1 disables)\n", ps->in_index,
+                           avcodec_get_name(d->ifmt->streams[ps->in_index]->codecpar->codec_id), ps->gap_n, ps->ovl_n);
+                    ps->gap_n = ps->ovl_n = 0;
+                    ps->dmg_log_wc = now;
+                }
             }
             ps->arr_wc   = av_gettime_relative();
             ps->real_end = out->dts + (out->duration > 0 ? out->duration : ps->sil_dur);
@@ -1764,8 +1818,7 @@ static int demux_pass(DemuxArgs *d, AVPacket *out)
  * beyond the video front plus the lead it had). Routed like a real copy (delivery gate or mux_q). */
 void ptv_copy_fill(DemuxArgs *d, int64_t hs, int64_t now)
 {
-    int pi, i;
-    int64_t dropped = 0;
+    int pi;
 
     pthread_mutex_lock(&d->pass_lock);
     for (pi = 0; pi < d->n_pass; pi++) {
@@ -1779,17 +1832,7 @@ void ptv_copy_fill(DemuxArgs *d, int64_t hs, int64_t now)
         if (ps->last_dts != AV_NOPTS_VALUE && cur <= ps->last_dts)
             cur = ps->last_dts + 1;
         while (cur + ps->sil_dur <= target && n < 100) {   /* at most 100 frames (~3 s) per call */
-            for (i = 0; i < d->n_out; i++) {
-                AVPacket *c = av_packet_clone(ps->sil);
-                if (!c) continue;
-                c->pts = c->dts = cur;
-                c->stream_index = ps->ost[i]->index;
-                if (d->gate[i])
-                    dlv_enqueue(d->gate[i], c, av_rescale_q(cur, ps->in_tb, AV_TIME_BASE_Q), 0);
-                else
-                    demux_send(d->mux_q[i], c, d->drop, &dropped);
-            }
-            ps->last_dts = cur;
+            copy_emit_sil(d, ps, cur);
             cur += ps->sil_dur;
             n++;
         }
@@ -1809,6 +1852,46 @@ void ptv_copy_fill(DemuxArgs *d, int64_t hs, int64_t now)
             atomic_store_explicit(&g_cfill_us[pi], av_rescale_q((int64_t)ps->fill_n * ps->sil_dur, ps->in_tb,
                                                                 AV_TIME_BASE_Q), memory_order_relaxed);
         }
+    }
+    pthread_mutex_unlock(&d->pass_lock);
+}
+
+/* 2.0.0-pre9.4 (T-083), demux thread on a video arrival: the source is delivering but a copied AC-3 / E-AC-3 PID has
+ * delivered nothing usable (lost or corrupt-discarded) for 2 s of a gap-free video run — the transcoded NBS rule and
+ * threshold (1-2 s interleave blips are normal). Silent frames follow the wall clock from the track's last real end,
+ * 200 ms short of now so a resuming real frame meets the existing hand-back, which drops real frames below the fill.
+ * A bursty source stalls every PID together, so it never fills here. Long holes only: shorter ones are filled when
+ * the next real frame arrives (demux_pass_one). */
+static void copy_gap_watch(DemuxArgs *d, int64_t now)
+{
+    int pi;
+    pthread_mutex_lock(&d->pass_lock);
+    for (pi = 0; pi < d->n_pass; pi++) {
+        PassStream *ps = &d->pass[pi];
+        int64_t target, cur;
+        int n = 0;
+        if (!ps->sil || ps->real_end == AV_NOPTS_VALUE || now - FFMAX(ps->arr_wc, d->v_flow_since_us) < 2000000)
+            continue;
+        target = ps->real_end + av_rescale_q(now - ps->arr_wc - 200000, AV_TIME_BASE_Q, ps->in_tb);
+        cur    = ps->fill_end != AV_NOPTS_VALUE ? ps->fill_end : ps->real_end;
+        if (ps->last_dts != AV_NOPTS_VALUE && cur <= ps->last_dts)
+            cur = ps->last_dts + 1;
+        for (; cur + ps->sil_dur <= target && n < 100; cur += ps->sil_dur, n++)
+            copy_emit_sil(d, ps, cur);
+        if (!n)
+            continue;
+        if (!ps->fill_n) {
+            ps->fill_cls_seq0 = atomic_load_explicit(&g_rj_cls_seq, memory_order_acquire);
+            ps->fill_wc0      = now;
+            av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] copy #%d (%s) gap fill: no usable packets for 2 s while video "
+                   "flows — silent frames (PTV_NO_COPY_GAPFILL=1 disables)\n", ps->in_index,
+                   avcodec_get_name(d->ifmt->streams[ps->in_index]->codecpar->codec_id));
+        }
+        ps->fill_n  += n;
+        ps->fill_end = cur;
+        atomic_store_explicit(&g_cfill_idx[pi], ps->in_index, memory_order_relaxed);
+        atomic_store_explicit(&g_cfill_us[pi], av_rescale_q((int64_t)ps->fill_n * ps->sil_dur, ps->in_tb,
+                                                            AV_TIME_BASE_Q), memory_order_relaxed);
     }
     pthread_mutex_unlock(&d->pass_lock);
 }
@@ -3308,6 +3391,8 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                     if (av_thread_message_queue_send(d->audio_q[k], &fs, AV_THREAD_MESSAGE_NONBLOCK) < 0)
                         av_packet_free(&fs);
                 }
+                if (g_copy_gapfill && d->n_pass && !ptv_src_holding())   /* 2.0.0-pre9.4 (T-083) */
+                    copy_gap_watch(d, nw);
             }
             /* 1.0.1-pre10 review fix (rr10 D1): measure THIS input's video arrival rate — the
              * catch-up governor's pacing currency (the master OUT tick was the wrong currency:

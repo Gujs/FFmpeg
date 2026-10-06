@@ -5,6 +5,27 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre9.4 (in progress) — linear output whatever the input (T-083)
+
+Owner rule (2026-10-06): the output is always fluent and linear — video one frame per tick, every audio track
+continuous, PCR in spec, no pauses; damage shows only as content — and lip sync is back within ±25 ms once the input is
+clean. Measured with `test-scripts/t056/structcheck.py`.
+- **Step 1, copied AC-3 continuous through damage while video flows.** A copied frame up to 1 s behind where the track
+  already is (the overlap a damaged PES leaves) is dropped — it used to be bumped 1 tick past the previous frame,
+  stacking frames on one instant; a frame up to 3 s ahead gets the gap filled with silent frames first (nothing real
+  dropped). Both windows widen by the house_skew change since the last real frame (the copy rides it: a video content
+  leap dropped house_skew 1.08 s → 0 under loss = an overlap of exactly the skipped content). Holes longer than 2 s of a
+  gap-free video run (no usable packets, lost or corrupt-discarded) get timely silent frames from the demux thread, the
+  transcoded NBS rule and threshold; a bursty source stalls every PID and never triggers it. Logs: `[PTV-SRC] copy #N
+  (ac3) kept continuous: …`, `… gap fill: no usable packets for 2 s while video flows`. `PTV_NO_COPY_GAPFILL=1` reverts.
+  Cinestar 10 % loss (production audio path): AC-3 holes 14 (max 8.5 s) → 0, overlaps 0, transcoded lip sync −12…+20 ms;
+  fixture `sync_ac3_loss_100`: AC-3 holes 92 / overlaps 200 → 0 / 0; Cinestar clean identical (no fill fires); Cinestar
+  bursty AC-3 holes 7 → 0 with no timely fill and no real frame dropped; the six copied-AC-3 fixtures keep lip sync PASS on
+  AAC and AC-3 (kill_return_20's AAC +96 ms is T-082, same with the fill off).
+- Still open: video PTS holes (content leap), the first AAC packet stamped −19 ms at start (wraps to 95,443.7 s on the
+  wire — the scale of the 2026-10-06 grid DESYNC readings), the copied AC-3 starting ~0.9 s after video, wire pauses,
+  long-hold A/V PTS divergence.
+
 ## 2.0.0-pre9.3 — heavy packet loss no longer desyncs the audio (T-080 mechanism A)
 
 Canary L3 (Cinestar, 10 % random datagram loss for 30 s): audio +1.67 s early, fixed by RESYNC only after 7.5 min.

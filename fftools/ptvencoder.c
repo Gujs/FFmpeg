@@ -847,6 +847,7 @@ _Atomic int64_t g_mux_sent_wc[PTV_MAX_RUNG];
 int     g_glueclass = 1;
 int     g_nbs_fill  = 0;
 int     g_hold_fill = 1;                       /* 2.0.0-pre6: audio fill during a source hold (default-on, D24) */
+int     g_copy_gapfill = 1;                    /* 2.0.0-pre9.4 (T-083): copied AC-3 gap fill / overlap drop */
 int     g_glue_htol = 5;                       /* §2.3 |H−1| tolerance, % (fixture-tuned, G4) */
 int64_t g_pair_ttl_us = PTV_PAIR_EXPECT_TTL_US;
 int64_t g_nbs_quantum_us = 100000;             /* fill quantum: 100ms of silence per sentinel */
@@ -6438,6 +6439,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_ACQ_BACKOFF")) g_acq_backoff = 0;       /* 1.0.1-pre18 #49: no repeated-ACQUIRE threshold backoff */
     if (getenv("PTV_NBS_FILL") && g_glueclass) g_nbs_fill = 1;
     if (getenv("PTV_NO_SRC_FILL")) g_hold_fill = 0;   /* 2.0.0-pre6 kill switch: no fill while holding */
+    if (getenv("PTV_NO_COPY_GAPFILL")) g_copy_gapfill = 0;   /* 2.0.0-pre9.4 kill switch */
     if (getenv("PTV_NO_REJOIN_MAP")) g_rejoin_map = 0; /* 2.0.0-pre6.1 kill switch: PTS jumps at a rejoin again */
     { const char *s = getenv("PTV_GLUE_HTOL_PCT");     if (s && atoi(s) > 0) g_glue_htol = atoi(s); }             /* tuning knob (G4) */
     { const char *s = getenv("PTV_PAIR_EXPECT_TTL_US");if (s && atoll(s) > 0) g_pair_ttl_us = atoll(s); }          /* TEST ONLY (G6) */
