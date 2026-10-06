@@ -2026,6 +2026,7 @@ extern _Atomic int     g_fq_hw;
 extern int     g_exacttick;
 extern int     g_mv_exacttick;
 extern int     g_decimate;
+extern int     g_vgapfill;               /* 2.0.0-pre9.4 (T-083): fill a content gap at the tick rate (PTV_NO_VGAPFILL=1 off) */
 extern int     g_pulldown;
 extern int     g_cad_disarm;
 extern int     g_frameq_cap;

@@ -899,6 +899,8 @@ void *output_thread(void *arg)
         /* v0.9.11 pulldown state: 1-frame lookahead + film-mode detector (see g_pulldown comment) */
         AVFrame *nextf = NULL;
         int next_have = 0, film_arm = 0, held_extra = 0;
+        int vgap_park = 0;                          /* 2.0.0-pre9.4 (T-083): nextf is a frame parked behind a content gap */
+        int64_t vgap_filled = 0, vgap_log_wc = 0;   /* ticks filled since the last [PTV-VFILL] line */
         unsigned rff_bits = 0;
         int64_t cad_ema_us   = v->tick_dur_us;      /* M7: fresh-frame source-spacing EMA (tau ~8f); seeded real-time */
         int64_t cad_prev_src = AV_NOPTS_VALUE;      /* previous fresh frame's SOURCE pts (held_src_pts domain) */
@@ -920,11 +922,14 @@ void *output_thread(void *arg)
                 int64_t nc = content_index(v, nextf->pts);
                 if (nc < 0 || nc <= last_vpts + 1 || held_extra >= 1) {   /* due, unstampable, or residence CAP hit */
                     av_frame_unref(held); av_frame_move_ref(held, nextf); av_frame_free(&nextf);
-                    next_have = 0; fresh = 1; held_src_pts = held->pts; held_extra = 0;
+                    next_have = 0; fresh = 1; held_src_pts = held->pts; held_extra = 0; vgap_park = 0;
                 } else
                     cadence_hold = 1;               /* held frame legitimately occupies this tick (3-field residence) */
             }
             /* queue empty + no lookahead: fall through = dup-on-empty exactly as today */
+        } else if (next_have && vgap_park && content_index(v, nextf->pts) > last_vpts + 1) {
+            cadence_hold = 1;                       /* 2.0.0-pre9.4 (T-083): still inside the content gap — repeat */
+            vgap_filled++;
         } else if (next_have) {
             /* v0.9.16.2 (defensive): drain a PARKED pulldown lookahead first. If cadence ever
              * disarms with a frame still in nextf, that frame would sit orphaned until the next
@@ -936,7 +941,7 @@ void *output_thread(void *arg)
              * The promoted frame is the NEXT content frame, so no decim check needed (mirrors the
              * film path's own promotion). */
             av_frame_unref(held); av_frame_move_ref(held, nextf); av_frame_free(&nextf);
-            next_have = 0; have = 1; fresh = 1; held_src_pts = held->pts; held_extra = 0;
+            next_have = 0; have = 1; fresh = 1; held_src_pts = held->pts; held_extra = 0; vgap_park = 0;
         } else {
             /* v0.9.15.2 CADENCE DECIMATION (single-input mirror of the 0.9.13 mosaic multi-pop):
              * a frame whose content index does NOT advance past the last emitted tick is SURPLUS —
@@ -951,6 +956,22 @@ void *output_thread(void *arg)
             int pops = 0, got_eof = 0;
             for (;;) {
                 ret = av_thread_message_queue_recv(v->frame_q, &f, AV_THREAD_MESSAGE_NONBLOCK);
+                if (ret >= 0 && g_vgapfill && have && !pops && f->opaque != &ptv_hold_tag) {
+                    /* 2.0.0-pre9.4 (T-083): a content gap INSIDE frame_q (frames lost or corrupt-discarded at the
+                     * source — the demux already re-maps relabels: DISCONT < 1 s, LAYERA > 1 s) used to be leapt:
+                     * this frame stamped past the gap on the very next tick = a hole in the output video PTS (and a
+                     * PCR jump of the same size, 0.88 s under 10 % loss) while frame_q drained early. Park it and
+                     * repeat the held frame up to its slot — the source's own timing, so latency is unchanged; the
+                     * repeats are residence (held_extra), not skew, so house_skew and audio do not move. Gaps over
+                     * 2 s are outage-class (hold / rejoin map) and keep the old path. */
+                    int64_t hc = content_index(v, f->pts);
+                    if (hc > last_vpts + 1 && (hc - last_vpts - 1) * v->tick_dur_us <= 2000000) {
+                        nextf = f; next_have = 1; vgap_park = 1;
+                        cadence_hold = 1;
+                        vgap_filled++;
+                        break;
+                    }
+                }
                 if (ret >= 0) {
                     av_frame_unref(held); av_frame_move_ref(held, f); av_frame_free(&f);
                     have = 1; fresh = 1; held_src_pts = held->pts;   /* capture before emit overwrites it */
@@ -1371,6 +1392,12 @@ void *output_thread(void *arg)
                                                                           * media time reached — every
                                                                           * demux stops pulling */
         if (!fresh) { if (cadence_hold) v->pd++; else v->dup++; }   /* pd = intentional cadence residence; dup stays the health alarm */
+        if (vgap_filled && v->is_master && av_gettime_relative() - vgap_log_wc >= 10000000) {
+            av_log(NULL, AV_LOG_WARNING, "[PTV-VFILL] %"PRId64" frame(s) repeated into content gaps (source frames "
+                   "lost/corrupt) — output PTS stays continuous (PTV_NO_VGAPFILL=1 disables)\n", vgap_filled);
+            vgap_filled = 0;
+            vgap_log_wc = av_gettime_relative();
+        }
         /* 2.0.0-pre3 (T-056 §3): source-state watch, OBSERVE-ONLY. A hold needs the content gone AND the
          * input silent: no fresh frame, video_q empty and no video arrival, all for max(-stall_min, bank
          * target) — shorter underruns are today's dup path (fleet 2026-10-02: 63 % of >=2 s frame-queue-

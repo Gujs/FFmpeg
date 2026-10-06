@@ -27,8 +27,17 @@ clean. Measured with `test-scripts/t056/structcheck.py`.
   field wraps it to 95,443.7 s, the scale of the 2026-10-06 grid DESYNC readings (−95,274 s) that made sync_check restart
   live outputs. The mux thread drops any packet with dts < 0 (`[PTV-MUX] … dropped a packet stamped before the start`).
   Cinestar clean: structcheck PASS (was FAIL on the wrapped packet).
-- Still open: video PTS holes (content leap), the copied AC-3 starting ~0.9 s after video, wire pauses, long-hold A/V
-  PTS divergence.
+- **Step 3, a content gap is filled, not leapt.** Frames lost or corrupt-discarded at the source left a gap INSIDE
+  frame_q; the next frame was stamped past it on the very next tick — a hole in the output video PTS (0.88 s under 10 %
+  loss; the PCR rides it, so "PCR > 40 ms" was this) — and frame_q drained early (starvation dups later). The output
+  clock now parks that frame and repeats the held one up to its slot: the source's own timing, latency unchanged, the
+  repeats are residence (held_extra) so house_skew and the audio do not move. Relabels never reach it (DISCONT < 1 s,
+  LAYERA > 1 s re-map them in the demux); gaps over 2 s keep the outage path. `[PTV-VFILL] N frame(s) repeated into
+  content gaps`; `PTV_NO_VGAPFILL=1` reverts. 13 fixtures: video holes 0 everywhere, PCR max 40 ms everywhere (was up to
+  880 ms), sync_loss_100 wire pauses 7 (max 1.08 s) → 0, starvation dups under loss 341 → 0, lip sync PASS on every
+  loss/bitflip/outage fixture (AAC and AC-3); clean / bursty never fill; sync_flapping (T-075) −192/−477 → −192/−192 ms.
+- Still open: the copied AC-3 starting ~0.9 s after video, wire pauses at rejoins (330 ms sync_gap_20, flapping),
+  long-hold A/V PTS divergence.
 
 ## 2.0.0-pre9.3 — heavy packet loss no longer desyncs the audio (T-080 mechanism A)
 
