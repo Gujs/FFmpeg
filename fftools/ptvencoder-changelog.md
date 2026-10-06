@@ -36,8 +36,13 @@ clean. Measured with `test-scripts/t056/structcheck.py`.
   content gaps`; `PTV_NO_VGAPFILL=1` reverts. 13 fixtures: video holes 0 everywhere, PCR max 40 ms everywhere (was up to
   880 ms), sync_loss_100 wire pauses 7 (max 1.08 s) → 0, starvation dups under loss 341 → 0, lip sync PASS on every
   loss/bitflip/outage fixture (AAC and AC-3); clean / bursty never fill; sync_flapping (T-075) −192/−477 → −192/−192 ms.
-- Still open: the copied AC-3 starting ~0.9 s after video, wire pauses at rejoins (330 ms sync_gap_20, flapping),
-  long-hold A/V PTS divergence.
+- **Step 4, the copied AC-3 starts with the video.** A copy arriving before h0 exists was dropped, and h0 is set at the
+  first DECODED frame, ~1 s of input later: the copied AC-3 began 0.92 s after the video (first 6 s segment 85 % AC-3).
+  Copies are now parked while the video is unanchored (the existing park; released at the first fresh frame, what
+  precedes the anchor still dropped). Fixture AC-3 start 0.965 → 0.027 s, structcheck PASS; Cinestar bursty 6.58 →
+  0.86 s; Cinestar clean unchanged (0.024 s).
+- Still open: wire pauses at rejoins (330 ms sync_gap_20, 755 ms sync_audio_gap, flapping), long-hold A/V PTS
+  divergence. Seen, not T-083: bursty Cinestar lip sync swings −45…−1,082 ms on every build (pre9.3 too).
 
 ## 2.0.0-pre9.3 — heavy packet loss no longer desyncs the audio (T-080 mechanism A)
 
