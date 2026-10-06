@@ -22,9 +22,13 @@ clean. Measured with `test-scripts/t056/structcheck.py`.
   fixture `sync_ac3_loss_100`: AC-3 holes 92 / overlaps 200 → 0 / 0; Cinestar clean identical (no fill fires); Cinestar
   bursty AC-3 holes 7 → 0 with no timely fill and no real frame dropped; the six copied-AC-3 fixtures keep lip sync PASS on
   AAC and AC-3 (kill_return_20's AAC +96 ms is T-082, same with the fill off).
-- Still open: video PTS holes (content leap), the first AAC packet stamped −19 ms at start (wraps to 95,443.7 s on the
-  wire — the scale of the 2026-10-06 grid DESYNC readings), the copied AC-3 starting ~0.9 s after video, wire pauses,
-  long-hold A/V PTS divergence.
+- **Step 2, nothing on the wire before the start.** The first AAC packet carries the encoder priming (1024 samples =
+  −21.3 ms) and was stamped negative whenever audio starts within 21 ms of the anchor (Cinestar −18.7 ms) — the 33-bit
+  field wraps it to 95,443.7 s, the scale of the 2026-10-06 grid DESYNC readings (−95,274 s) that made sync_check restart
+  live outputs. The mux thread drops any packet with dts < 0 (`[PTV-MUX] … dropped a packet stamped before the start`).
+  Cinestar clean: structcheck PASS (was FAIL on the wrapped packet).
+- Still open: video PTS holes (content leap), the copied AC-3 starting ~0.9 s after video, wire pauses, long-hold A/V
+  PTS divergence.
 
 ## 2.0.0-pre9.3 — heavy packet loss no longer desyncs the audio (T-080 mechanism A)
 

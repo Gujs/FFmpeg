@@ -3296,6 +3296,7 @@ static void *mux_thread(void *arg)
     int       mg_n = m->ofmt->nb_streams;
     int64_t  *mg_last = av_malloc_array(mg_n > 0 ? mg_n : 1, sizeof(*mg_last));
     int64_t   mg_dropped = 0, mg_warn_last = 0;
+    int64_t   neg_dropped = 0;   /* 2.0.0-pre9.4 (T-083): packets stamped before the house anchor */
     int64_t   mt0 = av_gettime_relative();
     int       mg_test_injected = 0;
     /* 1.0.1-pre27 #62 (pre26 review rider): [PTV-MUXGUARD] drop-span ceiling — per-stream
@@ -3356,6 +3357,18 @@ static void *mux_thread(void *arg)
                            "(gate fixture, PTV_MUXTEST_BACK_AT_S)\n",
                            m->rung, g_muxtest_back_ms, stream_index);
                 mg_test_injected = 1;
+            }
+            /* 2.0.0-pre9.4 (T-083): nothing goes on the wire stamped before the house anchor. A negative dts wraps
+             * to ~95,443 s in the 33-bit field — the first AAC packet carries the encoder's priming (1024 samples
+             * = −21.3 ms), negative whenever audio starts within 21 ms of the anchor (Cinestar: −18.7 ms; the
+             * 2026-10-06 sync_check DESYNC −95,274 s readings). A live decoder joins mid-stream anyway. */
+            if (pkt->dts != AV_NOPTS_VALUE && pkt->dts < 0) {
+                if (!neg_dropped++)
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-MUX] rung %d stream %d: dropped a packet stamped before the "
+                           "start (%.1f ms) — it would wrap to ~95443 s on the wire\n", m->rung, stream_index,
+                           pkt->dts * av_q2d(m->ofmt->streams[stream_index]->time_base) * 1000);
+                av_packet_free(&pkt);
+                continue;
             }
             if (g_muxguard && mg_last && pkt->dts != AV_NOPTS_VALUE && stream_index < mg_n) {
                 enum AVMediaType mgt = m->ofmt->streams[stream_index]->codecpar->codec_type;
