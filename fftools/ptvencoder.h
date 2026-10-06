@@ -156,6 +156,9 @@ typedef struct DlvGate {
     int64_t         v_lat_ema;          /* EMA of the enc-vs-delivered content skew (µs) */
     int             v_lat_seed;         /* EMA seeded */
     int64_t         v_cap_log_wc;       /* rate limit for the cap-resize INFO line */
+    int64_t         v_rel_age;          /* 2.0.0-pre9.4 (T-083): EMA of a held packet's age at a normal (due) release —
+                                         * the steady hold latency an audio stall keeps flowing at */
+    int64_t         v_stall_log_wc;     /* rate limit for the stall line */
     _Atomic int64_t a_dlv_dts_hi;       /* newest audio/copy DTS DELIVERED to mux_q (µs); INT64_MIN = none yet */
     _Atomic int64_t a_hi_change_wc;     /* wall time a_dlv_dts_hi last ADVANCED (escape/re-arm detector) */
     _Atomic int64_t st_vhold_us;        /* stats vdlvhold=: age of the oldest held video at the last video drain */
@@ -1054,6 +1057,7 @@ typedef struct AudioState {
     int64_t          glue_raw_last_us;                /* last RAW in-pts (us); NOPTS until first frame */
     int64_t          glue_raw_dur_us;                 /* its frame span (us) */
     int64_t          glue_wall_last_us;               /* monotonic wall time of the previous fed frame */
+    int64_t          hf_hs_real, hf_dup_real;         /* 2.0.0-pre9.4 (T-083): house_skew + g_dup_out_us at that frame */
     int              glue_events;                     /* RELABEL verdicts this run */
     int64_t          glue_log_win_us;                 /* 0.9.18: verdict-log rate-limit window start (wall) */
     int              glue_log_win_n;                  /* verdict lines emitted this window */
@@ -1173,6 +1177,7 @@ typedef struct AudioState {
      * catch-up (sync_stop_10: 10 s of audio decoded in 10 ms; 256 overflowed and released early, one tick off) */
 #define PTV_RJ_BUF 1024
     AVFrame         *rj_buf[PTV_RJ_BUF];
+    int64_t          hold_drop_n;                     /* 2.0.0-pre9.4: real frames dropped while the source held */
     int              rj_n, rj_released, rj_releasing, rj_cls_seq0;
     int64_t          rj_t0;                           /* wall us the first frame was buffered */
     int64_t          hold_fill_last_wc;               /* wall us of the newest fill frame */
@@ -1364,6 +1369,7 @@ typedef struct PassStream {
     int64_t    arr_wc;                /* wall us of the last real packet */
     int64_t    real_end;              /* last real packet's dts + duration (in_tb, output domain) */
     int64_t    hs_real;               /* house_skew (us) that packet was stamped with */
+    int64_t    dup_real;              /* 2.0.0-pre9.4 (T-083): g_dup_out_us when that packet was stamped */
     int64_t    fill_end;              /* end of the replayed silence (in_tb); NOPTS = no fill */
     int        fill_n, drop_n;        /* frames replayed / real packets dropped below fill_end (hand-back) */
     /* 2.0.0-pre6: a dense copy resuming after >=300 ms of silence is parked (demux thread only) until the master
@@ -1376,6 +1382,9 @@ typedef struct PassStream {
     int        fill_cls_seq0;         /* 2.0.0-pre8.5: g_rj_cls_seq when this copy's hold fill began */
     int64_t    fill_wc0;              /* 2.0.0-pre8.5: wall us it began */
     int64_t    in_wc;                 /* wall us of the last packet's arrival here */
+    /* 2.0.0-pre9.4 (T-083): damage while video flows — silent frames put into gaps, overlapping frames dropped */
+    int        gap_n, ovl_n;          /* since the last [PTV-SRC] copy damage line */
+    int64_t    dmg_log_wc;            /* wall us of that line */
 } PassStream;
 
 /* ---- legacy-0004 TS-discontinuity buffer (g_layera / PTV_LAYERA, default OFF) ----
@@ -1933,6 +1942,7 @@ extern _Atomic int64_t g_vskip_from_us;    /* latest skip boundary on the source
 extern _Atomic int64_t g_rj_off_total, g_rj_off_before, g_rj_from_us;
 extern _Atomic int     g_rj_epoch;
 extern _Atomic int64_t g_house_out_us, g_house_tick_us;   /* master: last emitted vpts on the output axis, tick */
+extern _Atomic int64_t g_dup_out_us;     /* master: output time on ticks whose content did not advance (hold fills' clock) */
 extern int             g_rejoin_map;       /* PTV_NO_REJOIN_MAP=1 off */
 static inline int64_t ptv_rj_off(int64_t src_us)
 {
@@ -2023,6 +2033,7 @@ extern _Atomic int     g_fq_hw;
 extern int     g_exacttick;
 extern int     g_mv_exacttick;
 extern int     g_decimate;
+extern int     g_vgapfill;               /* 2.0.0-pre9.4 (T-083): fill a content gap at the tick rate (PTV_NO_VGAPFILL=1 off) */
 extern int     g_pulldown;
 extern int     g_cad_disarm;
 extern int     g_frameq_cap;
@@ -2040,6 +2051,7 @@ extern int     g_reprime;
 extern int     g_adapt_cushion;
 extern CushionPlan g_cp;                 /* defined in ptvencoder_gate.c */
 extern _Atomic int     g_frameq_depth;
+extern _Atomic int64_t g_fq0_tail_pts;
 extern int     g_genlock_guard;
 extern _Atomic int64_t g_async_ppm;
 extern int64_t g_stats_period_us;
@@ -2086,7 +2098,7 @@ extern _Atomic int64_t g_src_fresh_wc;    /* 2.0.0-pre6: wall us of the master's
 extern _Atomic int     g_src_icb_armed;   /* 2.0.0-pre5: the no-video read interrupt is live (single input) */
 extern int             g_backoff_s[8], g_backoff_n;   /* -reopen_backoff (s), 2.0.0-pre2/pre5 */
 int ptv_src_interrupt(void *opaque);     /* 2.0.0-pre5: AVIOInterruptCB — no video read for -lost_after */
-void ptv_copy_fill(struct DemuxArgs *d, int64_t hs, int64_t now);   /* 2.0.0-pre6: copied AC-3 silence */
+void ptv_copy_fill(struct DemuxArgs *d, int64_t now);   /* 2.0.0-pre6: copied AC-3 silence */
 extern _Atomic int64_t g_acq_since;      /* 2.0.0-pre7: wall us a single input began waiting for its source (0 = not) */
 /* 2.0.0-pre8 (T-056 §5.1): the stats line's afill= — current silence-fill run per transcoded track (hold or NBS fill)
  * and per copied AC-3/E-AC-3 stream (us; 0 = not filling) */
@@ -2179,6 +2191,8 @@ extern _Atomic int64_t g_mux_sent_wc[PTV_MAX_RUNG];
 extern int     g_glueclass;              /* the whole classifier; PTV_NO_GLUECLASS=1 reverts wholesale */
 extern int     g_nbs_fill;               /* §3 starvation silence-fill — OPT-IN (PTV_NBS_FILL=1; owner Q2) */
 extern int     g_hold_fill;              /* 2.0.0-pre6: audio silence while input 0 holds (PTV_NO_SRC_FILL=1 off) */
+extern int     g_copy_gapfill;           /* 2.0.0-pre9.4 (T-083): copied AC-3 stays continuous while video flows
+                                          * (PTV_NO_COPY_GAPFILL=1 off) */
 extern int     g_glue_htol;              /* §2.3 label-health tolerance, percent (5; PTV_GLUE_HTOL_PCT — TEST/tuning) */
 extern int64_t g_pair_ttl_us;            /* pair-expect TTL (30s; PTV_PAIR_EXPECT_TTL_US — TEST ONLY, G6) */
 extern int64_t g_nbs_quantum_us;         /* fill quantum (100ms; PTV_NBS_QUANTUM_MS — TEST ONLY, G8) */

@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.0-pre9.3"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.0-pre9.4"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -207,6 +207,7 @@ _Atomic int64_t g_vskip_from_us;
 _Atomic int64_t g_rj_off_total, g_rj_off_before, g_rj_from_us;   /* 2.0.0-pre6.1 rejoin map */
 _Atomic int     g_rj_epoch;
 _Atomic int64_t g_house_out_us, g_house_tick_us;
+_Atomic int64_t g_dup_out_us;   /* 2.0.0-pre9.4 (T-083): output time on ticks whose content did not advance */
 int             g_rejoin_map = 1;
 _Atomic int     g_vskip_epoch;
 _Atomic int64_t g_vgop_est_us;
@@ -549,6 +550,7 @@ int     g_mv_exacttick = 1;   /* v0.9.12 MV-EXACTTICK (PTV_NO_MV_EXACTTICK rever
                                       * video axis at 30000/1001, so the per-slot audio followers ENFORCED
                                       * ~36ms/h audio-late onto the wire while every internal offset read bounded.
                                       * See analysis/ptvencoder-0911-multiview-tick-audit.md. */
+int     g_vgapfill = 1;       /* 2.0.0-pre9.4 (T-083): a content gap inside frame_q is filled, not leapt */
 int     g_decimate = 1;       /* v0.9.15.2 cadence decimation (PTV_NO_DECIMATE reverts): a frame whose
                                       * content index does not advance past the last emitted tick is surplus
                                       * (source delivers MORE real frames than its declared rate — NewsNation
@@ -667,6 +669,7 @@ int             g_reprime = 1;                /* PTV_REPRIME: when a glue drains
  * oscillation, no per-channel tuning; transitions log [PTV-CUSHION] and depth shows in -stats. */
 int             g_adapt_cushion = 1;
 _Atomic int     g_frameq_depth;               /* DIAG: master video frame_q occupancy (frames), published each tick for the discontinuity logs */
+_Atomic int64_t g_fq0_tail_pts = AV_NOPTS_VALUE; /* 2.0.0-pre9.4 (T-083): pts of the newest frame pushed to the master frame_q */
 /* v0.9.4 genlock GUARD (PTV_NO_GENLOCK_GUARD reverts to exact v0.9.x behavior). TruBLU-class jittery/
  * bursty sources alias the 3s FLL window → noisy sub-window rates that the loose ±1% gate folded in,
  * driving a slew-limited ±1000ppm limit cycle + an UNBOUNDED house_skew runaway (cor-1: 8.6→28s over
@@ -847,6 +850,7 @@ _Atomic int64_t g_mux_sent_wc[PTV_MAX_RUNG];
 int     g_glueclass = 1;
 int     g_nbs_fill  = 0;
 int     g_hold_fill = 1;                       /* 2.0.0-pre6: audio fill during a source hold (default-on, D24) */
+int     g_copy_gapfill = 1;                    /* 2.0.0-pre9.4 (T-083): copied AC-3 gap fill / overlap drop */
 int     g_glue_htol = 5;                       /* §2.3 |H−1| tolerance, % (fixture-tuned, G4) */
 int64_t g_pair_ttl_us = PTV_PAIR_EXPECT_TTL_US;
 int64_t g_nbs_quantum_us = 100000;             /* fill quantum: 100ms of silence per sentinel */
@@ -2660,6 +2664,7 @@ static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
             AVFrame *out;
             if (i == d->n_rung - 1) { out = av_frame_alloc(); if (out) av_frame_move_ref(out, frame); }
             else                    { out = av_frame_clone(frame); }
+            if (out && i == 0) atomic_store_explicit(&g_fq0_tail_pts, out->pts, memory_order_relaxed);
             if (out) push_frame_q(d->frame_q[i], ((d->deep_prime_packets > 0 || atomic_load_explicit(&g_bank_pkts, memory_order_relaxed) > 0) && i == 0) ? 0 : d->live, &d->framedrop[i], out);
             else if (i == d->n_rung - 1) av_frame_unref(frame);
         }
@@ -2677,6 +2682,7 @@ static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
                 continue;
             }
             out = av_frame_alloc();
+            if (out && i == 0) atomic_store_explicit(&g_fq0_tail_pts, filt->pts, memory_order_relaxed);
             if (out) { av_frame_move_ref(out, filt); push_frame_q(d->frame_q[i], ((d->deep_prime_packets > 0 || atomic_load_explicit(&g_bank_pkts, memory_order_relaxed) > 0) && i == 0) ? 0 : d->live, &d->framedrop[i], out); }
             else     { av_frame_unref(filt); }
         }
@@ -3295,6 +3301,7 @@ static void *mux_thread(void *arg)
     int       mg_n = m->ofmt->nb_streams;
     int64_t  *mg_last = av_malloc_array(mg_n > 0 ? mg_n : 1, sizeof(*mg_last));
     int64_t   mg_dropped = 0, mg_warn_last = 0;
+    int64_t   neg_dropped = 0;   /* 2.0.0-pre9.4 (T-083): packets stamped before the house anchor */
     int64_t   mt0 = av_gettime_relative();
     int       mg_test_injected = 0;
     /* 1.0.1-pre27 #62 (pre26 review rider): [PTV-MUXGUARD] drop-span ceiling — per-stream
@@ -3355,6 +3362,22 @@ static void *mux_thread(void *arg)
                            "(gate fixture, PTV_MUXTEST_BACK_AT_S)\n",
                            m->rung, g_muxtest_back_ms, stream_index);
                 mg_test_injected = 1;
+            }
+            /* 2.0.0-pre9.4 (T-083): nothing goes on the wire stamped before the house anchor. A negative dts wraps
+             * to ~95,443 s in the 33-bit field — the first AAC packet carries the encoder's priming (1024 samples
+             * = −21.3 ms), negative whenever audio starts within 21 ms of the anchor (Cinestar: −18.7 ms; the
+             * 2026-10-06 sync_check DESYNC −95,274 s readings). A live decoder joins mid-stream anyway. Keyed on
+             * the PRESENTATION time: B-frame video (production NVENC -bf 2) opens with its IDR at pts 0 and dts one
+             * frame earlier — dropping on dts removed that IDR and the muxer failed on the next packet (exit at 3.8 s
+             * in the production-graph fixture). */
+            if ((pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts) < 0 && pkt->dts != AV_NOPTS_VALUE) {
+                if (!neg_dropped++)
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-MUX] rung %d stream %d: dropped a packet stamped before the "
+                           "start (%.1f ms) — it would wrap to ~95443 s on the wire\n", m->rung, stream_index,
+                           (pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts) *
+                           av_q2d(m->ofmt->streams[stream_index]->time_base) * 1000);
+                av_packet_free(&pkt);
+                continue;
             }
             if (g_muxguard && mg_last && pkt->dts != AV_NOPTS_VALUE && stream_index < mg_n) {
                 enum AVMediaType mgt = m->ofmt->streams[stream_index]->codecpar->codec_type;
@@ -5276,7 +5299,13 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
             if ((ret = avio_open(&rung[r].ofmt->pb, out_url, AVIO_FLAG_WRITE)) < 0) {
                 av_log(NULL, AV_LOG_ERROR, "open output '%s': %s\n", out_url, av_err2str(ret)); goto end;
             }
-        rung[r].ofmt->max_interleave_delta = 200000;   /* 200 ms */
+        /* 2.0.0-pre9.4 (T-083): 200 → 50 ms. The interleaver waits this long for a stream that stopped (the
+         * source just went away: audio ends with it, the hold fill starts seconds later) while holding every
+         * other stream — the ~330 ms wire pause at an outage onset (T-077, ~1.5 s on the fleet), measured 331 →
+         * 108 ms at 50 ms on sync_gap_20. The delivery gates (§7.5a/§7.5b) already align audio with video, so
+         * the muxer gets each audio packet right after the video packet that releases it; the 200 ms was a bound
+         * on waiting for sparse subtitles, which a smaller value only shortens. */
+        rung[r].ofmt->max_interleave_delta = 50000;
         {   /* forwarded muxer opts (-mpegts_flags/-pat_period/-pcr_period/...) + file -metadata */
             AVDictionary *mopts = NULL; int mi;
             av_dict_copy(&mopts, g->format_opts, 0);
@@ -6374,6 +6403,7 @@ int main(int argc, char **argv)
     /* PTV_PREROLL_MS / PTV_VIDEOQ / PTV_CUSHION_MAX_MS / PTV_BANK_DECAY_S parses moved to resolve_cushions() (0.9.18 M1) */
     if (getenv("PTV_NO_AUTOBANK")) g_autobank = 0;   /* v0.9.14: revert to advisor-only (manual PTV_PREROLL_MS recipe) */
     if (getenv("PTV_NO_CLOCKFOLLOW")) g_clockfollow = 0;   /* v0.9.15: never follow a large source-clock offset (buffers pin + resampler churns on such sources) */
+    if (getenv("PTV_NO_VGAPFILL")) g_vgapfill = 0;          /* 2.0.0-pre9.4 (T-083) kill switch */
     if (getenv("PTV_NO_DECIMATE")) g_decimate = 0;         /* v0.9.15.2: keep pop-per-tick even for >house-rate sources (frame_q pins on surplus) */
     /* PTV_FRAMEQ stays HERE (not resolve_cushions()): the multiview hold.q alloc consumes
      * g_frameq_cap before resolve_cushions() runs in transcode() setup (0.9.18 M1). */
@@ -6438,6 +6468,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_ACQ_BACKOFF")) g_acq_backoff = 0;       /* 1.0.1-pre18 #49: no repeated-ACQUIRE threshold backoff */
     if (getenv("PTV_NBS_FILL") && g_glueclass) g_nbs_fill = 1;
     if (getenv("PTV_NO_SRC_FILL")) g_hold_fill = 0;   /* 2.0.0-pre6 kill switch: no fill while holding */
+    if (getenv("PTV_NO_COPY_GAPFILL")) g_copy_gapfill = 0;   /* 2.0.0-pre9.4 kill switch */
     if (getenv("PTV_NO_REJOIN_MAP")) g_rejoin_map = 0; /* 2.0.0-pre6.1 kill switch: PTS jumps at a rejoin again */
     { const char *s = getenv("PTV_GLUE_HTOL_PCT");     if (s && atoi(s) > 0) g_glue_htol = atoi(s); }             /* tuning knob (G4) */
     { const char *s = getenv("PTV_PAIR_EXPECT_TTL_US");if (s && atoll(s) > 0) g_pair_ttl_us = atoll(s); }          /* TEST ONLY (G6) */

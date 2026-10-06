@@ -5,6 +5,102 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre9.4 — linear output whatever the input (T-083)
+
+Owner rule (2026-10-06): the output is always fluent and linear — video one frame per tick, every audio track
+continuous, PCR in spec, no pauses; damage shows only as content — and lip sync is back within ±25 ms once the input is
+clean. Measured with `test-scripts/t056/structcheck.py`.
+
+Gate (2026-10-07, `test-scripts/t056`, 43 runs on the standard AND the production filter graph — T056_PROD=1: bwdif,
+720p, loudnorm, x264 with 2 B-frames like NVENC -bf 2): ACCEPTANCE (exit/wire/content/structure/lip sync) PASS on every
+outage, loss and bit-flip fixture incl. copied AC-3 and bit-flip seeds 1–5 (seed 4's +64 ms residual since pre9.2 is
+gone) and Cinestar 50 % loss / 180 s; misses: sync_flapping −192 ms (T-075, every build), Cinestar loss content share
+0.88 (still shots in the film: clean Cinestar shows the same FROZEN windows), psi_only extra 2 s silence in 2 of 3 runs
+(video_q GOP shed after the reopen, T-076 class, pre9.3 has the 3 s part), audio_format_switch one 0.23 s AAC hole at
+the rebuild (pre9.3 identical; its video hole is gone), reshaped_return exit 4 (by design).
+- **Step 1, copied AC-3 continuous through damage while video flows.** A copied frame up to 1 s behind where the track
+  already is (the overlap a damaged PES leaves) is dropped — it used to be bumped 1 tick past the previous frame,
+  stacking frames on one instant; a frame up to 3 s ahead gets the gap filled with silent frames first (nothing real
+  dropped). Both windows widen by the house_skew change since the last real frame (the copy rides it: a video content
+  leap dropped house_skew 1.08 s → 0 under loss = an overlap of exactly the skipped content). Holes longer than 2 s of a
+  gap-free video run (no usable packets, lost or corrupt-discarded) get timely silent frames from the demux thread, the
+  transcoded NBS rule and threshold; a bursty source stalls every PID and never triggers it. Logs: `[PTV-SRC] copy #N
+  (ac3) kept continuous: …`, `… gap fill: no usable packets for 2 s while video flows`. `PTV_NO_COPY_GAPFILL=1` reverts.
+  Cinestar 10 % loss (production audio path): AC-3 holes 14 (max 8.5 s) → 0, overlaps 0, transcoded lip sync −12…+20 ms;
+  fixture `sync_ac3_loss_100`: AC-3 holes 92 / overlaps 200 → 0 / 0; Cinestar clean identical (no fill fires); Cinestar
+  bursty AC-3 holes 7 → 0 with no timely fill and no real frame dropped; the six copied-AC-3 fixtures keep lip sync PASS on
+  AAC and AC-3 (kill_return_20's AAC +96 ms is T-082, same with the fill off).
+- **Step 2, nothing on the wire before the start.** The first AAC packet carries the encoder priming (1024 samples =
+  −21.3 ms) and was stamped negative whenever audio starts within 21 ms of the anchor (Cinestar −18.7 ms) — the 33-bit
+  field wraps it to 95,443.7 s, the scale of the 2026-10-06 grid DESYNC readings (−95,274 s) that made sync_check restart
+  live outputs. The mux thread drops any packet with dts < 0 (`[PTV-MUX] … dropped a packet stamped before the start`).
+  Cinestar clean: structcheck PASS (was FAIL on the wrapped packet).
+- **Step 3, a content gap is filled, not leapt.** Frames lost or corrupt-discarded at the source left a gap INSIDE
+  frame_q; the next frame was stamped past it on the very next tick — a hole in the output video PTS (0.88 s under 10 %
+  loss; the PCR rides it, so "PCR > 40 ms" was this) — and frame_q drained early (starvation dups later). The output
+  clock now parks that frame and repeats the held one up to its slot: the source's own timing, latency unchanged, the
+  repeats are residence (held_extra) so house_skew and the audio do not move. Relabels never reach it (DISCONT < 1 s,
+  LAYERA > 1 s re-map them in the demux); gaps over 2 s keep the outage path. `[PTV-VFILL] N frame(s) repeated into
+  content gaps`; `PTV_NO_VGAPFILL=1` reverts. 13 fixtures: video holes 0 everywhere, PCR max 40 ms everywhere (was up to
+  880 ms), sync_loss_100 wire pauses 7 (max 1.08 s) → 0, starvation dups under loss 341 → 0, lip sync PASS on every
+  loss/bitflip/outage fixture (AAC and AC-3); clean / bursty never fill; sync_flapping (T-075) −192/−477 → −192/−192 ms.
+- **Step 4, the copied AC-3 starts with the video.** A copy arriving before h0 exists was dropped, and h0 is set at the
+  first DECODED frame, ~1 s of input later: the copied AC-3 began 0.92 s after the video (first 6 s segment 85 % AC-3).
+  Copies are now parked while the video is unanchored (the existing park; released at the first fresh frame, what
+  precedes the anchor still dropped). Fixture AC-3 start 0.965 → 0.027 s, structcheck PASS; Cinestar bursty 6.58 →
+  0.86 s; Cinestar clean unchanged (0.024 s).
+- **Step 5, no wire pauses.** Localized with temporary probes (clock loop, pacing, encode, mux queue, writes): (a) the
+  video delivery hold (§7.5b) froze the WHOLE wire while audio delivery stalled — the track lost, before its silence
+  fill delivers at 2 s (sync_audio_gap: mux queue empty 725 ms, the only vdlvhold=603 ms of the run); while audio
+  delivery has been stalled 150 ms, held video now keeps leaving at its steady latency (EMA of the hold age at normal
+  releases + 80 ms; `[PTV-VDLV] audio delivery stalled … the wire stays continuous`); the steady hold of a late-but-
+  flowing audio path and the 6 s audio-death escape are unchanged (Cinestar loudnorm: vdlvhold 2168 ms, no stall line).
+  (b) the ~330 ms pause at an outage ONSET (T-077, ~1.5 s on the fleet) was lavf's interleaver holding video up to
+  max_interleave_delta (200 ms) for the audio that had stopped — no stage of ours stalled; 200 → 50 ms (331 → 108 ms;
+  the delivery gates already align audio with video). sync_gap_20 331 → 103 ms, sync_audio_gap 721 → 151 ms, flapping
+  331 → 275 ms, stop_20 280 → 112 ms; 10 fixtures + Cinestar clean/loss: structure PASS (loss: 3 residual 0.16 s video
+  holes at the loss start, open), PCR ≤ 40 ms on the fixtures, lip sync PASS.
+- **Step 3 follow-up, the gap check runs on every pop.** Under damage a surplus (already-played) frame often came first
+  and the frame decimation popped next sat behind the gap — 3 residual holes (0.12–0.16 s) at the loss start on
+  Cinestar 10 % loss; that tick now shows the surplus frame as decimation always did and the repeats start on the next
+  tick. Cinestar 10 % loss: video holes 3 → 0, structcheck PASS (video, AAC, copied AC-3), PCR ≤ 40 ms.
+- **The cushion servo reads content, not frame count, under damage.** The lip-sync "transient" after loss was the
+  sensor, not the output: the flash+beep ruler reads 0.0 ms (±0.1) before, during and right after 10 % loss with the
+  fill on and off, while lipsync= peaks +75 ms (fill on: ~76 % of Cinestar frames are repeats, which the sensor counts
+  as late content by design) or −49 ms (fill off), each decaying on its 30 s EMA. The ruler found a real latency effect
+  instead: content age 1.2 → 1.86 s at the loss onset (draining ~5 ms/s). Cause: frames lost inside frame_q made the
+  frame COUNT read 8 of 24 while the content it spans was unchanged, so the WUCR servo re-primed (house 0.77x).
+  While corrupt packets/frames are seen (5 s window) the servo now uses the content span (newest queued frame − output
+  cursor, up to 2 s over the count); clean sources and film cadence keep the count. Loss onset 1.2 → 1.38 s (was 1.86;
+  pre9.3 dropped to 0.42 s by leaping); the remaining +0.18 s is a real ~0.9 s decoder-output stall under loss that the
+  cushion re-prime refills by design. Ruler lip sync PASS, structcheck PASS (fixture + Cinestar).
+- **Step 2 fix — B-frame video keeps its opening IDR.** The before-the-start drop is keyed on the presentation time:
+  B-frame video (production NVENC -bf 2) opens with its IDR at pts 0 and dts one frame earlier, and the dts-keyed drop
+  removed that IDR (output began on a non-IDR; HLS segmenter 144 warnings). Found by the new production-graph fixture.
+- **Step 6, long damage with holds — every audio track stays on the wire.** Cinestar, 50 % datagram loss over 180 s
+  (three holds of 55–107 s with LIVE phases between): AAC was absent from the wire for 75 s and the copied AC-3 for good
+  after the last rejoin (wire A/V spread +68 / +148 s — the sync_check DESYNC class). Measured causes, in turn:
+  (a) the hold fills rode house_skew, which a LIVE LOSS rejoin map pulls back while a dead track's last real label
+  stays put (all AAC corrupt) — the target fell 67 s behind the door. The fills now ride g_dup_out_us: the output time
+  on ticks whose content did not advance (dups, hold pictures) — what house_skew grows by, never stepped back. (The
+  whole output position was tried first: it also counts fresh ticks, so every routine 120 ms stall filled over real
+  frames about to arrive.) (b) real audio fragments surviving the damage while the source HOLDS were stamped with the
+  hold's house_skew: AC-3 108 s ahead of the output, and one AAC frame 88 s after the last double-counted the outage —
+  aresample padded ~1000 frames ahead of the video, the delivery FIFO (1024) filled and the non-blocking AC-3 copies were
+  dropped for 30 s. While the source holds and a track is being filled, its real frames are dropped (the fill covers
+  that time; damage shows as bars + silence); buffering them for after the rejoin was measured worse (stale: −29 s
+  re-label). (c) copy frames behind what is already on the wire (≤ 5 s) are dropped instead of stacked on one instant
+  by the monotonic guard (127 after a parked run), and the fills start a full frame after the frame on the wire (they
+  started 1 tick into it — one doubled frame every ~2 s). Structure PASS on the standard and the production graph.
+- **Copied audio parks after a hold again; forward audio steps near damage are padded.** The hold-era copy drop ran
+  after the arrival time was recorded, so the dropped packets hid the resume: the copy no longer parked until the rejoin
+  map and its first real packets rode the hold's house_skew (+10 s) — ~160 frames stacked per rejoin
+  (sync_ac3_gap2_10: 320 overlaps, caught by the new structure gate line). And a forward audio step within 3 s of
+  damaged audio on the track is real missing audio — padded, never folded (pre9.3 covered only the fill resume): two
+  such steps at 50 % loss looked like the non-converging ladder and were folded, deleting real time.
+- Still open: 50 % loss on the small-PES sync media (sync_loss_500, damage 20..120 s) ends audio −1.1 s early after
+  recovery (pre9.3: −3.4 s), with one 3.36 s video leap after a 3.4 s decoder starvation. Seen, not T-083: bursty Cinestar lip sync swings −45…−1,082 ms on every build (pre9.3 too).
+
 ## 2.0.0-pre9.3 — heavy packet loss no longer desyncs the audio (T-080 mechanism A)
 
 Canary L3 (Cinestar, 10 % random datagram loss for 30 s): audio +1.67 s early, fixed by RESYNC only after 7.5 min.
