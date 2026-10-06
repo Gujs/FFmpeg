@@ -668,6 +668,7 @@ int             g_reprime = 1;                /* PTV_REPRIME: when a glue drains
  * oscillation, no per-channel tuning; transitions log [PTV-CUSHION] and depth shows in -stats. */
 int             g_adapt_cushion = 1;
 _Atomic int     g_frameq_depth;               /* DIAG: master video frame_q occupancy (frames), published each tick for the discontinuity logs */
+_Atomic int64_t g_fq0_tail_pts = AV_NOPTS_VALUE; /* 2.0.0-pre9.4 (T-083): pts of the newest frame pushed to the master frame_q */
 /* v0.9.4 genlock GUARD (PTV_NO_GENLOCK_GUARD reverts to exact v0.9.x behavior). TruBLU-class jittery/
  * bursty sources alias the 3s FLL window → noisy sub-window rates that the loose ±1% gate folded in,
  * driving a slew-limited ±1000ppm limit cycle + an UNBOUNDED house_skew runaway (cor-1: 8.6→28s over
@@ -2662,6 +2663,7 @@ static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
             AVFrame *out;
             if (i == d->n_rung - 1) { out = av_frame_alloc(); if (out) av_frame_move_ref(out, frame); }
             else                    { out = av_frame_clone(frame); }
+            if (out && i == 0) atomic_store_explicit(&g_fq0_tail_pts, out->pts, memory_order_relaxed);
             if (out) push_frame_q(d->frame_q[i], ((d->deep_prime_packets > 0 || atomic_load_explicit(&g_bank_pkts, memory_order_relaxed) > 0) && i == 0) ? 0 : d->live, &d->framedrop[i], out);
             else if (i == d->n_rung - 1) av_frame_unref(frame);
         }
@@ -2679,6 +2681,7 @@ static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
                 continue;
             }
             out = av_frame_alloc();
+            if (out && i == 0) atomic_store_explicit(&g_fq0_tail_pts, filt->pts, memory_order_relaxed);
             if (out) { av_frame_move_ref(out, filt); push_frame_q(d->frame_q[i], ((d->deep_prime_packets > 0 || atomic_load_explicit(&g_bank_pkts, memory_order_relaxed) > 0) && i == 0) ? 0 : d->live, &d->framedrop[i], out); }
             else     { av_frame_unref(filt); }
         }

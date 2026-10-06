@@ -901,6 +901,7 @@ void *output_thread(void *arg)
         int next_have = 0, film_arm = 0, held_extra = 0;
         int vgap_park = 0;                          /* 2.0.0-pre9.4 (T-083): nextf is a frame parked behind a content gap */
         int64_t vgap_filled = 0, vgap_log_wc = 0;   /* ticks filled since the last [PTV-VFILL] line */
+        int64_t svo_cr = 0, svo_dmg_wc = 0;        /* T-083: corrupt count seen by the servo + when it last moved */
         unsigned rff_bits = 0;
         int64_t cad_ema_us   = v->tick_dur_us;      /* M7: fresh-frame source-spacing EMA (tau ~8f); seeded real-time */
         int64_t cad_prev_src = AV_NOPTS_VALUE;      /* previous fresh frame's SOURCE pts (held_src_pts domain) */
@@ -1238,6 +1239,23 @@ void *output_thread(void *arg)
                      * into the escalation runtime). Master computes; all rungs apply the published
                      * hr->rho_corr_ppm identically. */
                     int occ = av_thread_message_queue_nb_elems(v->frame_q);
+                    /* 2.0.0-pre9.4 (T-083): while the source is damaged, frames lost inside frame_q make the
+                     * frame COUNT read low although the content it spans is unchanged — the servo took that
+                     * for starvation and re-primed (house 0.77x), adding +0.55 s latency at the onset of 10 %
+                     * loss that then drained at ~5 ms/s. Under damage (corrupt packets/frames within 5 s)
+                     * the occupancy is the content span (newest queued frame − output cursor), up to the 2 s
+                     * the gap fill repeats into. Clean sources (and film cadence) keep the frame count. */
+                    if (g_vgapfill) {
+                        int64_t cr = (v->dbg_pcorrupt ? *v->dbg_pcorrupt : 0) + (v->dbg_vcorrupt ? *v->dbg_vcorrupt : 0);
+                        int64_t tp = atomic_load_explicit(&g_fq0_tail_pts, memory_order_relaxed);
+                        int64_t nw = av_gettime_relative();
+                        if (cr != svo_cr) { svo_cr = cr; svo_dmg_wc = nw; }
+                        if (svo_dmg_wc && nw - svo_dmg_wc < 5000000 && tp != AV_NOPTS_VALUE) {
+                            int64_t span = content_index(v, tp) - last_vpts;
+                            if (span > occ && (span - occ) * v->tick_dur_us <= 2000000)
+                                occ = (int)span;
+                        }
+                    }
                     /* 2.0.0-pre4: a hold is not a rate signal — nominal pacing, no REPRIME (it would run
                      * the house at 0.77x, then 1.5 % slow, for as long as the source is gone) */
                     atomic_store_explicit(&v->hr->rho_corr_ppm,

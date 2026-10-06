@@ -56,8 +56,17 @@ clean. Measured with `test-scripts/t056/structcheck.py`.
   and the frame decimation popped next sat behind the gap — 3 residual holes (0.12–0.16 s) at the loss start on
   Cinestar 10 % loss; that tick now shows the surplus frame as decimation always did and the repeats start on the next
   tick. Cinestar 10 % loss: video holes 3 → 0, structcheck PASS (video, AAC, copied AC-3), PCR ≤ 40 ms.
-- Still open: long-hold A/V PTS divergence; the lip-sync transient after loss (+64 ms on the 30 s-smoothed sensor,
-  settling at +19 ms) — A/B against pre9.3 running. Seen, not T-083: bursty Cinestar lip sync swings −45…−1,082 ms on every build (pre9.3 too).
+- **The cushion servo reads content, not frame count, under damage.** The lip-sync "transient" after loss was the
+  sensor, not the output: the flash+beep ruler reads 0.0 ms (±0.1) before, during and right after 10 % loss with the
+  fill on and off, while lipsync= peaks +75 ms (fill on: ~76 % of Cinestar frames are repeats, which the sensor counts
+  as late content by design) or −49 ms (fill off), each decaying on its 30 s EMA. The ruler found a real latency effect
+  instead: content age 1.2 → 1.86 s at the loss onset (draining ~5 ms/s). Cause: frames lost inside frame_q made the
+  frame COUNT read 8 of 24 while the content it spans was unchanged, so the WUCR servo re-primed (house 0.77x).
+  While corrupt packets/frames are seen (5 s window) the servo now uses the content span (newest queued frame − output
+  cursor, up to 2 s over the count); clean sources and film cadence keep the count. Loss onset 1.2 → 1.38 s (was 1.86;
+  pre9.3 dropped to 0.42 s by leaping); the remaining +0.18 s is a real ~0.9 s decoder-output stall under loss that the
+  cushion re-prime refills by design. Ruler lip sync PASS, structcheck PASS (fixture + Cinestar).
+- Still open: long-hold A/V PTS divergence. Seen, not T-083: bursty Cinestar lip sync swings −45…−1,082 ms on every build (pre9.3 too).
 
 ## 2.0.0-pre9.3 — heavy packet loss no longer desyncs the audio (T-080 mechanism A)
 
