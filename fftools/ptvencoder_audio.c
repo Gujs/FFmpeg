@@ -3194,6 +3194,17 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                             av_log(NULL, AV_LOG_INFO, "[PTV-AGLUE] a%d(in%d) +%"PRId64"ms at the silence-fill resume = "
                                    "real missing audio — padded, never folded\n", a->dbg_k, a->dbg_in, step / 1000);
                         }
+                        /* 2.0.0-pre9.4 (T-083): the same for a forward step within 3 s of damaged audio on this
+                         * track (A2's evidence: decode error, corrupt-discarded packet, a fill) — frames lost in the
+                         * damage. Two such steps in a row (50 % loss) looked like the non-converging ladder and were
+                         * folded: real missing time deleted, audio 3.44 s early for good after the source recovered
+                         * (sync_loss_500; pre9.3 identical). */
+                        if (!wev_meas && step > 0 && g_glueclass && dmg_last && now_wc - dmg_last <= 3000000) {
+                            wev_meas = 1;
+                            av_log(NULL, AV_LOG_INFO, "[PTV-AGLUE] a%d(in%d) +%"PRId64"ms %"PRId64"ms after damaged audio "
+                                   "= real missing audio — padded, never folded\n", a->dbg_k, a->dbg_in, step / 1000,
+                                   (now_wc - dmg_last) / 1000);
+                        }
                         wev_gap  = g_wallev && wev_meas;
                         if (g_convcap && !pad_cancel && !(fill_resumed && step < 0)) {
                             if (a->seam_park_until)          /* rr23: expiry is handled eagerly per

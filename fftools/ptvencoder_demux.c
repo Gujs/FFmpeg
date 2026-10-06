@@ -1801,8 +1801,6 @@ static int demux_pass(DemuxArgs *d, AVPacket *out)
             if (!ps->gated || out->stream_index != ps->in_index)
                 continue;
             now = av_gettime_relative();
-            prev = ps->in_wc;
-            ps->in_wc = now;
             /* 2.0.0-pre9.4 (T-083): also park while the video is not anchored yet — demux_pass_one drops a copy
              * that arrives before h0 exists, and h0 is set at the first DECODED frame, ~1 s of input later: the
              * copied AC-3 started 0.92 s after the video (the transcoded track has its ring). The drain releases
@@ -1821,10 +1819,12 @@ static int demux_pass(DemuxArgs *d, AVPacket *out)
                 holding = ps->fill_end != AV_NOPTS_VALUE;          /* ... and this copy is being filled */
                 pthread_mutex_unlock(&d->pass_lock);
             }
-            if (holding && !ps->npark) {
+            if (holding && !ps->npark) {   /* before in_wc: the copy's return must still read as a resume and park */
                 av_packet_free(&out);
                 return 0;
             }
+            prev = ps->in_wc;
+            ps->in_wc = now;
             if (ps->npark || (prev && now - prev >= 300000) || unanchored) {
                 if (!ps->npark)
                     ps->park_since = now;

@@ -84,7 +84,14 @@ clean. Measured with `test-scripts/t056/structcheck.py`.
   re-label). (c) copy frames behind what is already on the wire (≤ 5 s) are dropped instead of stacked on one instant
   by the monotonic guard (127 after a parked run), and the fills start a full frame after the frame on the wire (they
   started 1 tick into it — one doubled frame every ~2 s). Structure PASS on the standard and the production graph.
-- Still open: none of the step 1–6 symptoms. Seen, not T-083: bursty Cinestar lip sync swings −45…−1,082 ms on every build (pre9.3 too).
+- **Copied audio parks after a hold again; forward audio steps near damage are padded.** The hold-era copy drop ran
+  after the arrival time was recorded, so the dropped packets hid the resume: the copy no longer parked until the rejoin
+  map and its first real packets rode the hold's house_skew (+10 s) — ~160 frames stacked per rejoin
+  (sync_ac3_gap2_10: 320 overlaps, caught by the new structure gate line). And a forward audio step within 3 s of
+  damaged audio on the track is real missing audio — padded, never folded (pre9.3 covered only the fill resume): two
+  such steps at 50 % loss looked like the non-converging ladder and were folded, deleting real time.
+- Still open: 50 % loss on the small-PES sync media (sync_loss_500, damage 20..120 s) ends audio −1.1 s early after
+  recovery (pre9.3: −3.4 s), with one 3.36 s video leap after a 3.4 s decoder starvation. Seen, not T-083: bursty Cinestar lip sync swings −45…−1,082 ms on every build (pre9.3 too).
 
 ## 2.0.0-pre9.3 — heavy packet loss no longer desyncs the audio (T-080 mechanism A)
 
