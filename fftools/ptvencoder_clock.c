@@ -956,19 +956,24 @@ void *output_thread(void *arg)
             int pops = 0, got_eof = 0;
             for (;;) {
                 ret = av_thread_message_queue_recv(v->frame_q, &f, AV_THREAD_MESSAGE_NONBLOCK);
-                if (ret >= 0 && g_vgapfill && have && !pops && f->opaque != &ptv_hold_tag) {
+                if (ret >= 0 && g_vgapfill && have && f->opaque != &ptv_hold_tag) {
                     /* 2.0.0-pre9.4 (T-083): a content gap INSIDE frame_q (frames lost or corrupt-discarded at the
                      * source — the demux already re-maps relabels: DISCONT < 1 s, LAYERA > 1 s) used to be leapt:
                      * this frame stamped past the gap on the very next tick = a hole in the output video PTS (and a
                      * PCR jump of the same size, 0.88 s under 10 % loss) while frame_q drained early. Park it and
                      * repeat the held frame up to its slot — the source's own timing, so latency is unchanged; the
                      * repeats are residence (held_extra), not skew, so house_skew and audio do not move. Gaps over
-                     * 2 s are outage-class (hold / rejoin map) and keep the old path. */
+                     * 2 s are outage-class (hold / rejoin map) and keep the old path. Checked on EVERY pop: under
+                     * damage a surplus (already-played) frame often comes first, and the frame decimation pops next
+                     * sat behind the gap (3 holes of 0.12-0.16 s on Cinestar 10 % loss); that tick shows the surplus
+                     * frame as decimation always did, and the repeats start on the next tick. */
                     int64_t hc = content_index(v, f->pts);
                     if (hc > last_vpts + 1 && (hc - last_vpts - 1) * v->tick_dur_us <= 2000000) {
                         nextf = f; next_have = 1; vgap_park = 1;
-                        cadence_hold = 1;
-                        vgap_filled++;
+                        if (!fresh) {
+                            cadence_hold = 1;
+                            vgap_filled++;
+                        }
                         break;
                     }
                 }

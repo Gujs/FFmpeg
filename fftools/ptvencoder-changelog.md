@@ -52,7 +52,12 @@ clean. Measured with `test-scripts/t056/structcheck.py`.
   the delivery gates already align audio with video). sync_gap_20 331 → 103 ms, sync_audio_gap 721 → 151 ms, flapping
   331 → 275 ms, stop_20 280 → 112 ms; 10 fixtures + Cinestar clean/loss: structure PASS (loss: 3 residual 0.16 s video
   holes at the loss start, open), PCR ≤ 40 ms on the fixtures, lip sync PASS.
-- Still open: long-hold A/V PTS divergence; Cinestar loss residual video holes. Seen, not T-083: bursty Cinestar lip sync swings −45…−1,082 ms on every build (pre9.3 too).
+- **Step 3 follow-up, the gap check runs on every pop.** Under damage a surplus (already-played) frame often came first
+  and the frame decimation popped next sat behind the gap — 3 residual holes (0.12–0.16 s) at the loss start on
+  Cinestar 10 % loss; that tick now shows the surplus frame as decimation always did and the repeats start on the next
+  tick. Cinestar 10 % loss: video holes 3 → 0, structcheck PASS (video, AAC, copied AC-3), PCR ≤ 40 ms.
+- Still open: long-hold A/V PTS divergence; the lip-sync transient after loss (+64 ms on the 30 s-smoothed sensor,
+  settling at +19 ms) — A/B against pre9.3 running. Seen, not T-083: bursty Cinestar lip sync swings −45…−1,082 ms on every build (pre9.3 too).
 
 ## 2.0.0-pre9.3 — heavy packet loss no longer desyncs the audio (T-080 mechanism A)
 
