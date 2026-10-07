@@ -5,6 +5,42 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre9.6 — lip sync after a flapping source (T-075), honest lipsync= after holds, no wire pause at an audio stall (T-085)
+
+- **The video delivery hold keeps its latency through an audio stall (T-085 follow-up).** pre9.5.1 floored stall
+  releases at the measured audio lateness less the due band; with bursty audio delivery packets normally become due
+  well before that (probe: due age ~0.6 s vs floor 1.1–1.7 s), so every audio idle paused the wire for its whole length
+  (sync_flapping up to 1.1 s on the NVENC-like graph, bursty 1.04 s). A stall now keeps the head's age at stall onset —
+  the actual latency — and video leaves one-for-one as it arrives; due releases set the latency again once audio flows.
+  No learned value: nothing to collapse (the pre9.4 trap behind the Grid_2x1/Newsmax2 restart loop) and nothing to
+  over-estimate. NVENC-like graph (VideoToolbox, no B-frames + loudnorm): wire pauses ≤ 170 ms on every fixture
+  (flapping 1125 → 168 ms, bursty 1036 → 75 ms), hold on a clean source 1.5–1.6 s, spread median ≤ 0.2 s.
+- **A flapping source ends in sync (T-075).** The audio's jump got a GAP verdict first (labels carry it, the content
+  path pads) and propagated, so no audio leg could ever cross; the video glue cycle that armed afterwards waited six
+  extensions for it, released one-sided and erased −2.000 s, while the audio step was later folded −2.197 s at the door
+  — one source event, two remedies (#50's defect in the other order) → −192 ms for good on every build. A video-only
+  cycle whose missing sibling jump is a gap verdict is now disbanded like #50 (packets released unrebased, the jump
+  stays in the labels, both content paths pad, stamped as damage so the video gap fill covers it). Ruler −192 → 0.0 ms.
+- **lipsync= reads right after holds and folds (T-075).** The sensor's 30 s EMA covered deliberate label steps
+  (house_skew at a hold or rejoin map, glue folds) while the demux edit ledger moved at once: minutes of false readings
+  (canary NTD drop −12.7 s, flapping −1.8 s, gap_20 +1.6 s) although the instantaneous R equalled the ruler. Both sides
+  now smooth only the measured residual; on flapping RESYNC then also corrected the residual (before the root fix).
+- **A damaged AAC frame can no longer mute the track for good.** Bit flips inside a valid packet can decode without an
+  error into samples ~47,000× full scale (+93.6 dBFS, sync_ac3_bitflip_100 s1); loudnorm's live gain follows the
+  INTEGRATED loudness, which one such frame raises for the rest of the programme → the transcoded track sat at −103 dB
+  until restart (plain ffmpeg + loudnorm does the same; loudnorm is the fleet default -af, so 1.2.x is exposed too). A
+  decoded float frame above +18 dBFS or non-finite is now muted (timing kept, the damage shows as silence) and counted
+  as damaged audio; `[PTV-ADEC] … impossible samples … muted`. Found by the first gate with loudnorm in the prod mode.
+- T-077 rest: the copied AC-3 −40 ms tick after a BURST rejoin is gone (sync_ac3_stop_10 std + vt: AC-3 0.0 ms) —
+  resolved along the way by the pre9.4 copy changes.
+- Harness: `T056_PROD=1` now runs the fleet loudnorm chain (it ran the old compressor chain — the prod gate never
+  exercised the audio latency the video hold absorbs); `T056_PROD_ENC=vt` = VideoToolbox without B-frames (no
+  lookahead, like NVENC).
+- Still open (pre-existing, every build since the 1.0.1 corrector, 1.2.x included): a genuine −300 ms source audio
+  RELABEL (content continuous) is correctly re-based by the demux, but the label-domain sensor reads −300 ms and the
+  corrector acts on it after its ~8 min dwell — measured on a 15 min sync_arelabel run: ruler 0.1 → −292.1 ms for
+  good (corr −292 ms, PARK). Needs a content-side discriminator or a decision on the corrector's authority (T-075 b).
+
 ## 2.0.0-pre9.5.1 — hotfix: the video delivery hold no longer collapses to 0 (sync_check DESYNC restart loop)
 
 - **Live 2026-10-07 (pre9.5 canary):** Grid_2x1 (live-transcoder) and Newsmax2 (cor-3) restarted every 7–20 min — the
