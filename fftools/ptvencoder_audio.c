@@ -2154,12 +2154,23 @@ static int audio_drain_fg(AudioState *a)
                     }
                 }
                 m = out_us - (src_abs_us - inj) - slip;
-                if (!a->rs_ma_seed) { a->rs_ma_ema = m; a->rs_ma_seed = 1; }
-                else {
-                    int64_t dv = a->frame_size > 0                        /* EMA ≈ 30s of audio frames */
-                               ? 30LL * a->out_rate / a->frame_size : 1406;
-                    if (dv < 8) dv = 8;
-                    a->rs_ma_ema += (m - a->rs_ma_ema) / dv;
+                /* 2.0.0-pre9.6 (T-075): the EMA smooths only the MEASURED part of m_a (slip, rounding);
+                 * the label edits this thread made (glue_off relabels/folds, the door's house_skew) are
+                 * steps by nature and join outside it, as the demux ledger E does. Smoothed, a hold's
+                 * house_skew step or a fold slewed for minutes while the video side and E had moved at
+                 * once: lipsync= −1.8 s on sync_flapping, +1.6 s on sync_gap_20, −12.7 s on the canary
+                 * NTD drop, while the instantaneous R read the ruler's +192 ms / 0 ms exactly. corr_us
+                 * stays inside (the corrector's realized-trim feedback, §4). */
+                {
+                    int64_t step_us = a->glue_off_us + hs;
+                    if (!a->rs_ma_seed) { a->rs_ma_res = m - step_us; a->rs_ma_seed = 1; }
+                    else {
+                        int64_t dv = a->frame_size > 0                    /* EMA ≈ 30s of audio frames */
+                                   ? 30LL * a->out_rate / a->frame_size : 1406;
+                        if (dv < 8) dv = 8;
+                        a->rs_ma_res += (m - step_us - a->rs_ma_res) / dv;
+                    }
+                    a->rs_ma_ema = a->rs_ma_res + step_us;
                 }
                 atomic_store_explicit(&g_rsx.ma_ema[a->dbg_k], a->rs_ma_ema, memory_order_relaxed);
                 nowr = av_gettime_relative();

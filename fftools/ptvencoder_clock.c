@@ -892,7 +892,7 @@ void *output_thread(void *arg)
             g_curt.cur_sp  = base_sp;
         }
         /* 1.0.1-pre9 residual sensor: video-side EMA state (master rung; τ ≈ 30s of ticks) */
-        int64_t rs_mv_ema = 0, rs_mv_div = v->tick_dur_us > 0 ? 30000000 / v->tick_dur_us : 750;
+        int64_t rs_mv_ema = 0, rs_mv_res = 0, rs_mv_div = v->tick_dur_us > 0 ? 30000000 / v->tick_dur_us : 750;
         int     rs_mv_seed = 0;
         int     rs_mv_vskip_ep = 0;   /* 1.0.1-pre30: last vskip epoch this EMA re-seeded for */
         if (rs_mv_div < 8) rs_mv_div = 8;
@@ -1366,8 +1366,14 @@ void *output_thread(void *arg)
                         rs_mv_vskip_ep = ep;
                     }
                 }
-                if (!rs_mv_seed) { rs_mv_ema = m; rs_mv_seed = 1; }
-                else rs_mv_ema += (m - rs_mv_ema) / rs_mv_div;
+                {   /* 2.0.0-pre9.6 (T-075): smooth m_v − house_skew only — the same split as the audio
+                     * side (house_skew steps at a hold or a rejoin map; the cadence-hold residence and
+                     * everything else measured stays inside the EMA) */
+                    int64_t hs_us = v->house_skew ? *v->house_skew : 0;
+                    if (!rs_mv_seed) { rs_mv_res = m - hs_us; rs_mv_seed = 1; }
+                    else rs_mv_res += (m - hs_us - rs_mv_res) / rs_mv_div;
+                    rs_mv_ema = rs_mv_res + hs_us;
+                }
                 /* pre16: slot 0 of the per-slot arrays — single input IS slot 0 (multiview
                  * never reaches this block: passthrough rungs return above; the compositor
                  * owns per-slot publication there). */
