@@ -315,12 +315,6 @@ void dlv_video_drain(DlvGate *g)
                        g->v_cap_base / 1e6, ceil2 / 1e6);
             }
             g->v_cap_us = want;
-            /* 2.0.0-pre9.5.1: the stall floor's own sample — only while audio is actually arriving: v_lat_ema keeps
-             * sampling through a 2 s dry spell (bursty input) and the floor then rose with it (2.5 s wire pauses) */
-            if (now - adv < 100000) {
-                if (!g->v_flow_seed) { g->v_flow_ema = sk; g->v_flow_seed = 1; }
-                else g->v_flow_ema += (sk - g->v_flow_ema) / 64;
-            }
         }
     }
     if (!g->vcount) {
@@ -349,6 +343,19 @@ void dlv_video_drain(DlvGate *g)
         return;
     }
 
+    /* 2.0.0-pre9.6 (T-085): a stall keeps the hold latency it had when it began — the head's age at onset, the
+     * actual latency, not a learned one (pre9.4's v_rel_age learned only at due releases and could stay 0 — the
+     * Grid_2x1/Newsmax2 restart loop; pre9.5.1's measured floor sat 0.5-1 s above where bursty audio makes
+     * packets due, so every audio idle paused the wire up to 1.1 s on sync_flapping). Video then leaves one-for-
+     * one as it arrives: no pause beyond the 150 ms onset, no collapse; due releases set the latency again once
+     * audio flows. */
+    if (now - adv > 150000) {
+        if (!g->v_stall_on) {
+            g->v_stall_on   = 1;
+            g->v_stall_age0 = g->vhead ? now - g->vhead->enq_us : 0;
+        }
+    } else
+        g->v_stall_on = 0;
     while ((p = g->vhead)) {
         int due  = a_hi != INT64_MIN && p->dts_us <= a_hi + g->v_band_us;
         int aged = (now - p->enq_us) > g->v_cap_us;   /* audio flowing but permanently behind (label spread):
@@ -356,16 +363,9 @@ void dlv_video_drain(DlvGate *g)
         /* 2.0.0-pre9.4 (T-083): an audio STALL (nothing delivered for 150 ms — the track lost or undecodable,
          * before its silence fill delivers at 2 s) froze the key, so held video piled up and the WHOLE wire went
          * dark (725 ms measured, sync_audio_gap; the hold exists for a late-but-flowing audio path). While stalled,
-         * video keeps leaving at the latency it had just before: the wire stays continuous, the steady hold and
-         * the 6 s audio-death escape are untouched. */
-        /* 2.0.0-pre9.5.1: never below the MEASURED audio lateness (v_flow_ema, sampled while audio delivery is fresh, less
-         * the due band: the age a packet becomes due at; without the band every stall pause grew ~250 ms). v_rel_age
-         * learns only at due releases, and stall releases at a still-small v_rel_age emptied the queue before any packet
-         * became due — so it never learned: on a channel whose audio delivery idles >150 ms every couple of seconds
-         * the hold stayed at 0 for good (live 2026-10-07: Grid_2x1, Newsmax2 — "steady latency (0 ms)", wire video
-         * 2.2 s ahead of audio, sync_check DESYNC restarts every 7–20 min). */
-        int64_t steady = FFMAX(g->v_rel_age, g->v_flow_seed ? g->v_flow_ema - g->v_band_us : 0);   /* = the due age */
-        int stall = now - adv > 150000 && (now - p->enq_us) > steady + 80000;
+         * video keeps leaving at the latency it had when the stall began (above): the wire stays continuous, the
+         * steady hold and the 6 s audio-death escape are untouched. */
+        int stall = g->v_stall_on && (now - p->enq_us) >= g->v_stall_age0;
         if (!due && !aged && !stall)
             break;
         if (due) {
@@ -374,7 +374,7 @@ void dlv_video_drain(DlvGate *g)
         } else if (stall && !aged && now - g->v_stall_log_wc > 60000000) {
             g->v_stall_log_wc = now;
             av_log(NULL, AV_LOG_INFO, "[PTV-VDLV] audio delivery stalled %.1fs — held video keeps flowing at its "
-                   "steady latency (%.0f ms), the wire stays continuous\n", (now - adv) / 1e6, steady / 1e3);
+                   "steady latency (%.0f ms), the wire stays continuous\n", (now - adv) / 1e6, g->v_stall_age0 / 1e3);
         }
         if (aged && !due)
             atomic_fetch_add_explicit(&g->st_vforced, 1, memory_order_relaxed);
