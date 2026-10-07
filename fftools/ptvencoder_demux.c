@@ -1311,6 +1311,7 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
     }
     if (has_vid && has_aud) g_disc_viderr_sum += (vid_off - aud_off);   /* PTV-FLUSHAV: running total of source A/V misalignment absorbed at glues */
 
+    atomic_store_explicit(&g_vdmg_wc, av_gettime_relative(), memory_order_relaxed);   /* pre9.4: a LAYERA step = damage evidence */
     av_log(NULL, AV_LOG_INFO,   /* v0.9.13: always-on (paired with the jump line above) */
            "[PTV-LAYERA] flush %d pkts: old=%d new=%d keep=%s applied_offset=%.3fs (vid=%.3fs aud=%.3fs vid_err=%.3fs cum_vid_err=%.3fs)\n",
            b->nb_packets, old_count, new_count, keep_timeline ? "NEW" : "OLD",
@@ -2449,6 +2450,9 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                     }
                     if (d->disturb_epoch)   /* B3: a real content discontinuity → arm the PLL's mid-run re-acquire */
                         atomic_fetch_add_explicit(d->disturb_epoch, 1, memory_order_relaxed);
+                    /* 2.0.0-pre9.4: a source timeline step is damage evidence for the video gap fill — the frames after
+                     * it are marked, so a content gap the re-base leaves is repeated into, not leapt (fwd_pts_jump) */
+                    atomic_store_explicit(&g_vdmg_wc, av_gettime_relative(), memory_order_relaxed);
                     av_log(NULL, AV_LOG_INFO,   /* v0.9.13: always-on — one line per stream per crossing, events are rare */
                            "[PTV-DISCONT] stream %d: %+"PRId64"ms PTS jump absorbed (re-based to continuous)%s; frame_q=%d at jump\n",
                            pkt->stream_index, av_rescale_q(delta, st->time_base, (AVRational){1,1000}),
