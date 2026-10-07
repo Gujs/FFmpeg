@@ -5,6 +5,25 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre9.5 — start on a damaged source (T-084); the video gap fill only where content was lost
+
+- **T-084: a start on a damaged source no longer exit-loops.** A copied AC-3 / E-AC-3 / MPEG audio / AAC track whose
+  parameters the probe never saw (Cinestar_Premiere 2026-10-06, two senders on one group) made the mpegts header fail
+  ("sample rate not set" → exit 1 every ~27 s, zero output); it is now declared 48 kHz (the frames carry their own
+  layout) with a `[PTV-SRC] copy #N … no parameters from the probe` line. Local repro: the AC-3 PID nulled for the first
+  30 s of `sync_ac3.ts` — pre9.4 exit 1 at 8.5 s, no output → alive, content live 100 %.
+- **The video gap fill acts only on damage-era frames.** That same start (8 s probe → a 6.4 s backlog in a full frame
+  queue) showed the fill holding the cursor against the cushion servo: 2 s moving / 10 s frozen for the whole run. A frame
+  decoded within 5 s of a corrupt video packet/frame now carries a `ptv_dmg` mark (per frame, so every rung decides
+  alike); a content gap in front of an unmarked frame keeps the old leap (a backlog drain, a start-up wait).
+- **Video decoder errors count as damage evidence.** Bit flips inside valid packets never set the corrupt flag: with
+  the mark keyed on corrupt packets only, frames lost to them were unmarked and their gap was leapt again
+  (sync_ac3_bitflip_100: one 0.36 s video PTS hole). A decode error on send_packet or a frame with decode_error_flags
+  now counts too, and so does a source timeline step the demux re-bases (DISCONT absorb / LAYERA flush — `fwd_pts_jump`
+  keeps its fill: no 0.64 s hole).
+- Still open: a copied track absent at the start stays absent until its first packet (no silence before it); after a
+  long start-up probe the first frames still step once (0.84 s, as pre9.3).
+
 ## 2.0.0-pre9.4 — linear output whatever the input (T-083)
 
 Owner rule (2026-10-06): the output is always fluent and linear — video one frame per tick, every audio track

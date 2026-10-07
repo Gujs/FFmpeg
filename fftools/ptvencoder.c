@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.0-pre9.4"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.0-pre9.5"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -669,6 +669,7 @@ int             g_reprime = 1;                /* PTV_REPRIME: when a glue drains
  * oscillation, no per-channel tuning; transitions log [PTV-CUSHION] and depth shows in -stats. */
 int             g_adapt_cushion = 1;
 _Atomic int     g_frameq_depth;               /* DIAG: master video frame_q occupancy (frames), published each tick for the discontinuity logs */
+_Atomic int64_t g_vdmg_wc;                       /* 2.0.0-pre9.4 (T-083): wall time of the last corrupt video packet/frame */
 _Atomic int64_t g_fq0_tail_pts = AV_NOPTS_VALUE; /* 2.0.0-pre9.4 (T-083): pts of the newest frame pushed to the master frame_q */
 /* v0.9.4 genlock GUARD (PTV_NO_GENLOCK_GUARD reverts to exact v0.9.x behavior). TruBLU-class jittery/
  * bursty sources alias the 3s FLL window → noisy sub-window rates that the loose ±1% gate folded in,
@@ -2656,6 +2657,14 @@ static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
 {
     int i;
     rejoin_map(d, frame);                /* 2.0.0-pre6.1 (single input: emit_video is the non-mosaic path) */
+    {   /* 2.0.0-pre9.4 (T-083): a frame decoded within 5 s of corrupt video is damage-era — the output clock fills a
+         * content gap in front of it (frames lost); in front of any other frame a gap is the old leap (a backlog drain,
+         * a start-up probe wait: filling there held a full frame queue against the servo — 2 s moving / 10 s frozen).
+         * Per FRAME, so every rung decides alike (metadata survives the graph and the split). */
+        int64_t dw = atomic_load_explicit(&g_vdmg_wc, memory_order_relaxed);
+        if (dw && av_gettime_relative() - dw < 5000000)
+            av_dict_set(&frame->metadata, "ptv_dmg", "1", 0);
+    }
     ptv_hold_note_frame(d, frame);       /* 2.0.0-pre9: the freeze picture + render timeline (T-078/T-079) */
     if (!d->filtering) {                 /* no graph: clone the decoded frame to each rung */
         if (frame->best_effort_timestamp != AV_NOPTS_VALUE)   /* source time in ist_tb (== out_tb) */
@@ -3060,11 +3069,15 @@ static void *decode_thread(void *arg)
         PTV_HB_VDEC(d->hb_slot, PTV_HB_VDEC_SENDPKT);
         ret = avcodec_send_packet(d->vdec, pkt);
         av_packet_free(&pkt);
+        if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF)   /* 2.0.0-pre9.4: damage evidence (bit errors */
+            atomic_store_explicit(&g_vdmg_wc, av_gettime_relative(), memory_order_relaxed);   /* inside valid packets) */
         while (ret >= 0) {
             PTV_HB_VDEC(d->hb_slot, PTV_HB_VDEC_RECVFRAME);
             ret = avcodec_receive_frame(d->vdec, frame);
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) { ret = 0; break; }
             if (ret < 0) goto done;
+            if (frame->decode_error_flags)   /* 2.0.0-pre9.4: concealed / missing slices = damage evidence */
+                atomic_store_explicit(&g_vdmg_wc, av_gettime_relative(), memory_order_relaxed);
             /* TEST ONLY (F6 gate, PTV_CCTEST_CORRUPT_EVERY): real slice damage never reaches
              * here — the demuxer's own corrupt-packet path discards it first — so the only way
              * to exercise the branch below on demand is to set the flag ourselves. Inert
@@ -3073,6 +3086,7 @@ static void *decode_thread(void *arg)
                 frame->flags |= AV_FRAME_FLAG_CORRUPT;
             if (frame->flags & AV_FRAME_FLAG_CORRUPT) {
                 d->vcorrupt++;
+                atomic_store_explicit(&g_vdmg_wc, av_gettime_relative(), memory_order_relaxed);   /* pre9.4 */
                 /* The FRAME is unusable for video; its A53 side data is fed to the tap anyway,
                  * because cc_dec is STATEFUL and skipping the frame silently violated its
                  * "every frame's 608 pair, exactly once, in order" invariant, losing
@@ -5167,6 +5181,23 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
             pass[n_pass].gated    = (ist->codecpar->codec_type == AVMEDIA_TYPE_AUDIO);  /* §7.5a: dense AC-3/MP2 ride the gate; sparse subs/data/SCTE-35 bypass */
             pass[n_pass].fill_end = AV_NOPTS_VALUE;
             pass[n_pass].real_end = AV_NOPTS_VALUE;
+            /* 2.0.0-pre9.4 (T-084): a copied broadcast audio track whose parameters the probe never saw (no clean frame
+             * in the probe window — Cinestar_Premiere 2026-10-06, two senders on one group: `ac3, 4 channels, fltp`,
+             * no rate) made the mpegts header fail ("sample rate not set" → exit 1 every ~27 s, zero output). Its
+             * codec fixes the rate in DVB/ATSC use: 48 kHz; the frames carry their own layout. */
+            if (ist->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && ist->codecpar->sample_rate <= 0 &&
+                (ist->codecpar->codec_id == AV_CODEC_ID_AC3 || ist->codecpar->codec_id == AV_CODEC_ID_EAC3 ||
+                 ist->codecpar->codec_id == AV_CODEC_ID_MP2 || ist->codecpar->codec_id == AV_CODEC_ID_MP3 ||
+                 ist->codecpar->codec_id == AV_CODEC_ID_AAC)) {
+                ist->codecpar->sample_rate = 48000;
+                if (ist->codecpar->ch_layout.nb_channels <= 0) {
+                    av_channel_layout_uninit(&ist->codecpar->ch_layout);
+                    av_channel_layout_default(&ist->codecpar->ch_layout, 2);
+                }
+                av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] copy #%d (%s): no parameters from the probe (damaged source at "
+                       "start) — declared 48 kHz, the frames carry their own layout\n", sidx,
+                       avcodec_get_name(ist->codecpar->codec_id));
+            }
             if (pass[n_pass].gated && n_input == 1 && g_hold_fill)   /* 2.0.0-pre6 D17: copied AC-3/E-AC-3 silence */
                 pass[n_pass].sil = silent_copy_frame(ist->codecpar, ist->time_base, &pass[n_pass].sil_dur);
             for (r = 0; r < n_rung; r++) {
