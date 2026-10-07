@@ -969,7 +969,8 @@ void *output_thread(void *arg)
                      * sat behind the gap (3 holes of 0.12-0.16 s on Cinestar 10 % loss); that tick shows the surplus
                      * frame as decimation always did, and the repeats start on the next tick. */
                     int64_t hc = content_index(v, f->pts);
-                    if (hc > last_vpts + 1 && (hc - last_vpts - 1) * v->tick_dur_us <= 2000000) {
+                    if (hc > last_vpts + 1 && (hc - last_vpts - 1) * v->tick_dur_us <= 2000000 &&
+                        av_dict_get(f->metadata, "ptv_dmg", NULL, 0)) {   /* damage-era frame (emit_video) */
                         nextf = f; next_have = 1; vgap_park = 1;
                         if (!fresh) {
                             cadence_hold = 1;

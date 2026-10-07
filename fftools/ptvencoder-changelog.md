@@ -98,7 +98,17 @@ the rebuild (pre9.3 identical; its video hole is gone), reshaped_return exit 4 (
   (sync_ac3_gap2_10: 320 overlaps, caught by the new structure gate line). And a forward audio step within 3 s of
   damaged audio on the track is real missing audio — padded, never folded (pre9.3 covered only the fill resume): two
   such steps at 50 % loss looked like the non-converging ladder and were folded, deleting real time.
-- Still open: 50 % loss on the small-PES sync media (sync_loss_500, damage 20..120 s) ends audio −1.1 s early after
+- **T-084: a start on a damaged source no longer exit-loops.** A copied AC-3 / E-AC-3 / MPEG audio / AAC track whose
+  parameters the probe never saw (Cinestar_Premiere 2026-10-06, two senders on one group) made the mpegts header fail
+  ("sample rate not set" → exit 1 every ~27 s, zero output); it is now declared 48 kHz (the frames carry their own
+  layout) with a `[PTV-SRC] copy #N … no parameters from the probe` line. Local repro: the AC-3 PID nulled for the first
+  30 s of `sync_ac3.ts` — pre9.4 candidate exit 1 at 8.5 s, no output → alive, content live 100 %.
+- **The video gap fill acts only on damage-era frames.** That same start (8 s probe → a 6.4 s backlog in a full frame
+  queue) showed the fill holding the cursor against the cushion servo: 2 s moving / 10 s frozen for the whole run. A frame
+  decoded within 5 s of a corrupt video packet/frame now carries a `ptv_dmg` mark (per frame, so every rung decides
+  alike); a content gap in front of an unmarked frame keeps the old leap (a backlog drain, a start-up wait).
+- Still open: a copied track absent at the start stays absent until its first packet (no silence before it); 50 % loss
+  on the small-PES sync media (sync_loss_500, damage 20..120 s) ends audio −1.1 s early after
   recovery (pre9.3: −3.4 s), with one 3.36 s video leap after a 3.4 s decoder starvation. Seen, not T-083: bursty Cinestar lip sync swings −45…−1,082 ms on every build (pre9.3 too).
 
 ## 2.0.0-pre9.3 — heavy packet loss no longer desyncs the audio (T-080 mechanism A)
