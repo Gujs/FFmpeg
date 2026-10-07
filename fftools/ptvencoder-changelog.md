@@ -5,6 +5,26 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre9.5.1 — hotfix: the video delivery hold no longer collapses to 0 (sync_check DESYNC restart loop)
+
+- **Live 2026-10-07 (pre9.5 canary):** Grid_2x1 (live-transcoder) and Newsmax2 (cor-3) restarted every 7–20 min — the
+  sync_check monitor read the wire video 2.1–2.6 s ahead of audio (`DESYNC`, threshold 2 s); every `[PTV-VDLV]` line
+  said "steady latency (0 ms)" while the other 39 channels held 0.3–2.4 s. Cause: pre9.4's stall rule (T-083 step 5:
+  while audio delivery is idle 150 ms, held video keeps leaving at its steady latency). The steady latency learns only
+  at normal (due) releases; on a channel whose audio delivery idles >150 ms every couple of seconds in normal operation
+  (large audio PES, loudnorm's 100 ms quantum, bursty input) the stall releases emptied the queue at ~80 ms before any
+  packet became due, so it never learned and the hold stayed at 0 — video went out a whole loudnorm latency early.
+- **Fix:** during a stall, held video never leaves earlier than the measured audio lateness less the due band (the
+  enc-vs-delivered skew sampled only while audio delivery is fresh, `v_flow_ema`, − the 300 ms due band = the age a
+  packet becomes due at) — the steady hold can no longer collapse; the 150 ms stall threshold and
+  the rest of step 5 are unchanged. (A threshold adapted to the channel's delivery gaps was tried and dropped: under
+  loss the long gaps raised it to ~3 s and switched the stall rule off when it was needed — 13 wire gaps ≤1.2 s on
+  sync_loss_100.)
+- Local A/B, loudnorm production graph (lib.sh `T056_PROD=1` now runs the fleet `PTV_AF` — it ran the old compressor
+  chain until now, so the prod gate never exercised loudnorm's latency): bursty source wire A/V spread pre9.5 +1.22 s →
+  −0.12 s; clean unchanged. Bursty input keeps pre9.2's ~1.2 s wire pause per HLS-segment cycle (audio has no bank;
+  pre9.2 identical) — open.
+
 ## 2.0.0-pre9.5 — start on a damaged source (T-084); the video gap fill only where content was lost
 
 - **T-084: a start on a damaged source no longer exit-loops.** A copied AC-3 / E-AC-3 / MPEG audio / AAC track whose
