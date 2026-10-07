@@ -159,9 +159,8 @@ typedef struct DlvGate {
     int64_t         v_rel_age;          /* 2.0.0-pre9.4 (T-083): EMA of a held packet's age at a normal (due) release —
                                          * the steady hold latency an audio stall keeps flowing at */
     int64_t         v_stall_log_wc;     /* rate limit for the stall line */
-    int64_t         v_flow_ema;         /* 2.0.0-pre9.5.1: EMA of the same skew sampled only while audio delivery is FRESH
-                                         * (<100 ms) — the steady lateness; floors the stall release (µs) */
-    int             v_flow_seed;
+    int             v_stall_on;         /* 2.0.0-pre9.6: an audio delivery stall is in progress */
+    int64_t         v_stall_age0;       /* the hold latency (head age) when it began — kept during the stall (µs) */
     _Atomic int64_t a_dlv_dts_hi;       /* newest audio/copy DTS DELIVERED to mux_q (µs); INT64_MIN = none yet */
     _Atomic int64_t a_hi_change_wc;     /* wall time a_dlv_dts_hi last ADVANCED (escape/re-arm detector) */
     _Atomic int64_t st_vhold_us;        /* stats vdlvhold=: age of the oldest held video at the last video drain */
@@ -1123,6 +1122,8 @@ typedef struct AudioState {
     /* 1.0.1-pre9 residual sensor (PASSIVE — see RsyncSense): audio-side content mapping. */
     int64_t          rs_ma_ema;                       /* EMA of m_a = out − (sink_src − inj) − slip (µs) */
     int              rs_ma_seed;                      /* EMA seeded at first sample */
+    int64_t          imposs_n, imposs_log_wc;          /* 2.0.0-pre9.6: decoded frames muted for impossible samples */
+    int64_t          rs_ma_res;                       /* 2.0.0-pre9.6: EMA of m_a − (glue_off + house_skew) (µs) */
     int64_t          rs_slip_us;                      /* latest net (dead-banded) resampler slip (DIAG) */
     int64_t          rs_log_last;                     /* [PTV-RSYNC] DIAG rate limit (wall µs) */
     /* 1.0.1-pre14 residual-sync corrector (see CorrState above; design doc §4/§8). The two
@@ -1641,6 +1642,7 @@ typedef struct DemuxArgs {
      * releases one-sided (the sibling's matching jump = evidence the event is two-legged). */
     int64_t               sib_jump_us[2];
     int64_t               sib_jump_wall[2];
+    int                   sib_jump_gap[2];      /* 2.0.0-pre9.6: that jump was a GAP verdict (labels carry it, content pads) */
     int                   drop;          /* non-blocking + drop on full (network input) */
     PassStream           *pass;          /* copy-passthrough: extra audio, subs, data */
     int                   n_pass;
