@@ -3069,11 +3069,15 @@ static void *decode_thread(void *arg)
         PTV_HB_VDEC(d->hb_slot, PTV_HB_VDEC_SENDPKT);
         ret = avcodec_send_packet(d->vdec, pkt);
         av_packet_free(&pkt);
+        if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF)   /* 2.0.0-pre9.4: damage evidence (bit errors */
+            atomic_store_explicit(&g_vdmg_wc, av_gettime_relative(), memory_order_relaxed);   /* inside valid packets) */
         while (ret >= 0) {
             PTV_HB_VDEC(d->hb_slot, PTV_HB_VDEC_RECVFRAME);
             ret = avcodec_receive_frame(d->vdec, frame);
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) { ret = 0; break; }
             if (ret < 0) goto done;
+            if (frame->decode_error_flags)   /* 2.0.0-pre9.4: concealed / missing slices = damage evidence */
+                atomic_store_explicit(&g_vdmg_wc, av_gettime_relative(), memory_order_relaxed);
             /* TEST ONLY (F6 gate, PTV_CCTEST_CORRUPT_EVERY): real slice damage never reaches
              * here — the demuxer's own corrupt-packet path discards it first — so the only way
              * to exercise the branch below on demand is to set the flag ourselves. Inert
