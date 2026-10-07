@@ -1642,6 +1642,7 @@ typedef struct DemuxArgs {
      * releases one-sided (the sibling's matching jump = evidence the event is two-legged). */
     int64_t               sib_jump_us[2];
     int64_t               sib_jump_wall[2];
+    int                   sib_jump_gap[2];      /* 2.0.0-pre9.6: that jump was a GAP verdict (labels carry it, content pads) */
     int                   drop;          /* non-blocking + drop on full (network input) */
     PassStream           *pass;          /* copy-passthrough: extra audio, subs, data */
     int                   n_pass;

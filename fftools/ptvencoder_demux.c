@@ -520,6 +520,7 @@ static int ptv_disc_detect_jump(DemuxArgs *d, PtvDiscBuf *b, int stream_idx,
         int mi = ct == AVMEDIA_TYPE_VIDEO ? 0 : 1;
         d->sib_jump_us[mi]   = delta;
         d->sib_jump_wall[mi] = av_gettime_relative();
+        d->sib_jump_gap[mi]  = 0;
     }
     av_log(NULL, AV_LOG_INFO,   /* v0.9.13: always-on — a glue is rare (few/hour worst case) and operators need it in the log */
            "[PTV-LAYERA] jump on stream %d: %.3fs -> %.3fs (delta=%.3fs) — buffering\n",
@@ -705,6 +706,8 @@ static void ptv_aanch_fire(DemuxArgs *d, PtvDiscBuf *b)
  * corrupt-packet hoist keeping the bases honest and the extensions repeating up to the
  * pairing window, the held cycle can now genuinely collect the sibling leg and flush
  * SHARED — the Fashion-replay gate exercises exactly that path.) */
+static void ptv_disc_cancel(DemuxArgs *d, PtvDiscBuf *b);
+
 static int ptv_disc_partial_hold(DemuxArgs *d, PtvDiscBuf *b)
 {
     int i, has_v = 0, has_a = 0, sib, trig;
@@ -759,6 +762,25 @@ static int ptv_disc_partial_hold(DemuxArgs *d, PtvDiscBuf *b)
             if (d->ifmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
                 (b->stream_state[i].pair_has || b->stream_state[i].pair_prov))
                 return 0;                       /* an audio leg already applied this window */
+    }
+    /* 2.0.0-pre9.6 (T-075): the missing audio leg's known jump was a GAP verdict — that verdict already
+     * propagated (no audio cycle can ever cross) and left the jump in the audio labels for the content
+     * path to PAD. Flushing this video-only cycle would ERASE the same source event on video: one event,
+     * two remedies (#50's defect in the other order — the verdict came first, the cycle armed after).
+     * sync_flapping: video erased −2.000 s, the audio step later folded −2.197 s → −192 ms for good.
+     * Disband the cycle like #50: packets released unrebased, the jump stays in the video labels too,
+     * both content paths pad it. */
+    if (g_glueveto && sib == 1 && d->sib_jump_gap[1]) {
+        av_log(NULL, AV_LOG_WARNING,
+               "[PTV-GLUE] video-only cycle (offset %+.3fs) matches the audio GAP verdict (%+.3fs, %"PRId64"ms ago) "
+               "— SAME source event: cycle DISBANDED, %d pkts released unrebased; labels carry the jump, content "
+               "paths pad (PTV_NO_GLUEVETO reverts)\n",
+               (double)own / AV_TIME_BASE, (double)sj / AV_TIME_BASE, (now - sw) / 1000, b->nb_packets);
+        atomic_store_explicit(&g_vdmg_wc, av_gettime_relative(), memory_order_relaxed);   /* a source step = damage
+                                                                                           * evidence: the video gap fill
+                                                                                           * fills it (no PTS hole) */
+        ptv_disc_cancel(d, b);
+        return 1;
     }
     b->partial_ext++;
     b->buffer_start_time = now;                 /* one more PTV_DISC_TIMEOUT_US */
@@ -2141,6 +2163,7 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                             is_gap = 1;
                             d->sib_jump_us[1]   = jump_us;   /* pre16 #47-C: a gap is a known audio jump */
                             d->sib_jump_wall[1] = wall_now;
+                            d->sib_jump_gap[1]  = 1;
                             if (d->disturb_epoch)   /* audio dropout is a disturbance (freeze rate-recovery / arm re-acquire) */
                                 atomic_fetch_add_explicit(d->disturb_epoch, 1, memory_order_relaxed);
                             av_log(NULL, AV_LOG_INFO,   /* v0.9.13: always-on — a real source audio dropout, rare + meaningful */
@@ -2279,6 +2302,7 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                             rsync_post_edit(d, pkt->stream_index, -flow_us);   /* flow-evidenced erase */
                             d->sib_jump_us[1]   = jump_us;
                             d->sib_jump_wall[1] = wall_now;
+                            d->sib_jump_gap[1]  = 0;
                             if (d->disturb_epoch)
                                 atomic_fetch_add_explicit(d->disturb_epoch, 1, memory_order_relaxed);
                             if (g_layera && d->disc &&
@@ -2366,6 +2390,7 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                             }
                             d->sib_jump_us[0]   = vjump_us;   /* #47-C: a known video jump */
                             d->sib_jump_wall[0] = wall_now;
+                            d->sib_jump_gap[0]  = 0;
                             if (d->disturb_epoch)
                                 atomic_fetch_add_explicit(d->disturb_epoch, 1, memory_order_relaxed);
                             /* propagate the continuity ref — no LAYERA cycle for the kept hole */
@@ -3001,6 +3026,7 @@ void *demux_thread(void *arg)
                                 int mij = ctj == AVMEDIA_TYPE_VIDEO ? 0 : 1;
                                 d->sib_jump_us[mij]   = raw_dts - last_dts;
                                 d->sib_jump_wall[mij] = av_gettime_relative();
+                                d->sib_jump_gap[mij]  = 0;
                             }
                         }
                     }
