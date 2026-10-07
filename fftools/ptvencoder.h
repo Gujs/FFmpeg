@@ -1122,6 +1122,7 @@ typedef struct AudioState {
     /* 1.0.1-pre9 residual sensor (PASSIVE — see RsyncSense): audio-side content mapping. */
     int64_t          rs_ma_ema;                       /* EMA of m_a = out − (sink_src − inj) − slip (µs) */
     int              rs_ma_seed;                      /* EMA seeded at first sample */
+    int64_t          imposs_n, imposs_log_wc;          /* 2.0.0-pre9.6: decoded frames muted for impossible samples */
     int64_t          rs_ma_res;                       /* 2.0.0-pre9.6: EMA of m_a − (glue_off + house_skew) (µs) */
     int64_t          rs_slip_us;                      /* latest net (dead-banded) resampler slip (DIAG) */
     int64_t          rs_log_last;                     /* [PTV-RSYNC] DIAG rate limit (wall µs) */

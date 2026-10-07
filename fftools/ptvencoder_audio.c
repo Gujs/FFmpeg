@@ -3659,12 +3659,55 @@ static int audio_anchor_and_feed(AudioState *a, AVFrame *frame, int64_t h0)
     return audio_feed(a, frame);
 }
 
+/* 2.0.0-pre9.6: peak |sample| of a decoded float frame (−1 = not a float format); non-finite → +inf */
+static double afrm_peak(const AVFrame *f)
+{
+    int planar = av_sample_fmt_is_planar(f->format), ch = f->ch_layout.nb_channels;
+    int np = planar ? ch : 1, ns = planar ? f->nb_samples : f->nb_samples * ch, p, i;
+    enum AVSampleFormat pk = av_get_packed_sample_fmt(f->format);
+    double peak = 0;
+    if (pk != AV_SAMPLE_FMT_FLT && pk != AV_SAMPLE_FMT_DBL)
+        return -1;
+    for (p = 0; p < np && f->extended_data[p]; p++)
+        for (i = 0; i < ns; i++) {
+            double x = pk == AV_SAMPLE_FMT_FLT ? ((const float *)f->extended_data[p])[i]
+                                               : ((const double *)f->extended_data[p])[i];
+            if (!isfinite(x)) return INFINITY;
+            if (fabs(x) > peak) peak = fabs(x);
+        }
+    return peak;
+}
+
 static int audio_push(AudioState *a, AVFrame *frame)
 {
     int64_t ts = frame->best_effort_timestamp;
     int ret = 0, i;
 
     a->in_frames++;
+
+    /* 2.0.0-pre9.6: a frame with IMPOSSIBLE samples is damage, not content. Bit flips inside a valid AAC
+     * packet can decode without an error into samples tens of thousands of times full scale (+93 dBFS
+     * measured, sync_ac3_bitflip_100 s1); loudnorm's live gain follows the INTEGRATED loudness, which one such
+     * frame raises for the rest of the programme → the track stayed silent (−103 dB) until restart — the
+     * fleet's default -af (plain ffmpeg + loudnorm does the same). Above +18 dBFS (8.0; real decoded audio
+     * overshoots full scale by a few dB at most) or non-finite: mute the frame (timing kept, the damage shows
+     * as silence) and count it as damaged audio for the glue rules. */
+    if (frame->nb_samples > 0) {
+        double pk = afrm_peak(frame);
+        if (pk > 8.0) {
+            int64_t now = av_gettime_relative();
+            av_samples_set_silence(frame->extended_data, 0, frame->nb_samples,
+                                   frame->ch_layout.nb_channels, frame->format);
+            a->dmg_wc = now;
+            a->imposs_n++;
+            if (!a->imposs_log_wc || now - a->imposs_log_wc > 10000000) {
+                a->imposs_log_wc = now;
+                av_log(NULL, AV_LOG_WARNING, "[PTV-ADEC] a%d(in%d) decoded frame with impossible samples (peak %s%.1f dBFS) "
+                       "— muted as damage, kept out of the -af chain (total %"PRId64")\n", a->dbg_k, a->dbg_in,
+                       isfinite(pk) ? "+" : "", isfinite(pk) ? 20 * log10(pk) : INFINITY, a->imposs_n);
+            }
+        }
+    }
 
     /* Audio anchors to the FIRST VIDEO frame (h0, set by the video decode thread) so
      * A/V share one origin. While h0 is unset (the slot's video is still acquiring its
