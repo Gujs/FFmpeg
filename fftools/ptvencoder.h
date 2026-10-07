@@ -159,6 +159,9 @@ typedef struct DlvGate {
     int64_t         v_rel_age;          /* 2.0.0-pre9.4 (T-083): EMA of a held packet's age at a normal (due) release —
                                          * the steady hold latency an audio stall keeps flowing at */
     int64_t         v_stall_log_wc;     /* rate limit for the stall line */
+    int64_t         v_flow_ema;         /* 2.0.0-pre9.5.1: EMA of the same skew sampled only while audio delivery is FRESH
+                                         * (<100 ms) — the steady lateness; floors the stall release (µs) */
+    int             v_flow_seed;
     _Atomic int64_t a_dlv_dts_hi;       /* newest audio/copy DTS DELIVERED to mux_q (µs); INT64_MIN = none yet */
     _Atomic int64_t a_hi_change_wc;     /* wall time a_dlv_dts_hi last ADVANCED (escape/re-arm detector) */
     _Atomic int64_t st_vhold_us;        /* stats vdlvhold=: age of the oldest held video at the last video drain */

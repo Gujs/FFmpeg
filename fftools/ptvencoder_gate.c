@@ -315,6 +315,12 @@ void dlv_video_drain(DlvGate *g)
                        g->v_cap_base / 1e6, ceil2 / 1e6);
             }
             g->v_cap_us = want;
+            /* 2.0.0-pre9.5.1: the stall floor's own sample — only while audio is actually arriving: v_lat_ema keeps
+             * sampling through a 2 s dry spell (bursty input) and the floor then rose with it (2.5 s wire pauses) */
+            if (now - adv < 100000) {
+                if (!g->v_flow_seed) { g->v_flow_ema = sk; g->v_flow_seed = 1; }
+                else g->v_flow_ema += (sk - g->v_flow_ema) / 64;
+            }
         }
     }
     if (!g->vcount) {
@@ -352,7 +358,14 @@ void dlv_video_drain(DlvGate *g)
          * dark (725 ms measured, sync_audio_gap; the hold exists for a late-but-flowing audio path). While stalled,
          * video keeps leaving at the latency it had just before: the wire stays continuous, the steady hold and
          * the 6 s audio-death escape are untouched. */
-        int stall = now - adv > 150000 && (now - p->enq_us) > g->v_rel_age + 80000;
+        /* 2.0.0-pre9.5.1: never below the MEASURED audio lateness (v_flow_ema, sampled while audio delivery is fresh, less
+         * the due band: the age a packet becomes due at; without the band every stall pause grew ~250 ms). v_rel_age
+         * learns only at due releases, and stall releases at a still-small v_rel_age emptied the queue before any packet
+         * became due — so it never learned: on a channel whose audio delivery idles >150 ms every couple of seconds
+         * the hold stayed at 0 for good (live 2026-10-07: Grid_2x1, Newsmax2 — "steady latency (0 ms)", wire video
+         * 2.2 s ahead of audio, sync_check DESYNC restarts every 7–20 min). */
+        int64_t steady = FFMAX(g->v_rel_age, g->v_flow_seed ? g->v_flow_ema - g->v_band_us : 0);   /* = the due age */
+        int stall = now - adv > 150000 && (now - p->enq_us) > steady + 80000;
         if (!due && !aged && !stall)
             break;
         if (due) {
@@ -361,7 +374,7 @@ void dlv_video_drain(DlvGate *g)
         } else if (stall && !aged && now - g->v_stall_log_wc > 60000000) {
             g->v_stall_log_wc = now;
             av_log(NULL, AV_LOG_INFO, "[PTV-VDLV] audio delivery stalled %.1fs — held video keeps flowing at its "
-                   "steady latency (%.0f ms), the wire stays continuous\n", (now - adv) / 1e6, g->v_rel_age / 1e3);
+                   "steady latency (%.0f ms), the wire stays continuous\n", (now - adv) / 1e6, steady / 1e3);
         }
         if (aged && !due)
             atomic_fetch_add_explicit(&g->st_vforced, 1, memory_order_relaxed);
