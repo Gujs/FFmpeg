@@ -1964,6 +1964,7 @@ extern _Atomic int     g_rj_epoch;
 extern _Atomic int64_t g_house_out_us, g_house_tick_us;   /* master: last emitted vpts on the output axis, tick */
 extern _Atomic int64_t g_dup_out_us;     /* master: output time on ticks whose content did not advance (hold fills' clock) */
 extern int             g_rejoin_map;       /* PTV_NO_REJOIN_MAP=1 off */
+extern int             g_vo_hold;          /* 2.0.0-pre9.8 (T-076), PTV_NO_VO_HOLD=1 off */
 static inline int64_t ptv_rj_off(int64_t src_us)
 {
     int64_t off = atomic_load_explicit(&g_rj_off_total, memory_order_acquire);
@@ -2111,6 +2112,7 @@ extern int64_t         g_lost_after_us;  /* -lost_after (default 30 s); pre3: ob
 extern _Atomic int     g_src_state;      /* 0 = LIVE, 1 = STALLED */
 extern _Atomic int64_t g_src_hold_start; /* wall us the hold began (0 = not holding) */
 extern _Atomic int64_t g_src_vread_wc;   /* wall us of the last video packet READ (before any buffering) */
+extern _Atomic int64_t g_src_aread_wc;   /* 2.0.0-pre9.8 (T-076): last transcoded-audio packet read (single input) */
 extern int             g_src_hold_act;   /* 2.0.0-pre4: act on STALLED (engine freeze, accounting); 0 = observe
                                           * only (PTV_HOLD_OBSERVE=1, the pre3 behaviour) */
 extern _Atomic int64_t g_src_rejoin_wall; /* 2.0.0-pre4: wall us of the last STALLED -> LIVE (0 = never) */

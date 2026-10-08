@@ -899,6 +899,7 @@ void *output_thread(void *arg)
         /* v0.9.11 pulldown state: 1-frame lookahead + film-mode detector (see g_pulldown comment) */
         AVFrame *nextf = NULL;
         int next_have = 0, film_arm = 0, held_extra = 0;
+        int64_t vo_extra = 0;   /* 2.0.0-pre9.8 (T-076): video-only repeat ticks kept out of house_skew */
         int vgap_park = 0;                          /* 2.0.0-pre9.4 (T-083): nextf is a frame parked behind a content gap */
         int64_t vgap_filled = 0, vgap_log_wc = 0;   /* ticks filled since the last [PTV-VFILL] line */
         int64_t svo_cr = 0, svo_dmg_wc = 0;        /* T-083: corrupt count seen by the servo + when it last moved */
@@ -1310,6 +1311,7 @@ void *output_thread(void *arg)
              * what house_skew grows by, but a rejoin map never steps it back. */
             if (v->is_master && !cadence_hold && (content_vpts < 0 || content_vpts <= last_content_vpts))
                 atomic_fetch_add_explicit(&g_dup_out_us, v->tick_dur_us, memory_order_relaxed);
+            int dup_tick = content_vpts < 0 || content_vpts <= last_content_vpts;   /* T-076 */
             if (content_vpts >= 0)
                 last_content_vpts = content_vpts;   /* v0.9.15.3 decimation cursor: real content played
                                                      * (held_src_pts survives dups -> idempotent on dup/hold) */
@@ -1325,8 +1327,23 @@ void *output_thread(void *arg)
             if (cadence_hold) held_extra++;
             /* house_skew keeps growing through a hold (measured 2026-10-04: freezing it made a BURST rejoin
              * 6 s audio-early — post-gap audio read the stale value before the first fresh frame updated it) */
+            /* 2.0.0-pre9.8 (T-076): video packets gone (>= 0.5 s) while the source's audio keeps arriving (< 1 s) = video
+             * content lost, not late — spec §5.1 "audio flows, video stops: audio continues". Such repeats are kept out of
+             * house_skew, or the live audio is stretched behind them (video PID nulled 40 s: house_skew +34 s, a 22 s
+             * audio delivery hold, ~23 s without lip sync after the return, then 3–5 s cut). Counted like the cadence
+             * residence (vo_extra) and cleared when content moves again, where the rejoin map's own step lands. */
+            int vo_rep = 0;
+            if (g_vo_hold && v->is_master && dup_tick) {
+                int64_t nwv = av_gettime_relative();
+                int64_t vr = atomic_load_explicit(&g_src_vread_wc, memory_order_relaxed);
+                int64_t ar = atomic_load_explicit(&g_src_aread_wc, memory_order_relaxed);
+                vo_rep = vr && ar && nwv - vr >= 500000 && nwv - ar < 1000000;
+                if (vo_rep) vo_extra++;
+            }
+            if (g_vo_hold && fresh && !dup_tick)
+                vo_extra = 0;   /* content moves again: house_skew back on the formula (the rejoin's map step lands here) */
             if (v->is_master && v->house_skew && content_vpts >= 0)   /* against RAW content: −rejoin map (pre6.1) */
-                *v->house_skew = (vpts - content_vpts - held_extra) * v->tick_dur_us -
+                *v->house_skew = (vpts - content_vpts - held_extra - vo_extra) * v->tick_dur_us -
                                  (src_ts != AV_NOPTS_VALUE ? ptv_rj_off(av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q)) : 0);
             if (v->is_master) {        /* 2.0.0-pre6.1: the house position the decode thread maps a rejoin onto */
                 atomic_store_explicit(&g_house_out_us, v->out_fps.num > 0
