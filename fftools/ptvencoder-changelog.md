@@ -13,6 +13,18 @@ the v2 `0001` patch (additive, travels with the source to the build box).
   step on the T-084 media: 20 frames dropped, `drop=0` shown; now `drop=20`). Multiview unchanged (it already printed
   the right counter).
 
+- **A multiview slot that comes back after a long outage on a new timeline has its audio back with the picture
+  (T-089).** Daily on MV_2x2_RAV (RAV restarts at PTS 0 after ~24 h, read as the 33-bit wrap): the slot's picture
+  returned but its audio stayed off for ~50 s — the A/V pairing for the PLL still held the slot's pre-outage video, so
+  it read the returning audio as 50+ s early and padded the outage a second time (then dropped ~55 s of real audio).
+  Three fixes, multiview only for the first and last: the pairing ring restarts when the slot's content steps by more
+  than 2 s; a cut that leaves two old frames before the new timeline no longer loses the outage's wall-clock evidence
+  (the second old frame took it, so video erased the hole while audio kept it: audio 51 s late); and for 10 s after a
+  restart, audio older than the returned video by more than 1 s (the silence that bridges the outage, drained in a
+  burst) is not paired. Local fixture: pre9.6 audio +51 s late → returns on the same frame, +7 ms 10 s later; a
+  −130…−220 ms residual 10–30 s after the return is the compositor's post-return re-delay (T-091, 2.1). Live 1.2.x logs
+  show the same mechanism.
+
 ## 2.0.0-pre9.6 — lip sync after a flapping source (T-075), honest lipsync= after holds, no wire pause at an audio stall (T-085)
 
 - **The video delivery hold keeps its latency through an audio stall (T-085 follow-up).** pre9.5.1 floored stall

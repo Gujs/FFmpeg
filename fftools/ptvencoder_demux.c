@@ -2038,9 +2038,21 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                 int64_t *tg = &d->tail_gap_us[pkt->stream_index];
                 if (*tg && pg < *tg) {
                     d->pkt_wall_gap_us[pkt->stream_index] = *tg + pg;
-                    *tg = 0;
-                } else
+                    /* 2.0.0 T-089 (measured, MV slot rejoin): a cut can leave TWO pre-gap tail frames — the second
+                     * one took the carry and the jump packet after it read a 60 ms gap: video W = 0, the flush
+                     * refused, video erased the hole while audio kept it (audio 51 s late). Packets still on the
+                     * old timeline (forward, under the 1 s jump bar) within 1 s of the gap pass the carry on. */
+                    if (d->tail_wc_us && wall_now - d->tail_wc_us[pkt->stream_index] < 1000000 &&
+                        last != AV_NOPTS_VALUE && raw > last &&
+                        av_rescale_q(raw - last, st->time_base, AV_TIME_BASE_Q) <= PTV_DISC_THRESHOLD_US)
+                        *tg += pg;
+                    else
+                        *tg = 0;
+                } else {
                     *tg = pg >= g_gap_min_us ? pg : 0;
+                    if (*tg && d->tail_wc_us)
+                        d->tail_wc_us[pkt->stream_index] = wall_now;
+                }
             }
             if (d->wall_cad_us && pg > 5000 && pg < 2000000) {
                 if (!d->wall_cad_us[pkt->stream_index])

@@ -549,8 +549,21 @@ void *compositor_thread(void *arg)
                     c->inputs[k].house_lag_true = sk;                     /* publish for the per-slot audio lip-sync probe */
                     /* A/V probe (read-only): record this slot's distinct displayed content → its
                      * first-display output time, so the slot's audio can pair against it (§3.2b). */
-                    if (fresh)
-                        vring_put(&c->inputs[k].vring, disp_src, mv_tick_us(c, tick));
+                    if (fresh) {
+                        /* 2.0.0 T-089: one continuous content segment per ring. A slot returning from an
+                         * outage on a new timeline (or any >2 s label step) starts a fresh ring: the audio
+                         * pairing is nearest-by-content and extrapolates by the content distance, so stale
+                         * pre-gap entries paired the returning audio across the hole and the PLL padded the
+                         * outage a second time (live RAV: pad 54.5 s, then drop 55.9 s of real audio). */
+                        VOutRing *vr = &c->inputs[k].vring;
+                        pthread_mutex_lock(&vr->lock);
+                        if (vr->n && llabs(disp_src - vr->src[(vr->n - 1) % PTV_VRING]) > 2000000) {
+                            vr->n = 0;
+                            vr->seg_wc = av_gettime_relative();
+                        }
+                        pthread_mutex_unlock(&vr->lock);
+                        vring_put(vr, disp_src, mv_tick_us(c, tick));
+                    }
                     /* Don't ratchet the audio skew during a CONTENT-CLAMP hold: that freeze is
                      * deliberate pacing (a future frame is pending, video waits for the clock),
                      * NOT a dup-underrun the audio should follow. Letting skew grow here would
