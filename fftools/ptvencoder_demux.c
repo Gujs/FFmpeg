@@ -1686,6 +1686,16 @@ static int demux_pass_one(DemuxArgs *d, AVPacket *out)
         if (d->pass[pi].sil && out->dts != AV_NOPTS_VALUE) {
             PassStream *ps = &d->pass[pi];
             int64_t exp = ps->real_end;              /* where this track's next frame belongs */
+            if (ps->start_fill && ps->fill_end != AV_NOPTS_VALUE && out->dts > ps->fill_end &&
+                out->dts - ps->fill_end <= av_rescale_q(60000000, AV_TIME_BASE_Q, ps->in_tb)) {
+                /* 2.0.0-pre9.6: the first real packet of a track absent since the start comes in ahead of the video
+                 * output position the start fill follows (a start-up backlog: 6.5 s on the T-084 media) — the gap up
+                 * to it is still the start fill's, bridge it */
+                int64_t cur = ps->fill_end;
+                for (; cur + ps->sil_dur / 2 < out->dts; cur += ps->sil_dur)
+                    copy_emit_sil(d, ps, cur);
+                ps->fill_end = cur;
+            }
             if (ps->fill_end != AV_NOPTS_VALUE) {
                 /* hand-back: real packets below the end of the replayed silence are dropped (a sub-frame gap
                  * is left), never re-stamped — bounded to 2 s of drops */
@@ -1747,6 +1757,7 @@ static int demux_pass_one(DemuxArgs *d, AVPacket *out)
             }
             ps->arr_wc   = av_gettime_relative();
             ps->real_end = out->dts + (out->duration > 0 ? out->duration : ps->sil_dur);
+            ps->start_fill = 0;
             ps->hs_real  = hs_used;
             ps->dup_real = atomic_load_explicit(&g_dup_out_us, memory_order_relaxed);
         }
@@ -1919,14 +1930,38 @@ void ptv_copy_fill(DemuxArgs *d, int64_t now)
 static void copy_gap_watch(DemuxArgs *d, int64_t now)
 {
     int pi;
+    int64_t h0;
+    pthread_mutex_lock(d->h0_lock); h0 = *d->h0; pthread_mutex_unlock(d->h0_lock);
     pthread_mutex_lock(&d->pass_lock);
     for (pi = 0; pi < d->n_pass; pi++) {
         PassStream *ps = &d->pass[pi];
         int64_t target, cur;
         int n = 0;
+        /* 2.0.0-pre9.6 (T-084 rest / T-083): a copied track that has delivered NOTHING since the start (T-084: its
+         * PID absent on a damaged source — 5 of 8 segments without audio, and the CDN-side segmenter could not even
+         * read the stream's parameters) gets silent frames from the video's start, under the same 2 s rule; its
+         * first real packet takes over through the existing hand-back. */
+        if (ps->sil && ps->real_end == AV_NOPTS_VALUE && h0 != AV_NOPTS_VALUE) {
+            if (!ps->absent_wc)
+                ps->absent_wc = now;
+            else if (now - ps->absent_wc >= 2000000) {
+                ps->real_end   = 0;            /* output timeline: 0 = the video anchor */
+                ps->arr_wc     = ps->absent_wc;
+                ps->start_fill = 1;
+                ps->hs_real  = 0;
+                ps->dup_real = atomic_load_explicit(&g_dup_out_us, memory_order_relaxed);
+                av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] copy #%d (%s) absent since the start — silent frames from the "
+                       "video's start until its first packet\n", ps->in_index,
+                       avcodec_get_name(d->ifmt->streams[ps->in_index]->codecpar->codec_id));
+            }
+        }
         if (!ps->sil || ps->real_end == AV_NOPTS_VALUE || now - FFMAX(ps->arr_wc, d->v_flow_since_us) < 2000000)
             continue;
         target = ps->real_end + av_rescale_q(now - ps->arr_wc - 200000, AV_TIME_BASE_Q, ps->in_tb);
+        if (ps->start_fill)   /* the output timeline, not the wall: a long start-up probe leaves a backlog that drains
+                               * ahead of the wall (T-084 media: 7.4 s) — the video's output position, 200 ms short */
+            target = av_rescale_q(atomic_load_explicit(&g_house_out_us, memory_order_relaxed) - 200000,
+                                  AV_TIME_BASE_Q, ps->in_tb);
         cur    = ps->fill_end != AV_NOPTS_VALUE ? ps->fill_end : ps->real_end;
         if (ps->last_dts != AV_NOPTS_VALUE && cur < ps->last_dts + ps->sil_dur)
             cur = ps->last_dts + ps->sil_dur;   /* 2.0.0-pre9.4: after the frame on the wire, not 1 tick into it */

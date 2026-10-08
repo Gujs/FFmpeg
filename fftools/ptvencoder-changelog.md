@@ -37,6 +37,11 @@ the v2 `0001` patch (additive, travels with the source to the build box).
   confirming frames are now held and fed to the rebuilt path, the old graph is drained and cut at the real content end,
   and a source gap at the switch (≤ 2 s) is filled with silence. Standard graph: no hole; loudnorm graphs: 0.055 s left —
   inside loudnorm's own EOF flush (its buffered tail comes out with a 54.7 ms timestamp jump, probed).
+- **A copied track absent at the start is continuous from the first frame (T-084 rest).** pre9.5 started on such a
+  source (T-084) but its AC-3 PID was simply missing until the first packet: 5 of 8 segments without audio and the
+  CDN-side segmenter could not read the stream's parameters. After 2 s without a packet the track now gets silent frames
+  from the video's start, following the video output position (a start-up backlog runs ahead of the wall clock), and the
+  gap up to its first real packet is bridged. T-084 media: AC-3 gaps 0, 0 of 8 segments miss audio, HLS segmenter OK.
 - T-077 rest: the copied AC-3 −40 ms tick after a BURST rejoin is gone (sync_ac3_stop_10 std + vt: AC-3 0.0 ms) —
   resolved along the way by the pre9.4 copy changes.
 - Harness: `T056_PROD=1` now runs the fleet loudnorm chain (it ran the old compressor chain — the prod gate never
