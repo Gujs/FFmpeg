@@ -1123,6 +1123,12 @@ typedef struct AudioState {
     int64_t          rs_ma_ema;                       /* EMA of m_a = out − (sink_src − inj) − slip (µs) */
     int              rs_ma_seed;                      /* EMA seeded at first sample */
     int64_t          imposs_n, imposs_log_wc;          /* 2.0.0-pre9.6: decoded frames muted for impossible samples */
+#define PTV_AFMT_QMAX 8
+    AVFrame         *afmt_q[PTV_AFMT_QMAX];           /* 2.0.0-pre9.6: frames confirming a format change, held for the rebuild */
+    int              afmt_qn;
+    int              afmt_draining;                    /* 2.0.0-pre9.6: the old graph is being drained before a rebuild */
+    int64_t          afmt_drop_us;                     /* its withheld partial tail (µs) */
+    int64_t          afmt_drain_end_us;                /* door-domain content end the drain is cut at (µs) */
     int64_t          rs_ma_res;                       /* 2.0.0-pre9.6: EMA of m_a − (glue_off + house_skew) (µs) */
     int64_t          rs_slip_us;                      /* latest net (dead-banded) resampler slip (DIAG) */
     int64_t          rs_log_last;                     /* [PTV-RSYNC] DIAG rate limit (wall µs) */

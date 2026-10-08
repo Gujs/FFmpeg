@@ -1596,6 +1596,14 @@ static int audio_drain_fg(AudioState *a)
     h0_samp = (h0 == AV_NOPTS_VALUE) ? 0 : av_rescale(h0, a->out_rate, 1000000);
     sink_tb = av_buffersink_get_time_base(a->afsink);
     while ((ret = av_buffersink_get_frame(a->afsink, filt)) >= 0) {
+        if (filt->pts != AV_NOPTS_VALUE && a->afmt_draining && a->afmt_drain_end_us != AV_NOPTS_VALUE) {
+            /* 2.0.0-pre9.6: a flushed buffering filter (loudnorm's 100 ms blocks) pads its last block past the real
+             * content end — cut the drain there, the rebuilt path continues from that point */
+            int64_t st_us = av_rescale_q(filt->pts, sink_tb, AV_TIME_BASE_Q);
+            int64_t keep  = av_rescale(a->afmt_drain_end_us - st_us, filt->sample_rate > 0 ? filt->sample_rate : 48000, 1000000);
+            if (keep <= 0) { av_frame_unref(filt); continue; }
+            if (keep < filt->nb_samples) filt->nb_samples = (int)keep;
+        }
         if (filt->pts != AV_NOPTS_VALUE) {
             int64_t src_abs_us = av_rescale_q(filt->pts, sink_tb, AV_TIME_BASE_Q);  /* A/V probe: this frame's (post-async) source content time (us), before pts is rebased */
             if (a->dbg_k == 0)   /* [PTV-CHAIN] primary-audio source-content being emitted (us) */
@@ -2518,6 +2526,14 @@ static int audio_drain_fg(AudioState *a)
             a->out_last_pts = filt->pts;   /* F1: the guard's monotonic reference (all paths) */
             a->out_pts_set  = 1;
         }
+        if (a->afmt_draining && a->frame_size > 0 && filt->nb_samples < a->frame_size) {
+            /* 2.0.0-pre9.6: the drained old graph's last PARTIAL frame — the encoder would pad it to a full frame
+             * (overlap with the rebuilt path, then the monotonic guard's hole); its span is re-covered by the
+             * rebuild's silence bridge instead */
+            a->afmt_drop_us += av_rescale(filt->nb_samples, 1000000, a->out_rate > 0 ? a->out_rate : 48000);
+            av_frame_unref(filt);
+            continue;
+        }
         ret = audio_encode_push(a, filt);
         a->out_frames++;
         av_frame_unref(filt);
@@ -2721,6 +2737,21 @@ static int rj_release_ok(AudioState *a)
 
 static void rj_flush(AudioState *a);
 
+/* 2.0.0-pre9.6: frames that confirm a source format change are held for the rebuilt path (were dropped) */
+static void afmt_q_reset(AudioState *a)
+{
+    while (a->afmt_qn > 0)
+        av_frame_free(&a->afmt_q[--a->afmt_qn]);
+}
+static void afmt_q_add(AudioState *a, const AVFrame *frame)
+{
+    if (a->afmt_qn < PTV_AFMT_QMAX) {
+        AVFrame *c = av_frame_clone(frame);
+        if (c)
+            a->afmt_q[a->afmt_qn++] = c;
+    }
+}
+
 static int audio_feed(AudioState *a, AVFrame *frame)
 {
     uint8_t **out = NULL;
@@ -2775,16 +2806,20 @@ static int audio_feed(AudioState *a, AVFrame *frame)
         int same_pending = (a->afmt_pending_rate == frame->sample_rate &&
                             a->afmt_pending_fmt  == frame->format &&
                             !av_channel_layout_compare(&a->afmt_pending_chl, &frame->ch_layout));
-        if (!same_pending) {                       /* new candidate → start hysteresis, drop this frame */
+        if (!same_pending) {                       /* new candidate → start hysteresis, hold this frame */
             a->afmt_pending_rate = frame->sample_rate;
             a->afmt_pending_fmt  = frame->format;
             av_channel_layout_uninit(&a->afmt_pending_chl);
             av_channel_layout_copy(&a->afmt_pending_chl, &frame->ch_layout);
             a->afmt_stable = 1;
+            afmt_q_reset(a);
+            afmt_q_add(a, frame);
             return 0;
         }
-        if (++a->afmt_stable < PTV_AFMT_HYSTERESIS)
-            return 0;                              /* still settling — drop (downstream can't take the change) */
+        if (++a->afmt_stable < PTV_AFMT_HYSTERESIS) {
+            afmt_q_add(a, frame);                  /* still settling — held (downstream can't take the change yet) */
+            return 0;
+        }
         /* memcap F1: rebuild-storm CIRCUIT-BREAKER. A flapping origin (CORELINK class flaps
          * 44.1<->48kHz across discontinuities, sometimes continuously) confirms a "new" format
          * over and over; every rebuild churns the whole -af graph (measured ~2MB RSS/rebuild of
@@ -2807,6 +2842,7 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                 if (a->afmt_stable > PTV_AFMT_HYSTERESIS)
                     a->afmt_stable = PTV_AFMT_HYSTERESIS;   /* stay "confirmed", don't overflow */
                 a->afmt_bk_dropped++;
+                afmt_q_reset(a);
                 if (bnow - a->afmt_bk_log_us >= 5000000) {
                     a->afmt_bk_log_us = bnow;
                     av_log(NULL, AV_LOG_WARNING,
@@ -2821,6 +2857,8 @@ static int audio_feed(AudioState *a, AVFrame *frame)
         }
         {   /* confirmed: rebuild for the new params (a->dec already reflects them) */
             char ochl[64], nchl[64], tchl[64];
+            int64_t raw_end0 = a->glue_raw_last_us != AV_NOPTS_VALUE   /* the re-anchor below resets it */
+                             ? a->glue_raw_last_us + a->glue_raw_dur_us : AV_NOPTS_VALUE;
             av_channel_layout_describe(&a->fg_in_chl, ochl, sizeof ochl);
             av_channel_layout_describe(&frame->ch_layout, nchl, sizeof nchl);
             av_channel_layout_describe(&a->out_chl, tchl, sizeof tchl);
@@ -2831,6 +2869,19 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                    frame->sample_rate, av_get_sample_fmt_name(frame->format), nchl,
                    a->afmt_stable, tchl);
             a->afmt_stable = 0;
+            /* 2.0.0-pre9.6 (T-083): drain the old graph before it goes — what it still holds (the sink's partial
+             * encoder frame, resampler and limiter tails) was lost at every rebuild: with the dropped confirming
+             * frames a 0.23 s AAC hole at each source format switch (audio_format_switch, since pre9.3). */
+            a->afmt_drop_us = 0;
+            a->afmt_drain_end_us = a->acomp_exp_us;   /* the door's next expected label = the real content end */
+            if (a->afg && a->afsrc && a->use_fg) {
+                a->afmt_draining = 1;
+                if (av_buffersrc_add_frame_flags(a->afsrc, NULL, 0) >= 0)
+                    audio_drain_fg(a);
+                a->afmt_draining = 0;
+                if (raw_end0 != AV_NOPTS_VALUE)
+                    raw_end0 -= a->afmt_drop_us;   /* the bridge re-covers the withheld partial tail */
+            }
             if (a->afg) { avfilter_graph_free(&a->afg); a->afsrc = a->afsink = NULL; a->fg_swr = NULL; a->fg_swr_flt = NULL; }
             a->use_fg = 0;
             /* v0.9.17.1: rebuild the -af graph whenever the chain exists — INCLUDING for a track
@@ -2879,7 +2930,7 @@ static int audio_feed(AudioState *a, AVFrame *frame)
             /* 1.0.1-pre20: the rebuilt path gets a BIRTH-EQUIVALENT base derived from the
              * current house mapping instead of the carried one (see ptv_rebuild_reanchor).
              * Runs for ACHOP-triggered rebuilds too — they complete through this same site. */
-            ptv_rebuild_reanchor(a, frame);
+            ptv_rebuild_reanchor(a, a->afmt_qn ? a->afmt_q[0] : frame);   /* pre9.6: the first held frame starts the new path */
             /* 1.0.1-pre26 ROOT-CAUSE FIX (the NBS/CORELINK backward-label mux killer,
              * live 2026-07-25, 8+ crashes/24h; fixture-reproduced): a BACKWARD door step
              * left in the labels (a flush-routed negative mismatch / pad round-trip — the
@@ -2915,11 +2966,59 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                        "[PTV-AFMT] a%d(in%d) decoder context diverged from the confirmed frame "
                        "params during rebuild — frame dropped, detection re-arms\n",
                        a->dbg_k, a->dbg_in);
+                afmt_q_reset(a);
                 return 0;
+            }
+            /* 2.0.0-pre9.6: the confirming frames were held, not dropped — feed them first, in order (they match the
+             * new params by construction: same_pending) */
+            if (a->afmt_qn) {
+                int qi, qn = a->afmt_qn, qret = 0;
+                AVFrame *q[PTV_AFMT_QMAX];
+                memcpy(q, a->afmt_q, qn * sizeof(*q));
+                a->afmt_qn = 0;
+                /* a source gap AT the switch (audio_format_switch: 0.15 s of missing audio at the splice) is real missing
+                 * content, but the rebuilt graph has no history for aresample to pad it from: fill it with silence on the
+                 * source timeline (raw labels, ≤ 2 s), so the output stays continuous (T-083) */
+                if (q[0]->pts != AV_NOPTS_VALUE && q[0]->sample_rate > 0 && raw_end0 != AV_NOPTS_VALUE) {
+                    int64_t end = raw_end0;
+                    int64_t gap = av_rescale_q(q[0]->pts, a->ist_tb, AV_TIME_BASE_Q) - end;
+                    int64_t fdur = av_rescale(1024, 1000000, q[0]->sample_rate);
+                    if (gap > fdur / 2 && gap <= 2000000) {
+                        int64_t left = av_rescale(gap, q[0]->sample_rate, 1000000), at = end;
+                        av_log(NULL, AV_LOG_WARNING, "[PTV-AFMT] a%d(in%d) source gap of %"PRId64" ms at the switch — "
+                               "filled with silence (the rebuilt path cannot pad it)\n", a->dbg_k, a->dbg_in, gap / 1000);
+                        while (left > 0 && qret >= 0) {
+                            AVFrame *z = av_frame_alloc();
+                            int n = left > 1024 ? 1024 : (int)left;
+                            if (!z)
+                                break;
+                            z->nb_samples  = n;
+                            z->format      = q[0]->format;
+                            z->sample_rate = q[0]->sample_rate;
+                            av_channel_layout_copy(&z->ch_layout, &q[0]->ch_layout);
+                            if (av_frame_get_buffer(z, 0) >= 0) {
+                                av_samples_set_silence(z->extended_data, 0, n, z->ch_layout.nb_channels, z->format);
+                                z->pts = z->best_effort_timestamp = av_rescale_q(at, AV_TIME_BASE_Q, a->ist_tb);
+                                qret = audio_feed(a, z);
+                            }
+                            av_frame_free(&z);
+                            at   += av_rescale(n, 1000000, q[0]->sample_rate);
+                            left -= n;
+                        }
+                    }
+                }
+                for (qi = 0; qi < qn; qi++) {
+                    if (qret >= 0)
+                        qret = audio_feed(a, q[qi]);
+                    av_frame_free(&q[qi]);
+                }
+                if (qret < 0)
+                    return qret;
             }
         }
     } else if (a->afmt_stable) {                   /* params returned to normal → transient filtered out */
         a->afmt_stable = 0;
+        afmt_q_reset(a);
         av_channel_layout_uninit(&a->afmt_pending_chl);
         a->afmt_pending_rate = 0; a->afmt_pending_fmt = AV_SAMPLE_FMT_NONE;
     }
@@ -3917,6 +4016,7 @@ static void achop_rebuild(AudioState *a)
     av_channel_layout_uninit(&a->afmt_pending_chl);
     a->afmt_pending_rate = 0; a->afmt_pending_fmt = AV_SAMPLE_FMT_NONE;
     a->afmt_stable = 0;
+    afmt_q_reset(a);
     a->afmt_rebuilds++;                        /* corrector event (§4.4), same as an AFMT rebuild */
     av_log(NULL, AV_LOG_WARNING,
            "[PTV-ACHOP] a%d(in%d) sustained audio chop (>=%d min above floor; errs=%"PRId64") — "
@@ -4238,6 +4338,7 @@ void *audio_thread(void *arg)
 done:
     av_frame_free(&frame);
     { int i; for (i = 0; i < a->aq_npending; i++) av_frame_free(&a->aq_pending[i]); a->aq_npending = 0; }
+    afmt_q_reset(a);
     av_thread_message_queue_set_err_send(a->audio_q, AVERROR_EOF);   /* unblock demux (a SENDER) */
     { int i; for (i = 0; i < a->n_out; i++) {        /* EOF marker to each muxer */
         AVPacket *eof = NULL; av_thread_message_queue_send(a->mux_q[i], &eof, 0); } }

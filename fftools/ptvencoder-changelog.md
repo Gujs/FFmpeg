@@ -31,6 +31,12 @@ the v2 `0001` patch (additive, travels with the source to the build box).
   until restart (plain ffmpeg + loudnorm does the same; loudnorm is the fleet default -af, so 1.2.x is exposed too). A
   decoded float frame above +18 dBFS or non-finite is now muted (timing kept, the damage shows as silence) and counted
   as damaged audio; `[PTV-ADEC] … impossible samples … muted`. Found by the first gate with loudnorm in the prod mode.
+- **No AAC hole at a source audio format switch (T-083).** The 0.23 s hole (every build since pre9.3) came from three
+  losses at the rebuild: the 5 frames confirming the new format were dropped, the old filter graph was freed without
+  draining, and a real 0.15 s source gap at the splice had no history in the rebuilt graph for aresample to pad. The
+  confirming frames are now held and fed to the rebuilt path, the old graph is drained and cut at the real content end,
+  and a source gap at the switch (≤ 2 s) is filled with silence. Standard graph: no hole; loudnorm graphs: 0.055 s left —
+  inside loudnorm's own EOF flush (its buffered tail comes out with a 54.7 ms timestamp jump, probed).
 - T-077 rest: the copied AC-3 −40 ms tick after a BURST rejoin is gone (sync_ac3_stop_10 std + vt: AC-3 0.0 ms) —
   resolved along the way by the pre9.4 copy changes.
 - Harness: `T056_PROD=1` now runs the fleet loudnorm chain (it ran the old compressor chain — the prod gate never
