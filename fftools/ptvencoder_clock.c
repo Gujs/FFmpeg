@@ -1548,7 +1548,7 @@ void *output_thread(void *arg)
                     "[PTV-DIAG] t=%.1fs dec=%"PRId64" vcorrupt=%"PRId64" emitted=%"PRId64
                     " muxed=%"PRId64" dup=%"PRId64" pd=%"PRId64" framedrop=%"PRId64" vq=%d frameq=%d muxq=%d gpps=%d/%d gov=%d%s genlock=%d rate=%+.0fppm wucr_rho=%+.0fppm cf=%+.0fppm/%d\n",
                     (nowd - diag_t0) / 1000000.0, *v->dbg_dec_frames, *v->dbg_vcorrupt, v->emitted,
-                    g_muxed, v->dup, v->pd, v->framedrop,
+                    g_muxed, v->dup, v->pd, v->framedrop_src ? *v->framedrop_src : v->framedrop,
                     av_thread_message_queue_nb_elems(v->dbg_video_q),
                     av_thread_message_queue_nb_elems(v->frame_q),
                     av_thread_message_queue_nb_elems(v->mux_q),
@@ -1724,7 +1724,7 @@ void *output_thread(void *arg)
                     "dup=%"PRId64" pd=%"PRId64" drop=%"PRId64" corrupt=%"PRId64" "
                     "async=%+"PRId64"ppm%s%s%s%s%s%s%s%s%s%s%s%s\n",
                     v->emitted, fps, hh, mm, ss,
-                    v->dup, v->pd, v->framedrop, cr, aw, dlv, wu, bk, cfs, aco, rsl, crs, cvs, rsn, ccs, srcs, afs);
+                    v->dup, v->pd, v->framedrop_src ? *v->framedrop_src : v->framedrop, cr, aw, dlv, wu, bk, cfs, aco, rsl, crs, cvs, rsn, ccs, srcs, afs);
                 stat_last = nows; stat_prev = v->emitted;
             }
         }

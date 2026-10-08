@@ -5,6 +5,14 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## Unreleased (after 2.0.0-pre9.6)
+
+- **The stats line's `drop=` counts again on single input.** Drop-oldest at the frame queue counts into the decode
+  thread's per-rung counter; the single-input stats line and [PTV-DIAG] printed the video context's own counter, which
+  nothing writes — `drop=0` on every single-input channel whatever happened (found while localizing the 0.84 s start
+  step on the T-084 media: 20 frames dropped, `drop=0` shown; now `drop=20`). Multiview unchanged (it already printed
+  the right counter).
+
 ## 2.0.0-pre9.6 — lip sync after a flapping source (T-075), honest lipsync= after holds, no wire pause at an audio stall (T-085)
 
 - **The video delivery hold keeps its latency through an audio stall (T-085 follow-up).** pre9.5.1 floored stall

@@ -840,6 +840,8 @@ typedef struct VideoCtx {
     int64_t         *dbg_disc_resid;                 /* 0.9.18.7: input-0 LAYERA hs-residue ledger (hsres= on the stats line) */
     /* counters */
     int64_t          framedrop, emitted, dup, pd;   /* pd = intentional cadence holds (telecine residence), split from dup (health alarm) */
+    const int64_t   *framedrop_src;  /* 2.0.0-pre9.6: single input — the decode thread's drop-oldest count for this rung
+                                      * (push_frame_q counts there; VideoCtx->framedrop was never written: drop= read 0) */
     int64_t          decim;          /* v0.9.15.2: surplus frames decimated by content mapping (>house-rate source) */
     /* watchdog */
     int64_t          last_emit_us;

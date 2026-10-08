@@ -5498,6 +5498,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
     for (r = 0; r < n_rung; r++) {
         VideoCtx *vc = &rung[r].vc;
         vc->frame_q = rung[r].frame_q; vc->mux_q = rung[r].mux_q; vc->venc = rung[r].venc;
+        if (n_input == 1)
+            vc->framedrop_src = &inputs[0].dc.framedrop[r];
         vc->gate = delivery_on ? &rung[r].gate : NULL;   /* §7.5a: this rung's delivery-alignment FIFO */
         vc->out_tb = filtering ? av_buffersink_get_time_base(vsink[r]) : inputs[0].ist_tb;
         vc->tick_dur_us = av_rescale(1000000, out_fps.den, out_fps.num);
