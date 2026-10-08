@@ -1378,6 +1378,8 @@ typedef struct PassStream {
     int64_t    sil_dur;               /* its duration (in_tb) */
     int64_t    arr_wc;                /* wall us of the last real packet */
     int64_t    real_end;              /* last real packet's dts + duration (in_tb, output domain) */
+    int64_t    absent_wc;             /* 2.0.0-pre9.6: first video-flowing look at a track with no packet yet (µs) */
+    int        start_fill;            /* 2.0.0-pre9.6: filling a track absent since the start (follows the video output) */
     int64_t    hs_real;               /* house_skew (us) that packet was stamped with */
     int64_t    dup_real;              /* 2.0.0-pre9.4 (T-083): g_dup_out_us when that packet was stamped */
     int64_t    fill_end;              /* end of the replayed silence (in_tb); NOPTS = no fill */
