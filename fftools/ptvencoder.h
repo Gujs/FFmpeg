@@ -283,6 +283,7 @@ typedef struct VOutRing {
     int64_t          src[PTV_VRING];   /* absolute source pts of the displayed content (us) */
     int64_t          out[PTV_VRING];   /* output time that content was emitted at (us, output-PTS axis) */
     int64_t          n;                /* total writes (monotonic); newest index = (n-1) % PTV_VRING */
+    int64_t          seg_wc;           /* 2.0.0 T-089: wall time the current content segment started (multiview; 0 = never reset) */
     pthread_mutex_t  lock;
 } VOutRing;
 /* ===================== 1.0.1-pre9 — PASSIVE residual lip-sync SENSOR =====================
@@ -740,6 +741,8 @@ typedef struct PtvTsOutlier {
     int64_t pend_last;      /* a backward step was absorbed: the raw ts before it (AV_NOPTS_VALUE = none) */
     int64_t pend_dw;        /* ... what it added to wrap_off */
     int64_t pend_dprog;     /* ... and to prog_off (video) */
+    int64_t fx_base;        /* 2.0.0 T-088: raw ts before a flowed forward excursion (one corrupt PES = several packets) */
+    int     fx_n;           /* ... packets since it (the excursion packet = 1); 0 = none / expired */
 } PtvTsOutlier;
 
 typedef struct DecodeCtx {
@@ -840,6 +843,8 @@ typedef struct VideoCtx {
     int64_t         *dbg_disc_resid;                 /* 0.9.18.7: input-0 LAYERA hs-residue ledger (hsres= on the stats line) */
     /* counters */
     int64_t          framedrop, emitted, dup, pd;   /* pd = intentional cadence holds (telecine residence), split from dup (health alarm) */
+    const int64_t   *framedrop_src;  /* 2.0.0-pre9.6: single input — the decode thread's drop-oldest count for this rung
+                                      * (push_frame_q counts there; VideoCtx->framedrop was never written: drop= read 0) */
     int64_t          decim;          /* v0.9.15.2: surplus frames decimated by content mapping (>house-rate source) */
     /* watchdog */
     int64_t          last_emit_us;
@@ -1705,6 +1710,7 @@ typedef struct DemuxArgs {
     int64_t               src_pend_w, src_pend_raw; /* 2.0.0-pre3: its wall gap; the last pre-gap DTS */
     int64_t               src_gap_pending;  /* 2.0.0-pre4: a hold's arrival gap awaiting its rejoin class */
     int64_t              *tail_gap_us;      /* 2.0.0-pre4c: per stream, wall gap of the last packet if it was a gapped PES tail */
+    int64_t              *tail_wc_us;       /* 2.0.0 T-089: per stream, wall time that carry was taken (bounds a multi-packet tail) */
     int                   src_gap_class;    /* 2.0.0-pre4: class known before the gap was counted: 1 BURST, 2 other */
     PtvDiscBuf           *disc;           /* legacy-0004 buffer-classify-discard (g_layera only; NULL otherwise) */
     int64_t               video_fwd_us;   /* wall-clock (us) of the last VIDEO forward-discontinuity crossing (whole-program-splice indicator) */
@@ -1813,6 +1819,7 @@ typedef struct Input {
     int64_t              *wall_cad_us;       /* 1.0.1-pre24 #63: per-stream delivery-cadence EMA storage */
     int64_t              *pkt_wall_gap_us;   /* 1.0.1-pre24 #63: per-stream current-pkt wall-gap storage */
     int64_t              *tail_gap_us;       /* 2.0.0-pre4c: per-stream PES-tail wall-gap carry */
+    int64_t              *tail_wc_us;        /* 2.0.0 T-089: per-stream carry wall time */
     PtvDiscBuf            disc;              /* legacy-0004 buffer-classify-discard state (used only when g_layera) */
     /* 1.0.1-pre5 shared-flush expected-step handshake storage (D1) — one slot per GLOBAL
      * transcoded track index (only the tracks sourced from this input are wired). Demux thread

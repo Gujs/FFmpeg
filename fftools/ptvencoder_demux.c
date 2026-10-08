@@ -2038,9 +2038,21 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                 int64_t *tg = &d->tail_gap_us[pkt->stream_index];
                 if (*tg && pg < *tg) {
                     d->pkt_wall_gap_us[pkt->stream_index] = *tg + pg;
-                    *tg = 0;
-                } else
+                    /* 2.0.0 T-089 (measured, MV slot rejoin): a cut can leave TWO pre-gap tail frames — the second
+                     * one took the carry and the jump packet after it read a 60 ms gap: video W = 0, the flush
+                     * refused, video erased the hole while audio kept it (audio 51 s late). Packets still on the
+                     * old timeline (forward, under the 1 s jump bar) within 1 s of the gap pass the carry on. */
+                    if (d->tail_wc_us && wall_now - d->tail_wc_us[pkt->stream_index] < 1000000 &&
+                        last != AV_NOPTS_VALUE && raw > last &&
+                        av_rescale_q(raw - last, st->time_base, AV_TIME_BASE_Q) <= PTV_DISC_THRESHOLD_US)
+                        *tg += pg;
+                    else
+                        *tg = 0;
+                } else {
                     *tg = pg >= g_gap_min_us ? pg : 0;
+                    if (*tg && d->tail_wc_us)
+                        d->tail_wc_us[pkt->stream_index] = wall_now;
+                }
             }
             if (d->wall_cad_us && pg > 5000 && pg < 2000000) {
                 if (!d->wall_cad_us[pkt->stream_index])
@@ -2072,8 +2084,18 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                 }
                 ol->pend_last = AV_NOPTS_VALUE;
             }
-            if (ol && delta > 0 && delta <= av_rescale(250, st->time_base.den, (int64_t)st->time_base.num * 1000))
+            if (ol && delta > 0 && delta <= av_rescale(250, st->time_base.den, (int64_t)st->time_base.num * 1000) &&
+                (!ol->nom || delta <= 2 * ol->nom))   /* T-088: an excursion is not a normal step */
                 ol->nom = ol->nom ? ol->nom + (delta - ol->nom) / 8 : delta;   /* the normal step */
+            /* 2.0.0 T-088: remember a forward excursion under the absorber's 1 s bar (it flows), for 16 packets — a
+             * corrupt PES header shifts every frame lavf splits out of that PES (AC-3: three), so the return to the
+             * old timeline comes several packets later, not on the next one */
+            if (ol && ol->nom > 0 && delta > 2 * ol->nom &&
+                av_rescale_q(delta, st->time_base, AV_TIME_BASE_Q) <= PTV_DISC_THRESHOLD_US) {
+                ol->fx_base = last;
+                ol->fx_n    = 1;
+            } else if (ol && ol->fx_n)
+                ol->fx_n = ol->fx_n < 16 ? ol->fx_n + 1 : 0;
             /* v0.9.16.1 sparse-PID wrap guard: past HALF the wrap period (13.26h @90kHz) of wall
              * silence, the ±half delta heuristic ALIASES both ways — a no-wrap gap >13.26h reads
              * as "late pre-roll" (−2^33 → the PID lands 26.5h in the past and demux_pass drops it
@@ -2126,7 +2148,13 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                 /* DIRECTIONAL (§5.A.1): forward jump must exceed the (large) forward threshold — small
                  * forward frame-drops flow through unabsorbed; backward jump must exceed the (small)
                  * backward threshold — backward jumps still absorb to protect aresample from a stall. */
-                if ((fwd_thresh > 0 && delta > fwd_thresh) || (back_thresh > 0 && delta < -back_thresh)) {
+                /* 2.0.0 T-088: the backward test measures from where this packet was EXPECTED (last + one frame), not
+                 * from last. A both-stream source step of ~100 ms (Racer_Select, stitched FAST source) left video at a raw
+                 * −67 ms (under the bar: decimated + 1 tick hs) while audio's −85 ms crossed and was erased alone →
+                 * audio 85–107 ms late per event until the corrector's dwell. Both now cross and the shared
+                 * first-crosser amount erases them equally. */
+                int64_t bnom = pkt->duration > 0 ? pkt->duration : (ol && ol->nom > 0 ? ol->nom : 0);
+                if ((fwd_thresh > 0 && delta > fwd_thresh) || (back_thresh > 0 && delta - bnom < -back_thresh)) {
                     int64_t thresh  = delta > 0 ? fwd_thresh : back_thresh;
                     int64_t nominal = pkt->duration > 0 ? pkt->duration : thresh / 4;
                     int64_t adj = delta - nominal;
@@ -2138,9 +2166,11 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                      * LAYERA broke its cycle — local, a 2^30-tick bit flip: content dead after the damage). */
                     if (delta < 0 && ol && ol->nom > 0 && ol->last2 != AV_NOPTS_VALUE &&
                         av_rescale_q(-delta, st->time_base, AV_TIME_BASE_Q) <= PTV_DISC_THRESHOLD_US &&   /* >1 s: LAYERA's */
-                        raw - ol->last2 > 0 && raw - ol->last2 <= 3 * ol->nom && last - ol->last2 > 3 * ol->nom) {
-                        av_log(NULL, AV_LOG_WARNING, "[PTV-DISCONT] stream %d: %+"PRId64"ms backward step returns from ONE "
-                               "corrupt forward timestamp — NOT absorbed\n", pkt->stream_index,
+                        ((raw - ol->last2 > 0 && raw - ol->last2 <= 3 * ol->nom && last - ol->last2 > 3 * ol->nom) ||
+                         /* T-088: the same for an excursion several packets long — back on its pre-excursion timeline */
+                         (ol->fx_n && llabs(raw - (ol->fx_base + ol->fx_n * ol->nom)) <= ol->nom))) {
+                        av_log(NULL, AV_LOG_WARNING, "[PTV-DISCONT] stream %d: %+"PRId64"ms backward step returns from a "
+                               "corrupt forward timestamp (one PES) — NOT absorbed\n", pkt->stream_index,
                                av_rescale_q(delta, st->time_base, (AVRational){1,1000}));
                         goto absorb_done;
                     }

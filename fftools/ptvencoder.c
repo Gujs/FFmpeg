@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.0-pre9.6"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.0-pre9.7"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -980,10 +980,11 @@ void vring_put(VOutRing *r, int64_t src_us, int64_t out_us)
 }
 
 /* nearest-by-content lookup: of all kept entries, return the out_v and matched src of the one
- * whose src is closest to want_src. 0 = found (ring non-empty), -1 = empty. */
+ * whose src is closest to want_src. 0 = found (ring non-empty), -1 = empty (or, 2.0.0 T-089, no
+ * pairing: see below). */
 int vring_lookup(VOutRing *r, int64_t want_src, int64_t *out_v, int64_t *matched_src)
 {
-    int64_t best = INT64_MAX, bo = 0, bs = 0;
+    int64_t best = INT64_MAX, bo = 0, bs = 0, lo = INT64_MAX;
     int found = 0, cnt, i;
     pthread_mutex_lock(&r->lock);
     cnt = r->n < PTV_VRING ? (int)r->n : PTV_VRING;
@@ -991,7 +992,14 @@ int vring_lookup(VOutRing *r, int64_t want_src, int64_t *out_v, int64_t *matched
         int idx = (int)((r->n - 1 - i) % PTV_VRING);
         int64_t d = r->src[idx] - want_src; if (d < 0) d = -d;
         if (d < best) { best = d; bo = r->out[idx]; bs = r->src[idx]; found = 1; }
+        if (r->src[idx] < lo) lo = r->src[idx];
     }
+    /* 2.0.0 T-089: for 10 s after a multiview slot's ring restarted on a new content segment, audio
+     * content more than 1 s older than the whole segment has no video to pair with — it is the silence
+     * that bridged the outage, drained in a burst. Extrapolating it read −0.8 s and the PLL dropped
+     * 639 ms of real audio right after the return (audio ~150 ms early for a minute). */
+    if (found && r->seg_wc && want_src < lo - 1000000 && av_gettime_relative() - r->seg_wc < 10000000)
+        found = 0;
     pthread_mutex_unlock(&r->lock);
     if (found) { *out_v = bo; *matched_src = bs; }
     return found ? 0 : -1;
@@ -4825,9 +4833,10 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         inputs[k].wall_cad_us     = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].wall_cad_us));     /* pre24 #63: cadence EMA */
         inputs[k].pkt_wall_gap_us = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].pkt_wall_gap_us)); /* pre24 #63: current-pkt gap */
         inputs[k].tail_gap_us     = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].tail_gap_us));     /* 2.0.0-pre4c: PES-tail carry */
+        inputs[k].tail_wc_us      = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].tail_wc_us));      /* 2.0.0 T-089 */
         inputs[k].ts_outl         = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].ts_outl));         /* 2.0.0-pre9.2 (T-080 B) */
         if (!inputs[k].wrap_off || !inputs[k].wrap_last || !inputs[k].wrap_wall_last || !inputs[k].edit_us || !inputs[k].gap_vsnap ||
-            !inputs[k].wall_cad_us || !inputs[k].pkt_wall_gap_us || !inputs[k].tail_gap_us || !inputs[k].ts_outl) { ret = AVERROR(ENOMEM); goto end; }
+            !inputs[k].wall_cad_us || !inputs[k].pkt_wall_gap_us || !inputs[k].tail_gap_us || !inputs[k].tail_wc_us || !inputs[k].ts_outl) { ret = AVERROR(ENOMEM); goto end; }
         for (si = 0; si < (int)inputs[k].ifmt->nb_streams; si++) {
             inputs[k].wrap_last[si] = AV_NOPTS_VALUE;
             inputs[k].ts_outl[si].last2 = inputs[k].ts_outl[si].pend_last = AV_NOPTS_VALUE;
@@ -5498,6 +5507,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
     for (r = 0; r < n_rung; r++) {
         VideoCtx *vc = &rung[r].vc;
         vc->frame_q = rung[r].frame_q; vc->mux_q = rung[r].mux_q; vc->venc = rung[r].venc;
+        if (n_input == 1)
+            vc->framedrop_src = &inputs[0].dc.framedrop[r];
         vc->gate = delivery_on ? &rung[r].gate : NULL;   /* §7.5a: this rung's delivery-alignment FIFO */
         vc->out_tb = filtering ? av_buffersink_get_time_base(vsink[r]) : inputs[0].ist_tb;
         vc->tick_dur_us = av_rescale(1000000, out_fps.den, out_fps.num);
@@ -5591,6 +5602,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         d->wall_cad_us     = inputs[kk].wall_cad_us;     /* pre24 #63: delivery-cadence EMA */
         d->pkt_wall_gap_us = inputs[kk].pkt_wall_gap_us; /* pre24 #63: current-pkt wall gap */
         d->tail_gap_us     = inputs[kk].tail_gap_us;     /* 2.0.0-pre4c: PES-tail carry */
+        d->tail_wc_us      = inputs[kk].tail_wc_us;      /* 2.0.0 T-089 */
         d->rsync_slot = kk;                             /* pre16: EVERY input publishes its ledgers to g_rsx,
                                                          * video keyed by this slot (was single-input-only) */
         d->shed_wall = &inputs[kk].shed_wall;           /* pre16: per-input self-shed stamp */
@@ -5820,6 +5832,7 @@ end:
         av_freep(&inputs[k].wall_cad_us);       /* pre24 #63 */
         av_freep(&inputs[k].pkt_wall_gap_us);   /* pre24 #63 */
         av_freep(&inputs[k].tail_gap_us);       /* 2.0.0-pre4c */
+        av_freep(&inputs[k].tail_wc_us);        /* 2.0.0 T-089 */
         av_dict_free(&inputs[k].da.reopen_opts);   /* pre17 R1 */
         ptv_disc_free(&inputs[k].disc);   /* legacy-0004 buffer (no-op if never inited) */
         if (inputs[k].ifmt) avformat_close_input(&inputs[k].ifmt);

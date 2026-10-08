@@ -5,6 +5,35 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre9.7 — multiview slot rejoin keeps its audio (T-089), both-stream backward step erased on both (T-088), stats drop= on single input
+
+- **The stats line's `drop=` counts again on single input.** Drop-oldest at the frame queue counts into the decode
+  thread's per-rung counter; the single-input stats line and [PTV-DIAG] printed the video context's own counter, which
+  nothing writes — `drop=0` on every single-input channel whatever happened (found while localizing the 0.84 s start
+  step on the T-084 media: 20 frames dropped, `drop=0` shown; now `drop=20`). Multiview unchanged (it already printed
+  the right counter).
+
+- **A multiview slot that comes back after a long outage on a new timeline has its audio back with the picture
+  (T-089).** Daily on MV_2x2_RAV (RAV restarts at PTS 0 after ~24 h, read as the 33-bit wrap): the slot's picture
+  returned but its audio stayed off for ~50 s — the A/V pairing for the PLL still held the slot's pre-outage video, so
+  it read the returning audio as 50+ s early and padded the outage a second time (then dropped ~55 s of real audio).
+  Three fixes, multiview only for the first and last: the pairing ring restarts when the slot's content steps by more
+  than 2 s; a cut that leaves two old frames before the new timeline no longer loses the outage's wall-clock evidence
+  (the second old frame took it, so video erased the hole while audio kept it: audio 51 s late); and for 10 s after a
+  restart, audio older than the returned video by more than 1 s (the silence that bridges the outage, drained in a
+  burst) is not paired. Local fixture: pre9.6 audio +51 s late → returns on the same frame, +7 ms 10 s later; a
+  −130…−220 ms residual 10–30 s after the return is the compositor's post-return re-delay (T-091, 2.1). Live 1.2.x logs
+  show the same mechanism.
+
+- **A source that steps both audio and video back ~100 ms keeps its lip sync (T-088).** Racer_Select's stitched
+  source backs both streams up at content boundaries (43–84 times a day). Video's step measured from the previous
+  packet was only −67 ms, under the 80 ms backward bar, so only audio was re-based: audio 85–107 ms late per event,
+  stacking until the corrector's 5-minute dwell. The backward test now measures from where the packet was expected
+  (one frame after the previous one), so both streams cross and the shared amount is erased on both. Fixture
+  `sync_bstep` (three −120 ms both-stream steps): pre9.6 +360 ms late → 0.0 ms. The wider test also caught the return
+  from a corrupt PES timestamp that lavf had split into three AC-3 frames (copied AC-3 +91 ms on the bit-flip fixture);
+  the one-packet outlier rule now also recognizes a return to the pre-excursion timeline up to 16 packets later.
+
 ## 2.0.0-pre9.6 — lip sync after a flapping source (T-075), honest lipsync= after holds, no wire pause at an audio stall (T-085)
 
 - **The video delivery hold keeps its latency through an audio stall (T-085 follow-up).** pre9.5.1 floored stall
