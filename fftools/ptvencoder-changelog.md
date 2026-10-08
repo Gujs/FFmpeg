@@ -5,7 +5,7 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
-## Unreleased (after 2.0.0-pre9.6)
+## 2.0.0-pre9.7 — multiview slot rejoin keeps its audio (T-089), both-stream backward step erased on both (T-088), stats drop= on single input
 
 - **The stats line's `drop=` counts again on single input.** Drop-oldest at the frame queue counts into the decode
   thread's per-rung counter; the single-input stats line and [PTV-DIAG] printed the video context's own counter, which
