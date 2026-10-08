@@ -741,6 +741,8 @@ typedef struct PtvTsOutlier {
     int64_t pend_last;      /* a backward step was absorbed: the raw ts before it (AV_NOPTS_VALUE = none) */
     int64_t pend_dw;        /* ... what it added to wrap_off */
     int64_t pend_dprog;     /* ... and to prog_off (video) */
+    int64_t fx_base;        /* 2.0.0 T-088: raw ts before a flowed forward excursion (one corrupt PES = several packets) */
+    int     fx_n;           /* ... packets since it (the excursion packet = 1); 0 = none / expired */
 } PtvTsOutlier;
 
 typedef struct DecodeCtx {

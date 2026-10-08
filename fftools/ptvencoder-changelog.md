@@ -25,6 +25,15 @@ the v2 `0001` patch (additive, travels with the source to the build box).
   −130…−220 ms residual 10–30 s after the return is the compositor's post-return re-delay (T-091, 2.1). Live 1.2.x logs
   show the same mechanism.
 
+- **A source that steps both audio and video back ~100 ms keeps its lip sync (T-088).** Racer_Select's stitched
+  source backs both streams up at content boundaries (43–84 times a day). Video's step measured from the previous
+  packet was only −67 ms, under the 80 ms backward bar, so only audio was re-based: audio 85–107 ms late per event,
+  stacking until the corrector's 5-minute dwell. The backward test now measures from where the packet was expected
+  (one frame after the previous one), so both streams cross and the shared amount is erased on both. Fixture
+  `sync_bstep` (three −120 ms both-stream steps): pre9.6 +360 ms late → 0.0 ms. The wider test also caught the return
+  from a corrupt PES timestamp that lavf had split into three AC-3 frames (copied AC-3 +91 ms on the bit-flip fixture);
+  the one-packet outlier rule now also recognizes a return to the pre-excursion timeline up to 16 packets later.
+
 ## 2.0.0-pre9.6 — lip sync after a flapping source (T-075), honest lipsync= after holds, no wire pause at an audio stall (T-085)
 
 - **The video delivery hold keeps its latency through an audio stall (T-085 follow-up).** pre9.5.1 floored stall
