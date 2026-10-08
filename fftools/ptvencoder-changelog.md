@@ -5,6 +5,17 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre9.8 — a video-only outage keeps the live audio (T-076)
+
+- **Audio carries on unchanged while only the video is gone (T-076, psi_only class).** A source that keeps sending PSI
+  and audio but no video (video PID gone 40 s): pre9.7 stretched the live audio behind the repeated picture (house_skew
+  +34 s, a 22 s audio delivery hold), lip sync was gone for ~23 s after the picture returned and the backlog was then
+  cut (3–5 s silent); the no-video read cut also reopened the input at 30 s although audio was flowing (~10 s of audio
+  lost). Now the repeats do not move the audio and the input is not reopened while audio arrives (spec §5.1: after
+  2 × -lost_after). Fixture `sync_vnull_40`: lip sync 0.1 ms from the picture's return, audio continuous throughout.
+  Residual: at the return the video catches up 2.1 s (its cushion) and the audio skips the same 2.1 s of content.
+  `PTV_NO_VO_HOLD=1` reverts.
+
 ## 2.0.0-pre9.7 — multiview slot rejoin keeps its audio (T-089), both-stream backward step erased on both (T-088), stats drop= on single input
 
 - **The stats line's `drop=` counts again on single input.** Drop-oldest at the frame queue counts into the decode
