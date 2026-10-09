@@ -254,6 +254,10 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
         house_us = v->out_fps.num > 0
                  ? av_rescale(idx, 1000000LL * v->out_fps.den, v->out_fps.num)
                  : idx * v->tick_dur_us;
+        /* 2.0.0 T-095: on the video's display axis, not the bare content index (single input; the mosaic
+         * compositor does not publish it and keeps the content-index stamp) */
+        if (!v->passthrough)
+            house_us += atomic_load_explicit(&g_vdisp_skew_us, memory_order_relaxed);
     }
     /* TEST ONLY (PTV_CCTEST_REBASE_AT_S — see the declaration). Emit a 5s window of stamps
      * shifted 30s FORWARD, then stop shifting. Because those packets really are muxed at the
@@ -1345,6 +1349,12 @@ void *output_thread(void *arg)
             if (v->is_master && v->house_skew && content_vpts >= 0)   /* against RAW content: −rejoin map (pre6.1) */
                 *v->house_skew = (vpts - content_vpts - held_extra - vo_extra) * v->tick_dur_us -
                                  (src_ts != AV_NOPTS_VALUE ? ptv_rj_off(av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q)) : 0);
+            /* 2.0.0 T-095: how far the master shows content past its content index (dups / a BURST rejoin keep this;
+             * 0 in steady state). Captions are stamped from the content index, so they need the same offset or they
+             * fall behind the video (Racer_Select 2026-10-09: +53 s after two BURST rejoins, every caption dropped by
+             * [PTV-MUXGUARD] as a backward subtitle dts — subtitles gone on air). */
+            if (v->is_master && fresh && content_vpts >= 0)
+                atomic_store_explicit(&g_vdisp_skew_us, (vpts - content_vpts) * v->tick_dur_us, memory_order_relaxed);
             if (v->is_master) {        /* 2.0.0-pre6.1: the house position the decode thread maps a rejoin onto */
                 atomic_store_explicit(&g_house_out_us, v->out_fps.num > 0
                                       ? av_rescale(vpts, 1000000LL * v->out_fps.den, v->out_fps.num)
