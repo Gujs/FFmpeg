@@ -207,6 +207,7 @@ _Atomic int64_t g_vskip_from_us;
 _Atomic int64_t g_rj_off_total, g_rj_off_before, g_rj_from_us;   /* 2.0.0-pre6.1 rejoin map */
 _Atomic int     g_rj_epoch;
 _Atomic int64_t g_house_out_us, g_house_tick_us;
+_Atomic int64_t g_vdisp_skew_us;   /* 2.0.0 T-095: master: (vpts - content index) of the last fresh frame, us */
 _Atomic int64_t g_dup_out_us;   /* 2.0.0-pre9.4 (T-083): output time on ticks whose content did not advance */
 int             g_rejoin_map = 1;
 int             g_vo_hold = 1;   /* 2.0.0-pre9.8 (T-076): audio keeps its own clock while only the video is gone; PTV_NO_VO_HOLD=1 off */

@@ -1962,6 +1962,7 @@ extern _Atomic int64_t g_vskip_from_us;    /* latest skip boundary on the source
 extern _Atomic int64_t g_rj_off_total, g_rj_off_before, g_rj_from_us;
 extern _Atomic int     g_rj_epoch;
 extern _Atomic int64_t g_house_out_us, g_house_tick_us;   /* master: last emitted vpts on the output axis, tick */
+extern _Atomic int64_t g_vdisp_skew_us;  /* 2.0.0 T-095: where the master put the last fresh frame vs its content index */
 extern _Atomic int64_t g_dup_out_us;     /* master: output time on ticks whose content did not advance (hold fills' clock) */
 extern int             g_rejoin_map;       /* PTV_NO_REJOIN_MAP=1 off */
 extern int             g_vo_hold;          /* 2.0.0-pre9.8 (T-076), PTV_NO_VO_HOLD=1 off */
