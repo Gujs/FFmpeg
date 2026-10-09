@@ -1061,7 +1061,11 @@ typedef struct AudioState {
      * RAW label domain (pre-glue, pre-AVLOCK) so LAYERA/house_skew actuation never looks like a
      * source step. glue_off_us accumulates erased relabels and is added to every graph-input pts. */
     int64_t          glue_off_us;                     /* cumulative relabel offset applied to input labels (us) */
-    int64_t          glue_raw_last_us;                /* last RAW in-pts (us); NOPTS until first frame */
+    int64_t          mv_hold_us;                      /* 2.0.0 T-093: the part of glue_off that continued labels over a
+                                                       * multiview slot fill (a hold, not content — out of the PLL pairing) */
+    int64_t          mvf_lo_us, mvf_hi_us;            /* T-093: door span of the last multiview fill phase (+ its pad) */
+    int              mvf_open;                        /* T-093: a fill phase is feeding the door */
+    int64_t          glue_raw_last_us;              /* last RAW in-pts (us); NOPTS until first frame */
     int64_t          glue_raw_dur_us;                 /* its frame span (us) */
     int64_t          glue_wall_last_us;               /* monotonic wall time of the previous fed frame */
     int64_t          hf_hs_real, hf_dup_real;         /* 2.0.0-pre9.4 (T-083): house_skew + g_dup_out_us at that frame */

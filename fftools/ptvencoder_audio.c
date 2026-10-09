@@ -2328,8 +2328,10 @@ static int audio_drain_fg(AudioState *a)
                 if (!(a->multiview && g_audio_follow) && a->house_skew)
                     content -= *a->house_skew + a->corr.corr_us;
                 else if (a->multiview && g_audio_follow && g_avsync_pll)
-                    content -= a->af_steer_us + a->corr.corr_us;
-                if (vring_lookup(a->vring, content, &out_v, &msrc) == 0) {
+                    content -= a->af_steer_us + a->corr.corr_us + a->mv_hold_us;   /* T-093: a fill hold is not content */
+                if (!(a->multiview && a->mvf_hi_us > a->mvf_lo_us &&             /* T-093: fill phase frames carry no */
+                      src_abs_us >= a->mvf_lo_us && src_abs_us < a->mvf_hi_us) &&  /* content to pair */
+                    vring_lookup(a->vring, content, &out_v, &msrc) == 0) {
                     int64_t vlag   = out_v    - (msrc    - h0_us);   /* video realized output − content (at msrc) */
                     int64_t alag   = out_a_us - (content - h0_us);   /* audio realized output − content (at content) */
                     int64_t paird  = msrc - content;                 /* pairing residual: msrc and content differ when the
@@ -3147,6 +3149,23 @@ static int audio_feed(AudioState *a, AVFrame *frame)
             }
             if (a->glue_raw_last_us != AV_NOPTS_VALUE) {
                 int64_t step = raw_us - (a->glue_raw_last_us + a->glue_raw_dur_us);
+                /* 2.0.0 T-093 part 2: a multiview slot's silence fill (the compositor drives it while the slot's source is
+                 * gone) advances the labels with wall time. A source that comes back where it stopped (a restart the
+                 * discontinuity layer maps onto the old timeline, a pause) then arrives that far BEHIND the fill: the fill
+                 * was a hold — like the cell's repeated picture — not content. Continue the labels at the fill's end
+                 * (glue_off: the door stays continuous, the R sensor removes it as an edit) and keep the hold out of the
+                 * PLL's content pairing (mv_hold_us), so the audio reads delayed by the outage exactly as its picture is.
+                 * Before: the step went to the discontinuity layer, the PLL padded the outage again (kill_return_20:
+                 * ACQUIRE pad 19 s, audio PID dark 20 s after the return, lip sync −0.8 s for 25 s). A source that
+                 * lost the outage (labels +gap) resumes at or after the fill's end and keeps the pad-the-rest rule. */
+                if (fill_resumed && step < 0 && a->multiview && g_audio_follow && g_avsync_pll) {
+                    a->glue_off_us += -step;
+                    a->mv_hold_us  += -step;
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-ADISC] a%d(in%d) source resumed %"PRId64" ms behind the slot's silence fill "
+                           "— the fill was a hold: labels continue at its end (glue %+"PRId64"ms)\n",
+                           a->dbg_k, a->dbg_in, -step / 1000, a->glue_off_us / 1000);
+                    step = 0;
+                }
                 if (llabs(step) > (int64_t)g_aglue_ms * 1000) {
                     int64_t wall_gap = now_wc - a->glue_wall_last_us;
                     /* 1.0.1-pre5 (D1) shared-flush expected-step handshake: the demux flush
@@ -3629,6 +3648,21 @@ static int audio_feed(AudioState *a, AVFrame *frame)
          * mis-sized bus term). corr_us==0 (default-off / parked-at-zero) skips = byte-inert. */
         if (a->corr.corr_us && frame->pts != AV_NOPTS_VALUE && !a->hold_feeding)
             frame->pts += av_rescale_q(a->corr.corr_us, AV_TIME_BASE_Q, a->ist_tb);
+        /* 2.0.0 T-093 part 2: the door span of a multiview fill phase — its silence plus the pad up to the first real
+         * frame. The PLL's pairing skips frames of that span when they leave the graph (loudnorm holds ~3 s, so they
+         * leave after the slot is back): paired against the returning picture's ring they read +19 s, the noise floor
+         * rose to 4.5 s and the real −1 s offset at the return was never acquired (sync_gap_20). */
+        if (a->multiview && g_audio_follow && g_avsync_pll && frame->pts != AV_NOPTS_VALUE) {
+            int64_t door_us = av_rescale_q(frame->pts, a->ist_tb, AV_TIME_BASE_Q);
+            if (a->nbs_feeding) {
+                if (!a->mvf_open) { a->mvf_open = 1; a->mvf_lo_us = door_us; }
+                a->mvf_hi_us = door_us + (frame->sample_rate > 0 ?
+                               av_rescale(frame->nb_samples, 1000000, frame->sample_rate) : 0);
+            } else if (a->mvf_open) {
+                a->mvf_open  = 0;
+                a->mvf_hi_us = door_us;
+            }
+        }
         /* 1.0.1-pre3 [PTV-ACOMP] — swr hard-compensation proxy (always-on, log rate-limited to
          * ~1/10s per track). aresample=async realizes a graph-input pts step beyond
          * min_hard_comp (~30ms in the production chain) as an INSTANTANEOUS sample insert/drop
