@@ -3728,6 +3728,8 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                 if (!(c = av_packet_clone(out))) continue;
                 d->apkt++;
                 d->a_arr_us[k] = av_gettime_relative();   /* 2.0.0-pre6: absence trigger */
+                if (d->single)
+                    atomic_store_explicit(&g_src_aread_wc, d->a_arr_us[k], memory_order_relaxed);
                 /* 1.0.1-pre8 (a): audio overflow sheds whole frames OLDEST-first (audio frames
                  * are independent — no GOP structure). The old drop-NEWEST pinned the stalest
                  * content in the queue; keeping the freshest drains latency instead. */
