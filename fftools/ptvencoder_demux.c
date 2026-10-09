@@ -2637,12 +2637,6 @@ int ptv_src_interrupt(void *opaque)
     if (!atomic_load_explicit(&g_src_icb_armed, memory_order_relaxed))
         return 0;
     vr = atomic_load_explicit(&g_src_vread_wc, memory_order_relaxed);
-    if (g_vo_hold) {   /* 2.0.0-pre9.8 (T-076): audio still being read = not a blocked read — the 2 x -lost_after rule
-                        * owns a video-only outage (spec §5.1); this cut reopened at 30 s and lost the audio for ~10 s */
-        int64_t ar = atomic_load_explicit(&g_src_aread_wc, memory_order_relaxed);
-        if (ar && av_gettime_relative() - ar < 2000000)
-            return 0;
-    }
     return vr && av_gettime_relative() - vr > g_lost_after_us;
 }
 
@@ -3734,8 +3728,6 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                 if (!(c = av_packet_clone(out))) continue;
                 d->apkt++;
                 d->a_arr_us[k] = av_gettime_relative();   /* 2.0.0-pre6: absence trigger */
-                if (d->single)
-                    atomic_store_explicit(&g_src_aread_wc, d->a_arr_us[k], memory_order_relaxed);
                 /* 1.0.1-pre8 (a): audio overflow sheds whole frames OLDEST-first (audio frames
                  * are independent — no GOP structure). The old drop-NEWEST pinned the stalest
                  * content in the queue; keeping the freshest drains latency instead. */

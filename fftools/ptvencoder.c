@@ -209,7 +209,6 @@ _Atomic int     g_rj_epoch;
 _Atomic int64_t g_house_out_us, g_house_tick_us;
 _Atomic int64_t g_dup_out_us;   /* 2.0.0-pre9.4 (T-083): output time on ticks whose content did not advance */
 int             g_rejoin_map = 1;
-int             g_vo_hold = 1;   /* 2.0.0-pre9.8 (T-076): audio keeps its own clock while only the video is gone; PTV_NO_VO_HOLD=1 off */
 _Atomic int     g_vskip_epoch;
 _Atomic int64_t g_vgop_est_us;
 _Atomic int64_t g_vgop_key_wall;
@@ -745,7 +744,6 @@ int64_t         g_lost_after_us = 30000000;
 _Atomic int     g_src_state;
 _Atomic int64_t g_src_hold_start;
 _Atomic int64_t g_src_vread_wc;
-_Atomic int64_t g_src_aread_wc;   /* 2.0.0-pre9.8 (T-076): last transcoded-audio packet read (single input) */
 int             g_src_hold_act;
 _Atomic int64_t g_src_rejoin_wall;
 _Atomic int64_t g_src_fresh_wc;          /* 2.0.0-pre6: wall us of the master's last FRESH frame */
@@ -6515,7 +6513,6 @@ int main(int argc, char **argv)
     if (getenv("PTV_NBS_FILL") && g_glueclass) g_nbs_fill = 1;
     if (getenv("PTV_NO_SRC_FILL")) g_hold_fill = 0;   /* 2.0.0-pre6 kill switch: no fill while holding */
     if (getenv("PTV_NO_COPY_GAPFILL")) g_copy_gapfill = 0;   /* 2.0.0-pre9.4 kill switch */
-    if (getenv("PTV_NO_VO_HOLD")) g_vo_hold = 0;
     if (getenv("PTV_NO_REJOIN_MAP")) g_rejoin_map = 0; /* 2.0.0-pre6.1 kill switch: PTS jumps at a rejoin again */
     { const char *s = getenv("PTV_GLUE_HTOL_PCT");     if (s && atoi(s) > 0) g_glue_htol = atoi(s); }             /* tuning knob (G4) */
     { const char *s = getenv("PTV_PAIR_EXPECT_TTL_US");if (s && atoll(s) > 0) g_pair_ttl_us = atoll(s); }          /* TEST ONLY (G6) */
