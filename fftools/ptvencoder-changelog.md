@@ -5,6 +5,17 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre10 — multiview slot audio through a full slot outage (T-093 part 2)
+
+- **A multiview slot whose source stops altogether keeps its audio on the wire (T-093, part 2).** The slot's audio
+  PID was dark for the whole outage (its demux thread is blocked in the read, so the part-1 fill never ran) and the PLL
+  padded the hole in one burst at the return. The compositor now drives the slot's silence fill (no fresh frame for 1 s,
+  nothing decoded for 2 s). A source that comes back where it stopped (a restart mapped onto the old timeline) continues
+  at the fill's end and the hold stays out of the PLL's content pairing; frames of a fill phase are skipped by the
+  pairing (they leave loudnorm after the return and froze the ACQUIRE of the real return offset). Multiview fixtures vs
+  pre9.9: slot audio dark gap_20 20.5 → 2.4 s, kill_return_20 20.8 + 7.2 → 2.5 + 1.5 s (PLL pad 18.9 → 1.3 s, first
+  lip sync −875 → −180 ms), jump_return_50 51.8 → 2.3 s; single input unchanged.
+
 ## 2.0.0-pre9.9 — subtitles survive a stall that keeps its delay (T-095); multiview slot audio fill (T-093 part 1)
 
 - **Subtitles no longer disappear after a source stall that comes back contiguous (T-095).** Racer_Select (cor-3,

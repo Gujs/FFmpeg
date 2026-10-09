@@ -88,6 +88,7 @@ void *compositor_thread(void *arg)
     int64_t lag_true_us[PTV_MAX_INPUT] = {0}; /* PTV_DIAG: TRUE uncapped signed video lag (output−content); when
                                                * this >> skew_us the 250ms cap is saturating = audio can't follow */
     int      slated[PTV_MAX_INPUT] = {0};     /* slot is/was black-slated (outage) since last fresh frame */
+    int64_t  mv_fill_us[PTV_MAX_INPUT][PTV_MAX_AUDIO] = {{0}};   /* T-093 part 2: last fill sentinel per slot track */
     int64_t res_due_us[PTV_MAX_INPUT] = {0};  /* v0.9.13 residence: house-time the next pop is allowed (0 = immediate) */
     int64_t res_ema_us[PTV_MAX_INPUT];        /* v0.9.13: EMA of content deltas = the slot's smoothed cadence */
     int64_t res_src_us[PTV_MAX_INPUT];        /* v0.9.13: content time (us) of the last popped frame */
@@ -382,6 +383,31 @@ void *compositor_thread(void *arg)
                                                        * any slot is slated (finding 1's condition). */
                 slated[k] = 1;
                 atomic_fetch_or_explicit(&g_mv_slate_mask, 1 << k, memory_order_relaxed);
+            }
+            /* 2.0.0 T-093 part 2: a slot whose source stops altogether (audio AND video) — its demux thread is
+             * blocked in the read, so the per-slot silence fill of part 1 (sent on video packet arrival) never
+             * runs and the slot's audio PID went dark on the wire for the whole outage, then the PLL padded the
+             * hole in one burst at the return (fixture kill_return_20: 21 s dark, ACQUIRE pad 19.3 s). The
+             * compositor keeps ticking: once the cell has shown no fresh frame for 1 s and the track has decoded
+             * nothing for 2 s, it sends the same fill sentinels (the quantum fills the wall time elapsed, so a
+             * sentinel from the demux as well never doubles the silence). PTV_NO_SRC_FILL=1 off. */
+            if (g_hold_fill && g_glueclass && last_fresh_us[k] > 0 && now_us - last_fresh_us[k] > 1000000) {
+                DemuxArgs *da = &c->inputs[k].da;
+                int64_t nw = av_gettime_relative();
+                int j;
+                for (j = 0; j < da->n_audio; j++) {
+                    int g = da->aglobal[j];
+                    int64_t fw = g >= 0 && g < PTV_MAX_AUDIO ? atomic_load_explicit(&g_adec_frame_wc[g], memory_order_relaxed) : 0;
+                    AVPacket *fs;
+                    if (!fw || nw - fw < 2000000 || nw - mv_fill_us[k][j] < g_nbs_quantum_us)
+                        continue;
+                    mv_fill_us[k][j] = nw;
+                    if (!(fs = av_packet_alloc())) continue;
+                    fs->stream_index = da->astream[j];
+                    fs->flags |= PTV_PKT_FLAG_NBS_FILL;
+                    if (av_thread_message_queue_send(da->audio_q[j], &fs, AV_THREAD_MESSAGE_NONBLOCK) < 0)
+                        av_packet_free(&fs);
+                }
             }
             /* Option F (fine half) — per-slot audio skew = the MEASURED output-vs-content
              * offset of the frame this cell actually displays: skew = out_time -
