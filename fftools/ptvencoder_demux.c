@@ -2637,12 +2637,6 @@ int ptv_src_interrupt(void *opaque)
     if (!atomic_load_explicit(&g_src_icb_armed, memory_order_relaxed))
         return 0;
     vr = atomic_load_explicit(&g_src_vread_wc, memory_order_relaxed);
-    if (g_vo_hold) {   /* 2.0.0-pre9.8 (T-076): audio still being read = not a blocked read — the 2 x -lost_after rule
-                        * owns a video-only outage (spec §5.1); this cut reopened at 30 s and lost the audio for ~10 s */
-        int64_t ar = atomic_load_explicit(&g_src_aread_wc, memory_order_relaxed);
-        if (ar && av_gettime_relative() - ar < 2000000)
-            return 0;
-    }
     return vr && av_gettime_relative() - vr > g_lost_after_us;
 }
 
