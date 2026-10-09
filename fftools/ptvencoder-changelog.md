@@ -5,6 +5,19 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre9.9 — subtitles survive a stall that keeps its delay (T-095); multiview slot audio fill (T-093 part 1)
+
+- **Subtitles no longer disappear after a source stall that comes back contiguous (T-095).** Racer_Select (cor-3,
+  2026-10-09): two ~25 s source stalls were rejoined as BURST and kept their repeats as house_skew (+53 s). Captions
+  were stamped from the bare content index, i.e. that far behind the subtitle stream, and the muxer dropped every one
+  as a backward timestamp — only keepalives on air until the restart. Captions now carry the video's own display
+  offset. Fixture `burstjump` on a Newsmax2 capture with `-cc_extract`: 22 dropped caption packets → 0 new ones, no
+  20 s caption gap; on a clean run every caption page is identical to pre9.8.
+- **A multiview slot whose source stops only its audio stays audible on the wire (T-093, part 1).** Grid_2x2
+  (live-transcoder, 2026-10-09 12:26): the slot's audio PID went dead for 4.5 min and sync_check restarted the mosaic.
+  The single-input silence fill (audio absent 2 s while video flows) now runs per slot: dead PID 10.6 s → 2.2 s on the
+  fixture, lip sync unchanged after the return. Still open: a slot whose audio AND video stop.
+
 ## 2.0.0-pre9.8 — a video-only outage keeps the live audio (T-076)
 
 - **Audio carries on unchanged while only the video is gone (T-076, psi_only class).** A source that keeps sending PSI
