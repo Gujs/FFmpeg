@@ -3497,10 +3497,13 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
              * 2 s (measured: above the 1-2 s interleave blips, below the 3 s+ real holes) — the NBS
              * silence fill, default-on: its thread is blocked on an empty audio_q, so this (the live
              * demux thread) sends the sentinels; labels advance with wall time (house_skew is not
-             * moving while video flows). Single input; PTV_NO_SRC_FILL=1 off. Only silence DURING a
+             * moving while video flows). PTV_NO_SRC_FILL=1 off. Only silence DURING a
              * gap-free video run counts: after an input gap the track's last packet is as old as the gap,
-             * and filling there (pre-gap label continuation) stepped the door back by the gap at a rejoin. */
-            if (g_hold_fill && g_glueclass && d->single) {
+             * and filling there (pre-gap label continuation) stepped the door back by the gap at a rejoin.
+             * 2.0.0 T-093: multiview slots too (each slot is its own input) — Grid_2x2 live 2026-10-09: a slot
+             * source stopped its audio while its video flowed, the slot's audio PID went dead on the wire 4.5 min
+             * and sync_check restarted the mosaic (DEAD_AUDIO_TRACK). The copied-track watch stays single input. */
+            if (g_hold_fill && g_glueclass) {
                 int64_t nw = av_gettime_relative();
                 int k;
                 if (!d->v_last_arr_us || nw - d->v_last_arr_us > 1000000)
@@ -3518,7 +3521,7 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                     if (av_thread_message_queue_send(d->audio_q[k], &fs, AV_THREAD_MESSAGE_NONBLOCK) < 0)
                         av_packet_free(&fs);
                 }
-                if (g_copy_gapfill && d->n_pass && !ptv_src_holding())   /* 2.0.0-pre9.4 (T-083) */
+                if (g_copy_gapfill && d->single && d->n_pass && !ptv_src_holding())   /* 2.0.0-pre9.4 (T-083) */
                     copy_gap_watch(d, nw);
             }
             /* 1.0.1-pre10 review fix (rr10 D1): measure THIS input's video arrival rate — the
