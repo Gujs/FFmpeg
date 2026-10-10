@@ -5,6 +5,56 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre11 — subtitles, SCTE-35 and captions on their frames; a pause never leaves delay or pictures without sound
+
+(T-313…T-316 were numbered T-101…T-104 in the first pre11 candidate e87867cf8e; those numbers belong to 1.2.0 items.)
+
+- **Copied subtitles, SCTE-35 cues and CC captions land on their own video frame (T-100, T-314).** They were stamped with
+  the house-vs-content skew of the moment they were read, but their video goes on air one pipeline latency (~3 s)
+  later and the skew moves in between (holds, rejoins, bursts). New timing fixtures (ruler media at 25/29.97/50/59.94
+  with numbered SCTE-35 cues, DVB subtitles and EIA-608 captions) measured on pre10: after a 20 s pause DVB subs
+  +3.9 s and SCTE-35 up to +3.5 s, after flapping subs +0.6 s, after each outage of a double outage ~10 subs pinned up
+  to +9.4 s behind the subtitle PES left open across it; on 6 s bursty input 32 of 47 captions dropped by the mux guard
+  (1.2.2 identical). The master now records where every fresh frame went on air; sparse copies and captions wait until
+  the video has shown their content and take that output time (SCTE-35's pts_adjustment by the same offset). Content
+  never shown (inside a hold, the lone pre-gap tail frame) is dropped instead of misplaced; SCTE-35 is always sent.
+  29.97 VT fixtures: SCTE-35 and DVB subs +0.0 ms in every scenario, teletext at the designed +300 ms, bursty captions
+  47/47. PTV_NO_VMAP=1 reverts.
+- **The first caption after an input stall is on time (T-098).** Keepalives during a stall ran on the wall clock while
+  the output gained ~2 s less; the first caption after the return was bumped behind them (+1.4 s). They now follow the
+  output position.
+- **Copied AC-3 survives a source pause (T-313).** The delivery gate was sized without copied audio and dropped it
+  silently when full (20 s pause: ~51 s of AC-3 lost, 8 of 18 segments without audio). Sized for 300 s per copied
+  track; drops are logged ([PTV-DLV]) and shown as dlvdrop=.
+- **A pause never leaves delay or pictures without sound (T-315; owner rule 2026-10-10: the output delay is pinned).**
+  Bursty input is still absorbed up to the bank ceiling (12 s). A source pause beyond it was kept as delay for good
+  (20 s pause: content age 3.0 → 20.4 s; 45 s: 22.9 s; never drained), and the audio of the sender's catch-up burst was
+  dropped as "during the hold" while its pictures played (5 s pause: 5 s of pictures over silence; 20 s: 21 s). Now
+  the catch-up audio is kept (only when the input came back as a BURST: under heavy loss damaged fragments keep
+  "returning" during a long hold — Cinestar 50 % loss, kept, queued 32 s of audio behind the delivery gate and the
+  channel came back with no sound; they are dropped as before), and a pause that would hold more than the ceiling skips the catch-up to the live content —
+  all streams to one video keyframe, bars a moment longer, picture and sound together. A source that does not catch up
+  within 2 s resumes where it is. Fixtures: 20/45/90 s and two 20 s pauses keep content age at 3.0–3.1 s with no
+  pictures over silence; 5/10 s pauses keep their delay (inside the ceiling) with sound; bursts over 12 s: NOT fixed —
+  repeated runs are bimodal (20 s bursts, 6 runs: 2 with audio dark ~3.5 s, 4 with audio dark 7–10 s and lip sync
+  4–8 s off; one-run figures earlier said 3.3–3.5 s), T-316. Still open: bursty start-up and > 8 s burst structure (T-316), flapping returns. PTV_MAX_DELAY_MS sets the
+  ceiling (0 = keep every pause as delay, as pre10 did).
+- **Captions on their own picture, for their full time (T-318, T-312).** A pop-on caption went on air 300 ms after its
+  picture (the assembly wait, T-096) while its erase went on air on its own frame, so every caption lost 300 ms of
+  screen time (owner: "300 ms less is significant and can influence reading"). The wait only decides when the page is
+  known; the page now takes the output time of the frame it belongs to (pop-on: its EOC; roll-up: its last character).
+  Looking the caption up by "content + 300 ms" also let a caption whose picture went on air just before an outage
+  follow the pre-gap tail frames shown after the hold (+8.3 s); it is now matched to its own frame (and dropped if its
+  moment has passed). v2 timing media 29.97: pop-on captions and erases +0.0 ms in clean, double outage, pause,
+  restart and flapping; screen time = the source. Roll-up +166.8 ms (was +266.6): cc_dec's real-time mode reports the
+  screen at most every 200 ms (T-319). The 1 Hz keepalive (no picture) now stays 500 ms behind the output: stamped
+  ahead of a caption still on its way it pushed that caption one frame late (restart, +41 ms).
+- **No 80 ms lip-sync step after a short source pause (T-317).** The rejoin map compared each returning frame with the
+  very next house tick, but a sender's catch-up burst decodes ~3 s ahead of the output: the ~74th queued frame looked
+  "ahead of the house" and contiguous content was shifted 80 ms (sync_stop_5: sound 80 ms late for 5 s, then a snap;
+  pre10 too). The comparison now uses the tick the frame will actually be shown on (after the frames already queued).
+  Real outages map exactly as before (sync_gap_20 2.20 s, the second of two outages 0.32 s, lip sync 0.0 ms).
+
 ## 2.0.0-pre10 — multiview slot audio through a full slot outage (T-093 part 2)
 
 - **A multiview slot whose source stops altogether keeps its audio on the wire (T-093, part 2).** The slot's audio

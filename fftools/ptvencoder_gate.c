@@ -414,7 +414,13 @@ void dlv_enqueue(DlvGate *g, AVPacket *pkt, int64_t dts_us, int block)
     pthread_mutex_lock(&g->lock);
     while (!g->closed && g->count >= g->maxq) {
         if (!block) {                       /* full + non-blocking → drop this copy packet */
-            atomic_fetch_add_explicit(&g->st_dropped, 1, memory_order_relaxed);
+            int64_t nd = atomic_fetch_add_explicit(&g->st_dropped, 1, memory_order_relaxed) + 1, now = av_gettime_relative();
+            if (nd == 1 || now - g->drop_log_wc >= 60000000) {   /* 2.0.0 T-101: never silent */
+                g->drop_log_wc = now;
+                av_log(NULL, AV_LOG_WARNING, "[PTV-DLV] delivery gate full (%d packets): copied packet dropped "
+                       "(%"PRId64" so far) — its video is %"PRId64" ms behind it\n", g->maxq, nd,
+                       (dts_us - atomic_load_explicit(&g->v_enc_dts_hi, memory_order_relaxed)) / 1000);
+            }
             pthread_mutex_unlock(&g->lock);
             av_packet_free(&pkt);
             return;

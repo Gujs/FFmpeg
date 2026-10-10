@@ -122,6 +122,7 @@ typedef struct DlvGate {
                                          * encoder latency ≈ a few s). Absolute-age cap mis-fired there. */
     /* stats (NFR-OBS) */
     _Atomic int64_t st_hold_us;         /* age of the oldest still-held packet at the last drain */
+    int64_t         drop_log_wc;        /* 2.0.0 T-101: wall us of the last [PTV-DLV] drop line (under lock) */
     _Atomic int64_t st_forced;          /* cap_us-forced releases (encoder latency > cap) */
     _Atomic int64_t st_dropped;         /* non-blocking copy drops on a full FIFO */
     /* ---- §7.5b (1.0.1-pre12) SYMMETRIC gate: the video-side hold (see ptvencoder_gate.c
@@ -650,6 +651,10 @@ typedef struct CcEvent {
     int      deferred;   /* ERASE held by the min-display rule; cclate= counts these in the
                           * EMITTER (after the encode), never here — a queue-full drop or an
                           * already-blank page must not read as a clear that went out */
+    int      vmapped;    /* 2.0.0 T-100: vm_out_us holds the output time the video gave src_us */
+    int64_t  vm_out_us;
+    int64_t  vm_delay_us;  /* 2.0.0 T-318/T-312: src_us = the caption's own frame + this assembly wait; the video
+                            * record is asked for that FRAME and the caption takes its output time (0 = src_us is it) */
 } CcEvent;
 
 /* Decode-thread side. One per input; wired to every input the extraction runs on
@@ -876,6 +881,17 @@ typedef struct CcCtx {
     int64_t          last_dts;                /* house-domain us; strictly-increasing guard */
     int64_t          last_emit_wc;            /* wall clock of the last emitted packet — the
                                                * synthetic-keepalive timer for a frameless input */
+    /* 2.0.0 T-098: how far the last REAL event's stamp led the master's output position
+     * (g_house_out_us) when it was emitted — the pipeline's buffering. A synthetic keepalive
+     * rides the output position plus this lead, so it cannot run ahead of the video. */
+    int64_t          ka_lead_us;
+    int              ka_lead_ok;
+    /* 2.0.0 T-100: captions wait here (cc_thread only) until the video has shown their frame, then take its output time */
+#define PTV_CC_VQ 256
+    CcEvent          vq[PTV_CC_VQ];
+    int64_t          vq_wc[PTV_CC_VQ];
+    int              nvq;
+    int64_t          vq_ok, vq_late, vq_fb, vq_log_wc;
     int64_t          err_log_us;              /* encoder-error log rate limit */
     /* state log (§2 observability): first caption, and the caption-went-quiet transition */
     int              seen_caption;
@@ -1406,6 +1422,13 @@ typedef struct PassStream {
     /* 2.0.0-pre9.4 (T-083): damage while video flows — silent frames put into gaps, overlapping frames dropped */
     int        gap_n, ovl_n;          /* since the last [PTV-SRC] copy damage line */
     int64_t    dmg_log_wc;            /* wall us of that line */
+    /* 2.0.0 T-100: a SPARSE copy (subs, SCTE-35, data) waits here until the video has shown its content, then is
+     * stamped through the video's record (g_vmap; single input; demux thread only) */
+#define PTV_VWAIT_MAX 512
+    AVPacket  *vwait[PTV_VWAIT_MAX];
+    int64_t    vwait_wc[PTV_VWAIT_MAX];
+    int64_t    vwait_po[PTV_VWAIT_MAX];   /* DemuxArgs.prog_off when it arrived (the SCTE-35 rebase term) */
+    int        nvwait;
 } PassStream;
 
 /* ---- legacy-0004 TS-discontinuity buffer (g_layera / PTV_LAYERA, default OFF) ----
@@ -1662,6 +1685,9 @@ typedef struct DemuxArgs {
     int                   sib_jump_gap[2];      /* 2.0.0-pre9.6: that jump was a GAP verdict (labels carry it, content pads) */
     int                   drop;          /* non-blocking + drop on full (network input) */
     PassStream           *pass;          /* copy-passthrough: extra audio, subs, data */
+    int64_t               vm_po;                              /* 2.0.0 T-100: prog_off of the copy being released */
+    int64_t               vm_ok, vm_late, vm_fb, vm_log_wc;   /* 2.0.0 T-100: copies stamped through the video's record /
+                                                               * dropped (content never shown or its moment passed) / old way (queue full) */
     int                   n_pass;
     int64_t              *h0;             /* house origin (us); copy ts rebased onto it */
     pthread_mutex_t      *h0_lock;
@@ -1712,6 +1738,13 @@ typedef struct DemuxArgs {
     int                   src_classified;   /* 2.0.0-pre3: rejoin of the current hold already classified */
     int                   src_pend;         /* 2.0.0-pre3: first post-gap packet (the PES tail) seen */
     int64_t               src_pend_w, src_pend_raw; /* 2.0.0-pre3: its wall gap; the last pre-gap DTS */
+    /* 2.0.0 T-103 (owner 2026-10-10: the output delay is pinned): a pause the burst bank cannot absorb is not kept as
+     * delay — the returning catch-up is skipped up to the live content, all streams to one video keyframe */
+    int                   rj_skip;          /* 1 = dropping until a keyframe at the live point, 2 = cut found: other streams
+                                             * drop what lies before it */
+    int64_t               rj_skip_target, rj_skip_cut, rj_skip_wc, rj_skip_n;
+    int64_t               rj_hs_base;       /* house_skew at the last skip's cut: the delay kept since is house_skew minus it
+                                             * (a skip glues the skipped stretch over, house_skew keeps its repeats) */
     int64_t               src_gap_pending;  /* 2.0.0-pre4: a hold's arrival gap awaiting its rejoin class */
     int64_t              *tail_gap_us;      /* 2.0.0-pre4c: per stream, wall gap of the last packet if it was a gapped PES tail */
     int64_t              *tail_wc_us;       /* 2.0.0 T-089: per stream, wall time that carry was taken (bounds a multi-packet tail) */
@@ -1966,6 +1999,13 @@ extern _Atomic int64_t g_vskip_from_us;    /* latest skip boundary on the source
 extern _Atomic int64_t g_rj_off_total, g_rj_off_before, g_rj_from_us;
 extern _Atomic int     g_rj_epoch;
 extern _Atomic int64_t g_house_out_us, g_house_tick_us;   /* master: last emitted vpts on the output axis, tick */
+/* 2.0.0 T-100: the video's content -> output record (ptvencoder.c) */
+#define PTV_VMAP_N 4096
+extern int g_vmap;
+extern int64_t g_max_delay_us;   /* 2.0.0 T-103: pinned output delay (us; 0 = off) */
+void ptv_vmap_push(int64_t src_us, int64_t out_us);
+int  ptv_vmap_lookup(int64_t c_us, int64_t *out_us, int64_t *gap_us);
+void ptv_copy_vwait(struct DemuxArgs *d);   /* master output thread: release the copies the video has shown */
 extern _Atomic int64_t g_vdisp_skew_us;  /* 2.0.0 T-095: where the master put the last fresh frame vs its content index */
 extern _Atomic int64_t g_dup_out_us;     /* master: output time on ticks whose content did not advance (hold fills' clock) */
 extern int             g_rejoin_map;       /* PTV_NO_REJOIN_MAP=1 off */
@@ -2165,6 +2205,16 @@ static inline int ptv_rj_settled(int cls_seq0, int64_t now)
     case 2:  return atomic_load_explicit(&g_src_jump_wc, memory_order_relaxed) >= rj;
     default: return atomic_load_explicit(&g_src_jump_wc, memory_order_relaxed) >= rj || now - rj > 200000;
     }
+}
+/* 2.0.0 T-315: has the input come back as a BURST (a sender catching up a pause) since cls_seq0? Only then are frames
+ * that arrive while the hold is still on air the returning content. Any other class during a hold is damaged
+ * fragments trickling in (Cinestar 50 % loss: NEW DOMAIN classified 107 s before the picture came back) — the fill
+ * covers their time and they are dropped, as before T-315 (kept, 32 s of audio queued behind the delivery gate and
+ * the channel came back with no sound). */
+static inline int ptv_rj_burst_since(int cls_seq0)
+{
+    return atomic_load_explicit(&g_rj_cls_seq, memory_order_acquire) != cls_seq0 &&
+           atomic_load_explicit(&g_rj_cls, memory_order_relaxed) == 1;
 }
 extern _Atomic int64_t g_shed_wall;      /* (d) wall us of the last self-inflicted queue drop (ANY input —
                                           * pre16: per-track readers use Input.shed_wall; this aggregate
