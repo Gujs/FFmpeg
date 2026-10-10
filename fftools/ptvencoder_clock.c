@@ -250,6 +250,8 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
             if (pos > 0 && pos + c->ka_lead_us < house_us)
                 house_us = FFMAX(pos + c->ka_lead_us, c->last_dts + 1000);
         }
+    } else if (ev->vmapped) {
+        house_us = ev->vm_out_us;        /* 2.0.0 T-100: where the video put this caption's frame */
     } else {
         /* content_index() wants the source pts in the rung's own out_tb. h0_lock is held
          * because on multiview the compositor's REANCHOR2 mutates this slot's h0 at runtime
@@ -586,6 +588,51 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
     }
 }
 
+/* 2.0.0 T-100: emit the waiting captions whose frame the video has shown, stamped with that frame's output time, in
+ * order. A caption or keepalive whose frame was never shown (skipped, erased, lost in an outage) or went on air more
+ * than 1 s ago is dropped: shown now it would sit off its picture. An erase is always sent (at the latest now: it must
+ * clear the page). force = the queue is full: what the video has not reached yet takes the old stamp. Returns how many
+ * left the queue. */
+static int cc_vq_release(CcCtx *c, int force)
+{
+    char tag[16];
+    int k = 0;
+    int64_t now = av_gettime_relative(), pos = atomic_load_explicit(&g_house_out_us, memory_order_relaxed);
+    while (k < c->nvq) {
+        CcEvent *ev = &c->vq[k];
+        int64_t o = AV_NOPTS_VALUE, gap = 0;
+        int r = ptv_vmap_lookup(ev->src_us, &o, &gap);
+        if (r == 0 && !force)
+            break;
+        if (ev->kind != PTV_CC_ERASE && (r < 0 || (r == 1 && (gap > 1000000 || o < pos - 1000000)))) {
+            c->vq_late++;
+        } else {
+            if (r == 1) {
+                ev->vmapped   = 1;
+                ev->vm_out_us = FFMAX(o, pos - 1000000);
+                c->vq_ok++;
+            } else
+                c->vq_fb++;
+            cc_emit(c, ev);
+        }
+        av_freep(&ev->ass);
+        k++;
+    }
+    if (k) {
+        memmove(c->vq, c->vq + k, (c->nvq - k) * sizeof(*c->vq));
+        memmove(c->vq_wc, c->vq_wc + k, (c->nvq - k) * sizeof(*c->vq_wc));
+        c->nvq -= k;
+    }
+    if ((c->vq_late || c->vq_fb) && now - c->vq_log_wc >= 60000000) {
+        av_log(NULL, AV_LOG_WARNING, "[PTV-VMAP]%s captions: %"PRId64" stamped where the video showed their frame, %"PRId64
+               " dropped (frame never shown, or its moment had passed), %"PRId64" stamped the old way (queue full) — "
+               "PTV_NO_VMAP=1 disables\n", cc_tag(c, tag, sizeof tag), c->vq_ok, c->vq_late, c->vq_fb);
+        c->vq_ok = c->vq_late = c->vq_fb = 0;
+        c->vq_log_wc = now;
+    }
+    return k;
+}
+
 void *cc_thread(void *arg)
 {
     CcCtx *c = arg;
@@ -603,17 +650,29 @@ void *cc_thread(void *arg)
     for (;;) {
         CcEvent ev;
         int ret = av_thread_message_queue_recv(c->q, &ev, AV_THREAD_MESSAGE_NONBLOCK);
+        if (ret >= 0 && g_vmap && !c->multi) {    /* 2.0.0 T-100: wait for the video to show this frame */
+            if (c->nvq == PTV_CC_VQ)
+                cc_vq_release(c, 1);
+            c->vq[c->nvq] = ev;
+            c->vq_wc[c->nvq++] = av_gettime_relative();
+            continue;
+        }
         if (ret == AVERROR(EAGAIN)) {
             int64_t now_wc = av_gettime_relative();
-            if (c->last_emit_wc && now_wc - c->last_emit_wc >= PTV_CC_KEEPALIVE_US) {
+            if (c->nvq && cc_vq_release(c, 0))
+                continue;
+            /* no synthetic keepalive while captions wait for their frames: the input is delivering */
+            if (!c->nvq && c->last_emit_wc && now_wc - c->last_emit_wc >= PTV_CC_KEEPALIVE_US) {
                 CcEvent ka = { NULL, AV_NOPTS_VALUE, 0, PTV_CC_KEEPALIVE };
                 cc_emit(c, &ka);
             } else
                 av_usleep(20000);                 /* 20ms: 1 Hz floor without a busy loop */
             continue;
         }
-        if (ret < 0)
+        if (ret < 0) {
+            cc_vq_release(c, 1);
             break;                                /* decode thread EOF'd the queue */
+        }
         cc_emit(c, &ev);
         av_freep(&ev.ass);
     }
@@ -1372,8 +1431,17 @@ void *output_thread(void *arg)
              * 0 in steady state). Captions are stamped from the content index, so they need the same offset or they
              * fall behind the video (Racer_Select 2026-10-09: +53 s after two BURST rejoins, every caption dropped by
              * [PTV-MUXGUARD] as a backward subtitle dts — subtitles gone on air). */
-            if (v->is_master && fresh && content_vpts >= 0)
+            if (v->is_master && fresh && content_vpts >= 0) {
                 atomic_store_explicit(&g_vdisp_skew_us, (vpts - content_vpts) * v->tick_dur_us, memory_order_relaxed);
+                /* 2.0.0 T-100: record where this content went on air (copies + captions are stamped through it) */
+                if (g_vmap && !v->passthrough && src_ts != AV_NOPTS_VALUE) {
+                    ptv_vmap_push(av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q),
+                                  v->out_fps.num > 0 ? av_rescale(vpts, 1000000LL * v->out_fps.den, v->out_fps.num)
+                                                     : vpts * v->tick_dur_us);
+                    if (v->hold_da)              /* release the copies this frame has caught up to */
+                        ptv_copy_vwait(v->hold_da);
+                }
+            }
             if (v->is_master) {        /* 2.0.0-pre6.1: the house position the decode thread maps a rejoin onto */
                 atomic_store_explicit(&g_house_out_us, v->out_fps.num > 0
                                       ? av_rescale(vpts, 1000000LL * v->out_fps.den, v->out_fps.num)

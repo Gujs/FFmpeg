@@ -650,6 +650,8 @@ typedef struct CcEvent {
     int      deferred;   /* ERASE held by the min-display rule; cclate= counts these in the
                           * EMITTER (after the encode), never here — a queue-full drop or an
                           * already-blank page must not read as a clear that went out */
+    int      vmapped;    /* 2.0.0 T-100: vm_out_us holds the output time the video gave src_us */
+    int64_t  vm_out_us;
 } CcEvent;
 
 /* Decode-thread side. One per input; wired to every input the extraction runs on
@@ -881,6 +883,12 @@ typedef struct CcCtx {
      * rides the output position plus this lead, so it cannot run ahead of the video. */
     int64_t          ka_lead_us;
     int              ka_lead_ok;
+    /* 2.0.0 T-100: captions wait here (cc_thread only) until the video has shown their frame, then take its output time */
+#define PTV_CC_VQ 256
+    CcEvent          vq[PTV_CC_VQ];
+    int64_t          vq_wc[PTV_CC_VQ];
+    int              nvq;
+    int64_t          vq_ok, vq_late, vq_fb, vq_log_wc;
     int64_t          err_log_us;              /* encoder-error log rate limit */
     /* state log (§2 observability): first caption, and the caption-went-quiet transition */
     int              seen_caption;
@@ -1411,6 +1419,13 @@ typedef struct PassStream {
     /* 2.0.0-pre9.4 (T-083): damage while video flows — silent frames put into gaps, overlapping frames dropped */
     int        gap_n, ovl_n;          /* since the last [PTV-SRC] copy damage line */
     int64_t    dmg_log_wc;            /* wall us of that line */
+    /* 2.0.0 T-100: a SPARSE copy (subs, SCTE-35, data) waits here until the video has shown its content, then is
+     * stamped through the video's record (g_vmap; single input; demux thread only) */
+#define PTV_VWAIT_MAX 512
+    AVPacket  *vwait[PTV_VWAIT_MAX];
+    int64_t    vwait_wc[PTV_VWAIT_MAX];
+    int64_t    vwait_po[PTV_VWAIT_MAX];   /* DemuxArgs.prog_off when it arrived (the SCTE-35 rebase term) */
+    int        nvwait;
 } PassStream;
 
 /* ---- legacy-0004 TS-discontinuity buffer (g_layera / PTV_LAYERA, default OFF) ----
@@ -1667,6 +1682,9 @@ typedef struct DemuxArgs {
     int                   sib_jump_gap[2];      /* 2.0.0-pre9.6: that jump was a GAP verdict (labels carry it, content pads) */
     int                   drop;          /* non-blocking + drop on full (network input) */
     PassStream           *pass;          /* copy-passthrough: extra audio, subs, data */
+    int64_t               vm_po;                              /* 2.0.0 T-100: prog_off of the copy being released */
+    int64_t               vm_ok, vm_late, vm_fb, vm_log_wc;   /* 2.0.0 T-100: copies stamped through the video's record /
+                                                               * dropped (content never shown or its moment passed) / old way (queue full) */
     int                   n_pass;
     int64_t              *h0;             /* house origin (us); copy ts rebased onto it */
     pthread_mutex_t      *h0_lock;
@@ -1971,6 +1989,12 @@ extern _Atomic int64_t g_vskip_from_us;    /* latest skip boundary on the source
 extern _Atomic int64_t g_rj_off_total, g_rj_off_before, g_rj_from_us;
 extern _Atomic int     g_rj_epoch;
 extern _Atomic int64_t g_house_out_us, g_house_tick_us;   /* master: last emitted vpts on the output axis, tick */
+/* 2.0.0 T-100: the video's content -> output record (ptvencoder.c) */
+#define PTV_VMAP_N 4096
+extern int g_vmap;
+void ptv_vmap_push(int64_t src_us, int64_t out_us);
+int  ptv_vmap_lookup(int64_t c_us, int64_t *out_us, int64_t *gap_us);
+void ptv_copy_vwait(struct DemuxArgs *d);   /* master output thread: release the copies the video has shown */
 extern _Atomic int64_t g_vdisp_skew_us;  /* 2.0.0 T-095: where the master put the last fresh frame vs its content index */
 extern _Atomic int64_t g_dup_out_us;     /* master: output time on ticks whose content did not advance (hold fills' clock) */
 extern int             g_rejoin_map;       /* PTV_NO_REJOIN_MAP=1 off */

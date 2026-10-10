@@ -207,6 +207,67 @@ _Atomic int64_t g_vskip_from_us;
 _Atomic int64_t g_rj_off_total, g_rj_off_before, g_rj_from_us;   /* 2.0.0-pre6.1 rejoin map */
 _Atomic int     g_rj_epoch;
 _Atomic int64_t g_house_out_us, g_house_tick_us;
+
+/* 2.0.0 T-100: where the video actually put its content. The master records every fresh frame it puts on the
+ * output (source content time -> output time, both us); sparse copies (DVB subs, SCTE-35) and CC captions are
+ * stamped through it once the video has shown their content, instead of with the skew of the moment they were
+ * read — that skew moves between the read and the display (holds, rejoins, bursts) and they landed seconds off
+ * their frame. Single input. PTV_NO_VMAP=1 reverts. */
+int g_vmap = 1;
+static pthread_mutex_t vmap_lock = PTHREAD_MUTEX_INITIALIZER;
+static int64_t vmap_src[PTV_VMAP_N], vmap_out[PTV_VMAP_N];
+static int     vmap_w, vmap_n;                  /* next write slot, entries held */
+
+void ptv_vmap_push(int64_t src_us, int64_t out_us)
+{
+    pthread_mutex_lock(&vmap_lock);
+    if (vmap_n && src_us < vmap_src[(vmap_w + PTV_VMAP_N - 1) % PTV_VMAP_N] - 1000000)
+        vmap_n = 0;                             /* the content timeline stepped back: a new epoch */
+    vmap_src[vmap_w] = src_us;
+    vmap_out[vmap_w] = out_us;
+    vmap_w = (vmap_w + 1) % PTV_VMAP_N;
+    if (vmap_n < PTV_VMAP_N)
+        vmap_n++;
+    pthread_mutex_unlock(&vmap_lock);
+}
+
+/* 1 = the video has shown content at or after c_us: *out_us = c_us on the timeline of the first such frame and
+ * *gap_us = how far past c_us that frame lies, in content or (across a hold) in output time — > ~1 frame: c_us itself
+ * was never shown (skipped, erased, lost in an outage); 0 = not yet (or nothing recorded); -1 = c_us is older than everything held by > 1 s. */
+int ptv_vmap_lookup(int64_t c_us, int64_t *out_us, int64_t *gap_us)
+{
+    int k, i, hit = -1, ret;
+    pthread_mutex_lock(&vmap_lock);
+    for (k = 0; k < vmap_n; k++) {             /* newest -> oldest: the oldest entry still >= c_us */
+        i = (vmap_w + PTV_VMAP_N - 1 - k) % PTV_VMAP_N;
+        if (vmap_src[i] < c_us)
+            break;
+        hit = i;
+    }
+    if (hit < 0 || hit == (vmap_w + PTV_VMAP_N - 1) % PTV_VMAP_N)
+        ret = 0;                                /* wait for one frame more: it tells whether this one was a stale tail */
+    else if (k == vmap_n && vmap_src[hit] - c_us > 1000000)
+        ret = -1;                               /* older than the record by more than a second */
+    else {
+        *out_us = vmap_out[hit] - (vmap_src[hit] - c_us);
+        *gap_us = vmap_src[hit] - c_us;
+        if (k < vmap_n && c_us < vmap_src[hit]) {
+            /* c_us lies between two shown frames: if the output ran on further than the content between them (a hold
+             * or an outage the timeline erased — the labels continue across it), c_us itself was never shown */
+            i = (hit + PTV_VMAP_N - 1) % PTV_VMAP_N;
+            *gap_us = FFMAX(*gap_us, (vmap_out[hit] - vmap_out[i]) - (vmap_src[hit] - vmap_src[i]));
+        }
+        i = (hit + 1) % PTV_VMAP_N;             /* the frame after it: content leaps further than the output — this one
+                                                 * was the pre-gap PES tail lavf releases only after an outage (T-074),
+                                                 * shown alone after the hold (then the video waits for a keyframe): nothing
+                                                 * belongs on it */
+        if ((vmap_src[i] - vmap_src[hit]) - (vmap_out[i] - vmap_out[hit]) > 1000000)
+            *gap_us = FFMAX(*gap_us, (vmap_src[i] - vmap_src[hit]) - (vmap_out[i] - vmap_out[hit]));
+        ret = 1;
+    }
+    pthread_mutex_unlock(&vmap_lock);
+    return ret;
+}
 _Atomic int64_t g_vdisp_skew_us;   /* 2.0.0 T-095: master: (vpts - content index) of the last fresh frame, us */
 _Atomic int64_t g_dup_out_us;   /* 2.0.0-pre9.4 (T-083): output time on ticks whose content did not advance */
 int             g_rejoin_map = 1;
@@ -1372,6 +1433,13 @@ static void cc_tap_send(CcTap *t, CcEvent *ev, char *ttag)
 static void cc_tap_flush_pending(CcTap *t, int64_t cur_us, char *ttag)
 {
     CcEvent pe = { t->pend_ass, cur_us, t->pend_end_ms, PTV_CC_CAPTION };
+    /* 2.0.0 T-100: the content time the page was DUE (text quiet for the debounce, or the roll-up deadline), not the
+     * frame that happened to come next — across an outage that frame is the first one after it, and the caption went on
+     * air over that content 9.7 s late (sync_gap2_10); stamped where it was due, the video's record drops it as never
+     * shown. In normal flow it is the same frame. */
+    if (g_vmap)
+        pe.src_us = FFMIN(cur_us, FFMIN(t->pend_changed_us + PTV_CC_DEBOUNCE_US, t->pend_first_us + PTV_CC_DEADLINE_US));
+    cur_us = pe.src_us;
     t->pend_ass = NULL;
     cc_tap_send(t, &pe, ttag);
     t->shown_since_us = cur_us;               /* min-display clock starts now */
@@ -2554,7 +2622,8 @@ static void cc_tap_frame(CcTap *t, AVFrame *frame, AVRational ist_tb)
             cc_tap_flush_pending(t, cur_us, ttag);
             cc_tap_hold_erase(t, NULL, 0, cur_us + PTV_CC_MIN_DISPLAY_US, 0);
         } else {
-            CcEvent ee = { t->erase_ass, cur_us, t->erase_end_ms, PTV_CC_ERASE, 1 };
+            CcEvent ee = { t->erase_ass, g_vmap ? FFMIN(cur_us, t->erase_due_us) : cur_us,   /* T-100: when it was due */
+                           t->erase_end_ms, PTV_CC_ERASE, 1 };
             t->erase_ass = NULL;
             cc_tap_send(t, &ee, ttag);        /* cclate= is counted in the emitter */
         }
@@ -5794,6 +5863,7 @@ end:
         int j;
         av_packet_free(&pass[k].sil);
         for (j = 0; j < pass[k].npark; j++) av_packet_free(&pass[k].park[j]);
+        for (j = 0; j < pass[k].nvwait; j++) av_packet_free(&pass[k].vwait[j]);   /* 2.0.0 T-100 */
     }
     for (k = 0; k < n_cc; k++)                   /* the free func releases any queued ASS lines */
         av_thread_message_queue_free(&cc_q[k]);
@@ -6448,7 +6518,8 @@ int main(int argc, char **argv)
     if (getenv("PTV_AF_NO_PLL")) g_af_pll = 0;              /* A/B: pure discrete drop/pad (no smooth nudge) */
     if (getenv("PTV_AF_NO_ANCHOR")) g_af_anchor = 0;        /* A/B: revert B1 → pre-B1 free-running counter */
     /* PTV_PREROLL_MS / PTV_VIDEOQ / PTV_CUSHION_MAX_MS / PTV_BANK_DECAY_S parses moved to resolve_cushions() (0.9.18 M1) */
-    if (getenv("PTV_NO_AUTOBANK")) g_autobank = 0;   /* v0.9.14: revert to advisor-only (manual PTV_PREROLL_MS recipe) */
+    if (getenv("PTV_NO_AUTOBANK")) g_autobank = 0;
+    if (getenv("PTV_NO_VMAP")) g_vmap = 0;            /* 2.0.0 T-100: copies + captions on the read-time skew again */   /* v0.9.14: revert to advisor-only (manual PTV_PREROLL_MS recipe) */
     if (getenv("PTV_NO_CLOCKFOLLOW")) g_clockfollow = 0;   /* v0.9.15: never follow a large source-clock offset (buffers pin + resampler churns on such sources) */
     if (getenv("PTV_NO_VGAPFILL")) g_vgapfill = 0;          /* 2.0.0-pre9.4 (T-083) kill switch */
     if (getenv("PTV_NO_DECIMATE")) g_decimate = 0;         /* v0.9.15.2: keep pop-per-tick even for >house-rate sources (frame_q pins on surplus) */

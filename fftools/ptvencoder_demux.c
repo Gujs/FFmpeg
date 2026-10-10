@@ -1636,7 +1636,7 @@ static void copy_emit_sil(DemuxArgs *d, PassStream *ps, int64_t ts)
  * subtitle, data/SCTE-35) straight to the muxer, rebased onto the same h0 house
  * timeline the encoded streams use so everything stays in sync. Packets that
  * precede the anchor are dropped (exactly like audio_push). */
-static int demux_pass_one(DemuxArgs *d, AVPacket *out)
+static int demux_pass_one(DemuxArgs *d, AVPacket *out, int64_t vm_out_us)
 {
     int pi, i;
     for (pi = 0; pi < d->n_pass; pi++) {
@@ -1656,6 +1656,12 @@ static int demux_pass_one(DemuxArgs *d, AVPacket *out)
             hs_used = *d->house_skew;
             h0_tb -= av_rescale_q(hs_used, AV_TIME_BASE_Q, d->pass[pi].in_tb);
         }
+        if (vm_out_us != AV_NOPTS_VALUE) {
+            /* 2.0.0 T-100: stamped where the video put this content (the video's record), not h0/house_skew */
+            int64_t ts = out->dts != AV_NOPTS_VALUE ? out->dts : out->pts;
+            h0_tb = -av_rescale_q(vm_out_us - av_rescale_q(ts, d->pass[pi].in_tb, AV_TIME_BASE_Q),
+                                  AV_TIME_BASE_Q, d->pass[pi].in_tb);   /* the net offset, as the old path's -h0_tb */
+        }
         if (out->pts != AV_NOPTS_VALUE) out->pts -= h0_tb;
         if (out->dts != AV_NOPTS_VALUE) out->dts -= h0_tb;
         ref = out->dts != AV_NOPTS_VALUE ? out->dts : out->pts;
@@ -1670,7 +1676,7 @@ static int demux_pass_one(DemuxArgs *d, AVPacket *out)
         if (d->ifmt->streams[d->pass[pi].in_index]->codecpar->codec_id == AV_CODEC_ID_SCTE_35) {
             int64_t adj_us = -av_rescale_q(h0_tb, d->pass[pi].in_tb, AV_TIME_BASE_Q);
             if (g_discont && g_prog_off)
-                adj_us += av_rescale_q(d->prog_off, d->pass[pi].in_tb, AV_TIME_BASE_Q);
+                adj_us += av_rescale_q(vm_out_us != AV_NOPTS_VALUE ? d->vm_po : d->prog_off, d->pass[pi].in_tb, AV_TIME_BASE_Q);
             scte35_rebase_pts_adjustment(out, adj_us);
         }
         /* Monotonic-DTS guard for the copy path (final, after the SCTE rebase). The
@@ -1762,6 +1768,13 @@ static int demux_pass_one(DemuxArgs *d, AVPacket *out)
             ps->dup_real = atomic_load_explicit(&g_dup_out_us, memory_order_relaxed);
         }
         if (out->dts != AV_NOPTS_VALUE) {
+            if (d->pass[pi].last_dts != AV_NOPTS_VALUE && out->dts <= d->pass[pi].last_dts && vm_out_us != AV_NOPTS_VALUE) {
+                d->vm_late++;                    /* 2.0.0 T-100: stamped behind what is on the wire: its moment passed */
+                if (d->pass[pi].sil)
+                    pthread_mutex_unlock(&d->pass_lock);
+                av_packet_free(&out);
+                return 0;
+            }
             if (d->pass[pi].last_dts != AV_NOPTS_VALUE && out->dts <= d->pass[pi].last_dts) {
                 int64_t bump = d->pass[pi].last_dts + 1 - out->dts;
                 out->dts += bump;
@@ -1815,7 +1828,7 @@ static void park_drain(DemuxArgs *d, int force)
         if (!(force || ready || now - ps->park_since > 4000000))
             continue;
         for (j = 0; j < ps->npark; j++)
-            demux_pass_one(d, ps->park[j]);
+            demux_pass_one(d, ps->park[j], AV_NOPTS_VALUE);
         ps->npark = 0;
     }
 }
@@ -1823,10 +1836,92 @@ static void park_drain(DemuxArgs *d, int force)
 /* Copy fan-out. 2.0.0-pre6: a dense copied audio stream that resumes after >=300 ms of silence waits (parked,
  * the demux thread keeps reading — it carries the video that ends the hold) until the master has emitted a
  * fresh frame after that resume; in steady flow that is the next tick. Single input. */
+/* 2.0.0 T-100: release the sparse copies the video has shown, in arrival order per stream, stamped where the video
+ * put their content. Called under pass_lock, by the demux thread on every packet and by the master output thread on
+ * every fresh frame (the demux thread sleeps in the read during an outage). A subtitle / data packet whose content was
+ * never shown (skipped, erased, lost in the outage) or whose moment on the output passed more than 1 s ago is dropped:
+ * shown now it would sit off its picture. SCTE-35 is always sent (its splice point lies ahead). force = the queue is
+ * full: what the video has not reached yet takes the old stamp. */
+static void vwait_drain(DemuxArgs *d, int force)
+{
+    int pi;
+    int64_t now = av_gettime_relative(), pos = atomic_load_explicit(&g_house_out_us, memory_order_relaxed);
+    for (pi = 0; pi < d->n_pass; pi++) {
+        PassStream *ps = &d->pass[pi];
+        int scte = d->ifmt->streams[ps->in_index]->codecpar->codec_id == AV_CODEC_ID_SCTE_35;
+        int k = 0;
+        while (k < ps->nvwait) {
+            AVPacket *p = ps->vwait[k];
+            int64_t ts = p->dts != AV_NOPTS_VALUE ? p->dts : p->pts, o = AV_NOPTS_VALUE, gap = 0;
+            int r = ts == AV_NOPTS_VALUE ? -1 : ptv_vmap_lookup(av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q), &o, &gap);
+            if (r == 0 && !force)
+                break;                          /* its content is not on the output yet */
+            if (r == 1 && !scte && (gap > 1000000 || o < pos - 1000000)) {
+                av_packet_free(&p);
+                d->vm_late++;
+            } else if (r == 1) {
+                d->vm_po = ps->vwait_po[k];     /* the prog_off this packet was unwrapped with */
+                demux_pass_one(d, p, o);
+                d->vm_ok++;
+            } else if (r < 0 && !scte) {
+                av_packet_free(&p);             /* older than anything the video still records */
+                d->vm_late++;
+            } else {
+                demux_pass_one(d, p, AV_NOPTS_VALUE);
+                d->vm_fb++;
+            }
+            k++;
+        }
+        if (k) {
+            memmove(ps->vwait, ps->vwait + k, (ps->nvwait - k) * sizeof(*ps->vwait));
+            memmove(ps->vwait_wc, ps->vwait_wc + k, (ps->nvwait - k) * sizeof(*ps->vwait_wc));
+            memmove(ps->vwait_po, ps->vwait_po + k, (ps->nvwait - k) * sizeof(*ps->vwait_po));
+            ps->nvwait -= k;
+        }
+    }
+    if ((d->vm_late || d->vm_fb) && now - d->vm_log_wc >= 60000000) {
+        av_log(NULL, AV_LOG_WARNING, "[PTV-VMAP] sparse copies: %"PRId64" stamped where the video showed their content, "
+               "%"PRId64" dropped (content never shown, or its moment had passed), %"PRId64" stamped the old way (queue "
+               "full) — PTV_NO_VMAP=1 disables\n", d->vm_ok, d->vm_late, d->vm_fb);
+        d->vm_ok = d->vm_late = d->vm_fb = 0;
+        d->vm_log_wc = now;
+    }
+}
+
+void ptv_copy_vwait(DemuxArgs *d)
+{
+    pthread_mutex_lock(&d->pass_lock);
+    vwait_drain(d, 0);
+    pthread_mutex_unlock(&d->pass_lock);
+}
+
 static int demux_pass(DemuxArgs *d, AVPacket *out)
 {
     int pi;
     park_drain(d, 0);
+    if (d->single && g_vmap) {              /* 2.0.0 T-100: sparse copies wait for the video to show their content */
+        pthread_mutex_lock(&d->pass_lock);
+        vwait_drain(d, 0);
+        for (pi = 0; pi < d->n_pass; pi++) {
+            PassStream *ps = &d->pass[pi];
+            int anchored;
+            if (ps->gated || out->stream_index != ps->in_index)
+                continue;
+            pthread_mutex_lock(d->h0_lock);
+            anchored = *d->h0 != AV_NOPTS_VALUE;
+            pthread_mutex_unlock(d->h0_lock);
+            if (!anchored)
+                break;                          /* demux_pass_one drops a copy before the anchor */
+            if (ps->nvwait == PTV_VWAIT_MAX)
+                vwait_drain(d, 1);
+            ps->vwait_wc[ps->nvwait] = av_gettime_relative();
+            ps->vwait_po[ps->nvwait] = d->prog_off;
+            ps->vwait[ps->nvwait++]  = out;
+            pthread_mutex_unlock(&d->pass_lock);
+            return 0;
+        }
+        pthread_mutex_unlock(&d->pass_lock);
+    }
     if (d->single && g_src_watch) {
         for (pi = 0; pi < d->n_pass; pi++) {
             PassStream *ps = &d->pass[pi];
@@ -1871,7 +1966,7 @@ static int demux_pass(DemuxArgs *d, AVPacket *out)
             break;
         }
     }
-    return demux_pass_one(d, out);
+    return demux_pass_one(d, out, AV_NOPTS_VALUE);
 }
 
 /* 2.0.0-pre6 (T-056 §5.1, D17), called by the master output thread while video repeats: a copied AC-3 /
