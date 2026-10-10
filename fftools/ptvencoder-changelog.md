@@ -5,6 +5,36 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre11 — subtitles, SCTE-35 and captions on their frames; a pause never leaves delay or pictures without sound
+
+- **Copied subtitles, SCTE-35 cues and CC captions land on their own video frame (T-100, T-102).** They were stamped with
+  the house-vs-content skew of the moment they were read, but their video goes on air one pipeline latency (~3 s)
+  later and the skew moves in between (holds, rejoins, bursts). New timing fixtures (ruler media at 25/29.97/50/59.94
+  with numbered SCTE-35 cues, DVB subtitles and EIA-608 captions) measured on pre10: after a 20 s pause DVB subs
+  +3.9 s and SCTE-35 up to +3.5 s, after flapping subs +0.6 s, after each outage of a double outage ~10 subs pinned up
+  to +9.4 s behind the subtitle PES left open across it; on 6 s bursty input 32 of 47 captions dropped by the mux guard
+  (1.2.2 identical). The master now records where every fresh frame went on air; sparse copies and captions wait until
+  the video has shown their content and take that output time (SCTE-35's pts_adjustment by the same offset). Content
+  never shown (inside a hold, the lone pre-gap tail frame) is dropped instead of misplaced; SCTE-35 is always sent.
+  29.97 VT fixtures: SCTE-35 and DVB subs +0.0 ms in every scenario, teletext at the designed +300 ms, bursty captions
+  47/47. PTV_NO_VMAP=1 reverts.
+- **The first caption after an input stall is on time (T-098).** Keepalives during a stall ran on the wall clock while
+  the output gained ~2 s less; the first caption after the return was bumped behind them (+1.4 s). They now follow the
+  output position.
+- **Copied AC-3 survives a source pause (T-101).** The delivery gate was sized without copied audio and dropped it
+  silently when full (20 s pause: ~51 s of AC-3 lost, 8 of 18 segments without audio). Sized for 300 s per copied
+  track; drops are logged ([PTV-DLV]) and shown as dlvdrop=.
+- **A pause never leaves delay or pictures without sound (T-103; owner rule 2026-10-10: the output delay is pinned).**
+  Bursty input is still absorbed up to the bank ceiling (12 s). A source pause beyond it was kept as delay for good
+  (20 s pause: content age 3.0 → 20.4 s; 45 s: 22.9 s; never drained), and the audio of the sender's catch-up burst was
+  dropped as "during the hold" while its pictures played (5 s pause: 5 s of pictures over silence; 20 s: 21 s). Now
+  the catch-up audio is kept, and a pause that would hold more than the ceiling skips the catch-up to the live content —
+  all streams to one video keyframe, bars a moment longer, picture and sound together. A source that does not catch up
+  within 2 s resumes where it is. Fixtures: 20/45/90 s and two 20 s pauses keep content age at 3.0–3.1 s with no
+  pictures over silence; 5/10 s pauses keep their delay (inside the ceiling) with sound; bursts over 12 s: audio dark
+  3.3–3.5 s (pre10: 15–20 s). Still open: bursty start-up and > 8 s burst structure (T-104), flapping returns (T-104). PTV_MAX_DELAY_MS sets the
+  ceiling (0 = keep every pause as delay, as pre10 did).
+
 ## 2.0.0-pre10 — multiview slot audio through a full slot outage (T-093 part 2)
 
 - **A multiview slot whose source stops altogether keeps its audio on the wire (T-093, part 2).** The slot's audio
