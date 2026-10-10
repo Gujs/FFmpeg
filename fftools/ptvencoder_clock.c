@@ -247,8 +247,13 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
          * are stamped on. Never backward: at least 1 ms past the last stamp. */
         if (c->ka_lead_ok) {
             int64_t pos = atomic_load_explicit(&g_house_out_us, memory_order_relaxed);
-            if (pos > 0 && pos + c->ka_lead_us < house_us)
-                house_us = FFMAX(pos + c->ka_lead_us, c->last_dts + 1000);
+            /* 2.0.0 T-312: with captions on their own frame (T-100 video record) the lead is ~-1 frame, and a caption
+             * released a moment later carries an EARLIER frame time: stamped behind this keepalive it was bumped one
+             * frame late (sync_kill_return_20, the 4th caption after the restart, +41 ms). A keepalive is no picture —
+             * keep it behind everything still on its way: the assembly window behind the output. */
+            int64_t lead = g_vmap && !c->multi ? FFMIN(c->ka_lead_us, -PTV_CC_DEBOUNCE_US) : c->ka_lead_us;
+            if (pos > 0 && pos + lead < house_us)
+                house_us = FFMAX(pos + lead, c->last_dts + 1000);
         }
     } else if (ev->vmapped) {
         house_us = ev->vm_out_us;        /* 2.0.0 T-100: where the video put this caption's frame */

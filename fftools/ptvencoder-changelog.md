@@ -47,7 +47,8 @@ the v2 `0001` patch (additive, travels with the source to the build box).
   follow the pre-gap tail frames shown after the hold (+8.3 s); it is now matched to its own frame (and dropped if its
   moment has passed). v2 timing media 29.97: pop-on captions and erases +0.0 ms in clean, double outage, pause,
   restart and flapping; screen time = the source. Roll-up +166.8 ms (was +266.6): cc_dec's real-time mode reports the
-  screen at most every 200 ms (T-319).
+  screen at most every 200 ms (T-319). The 1 Hz keepalive (no picture) now stays 500 ms behind the output: stamped
+  ahead of a caption still on its way it pushed that caption one frame late (restart, +41 ms).
 - **No 80 ms lip-sync step after a short source pause (T-317).** The rejoin map compared each returning frame with the
   very next house tick, but a sender's catch-up burst decodes ~3 s ahead of the output: the ~74th queued frame looked
   "ahead of the house" and contiguous content was shifted 80 ms (sync_stop_5: sound 80 ms late for 5 s, then a snap;
