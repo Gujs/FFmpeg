@@ -214,6 +214,10 @@ _Atomic int64_t g_house_out_us, g_house_tick_us;
  * read — that skew moves between the read and the display (holds, rejoins, bursts) and they landed seconds off
  * their frame. Single input. PTV_NO_VMAP=1 reverts. */
 int g_vmap = 1;
+/* 2.0.0 T-103 (owner 2026-10-10): bursty input is absorbed up to the bank ceiling, never more — a pause that would keep
+ * more delay than this skips the catch-up to live instead. 0 = keep every pause as delay (the pre-T-103 rule). -1 = the
+ * bank ceiling (g_cushion_max_ms); PTV_MAX_DELAY_MS overrides. */
+int64_t g_max_delay_us = -1;
 static pthread_mutex_t vmap_lock = PTHREAD_MUTEX_INITIALIZER;
 static int64_t vmap_src[PTV_VMAP_N], vmap_out[PTV_VMAP_N];
 static int     vmap_w, vmap_n;                  /* next write slot, entries held */
@@ -6527,7 +6531,12 @@ int main(int argc, char **argv)
     if (getenv("PTV_AF_NO_ANCHOR")) g_af_anchor = 0;        /* A/B: revert B1 → pre-B1 free-running counter */
     /* PTV_PREROLL_MS / PTV_VIDEOQ / PTV_CUSHION_MAX_MS / PTV_BANK_DECAY_S parses moved to resolve_cushions() (0.9.18 M1) */
     if (getenv("PTV_NO_AUTOBANK")) g_autobank = 0;
-    if (getenv("PTV_NO_VMAP")) g_vmap = 0;            /* 2.0.0 T-100: copies + captions on the read-time skew again */   /* v0.9.14: revert to advisor-only (manual PTV_PREROLL_MS recipe) */
+    if (getenv("PTV_NO_VMAP")) g_vmap = 0;            /* 2.0.0 T-100: copies + captions on the read-time skew again */
+    {   /* 2.0.0 T-103: pinned output delay (default: the bank ceiling, resolved where it is used) */
+        const char *md = getenv("PTV_MAX_DELAY_MS");
+        if (md)
+            g_max_delay_us = (int64_t)atoll(md) * 1000;
+    }   /* v0.9.14: revert to advisor-only (manual PTV_PREROLL_MS recipe) */
     if (getenv("PTV_NO_CLOCKFOLLOW")) g_clockfollow = 0;   /* v0.9.15: never follow a large source-clock offset (buffers pin + resampler churns on such sources) */
     if (getenv("PTV_NO_VGAPFILL")) g_vgapfill = 0;          /* 2.0.0-pre9.4 (T-083) kill switch */
     if (getenv("PTV_NO_DECIMATE")) g_decimate = 0;         /* v0.9.15.2: keep pop-per-tick even for >house-rate sources (frame_q pins on surplus) */

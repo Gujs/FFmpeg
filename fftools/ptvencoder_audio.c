@@ -2775,7 +2775,12 @@ static int audio_feed(AudioState *a, AVFrame *frame)
          * house_skew → aresample padded ~1000 frames ahead of the video, the delivery FIFO filled and the copied AC-3
          * was dropped for 30 s); kept for after the rejoin it is stale (−29 s re-label). The fill already covers its
          * time: drop it; the return is buffered below once the hold has ended, as before. */
-        if (ptv_src_holding()) {
+        /* 2.0.0 T-103: only while the input is still gone. Once its return is classified the frames are the returning
+         * content — a sender that catches up delivers the paused stretch in one burst, before the video has ended the
+         * hold — and dropping them put the pictures on air with no sound (sync_stop_20: 21 flashes over silence, also
+         * stop_5: 5). They go to the rejoin buffer below like any return. */
+        if (ptv_src_holding() &&
+            atomic_load_explicit(&g_rj_cls_seq, memory_order_acquire) == a->rj_cls_seq0) {
             if (!a->hold_drop_n++)
                 av_log(NULL, AV_LOG_INFO, "[PTV-SRC] a%d(in%d) real frames during the hold are dropped — the fill "
                        "covers the track until the rejoin\n", a->dbg_k, a->dbg_in);

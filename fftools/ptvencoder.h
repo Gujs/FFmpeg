@@ -1736,6 +1736,13 @@ typedef struct DemuxArgs {
     int                   src_classified;   /* 2.0.0-pre3: rejoin of the current hold already classified */
     int                   src_pend;         /* 2.0.0-pre3: first post-gap packet (the PES tail) seen */
     int64_t               src_pend_w, src_pend_raw; /* 2.0.0-pre3: its wall gap; the last pre-gap DTS */
+    /* 2.0.0 T-103 (owner 2026-10-10: the output delay is pinned): a pause the burst bank cannot absorb is not kept as
+     * delay — the returning catch-up is skipped up to the live content, all streams to one video keyframe */
+    int                   rj_skip;          /* 1 = dropping until a keyframe at the live point, 2 = cut found: other streams
+                                             * drop what lies before it */
+    int64_t               rj_skip_target, rj_skip_cut, rj_skip_wc, rj_skip_n;
+    int64_t               rj_hs_base;       /* house_skew at the last skip's cut: the delay kept since is house_skew minus it
+                                             * (a skip glues the skipped stretch over, house_skew keeps its repeats) */
     int64_t               src_gap_pending;  /* 2.0.0-pre4: a hold's arrival gap awaiting its rejoin class */
     int64_t              *tail_gap_us;      /* 2.0.0-pre4c: per stream, wall gap of the last packet if it was a gapped PES tail */
     int64_t              *tail_wc_us;       /* 2.0.0 T-089: per stream, wall time that carry was taken (bounds a multi-packet tail) */
@@ -1993,6 +2000,7 @@ extern _Atomic int64_t g_house_out_us, g_house_tick_us;   /* master: last emitte
 /* 2.0.0 T-100: the video's content -> output record (ptvencoder.c) */
 #define PTV_VMAP_N 4096
 extern int g_vmap;
+extern int64_t g_max_delay_us;   /* 2.0.0 T-103: pinned output delay (us; 0 = off) */
 void ptv_vmap_push(int64_t src_us, int64_t out_us);
 int  ptv_vmap_lookup(int64_t c_us, int64_t *out_us, int64_t *gap_us);
 void ptv_copy_vwait(struct DemuxArgs *d);   /* master output thread: release the copies the video has shown */

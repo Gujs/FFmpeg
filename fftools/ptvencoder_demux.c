@@ -1945,7 +1945,9 @@ static int demux_pass(DemuxArgs *d, AVPacket *out)
             holding = ptv_src_holding();
             if (holding) {
                 pthread_mutex_lock(&d->pass_lock);
-                holding = ps->fill_end != AV_NOPTS_VALUE;          /* ... and this copy is being filled */
+                holding = ps->fill_end != AV_NOPTS_VALUE &&         /* ... and this copy is being filled */
+                          /* 2.0.0 T-103: ... and the input has not come back yet (a catch-up burst is real content) */
+                          atomic_load_explicit(&g_rj_cls_seq, memory_order_acquire) == ps->fill_cls_seq0;
                 pthread_mutex_unlock(&d->pass_lock);
             }
             if (holding && !ps->npark) {   /* before in_wc: the copy's return must still read as a resume and park */
@@ -3036,6 +3038,19 @@ void *demux_thread(void *arg)
                             }
                             A = av_rescale_q(delta, vst->time_base, AV_TIME_BASE_Q);
                             int burst = A >= 0 && A < 500000;
+                            /* 2.0.0 T-103: the delay this pause would keep (house_skew has grown through the hold) */
+                            int64_t kept = (d->house_skew ? *d->house_skew : 0) - d->rj_hs_base;
+                            int64_t maxd = g_max_delay_us >= 0 ? g_max_delay_us : g_cushion_max_ms * 1000;
+                            int skip = burst && d->single && maxd > 0 && kept > maxd;
+                            if (skip) {
+                                d->rj_skip        = 1;
+                                d->rj_skip_target = d->src_pend_raw + av_rescale_q(W, AV_TIME_BASE_Q, vst->time_base);
+                                d->rj_skip_wc     = now;
+                                d->rj_skip_n      = 0;
+                                av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 rejoin: keeping this pause would hold %.1f s of "
+                                       "delay (max %.0f s) — skipping the catch-up to the live content (PTV_MAX_DELAY_MS=0 "
+                                       "keeps it)\n", kept / 1e6, maxd / 1e6);
+                            }
                             av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 rejoin class %s (A=%+.2f s, W=%.2f s)%s\n",
                                    burst ? "BURST" :
                                    llabs(A - W) <= FFMAX(1000000, W / 10) ? "LIVE LOSS" : "NEW DOMAIN",
@@ -3049,9 +3064,11 @@ void *demux_thread(void *arg)
                                     d->src_gap_class = burst ? 1 : 2;   /* the gap packet is still to be dispatched */
                             }
                             d->src_classified = 1;
-                            atomic_store_explicit(&g_rj_cls, burst ? 1 :                       /* 2.0.0-pre8.1 */
-                                                  llabs(A - W) <= FFMAX(1000000, W / 10) ? 2 : 3, memory_order_relaxed);
-                            atomic_fetch_add_explicit(&g_rj_cls_seq, 1, memory_order_release);
+                            if (!skip) {                    /* a skip publishes its class at the cut */
+                                atomic_store_explicit(&g_rj_cls, burst ? 1 :                       /* 2.0.0-pre8.1 */
+                                                      llabs(A - W) <= FFMAX(1000000, W / 10) ? 2 : 3, memory_order_relaxed);
+                                atomic_fetch_add_explicit(&g_rj_cls_seq, 1, memory_order_release);
+                            }
                             d->src_pend       = 0;
                         }
                     }
@@ -3063,6 +3080,62 @@ void *demux_thread(void *arg)
                 d->src_last_vwall    = now;   /* timestamped packets only: a broken PES without PTS (corrupt
                                                * resume) must not reset the gap the next packet measures */
             }
+        }
+        /* 2.0.0 T-103: skipping a pause's catch-up (decided at the rejoin class above). Every stream drops until a video
+         * keyframe at the live point (the content the source would be at had it not paused); then the other streams drop
+         * what lies before that keyframe, so picture and sound resume at the same content. A source that does not catch
+         * up within 2 s (content arriving in real time) resumes where it is: its pause stays as delay, skipping more
+         * would only starve the output. The class goes out at the cut, as BURST: the returning content settles when the
+         * hold ends. */
+        if (d->rj_skip) {
+            const AVStream *vst = d->ifmt->streams[d->vstream], *st = d->ifmt->streams[out->stream_index];
+            int64_t raw = out->dts != AV_NOPTS_VALUE ? out->dts : out->pts, nw = av_gettime_relative();
+            int isv = out->stream_index == d->vstream;
+            if (d->rj_skip == 1) {
+                int at_live = 0;
+                if (isv && raw != AV_NOPTS_VALUE) {
+                    int64_t dl = raw - d->rj_skip_target;
+                    if (vst->pts_wrap_bits > 0 && vst->pts_wrap_bits < 63) {
+                        int64_t m = 1LL << vst->pts_wrap_bits;
+                        dl &= m - 1;
+                        if (dl >= m >> 1) dl -= m;
+                    }
+                    at_live = dl >= 0;
+                }
+                if (isv && raw != AV_NOPTS_VALUE && (out->flags & AV_PKT_FLAG_KEY) && (at_live || nw - d->rj_skip_wc > 2000000)) {
+                    d->rj_skip     = 2;
+                    d->rj_skip_cut = raw;
+                    d->rj_skip_wc  = nw;
+                    if (at_live && d->house_skew)
+                        d->rj_hs_base = *d->house_skew;   /* the hold's repeats are not delay any more */
+                    /* settle when the hold ends (BURST's rule): the content lands on the house position — nothing for
+                     * the rejoin map to move, no jump for LIVE LOSS's settle to wait for (t103a: audio held 4.1 s, dark) */
+                    atomic_store_explicit(&g_rj_cls, 1, memory_order_relaxed);
+                    atomic_fetch_add_explicit(&g_rj_cls_seq, 1, memory_order_release);
+                    av_log(NULL, AV_LOG_WARNING, at_live ?
+                           "[PTV-SRC] in0 rejoin: skipped the catch-up (%"PRId64" packets) — resuming at the live content, "
+                           "picture and sound together\n" :
+                           "[PTV-SRC] in0 rejoin: the source did not catch up within 2 s (%"PRId64" packets skipped) — resuming "
+                           "where it is; its pause stays as delay\n", d->rj_skip_n);
+                } else {
+                    d->rj_skip_n++;
+                    av_packet_free(&out);
+                    continue;
+                }
+            } else if (!isv && raw != AV_NOPTS_VALUE) {
+                int64_t dl = raw - av_rescale_q(d->rj_skip_cut, vst->time_base, st->time_base);
+                if (st->pts_wrap_bits > 0 && st->pts_wrap_bits < 63) {
+                    int64_t m = 1LL << st->pts_wrap_bits;
+                    dl &= m - 1;
+                    if (dl >= m >> 1) dl -= m;
+                }
+                if (dl < 0) {
+                    av_packet_free(&out);
+                    continue;
+                }
+            }
+            if (d->rj_skip == 2 && nw - d->rj_skip_wc > 3000000)
+                d->rj_skip = 0;
         }
         demux_unwrap(d, out);               /* 33-bit source wrap -> monotonic extended ts (ONCE) */
 
