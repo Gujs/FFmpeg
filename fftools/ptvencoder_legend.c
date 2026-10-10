@@ -194,6 +194,7 @@ void ptv_print_log_legend(int full)
         "  dlvhold    (delivery gate) ms of audio HELD waiting for matching video (≈ encoder latency +\n"
         "             cushion); normal ~1-2s, scales with the cushion\n"
         "  dlvforced  (gate) packets force-released because video STALLED — MUST stay ~0\n"
+        "  dlvdrop    (gate, shown when >0) copied AC-3/MP2 packets dropped because the gate was full — MUST be 0\n"
         "  vdlvhold   (§7.5b symmetric gate, pre12; armed on MULTIVIEW too since pre17 — task #48:\n"
         "             the fleet loudnorm chain made every mv audio track wall-late, video left ~2-3s\n"
         "             early on the wire with labels intact) ms of EARLY VIDEO held for audio delivery\n"

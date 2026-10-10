@@ -1691,7 +1691,7 @@ void *output_thread(void *arg)
                 int hh = (int)(secs / 3600), mm = ((int)secs % 3600) / 60;
                 double ss = secs - hh * 3600 - mm * 60;
                 int64_t cr = (v->dbg_pcorrupt ? *v->dbg_pcorrupt : 0) + (v->dbg_vcorrupt ? *v->dbg_vcorrupt : 0);  /* corrupt: demux + decode */
-                char dlv[112] = "";                                  /* §7.5a delivery gate: max hold + cap-forced releases */
+                char dlv[160] = "";                                  /* §7.5a delivery gate: max hold + cap-forced releases */
                 if (v->gate) {
                     int dn = snprintf(dlv, sizeof dlv, " dlvhold=%"PRId64"ms dlvforced=%"PRId64,
                              atomic_load_explicit(&v->gate->st_hold_us, memory_order_relaxed) / 1000,
@@ -1704,7 +1704,12 @@ void *output_thread(void *arg)
                         dn += snprintf(dlv + dn, sizeof dlv - dn, " vdlvhold=%"PRId64"ms",
                                  atomic_load_explicit(&v->gate->st_vhold_us, memory_order_relaxed) / 1000);
                         if (vf > 0 && dn > 0 && dn < (int)sizeof dlv)
-                            snprintf(dlv + dn, sizeof dlv - dn, " vdlvforced=%"PRId64, vf);
+                            dn += snprintf(dlv + dn, sizeof dlv - dn, " vdlvforced=%"PRId64, vf);
+                    }
+                    {   /* 2.0.0 T-101: copied packets the full gate dropped (shown when >0) */
+                        int64_t dd = atomic_load_explicit(&v->gate->st_dropped, memory_order_relaxed);
+                        if (dd > 0 && dn > 0 && dn < (int)sizeof dlv)
+                            snprintf(dlv + dn, sizeof dlv - dn, " dlvdrop=%"PRId64, dd);
                     }
                 }
                 int64_t aw = atomic_load_explicit(&g_async_ppm, memory_order_relaxed);  /* aresample work (ppm) */

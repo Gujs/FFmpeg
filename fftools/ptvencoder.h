@@ -122,6 +122,7 @@ typedef struct DlvGate {
                                          * encoder latency ≈ a few s). Absolute-age cap mis-fired there. */
     /* stats (NFR-OBS) */
     _Atomic int64_t st_hold_us;         /* age of the oldest still-held packet at the last drain */
+    int64_t         drop_log_wc;        /* 2.0.0 T-101: wall us of the last [PTV-DLV] drop line (under lock) */
     _Atomic int64_t st_forced;          /* cap_us-forced releases (encoder latency > cap) */
     _Atomic int64_t st_dropped;         /* non-blocking copy drops on a full FIFO */
     /* ---- §7.5b (1.0.1-pre12) SYMMETRIC gate: the video-side hold (see ptvencoder_gate.c

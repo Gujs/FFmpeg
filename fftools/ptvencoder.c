@@ -5480,12 +5480,20 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
      * an explicit PTV_DELIVERY_MAXQ still wins). */
     delivery_on = live && g_delivery && (!multiview || g_delivery_mv);
     if (delivery_on) {
-        int maxq = g_cp.delivery_maxq;
-        if (!getenv("PTV_DELIVERY_MAXQ"))
+        int maxq = g_cp.delivery_maxq, n_gated = 0, k2;
+        for (k2 = 0; k2 < n_pass; k2++)
+            n_gated += pass[k2].gated;
+        if (!getenv("PTV_DELIVERY_MAXQ")) {
             maxq = FFMAX(maxq, n_audio * 50 *
                          (int)(g_cp.delivery_cap_us / 1000000 + g_cushion_max_ms / 1000 + 5));
             /* per gated track: ~50 pkt/s x (gate cap + bank ceiling + clump surge headroom) —
              * the same sizing the deep-preroll path applies, computed automatically (v0.9.14.1) */
+            /* 2.0.0 T-101: copied AC-3/MP2 ride this gate too and were not counted. After a sender pause the
+             * BURST rejoin keeps the pause as delay, so a copy waits that long here: 1024 slots overflowed at a
+             * 20 s pause and ~51 s of AC-3 was dropped (silently). Room for 300 s per copied track; nodes are
+             * allocated per enqueue, so this is only the backstop. */
+            maxq += n_gated * 50 * 300;
+        }
         for (r = 0; r < n_rung; r++)
             dlv_init(&rung[r].gate, rung[r].mux_q, g_cp.delivery_cap_us, maxq);
         /* §7.5b (1.0.1-pre12) symmetric gate: arm the EARLY-VIDEO hold, keyed on the audio
