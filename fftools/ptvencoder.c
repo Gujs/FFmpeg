@@ -1441,8 +1441,14 @@ static void cc_tap_flush_pending(CcTap *t, int64_t cur_us, char *ttag)
      * frame that happened to come next — across an outage that frame is the first one after it, and the caption went on
      * air over that content 9.7 s late (sync_gap2_10); stamped where it was due, the video's record drops it as never
      * shown. In normal flow it is the same frame. */
-    if (g_vmap)
+    if (g_vmap) {
         pe.src_us = FFMIN(cur_us, FFMIN(t->pend_changed_us + PTV_CC_DEBOUNCE_US, t->pend_first_us + PTV_CC_DEADLINE_US));
+        /* 2.0.0 T-318: ... measured from the frame the page belongs to. Looked up as "content + delay", a caption
+         * whose frame went on air just before an outage followed the pre-gap tail frames shown after the hold: M020
+         * +8.3 s (sync_gap2_10, v2 timing media). Its frame + the delay puts it 300 ms after its own picture. */
+        if (t->pend_first_us != AV_NOPTS_VALUE && t->pend_first_us <= pe.src_us)
+            pe.vm_delay_us = pe.src_us - t->pend_first_us;
+    }
     cur_us = pe.src_us;
     t->pend_ass = NULL;
     cc_tap_send(t, &pe, ttag);

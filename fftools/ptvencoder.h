@@ -653,6 +653,8 @@ typedef struct CcEvent {
                           * already-blank page must not read as a clear that went out */
     int      vmapped;    /* 2.0.0 T-100: vm_out_us holds the output time the video gave src_us */
     int64_t  vm_out_us;
+    int64_t  vm_delay_us;  /* 2.0.0 T-318: src_us = the caption's own frame + this assembly delay; the video record is
+                            * asked for that FRAME and the delay added on the output clock (0 = src_us is the frame) */
 } CcEvent;
 
 /* Decode-thread side. One per input; wired to every input the extraction runs on
