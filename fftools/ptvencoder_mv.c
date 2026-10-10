@@ -389,8 +389,11 @@ void *compositor_thread(void *arg)
              * runs and the slot's audio PID went dark on the wire for the whole outage, then the PLL padded the
              * hole in one burst at the return (fixture kill_return_20: 21 s dark, ACQUIRE pad 19.3 s). The
              * compositor keeps ticking: once the cell has shown no fresh frame for 1 s and the track has decoded
-             * nothing for 2 s, it sends the same fill sentinels (the quantum fills the wall time elapsed, so a
-             * sentinel from the demux as well never doubles the silence). PTV_NO_SRC_FILL=1 off. */
+             * nothing for 1 s, it sends the same fill sentinels (the quantum fills the wall time elapsed, so a
+             * sentinel from the demux as well never doubles the silence). PTV_NO_SRC_FILL=1 off.
+             * 1 s, not the demux path's 2 s: the picture is gone too, so this is an outage, not an interleave blip —
+             * with 2 s a slot flapping in 2 s outages was never filled (pre10 MV sync_flapping: slot audio dark 3.2 s,
+             * each outage padded in one burst after the return). */
             if (g_hold_fill && g_glueclass && last_fresh_us[k] > 0 && now_us - last_fresh_us[k] > 1000000) {
                 DemuxArgs *da = &c->inputs[k].da;
                 int64_t nw = av_gettime_relative();
@@ -399,7 +402,7 @@ void *compositor_thread(void *arg)
                     int g = da->aglobal[j];
                     int64_t fw = g >= 0 && g < PTV_MAX_AUDIO ? atomic_load_explicit(&g_adec_frame_wc[g], memory_order_relaxed) : 0;
                     AVPacket *fs;
-                    if (!fw || nw - fw < 2000000 || nw - mv_fill_us[k][j] < g_nbs_quantum_us)
+                    if (!fw || nw - fw < 1000000 || nw - mv_fill_us[k][j] < g_nbs_quantum_us)
                         continue;
                     mv_fill_us[k][j] = nw;
                     if (!(fs = av_packet_alloc())) continue;
