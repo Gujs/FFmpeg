@@ -35,9 +35,15 @@ the v2 `0001` patch (additive, travels with the source to the build box).
   channel came back with no sound; they are dropped as before), and a pause that would hold more than the ceiling skips the catch-up to the live content —
   all streams to one video keyframe, bars a moment longer, picture and sound together. A source that does not catch up
   within 2 s resumes where it is. Fixtures: 20/45/90 s and two 20 s pauses keep content age at 3.0–3.1 s with no
-  pictures over silence; 5/10 s pauses keep their delay (inside the ceiling) with sound; bursts over 12 s: audio dark
-  3.3–3.5 s (pre10: 15–20 s). Still open: bursty start-up and > 8 s burst structure (T-316), flapping returns. PTV_MAX_DELAY_MS sets the
+  pictures over silence; 5/10 s pauses keep their delay (inside the ceiling) with sound; bursts over 12 s: NOT fixed —
+  repeated runs are bimodal (20 s bursts, 6 runs: 2 with audio dark ~3.5 s, 4 with audio dark 7–10 s and lip sync
+  4–8 s off; one-run figures earlier said 3.3–3.5 s), T-316. Still open: bursty start-up and > 8 s burst structure (T-316), flapping returns. PTV_MAX_DELAY_MS sets the
   ceiling (0 = keep every pause as delay, as pre10 did).
+- **No 80 ms lip-sync step after a short source pause (T-317).** The rejoin map compared each returning frame with the
+  very next house tick, but a sender's catch-up burst decodes ~3 s ahead of the output: the ~74th queued frame looked
+  "ahead of the house" and contiguous content was shifted 80 ms (sync_stop_5: sound 80 ms late for 5 s, then a snap;
+  pre10 too). The comparison now uses the tick the frame will actually be shown on (after the frames already queued).
+  Real outages map exactly as before (sync_gap_20 2.20 s, the second of two outages 0.32 s, lip sync 0.0 ms).
 
 ## 2.0.0-pre10 — multiview slot audio through a full slot outage (T-093 part 2)
 

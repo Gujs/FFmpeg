@@ -2686,6 +2686,7 @@ strip:
 static void rejoin_map(DecodeCtx *d, const AVFrame *frame)
 {
     int64_t src_us, h0, pos, next, tick, lead, old, vs;
+    int qn;
 
     if (!g_rejoin_map || !g_src_hold_act)
         return;
@@ -2710,14 +2711,20 @@ static void rejoin_map(DecodeCtx *d, const AVFrame *frame)
     if (vs && src_us < atomic_load_explicit(&g_vskip_from_us, memory_order_relaxed))
         vs = atomic_load_explicit(&g_vskip_off_before, memory_order_relaxed);
     pos  = src_us - h0 - vs - ptv_rj_off(src_us);                 /* where content_index() would put it now */
-    next = atomic_load_explicit(&g_house_out_us, memory_order_relaxed) + tick;   /* the next house tick: a frame
-                                                                                   * that misses it costs one dup */
+    /* 2.0.0 T-317: the house tick THIS frame will be shown on — after the frames already queued for the master. Against
+     * the very next tick, a catch-up burst (decoded faster than real time) looked "ahead" once ~3 s of it were queued
+     * (sync_stop_5: lead −2.88 s on the first returning frame, +0.08 s on the 74th, queued): the map shifted contiguous
+     * content by 80 ms and the sound ran 80 ms late for 5 s ([PTV-ACOMP] −79 ms step). Content genuinely ahead of the
+     * house (T-077's WUCR debt) arrives with an empty queue and is still mapped. */
+    qn   = d->frame_q[0] ? av_thread_message_queue_nb_elems(d->frame_q[0]) : 0;
+    next = atomic_load_explicit(&g_house_out_us, memory_order_relaxed) + tick * (1 + qn);   /* a frame that misses
+                                                                                              * its tick costs one dup */
     lead = pos - next;
     if (g_diag && d->rj_dbg_n < 16) {   /* 2.0.0-pre8.2: [PTV-RJTRACE] (canary B: the map cancelled — localize) */
         d->rj_dbg_n++;
-        av_log(NULL, AV_LOG_INFO, "[PTV-RJTRACE] dec src=%.3f pict=%c key=%d pos=%.3f next=%.3f lead=%+.3f vs=%.3f "
+        av_log(NULL, AV_LOG_INFO, "[PTV-RJTRACE] dec src=%.3f pict=%c key=%d pos=%.3f next=%.3f lead=%+.3f qn=%d vs=%.3f "
                "h0=%.3f holding=%d\n", src_us / 1e6, av_get_picture_type_char(frame->pict_type),
-               !!(frame->flags & AV_FRAME_FLAG_KEY), pos / 1e6, next / 1e6, lead / 1e6, vs / 1e6, h0 / 1e6,
+               !!(frame->flags & AV_FRAME_FLAG_KEY), pos / 1e6, next / 1e6, lead / 1e6, qn, vs / 1e6, h0 / 1e6,
                ptv_src_holding());
     }
     if (lead <= tick)
