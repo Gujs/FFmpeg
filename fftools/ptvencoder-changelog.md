@@ -39,6 +39,15 @@ the v2 `0001` patch (additive, travels with the source to the build box).
   repeated runs are bimodal (20 s bursts, 6 runs: 2 with audio dark ~3.5 s, 4 with audio dark 7–10 s and lip sync
   4–8 s off; one-run figures earlier said 3.3–3.5 s), T-316. Still open: bursty start-up and > 8 s burst structure (T-316), flapping returns. PTV_MAX_DELAY_MS sets the
   ceiling (0 = keep every pause as delay, as pre10 did).
+- **Captions on their own picture, for their full time (T-318, T-312).** A pop-on caption went on air 300 ms after its
+  picture (the assembly wait, T-096) while its erase went on air on its own frame, so every caption lost 300 ms of
+  screen time (owner: "300 ms less is significant and can influence reading"). The wait only decides when the page is
+  known; the page now takes the output time of the frame it belongs to (pop-on: its EOC; roll-up: its last character).
+  Looking the caption up by "content + 300 ms" also let a caption whose picture went on air just before an outage
+  follow the pre-gap tail frames shown after the hold (+8.3 s); it is now matched to its own frame (and dropped if its
+  moment has passed). v2 timing media 29.97: pop-on captions and erases +0.0 ms in clean, double outage, pause,
+  restart and flapping; screen time = the source. Roll-up +166.8 ms (was +266.6): cc_dec's real-time mode reports the
+  screen at most every 200 ms (T-319).
 - **No 80 ms lip-sync step after a short source pause (T-317).** The rejoin map compared each returning frame with the
   very next house tick, but a sender's catch-up burst decodes ~3 s ahead of the output: the ~74th queued frame looked
   "ahead of the house" and contiguous content was shifted 80 ms (sync_stop_5: sound 80 ms late for 5 s, then a snap;

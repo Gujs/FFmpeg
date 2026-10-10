@@ -1445,9 +1445,14 @@ static void cc_tap_flush_pending(CcTap *t, int64_t cur_us, char *ttag)
         pe.src_us = FFMIN(cur_us, FFMIN(t->pend_changed_us + PTV_CC_DEBOUNCE_US, t->pend_first_us + PTV_CC_DEADLINE_US));
         /* 2.0.0 T-318: ... measured from the frame the page belongs to. Looked up as "content + delay", a caption
          * whose frame went on air just before an outage followed the pre-gap tail frames shown after the hold: M020
-         * +8.3 s (sync_gap2_10, v2 timing media). Its frame + the delay puts it 300 ms after its own picture. */
-        if (t->pend_first_us != AV_NOPTS_VALUE && t->pend_first_us <= pe.src_us)
-            pe.vm_delay_us = pe.src_us - t->pend_first_us;
+         * +8.3 s (sync_gap2_10, v2 timing media).
+         * 2.0.0 T-312 (owner 2026-10-10: "300 ms less is significant and can influence reading"): and it goes on air
+         * ON that frame — the frame where the page as emitted was complete (pop-on: its EOC; roll-up: its last
+         * character). The assembly wait only decides WHEN the page is known; the video record gives it the frame's
+         * output time (the video reaches the air ~3 s after the wait is over). Was +300 ms (T-096), while the erase
+         * went out on its own frame: every caption lost 300 ms of screen time. */
+        if (t->pend_changed_us != AV_NOPTS_VALUE && t->pend_changed_us <= pe.src_us)
+            pe.vm_delay_us = pe.src_us - t->pend_changed_us;
     }
     cur_us = pe.src_us;
     t->pend_ass = NULL;

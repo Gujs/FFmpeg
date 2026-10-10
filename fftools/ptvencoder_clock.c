@@ -601,9 +601,7 @@ static int cc_vq_release(CcCtx *c, int force)
     while (k < c->nvq) {
         CcEvent *ev = &c->vq[k];
         int64_t o = AV_NOPTS_VALUE, gap = 0;
-        int r = ptv_vmap_lookup(ev->src_us - ev->vm_delay_us, &o, &gap);   /* T-318: the caption's own frame */
-        if (r == 1)
-            o += ev->vm_delay_us;                                            /* ... then its assembly delay */
+        int r = ptv_vmap_lookup(ev->src_us - ev->vm_delay_us, &o, &gap);   /* T-318/T-312: on the caption's own frame */
         if (r == 0 && !force)
             break;
         if (ev->kind != PTV_CC_ERASE && (r < 0 || (r == 1 && (gap > 1000000 || o < pos - 1000000)))) {
