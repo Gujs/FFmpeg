@@ -238,6 +238,18 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
         if (c->last_dts == AV_NOPTS_VALUE)
             return;                      /* nothing has ever been on screen: nothing to keep alive */
         house_us = c->last_dts + PTV_CC_KEEPALIVE_US;
+        /* 2.0.0 T-098: ... but never past the video. During an input stall the output does not
+         * advance one second per wall second (sync_gap_20 at 29.97: the video PID went dark 1.7 s
+         * before the hold took over, and the output gained 18.0 s in a 20.1 s outage), so a
+         * wall-paced chain ended 2 s ahead of the returning content: the first caption after the
+         * return was bumped behind the last keepalive and went on air 1.15 s late. The output
+         * position plus the lead the last real event had over it is the same axis the captions
+         * are stamped on. Never backward: at least 1 ms past the last stamp. */
+        if (c->ka_lead_ok) {
+            int64_t pos = atomic_load_explicit(&g_house_out_us, memory_order_relaxed);
+            if (pos > 0 && pos + c->ka_lead_us < house_us)
+                house_us = FFMAX(pos + c->ka_lead_us, c->last_dts + 1000);
+        }
     } else {
         /* content_index() wants the source pts in the rung's own out_tb. h0_lock is held
          * because on multiview the compositor's REANCHOR2 mutates this slot's h0 at runtime
@@ -472,6 +484,13 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
     pkt->duration = (int64_t)ev->end_ms * 1000;
     pkt->pos      = -1;
     c->last_dts     = house_us;
+    if (ev->src_us != AV_NOPTS_VALUE) {           /* 2.0.0 T-098: the lead a synthetic keepalive rides */
+        int64_t pos = atomic_load_explicit(&g_house_out_us, memory_order_relaxed);
+        if (pos > 0) {
+            c->ka_lead_us = house_us - pos;
+            c->ka_lead_ok = 1;
+        }
+    }
     /* AFTER the encode: ev->kind may have been rewritten to KEEPALIVE by the retry above, and
      * only a page that really went out is a floor for the next erase. */
     if (ev->kind == PTV_CC_CAPTION) {

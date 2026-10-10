@@ -876,6 +876,11 @@ typedef struct CcCtx {
     int64_t          last_dts;                /* house-domain us; strictly-increasing guard */
     int64_t          last_emit_wc;            /* wall clock of the last emitted packet — the
                                                * synthetic-keepalive timer for a frameless input */
+    /* 2.0.0 T-098: how far the last REAL event's stamp led the master's output position
+     * (g_house_out_us) when it was emitted — the pipeline's buffering. A synthetic keepalive
+     * rides the output position plus this lead, so it cannot run ahead of the video. */
+    int64_t          ka_lead_us;
+    int              ka_lead_ok;
     int64_t          err_log_us;              /* encoder-error log rate limit */
     /* state log (§2 observability): first caption, and the caption-went-quiet transition */
     int              seen_caption;
