@@ -2204,6 +2204,16 @@ static inline int ptv_rj_settled(int cls_seq0, int64_t now)
     default: return atomic_load_explicit(&g_src_jump_wc, memory_order_relaxed) >= rj || now - rj > 200000;
     }
 }
+/* 2.0.0 T-315: has the input come back as a BURST (a sender catching up a pause) since cls_seq0? Only then are frames
+ * that arrive while the hold is still on air the returning content. Any other class during a hold is damaged
+ * fragments trickling in (Cinestar 50 % loss: NEW DOMAIN classified 107 s before the picture came back) — the fill
+ * covers their time and they are dropped, as before T-315 (kept, 32 s of audio queued behind the delivery gate and
+ * the channel came back with no sound). */
+static inline int ptv_rj_burst_since(int cls_seq0)
+{
+    return atomic_load_explicit(&g_rj_cls_seq, memory_order_acquire) != cls_seq0 &&
+           atomic_load_explicit(&g_rj_cls, memory_order_relaxed) == 1;
+}
 extern _Atomic int64_t g_shed_wall;      /* (d) wall us of the last self-inflicted queue drop (ANY input —
                                           * pre16: per-track readers use Input.shed_wall; this aggregate
                                           * stays for the catch-up governor + unwired fallback) */

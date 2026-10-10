@@ -1946,8 +1946,8 @@ static int demux_pass(DemuxArgs *d, AVPacket *out)
             if (holding) {
                 pthread_mutex_lock(&d->pass_lock);
                 holding = ps->fill_end != AV_NOPTS_VALUE &&         /* ... and this copy is being filled */
-                          /* 2.0.0 T-103: ... and the input has not come back yet (a catch-up burst is real content) */
-                          atomic_load_explicit(&g_rj_cls_seq, memory_order_acquire) == ps->fill_cls_seq0;
+                          /* 2.0.0 T-315: ... and the input has not come back as a BURST (a catch-up is real content) */
+                          !ptv_rj_burst_since(ps->fill_cls_seq0);
                 pthread_mutex_unlock(&d->pass_lock);
             }
             if (holding && !ps->npark) {   /* before in_wc: the copy's return must still read as a resume and park */
