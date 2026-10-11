@@ -275,6 +275,7 @@ int ptv_vmap_lookup(int64_t c_us, int64_t *out_us, int64_t *gap_us)
 _Atomic int64_t g_vdisp_skew_us;   /* 2.0.0 T-095: master: (vpts - content index) of the last fresh frame, us */
 _Atomic int64_t g_dup_out_us;   /* 2.0.0-pre9.4 (T-083): output time on ticks whose content did not advance */
 int             g_rejoin_map = 1;
+int64_t         g_hold_clean_us = 1000000;
 int             g_vo_hold = 1;   /* 2.0.0-pre9.8 (T-076): audio keeps its own clock while only the video is gone; PTV_NO_VO_HOLD=1 off */
 _Atomic int     g_vskip_epoch;
 _Atomic int64_t g_vgop_est_us;
@@ -2760,9 +2761,60 @@ static void rejoin_map(DecodeCtx *d, const AVFrame *frame)
            "jump (PTV_NO_REJOIN_MAP=1 reverts)\n", lead / 1e6);
 }
 
+/* 2.0.0 T-324: may this decoded frame end the hold? A hold whose input sent damaged video ends only after the video has
+ * played cleanly for g_hold_clean_us: no corrupt packet or frame, no step, no wall pause over 500 ms, and no frame missing
+ * (consecutive frames more than 1.5 source frame spacings apart — after heavy loss the decoder's references stay broken
+ * for a while and it drops frames without an error: every 4th one on the Cinestar 50 % seed 2). Until then the frames are
+ * discarded and the output stays on its hold picture and silence. Under heavy loss a decodable fragment ended the hold,
+ * the video then waited 3.3 s for a keyframe outside it and the output clock leapt over the gap (a 4.1 s video PTS hole;
+ * 5.8 s on the canary). A clean outage (stop, kill, burst) returns at its first frame as before. The missed content is
+ * skipped: the channel resumes at live, picture and sound together. */
+static int hold_clean_pass(DecodeCtx *d, const AVFrame *frame)
+{
+    int64_t hid, dw, now = av_gettime_relative(), dt = 0;
+    int gap;
+    dw = atomic_load_explicit(&g_vdmg_wc, memory_order_relaxed);
+    if (frame->best_effort_timestamp != AV_NOPTS_VALUE) {
+        int64_t pts = av_rescale_q(frame->best_effort_timestamp, d->ist_tb, AV_TIME_BASE_Q);
+        if (d->hc_last_pts != AV_NOPTS_VALUE)
+            dt = pts - d->hc_last_pts;
+        if (dt >= 5000 && (!d->hc_min_dt || dt < d->hc_min_dt) && !ptv_src_holding() && (!dw || now - dw > 5000000))
+            d->hc_min_dt = dt;           /* the source's frame spacing: the smallest step of steady, undamaged video
+                                          * (a damaged field decodes 20 ms from its neighbour on 1080i25) */
+        d->hc_last_pts = pts;
+    }
+    if (!g_hold_clean_us || !ptv_src_holding())
+        return 1;
+    hid = atomic_load_explicit(&g_src_hold_start, memory_order_relaxed);
+    if (hid != d->hc_hold_id) {
+        d->hc_hold_id = hid; d->hc_since = d->hc_flag_since = d->hc_last = 0; d->hc_drop = d->hc_passed = 0;
+    }
+    if (!hid || dw < hid || d->hc_passed)
+        return 1;                        /* no damage since the hold began: a clean outage */
+    gap = d->hc_min_dt && (dt <= 0 || dt > d->hc_min_dt * 3 / 2);   /* a frame missing (or out of order) */
+    if (!d->hc_flag_since || dw >= d->hc_flag_since || now - d->hc_last > 500000)
+        d->hc_flag_since = d->hc_since = now;   /* damage or a pause: both runs restart at this frame */
+    else if (gap)
+        d->hc_since = now;               /* the frame run restarts */
+    d->hc_last = now;
+    if (now - d->hc_since >= g_hold_clean_us || now - d->hc_flag_since >= 5 * g_hold_clean_us) {
+        av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 damaged input: %d frames discarded until the video played cleanly "
+               "%.1f s%s — the hold ends now (PTV_HOLD_CLEAN_MS=0 reverts)\n", d->hc_drop, g_hold_clean_us / 1e6,
+               now - d->hc_since >= g_hold_clean_us ? "" : " (no corrupt data for 5x that, frames still irregular)");
+        d->hc_passed = 1;                /* pass the rest of this hold's frames */
+        return 1;
+    }
+    d->hc_drop++;
+    return 0;
+}
+
 static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
 {
     int i;
+    if (!hold_clean_pass(d, frame)) {
+        av_frame_unref(frame);
+        return;
+    }
     rejoin_map(d, frame);                /* 2.0.0-pre6.1 (single input: emit_video is the non-mosaic path) */
     {   /* 2.0.0-pre9.4 (T-083): a frame decoded within 5 s of corrupt video is damage-era — the output clock fills a
          * content gap in front of it (frames lost); in front of any other frame a gap is the old leap (a backlog drain,
@@ -5568,6 +5620,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
     for (k = 0; k < n_input; k++) {
         DecodeCtx *d = &inputs[k].dc;
         d->video_q = inputs[k].video_q; d->vdec = inputs[k].vdec; d->ist_tb = inputs[k].ist_tb;
+        d->hc_last_pts = AV_NOPTS_VALUE;   /* 2.0.0 T-324 */
         d->h0 = &inputs[k].h0; d->h0_lock = &inputs[k].h0_lock; d->live = live;
         if (multiview) { d->hold = &inputs[k].hold; d->filtering = 0; d->n_rung = 0; }
         else { d->n_rung = n_rung; for (r = 0; r < n_rung; r++) d->frame_q[r] = rung[r].frame_q; }
@@ -6628,6 +6681,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_SRC_FILL")) g_hold_fill = 0;   /* 2.0.0-pre6 kill switch: no fill while holding */
     if (getenv("PTV_NO_COPY_GAPFILL")) g_copy_gapfill = 0;   /* 2.0.0-pre9.4 kill switch */
     if (getenv("PTV_NO_VO_HOLD")) g_vo_hold = 0;
+    { const char *hc = getenv("PTV_HOLD_CLEAN_MS"); if (hc) g_hold_clean_us = (int64_t)atoi(hc) * 1000; }   /* 2.0.0 T-324 */
     if (getenv("PTV_NO_REJOIN_MAP")) g_rejoin_map = 0; /* 2.0.0-pre6.1 kill switch: PTS jumps at a rejoin again */
     { const char *s = getenv("PTV_GLUE_HTOL_PCT");     if (s && atoi(s) > 0) g_glue_htol = atoi(s); }             /* tuning knob (G4) */
     { const char *s = getenv("PTV_PAIR_EXPECT_TTL_US");if (s && atoll(s) > 0) g_pair_ttl_us = atoll(s); }          /* TEST ONLY (G6) */

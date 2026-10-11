@@ -1848,8 +1848,20 @@ static void park_drain(DemuxArgs *d, int force)
             (!ptv_src_holding() &&                                                 /* filled, but no rejoin since */
              atomic_load_explicit(&g_src_rejoin_wall, memory_order_relaxed) <= ps->fill_wc0))
             ready = fw > ps->park_since;
-        else
+        else {
             ready = ptv_rj_settled(ps->fill_cls_seq0, now);                        /* 2.0.0-pre8.5 */
+            /* 2.0.0 T-324: ... and the video has put this run's content on air. Under heavy loss the rejoin is
+             * classified by fragments mid-hold, so "settled" was already true at the return, 200 ms before the
+             * master wrote the post-rejoin house_skew (it does so on the frame it records here): the first AC-3
+             * packets rode the hold's skew, 21 s ahead of the video, and the real track sat behind them (Cinestar
+             * 50 % loss: AC-3 holes of 9-22 s, 3 of 9 seeds) */
+            if (ready && g_vmap) {
+                AVPacket *p0 = ps->park[0];
+                int64_t ts = p0->dts != AV_NOPTS_VALUE ? p0->dts : p0->pts, o, gap;
+                ready = ts == AV_NOPTS_VALUE ||
+                        ptv_vmap_lookup(av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q), &o, &gap) != 0;
+            }
+        }
         pthread_mutex_unlock(&d->pass_lock);
         if (!(force || ready || now - ps->park_since > 4000000))
             continue;
