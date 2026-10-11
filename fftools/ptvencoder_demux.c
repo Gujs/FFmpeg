@@ -1387,6 +1387,32 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
                    (double)so / AV_TIME_BASE, (double)mm / AV_TIME_BASE);
     }
 
+    /* 2.0.0 T-320: a corrupt-timestamp outlier is dropped, but every packet that ARRIVED during the cycle had already
+     * advanced its stream's continuity reference (last_dts_us) — including an outlier on ANOTHER stream than the one
+     * that opened the cycle (29.97 bitflip_100: an audio PES +186 s opened it, a video PES +46.6 s arrived inside it).
+     * Left there, the next good packet of that stream read as a −46.6 s jump: a second cycle re-based the video by
+     * a frame (sync_ptsone + T056_PTSONE_A: lip sync +33 ms), or on the busier bit-error media the output followed
+     * the outlier (a 46.5 s video PTS hole, subtitles and SCTE-35 lost for 30 s). Each stream's reference goes back
+     * to its last KEPT packet. */
+    if (outlier) {
+        int s2;
+        for (s2 = 0; s2 < b->nb_streams; s2++) {
+            int64_t kept = AV_NOPTS_VALUE;
+            for (i = 0; i < b->nb_packets; i++) {
+                PtvDiscPacket *dp = b->packets[i];
+                if (dp && dp->stream_idx == s2 && (dp->timeline == keep_timeline || dp->timeline == 2) &&
+                    (kept == AV_NOPTS_VALUE || dp->raw_dts > kept))
+                    kept = dp->raw_dts;
+            }
+            if (kept != AV_NOPTS_VALUE && b->stream_state[s2].last_dts_us != kept) {
+                av_log(NULL, AV_LOG_INFO, "[PTV-LAYERA] outlier flush: stream %d continuity back to its last kept "
+                       "packet %.3fs (was %.3fs)\n", s2, (double)kept / AV_TIME_BASE,
+                       (double)b->stream_state[s2].last_dts_us / AV_TIME_BASE);
+                b->stream_state[s2].last_dts_us = kept;
+            }
+        }
+    }
+
     for (i = 0; i < b->nb_packets; i++) {
         PtvDiscPacket *dp = b->packets[i];
         AVStream *st;
@@ -2986,6 +3012,28 @@ void *demux_thread(void *arg)
          * pursuit) descends from that one poisoned classification. Bookkeeping must never
          * learn from a packet the pipeline is about to discard. The demux_dispatch check
          * stays as the belt for re-injected/other paths. */
+        /* 2.0.0 T-320: a video packet whose PTS lies more than PTV_DISC_THRESHOLD_US from its own DTS carries a corrupt
+         * PTS (one bit error in a PES header — no CRC). Measured on the 29.97 bitflip_100 timing media: PTS 82.826 s with
+         * DTS 36.190 s (lavf interpolated the DTS across the damage, the header gave only the bad PTS); LAYERA watches DTS
+         * and saw nothing, the decoder stamped the frame 46.6 s ahead and the master followed it — a 46.5 s output PTS
+         * hole, and subtitles / SCTE-35 lost behind it for 30 s at 25 and 59.94 fps. Real reordering is a few frames.
+         * The frame is kept; its PTS is dropped and the decoder falls back to the (continuous) DTS. */
+        if (out->stream_index == d->vstream && out->pts != AV_NOPTS_VALUE && out->dts != AV_NOPTS_VALUE) {
+            const AVStream *vst2 = d->ifmt->streams[out->stream_index];
+            int64_t pd = out->pts - out->dts;
+            if (vst2->pts_wrap_bits > 0 && vst2->pts_wrap_bits < 63) {      /* nearest 33-bit wrap */
+                int64_t m = 1LL << vst2->pts_wrap_bits;
+                pd &= m - 1;
+                if (pd >= m >> 1) pd -= m;
+            }
+            if (llabs(av_rescale_q(pd, vst2->time_base, AV_TIME_BASE_Q)) > PTV_DISC_THRESHOLD_US) {
+                if (!d->pts_outlier_n++ || !(d->pts_outlier_n % 100))
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-LAYERA] video PTS %+.3f s away from its DTS — a corrupt label, "
+                           "PTS dropped, the frame keeps its DTS (%"PRId64" so far)\n",
+                           av_rescale_q(pd, vst2->time_base, AV_TIME_BASE_Q) / 1e6, d->pts_outlier_n);
+                out->pts = AV_NOPTS_VALUE;
+            }
+        }
         if ((out->flags & AV_PKT_FLAG_CORRUPT) && g_discardcorrupt) {
             ret = demux_dispatch(d, out);   /* dispatch = the existing counted discard path */
             if (ret < 0) break;

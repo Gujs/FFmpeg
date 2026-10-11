@@ -1740,6 +1740,7 @@ typedef struct DemuxArgs {
     int64_t               src_pend_w, src_pend_raw; /* 2.0.0-pre3: its wall gap; the last pre-gap DTS */
     /* 2.0.0 T-103 (owner 2026-10-10: the output delay is pinned): a pause the burst bank cannot absorb is not kept as
      * delay — the returning catch-up is skipped up to the live content, all streams to one video keyframe */
+    int64_t               pts_outlier_n;    /* 2.0.0 T-320: video packets whose corrupt PTS was dropped (PTS far from DTS) */
     int                   rj_skip;          /* 1 = dropping until a keyframe at the live point, 2 = cut found: other streams
                                              * drop what lies before it */
     int64_t               rj_skip_target, rj_skip_cut, rj_skip_wc, rj_skip_n;

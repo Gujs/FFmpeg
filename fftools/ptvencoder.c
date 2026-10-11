@@ -1853,6 +1853,11 @@ static int cc_block_emit(CcTap *t, int64_t cur_us, char *ttag)
     av_freep(&t->pend_ass);
     t->pend_ass    = ass;                  /* ownership moves to the tap, then to the event */
     t->pend_end_ms = PTV_CC_MAX_DISPLAY_MS;
+    /* 2.0.0 T-322: a paced block is due NOW — on the frame its pacing released it. The flush computes the due time
+     * from the faithful path's debounce fields, which block mode never updates: every block carried the run's first
+     * caption time, the video record put it tens of seconds behind the output and T-100 dropped it as late (NTD on
+     * live-transcoder, pre11: ~35 % of blocks; roll-up timing media in block mode: 58 of 144). */
+    t->pend_first_us = t->pend_changed_us = cur_us;
     cc_tap_flush_pending(t, cur_us, ttag);
     cc_tap_hold_erase(t, NULL, 0, cur_us + PTV_CC_MIN_DISPLAY_US, 0);
     return 1;
