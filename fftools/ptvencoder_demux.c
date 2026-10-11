@@ -1814,7 +1814,9 @@ static int demux_pass_one(DemuxArgs *d, AVPacket *out, int64_t vm_out_us)
             ps->dup_real = atomic_load_explicit(&g_dup_out_us, memory_order_relaxed);
         }
         if (out->dts != AV_NOPTS_VALUE) {
-            if (d->pass[pi].last_dts != AV_NOPTS_VALUE && out->dts <= d->pass[pi].last_dts && vm_out_us != AV_NOPTS_VALUE) {
+            if (d->pass[pi].last_dts != AV_NOPTS_VALUE && out->dts <= d->pass[pi].last_dts && vm_out_us != AV_NOPTS_VALUE &&
+                d->ifmt->streams[d->pass[pi].in_index]->codecpar->codec_id != AV_CODEC_ID_SCTE_35) {
+                /* SCTE-35 is always sent (T-335: two cues released on the same frame shared its stamp) */
                 d->vm_late++;                    /* 2.0.0 T-100: stamped behind what is on the wire: its moment passed */
                 if (d->pass[pi].sil)
                     pthread_mutex_unlock(&d->pass_lock);
