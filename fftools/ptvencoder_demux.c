@@ -1396,13 +1396,32 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
      * to its last KEPT packet. */
     if (outlier) {
         int s2;
-        for (s2 = 0; s2 < b->nb_streams; s2++) {
-            int64_t kept = AV_NOPTS_VALUE;
+        int64_t *ts = av_malloc_array(FFMAX(b->nb_packets, 1), sizeof(*ts));
+        for (s2 = 0; s2 < b->nb_streams && ts; s2++) {
+            int64_t kept = AV_NOPTS_VALUE, ref;
+            int n = 0, j, k;
+            /* 2.0.0 T-320 (pre12c): the LAST plausible kept packet, not the largest — a second outlier among the kept
+             * packets (rich50b bitflip_100: +93.2 s, 2^23 ticks) was the maximum, continuity went to it and the next
+             * good packet opened a -92.8 s cycle that applied +92.8 s (a 92.86 s video PTS hole). Start from the median
+             * of the stream's kept timestamps and follow, in arrival order, the packets within PTV_DISC_THRESHOLD_US of
+             * the previous one. */
             for (i = 0; i < b->nb_packets; i++) {
                 PtvDiscPacket *dp = b->packets[i];
                 if (dp && dp->stream_idx == s2 && (dp->timeline == keep_timeline || dp->timeline == 2) &&
-                    (kept == AV_NOPTS_VALUE || dp->raw_dts > kept))
-                    kept = dp->raw_dts;
+                    dp->raw_dts != AV_NOPTS_VALUE)
+                    ts[n++] = dp->raw_dts;
+            }
+            if (!n)
+                continue;
+            for (j = 1; j < n; j++)                        /* insertion sort: a cycle holds few packets */
+                for (k = j; k > 0 && ts[k - 1] > ts[k]; k--)
+                    FFSWAP(int64_t, ts[k - 1], ts[k]);
+            ref = ts[n / 2];
+            for (i = 0; i < b->nb_packets; i++) {
+                PtvDiscPacket *dp = b->packets[i];
+                if (dp && dp->stream_idx == s2 && (dp->timeline == keep_timeline || dp->timeline == 2) &&
+                    dp->raw_dts != AV_NOPTS_VALUE && llabs(dp->raw_dts - ref) <= PTV_DISC_THRESHOLD_US)
+                    kept = ref = dp->raw_dts;
             }
             if (kept != AV_NOPTS_VALUE && b->stream_state[s2].last_dts_us != kept) {
                 av_log(NULL, AV_LOG_INFO, "[PTV-LAYERA] outlier flush: stream %d continuity back to its last kept "
@@ -1411,6 +1430,7 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
                 b->stream_state[s2].last_dts_us = kept;
             }
         }
+        av_free(ts);
     }
 
     for (i = 0; i < b->nb_packets; i++) {
