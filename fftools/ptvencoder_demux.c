@@ -3544,6 +3544,7 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
         if (out->stream_index == d->vstream) {
             d->vcorrupt++;
             atomic_store_explicit(&g_vdmg_wc, av_gettime_relative(), memory_order_relaxed);   /* pre9.4 */
+            atomic_store_explicit(&g_vcorrupt_wc, av_gettime_relative(), memory_order_relaxed);   /* 2.0.0 T-324 */
             /* pre24 #63: a corrupt-discarded video packet IS a delivery arrival — the
              * [PTV-BURSTY]/AUTO-BANK advisor measures DELIVERY stalls (HLS-burst clumping),
              * and leaving these unstamped made every TEI corrupt storm read as arrival

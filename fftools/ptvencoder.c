@@ -738,6 +738,7 @@ int             g_reprime = 1;                /* PTV_REPRIME: when a glue drains
 int             g_adapt_cushion = 1;
 _Atomic int     g_frameq_depth;               /* DIAG: master video frame_q occupancy (frames), published each tick for the discontinuity logs */
 _Atomic int64_t g_vdmg_wc;                       /* 2.0.0-pre9.4 (T-083): wall time of the last corrupt video packet/frame */
+_Atomic int64_t g_vcorrupt_wc;                   /* 2.0.0 T-324: ... corrupt DATA only (no timeline step): the hold's clean rule */
 _Atomic int64_t g_fq0_tail_pts = AV_NOPTS_VALUE; /* 2.0.0-pre9.4 (T-083): pts of the newest frame pushed to the master frame_q */
 /* v0.9.4 genlock GUARD (PTV_NO_GENLOCK_GUARD reverts to exact v0.9.x behavior). TruBLU-class jittery/
  * bursty sources alias the 3s FLL window → noisy sub-window rates that the loose ±1% gate folded in,
@@ -2762,7 +2763,7 @@ static void rejoin_map(DecodeCtx *d, const AVFrame *frame)
 }
 
 /* 2.0.0 T-324: may this decoded frame end the hold? A hold whose input sent damaged video ends only after the video has
- * played cleanly for g_hold_clean_us: no corrupt packet or frame, no step, no wall pause over 500 ms, and no frame missing
+ * played cleanly for g_hold_clean_us: no corrupt packet, frame or decode error, no wall pause over 500 ms, and no frame missing
  * (consecutive frames more than 1.5 source frame spacings apart — after heavy loss the decoder's references stay broken
  * for a while and it drops frames without an error: every 4th one on the Cinestar 50 % seed 2). Until then the frames are
  * discarded and the output stays on its hold picture and silence. Under heavy loss a decodable fragment ended the hold,
@@ -2773,7 +2774,8 @@ static int hold_clean_pass(DecodeCtx *d, const AVFrame *frame)
 {
     int64_t hid, dw, now = av_gettime_relative(), dt = 0;
     int gap;
-    dw = atomic_load_explicit(&g_vdmg_wc, memory_order_relaxed);
+    dw = atomic_load_explicit(&g_vcorrupt_wc, memory_order_relaxed);   /* corrupt data, not timeline steps: a clean
+                                                                     * outage's return steps the labels too */
     if (frame->best_effort_timestamp != AV_NOPTS_VALUE) {
         int64_t pts = av_rescale_q(frame->best_effort_timestamp, d->ist_tb, AV_TIME_BASE_Q);
         if (d->hc_last_pts != AV_NOPTS_VALUE)
@@ -3228,15 +3230,19 @@ static void *decode_thread(void *arg)
         PTV_HB_VDEC(d->hb_slot, PTV_HB_VDEC_SENDPKT);
         ret = avcodec_send_packet(d->vdec, pkt);
         av_packet_free(&pkt);
-        if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF)   /* 2.0.0-pre9.4: damage evidence (bit errors */
+        if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) { /* 2.0.0-pre9.4: damage evidence (bit errors */
             atomic_store_explicit(&g_vdmg_wc, av_gettime_relative(), memory_order_relaxed);   /* inside valid packets) */
+            atomic_store_explicit(&g_vcorrupt_wc, av_gettime_relative(), memory_order_relaxed);
+        }
         while (ret >= 0) {
             PTV_HB_VDEC(d->hb_slot, PTV_HB_VDEC_RECVFRAME);
             ret = avcodec_receive_frame(d->vdec, frame);
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) { ret = 0; break; }
             if (ret < 0) goto done;
-            if (frame->decode_error_flags)   /* 2.0.0-pre9.4: concealed / missing slices = damage evidence */
+            if (frame->decode_error_flags) { /* 2.0.0-pre9.4: concealed / missing slices = damage evidence */
                 atomic_store_explicit(&g_vdmg_wc, av_gettime_relative(), memory_order_relaxed);
+                atomic_store_explicit(&g_vcorrupt_wc, av_gettime_relative(), memory_order_relaxed);
+            }
             /* TEST ONLY (F6 gate, PTV_CCTEST_CORRUPT_EVERY): real slice damage never reaches
              * here — the demuxer's own corrupt-packet path discards it first — so the only way
              * to exercise the branch below on demand is to set the flag ourselves. Inert
@@ -3246,6 +3252,7 @@ static void *decode_thread(void *arg)
             if (frame->flags & AV_FRAME_FLAG_CORRUPT) {
                 d->vcorrupt++;
                 atomic_store_explicit(&g_vdmg_wc, av_gettime_relative(), memory_order_relaxed);   /* pre9.4 */
+                atomic_store_explicit(&g_vcorrupt_wc, av_gettime_relative(), memory_order_relaxed);
                 /* The FRAME is unusable for video; its A53 side data is fed to the tap anyway,
                  * because cc_dec is STATEFUL and skipping the frame silently violated its
                  * "every frame's 608 pair, exactly once, in order" invariant, losing

@@ -2125,6 +2125,7 @@ extern CushionPlan g_cp;                 /* defined in ptvencoder_gate.c */
 extern _Atomic int     g_frameq_depth;
 extern _Atomic int64_t g_fq0_tail_pts;
 extern _Atomic int64_t g_vdmg_wc;
+extern _Atomic int64_t g_vcorrupt_wc;   /* 2.0.0 T-324: wall time of the last corrupt video data (no timeline steps) */
 extern int     g_genlock_guard;
 extern _Atomic int64_t g_async_ppm;
 extern int64_t g_stats_period_us;
