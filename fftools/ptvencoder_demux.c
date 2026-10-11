@@ -2884,6 +2884,19 @@ bad:
 
 static void by_count_gap(DemuxArgs *d, int64_t gap, int64_t now);   /* 2.0.0-pre4, defined below */
 
+/* 2.0.0 T-345: raw (a video packet after a gap) is still on the pre-gap timeline: 0..500 ms past ref (33-bit wrap) */
+static int src_tail_more(const AVStream *vst, int64_t raw, int64_t ref)
+{
+    int64_t delta = raw - ref;
+    if (vst->pts_wrap_bits > 0 && vst->pts_wrap_bits < 63) {
+        int64_t m = 1LL << vst->pts_wrap_bits;
+        delta &= m - 1;
+        if (delta >= m >> 1) delta -= m;
+    }
+    delta = av_rescale_q(delta, vst->time_base, AV_TIME_BASE_Q);
+    return delta >= 0 && delta < 500000;
+}
+
 void *demux_thread(void *arg)
 {
     DemuxArgs *d = arg;
@@ -3137,6 +3150,14 @@ void *demux_thread(void *arg)
                             d->src_pend     = 1;
                             d->src_pend_w   = now - d->src_last_vwall;
                             d->src_pend_raw = d->src_last_vdts_raw;   /* last packet BEFORE the gap */
+                        } else if (d->src_pend < 3 && src_tail_more(vst, raw, d->src_pend_raw)) {
+                            /* 2.0.0 T-345: a cut can leave TWO pre-gap tail frames (T-089): the second was classified,
+                             * A = +0.04 s → BURST after a 20 s video-only outage (rich50b sync_vnull_20; the jump to the
+                             * live content came one packet later). BURST counted the gap toward AUTO-BANK, the armed
+                             * bank disabled the wall evidence and the real 20 s hole was erased as a splice: 18 s of
+                             * silence, A/V +20 s. Up to two more packets still on the old timeline are tail too; a real
+                             * burst stays contiguous and is classified BURST on the next one */
+                            d->src_pend++;
                         } else {                            /* second: the first post-gap content */
                             int64_t delta = raw - d->src_pend_raw, A, W = d->src_pend_w;
                             if (vst->pts_wrap_bits > 0 && vst->pts_wrap_bits < 63) {   /* nearest 33-bit wrap */
