@@ -219,7 +219,7 @@ int g_vmap = 1;
  * bank ceiling (g_cushion_max_ms); PTV_MAX_DELAY_MS overrides. */
 int64_t g_max_delay_us = -1;
 static pthread_mutex_t vmap_lock = PTHREAD_MUTEX_INITIALIZER;
-static int64_t vmap_src[PTV_VMAP_N], vmap_out[PTV_VMAP_N];
+static int64_t vmap_src[PTV_VMAP_N], vmap_out[PTV_VMAP_N], vmap_wc[PTV_VMAP_N];
 static int     vmap_w, vmap_n;                  /* next write slot, entries held */
 
 void ptv_vmap_push(int64_t src_us, int64_t out_us)
@@ -229,10 +229,31 @@ void ptv_vmap_push(int64_t src_us, int64_t out_us)
         vmap_n = 0;                             /* the content timeline stepped back: a new epoch */
     vmap_src[vmap_w] = src_us;
     vmap_out[vmap_w] = out_us;
+    vmap_wc[vmap_w]  = av_gettime_relative();
     vmap_w = (vmap_w + 1) % PTV_VMAP_N;
     if (vmap_n < PTV_VMAP_N)
         vmap_n++;
     pthread_mutex_unlock(&vmap_lock);
+}
+
+/* 2.0.0 T-335: the newest frame the video put on air, once its last two frames were both shown after since_wc and
+ * run on together (no leap: not the pre-gap PES tail lavf releases after an outage, T-074). 1 = *src_us / *out_us set */
+int ptv_vmap_newest(int64_t since_wc, int64_t *src_us, int64_t *out_us)
+{
+    int a, b, ret = 0;
+    pthread_mutex_lock(&vmap_lock);
+    if (vmap_n >= 2) {
+        a = (vmap_w + PTV_VMAP_N - 1) % PTV_VMAP_N;
+        b = (vmap_w + PTV_VMAP_N - 2) % PTV_VMAP_N;
+        if (vmap_wc[b] > since_wc &&
+            FFABS((vmap_src[a] - vmap_src[b]) - (vmap_out[a] - vmap_out[b])) < 1000000) {
+            *src_us = vmap_src[a];
+            *out_us = vmap_out[a];
+            ret = 1;
+        }
+    }
+    pthread_mutex_unlock(&vmap_lock);
+    return ret;
 }
 
 /* 1 = the video has shown content at or after c_us: *out_us = c_us on the timeline of the first such frame and

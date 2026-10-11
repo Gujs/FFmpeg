@@ -1914,6 +1914,23 @@ static void vwait_drain(DemuxArgs *d, int force)
             int r = ts == AV_NOPTS_VALUE ? -1 : ptv_vmap_lookup(av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q), &o, &gap);
             if (r == 0 && !force)
                 break;                          /* its content is not on the output yet */
+            if (r < 0 && scte && !force) {
+                /* 2.0.0 T-335: a cue with no usable time of its own (the PCR rides the video PID: none while only the
+                 * video is gone, or a stale one) took the read-time stamp, +8.96 s off its splice picture at a
+                 * video-only outage's return. Its splice point lies ahead: it goes out with the offset the video runs
+                 * on once it is back, up to 12 s (the output delay pin), then the old way */
+                int64_t ns, no;
+                if (ptv_vmap_newest(ps->vwait_wc[k], &ns, &no)) {
+                    p->pts = p->dts = av_rescale_q(ns, AV_TIME_BASE_Q, ps->in_tb);
+                    d->vm_po = d->prog_off;     /* the video's content is unwrapped with the current prog_off */
+                    demux_pass_one(d, p, no);
+                    d->vm_ok++;
+                    k++;
+                    continue;
+                }
+                if (now - ps->vwait_wc[k] < 12000000)
+                    break;
+            }
             if (r == 1 && !scte && (gap > 1000000 || o < pos - 1000000)) {
                 av_packet_free(&p);
                 d->vm_late++;
