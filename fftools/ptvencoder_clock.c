@@ -251,7 +251,9 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
              * released a moment later carries an EARLIER frame time: stamped behind this keepalive it was bumped one
              * frame late (sync_kill_return_20, the 4th caption after the restart, +41 ms). A keepalive is no picture —
              * keep it behind everything still on its way: the assembly window behind the output. */
-            int64_t lead = g_vmap && !c->multi ? FFMIN(c->ka_lead_us, -PTV_CC_DEBOUNCE_US) : c->ka_lead_us;
+            int64_t lead = g_vmap && !c->multi ? FFMIN(c->ka_lead_us, -PTV_CC_DEBOUNCE_US)
+                         : g_vmap ? c->ka_lead_us - PTV_CC_DEBOUNCE_US   /* T-338: mosaic captions on their frame too */
+                         : c->ka_lead_us;
             if (pos > 0 && pos + lead < house_us)
                 house_us = FFMAX(pos + lead, c->last_dts + 1000);
         }
@@ -261,8 +263,12 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
         /* content_index() wants the source pts in the rung's own out_tb. h0_lock is held
          * because on multiview the compositor's REANCHOR2 mutates this slot's h0 at runtime
          * (every other reader of it takes the lock too). */
+        /* 2.0.0 T-338: a mosaic slot has no video record (T-100 is single input), so a caption took the content time its
+         * page became KNOWN — its frame + the assembly wait: +300 ms on air while its erase was on its own frame (every
+         * caption 300 ms less on screen, the single-input T-312 defect). It goes on its own frame here too. */
+        int64_t src = ev->src_us - (c->multi && g_vmap ? ev->vm_delay_us : 0);
         pthread_mutex_lock(v->h0_lock);
-        idx = content_index(v, av_rescale_q(ev->src_us, AV_TIME_BASE_Q, v->out_tb));
+        idx = content_index(v, av_rescale_q(src, AV_TIME_BASE_Q, v->out_tb));
         pthread_mutex_unlock(v->h0_lock);
         if (idx < 0) {                   /* h0 not anchored yet (pre-first-video caption) */
             atomic_fetch_add_explicit(&g_cc_dropped, 1, memory_order_relaxed);
