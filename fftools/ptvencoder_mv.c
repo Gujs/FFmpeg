@@ -88,6 +88,7 @@ void *compositor_thread(void *arg)
     int64_t lag_true_us[PTV_MAX_INPUT] = {0}; /* PTV_DIAG: TRUE uncapped signed video lag (output−content); when
                                                * this >> skew_us the 250ms cap is saturating = audio can't follow */
     int      slated[PTV_MAX_INPUT] = {0};     /* slot is/was black-slated (outage) since last fresh frame */
+    int64_t  reprime_us[PTV_MAX_INPUT] = {0}; /* 2.0.0 T-339: wall time the returning slot's first frame was queued */
     int64_t  mv_fill_us[PTV_MAX_INPUT][PTV_MAX_AUDIO] = {{0}};   /* T-093 part 2: last fill sentinel per slot track */
     int64_t res_due_us[PTV_MAX_INPUT] = {0};  /* v0.9.13 residence: house-time the next pop is allowed (0 = immediate) */
     int64_t res_ema_us[PTV_MAX_INPUT];        /* v0.9.13: EMA of content deltas = the slot's smoothed cadence */
@@ -272,8 +273,20 @@ void *compositor_thread(void *arg)
                 int64_t hnow = mv_tick_us(c, tick);
                 int64_t half = c->tick_dur_us / 2;
                 int   qhot  = av_thread_message_queue_nb_elems(h->q) >= g_frameq_cap - g_frameq_cap / 4;
-                int   pops;
-                for (pops = 0; pops < 4; pops++) {
+                int   pops, reprime = 0;
+                /* 2.0.0 T-339: a slot back from an outage (slated) stays on its slate until its jitter buffer holds the
+                 * primed depth again (cap 3 s). It used to show the first returning frame at once, from an empty buffer:
+                 * the occupancy servo (+-2 %) then refilled it over ~60 s, one held frame every ~2.5 s, so the slot's
+                 * picture slid ~0.9 s later while its audio chased it (MV-04 gap_20: REANCHOR2 h0 +1 s, ACQUIRE drop
+                 * 831 ms, then audio 40..200 ms early for a minute, PLL pad 170 ms). Re-primed, the picture comes back
+                 * at the lag it had before the outage. */
+                if (slated[k] && resid && g_mv_reprime) {
+                    int occ = av_thread_message_queue_nb_elems(h->q);
+                    if (occ && !reprime_us[k])
+                        reprime_us[k] = now_us;
+                    reprime = occ < res_occ_tgt && (!reprime_us[k] || now_us - reprime_us[k] < 3000000);
+                }
+                for (pops = 0; pops < 4 && !reprime; pops++) {
                     AVFrame *nx = pending[k];
                     pending[k] = NULL;
                     if (!nx) {
@@ -364,6 +377,7 @@ void *compositor_thread(void *arg)
                                k, tick, skew_us[k]/1000, dd/1000, h0d/1000, (tick*c->tick_dur_us)/1000, g_reanchor);
                     }
                     if (g_reanchor) { skew_us[k] = 0; c->inputs[k].house_skew = 0; } slated[k] = 0;
+                    reprime_us[k] = 0;
                     /* 1.0.1-pre17: slate RECOVERY edge — clear this slot's bit; the corrector's
                      * sibling-slate freeze lifts and its 3min quiet window re-runs from here.
                      * Also re-seed the slot's m_v EMA: the outage gap + skew reset changed the

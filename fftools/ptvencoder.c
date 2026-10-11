@@ -78,6 +78,7 @@ int     g_mv_clamp = 0;
  * bypasses the gate (pressure valve vs a wrong rate estimate). PTV_NO_RESIDENCE reverts. */
 int     g_mv_residence = 1;
 int     g_mv_birthtrim = 1;
+int     g_mv_reprime = 1;   /* 2.0.0 T-339: a returning slot re-primes its jitter buffer before it shows; PTV_NO_MV_REPRIME=1 off */
 int     g_aglue_ceil = 1;     /* 1.0.1-pre17 fix round (R3c): erase a tripwire-REFUSED label pursuit at the
                                * graph door (butt-joint) instead of letting aresample grind at max rate
                                * forever against an implausible step. PTV_NO_AGLUE_CEIL=1 reverts. */   /* 1.0.1-pre17 (finding 1): mv birth-trim WINDOW — post-preroll backlog is
@@ -6896,6 +6897,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_CADDISARM")) g_cad_disarm = 0;  /* v0.9.18.1 M7: revert to flag-only pulldown disarm (dropouts drain frame_q again) */
     if (getenv("PTV_NO_MV_EXACTTICK")) g_mv_exacttick = 0;  /* v0.9.12: revert mv measurement axes to integer tick (re-enables the enforced ~10ppm mosaic drift) */
     if (getenv("PTV_NO_RESIDENCE")) g_mv_residence = 0;     /* v0.9.13: revert to one-pop-per-tick (rate-mismatched slots batch dups + fast-forward after starvation) */
+    if (getenv("PTV_NO_MV_REPRIME")) g_mv_reprime = 0;      /* 2.0.0 T-339 */
     if (getenv("PTV_NO_MV_BIRTHTRIM")) g_mv_birthtrim = 0;  /* pre17: one-shot trim only (re-enables the birth catch-up slide) */
     if (getenv("PTV_NO_AGLUE_CEIL"))   g_aglue_ceil = 0;     /* pre17 fix round: unbounded refused-step pursuit (pre-Fashion posture) */
     /* genlock preroll default + the three deep-prime side-cars moved to resolve_cushions() (0.9.18 M1) */

@@ -1928,6 +1928,7 @@ extern int     g_reanchor;
 extern int     g_mv_clamp;
 extern int     g_mv_residence;
 extern int     g_mv_birthtrim;
+extern int     g_mv_reprime;
 extern int     g_aglue_ceil;
 extern int     g_discont;
 extern int     g_gapdiscrim;
