@@ -689,6 +689,10 @@ typedef struct CcTap {
     /* ---- -cc_style block: roll-up -> whole-line block assembly (all unused in `faithful`,
      * which never enters cc_block_feed() at all) ---- */
     int              style;            /* PTV_CC_STYLE_* (resolved once in cc_setup) */
+    int              mode608;          /* 2.0.0 T-023(b): the source's caption mode from its last 608 mode code, as
+                                        * cc_dec reads it: 0 unknown, 1 pop-on (RCL), 2 roll-up (RU2-4), 3 paint-on (RDC),
+                                        * 4 text (RTD) */
+    int              rw_n;             /* pop-on captions re-wrapped (the first few are logged) */
     int              blk_rollup;       /* LATCH: this input has been positively identified as
                                         * a roll-up window. Until it sets, block mode is a
                                         * no-op and events take the pre4 path unchanged. */
@@ -2007,6 +2011,7 @@ extern _Atomic int64_t g_house_out_us, g_house_tick_us;   /* master: last emitte
 /* 2.0.0 T-100: the video's content -> output record (ptvencoder.c) */
 #define PTV_VMAP_N 4096
 extern int g_vmap;
+extern int     g_cc_rewrap;       /* 2.0.0 T-023(b): re-wrap pop-on captions to the teletext row (PTV_CC_NO_REWRAP=1 off) */
 extern int64_t g_hold_clean_us;   /* 2.0.0 T-324: a hold that saw video damage ends after this much clean video */
 extern int64_t g_max_delay_us;   /* 2.0.0 T-103: pinned output delay (us; 0 = off) */
 void ptv_vmap_push(int64_t src_us, int64_t out_us);

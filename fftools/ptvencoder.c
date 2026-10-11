@@ -1595,6 +1595,205 @@ static int cc_rows_parse(CcRows *rows, const char *ass)
 
 static void cc_rows_free(CcRows *rows) { av_freep(&rows->buf); }
 
+/* ---- 2.0.0 T-023(b): pop-on row re-wrap ----
+ *
+ * A pop-on caption keeps the source's line breaks, which were made for a 32-column 608 screen; a teletext subtitle row
+ * holds 36 (40 minus the two start and two end boxes, dvbteletextenc) and is centred by the encoder. Captioners break
+ * long sentences so one word lands alone on a row (TruBLU, 10 min: 37 of 141 captions) — on teletext that word could
+ * have stayed on the row above (owner 2026-10-11). The rows of a pop-on caption are re-flowed when, and only when, that
+ * saves a row or removes a one-word row: the WORDS and their order never change, a dialogue turn ("-" or ">>") keeps
+ * starting its own row, and the caption keeps its lowest row (it does not move on screen). Any markup inside a row
+ * (italics or a colour on part of it) or rows that differ in their leading markup: the caption is left exactly as the
+ * source sent it. Roll-up and paint-on are never touched (their rows are built while the viewer watches). On by
+ * default for pop-on; PTV_CC_NO_REWRAP=1 turns it off. */
+#define CC_TTX_COLS   36     /* a teletext subtitle row: 40 - 2 start boxes - 2 end boxes (dvbteletextenc.c) */
+#define CC_WRAP_WORDS 16     /* a block with more words keeps the source rows (bounded search) */
+int g_cc_rewrap = 1;
+
+typedef struct CcWord { const char *s; int len, w; } CcWord;   /* bytes, width in characters */
+
+static int cc_u8_width(const char *s, int n)
+{
+    int i, w = 0;
+    for (i = 0; i < n; i++)
+        w += ((unsigned char)s[i] & 0xC0) != 0x80;
+    return w;
+}
+
+/* Split words wd[0..n) into at most maxr lines of <= CC_TTX_COLS characters: the fewest lines, then no one-word line,
+ * then line breaks after punctuation, then the most even lines. Fills cut[0..r] (first word of each line, cut[r] = n)
+ * and returns r; 0 when no split fits. */
+static int cc_wrap_block(const CcWord *wd, int n, int maxr, int *best_cut)
+{
+    int r;
+    for (r = 1; r <= maxr && r <= n; r++) {
+        int cut[CC_BLK_MAX_ROWS + 1], k, l, found = 0;
+        int64_t best = INT64_MAX;
+        cut[0] = 0;
+        cut[r] = n;
+        for (k = 1; k < r; k++)
+            cut[k] = k;
+        for (;;) {
+            int ok = 1, orphan = 0, punct = 0, maxw = 0, minw = INT_MAX;
+            for (l = 0; l < r && ok; l++) {
+                int w = 0, i;
+                for (i = cut[l]; i < cut[l + 1]; i++)
+                    w += wd[i].w + (i > cut[l]);
+                if (w > CC_TTX_COLS)
+                    ok = 0;
+                if (r > 1 && cut[l + 1] - cut[l] == 1)
+                    orphan++;
+                if (l < r - 1) {
+                    const CcWord *e = &wd[cut[l + 1] - 1];
+                    punct += !strchr(".,?!;:", e->s[e->len - 1]);
+                }
+                maxw = FFMAX(maxw, w);
+                minw = FFMIN(minw, w);
+            }
+            if (ok) {
+                int64_t cost = (int64_t)orphan * 1000000 + punct * 6 + (maxw - minw);
+                if (cost < best) {
+                    best  = cost;
+                    found = 1;
+                    memcpy(best_cut, cut, (r + 1) * sizeof(*cut));
+                }
+            }
+            for (k = r - 1; k >= 1 && cut[k] == n - r + k; k--)
+                ;
+            if (k < 1)
+                break;
+            cut[k]++;
+            for (l = k + 1; l < r; l++)
+                cut[l] = cut[l - 1] + 1;
+        }
+        if (found)
+            return r;
+    }
+    return 0;
+}
+
+/* The re-wrapped dialog line for a pop-on caption, or NULL when it stays as it is (see the header above). */
+static char *cc_rewrap(const char *ass)
+{
+    CcRows rows;
+    const char *txt = cc_ass_text(ass);
+    char *body[CC_BLK_MAX_ROWS], *lead0 = NULL, *out = NULL;
+    char *line[CC_BLK_MAX_ROWS];
+    int nwords[CC_BLK_MAX_ROWS], nout = 0, orph_in = 0, orph_out = 0, i, ok = 1;
+    AVBPrint lead, bp;
+
+    if (!txt || cc_rows_parse(&rows, ass) < 0)
+        return NULL;
+    if (rows.n < 2) {
+        cc_rows_free(&rows);
+        return NULL;
+    }
+    av_bprint_init(&lead, 0, AV_BPRINT_SIZE_UNLIMITED);
+    for (i = 0; i < rows.n && ok; i++) {
+        char *p = rows.text[i], *e;
+        av_bprint_clear(&lead);
+        for (;;) {                                   /* leading markup: override blocks and \h */
+            if (p[0] == '{' && p[1] == '\\' && strchr(p, '}')) {
+                char *close = strchr(p, '}');
+                av_bprintf(&lead, "%.*s", (int)(close + 1 - p), p);
+                p = close + 1;
+            } else if (p[0] == '\\' && p[1] == 'h')
+                p += 2;
+            else if (p[0] == ' ')
+                p++;
+            else
+                break;
+        }
+        if (!*p || strchr(p, '{') || strchr(p, '\\'))
+            ok = 0;                                  /* empty row, or markup inside the text */
+        if (!i)
+            lead0 = av_strdup(lead.str);
+        else if (!lead0 || strcmp(lead0, lead.str))
+            ok = 0;                                  /* rows styled differently */
+        for (e = p + strlen(p); e > p && e[-1] == ' '; e--)
+            ;
+        *e = 0;
+        body[i] = p;
+    }
+    av_bprint_finalize(&lead, NULL);
+    if (ok) {
+        int b0 = 0;
+        for (i = 0; i < rows.n; i++) {               /* source orphans: one-word rows of multi-row blocks */
+            const char *p;
+            int w = 1;
+            for (p = body[i]; *p; p++)
+                w += p[0] == ' ' && p[1] && p[1] != ' ';
+            nwords[i] = w;
+        }
+        while (b0 < rows.n && ok) {                  /* blocks: a dialogue turn starts a new one */
+            int b1 = b0 + 1, nw = 0, r, j, cut[CC_BLK_MAX_ROWS + 1], big = 0;
+            CcWord wd[CC_WRAP_WORDS];
+            char *copy = NULL, *sv = NULL, *tok;
+            while (b1 < rows.n && body[b1][0] != '-' && strncmp(body[b1], ">>", 2))
+                b1++;
+            for (j = b0; j < b1 && b1 - b0 > 1; j++)
+                orph_in += nwords[j] == 1;
+            for (j = b0; j < b1; j++)
+                nw += nwords[j];
+            r = 0;
+            if (nw <= CC_WRAP_WORDS) {
+                AVBPrint all;
+                av_bprint_init(&all, 0, AV_BPRINT_SIZE_UNLIMITED);
+                for (j = b0; j < b1; j++)
+                    av_bprintf(&all, "%s%s", j > b0 ? " " : "", body[j]);
+                av_bprint_finalize(&all, &copy);
+                nw = 0;
+                for (tok = copy ? av_strtok(copy, " ", &sv) : NULL; tok && nw < CC_WRAP_WORDS;
+                     tok = av_strtok(NULL, " ", &sv)) {
+                    wd[nw].s   = tok;
+                    wd[nw].len = strlen(tok);
+                    wd[nw].w   = cc_u8_width(tok, wd[nw].len);
+                    big |= wd[nw].w > CC_TTX_COLS;
+                    nw++;
+                }
+                if (!big && nw)
+                    r = cc_wrap_block(wd, nw, b1 - b0, cut);
+            }
+            if (r) {
+                for (j = 0; j < r; j++) {
+                    AVBPrint l;
+                    int k;
+                    av_bprint_init(&l, 0, AV_BPRINT_SIZE_UNLIMITED);
+                    for (k = cut[j]; k < cut[j + 1]; k++)
+                        av_bprintf(&l, "%s%s", k > cut[j] ? " " : "", wd[k].s);
+                    av_bprint_finalize(&l, &line[nout]);
+                    orph_out += r > 1 && cut[j + 1] - cut[j] == 1;
+                    nout++;
+                }
+            } else {
+                for (j = b0; j < b1; j++) {          /* no better split: the source's rows */
+                    line[nout++] = av_strdup(body[j]);
+                    orph_out += b1 - b0 > 1 && nwords[j] == 1;
+                }
+            }
+            av_free(copy);
+            b0 = b1;
+        }
+        if (ok && (nout < rows.n || orph_out < orph_in)) {
+            av_bprint_init(&bp, 0, AV_BPRINT_SIZE_UNLIMITED);
+            av_bprintf(&bp, "%.*s", (int)(txt - ass), ass);
+            for (i = 0; i < nout; i++) {
+                int src = rows.n - nout + i;         /* bottom-aligned: the caption keeps its lowest row */
+                av_bprintf(&bp, "%s{\\an7}{\\pos(%d,%d)}%s%s", i ? "\\N" : "",
+                           rows.x[src] >= 0 ? rows.x[src] : 0, rows.y[src] >= 0 ? rows.y[src] : 0,
+                           lead0 ? lead0 : "", line[i]);
+            }
+            if (av_bprint_finalize(&bp, &out) < 0)
+                out = NULL;
+        }
+        for (i = 0; i < nout; i++)
+            av_free(line[i]);
+    }
+    av_free(lead0);
+    cc_rows_free(&rows);
+    return out;
+}
+
 /* First byte of REAL CONTENT in a row: past override blocks, the \h/\N/\n escapes and
  * whitespace. NULL when the row has none. Deliberately the same markup vocabulary
  * cc_ass_has_text() knows — the two must agree on what "empty" means. */
@@ -2390,6 +2589,7 @@ static int cc_block_timers(CcTap *t, int64_t cur_us, char *ttag)
 static int cc_tap_rect(CcTap *t, const char *ass, int end_ms, int64_t cur_us, char *ttag)
 {
     CcEvent ev = { NULL, cur_us, (uint32_t)end_ms, PTV_CC_ERASE };
+    char *rw = NULL;
 
     if (cc_ass_has_text(ass)) {
         /* -cc_style block: new text supersedes a deferred clear here exactly as it does
@@ -2409,6 +2609,14 @@ static int cc_tap_rect(CcTap *t, const char *ass, int end_ms, int64_t cur_us, ch
             if (cc_block_feed(t, ass, cur_us, ttag))
                 return 1;
         }
+        /* 2.0.0 T-023(b): a pop-on caption is re-flowed to the teletext row when that saves a row or a one-word row */
+        if (g_cc_rewrap && t->mode608 == 1 && (rw = cc_rewrap(ass))) {
+            if (t->rw_n++ < 3)
+                av_log(NULL, AV_LOG_INFO, "[PTV-CC]%s pop-on caption re-wrapped to %d columns: \"%s\" -> \"%s\" "
+                       "(PTV_CC_NO_REWRAP=1 disables; first 3 logged)\n", cc_tap_tag(t, ttag, sizeof(char[16])),
+                       CC_TTX_COLS, cc_ass_text(ass), cc_ass_text(rw));
+            ass = rw;
+        }
         /* DEBOUNCE (see PTV_CC_DEBOUNCE_US): buffer it. Only a CHANGE restarts the
          * silence timer — an identical retransmission must not keep the caption
          * pending forever. */
@@ -2425,6 +2633,7 @@ static int cc_tap_rect(CcTap *t, const char *ass, int end_ms, int64_t cur_us, ch
          * [EDM, chars] pair in ONE frame resolves: the erase this frame just held is
          * cancelled by the text that followed it.) */
         av_freep(&t->erase_ass);
+        av_free(rw);
         return 0;
     }
 
@@ -2549,6 +2758,21 @@ static void cc_tap_frame(CcTap *t, AVFrame *frame, AVRational ist_tb)
     sd = av_frame_get_side_data(frame, AV_FRAME_DATA_A53_CC);
     if (sd && sd->size >= 3) {
         AVPacket *cc_pkt = av_packet_alloc();
+        int k;
+        /* 2.0.0 T-023(b): follow the caption mode exactly as cc_dec reads it (field 1, valid 608 pair, low byte odd
+         * parity, control codes 0x14/0x15/0x1c + RCL / RU2-4 / RDC / RTD) — the re-wrap applies to pop-on only */
+        for (k = 0; k + 2 < sd->size; k += 3) {
+            const uint8_t *c3 = sd->data + k;
+            int hi = c3[1] & 0x7f, lo = c3[2] & 0x7f;
+            if (!(c3[0] & 4) || (c3[0] & 3) != 0 || !(av_popcount(c3[2]) & 1) || !(av_popcount(c3[1]) & 1))
+                continue;
+            if (hi != 0x14 && hi != 0x15 && hi != 0x1c)
+                continue;
+            if (lo == 0x20)                        t->mode608 = 1;   /* RCL: pop-on */
+            else if (lo >= 0x25 && lo <= 0x27)     t->mode608 = 2;   /* RU2-4: roll-up */
+            else if (lo == 0x29)                   t->mode608 = 3;   /* RDC: paint-on */
+            else if (lo == 0x2b)                   t->mode608 = 4;   /* RTD: text */
+        }
         atomic_fetch_add_explicit(&g_cc_a53, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&g_cc_a53_in[t->slot], 1, memory_order_relaxed);
         if (cc_pkt && av_new_packet(cc_pkt, sd->size) >= 0) {
@@ -6688,6 +6912,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_SRC_FILL")) g_hold_fill = 0;   /* 2.0.0-pre6 kill switch: no fill while holding */
     if (getenv("PTV_NO_COPY_GAPFILL")) g_copy_gapfill = 0;   /* 2.0.0-pre9.4 kill switch */
     if (getenv("PTV_NO_VO_HOLD")) g_vo_hold = 0;
+    if (getenv("PTV_CC_NO_REWRAP")) g_cc_rewrap = 0;   /* 2.0.0 T-023(b) */
     { const char *hc = getenv("PTV_HOLD_CLEAN_MS"); if (hc) g_hold_clean_us = (int64_t)atoi(hc) * 1000; }   /* 2.0.0 T-324 */
     if (getenv("PTV_NO_REJOIN_MAP")) g_rejoin_map = 0; /* 2.0.0-pre6.1 kill switch: PTS jumps at a rejoin again */
     { const char *s = getenv("PTV_GLUE_HTOL_PCT");     if (s && atoi(s) > 0) g_glue_htol = atoi(s); }             /* tuning knob (G4) */
