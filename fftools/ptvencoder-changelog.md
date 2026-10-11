@@ -5,6 +5,38 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre12 — heavy packet loss: bars and silence until the input plays cleanly; pop-on captions use the teletext row
+
+- **Heavy loss no longer opens holes in the output (T-324).** Canary 2026-10-11, Cinestar 50 % datagram loss for 60 s:
+  a 5.8 s video PTS hole, a 6.1 s AC-3 hole and AAC 8 s behind the video on the wire, then a burst (the packager
+  errored). Locally the same 50 % for 60 s failed 6 of 9 damage patterns on pre10 and pre11 alike (the gate had run one
+  pattern, which passes). Two causes, both measured: (1) a decodable fragment ended the hold while the input was still
+  at 50 % — the video then waited seconds for a keyframe outside the hold and the clock leapt (4.1 s hole), or the
+  delivery gates held picture or sound for 10+ s; (2) the copied AC-3 parked through the hold was released on a rejoin
+  "settled" by a classification made mid-hold, 200 ms before the post-rejoin house_skew existed — its first packets
+  went 21 s ahead of the picture and the real track was dropped behind them (AC-3 holes 9-22 s). Now (owner: "we could
+  send bars and silence with 50% loss") a hold whose input sent damaged video — 5 or more corrupt video events since
+  the hold began; a clean outage's return carries one — ends only after the video has played cleanly for 1 s (no
+  corrupt data, no pause, no missing frame: after heavy loss the decoder silently drops every 4th frame for a while),
+  bounded at 5 s without corrupt data; until then the output stays on bars and silence and resumes once, at live,
+  picture and sound together. A parked AC-3 run is released only when the video has shown its content. 9 of 9
+  patterns pass. PTV_HOLD_CLEAN_MS (default 1000; 0 = off).
+- **A bit error in one video timestamp no longer moves the output (T-320, partly).** A video PTS more than 1 s from its
+  own DTS is a corrupt label: dropped, the frame keeps its DTS (29.97: a 46.5 s video PTS hole, subtitles and SCTE-35
+  lost for 30 s). An outlier flush puts each stream's continuity back to its last plausible kept packet (the median of
+  its kept timestamps, then the chain within 1 s — the largest one could itself be a second outlier: +93 s at 50 fps).
+  Still open: the 25 fps bit-32 flip, 59.94 sparse copies after an outlier.
+- **Block-mode captions keep their time (T-322).** A paced block took its due time from the faithful path's debounce
+  fields, which block mode never updates: every block carried the run's first caption time and ~35 % were dropped as
+  late (NTD, pre11). No channel runs block mode today; the option stays fixed.
+- **Pop-on captions are re-flowed to the teletext row (T-023b, owner: on by default).** The source's line breaks are made
+  for a 32-column 608 screen; a teletext row holds 36. A pop-on caption is re-flowed only when that saves a row or
+  removes a one-word row; the words and their order never change, a dialogue turn keeps its own row, the caption keeps
+  its lowest row, markup inside a row leaves it as sent; roll-up and paint-on untouched. TruBLU (6 min): pages with a
+  one-word row 35 → 0, rows 219 → 171. PTV_CC_NO_REWRAP=1 off.
+- Known, unchanged from pre11 (3 runs each): a burst longer than the delay ceiling resumes with ~0.83 live share after
+  the skip (sync_burstjump at 50 / 59.94) — a separate task.
+
 ## 2.0.0-pre11 — subtitles, SCTE-35 and captions on their frames; a pause never leaves delay or pictures without sound
 
 (T-313…T-316 were numbered T-101…T-104 in the first pre11 candidate e87867cf8e; those numbers belong to 1.2.0 items.)
