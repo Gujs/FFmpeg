@@ -361,6 +361,34 @@ static int ptv_wallev_full(int64_t w, int64_t jump_us)
     return w > 0 && w >= jump_us - FFMAX(g_gap_min_us, jump_us / 8);
 }
 
+/* 2.0.0 T-336: one source event, one erase. The flowing part J−W is measured per stream from that stream's own
+ * labels and delivery, and a source restart does not cut the streams at the same point nor resume them with the
+ * old mux interleave: jump_return_50 (NEW DOMAIN rejoin, both splits within the same ms) read audio J−W 123 ms
+ * below video (J −83 ms, W +40 ms), and erasing each stream's own reading left the sound 120-123 ms late for good
+ * (the [PTV-RSYNC] edit ledgers ev−ea = −123 ms, the output mapping dm flat). The relabel is the source's — one
+ * amount for every stream: a split whose J−W lies within 500 ms of another stream's split in the same straddle
+ * window adopts that erase (0 when that one kept its whole step as a hole), clamped to its own step. Otherwise
+ * its own erase is recorded for the siblings. */
+static int64_t ptv_wallev_shared_flow(DemuxArgs *d, int sidx, int64_t jump_us, int64_t w_us,
+                                      int64_t flow_us, int64_t wall_now)
+{
+    int64_t est = jump_us - w_us;
+    if (d->wev_ev_wall && wall_now - d->wev_ev_wall <= g_progoff_debounce_us && d->wev_ev_sidx != sidx &&
+        llabs(est - d->wev_ev_est) <= 500000) {
+        int64_t f = av_clip64(d->wev_ev_flow, 0, jump_us);
+        if (f != flow_us)
+            av_log(NULL, AV_LOG_WARNING, "[PTV-WALLEV] stream %d: erases %"PRId64"ms like stream %d's split of the "
+                   "same event (own reading %"PRId64"ms) — one erase for every stream\n",
+                   sidx, f / 1000, d->wev_ev_sidx, flow_us / 1000);
+        return f;
+    }
+    d->wev_ev_sidx = sidx;
+    d->wev_ev_est  = est;
+    d->wev_ev_flow = flow_us;
+    d->wev_ev_wall = wall_now;
+    return flow_us;
+}
+
 /* pre24 #63 provenance: post `w_us` of UNEVIDENCED real-content deletion on stream s —
  * an erase whose event-time wall evidence said the content was genuinely missing (the #63
  * leak term, per stream). Always measured, even under PTV_NO_WALLEV; read ONLY by the
@@ -2429,6 +2457,13 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                         int64_t wev_w    = !veto_supp ? ptv_wallev_w(d, pkt->stream_index, jump_us) : 0;
                         int     wev_full = g_wallev && wev_w > 0 && ptv_wallev_full(wev_w, jump_us);
                         int     wev_comp = g_wallev && wev_w > 0 && !wev_full;
+                        int64_t wev_flow = 0;
+                        if (wev_full || wev_comp) {   /* T-336: the event's erase, shared with a sibling's split */
+                            wev_flow = ptv_wallev_shared_flow(d, pkt->stream_index, jump_us, wev_w,
+                                                              wev_full ? 0 : jump_us - wev_w, wall_now);
+                            wev_full = wev_flow == 0;
+                            wev_comp = wev_flow > 0;
+                        }
                         if (wev_full ||
                             ((!g_wallev || wev_w == 0) &&
                              !vcrossed && !veto_supp && wall_gap >= FFMAX(g_gap_min_us, jump_us / 2))) {
@@ -2568,7 +2603,7 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                              * LATE) or |W| (erase path, audio EARLY — capped at J/2 by the
                              * old boundary = Avivando's half-step bake). Propagate the
                              * continuity ref so no LAYERA cycle arms on the remaining W. */
-                            int64_t flow_us = jump_us - wev_w;
+                            int64_t flow_us = wev_flow;
                             d->wrap_off[pkt->stream_index] -=
                                 av_rescale_q(flow_us, AV_TIME_BASE_Q, st->time_base);
                             rsync_post_edit(d, pkt->stream_index, -flow_us);   /* flow-evidenced erase */
@@ -2640,7 +2675,8 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                         int64_t vw = ptv_wallev_w(d, pkt->stream_index, vjump_us);
                         if (vw > 0) {
                             int vfull = ptv_wallev_full(vw, vjump_us);
-                            int64_t vflow_us = vfull ? 0 : vjump_us - vw;
+                            int64_t vflow_us = ptv_wallev_shared_flow(d, pkt->stream_index, vjump_us, vw,   /* T-336 */
+                                                                      vfull ? 0 : vjump_us - vw, wall_now);
                             int64_t dukf_thresh = av_rescale(g_dukf_min_ms, st->time_base.den,
                                                              (int64_t)st->time_base.num * 1000);
                             if (vflow_us > 0) {

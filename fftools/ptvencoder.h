@@ -1696,6 +1696,10 @@ typedef struct DemuxArgs {
     int64_t               sib_jump_us[2];
     int64_t               sib_jump_wall[2];
     int                   sib_jump_gap[2];      /* 2.0.0-pre9.6: that jump was a GAP verdict (labels carry it, content pads) */
+    /* 2.0.0 T-336: the last wall-evidence split (stream, measured flowing part J−W, erase applied, wall) — a
+     * sibling's split of the same source event adopts that erase (ptv_wallev_shared_flow) */
+    int                   wev_ev_sidx;
+    int64_t               wev_ev_est, wev_ev_flow, wev_ev_wall;
     int                   drop;          /* non-blocking + drop on full (network input) */
     PassStream           *pass;          /* copy-passthrough: extra audio, subs, data */
     int64_t               vm_po;                              /* 2.0.0 T-100: prog_off of the copy being released */
