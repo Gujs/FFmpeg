@@ -1718,6 +1718,7 @@ typedef struct DemuxArgs {
     int64_t              *wall_cad_us;
     int64_t              *pkt_wall_gap_us;
     int64_t               wallev_fb_log_us; /* fallback (bank/bursty) advisory rate limit */
+    int64_t               any_wall_last, any_stall_wc; /* 2.0.0 T-345: last packet of the input; end of its last >= 700 ms pause */
     int64_t              *edit_us;        /* 1.0.1-pre9 sensor: per-stream label-EDIT ledger (µs) — the
                                            * non-wrap share of wrap_off (splice absorbs, LAYERA persists,
                                            * retro-corrections); demux thread only, published via g_rsx */

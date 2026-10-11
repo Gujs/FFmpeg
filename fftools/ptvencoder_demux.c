@@ -328,8 +328,10 @@ static int64_t ptv_wallev_w(DemuxArgs *d, int sidx, int64_t jump_us)
      * eligible: d->autobank is set on every single-input live channel and must NOT gate
      * this) or an operator-declared deep prime (Fintech-class §13 channels run
      * PTV_PREROLL_MS ≥ 4000 precisely because their delivery stalls multi-second). */
-    if (atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 ||
-        (int64_t)g_preroll_ms >= 4000) {
+    /* 2.0.0 T-345: ... unless the input itself kept flowing through this stream's whole gap (a video-only
+     * outage: the audio arrived throughout) — then the absence is this PID's, content evidence on any channel */
+    if ((atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 || (int64_t)g_preroll_ms >= 4000) &&
+        d->any_stall_wc >= d->wrap_wall_last[sidx] - gap) {
         int64_t now = av_gettime_relative();
         if (now - d->wallev_fb_log_us >= 60000000) {
             d->wallev_fb_log_us = now;
@@ -2193,6 +2195,9 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
     if (raw != AV_NOPTS_VALUE) {
         int64_t wall_now = av_gettime_relative();
         int64_t last = d->wrap_last[pkt->stream_index];
+        if (d->any_wall_last && wall_now - d->any_wall_last >= g_gap_min_us)
+            d->any_stall_wc = wall_now;         /* 2.0.0 T-345: the whole input paused (delivery, not one PID) */
+        d->any_wall_last = wall_now;
         /* pre24 #63: preserve THIS packet's pre-update delivery wall gap and fold quiet gaps
          * into the per-stream cadence EMA (burst-period reading — the rr15 R2 door pattern).
          * The LAYERA loop runs AFTER wrap_wall_last below has advanced to this packet, so the
