@@ -251,11 +251,18 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
              * released a moment later carries an EARLIER frame time: stamped behind this keepalive it was bumped one
              * frame late (sync_kill_return_20, the 4th caption after the restart, +41 ms). A keepalive is no picture —
              * keep it behind everything still on its way: the assembly window behind the output. */
-            int64_t lead = g_vmap && !c->multi ? FFMIN(c->ka_lead_us, -PTV_CC_DEBOUNCE_US)
-                         : g_vmap ? c->ka_lead_us - PTV_CC_DEBOUNCE_US   /* T-338: mosaic captions on their frame too */
-                         : c->ka_lead_us;
+            int64_t lead = g_vmap && !c->multi ? FFMIN(c->ka_lead_us, -PTV_CC_DEBOUNCE_US) : c->ka_lead_us;
             if (pos > 0 && pos + lead < house_us)
                 house_us = FFMAX(pos + lead, c->last_dts + 1000);
+        } else if (c->multi && g_vmap && c->ka_real_wc) {
+            /* 2.0.0 T-338: a mosaic publishes no output position, so the chain ran 1 s past the last stamp on the wall
+             * clock — and a caption stamped on its own frame (up to the assembly wait earlier than the moment it is
+             * known) landed behind a keepalive sent meanwhile and was bumped late (MV-01: 40 bumps, captions up to
+             * +300 ms). Follow the last real event on the wall clock, the assembly window behind: never ahead of a
+             * caption still on its way, and no drift on a long silence. */
+            int64_t h = c->ka_real_us + (av_gettime_relative() - c->ka_real_wc) - PTV_CC_DEBOUNCE_US;
+            if (h < house_us)
+                house_us = FFMAX(h, c->last_dts + 1000);
         }
     } else if (ev->vmapped) {
         house_us = ev->vm_out_us;        /* 2.0.0 T-100: where the video put this caption's frame */
@@ -497,6 +504,10 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
     pkt->duration = (int64_t)ev->end_ms * 1000;
     pkt->pos      = -1;
     c->last_dts     = house_us;
+    if (ev->kind != PTV_CC_KEEPALIVE) {           /* T-338: a mosaic's keepalives follow the last real event */
+        c->ka_real_us = house_us;
+        c->ka_real_wc = av_gettime_relative();
+    }
     if (ev->src_us != AV_NOPTS_VALUE) {           /* 2.0.0 T-098: the lead a synthetic keepalive rides */
         int64_t pos = atomic_load_explicit(&g_house_out_us, memory_order_relaxed);
         if (pos > 0) {

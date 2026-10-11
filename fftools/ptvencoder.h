@@ -894,6 +894,7 @@ typedef struct CcCtx {
      * rides the output position plus this lead, so it cannot run ahead of the video. */
     int64_t          ka_lead_us;
     int              ka_lead_ok;
+    int64_t          ka_real_us, ka_real_wc;      /* T-338: stamp + wall time of the last real (non-keepalive) event */
     /* 2.0.0 T-100: captions wait here (cc_thread only) until the video has shown their frame, then take its output time */
 #define PTV_CC_VQ 256
     CcEvent          vq[PTV_CC_VQ];
