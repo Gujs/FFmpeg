@@ -1902,6 +1902,12 @@ static void park_drain(DemuxArgs *d, int force)
  * never shown (skipped, erased, lost in the outage) or whose moment on the output passed more than 1 s ago is dropped:
  * shown now it would sit off its picture. SCTE-35 is always sent (its splice point lies ahead). force = the queue is
  * full: what the video has not reached yet takes the old stamp. */
+/* where the video showed content c_us: the single-input record, or (2.0.0 T-342) this multiview slot's own ring */
+static int copy_shown(DemuxArgs *d, int64_t c_us, int64_t *out_us, int64_t *gap_us)
+{
+    return d->mv_vring ? vring_shown(d->mv_vring, c_us, out_us, gap_us) : ptv_vmap_lookup(c_us, out_us, gap_us);
+}
+
 static void vwait_drain(DemuxArgs *d, int force)
 {
     int pi;
@@ -1913,7 +1919,7 @@ static void vwait_drain(DemuxArgs *d, int force)
         while (k < ps->nvwait) {
             AVPacket *p = ps->vwait[k];
             int64_t ts = p->dts != AV_NOPTS_VALUE ? p->dts : p->pts, o = AV_NOPTS_VALUE, gap = 0;
-            int r = ts == AV_NOPTS_VALUE ? -1 : ptv_vmap_lookup(av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q), &o, &gap);
+            int r = ts == AV_NOPTS_VALUE ? -1 : copy_shown(d, av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q), &o, &gap);
             if (r == 0 && !force)
                 break;                          /* its content is not on the output yet */
             if (r < 0 && scte && !force) {
@@ -1922,7 +1928,7 @@ static void vwait_drain(DemuxArgs *d, int force)
                  * video-only outage's return. Its splice point lies ahead: it goes out with the offset the video runs
                  * on once it is back, up to 12 s (the output delay pin), then the old way */
                 int64_t ns, no;
-                if (ptv_vmap_newest(ps->vwait_wc[k], &ns, &no)) {
+                if (!d->mv_vring && ptv_vmap_newest(ps->vwait_wc[k], &ns, &no)) {
                     p->pts = p->dts = av_rescale_q(ns, AV_TIME_BASE_Q, ps->in_tb);
                     d->vm_po = d->prog_off;     /* the video's content is unwrapped with the current prog_off */
                     demux_pass_one(d, p, no);
@@ -1976,7 +1982,8 @@ static int demux_pass(DemuxArgs *d, AVPacket *out)
 {
     int pi;
     park_drain(d, 0);
-    if (d->single && g_vmap) {              /* 2.0.0 T-100: sparse copies wait for the video to show their content */
+    if ((d->single || d->mv_vring) && g_vmap) {   /* 2.0.0 T-100: sparse copies wait for the video to show their content
+                                                   * (T-342: on a multiview slot, its own cell) */
         pthread_mutex_lock(&d->pass_lock);
         vwait_drain(d, 0);
         for (pi = 0; pi < d->n_pass; pi++) {

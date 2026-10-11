@@ -1072,6 +1072,36 @@ void vring_put(VOutRing *r, int64_t src_us, int64_t out_us)
     pthread_mutex_unlock(&r->lock);
 }
 
+/* 2.0.0 T-342: ptv_vmap_lookup's contract on a multiview slot's ring (the slot's displayed content -> mosaic output
+ * time): 1 = the cell has shown content at or after c_us (*out_us = c_us on the timeline of the first such frame,
+ * *gap_us = how far past c_us it lies), 0 = not yet (or only the newest frame: wait for one more), -1 = c_us is older
+ * than everything held by > 1 s */
+int vring_shown(VOutRing *r, int64_t c_us, int64_t *out_us, int64_t *gap_us)
+{
+    int64_t cnt, k;
+    int hit = -1, newest, ret;
+    pthread_mutex_lock(&r->lock);
+    cnt = r->n < PTV_VRING ? r->n : PTV_VRING;
+    newest = (int)((r->n + PTV_VRING - 1) % PTV_VRING);
+    for (k = 0; k < cnt; k++) {                 /* newest -> oldest: the oldest entry still >= c_us */
+        int i = (int)((r->n - 1 - k) % PTV_VRING);
+        if (r->src[i] < c_us)
+            break;
+        hit = i;
+    }
+    if (hit < 0 || hit == newest)
+        ret = 0;
+    else if (k == cnt && r->src[hit] - c_us > 1000000)
+        ret = -1;
+    else {
+        *out_us = r->out[hit] - (r->src[hit] - c_us);
+        *gap_us = r->src[hit] - c_us;
+        ret = 1;
+    }
+    pthread_mutex_unlock(&r->lock);
+    return ret;
+}
+
 /* nearest-by-content lookup: of all kept entries, return the out_v and matched src of the one
  * whose src is closest to want_src. 0 = found (ring non-empty), -1 = empty (or, 2.0.0 T-089, no
  * pairing: see below). */
@@ -6036,6 +6066,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         d->reopen    = live && is_net_url(inputs[kk].url) &&                     /* 2.0.0-pre5: single input too */
                        (multiview || !getenv("PTV_NO_REOPEN"));
         d->single    = !multiview;
+        d->mv_vring  = multiview ? &inputs[kk].vring : NULL;   /* 2.0.0 T-342 */
         d->ifmt_home = &inputs[kk].ifmt;
         d->disc = g_layera ? &inputs[kk].disc : NULL;   /* legacy-0004 buffer (NULL when off) */
         d->vq_shed_req = &inputs[kk].vq_shed_req;       /* 1.0.1-pre8 (a): overflow -> request head-GOP shed */

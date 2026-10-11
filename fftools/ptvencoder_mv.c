@@ -603,6 +603,8 @@ void *compositor_thread(void *arg)
                         }
                         pthread_mutex_unlock(&vr->lock);
                         vring_put(vr, disp_src, mv_tick_us(c, tick));
+                        if (g_vmap)          /* 2.0.0 T-342: release the slot's copies this frame has caught up to */
+                            ptv_copy_vwait(&c->inputs[k].da);
                     }
                     /* Don't ratchet the audio skew during a CONTENT-CLAMP hold: that freeze is
                      * deliberate pacing (a future frame is pending, video waits for the clock),

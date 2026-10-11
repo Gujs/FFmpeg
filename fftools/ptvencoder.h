@@ -1834,6 +1834,7 @@ typedef struct DemuxArgs {
                                             /* (by_bank_advise_us moved to CushionRt.bank_advise_us — 0.9.18 M3) */
     int64_t               vcorrupt;       /* video packets flagged AV_PKT_FLAG_CORRUPT (discarded if g_discardcorrupt) */
     pthread_mutex_t       pass_lock;        /* 2.0.0-pre6: copy state shared with the master's AC-3 fill */
+    VOutRing             *mv_vring;         /* 2.0.0 T-342: multiview — this slot's displayed content ring (sparse copies) */
 } DemuxArgs;
 
 /* One source input. Single-input uses inputs[0]; multiview uses 1/2/4. Each has
@@ -2404,6 +2405,7 @@ void ptv_stats_rsn(char *buf, size_t size, int force_idx);
 void rscorr_stale_watchdog(int64_t now);
 /* ptvencoder.c */
 void vring_put(VOutRing *r, int64_t src_us, int64_t out_us);
+int vring_shown(VOutRing *r, int64_t c_us, int64_t *out_us, int64_t *gap_us);
 int vring_lookup(VOutRing *r, int64_t want_src, int64_t *out_v, int64_t *matched_src);
 
 #endif /* FFTOOLS_PTVENCODER_H */
