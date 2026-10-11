@@ -2000,6 +2000,18 @@ static int demux_pass(DemuxArgs *d, AVPacket *out)
                 break;                          /* demux_pass_one drops a copy before the anchor */
             if (ps->nvwait == PTV_VWAIT_MAX)
                 vwait_drain(d, 1);
+            if (d->ifmt->streams[ps->in_index]->codecpar->codec_id == AV_CODEC_ID_SCTE_35 &&
+                out->dts != AV_NOPTS_VALUE && d->n_audio > 0 && d->wrap_last[d->astream[0]] != AV_NOPTS_VALUE) {
+                /* 2.0.0 T-345: a cue's time comes from the PCR, which rides the video PID: while only the video is gone
+                 * it stays at the last PCR (every cue of a 20 s video outage read 30.700 s), so the cue was placed with
+                 * the offset the video had before the outage — 2.07 s off its splice once the video came back on
+                 * another one (rich sync_vnull_20, marker 50). More than 1 s behind the audio, which flows on: no
+                 * time of its own — it waits for the video's offset like a cue without one (T-335) */
+                const AVStream *as = d->ifmt->streams[d->astream[0]];
+                int64_t at = av_rescale_q(d->wrap_last[d->astream[0]] + d->wrap_off[d->astream[0]], as->time_base, AV_TIME_BASE_Q);
+                if (av_rescale_q(out->dts, ps->in_tb, AV_TIME_BASE_Q) < at - 1000000)
+                    out->dts = out->pts = AV_NOPTS_VALUE;
+            }
             ps->vwait_wc[ps->nvwait] = av_gettime_relative();
             ps->vwait_po[ps->nvwait] = d->prog_off;
             ps->vwait[ps->nvwait++]  = out;
