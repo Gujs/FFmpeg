@@ -739,6 +739,7 @@ int             g_adapt_cushion = 1;
 _Atomic int     g_frameq_depth;               /* DIAG: master video frame_q occupancy (frames), published each tick for the discontinuity logs */
 _Atomic int64_t g_vdmg_wc;                       /* 2.0.0-pre9.4 (T-083): wall time of the last corrupt video packet/frame */
 _Atomic int64_t g_vcorrupt_wc;                   /* 2.0.0 T-324: ... corrupt DATA only (no timeline step): the hold's clean rule */
+_Atomic int64_t g_vcorrupt_n, g_hold_vcorrupt_n0;  /* 2.0.0 T-324: corrupt video events; the count when the hold began */
 _Atomic int64_t g_fq0_tail_pts = AV_NOPTS_VALUE; /* 2.0.0-pre9.4 (T-083): pts of the newest frame pushed to the master frame_q */
 /* v0.9.4 genlock GUARD (PTV_NO_GENLOCK_GUARD reverts to exact v0.9.x behavior). TruBLU-class jittery/
  * bursty sources alias the 3s FLL window → noisy sub-window rates that the loose ±1% gate folded in,
@@ -1606,6 +1607,7 @@ static void cc_rows_free(CcRows *rows) { av_freep(&rows->buf); }
  * (italics or a colour on part of it) or rows that differ in their leading markup: the caption is left exactly as the
  * source sent it. Roll-up and paint-on are never touched (their rows are built while the viewer watches). On by
  * default for pop-on; PTV_CC_NO_REWRAP=1 turns it off. */
+#define PTV_HOLD_DMG_MIN 5    /* 2.0.0 T-324: corrupt video events during a hold before the clean-input rule engages */
 #define CC_TTX_COLS   36     /* a teletext subtitle row: 40 - 2 start boxes - 2 end boxes (dvbteletextenc.c) */
 #define CC_WRAP_WORDS 16     /* a block with more words keeps the source rows (bounded search) */
 int g_cc_rewrap = 1;
@@ -3015,8 +3017,12 @@ static int hold_clean_pass(DecodeCtx *d, const AVFrame *frame)
     if (hid != d->hc_hold_id) {
         d->hc_hold_id = hid; d->hc_since = d->hc_flag_since = d->hc_last = 0; d->hc_drop = d->hc_passed = 0;
     }
-    if (!hid || dw < hid || d->hc_passed)
-        return 1;                        /* no damage since the hold began: a clean outage */
+    if (!hid || dw < hid || d->hc_passed ||
+        atomic_load_explicit(&g_vcorrupt_n, memory_order_relaxed) -
+        atomic_load_explicit(&g_hold_vcorrupt_n0, memory_order_relaxed) < PTV_HOLD_DMG_MIN)
+        return 1;                        /* no damage since the hold began: a clean outage — whose return carries ONE
+                                          * corrupt packet (the cut PES at the gap edge, T-074; measured on gap_20,
+                                          * burstjump); 50 % loss carries hundreds during the hold */
     gap = d->hc_min_dt && (dt <= 0 || dt > d->hc_min_dt * 3 / 2);   /* a frame missing (or out of order) */
     if (!d->hc_flag_since || dw >= d->hc_flag_since || now - d->hc_last > 500000)
         d->hc_flag_since = d->hc_since = now;   /* damage or a pause: both runs restart at this frame */
@@ -3457,6 +3463,7 @@ static void *decode_thread(void *arg)
         if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) { /* 2.0.0-pre9.4: damage evidence (bit errors */
             atomic_store_explicit(&g_vdmg_wc, av_gettime_relative(), memory_order_relaxed);   /* inside valid packets) */
             atomic_store_explicit(&g_vcorrupt_wc, av_gettime_relative(), memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_vcorrupt_n, 1, memory_order_relaxed);
         }
         while (ret >= 0) {
             PTV_HB_VDEC(d->hb_slot, PTV_HB_VDEC_RECVFRAME);
@@ -3466,6 +3473,7 @@ static void *decode_thread(void *arg)
             if (frame->decode_error_flags) { /* 2.0.0-pre9.4: concealed / missing slices = damage evidence */
                 atomic_store_explicit(&g_vdmg_wc, av_gettime_relative(), memory_order_relaxed);
                 atomic_store_explicit(&g_vcorrupt_wc, av_gettime_relative(), memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_vcorrupt_n, 1, memory_order_relaxed);
             }
             /* TEST ONLY (F6 gate, PTV_CCTEST_CORRUPT_EVERY): real slice damage never reaches
              * here — the demuxer's own corrupt-packet path discards it first — so the only way
@@ -3477,6 +3485,7 @@ static void *decode_thread(void *arg)
                 d->vcorrupt++;
                 atomic_store_explicit(&g_vdmg_wc, av_gettime_relative(), memory_order_relaxed);   /* pre9.4 */
                 atomic_store_explicit(&g_vcorrupt_wc, av_gettime_relative(), memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_vcorrupt_n, 1, memory_order_relaxed);
                 /* The FRAME is unusable for video; its A53 side data is fed to the tap anyway,
                  * because cc_dec is STATEFUL and skipping the frame silently violated its
                  * "every frame's 608 pair, exactly once, in order" invariant, losing

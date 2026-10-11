@@ -1564,6 +1564,8 @@ void *output_thread(void *arg)
                 int64_t thr = FFMAX(g_stall_min_us, atomic_load_explicit(&g_bank_us, memory_order_relaxed));
                 if (!fresh && src_fresh_wall && nw - src_fresh_wall >= thr && arr && nw - arr >= thr &&
                     v->dbg_video_q && !av_thread_message_queue_nb_elems(v->dbg_video_q)) {
+                    atomic_store_explicit(&g_hold_vcorrupt_n0, atomic_load_explicit(&g_vcorrupt_n, memory_order_relaxed),
+                                          memory_order_relaxed);   /* 2.0.0 T-324 */
                     atomic_store_explicit(&g_src_hold_start, nw, memory_order_relaxed);
                     atomic_store_explicit(&g_src_state, 1, memory_order_relaxed);
                     src_note = nw + 60000000; src_lost_logged = 0;
