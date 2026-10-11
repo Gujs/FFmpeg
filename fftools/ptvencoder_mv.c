@@ -279,8 +279,10 @@ void *compositor_thread(void *arg)
                  * the occupancy servo (+-2 %) then refilled it over ~60 s, one held frame every ~2.5 s, so the slot's
                  * picture slid ~0.9 s later while its audio chased it (MV-04 gap_20: REANCHOR2 h0 +1 s, ACQUIRE drop
                  * 831 ms, then audio 40..200 ms early for a minute, PLL pad 170 ms). Re-primed, the picture comes back
-                 * at the lag it had before the outage. */
-                if (slated[k] && resid && g_mv_reprime) {
+                 * at the lag it had before the outage. Also after a dry spell shorter than the slate (> 0.5 s without a
+                 * fresh frame: flapping ran the buffer dry on every cut and the same refill ramp moved the picture
+                 * +80 -> +680 ms while its audio chased it). */
+                if (resid && g_mv_reprime && last_fresh_us[k] && (slated[k] || now_us - last_fresh_us[k] > 500000)) {
                     int occ = av_thread_message_queue_nb_elems(h->q);
                     if (occ && !reprime_us[k])
                         reprime_us[k] = now_us;
@@ -349,6 +351,8 @@ void *compositor_thread(void *arg)
                     sv_cnt[k]++;                                 /* due but nothing arrived = genuine starvation dup */
             }
             fresh = (cand != NULL);
+            if (fresh)
+                reprime_us[k] = 0;                        /* 2.0.0 T-339: shown again — the next dry spell re-primes afresh */
             if (fresh) {
                 f = cand;                                 /* for the re-anchor diag below */
                 if (last[k]) av_frame_free(&last[k]);
