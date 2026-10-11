@@ -2739,6 +2739,61 @@ static int rj_release_ok(AudioState *a)
 
 static void rj_flush(AudioState *a);
 
+/* 2.0.0 T-321: the house_skew a real frame meets at the graph door. A short source gap (no hold) ends at the door
+ * before it ends on air: the returning audio arrives while the video still repeats frames through the gap, so
+ * house_skew carries that dup run (2 s flaps: +600 ms); ~1.6 s later the video shows the post-gap content, house_skew
+ * falls back and aresample drops what it padded — the sound played late, then lost its first ~0.6 s (measured: every
+ * return of sync_flapping, the ruler's +600 ms shrinking one frame per cycle). The returning frames keep the pre-gap
+ * house_skew until the video is back on it (bounded 4 s; then the current value, as before). A hold (STALLED →
+ * rejoin) is not touched: its return has its own buffer and mapping. PTV_NO_HS_GAPKEEP=1 = off. */
+static int64_t hs_door(AudioState *a, const AVFrame *frame, int64_t hs)
+{
+    static int off = -1;
+    int64_t now = av_gettime_relative(), src = AV_NOPTS_VALUE, out = hs;
+    int64_t tol = a->tick_dur_us > 0 ? a->tick_dur_us + a->tick_dur_us / 4 : 50000;
+    int gap, hold;
+    if (off < 0)
+        off = !!getenv("PTV_NO_HS_GAPKEEP");
+    if (off)
+        return hs;
+    if (frame->best_effort_timestamp != AV_NOPTS_VALUE)
+        src = av_rescale_q(frame->best_effort_timestamp, a->ist_tb, AV_TIME_BASE_Q);
+    gap = a->hsg_seen && src != AV_NOPTS_VALUE && a->hsg_src != AV_NOPTS_VALUE &&
+          src - a->hsg_src - a->hsg_dur > 500000;
+    hold = ptv_src_holding() || atomic_load_explicit(&g_src_rejoin_wall, memory_order_relaxed) > a->hsg_wc;
+    if (hold)
+        a->hsg_on = 0;      /* a hold took over: its return has its own buffer and mapping */
+    /* flapping: the video often returns while the audio is already in its NEXT gap, so no frame sees house_skew back
+     * on the kept value; the next gap's return then still keeps it — the bound counts from the latest gap */
+    if (a->hsg_on && gap)
+        a->hsg_t0 = now;
+    if (a->hsg_on) {
+        if (llabs(hs - a->hsg_val) <= tol || now - a->hsg_t0 > 4000000) {
+            if (a->hsg_n <= 3)
+                av_log(NULL, AV_LOG_INFO, "[PTV-AVLOCK] a%d(in%d) short gap: house_skew %+"PRId64" ms again after "
+                       "%.2f s (%s)\n", a->dbg_k, a->dbg_in, hs / 1000, (now - a->hsg_t0) / 1e6,
+                       llabs(hs - a->hsg_val) <= tol ? "the video is back" : "bounded");
+            a->hsg_on = 0;
+        } else
+            out = a->hsg_val;
+    } else if (gap && hs - a->hsg_hs > tol && !hold) {
+        a->hsg_on  = 1;
+        a->hsg_val = out = a->hsg_hs;
+        a->hsg_t0  = now;
+        if (++a->hsg_n <= 3)
+            av_log(NULL, AV_LOG_INFO, "[PTV-AVLOCK] a%d(in%d) short gap (%+"PRId64" ms, no hold): the returning audio "
+                   "keeps house_skew %+"PRId64" ms (now %+"PRId64" ms) until the video shows it%s\n", a->dbg_k,
+                   a->dbg_in, (src - a->hsg_src - a->hsg_dur) / 1000, out / 1000, hs / 1000,
+                   a->hsg_n == 3 ? " (further gaps not logged)" : "");
+    }
+    a->hsg_seen = 1;
+    a->hsg_src  = src;
+    a->hsg_dur  = frame->sample_rate > 0 ? av_rescale(frame->nb_samples, 1000000, frame->sample_rate) : 0;
+    a->hsg_hs   = out;
+    a->hsg_wc   = now;
+    return out;
+}
+
 /* 2.0.0-pre9.6: frames that confirm a source format change are held for the rebuilt path (were dropped) */
 static void afmt_q_reset(AudioState *a)
 {
@@ -3633,7 +3688,7 @@ static int audio_feed(AudioState *a, AVFrame *frame)
         }
         if (g_avlock && a->house_skew && !(a->multiview && g_audio_follow) && frame->pts != AV_NOPTS_VALUE &&
             !a->hold_feeding) {
-            int64_t sk = *a->house_skew;
+            int64_t sk = hs_door(a, frame, *a->house_skew);
             if (sk) frame->pts += av_rescale_q(sk, AV_TIME_BASE_Q, a->ist_tb);
         }
         /* 1.0.1-pre3: multiview audio-follow PLL — inject TRACK's accumulated steer into the

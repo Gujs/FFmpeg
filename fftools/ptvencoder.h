@@ -1093,6 +1093,10 @@ typedef struct AudioState {
     int64_t          glue_raw_dur_us;                 /* its frame span (us) */
     int64_t          glue_wall_last_us;               /* monotonic wall time of the previous fed frame */
     int64_t          hf_hs_real, hf_dup_real;         /* 2.0.0-pre9.4 (T-083): house_skew + g_dup_out_us at that frame */
+    int64_t          hsg_src, hsg_dur, hsg_hs, hsg_wc;  /* T-321: previous door frame's source pts / span / applied
+                                                         * house_skew / wall time */
+    int64_t          hsg_val, hsg_t0;                 /* T-321: house_skew kept for a short gap's return, since (wall) */
+    int              hsg_seen, hsg_on, hsg_n;         /* T-321: a previous frame / keeping / events (log limit) */
     int              glue_events;                     /* RELABEL verdicts this run */
     int64_t          glue_log_win_us;                 /* 0.9.18: verdict-log rate-limit window start (wall) */
     int              glue_log_win_n;                  /* verdict lines emitted this window */
