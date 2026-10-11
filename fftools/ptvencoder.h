@@ -1035,6 +1035,8 @@ typedef struct AudioState {
     int              av_off_valid;                    /* a measurement has paired (else the status line prints offset=--) */
     /* A/V PLL redesign Phase B3 — closed-loop two-regime controller on the measured av_offset_us (g_avsync_pll). */
     int64_t          pll_ema;                         /* EMA of the measured offset (us) */
+    int64_t          pll_raw[32];                     /* 2.0.0 T-339: the last 32 raw offset readings (the ACQUIRE is sized on their median) */
+    int              pll_raw_n;
     int64_t          pll_dev;                          /* v0.6.22: slow EMA of |off−ema| = the leg's offset jitter; raises the acquire threshold above the noise floor */
     int              pll_seed;                        /* pll_ema seeded at the first valid measurement */
     int              pll_dbnc;                        /* stability-debounce: consecutive large-AND-flat readings */

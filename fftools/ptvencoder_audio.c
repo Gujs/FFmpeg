@@ -1690,6 +1690,7 @@ static int audio_drain_fg(AudioState *a)
                         off += ((a->out_frames / g_pll_testnoise_frames) & 1) ? g_pll_testnoise_us : -g_pll_testnoise_us;
                     if (!a->pll_seed) { a->pll_ema = off; a->pll_dbnc_ref = off; a->pll_seed = 1; }
                     else a->pll_ema += (off - a->pll_ema) >> g_pll_ema_shift;   /* smooth ±vlag jitter (N6: toward −∞, sub-ms, negligible) */
+                    a->pll_raw[a->pll_raw_n++ % 32] = off;
                     /* v0.6.22: NOISE-ADAPTIVE acquire threshold. Track the leg's offset jitter (slow EMA of
                      * |off−ema|, seeded 0 so it ramps AFTER the startup bank is caught) and raise the threshold
                      * above it: thr = max(g_pll_acquire_us, k·dev), capped. Clean legs (dev≈0) keep the tight
@@ -1790,6 +1791,7 @@ static int audio_drain_fg(AudioState *a)
                             a->pll_yield_bias_us += a->pll_ema;
                             a->pll_bias_stale = 0;
                             a->pll_seed    = 0;
+                            a->pll_raw_n   = 0;      /* T-339: readings on the old baseline */
                             a->pll_dbnc    = 0;
                             a->pll_acq_win = 0;
                             av_log(NULL, AV_LOG_WARNING,
@@ -1819,10 +1821,30 @@ static int audio_drain_fg(AudioState *a)
                     if (may_acq) {
                         a->pll_acq_win = 0;
                         int64_t half = frame_us / 2;                        /* round to NEAREST whole frame (half away from 0) */
-                        int64_t dq = ((a->pll_ema + (a->pll_ema < 0 ? -half : half)) / frame_us) * frame_us; /* → residual ≤ ½ frame (≈11ms), vs ≤1 frame for truncation */
+                        /* 2.0.0 T-339: sized on the MEDIAN of the last 32 raw readings, not the EMA. A slot's return steps
+                         * the offset by seconds; the step itself raises the noise-adaptive threshold, so the flatness test
+                         * passed while the EMA (tau ~2.7 s) was still on its way: the ACQUIRE padded 1386 ms of a ~1750 ms
+                         * step (kill_return_20) / dropped 746 of ~959 ms (flapping), and TRACK took ~45 s at 10 ms/s to
+                         * walk off the rest (audio −420 ms after the return). The median of the window is the level the
+                         * readings are at — robust to the ±1-tick vlag quantum and to a jittery leg alike */
+                        int64_t win[32], med = a->pll_ema;
+                        int nw = FFMIN(a->pll_raw_n, 32), x, y;
+                        if (nw >= 16) {
+                            memcpy(win, a->pll_raw, nw * sizeof(*win));
+                            for (x = 1; x < nw; x++) {               /* insertion sort, nw <= 32 */
+                                int64_t t = win[x];
+                                for (y = x; y > 0 && win[y - 1] > t; y--) win[y] = win[y - 1];
+                                win[y] = t;
+                            }
+                            med = win[nw / 2];
+                        }
+                        int64_t dq = ((med + (med < 0 ? -half : half)) / frame_us) * frame_us; /* → residual ≤ ½ frame (≈11ms), vs ≤1 frame for truncation */
                         if (dq != 0) {
                             a->af_applied_us += dq;          /* UNIFORM both directions — cancels the content jump in want */
-                            a->pll_ema       -= dq;          /* N1: bumpless credit → no re-fire on the next reading */
+                            a->pll_ema        = med - dq;    /* N1: bumpless credit → no re-fire on the next reading (T-339: from the
+                                                              * level the readings are at, not the lagging EMA) */
+                            for (x = 0; x < nw; x++)
+                                a->pll_raw[x] -= dq;
                             if (dq < 0) { a->pll_drop = (int)(-dq / frame_us); a->af_acq_drop_us += -dq; }  /* advance: drop content */
                             else        { a->pll_pad  = (int)( dq / frame_us); a->af_acq_pad_us  +=  dq; }   /* delay: pad silence */
                             a->pll_acq_count++;
