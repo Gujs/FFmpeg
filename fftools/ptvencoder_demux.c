@@ -2181,8 +2181,10 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
              * behind it is content lost in the pause, filled at tick rate like a loss gap, not leapt. The post-gap frames
              * come out of the decoder right behind the pre-gap tail (lavf PES tail, decoder delay), so a pause measured
              * at the decoder output misses them; measured here it covers them (emit_video tags frames for 5 s). Flapping
-             * at 50 fps: the one return whose cut carried no corrupt PES was leapt — a 1.68 s video PTS hole. */
-            if (pg > 500000 && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+             * at 50 fps: the one return whose cut carried no corrupt PES was leapt — a 1.68 s video PTS hole. Not after
+             * a hold (STALLED): that return has its own rejoin mapping (kill_return_20 at 50 fps read 0.86 live share
+             * on 3 of 3 runs with it, the control 0.86 / 0.89 / PASS). */
+            if (pg > 500000 && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && !ptv_src_holding())
                 atomic_store_explicit(&g_vdmg_wc, wall_now, memory_order_relaxed);
             /* 2.0.0-pre4c PES-TAIL carry (measured 2026-10-03): lavf completes a video PES only when
              * the NEXT one starts (unbounded PES length), so after a real outage the first video
