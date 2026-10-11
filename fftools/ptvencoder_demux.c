@@ -1387,6 +1387,52 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
                    (double)so / AV_TIME_BASE, (double)mm / AV_TIME_BASE);
     }
 
+    /* 2.0.0 T-320: a corrupt-timestamp outlier is dropped, but every packet that ARRIVED during the cycle had already
+     * advanced its stream's continuity reference (last_dts_us) — including an outlier on ANOTHER stream than the one
+     * that opened the cycle (29.97 bitflip_100: an audio PES +186 s opened it, a video PES +46.6 s arrived inside it).
+     * Left there, the next good packet of that stream read as a −46.6 s jump: a second cycle re-based the video by
+     * a frame (sync_ptsone + T056_PTSONE_A: lip sync +33 ms), or on the busier bit-error media the output followed
+     * the outlier (a 46.5 s video PTS hole, subtitles and SCTE-35 lost for 30 s). Each stream's reference goes back
+     * to its last KEPT packet. */
+    if (outlier) {
+        int s2;
+        int64_t *ts = av_malloc_array(FFMAX(b->nb_packets, 1), sizeof(*ts));
+        for (s2 = 0; s2 < b->nb_streams && ts; s2++) {
+            int64_t kept = AV_NOPTS_VALUE, ref;
+            int n = 0, j, k;
+            /* 2.0.0 T-320 (pre12c): the LAST plausible kept packet, not the largest — a second outlier among the kept
+             * packets (rich50b bitflip_100: +93.2 s, 2^23 ticks) was the maximum, continuity went to it and the next
+             * good packet opened a -92.8 s cycle that applied +92.8 s (a 92.86 s video PTS hole). Start from the median
+             * of the stream's kept timestamps and follow, in arrival order, the packets within PTV_DISC_THRESHOLD_US of
+             * the previous one. */
+            for (i = 0; i < b->nb_packets; i++) {
+                PtvDiscPacket *dp = b->packets[i];
+                if (dp && dp->stream_idx == s2 && (dp->timeline == keep_timeline || dp->timeline == 2) &&
+                    dp->raw_dts != AV_NOPTS_VALUE)
+                    ts[n++] = dp->raw_dts;
+            }
+            if (!n)
+                continue;
+            for (j = 1; j < n; j++)                        /* insertion sort: a cycle holds few packets */
+                for (k = j; k > 0 && ts[k - 1] > ts[k]; k--)
+                    FFSWAP(int64_t, ts[k - 1], ts[k]);
+            ref = ts[n / 2];
+            for (i = 0; i < b->nb_packets; i++) {
+                PtvDiscPacket *dp = b->packets[i];
+                if (dp && dp->stream_idx == s2 && (dp->timeline == keep_timeline || dp->timeline == 2) &&
+                    dp->raw_dts != AV_NOPTS_VALUE && llabs(dp->raw_dts - ref) <= PTV_DISC_THRESHOLD_US)
+                    kept = ref = dp->raw_dts;
+            }
+            if (kept != AV_NOPTS_VALUE && b->stream_state[s2].last_dts_us != kept) {
+                av_log(NULL, AV_LOG_INFO, "[PTV-LAYERA] outlier flush: stream %d continuity back to its last kept "
+                       "packet %.3fs (was %.3fs)\n", s2, (double)kept / AV_TIME_BASE,
+                       (double)b->stream_state[s2].last_dts_us / AV_TIME_BASE);
+                b->stream_state[s2].last_dts_us = kept;
+            }
+        }
+        av_free(ts);
+    }
+
     for (i = 0; i < b->nb_packets; i++) {
         PtvDiscPacket *dp = b->packets[i];
         AVStream *st;
@@ -1822,8 +1868,20 @@ static void park_drain(DemuxArgs *d, int force)
             (!ptv_src_holding() &&                                                 /* filled, but no rejoin since */
              atomic_load_explicit(&g_src_rejoin_wall, memory_order_relaxed) <= ps->fill_wc0))
             ready = fw > ps->park_since;
-        else
+        else {
             ready = ptv_rj_settled(ps->fill_cls_seq0, now);                        /* 2.0.0-pre8.5 */
+            /* 2.0.0 T-324: ... and the video has put this run's content on air. Under heavy loss the rejoin is
+             * classified by fragments mid-hold, so "settled" was already true at the return, 200 ms before the
+             * master wrote the post-rejoin house_skew (it does so on the frame it records here): the first AC-3
+             * packets rode the hold's skew, 21 s ahead of the video, and the real track sat behind them (Cinestar
+             * 50 % loss: AC-3 holes of 9-22 s, 3 of 9 seeds) */
+            if (ready && g_vmap) {
+                AVPacket *p0 = ps->park[0];
+                int64_t ts = p0->dts != AV_NOPTS_VALUE ? p0->dts : p0->pts, o, gap;
+                ready = ts == AV_NOPTS_VALUE ||
+                        ptv_vmap_lookup(av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q), &o, &gap) != 0;
+            }
+        }
         pthread_mutex_unlock(&d->pass_lock);
         if (!(force || ready || now - ps->park_since > 4000000))
             continue;
@@ -2986,6 +3044,28 @@ void *demux_thread(void *arg)
          * pursuit) descends from that one poisoned classification. Bookkeeping must never
          * learn from a packet the pipeline is about to discard. The demux_dispatch check
          * stays as the belt for re-injected/other paths. */
+        /* 2.0.0 T-320: a video packet whose PTS lies more than PTV_DISC_THRESHOLD_US from its own DTS carries a corrupt
+         * PTS (one bit error in a PES header — no CRC). Measured on the 29.97 bitflip_100 timing media: PTS 82.826 s with
+         * DTS 36.190 s (lavf interpolated the DTS across the damage, the header gave only the bad PTS); LAYERA watches DTS
+         * and saw nothing, the decoder stamped the frame 46.6 s ahead and the master followed it — a 46.5 s output PTS
+         * hole, and subtitles / SCTE-35 lost behind it for 30 s at 25 and 59.94 fps. Real reordering is a few frames.
+         * The frame is kept; its PTS is dropped and the decoder falls back to the (continuous) DTS. */
+        if (out->stream_index == d->vstream && out->pts != AV_NOPTS_VALUE && out->dts != AV_NOPTS_VALUE) {
+            const AVStream *vst2 = d->ifmt->streams[out->stream_index];
+            int64_t pd = out->pts - out->dts;
+            if (vst2->pts_wrap_bits > 0 && vst2->pts_wrap_bits < 63) {      /* nearest 33-bit wrap */
+                int64_t m = 1LL << vst2->pts_wrap_bits;
+                pd &= m - 1;
+                if (pd >= m >> 1) pd -= m;
+            }
+            if (llabs(av_rescale_q(pd, vst2->time_base, AV_TIME_BASE_Q)) > PTV_DISC_THRESHOLD_US) {
+                if (!d->pts_outlier_n++ || !(d->pts_outlier_n % 100))
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-LAYERA] video PTS %+.3f s away from its DTS — a corrupt label, "
+                           "PTS dropped, the frame keeps its DTS (%"PRId64" so far)\n",
+                           av_rescale_q(pd, vst2->time_base, AV_TIME_BASE_Q) / 1e6, d->pts_outlier_n);
+                out->pts = AV_NOPTS_VALUE;
+            }
+        }
         if ((out->flags & AV_PKT_FLAG_CORRUPT) && g_discardcorrupt) {
             ret = demux_dispatch(d, out);   /* dispatch = the existing counted discard path */
             if (ret < 0) break;
@@ -3484,6 +3564,8 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
         if (out->stream_index == d->vstream) {
             d->vcorrupt++;
             atomic_store_explicit(&g_vdmg_wc, av_gettime_relative(), memory_order_relaxed);   /* pre9.4 */
+            atomic_store_explicit(&g_vcorrupt_wc, av_gettime_relative(), memory_order_relaxed);   /* 2.0.0 T-324 */
+            atomic_fetch_add_explicit(&g_vcorrupt_n, 1, memory_order_relaxed);
             /* pre24 #63: a corrupt-discarded video packet IS a delivery arrival — the
              * [PTV-BURSTY]/AUTO-BANK advisor measures DELIVERY stalls (HLS-burst clumping),
              * and leaving these unstamped made every TEI corrupt storm read as arrival

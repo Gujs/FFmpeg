@@ -689,6 +689,10 @@ typedef struct CcTap {
     /* ---- -cc_style block: roll-up -> whole-line block assembly (all unused in `faithful`,
      * which never enters cc_block_feed() at all) ---- */
     int              style;            /* PTV_CC_STYLE_* (resolved once in cc_setup) */
+    int              mode608;          /* 2.0.0 T-023(b): the source's caption mode from its last 608 mode code, as
+                                        * cc_dec reads it: 0 unknown, 1 pop-on (RCL), 2 roll-up (RU2-4), 3 paint-on (RDC),
+                                        * 4 text (RTD) */
+    int              rw_n;             /* pop-on captions re-wrapped (the first few are logged) */
     int              blk_rollup;       /* LATCH: this input has been positively identified as
                                         * a roll-up window. Until it sets, block mode is a
                                         * no-op and events take the pre4 path unchanged. */
@@ -760,6 +764,10 @@ typedef struct DecodeCtx {
     VideoHold       *hold;                    /* multiview: stage frames here (NULL = filter inline) */
     int64_t          rj_hold_id;              /* 2.0.0-pre6.1: the hold the rejoin map last armed for */
     int              rj_done;                 /* ... and whether it was applied */
+    int64_t          hc_hold_id, hc_since, hc_flag_since, hc_last;   /* 2.0.0 T-324: the damaged hold's clean runs: frames
+                                              * continuous / no corrupt data (wall us) */
+    int              hc_drop, hc_passed;      /* ... frames discarded until it lasted; the run passed */
+    int64_t          hc_last_pts, hc_min_dt;  /* ... its last frame (us), the source's own frame spacing (min seen) */
     int              rj_dbg_n;                /* 2.0.0-pre8.2: [PTV-RJTRACE] lines left this hold (PTV_DIAG) */
     /* 2.0.0-pre9 (T-078/T-079): hold pictures rendered through the graph while input 0 holds */
     AVFrame         *hr_last;                 /* ref of the last decoded frame (single input; shape + freeze picture) */
@@ -1740,6 +1748,7 @@ typedef struct DemuxArgs {
     int64_t               src_pend_w, src_pend_raw; /* 2.0.0-pre3: its wall gap; the last pre-gap DTS */
     /* 2.0.0 T-103 (owner 2026-10-10: the output delay is pinned): a pause the burst bank cannot absorb is not kept as
      * delay — the returning catch-up is skipped up to the live content, all streams to one video keyframe */
+    int64_t               pts_outlier_n;    /* 2.0.0 T-320: video packets whose corrupt PTS was dropped (PTS far from DTS) */
     int                   rj_skip;          /* 1 = dropping until a keyframe at the live point, 2 = cut found: other streams
                                              * drop what lies before it */
     int64_t               rj_skip_target, rj_skip_cut, rj_skip_wc, rj_skip_n;
@@ -2002,6 +2011,8 @@ extern _Atomic int64_t g_house_out_us, g_house_tick_us;   /* master: last emitte
 /* 2.0.0 T-100: the video's content -> output record (ptvencoder.c) */
 #define PTV_VMAP_N 4096
 extern int g_vmap;
+extern int     g_cc_rewrap;       /* 2.0.0 T-023(b): re-wrap pop-on captions to the teletext row (PTV_CC_NO_REWRAP=1 off) */
+extern int64_t g_hold_clean_us;   /* 2.0.0 T-324: a hold that saw video damage ends after this much clean video */
 extern int64_t g_max_delay_us;   /* 2.0.0 T-103: pinned output delay (us; 0 = off) */
 void ptv_vmap_push(int64_t src_us, int64_t out_us);
 int  ptv_vmap_lookup(int64_t c_us, int64_t *out_us, int64_t *gap_us);
@@ -2119,6 +2130,8 @@ extern CushionPlan g_cp;                 /* defined in ptvencoder_gate.c */
 extern _Atomic int     g_frameq_depth;
 extern _Atomic int64_t g_fq0_tail_pts;
 extern _Atomic int64_t g_vdmg_wc;
+extern _Atomic int64_t g_vcorrupt_n, g_hold_vcorrupt_n0;   /* 2.0.0 T-324: corrupt video events; the count when the hold began */
+extern _Atomic int64_t g_vcorrupt_wc;   /* 2.0.0 T-324: wall time of the last corrupt video data (no timeline steps) */
 extern int     g_genlock_guard;
 extern _Atomic int64_t g_async_ppm;
 extern int64_t g_stats_period_us;

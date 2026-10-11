@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.0-pre11"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.0-pre12"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -275,6 +275,7 @@ int ptv_vmap_lookup(int64_t c_us, int64_t *out_us, int64_t *gap_us)
 _Atomic int64_t g_vdisp_skew_us;   /* 2.0.0 T-095: master: (vpts - content index) of the last fresh frame, us */
 _Atomic int64_t g_dup_out_us;   /* 2.0.0-pre9.4 (T-083): output time on ticks whose content did not advance */
 int             g_rejoin_map = 1;
+int64_t         g_hold_clean_us = 1000000;
 int             g_vo_hold = 1;   /* 2.0.0-pre9.8 (T-076): audio keeps its own clock while only the video is gone; PTV_NO_VO_HOLD=1 off */
 _Atomic int     g_vskip_epoch;
 _Atomic int64_t g_vgop_est_us;
@@ -737,6 +738,8 @@ int             g_reprime = 1;                /* PTV_REPRIME: when a glue drains
 int             g_adapt_cushion = 1;
 _Atomic int     g_frameq_depth;               /* DIAG: master video frame_q occupancy (frames), published each tick for the discontinuity logs */
 _Atomic int64_t g_vdmg_wc;                       /* 2.0.0-pre9.4 (T-083): wall time of the last corrupt video packet/frame */
+_Atomic int64_t g_vcorrupt_wc;                   /* 2.0.0 T-324: ... corrupt DATA only (no timeline step): the hold's clean rule */
+_Atomic int64_t g_vcorrupt_n, g_hold_vcorrupt_n0;  /* 2.0.0 T-324: corrupt video events; the count when the hold began */
 _Atomic int64_t g_fq0_tail_pts = AV_NOPTS_VALUE; /* 2.0.0-pre9.4 (T-083): pts of the newest frame pushed to the master frame_q */
 /* v0.9.4 genlock GUARD (PTV_NO_GENLOCK_GUARD reverts to exact v0.9.x behavior). TruBLU-class jittery/
  * bursty sources alias the 3s FLL window → noisy sub-window rates that the loose ±1% gate folded in,
@@ -1593,6 +1596,206 @@ static int cc_rows_parse(CcRows *rows, const char *ass)
 
 static void cc_rows_free(CcRows *rows) { av_freep(&rows->buf); }
 
+/* ---- 2.0.0 T-023(b): pop-on row re-wrap ----
+ *
+ * A pop-on caption keeps the source's line breaks, which were made for a 32-column 608 screen; a teletext subtitle row
+ * holds 36 (40 minus the two start and two end boxes, dvbteletextenc) and is centred by the encoder. Captioners break
+ * long sentences so one word lands alone on a row (TruBLU, 10 min: 37 of 141 captions) — on teletext that word could
+ * have stayed on the row above (owner 2026-10-11). The rows of a pop-on caption are re-flowed when, and only when, that
+ * saves a row or removes a one-word row: the WORDS and their order never change, a dialogue turn ("-" or ">>") keeps
+ * starting its own row, and the caption keeps its lowest row (it does not move on screen). Any markup inside a row
+ * (italics or a colour on part of it) or rows that differ in their leading markup: the caption is left exactly as the
+ * source sent it. Roll-up and paint-on are never touched (their rows are built while the viewer watches). On by
+ * default for pop-on; PTV_CC_NO_REWRAP=1 turns it off. */
+#define PTV_HOLD_DMG_MIN 5    /* 2.0.0 T-324: corrupt video events during a hold before the clean-input rule engages */
+#define CC_TTX_COLS   36     /* a teletext subtitle row: 40 - 2 start boxes - 2 end boxes (dvbteletextenc.c) */
+#define CC_WRAP_WORDS 16     /* a block with more words keeps the source rows (bounded search) */
+int g_cc_rewrap = 1;
+
+typedef struct CcWord { const char *s; int len, w; } CcWord;   /* bytes, width in characters */
+
+static int cc_u8_width(const char *s, int n)
+{
+    int i, w = 0;
+    for (i = 0; i < n; i++)
+        w += ((unsigned char)s[i] & 0xC0) != 0x80;
+    return w;
+}
+
+/* Split words wd[0..n) into at most maxr lines of <= CC_TTX_COLS characters: the fewest lines, then no one-word line,
+ * then line breaks after punctuation, then the most even lines. Fills cut[0..r] (first word of each line, cut[r] = n)
+ * and returns r; 0 when no split fits. */
+static int cc_wrap_block(const CcWord *wd, int n, int maxr, int *best_cut)
+{
+    int r;
+    for (r = 1; r <= maxr && r <= n; r++) {
+        int cut[CC_BLK_MAX_ROWS + 1], k, l, found = 0;
+        int64_t best = INT64_MAX;
+        cut[0] = 0;
+        cut[r] = n;
+        for (k = 1; k < r; k++)
+            cut[k] = k;
+        for (;;) {
+            int ok = 1, orphan = 0, punct = 0, maxw = 0, minw = INT_MAX;
+            for (l = 0; l < r && ok; l++) {
+                int w = 0, i;
+                for (i = cut[l]; i < cut[l + 1]; i++)
+                    w += wd[i].w + (i > cut[l]);
+                if (w > CC_TTX_COLS)
+                    ok = 0;
+                if (r > 1 && cut[l + 1] - cut[l] == 1)
+                    orphan++;
+                if (l < r - 1) {
+                    const CcWord *e = &wd[cut[l + 1] - 1];
+                    punct += !strchr(".,?!;:", e->s[e->len - 1]);
+                }
+                maxw = FFMAX(maxw, w);
+                minw = FFMIN(minw, w);
+            }
+            if (ok) {
+                int64_t cost = (int64_t)orphan * 1000000 + punct * 6 + (maxw - minw);
+                if (cost < best) {
+                    best  = cost;
+                    found = 1;
+                    memcpy(best_cut, cut, (r + 1) * sizeof(*cut));
+                }
+            }
+            for (k = r - 1; k >= 1 && cut[k] == n - r + k; k--)
+                ;
+            if (k < 1)
+                break;
+            cut[k]++;
+            for (l = k + 1; l < r; l++)
+                cut[l] = cut[l - 1] + 1;
+        }
+        if (found)
+            return r;
+    }
+    return 0;
+}
+
+/* The re-wrapped dialog line for a pop-on caption, or NULL when it stays as it is (see the header above). */
+static char *cc_rewrap(const char *ass)
+{
+    CcRows rows;
+    const char *txt = cc_ass_text(ass);
+    char *body[CC_BLK_MAX_ROWS], *lead0 = NULL, *out = NULL;
+    char *line[CC_BLK_MAX_ROWS];
+    int nwords[CC_BLK_MAX_ROWS], nout = 0, orph_in = 0, orph_out = 0, i, ok = 1;
+    AVBPrint lead, bp;
+
+    if (!txt || cc_rows_parse(&rows, ass) < 0)
+        return NULL;
+    if (rows.n < 2) {
+        cc_rows_free(&rows);
+        return NULL;
+    }
+    av_bprint_init(&lead, 0, AV_BPRINT_SIZE_UNLIMITED);
+    for (i = 0; i < rows.n && ok; i++) {
+        char *p = rows.text[i], *e;
+        av_bprint_clear(&lead);
+        for (;;) {                                   /* leading markup: override blocks and \h */
+            if (p[0] == '{' && p[1] == '\\' && strchr(p, '}')) {
+                char *close = strchr(p, '}');
+                av_bprintf(&lead, "%.*s", (int)(close + 1 - p), p);
+                p = close + 1;
+            } else if (p[0] == '\\' && p[1] == 'h')
+                p += 2;
+            else if (p[0] == ' ')
+                p++;
+            else
+                break;
+        }
+        if (!*p || strchr(p, '{') || strchr(p, '\\'))
+            ok = 0;                                  /* empty row, or markup inside the text */
+        if (!i)
+            lead0 = av_strdup(lead.str);
+        else if (!lead0 || strcmp(lead0, lead.str))
+            ok = 0;                                  /* rows styled differently */
+        for (e = p + strlen(p); e > p && e[-1] == ' '; e--)
+            ;
+        *e = 0;
+        body[i] = p;
+    }
+    av_bprint_finalize(&lead, NULL);
+    if (ok) {
+        int b0 = 0;
+        for (i = 0; i < rows.n; i++) {               /* source orphans: one-word rows of multi-row blocks */
+            const char *p;
+            int w = 1;
+            for (p = body[i]; *p; p++)
+                w += p[0] == ' ' && p[1] && p[1] != ' ';
+            nwords[i] = w;
+        }
+        while (b0 < rows.n && ok) {                  /* blocks: a dialogue turn starts a new one */
+            int b1 = b0 + 1, nw = 0, r, j, cut[CC_BLK_MAX_ROWS + 1], big = 0;
+            CcWord wd[CC_WRAP_WORDS];
+            char *copy = NULL, *sv = NULL, *tok;
+            while (b1 < rows.n && body[b1][0] != '-' && strncmp(body[b1], ">>", 2))
+                b1++;
+            for (j = b0; j < b1 && b1 - b0 > 1; j++)
+                orph_in += nwords[j] == 1;
+            for (j = b0; j < b1; j++)
+                nw += nwords[j];
+            r = 0;
+            if (nw <= CC_WRAP_WORDS) {
+                AVBPrint all;
+                av_bprint_init(&all, 0, AV_BPRINT_SIZE_UNLIMITED);
+                for (j = b0; j < b1; j++)
+                    av_bprintf(&all, "%s%s", j > b0 ? " " : "", body[j]);
+                av_bprint_finalize(&all, &copy);
+                nw = 0;
+                for (tok = copy ? av_strtok(copy, " ", &sv) : NULL; tok && nw < CC_WRAP_WORDS;
+                     tok = av_strtok(NULL, " ", &sv)) {
+                    wd[nw].s   = tok;
+                    wd[nw].len = strlen(tok);
+                    wd[nw].w   = cc_u8_width(tok, wd[nw].len);
+                    big |= wd[nw].w > CC_TTX_COLS;
+                    nw++;
+                }
+                if (!big && nw)
+                    r = cc_wrap_block(wd, nw, b1 - b0, cut);
+            }
+            if (r) {
+                for (j = 0; j < r; j++) {
+                    AVBPrint l;
+                    int k;
+                    av_bprint_init(&l, 0, AV_BPRINT_SIZE_UNLIMITED);
+                    for (k = cut[j]; k < cut[j + 1]; k++)
+                        av_bprintf(&l, "%s%s", k > cut[j] ? " " : "", wd[k].s);
+                    av_bprint_finalize(&l, &line[nout]);
+                    orph_out += r > 1 && cut[j + 1] - cut[j] == 1;
+                    nout++;
+                }
+            } else {
+                for (j = b0; j < b1; j++) {          /* no better split: the source's rows */
+                    line[nout++] = av_strdup(body[j]);
+                    orph_out += b1 - b0 > 1 && nwords[j] == 1;
+                }
+            }
+            av_free(copy);
+            b0 = b1;
+        }
+        if (ok && (nout < rows.n || orph_out < orph_in)) {
+            av_bprint_init(&bp, 0, AV_BPRINT_SIZE_UNLIMITED);
+            av_bprintf(&bp, "%.*s", (int)(txt - ass), ass);
+            for (i = 0; i < nout; i++) {
+                int src = rows.n - nout + i;         /* bottom-aligned: the caption keeps its lowest row */
+                av_bprintf(&bp, "%s{\\an7}{\\pos(%d,%d)}%s%s", i ? "\\N" : "",
+                           rows.x[src] >= 0 ? rows.x[src] : 0, rows.y[src] >= 0 ? rows.y[src] : 0,
+                           lead0 ? lead0 : "", line[i]);
+            }
+            if (av_bprint_finalize(&bp, &out) < 0)
+                out = NULL;
+        }
+        for (i = 0; i < nout; i++)
+            av_free(line[i]);
+    }
+    av_free(lead0);
+    cc_rows_free(&rows);
+    return out;
+}
+
 /* First byte of REAL CONTENT in a row: past override blocks, the \h/\N/\n escapes and
  * whitespace. NULL when the row has none. Deliberately the same markup vocabulary
  * cc_ass_has_text() knows — the two must agree on what "empty" means. */
@@ -1853,6 +2056,11 @@ static int cc_block_emit(CcTap *t, int64_t cur_us, char *ttag)
     av_freep(&t->pend_ass);
     t->pend_ass    = ass;                  /* ownership moves to the tap, then to the event */
     t->pend_end_ms = PTV_CC_MAX_DISPLAY_MS;
+    /* 2.0.0 T-322: a paced block is due NOW — on the frame its pacing released it. The flush computes the due time
+     * from the faithful path's debounce fields, which block mode never updates: every block carried the run's first
+     * caption time, the video record put it tens of seconds behind the output and T-100 dropped it as late (NTD on
+     * live-transcoder, pre11: ~35 % of blocks; roll-up timing media in block mode: 58 of 144). */
+    t->pend_first_us = t->pend_changed_us = cur_us;
     cc_tap_flush_pending(t, cur_us, ttag);
     cc_tap_hold_erase(t, NULL, 0, cur_us + PTV_CC_MIN_DISPLAY_US, 0);
     return 1;
@@ -2383,6 +2591,7 @@ static int cc_block_timers(CcTap *t, int64_t cur_us, char *ttag)
 static int cc_tap_rect(CcTap *t, const char *ass, int end_ms, int64_t cur_us, char *ttag)
 {
     CcEvent ev = { NULL, cur_us, (uint32_t)end_ms, PTV_CC_ERASE };
+    char *rw = NULL;
 
     if (cc_ass_has_text(ass)) {
         /* -cc_style block: new text supersedes a deferred clear here exactly as it does
@@ -2402,6 +2611,14 @@ static int cc_tap_rect(CcTap *t, const char *ass, int end_ms, int64_t cur_us, ch
             if (cc_block_feed(t, ass, cur_us, ttag))
                 return 1;
         }
+        /* 2.0.0 T-023(b): a pop-on caption is re-flowed to the teletext row when that saves a row or a one-word row */
+        if (g_cc_rewrap && t->mode608 == 1 && (rw = cc_rewrap(ass))) {
+            if (t->rw_n++ < 3)
+                av_log(NULL, AV_LOG_INFO, "[PTV-CC]%s pop-on caption re-wrapped to %d columns: \"%s\" -> \"%s\" "
+                       "(PTV_CC_NO_REWRAP=1 disables; first 3 logged)\n", cc_tap_tag(t, ttag, sizeof(char[16])),
+                       CC_TTX_COLS, cc_ass_text(ass), cc_ass_text(rw));
+            ass = rw;
+        }
         /* DEBOUNCE (see PTV_CC_DEBOUNCE_US): buffer it. Only a CHANGE restarts the
          * silence timer — an identical retransmission must not keep the caption
          * pending forever. */
@@ -2418,6 +2635,7 @@ static int cc_tap_rect(CcTap *t, const char *ass, int end_ms, int64_t cur_us, ch
          * [EDM, chars] pair in ONE frame resolves: the erase this frame just held is
          * cancelled by the text that followed it.) */
         av_freep(&t->erase_ass);
+        av_free(rw);
         return 0;
     }
 
@@ -2542,6 +2760,21 @@ static void cc_tap_frame(CcTap *t, AVFrame *frame, AVRational ist_tb)
     sd = av_frame_get_side_data(frame, AV_FRAME_DATA_A53_CC);
     if (sd && sd->size >= 3) {
         AVPacket *cc_pkt = av_packet_alloc();
+        int k;
+        /* 2.0.0 T-023(b): follow the caption mode exactly as cc_dec reads it (field 1, valid 608 pair, low byte odd
+         * parity, control codes 0x14/0x15/0x1c + RCL / RU2-4 / RDC / RTD) — the re-wrap applies to pop-on only */
+        for (k = 0; k + 2 < sd->size; k += 3) {
+            const uint8_t *c3 = sd->data + k;
+            int hi = c3[1] & 0x7f, lo = c3[2] & 0x7f;
+            if (!(c3[0] & 4) || (c3[0] & 3) != 0 || !(av_popcount(c3[2]) & 1) || !(av_popcount(c3[1]) & 1))
+                continue;
+            if (hi != 0x14 && hi != 0x15 && hi != 0x1c)
+                continue;
+            if (lo == 0x20)                        t->mode608 = 1;   /* RCL: pop-on */
+            else if (lo >= 0x25 && lo <= 0x27)     t->mode608 = 2;   /* RU2-4: roll-up */
+            else if (lo == 0x29)                   t->mode608 = 3;   /* RDC: paint-on */
+            else if (lo == 0x2b)                   t->mode608 = 4;   /* RTD: text */
+        }
         atomic_fetch_add_explicit(&g_cc_a53, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&g_cc_a53_in[t->slot], 1, memory_order_relaxed);
         if (cc_pkt && av_new_packet(cc_pkt, sd->size) >= 0) {
@@ -2755,9 +2988,65 @@ static void rejoin_map(DecodeCtx *d, const AVFrame *frame)
            "jump (PTV_NO_REJOIN_MAP=1 reverts)\n", lead / 1e6);
 }
 
+/* 2.0.0 T-324: may this decoded frame end the hold? A hold whose input sent damaged video ends only after the video has
+ * played cleanly for g_hold_clean_us: no corrupt packet, frame or decode error, no wall pause over 500 ms, and no frame missing
+ * (consecutive frames more than 1.5 source frame spacings apart — after heavy loss the decoder's references stay broken
+ * for a while and it drops frames without an error: every 4th one on the Cinestar 50 % seed 2). Until then the frames are
+ * discarded and the output stays on its hold picture and silence. Under heavy loss a decodable fragment ended the hold,
+ * the video then waited 3.3 s for a keyframe outside it and the output clock leapt over the gap (a 4.1 s video PTS hole;
+ * 5.8 s on the canary). A clean outage (stop, kill, burst) returns at its first frame as before. The missed content is
+ * skipped: the channel resumes at live, picture and sound together. */
+static int hold_clean_pass(DecodeCtx *d, const AVFrame *frame)
+{
+    int64_t hid, dw, now = av_gettime_relative(), dt = 0;
+    int gap;
+    dw = atomic_load_explicit(&g_vcorrupt_wc, memory_order_relaxed);   /* corrupt data, not timeline steps: a clean
+                                                                     * outage's return steps the labels too */
+    if (frame->best_effort_timestamp != AV_NOPTS_VALUE) {
+        int64_t pts = av_rescale_q(frame->best_effort_timestamp, d->ist_tb, AV_TIME_BASE_Q);
+        if (d->hc_last_pts != AV_NOPTS_VALUE)
+            dt = pts - d->hc_last_pts;
+        if (dt >= 5000 && (!d->hc_min_dt || dt < d->hc_min_dt) && !ptv_src_holding() && (!dw || now - dw > 5000000))
+            d->hc_min_dt = dt;           /* the source's frame spacing: the smallest step of steady, undamaged video
+                                          * (a damaged field decodes 20 ms from its neighbour on 1080i25) */
+        d->hc_last_pts = pts;
+    }
+    if (!g_hold_clean_us || !ptv_src_holding())
+        return 1;
+    hid = atomic_load_explicit(&g_src_hold_start, memory_order_relaxed);
+    if (hid != d->hc_hold_id) {
+        d->hc_hold_id = hid; d->hc_since = d->hc_flag_since = d->hc_last = 0; d->hc_drop = d->hc_passed = 0;
+    }
+    if (!hid || dw < hid || d->hc_passed ||
+        atomic_load_explicit(&g_vcorrupt_n, memory_order_relaxed) -
+        atomic_load_explicit(&g_hold_vcorrupt_n0, memory_order_relaxed) < PTV_HOLD_DMG_MIN)
+        return 1;                        /* no damage since the hold began: a clean outage — whose return carries ONE
+                                          * corrupt packet (the cut PES at the gap edge, T-074; measured on gap_20,
+                                          * burstjump); 50 % loss carries hundreds during the hold */
+    gap = d->hc_min_dt && (dt <= 0 || dt > d->hc_min_dt * 3 / 2);   /* a frame missing (or out of order) */
+    if (!d->hc_flag_since || dw >= d->hc_flag_since || now - d->hc_last > 500000)
+        d->hc_flag_since = d->hc_since = now;   /* damage or a pause: both runs restart at this frame */
+    else if (gap)
+        d->hc_since = now;               /* the frame run restarts */
+    d->hc_last = now;
+    if (now - d->hc_since >= g_hold_clean_us || now - d->hc_flag_since >= 5 * g_hold_clean_us) {
+        av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 damaged input: %d frames discarded until the video played cleanly "
+               "%.1f s%s — the hold ends now (PTV_HOLD_CLEAN_MS=0 reverts)\n", d->hc_drop, g_hold_clean_us / 1e6,
+               now - d->hc_since >= g_hold_clean_us ? "" : " (no corrupt data for 5x that, frames still irregular)");
+        d->hc_passed = 1;                /* pass the rest of this hold's frames */
+        return 1;
+    }
+    d->hc_drop++;
+    return 0;
+}
+
 static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
 {
     int i;
+    if (!hold_clean_pass(d, frame)) {
+        av_frame_unref(frame);
+        return;
+    }
     rejoin_map(d, frame);                /* 2.0.0-pre6.1 (single input: emit_video is the non-mosaic path) */
     {   /* 2.0.0-pre9.4 (T-083): a frame decoded within 5 s of corrupt video is damage-era — the output clock fills a
          * content gap in front of it (frames lost); in front of any other frame a gap is the old leap (a backlog drain,
@@ -3171,15 +3460,21 @@ static void *decode_thread(void *arg)
         PTV_HB_VDEC(d->hb_slot, PTV_HB_VDEC_SENDPKT);
         ret = avcodec_send_packet(d->vdec, pkt);
         av_packet_free(&pkt);
-        if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF)   /* 2.0.0-pre9.4: damage evidence (bit errors */
+        if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) { /* 2.0.0-pre9.4: damage evidence (bit errors */
             atomic_store_explicit(&g_vdmg_wc, av_gettime_relative(), memory_order_relaxed);   /* inside valid packets) */
+            atomic_store_explicit(&g_vcorrupt_wc, av_gettime_relative(), memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_vcorrupt_n, 1, memory_order_relaxed);
+        }
         while (ret >= 0) {
             PTV_HB_VDEC(d->hb_slot, PTV_HB_VDEC_RECVFRAME);
             ret = avcodec_receive_frame(d->vdec, frame);
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) { ret = 0; break; }
             if (ret < 0) goto done;
-            if (frame->decode_error_flags)   /* 2.0.0-pre9.4: concealed / missing slices = damage evidence */
+            if (frame->decode_error_flags) { /* 2.0.0-pre9.4: concealed / missing slices = damage evidence */
                 atomic_store_explicit(&g_vdmg_wc, av_gettime_relative(), memory_order_relaxed);
+                atomic_store_explicit(&g_vcorrupt_wc, av_gettime_relative(), memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_vcorrupt_n, 1, memory_order_relaxed);
+            }
             /* TEST ONLY (F6 gate, PTV_CCTEST_CORRUPT_EVERY): real slice damage never reaches
              * here — the demuxer's own corrupt-packet path discards it first — so the only way
              * to exercise the branch below on demand is to set the flag ourselves. Inert
@@ -3189,6 +3484,8 @@ static void *decode_thread(void *arg)
             if (frame->flags & AV_FRAME_FLAG_CORRUPT) {
                 d->vcorrupt++;
                 atomic_store_explicit(&g_vdmg_wc, av_gettime_relative(), memory_order_relaxed);   /* pre9.4 */
+                atomic_store_explicit(&g_vcorrupt_wc, av_gettime_relative(), memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_vcorrupt_n, 1, memory_order_relaxed);
                 /* The FRAME is unusable for video; its A53 side data is fed to the tap anyway,
                  * because cc_dec is STATEFUL and skipping the frame silently violated its
                  * "every frame's 608 pair, exactly once, in order" invariant, losing
@@ -5563,6 +5860,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
     for (k = 0; k < n_input; k++) {
         DecodeCtx *d = &inputs[k].dc;
         d->video_q = inputs[k].video_q; d->vdec = inputs[k].vdec; d->ist_tb = inputs[k].ist_tb;
+        d->hc_last_pts = AV_NOPTS_VALUE;   /* 2.0.0 T-324 */
         d->h0 = &inputs[k].h0; d->h0_lock = &inputs[k].h0_lock; d->live = live;
         if (multiview) { d->hold = &inputs[k].hold; d->filtering = 0; d->n_rung = 0; }
         else { d->n_rung = n_rung; for (r = 0; r < n_rung; r++) d->frame_q[r] = rung[r].frame_q; }
@@ -6623,6 +6921,8 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_SRC_FILL")) g_hold_fill = 0;   /* 2.0.0-pre6 kill switch: no fill while holding */
     if (getenv("PTV_NO_COPY_GAPFILL")) g_copy_gapfill = 0;   /* 2.0.0-pre9.4 kill switch */
     if (getenv("PTV_NO_VO_HOLD")) g_vo_hold = 0;
+    if (getenv("PTV_CC_NO_REWRAP")) g_cc_rewrap = 0;   /* 2.0.0 T-023(b) */
+    { const char *hc = getenv("PTV_HOLD_CLEAN_MS"); if (hc) g_hold_clean_us = (int64_t)atoi(hc) * 1000; }   /* 2.0.0 T-324 */
     if (getenv("PTV_NO_REJOIN_MAP")) g_rejoin_map = 0; /* 2.0.0-pre6.1 kill switch: PTS jumps at a rejoin again */
     { const char *s = getenv("PTV_GLUE_HTOL_PCT");     if (s && atoi(s) > 0) g_glue_htol = atoi(s); }             /* tuning knob (G4) */
     { const char *s = getenv("PTV_PAIR_EXPECT_TTL_US");if (s && atoll(s) > 0) g_pair_ttl_us = atoll(s); }          /* TEST ONLY (G6) */
