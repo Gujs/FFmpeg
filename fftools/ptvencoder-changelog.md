@@ -5,6 +5,33 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre17 — pre16 + audio format switches without a graph rebuild (sample rate, channel layout, codec)
+
+- **A source audio format switch no longer rebuilds the -af graph (T-347 / T-348 / T-349).** Every source format is now
+  converted (one swresample stage) to the track's OUTPUT layout at 48 kHz in front of a fixed -af graph, so the graph,
+  loudnorm's state and the encoder never see the switch. Fixes, measured on the new local switch media:
+  - mono ↔ stereo: lip sync stepped −192 ms after the switch (T-347) → within ±25 ms;
+  - 44.1 / 96 kHz ↔ 48 kHz: holes in the output audio after the switch (T-348) → none;
+  - every switch: the audio PID went dark ~2 s while loudnorm refilled after the rebuild (T-349) → no pause.
+  The 5-frame confirm (hysteresis) and the re-anchor at the switch are unchanged; a torn-down graph (init failure)
+  still takes the full rebuild.
+- **5.1 sources on a stereo track are now downmixed BEFORE loudness normalization**, so they come out at −23 LUFS like
+  every other source (pre16 normalized the 5.1 and downmixed after it: ~5 LU quieter). Audible change on channels with
+  5.1 sources: they get louder, to the target. The downmix matrix is normalized (no clipping). 5.1 → 5.1 tracks and
+  AC-3 / E-AC-3 copy: unchanged.
+- **AAC inside one PES after a sample-rate switch is timed by its own header (T-348).** lavf times the continuation
+  frames of a PES at the rate probed at open; after a switch to another rate they were mislabeled. The labels are now
+  re-derived from the ADTS header once its rate is stable for 3 frames and differs from lavf's timing.
+- **Mosaic slot audio format switch keeps the slot's lip sync (T-352).** The splice edit the demux absorbed at the
+  switch is returned to the labels at the re-anchor (slot 0 of the local switch case: ≈0 ms after the switch).
+- CPU: one conversion stage per transcoded track, ~3.5 % of a core per chain; 5.1 → stereo cheaper than pre16
+  (loudnorm now runs on 2 channels instead of 6).
+- Release gate (frozen kit `6202071`, the pre14 single-input + pre16 multiview keys): 206 runs on the dev build, and the
+  rich-media timing block (97 runs) again on the upstream-patched build. No other differences from pre16: vt/bursty 3.0 s
+  = loudnorm's hold on the 3 s line (reruns 3/3 PASS on pre17 and pre16); burstjump at 50 / 59.94 fps 3/3 PASS on both;
+  rich5994b gap2_10 live share 0.886 vs 0.929 = a one-frame rejoin alignment that has flipped this checker since pre10
+  (video output identical). Fixed: rich50b vnull_40 SCTE-35 timing.
+
 ## 2.0.0-pre16 — pre15 + no audio-cut ping-pong on mosaic slots with recurring small damage; 0007 folded into 0002
 
 - **A mosaic slot with recurring small corruption no longer gets an audible audio cut after every damage event (T-350,
