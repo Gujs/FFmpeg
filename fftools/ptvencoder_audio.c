@@ -1696,9 +1696,11 @@ static int audio_drain_fg(AudioState *a)
                      * its 1500 ms cap, and the ACQUIRE waited for the EMA (tau ~2.7 s) to climb past it: 7.9 s of audio 1.8 s
                      * early. When the last 8 readings agree with each other (within the tick quantum) but sit far from the
                      * EMA, the EMA is re-seeded at their median and the step is kept out of the noise estimate: the
-                     * large-and-flat test then passes on its own windows (~2 s). A jittery leg never agrees: unchanged */
+                     * large-and-flat test then passes on its own windows (~2 s). A jittery leg never agrees: unchanged. Not in
+                     * the first 30 s: there the startup bank settles while the slot's video lag still moves, and re-seeding on
+                     * it acquired early (untouched slots +23…+61 ms before any event, 4 of 5 runs) */
                     int pll_level = 0;
-                    if (a->pll_raw_n >= 8) {
+                    if (a->pll_raw_n >= 8 && a->out_frames * a->frame_size >= 30LL * a->out_rate) {
                         int64_t w[8], band = FFMAX(g_pll_acquire_us, a->tick_dur_us > 0 ? 3 * a->tick_dur_us / 2 : 0);
                         int x, y;
                         for (x = 0; x < 8; x++)
