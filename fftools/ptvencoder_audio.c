@@ -3266,9 +3266,33 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                  * Before: the step went to the discontinuity layer, the PLL padded the outage again (kill_return_20:
                  * ACQUIRE pad 19 s, audio PID dark 20 s after the return, lip sync −0.8 s for 25 s). A source that
                  * lost the outage (labels +gap) resumes at or after the fill's end and keeps the pad-the-rest rule. */
+                /* T-350: the first frame out after an outage can be the pre-gap PES tail (T-074): the cut PES, completed
+                 * with post-gap bytes, flushed corrupt with its OLD label. MP2 / AC-3 decode it (AAC rejects it), so it
+                 * reads "behind the fill" and the fill was judged a hold — then the real return, the whole outage ahead,
+                 * was padded on top (live Grid_2x2 Cinestar cell, 10 s gap: glue +8063 then pad +9984, the PLL dropped
+                 * 10 s; local MV mp2 gap_10 cut mid-PES the same). A forward step of at least half the hold within 1 s
+                 * of the verdict is that return: the source lost the outage, so the hold is undone and only the rest
+                 * (the part before the fill engaged) is padded, as at a clean fill resume. */
+                if (a->mv_hold_prov_us && !fill_resumed) {
+                    if (now_wc - a->mv_hold_prov_wc > 1000000 || step < 0)
+                        a->mv_hold_prov_us = 0;
+                    else if (step >= a->mv_hold_prov_us / 2) {
+                        int64_t u = FFMIN(step, a->mv_hold_prov_us);
+                        a->glue_off_us -= u;
+                        a->mv_hold_us  -= u;
+                        step           -= u;
+                        av_log(NULL, AV_LOG_WARNING, "[PTV-ADISC] a%d(in%d) +%"PRId64" ms %"PRId64" ms after the hold verdict — "
+                               "the resumed frame was the pre-gap PES tail and the source lost the outage: hold undone, "
+                               "%+"PRId64" ms left to pad (glue %+"PRId64"ms)\n", a->dbg_k, a->dbg_in, (step + u) / 1000,
+                               (now_wc - a->mv_hold_prov_wc) / 1000, step / 1000, a->glue_off_us / 1000);
+                        a->mv_hold_prov_us = 0;
+                    }
+                }
                 if (fill_resumed && step < 0 && a->multiview && g_audio_follow && g_avsync_pll) {
                     a->glue_off_us += -step;
                     a->mv_hold_us  += -step;
+                    a->mv_hold_prov_us = -step;
+                    a->mv_hold_prov_wc = now_wc;
                     av_log(NULL, AV_LOG_WARNING, "[PTV-ADISC] a%d(in%d) source resumed %"PRId64" ms behind the slot's silence fill "
                            "— the fill was a hold: labels continue at its end (glue %+"PRId64"ms)\n",
                            a->dbg_k, a->dbg_in, -step / 1000, a->glue_off_us / 1000);

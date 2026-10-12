@@ -1090,6 +1090,8 @@ typedef struct AudioState {
     int64_t          glue_off_us;                     /* cumulative relabel offset applied to input labels (us) */
     int64_t          mv_hold_us;                      /* 2.0.0 T-093: the part of glue_off that continued labels over a
                                                        * multiview slot fill (a hold, not content — out of the PLL pairing) */
+    int64_t          mv_hold_prov_us, mv_hold_prov_wc; /* T-350: the last hold verdict (amount, wall) — undone when the
+                                                       * resumed frame was the pre-gap PES tail and the return follows */
     int64_t          mvf_lo_us, mvf_hi_us;            /* T-093: door span of the last multiview fill phase (+ its pad) */
     int              mvf_open;                        /* T-093: a fill phase is feeding the door */
     int64_t          glue_raw_last_us;              /* last RAW in-pts (us); NOPTS until first frame */
