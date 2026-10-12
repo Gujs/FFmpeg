@@ -2312,7 +2312,8 @@ pll_emit:
                      * ACQUIRE + (b)'s re-seed already restore honesty within ~12s. */
                     if (g_rebuild_reanchor && a->reanch_wc &&
                         (a->multiview && g_audio_follow)) {
-                        a->reanch_wc = 0;                         /* mv follow: PLL owns it */
+                        a->reanch_wc = 0;                         /* mv follow: PLL owns it (a format switch's splice
+                                                                   * edit is returned exactly at the switch: T-352) */
                     } else if (g_rebuild_reanchor && a->reanch_wc) {
                         if (nowr - a->reanch_wc > PTV_REANCH_WIN_US) {
                             a->reanch_wc = 0;                     /* window closed — never fires late */
@@ -3003,6 +3004,14 @@ static int audio_feed(AudioState *a, AVFrame *frame)
     int out_max, got, ret = 0;
     if (a->cv_feeding)
         goto graph_in;                             /* a converted frame: vetted by its source frame's pass */
+    if (a->multiview && g_audio_follow && a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO) {   /* T-352 ledger history */
+        int64_t hw = av_gettime_relative();
+        if (hw - a->ea_hist_wc[(a->ea_hist_i + PTV_EA_HIST - 1) % PTV_EA_HIST] >= 500000) {
+            a->ea_hist_wc[a->ea_hist_i] = hw;
+            a->ea_hist_v[a->ea_hist_i]  = atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed);
+            a->ea_hist_i = (a->ea_hist_i + 1) % PTV_EA_HIST;
+        }
+    }
     if (frame->best_effort_timestamp != AV_NOPTS_VALUE)
         a->dbg_last_src = frame->best_effort_timestamp;   /* probe: latest fed source pts */
     /* 2.0.0-pre6/pre8.1: real frames after a filled hold must meet the POST-rejoin house_skew. It is written on the
@@ -3121,6 +3130,31 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                  * carries on, so no emission guard (its aresample drops the overlap and keeps the output monotonic). */
                 a->afmt_rebuilds++;                /* corrector event (§4.4) */
                 ptv_rebuild_reanchor(a, qn ? q[0] : frame);
+                if (a->multiview && g_audio_follow && a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO) {
+                    /* T-352: the demux absorbed the splice's audio step as continuous (a label edit, posted to the ea
+                     * ledger); the slot's PLL reads the label-domain pairing and cannot see it (MV sync_aswitch_1:
+                     * +348 ms for good). At a format switch the source's labels are the truth: return exactly the
+                     * ledger change of the last ~4 s (the demux reads ahead of the decoder) to the labels. The PLL
+                     * keeps running (measured: it does not re-track the step; a forced stale-mark instead locked in the
+                     * moment's reading: +68 ms for good on a switch WITHOUT an edit, sync_aswitch_96). */
+                    int64_t nw = av_gettime_relative(), ea_now, ea_then = AV_NOPTS_VALUE, best = INT64_MAX;
+                    int hi;
+                    ea_now = atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed);
+                    for (hi = 0; hi < PTV_EA_HIST; hi++) {
+                        int64_t age = nw - a->ea_hist_wc[hi];
+                        if (a->ea_hist_wc[hi] && age >= 4000000 && age < best) {
+                            best = age;
+                            ea_then = a->ea_hist_v[hi];
+                        }
+                    }
+                    if (ea_then != AV_NOPTS_VALUE && ea_now != ea_then) {
+                        a->glue_off_us -= ea_now - ea_then;
+                        a->acomp_exp_us = AV_NOPTS_VALUE;     /* deliberate, not a click risk */
+                        av_log(NULL, AV_LOG_WARNING, "[PTV-AFMT] a%d(in%d) splice edit %+"PRId64"ms returned to the "
+                               "labels at the switch (mosaic slot: the source's labels are its A/V truth)\n",
+                               a->dbg_k, a->dbg_in, (ea_now - ea_then) / 1000);
+                    }
+                }
                 for (qi = 0; qi < qn; qi++) {
                     if (qret >= 0)
                         qret = audio_feed(a, q[qi]);

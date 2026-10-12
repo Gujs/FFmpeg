@@ -994,6 +994,10 @@ typedef struct AudioState {
     AVChannelLayout  cv_chl;
     int              cv_feeding;           /* audio_feed re-entered with a converted frame */
     int              cv_switches;          /* source format switches taken by the converter */
+    /* 2.0.0-pre18 T-352: the ea ledger sampled every 0.5 s (mosaic slots) — the splice edit a format switch returns */
+#define PTV_EA_HIST 16
+    int64_t          ea_hist_v[PTV_EA_HIST], ea_hist_wc[PTV_EA_HIST];
+    int              ea_hist_i;
     /* memcap F1: AFMT rebuild-storm circuit-breaker (flapping origins — CORELINK 44.1<->48kHz —
      * fire rebuilds continuously; each graph free/rebuild cycle churns ~2MB of allocator
      * fragmentation (measured, flat live-heap), unbounded ONLY in rebuild count = the HTTV
