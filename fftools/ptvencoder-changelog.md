@@ -5,6 +5,16 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre14 — pre13 + the video-only hold ends on new content
+
+- **No 17 s of silence after a video-only outage (T-345, a race left in pre13).** The hold that keeps a video-only
+  outage's repeated frames out of house_skew was cleared on the first frame after the outage — the pre-gap PES tail,
+  old content (T-074). For that one frame house_skew was the whole outage (+17.9 s for 39–102 ms, probe); an audio
+  frame crossing the AVLOCK door in that window stepped +17.95 s and aresample filled it with 17 s of silence (59.94
+  vnull_20, 2 of 2 runs on the regenerated media; whether an audio frame crosses is chance, at every rate). The hold
+  now ends on the post-gap content jump (> 1 s), or after 3 fresh frames when the video comes back contiguous.
+  vnull_20 lip sync at 25 / 29.97 / 50 / 59.94 (59.94 ×2); vnull_40, gap, kill_return, stop, audio_gap, flapping PASS.
+
 ## 2.0.0-pre13 — video-only outages, SCTE-35 on its frame with B-frames, multiview captions / subtitles / returns
 
 - **A video-only outage no longer silences the sound (T-345).** 20 s with the video PID gone and the audio flowing
