@@ -3100,6 +3100,34 @@ void *demux_thread(void *arg)
             av_packet_unref(pkt);
             continue;
         }
+        /* 2.0.0-pre17 T-348 (see aac_next): a frame without its own PES label (pos < 0: lavf split it out of the
+         * PES and interpolated its label) gets the previous label + the previous frame's ADTS duration */
+        if (pkt->stream_index < PTV_AAC_LBL && pkt->size >= 7 &&
+            d->ifmt->streams[pkt->stream_index]->codecpar->codec_id == AV_CODEC_ID_AAC &&
+            pkt->data[0] == 0xFF && (pkt->data[1] & 0xF6) == 0xF0) {
+            static const int adts_rate[16] = { 96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050,
+                                               16000, 12000, 11025, 8000, 7350 };
+            const AVStream *ast = d->ifmt->streams[pkt->stream_index];
+            int si = pkt->stream_index, rate = adts_rate[(pkt->data[2] >> 2) & 0xF];
+            if (rate > 0) {
+                int64_t dur = av_rescale_q(1024 * ((pkt->data[6] & 3) + 1), (AVRational){ 1, rate }, ast->time_base);
+                if (pkt->pos < 0 && d->aac_ok[si] && pkt->pts != AV_NOPTS_VALUE && pkt->pts != d->aac_next[si]) {
+                    if (rate != d->aac_rate[si]) {
+                        d->aac_rate[si] = rate;
+                        av_log(NULL, AV_LOG_WARNING, "[PTV-DEMUX] input '%s': stream #%d (pid 0x%x) AAC now %d Hz "
+                               "(lavf times its frames at %d Hz) — labels inside a PES re-derived from the ADTS "
+                               "header\n", d->url, si, ast->id, rate, ast->codecpar->sample_rate);
+                    }
+                    pkt->pts = pkt->dts = d->aac_next[si];
+                    d->aac_fixed++;
+                }
+                if (pkt->pts != AV_NOPTS_VALUE) {
+                    d->aac_next[si] = pkt->pts + dur;
+                    d->aac_ok[si]   = 1;
+                    pkt->duration   = dur;
+                }
+            }
+        }
         if (g_diag) {
             int64_t now = av_gettime_relative();
             if (now - diag_last >= 1000000) {

@@ -984,6 +984,16 @@ typedef struct AudioState {
     enum AVSampleFormat afmt_pending_fmt;
     AVChannelLayout  afmt_pending_chl;
     int              afmt_stable;          /* consecutive frames seen at the candidate params */
+    /* 2.0.0-pre17 T-347/T-349: the -af graph's input is FIXED (48 kHz fltp, the track's output layout, fg_in_*);
+     * the source format is converted in front of it. A source format switch changes only this converter: the
+     * graph (loudnorm's 3 s window) was rebuilt at every switch → the audio PID dark ~2 s, the residual stepper
+     * fed garbage (-192 ms), 5.1 sources normalized before their downmix (-27.7 instead of -23 LUFS). */
+    struct SwrContext *cv_swr;             /* source format -> fg_in_* (NULL: the source IS in the graph's format) */
+    int              cv_rate;              /* the source's current format (-1: not known yet) */
+    enum AVSampleFormat cv_fmt;
+    AVChannelLayout  cv_chl;
+    int              cv_feeding;           /* audio_feed re-entered with a converted frame */
+    int              cv_switches;          /* source format switches taken by the converter */
     /* memcap F1: AFMT rebuild-storm circuit-breaker (flapping origins — CORELINK 44.1<->48kHz —
      * fire rebuilds continuously; each graph free/rebuild cycle churns ~2MB of allocator
      * fragmentation (measured, flat live-heap), unbounded ONLY in rebuild count = the HTTV
@@ -1756,6 +1766,15 @@ typedef struct DemuxArgs {
                                             * (wrap_*, edit_us, gap_vsnap, wall_cad_us, pkt_wall_gap_us,
                                             * disc) were sized for at open */
     int                   late_stream_max; /* 1.2.2 T-064: highest late-born stream index logged */
+    /* 2.0.0-pre17 T-348: AAC labels inside a PES. lavf labels the 2nd.. frames of a PES as the previous label
+     * + 1024 / codecpar->sample_rate, the rate probed at open: after a 96 -> 48 kHz switch every frame read
+     * 10.7 ms long and every PES label jumped +140 ms (aresample: drop, then pad — 4.8 s of silence in 26 s).
+     * The demux re-derives them from the ADTS header's rate (true for HE-AAC too: 1024 core samples). */
+#define PTV_AAC_LBL 64
+    int64_t               aac_next[PTV_AAC_LBL]; /* per stream: last label + its true duration (stream tb) */
+    uint8_t               aac_ok[PTV_AAC_LBL];
+    int                   aac_rate[PTV_AAC_LBL]; /* the ADTS rate last logged */
+    int64_t               aac_fixed;             /* labels re-derived (differed from lavf's) */
     int                   single;           /* 2.0.0-pre5: single-input run (strict reshape check, exit 4) */
     int                   tail_flushed;     /* 2.0.0-pre5: PES tails mpegts flushed at a read error, dropped */
     int64_t               src_last_vdts_raw; /* 2.0.0-pre3: last video DTS, raw 33-bit (stream tb) */
@@ -2390,6 +2409,8 @@ void *cc_thread(void *arg);   /* -cc_extract emitter: lives here for content_ind
 void *audio_thread(void *arg);
 void ptv_adec_opts(AVCodecContext *dec);   /* 1.0.1-pre19 #38: opt-in tolerant AAC decode (by name, missing-option tolerant) */
 int  ptv_find_stream_info(AVFormatContext *ic);   /* 1.0.1-pre19.1: find_stream_info with the #38 tolerance on the AUDIO probe decoders */
+void ptv_graph_in_params(AudioState *a);
+int ptv_cv_setup(AudioState *a, int rate, enum AVSampleFormat fmt, const AVChannelLayout *chl);
 int build_audio_filter(AudioState *a, AVCodecContext *adec, AVRational tb,
                        const char *af, enum AVSampleFormat out_fmt);
 /* ptvencoder_demux.c */
