@@ -1774,6 +1774,7 @@ typedef struct DemuxArgs {
     int64_t               aac_next[PTV_AAC_LBL]; /* per stream: last label + its true duration (stream tb) */
     uint8_t               aac_ok[PTV_AAC_LBL];
     int                   aac_rate[PTV_AAC_LBL]; /* the ADTS rate last logged */
+    int                   aac_rate_cand[PTV_AAC_LBL], aac_rate_n[PTV_AAC_LBL], aac_rate_stable[PTV_AAC_LBL]; /* header rate, 3 in a row */
     int64_t               aac_fixed;             /* labels re-derived (differed from lavf's) */
     int                   single;           /* 2.0.0-pre5: single-input run (strict reshape check, exit 4) */
     int                   tail_flushed;     /* 2.0.0-pre5: PES tails mpegts flushed at a read error, dropped */
