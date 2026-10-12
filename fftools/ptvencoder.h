@@ -1044,6 +1044,7 @@ typedef struct AudioState {
     int              pll_refractory;                  /* frames remaining before acquire may re-arm (bumpless-credit backstop) */
     int              pll_acq_win;                     /* 1.0.1: consecutive completed above-threshold debounce windows (fire at 3; PTV_ACQ_INSTANT reverts) */
     int              pll_frozen;                      /* T-350: readings + corrections paused while the slot's input is damaged */
+    int              pll_postfrz;                     /* T-350: the first agreeing clean window after a freeze is corrected at once */
     int              pll_yielded;                     /* 1.0.1-pre21 #24: PLL actuators currently yielded to the steering corrector (transition-logged) */
     int64_t          pll_yield_bias_us;               /* #24 bumpless resume: alignment reference adopted at yield-resume — the PLL measures RELATIVE to the corrector's realized walk (never undoes it) */
     int              pll_bias_stale;                  /* rr21 A1: bias calibration voided by a label-baseline event — actuators suspended until the settled-window re-adoption */

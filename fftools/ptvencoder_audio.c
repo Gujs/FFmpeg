@@ -1692,7 +1692,7 @@ static int audio_drain_fg(AudioState *a)
                         frz = dl && nw - dl < 3000000;
                         if (frz != a->pll_frozen) {
                             a->pll_frozen = frz;
-                            if (!frz) { a->pll_raw_n = 0; a->pll_dbnc = 0; a->pll_acq_win = 0; a->pll_dbnc_ref = a->pll_ema; }
+                            if (!frz) { a->pll_raw_n = 0; a->pll_dbnc = 0; a->pll_acq_win = 0; a->pll_dbnc_ref = a->pll_ema; a->pll_postfrz = 1; }
                             av_log(NULL, AV_LOG_WARNING, frz ? "[PTV-PLL] a%d(in%d) FROZEN — the slot's input is damaged: "
                                    "no readings, no correction (ema %+"PRId64"ms applied %+"PRId64"ms)\n"
                                    : "[PTV-PLL] a%d(in%d) resumed — the slot's input clean for 3 s, readings restart "
@@ -1871,6 +1871,26 @@ static int audio_drain_fg(AudioState *a)
                     }
                     if (FFABS(a->pll_ema) <= thr)
                         a->pll_acq_win = 0;                               /* condition lapsed → windows no longer consecutive */
+                    /* T-350: the first 32 clean readings after a damage freeze that agree (within the tick quantum) are
+                     * corrected at once, from 20 ms: the slot's re-prime during the damage held its picture a frame or a few
+                     * (1 % loss: +40 ms), under the 1.5-tick ACQUIRE floor, and TRACK walked it off over ~15 s (MV mp2 loss_10:
+                     * b -40 ms, c 0). Readings that never agree within ~6 s fall back to the normal tests. */
+                    if (a->pll_postfrz && a->pll_raw_n >= 32) {
+                        int64_t w[32], band = FFMAX(g_pll_acquire_us, a->tick_dur_us > 0 ? 3 * a->tick_dur_us / 2 : 0);
+                        int x, y;
+                        memcpy(w, a->pll_raw, sizeof(w));
+                        for (x = 1; x < 32; x++) {                      /* insertion sort */
+                            int64_t t = w[x];
+                            for (y = x; y > 0 && w[y - 1] > t; y--) w[y] = w[y - 1];
+                            w[y] = t;
+                        }
+                        if (w[31] - w[0] <= band) {
+                            a->pll_postfrz = 0;
+                            if (FFABS(w[16]) >= 20000 && !pll_yield && !a->pll_bias_stale)
+                                may_acq = 1;
+                        } else if (a->pll_raw_n >= 256)
+                            a->pll_postfrz = 0;
+                    }
                     if (may_acq) {
                         a->pll_acq_win = 0;
                         int64_t half = frame_us / 2;                        /* round to NEAREST whole frame (half away from 0) */
