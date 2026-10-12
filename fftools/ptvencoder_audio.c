@@ -1675,6 +1675,33 @@ static int audio_drain_fg(AudioState *a)
                             ptv_pll_bias_mark(a, "label baseline moved (ledger/glue)", 0);
                         }
                     }
+                    /* T-350: while the slot's input is damaged (corrupt video on the slot or damaged audio on the track in
+                     * the last 3 s) the offset readings are not the slot's lip sync: lost video frames, fills and pads land
+                     * on the two halves at different moments (MV mp2 loss_100: vlag +40 / +560 / -40 ms between readings).
+                     * The PLL acted on them — ACQUIREs of 0.6..2.4 s during the loss, the slot +200..+470 ms 30-60 s after
+                     * (live Grid_2x2 Cinestar cell C5: pad 2517 ms during 10 % loss, audio 1.5 s late for ~50 s). No
+                     * readings and no correction until the input is clean; then the readings restart from empty, so the
+                     * level / ACQUIRE tests see clean readings only. The frame is still emitted on the applied offset. */
+                    {
+                        int64_t dl = a->dmg_wc, nw = av_gettime_relative();
+                        int frz;
+                        if (a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO)
+                            dl = FFMAX(dl, atomic_load_explicit(&g_adamage_wc[a->dbg_k], memory_order_relaxed));
+                        if (a->dbg_in >= 0 && a->dbg_in < PTV_MAX_INPUT)
+                            dl = FFMAX(dl, atomic_load_explicit(&g_mv_vdmg_wc[a->dbg_in], memory_order_relaxed));
+                        frz = dl && nw - dl < 3000000;
+                        if (frz != a->pll_frozen) {
+                            a->pll_frozen = frz;
+                            if (!frz) { a->pll_raw_n = 0; a->pll_dbnc = 0; a->pll_acq_win = 0; a->pll_dbnc_ref = a->pll_ema; a->pll_postfrz = 1; }
+                            av_log(NULL, AV_LOG_WARNING, frz ? "[PTV-PLL] a%d(in%d) FROZEN — the slot's input is damaged: "
+                                   "no readings, no correction (ema %+"PRId64"ms applied %+"PRId64"ms)\n"
+                                   : "[PTV-PLL] a%d(in%d) resumed — the slot's input clean for 3 s, readings restart "
+                                   "(ema %+"PRId64"ms applied %+"PRId64"ms)\n",
+                                   a->dbg_k, a->dbg_in, a->pll_ema / 1000, a->af_applied_us / 1000);
+                        }
+                        if (frz)
+                            goto pll_emit;
+                    }
                     /* #24 bumpless resume: measure RELATIVE to the alignment reference adopted
                      * after each corrector engagement (0 until one ends). Without the rebase,
                      * the corrector's DELIBERATE content shift (R walked to 0, PARK) reads as
@@ -1691,13 +1718,39 @@ static int audio_drain_fg(AudioState *a)
                     if (!a->pll_seed) { a->pll_ema = off; a->pll_dbnc_ref = off; a->pll_seed = 1; }
                     else a->pll_ema += (off - a->pll_ema) >> g_pll_ema_shift;   /* smooth ±vlag jitter (N6: toward −∞, sub-ms, negligible) */
                     a->pll_raw[a->pll_raw_n++ % 32] = off;
+                    /* 2.0.0 T-339: a LEVEL STEP is not noise. A slot's source restart moved the offset +39 → +1832 ms in one
+                     * reading (probe); the step fed the noise estimate (dev 3 → 556 ms), the noise-adaptive threshold rose to
+                     * its 1500 ms cap, and the ACQUIRE waited for the EMA (tau ~2.7 s) to climb past it: 7.9 s of audio 1.8 s
+                     * early. When the last 32 readings (~0.7 s) agree with each other (within the tick quantum) but sit far from the
+                     * EMA, the EMA is re-seeded at their median and the step is kept out of the noise estimate: the
+                     * large-and-flat test then passes on its own windows (~2 s). A jittery leg never agrees: unchanged. Not in
+                     * the first 30 s: there the startup bank settles while the slot's video lag still moves, and re-seeding on
+                     * it acquired early (untouched slots +23…+61 ms before any event, 4 of 5 runs); 8 readings were too few
+                     * after a gap return, while the re-primed slot's lag still settled (59.94 slot +42…+47 ms for 10 s) */
+                    int pll_level = 0;
+                    if (a->pll_raw_n >= 32 && a->out_frames * a->frame_size >= 30LL * a->out_rate) {
+                        int64_t w[32], band = FFMAX(g_pll_acquire_us, a->tick_dur_us > 0 ? 3 * a->tick_dur_us / 2 : 0);
+                        int x, y;
+                        memcpy(w, a->pll_raw, sizeof(w));
+                        for (x = 1; x < 32; x++) {                      /* insertion sort */
+                            int64_t t = w[x];
+                            for (y = x; y > 0 && w[y - 1] > t; y--) w[y] = w[y - 1];
+                            w[y] = t;
+                        }
+                        if (w[31] - w[0] <= band && FFABS(w[16] - a->pll_ema) > 4 * band) {
+                            a->pll_ema      = w[16];
+                            a->pll_dbnc_ref = w[16];
+                            pll_level       = 1;
+                        }
+                    }
                     /* v0.6.22: NOISE-ADAPTIVE acquire threshold. Track the leg's offset jitter (slow EMA of
                      * |off−ema|, seeded 0 so it ramps AFTER the startup bank is caught) and raise the threshold
                      * above it: thr = max(g_pll_acquire_us, k·dev), capped. Clean legs (dev≈0) keep the tight
                      * 40ms; jittery legs (dev ~150ms) get thr ~450ms so steady-state noise can't re-fire the
                      * acquire (the 0.6.20/0.6.21 limit cycle) — while the big DC startup bank still acquires
                      * while dev is still low. */
-                    a->pll_dev += (FFABS(off - a->pll_ema) - a->pll_dev) >> g_pll_dev_shift;
+                    if (!pll_level)
+                        a->pll_dev += (FFABS(off - a->pll_ema) - a->pll_dev) >> g_pll_dev_shift;
                     int64_t thr = (int64_t)g_pll_acquire_us;
                     /* 1.0.1: TICK-QUANTIZATION dead-band. vlag (the video half of the measured
                      * offset) is quantized to the house video tick — the vring records first-
@@ -1818,6 +1871,26 @@ static int audio_drain_fg(AudioState *a)
                     }
                     if (FFABS(a->pll_ema) <= thr)
                         a->pll_acq_win = 0;                               /* condition lapsed → windows no longer consecutive */
+                    /* T-350: the first 32 clean readings after a damage freeze that agree (within the tick quantum) are
+                     * corrected at once, from 20 ms: the slot's re-prime during the damage held its picture a frame or a few
+                     * (1 % loss: +40 ms), under the 1.5-tick ACQUIRE floor, and TRACK walked it off over ~15 s (MV mp2 loss_10:
+                     * b -40 ms, c 0). Readings that never agree within ~6 s fall back to the normal tests. */
+                    if (a->pll_postfrz && a->pll_raw_n >= 32) {
+                        int64_t w[32], band = FFMAX(g_pll_acquire_us, a->tick_dur_us > 0 ? 3 * a->tick_dur_us / 2 : 0);
+                        int x, y;
+                        memcpy(w, a->pll_raw, sizeof(w));
+                        for (x = 1; x < 32; x++) {                      /* insertion sort */
+                            int64_t t = w[x];
+                            for (y = x; y > 0 && w[y - 1] > t; y--) w[y] = w[y - 1];
+                            w[y] = t;
+                        }
+                        if (w[31] - w[0] <= band) {
+                            a->pll_postfrz = 0;
+                            if (FFABS(w[16]) >= 20000 && !pll_yield && !a->pll_bias_stale)
+                                may_acq = 1;
+                        } else if (a->pll_raw_n >= 256)
+                            a->pll_postfrz = 0;
+                    }
                     if (may_acq) {
                         a->pll_acq_win = 0;
                         int64_t half = frame_us / 2;                        /* round to NEAREST whole frame (half away from 0) */
@@ -1909,6 +1982,7 @@ static int audio_drain_fg(AudioState *a)
                         if (step < -lim) step = -lim;
                         a->af_steer_us += step;
                     }
+pll_emit:
                     if (a->pll_refractory > 0) a->pll_refractory--;   /* ticks on every EMITTED (non-dropped) frame */
                     while (a->pll_pad > 0) {                  /* PAD: emit pending one-shot silence on THIS base before the real frame */
                         AVFrame *s = av_frame_alloc();
@@ -3240,9 +3314,33 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                  * Before: the step went to the discontinuity layer, the PLL padded the outage again (kill_return_20:
                  * ACQUIRE pad 19 s, audio PID dark 20 s after the return, lip sync −0.8 s for 25 s). A source that
                  * lost the outage (labels +gap) resumes at or after the fill's end and keeps the pad-the-rest rule. */
+                /* T-350: the first frame out after an outage can be the pre-gap PES tail (T-074): the cut PES, completed
+                 * with post-gap bytes, flushed corrupt with its OLD label. MP2 / AC-3 decode it (AAC rejects it), so it
+                 * reads "behind the fill" and the fill was judged a hold — then the real return, the whole outage ahead,
+                 * was padded on top (live Grid_2x2 Cinestar cell, 10 s gap: glue +8063 then pad +9984, the PLL dropped
+                 * 10 s; local MV mp2 gap_10 cut mid-PES the same). A forward step of at least half the hold within 1 s
+                 * of the verdict is that return: the source lost the outage, so the hold is undone and only the rest
+                 * (the part before the fill engaged) is padded, as at a clean fill resume. */
+                if (a->mv_hold_prov_us && !fill_resumed) {
+                    if (now_wc - a->mv_hold_prov_wc > 1000000 || step < 0)
+                        a->mv_hold_prov_us = 0;
+                    else if (step >= a->mv_hold_prov_us / 2) {
+                        int64_t u = FFMIN(step, a->mv_hold_prov_us);
+                        a->glue_off_us -= u;
+                        a->mv_hold_us  -= u;
+                        step           -= u;
+                        av_log(NULL, AV_LOG_WARNING, "[PTV-ADISC] a%d(in%d) +%"PRId64" ms %"PRId64" ms after the hold verdict — "
+                               "the resumed frame was the pre-gap PES tail and the source lost the outage: hold undone, "
+                               "%+"PRId64" ms left to pad (glue %+"PRId64"ms)\n", a->dbg_k, a->dbg_in, (step + u) / 1000,
+                               (now_wc - a->mv_hold_prov_wc) / 1000, step / 1000, a->glue_off_us / 1000);
+                        a->mv_hold_prov_us = 0;
+                    }
+                }
                 if (fill_resumed && step < 0 && a->multiview && g_audio_follow && g_avsync_pll) {
                     a->glue_off_us += -step;
                     a->mv_hold_us  += -step;
+                    a->mv_hold_prov_us = -step;
+                    a->mv_hold_prov_wc = now_wc;
                     av_log(NULL, AV_LOG_WARNING, "[PTV-ADISC] a%d(in%d) source resumed %"PRId64" ms behind the slot's silence fill "
                            "— the fill was a hold: labels continue at its end (glue %+"PRId64"ms)\n",
                            a->dbg_k, a->dbg_in, -step / 1000, a->glue_off_us / 1000);

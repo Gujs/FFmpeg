@@ -1043,6 +1043,8 @@ typedef struct AudioState {
     int64_t          pll_dbnc_ref;                    /* ema value when the debounce window started (flatness reference) */
     int              pll_refractory;                  /* frames remaining before acquire may re-arm (bumpless-credit backstop) */
     int              pll_acq_win;                     /* 1.0.1: consecutive completed above-threshold debounce windows (fire at 3; PTV_ACQ_INSTANT reverts) */
+    int              pll_frozen;                      /* T-350: readings + corrections paused while the slot's input is damaged */
+    int              pll_postfrz;                     /* T-350: the first agreeing clean window after a freeze is corrected at once */
     int              pll_yielded;                     /* 1.0.1-pre21 #24: PLL actuators currently yielded to the steering corrector (transition-logged) */
     int64_t          pll_yield_bias_us;               /* #24 bumpless resume: alignment reference adopted at yield-resume — the PLL measures RELATIVE to the corrector's realized walk (never undoes it) */
     int              pll_bias_stale;                  /* rr21 A1: bias calibration voided by a label-baseline event — actuators suspended until the settled-window re-adoption */
@@ -1090,6 +1092,8 @@ typedef struct AudioState {
     int64_t          glue_off_us;                     /* cumulative relabel offset applied to input labels (us) */
     int64_t          mv_hold_us;                      /* 2.0.0 T-093: the part of glue_off that continued labels over a
                                                        * multiview slot fill (a hold, not content — out of the PLL pairing) */
+    int64_t          mv_hold_prov_us, mv_hold_prov_wc; /* T-350: the last hold verdict (amount, wall) — undone when the
+                                                       * resumed frame was the pre-gap PES tail and the return follows */
     int64_t          mvf_lo_us, mvf_hi_us;            /* T-093: door span of the last multiview fill phase (+ its pad) */
     int              mvf_open;                        /* T-093: a fill phase is feeding the door */
     int64_t          glue_raw_last_us;              /* last RAW in-pts (us); NOPTS until first frame */
@@ -2305,6 +2309,7 @@ extern int64_t g_nbs_quantum_us;         /* fill quantum (100ms; PTV_NBS_QUANTUM
 extern _Atomic int64_t g_acorrupt;                        /* total corrupt-discarded AUDIO pkts (acor= stats) */
 extern _Atomic int64_t g_adamage_wc[PTV_MAX_AUDIO];      /* 2.0.0-pre9.3 (T-080 A2): per global track, wall us of the
                                                            * last corrupt-discarded packet (demux → audio thread) */
+extern _Atomic int64_t g_mv_vdmg_wc[PTV_MAX_INPUT];     /* T-350: per multiview slot, wall us of its last corrupt video (compositor) */
 extern _Atomic int64_t g_adec_frame_wc[PTV_MAX_AUDIO];    /* wall µs of track k's last DECODED frame (audio
                                                            * thread stamps; demux reads = the E6 starvation
                                                            * discriminator: packets arrive, nothing decodes) */

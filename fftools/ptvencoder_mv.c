@@ -96,6 +96,8 @@ void *compositor_thread(void *arg)
     int64_t pd_cnt[PTV_MAX_INPUT] = {0};      /* v0.9.13: residence holds (correct cadence, not starvation) */
     int64_t sv_cnt[PTV_MAX_INPUT] = {0};      /* v0.9.13: genuine starvation dups (due but buffer empty) */
     int64_t md_cnt[PTV_MAX_INPUT] = {0};      /* v0.9.13: decimation drops (multiple frames due in one tick) */
+    int64_t dmg_cr[PTV_MAX_INPUT] = {0};      /* T-350: the slot's corrupt-video count (demux + decode) last seen */
+    int64_t dmg_wc[PTV_MAX_INPUT] = {0};      /* T-350: wall time it last moved */
     int     res_occ_tgt = 4;                  /* v0.9.13: occupancy-servo target (set from the primed depth) */
     /* AUDIO-FOLLOW (Option A) latch: average the per-slot lag over a startup window (past the
      * lossy join) and latch a STABLE signed offset, published to house_skew for the audio's
@@ -282,7 +284,21 @@ void *compositor_thread(void *arg)
                  * at the lag it had before the outage. Also after a dry spell shorter than the slate (> 0.5 s without a
                  * fresh frame: flapping ran the buffer dry on every cut and the same refill ramp moved the picture
                  * +80 -> +680 ms while its audio chased it). */
-                if (resid && g_mv_reprime && last_fresh_us[k] && (slated[k] || now_us - last_fresh_us[k] > 500000)) {
+                /* T-350: while the slot's video is damaged (corrupt data in the last 5 s) frames are lost: each one let the
+                 * cell take a buffered frame early, the buffer drained (1 % packet loss: 23 -> 0 in 20 s, no dry spell, so no
+                 * re-prime) and the +-2 % servo refilled it over ~75 s after the loss — the picture slid +800 ms while its
+                 * audio, padded for its own lost frames at once, chased it (MV mp2 loss_10: -70 ms 30-60 s after; live
+                 * Grid_2x2 Cinestar cell C4 / C5). Damaged and 3 frames short of the primed depth = re-prime now: the
+                 * picture holds a few frames during the damage instead of sliding after it. The slot's PLL reads nothing
+                 * while damaged (g_mv_vdmg_wc, ptvencoder_audio.c). */
+                int64_t cr = c->inputs[k].da.vcorrupt + c->inputs[k].dc.vcorrupt;
+                if (cr != dmg_cr[k]) {
+                    dmg_cr[k] = cr; dmg_wc[k] = now_us;
+                    atomic_store_explicit(&g_mv_vdmg_wc[k], now_us, memory_order_relaxed);
+                }
+                if (resid && g_mv_reprime && last_fresh_us[k] && (slated[k] || now_us - last_fresh_us[k] > 500000 ||
+                    (dmg_wc[k] && now_us - dmg_wc[k] < 5000000 &&
+                     (reprime_us[k] || av_thread_message_queue_nb_elems(h->q) < res_occ_tgt - 2)))) {
                     int occ = av_thread_message_queue_nb_elems(h->q);
                     if (occ && !reprime_us[k])
                         reprime_us[k] = now_us;
