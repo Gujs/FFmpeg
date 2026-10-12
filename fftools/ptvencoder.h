@@ -894,6 +894,7 @@ typedef struct CcCtx {
      * rides the output position plus this lead, so it cannot run ahead of the video. */
     int64_t          ka_lead_us;
     int              ka_lead_ok;
+    int64_t          ka_real_us, ka_real_wc;      /* T-338: stamp + wall time of the last real (non-keepalive) event */
     /* 2.0.0 T-100: captions wait here (cc_thread only) until the video has shown their frame, then take its output time */
 #define PTV_CC_VQ 256
     CcEvent          vq[PTV_CC_VQ];
@@ -1034,6 +1035,8 @@ typedef struct AudioState {
     int              av_off_valid;                    /* a measurement has paired (else the status line prints offset=--) */
     /* A/V PLL redesign Phase B3 — closed-loop two-regime controller on the measured av_offset_us (g_avsync_pll). */
     int64_t          pll_ema;                         /* EMA of the measured offset (us) */
+    int64_t          pll_raw[32];                     /* 2.0.0 T-339: the last 32 raw offset readings (the ACQUIRE is sized on their median) */
+    int              pll_raw_n;
     int64_t          pll_dev;                          /* v0.6.22: slow EMA of |off−ema| = the leg's offset jitter; raises the acquire threshold above the noise floor */
     int              pll_seed;                        /* pll_ema seeded at the first valid measurement */
     int              pll_dbnc;                        /* stability-debounce: consecutive large-AND-flat readings */
@@ -1093,6 +1096,10 @@ typedef struct AudioState {
     int64_t          glue_raw_dur_us;                 /* its frame span (us) */
     int64_t          glue_wall_last_us;               /* monotonic wall time of the previous fed frame */
     int64_t          hf_hs_real, hf_dup_real;         /* 2.0.0-pre9.4 (T-083): house_skew + g_dup_out_us at that frame */
+    int64_t          hsg_src, hsg_dur, hsg_hs, hsg_wc;  /* T-321: previous door frame's source pts / span / applied
+                                                         * house_skew / wall time */
+    int64_t          hsg_val, hsg_t0;                 /* T-321: house_skew kept for a short gap's return, since (wall) */
+    int              hsg_seen, hsg_on, hsg_n;         /* T-321: a previous frame / keeping / events (log limit) */
     int              glue_events;                     /* RELABEL verdicts this run */
     int64_t          glue_log_win_us;                 /* 0.9.18: verdict-log rate-limit window start (wall) */
     int              glue_log_win_n;                  /* verdict lines emitted this window */
@@ -1691,6 +1698,10 @@ typedef struct DemuxArgs {
     int64_t               sib_jump_us[2];
     int64_t               sib_jump_wall[2];
     int                   sib_jump_gap[2];      /* 2.0.0-pre9.6: that jump was a GAP verdict (labels carry it, content pads) */
+    /* 2.0.0 T-336: the last wall-evidence split (stream, measured flowing part J−W, erase applied, wall) — a
+     * sibling's split of the same source event adopts that erase (ptv_wallev_shared_flow) */
+    int                   wev_ev_sidx;
+    int64_t               wev_ev_est, wev_ev_flow, wev_ev_wall;
     int                   drop;          /* non-blocking + drop on full (network input) */
     PassStream           *pass;          /* copy-passthrough: extra audio, subs, data */
     int64_t               vm_po;                              /* 2.0.0 T-100: prog_off of the copy being released */
@@ -1713,6 +1724,7 @@ typedef struct DemuxArgs {
     int64_t              *wall_cad_us;
     int64_t              *pkt_wall_gap_us;
     int64_t               wallev_fb_log_us; /* fallback (bank/bursty) advisory rate limit */
+    int64_t               any_wall_last, any_stall_wc; /* 2.0.0 T-345: last packet of the input; end of its last >= 700 ms pause */
     int64_t              *edit_us;        /* 1.0.1-pre9 sensor: per-stream label-EDIT ledger (µs) — the
                                            * non-wrap share of wrap_off (splice absorbs, LAYERA persists,
                                            * retro-corrections); demux thread only, published via g_rsx */
@@ -1829,6 +1841,7 @@ typedef struct DemuxArgs {
                                             /* (by_bank_advise_us moved to CushionRt.bank_advise_us — 0.9.18 M3) */
     int64_t               vcorrupt;       /* video packets flagged AV_PKT_FLAG_CORRUPT (discarded if g_discardcorrupt) */
     pthread_mutex_t       pass_lock;        /* 2.0.0-pre6: copy state shared with the master's AC-3 fill */
+    VOutRing             *mv_vring;         /* 2.0.0 T-342: multiview — this slot's displayed content ring (sparse copies) */
 } DemuxArgs;
 
 /* One source input. Single-input uses inputs[0]; multiview uses 1/2/4. Each has
@@ -1923,6 +1936,7 @@ extern int     g_reanchor;
 extern int     g_mv_clamp;
 extern int     g_mv_residence;
 extern int     g_mv_birthtrim;
+extern int     g_mv_reprime;
 extern int     g_aglue_ceil;
 extern int     g_discont;
 extern int     g_gapdiscrim;
@@ -2016,6 +2030,7 @@ extern int64_t g_hold_clean_us;   /* 2.0.0 T-324: a hold that saw video damage e
 extern int64_t g_max_delay_us;   /* 2.0.0 T-103: pinned output delay (us; 0 = off) */
 void ptv_vmap_push(int64_t src_us, int64_t out_us);
 int  ptv_vmap_lookup(int64_t c_us, int64_t *out_us, int64_t *gap_us);
+int  ptv_vmap_newest(int64_t since_wc, int64_t *src_us, int64_t *out_us);
 void ptv_copy_vwait(struct DemuxArgs *d);   /* master output thread: release the copies the video has shown */
 extern _Atomic int64_t g_vdisp_skew_us;  /* 2.0.0 T-095: where the master put the last fresh frame vs its content index */
 extern _Atomic int64_t g_dup_out_us;     /* master: output time on ticks whose content did not advance (hold fills' clock) */
@@ -2397,6 +2412,7 @@ void ptv_stats_rsn(char *buf, size_t size, int force_idx);
 void rscorr_stale_watchdog(int64_t now);
 /* ptvencoder.c */
 void vring_put(VOutRing *r, int64_t src_us, int64_t out_us);
+int vring_shown(VOutRing *r, int64_t c_us, int64_t *out_us, int64_t *gap_us);
 int vring_lookup(VOutRing *r, int64_t want_src, int64_t *out_v, int64_t *matched_src);
 
 #endif /* FFTOOLS_PTVENCODER_H */

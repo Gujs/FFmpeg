@@ -1999,6 +1999,26 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
      * The splice_info_section data from the demuxer already has valid CRC
      * and pts_adjustment rebased to our output timeline. */
     if (st->codecpar->codec_id == AV_CODEC_ID_SCTE_35) {
+        int64_t mux_off = 0;
+        /* The muxer may have shifted every packet (avoid_negative_ts: a B-frame
+         * encoder starts at a negative dts; output_ts_offset). The splice time
+         * inside the section does not move with the packet timestamps, so its
+         * pts_adjustment takes the same shift: otherwise the cue lands that far
+         * before its picture (2 frames with -bf 2). */
+        if (size >= 17 && buf[0] == 0xFC &&
+            ff_get_muxer_ts_offset(s, pkt->stream_index, &mux_off) >= 0 && mux_off) {
+            uint8_t *sec = av_memdup(buf, size);
+            if (sec) {
+                int64_t adj = ((int64_t)(sec[4] & 0x01) << 32) | AV_RB32(sec + 5);
+                adj = (adj + av_rescale_q(mux_off, st->time_base, (AVRational){ 1, 90000 })) & 0x1FFFFFFFFLL;
+                sec[4] = (sec[4] & 0xFE) | (adj >> 32);
+                AV_WB32(sec + 5, adj);
+                AV_WB32(sec + size - 4, av_bswap32(av_crc(av_crc_get_table(AV_CRC_32_IEEE), -1, sec, size - 4)));
+                mpegts_write_scte35_section(s, st, sec, size);
+                av_free(sec);
+                return 0;
+            }
+        }
         if (size > 0)
             mpegts_write_scte35_section(s, st, buf, size);
         return 0;

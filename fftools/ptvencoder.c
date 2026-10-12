@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.0-pre12"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.0-pre13"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -78,6 +78,7 @@ int     g_mv_clamp = 0;
  * bypasses the gate (pressure valve vs a wrong rate estimate). PTV_NO_RESIDENCE reverts. */
 int     g_mv_residence = 1;
 int     g_mv_birthtrim = 1;
+int     g_mv_reprime = 1;   /* 2.0.0 T-339: a returning slot re-primes its jitter buffer before it shows; PTV_NO_MV_REPRIME=1 off */
 int     g_aglue_ceil = 1;     /* 1.0.1-pre17 fix round (R3c): erase a tripwire-REFUSED label pursuit at the
                                * graph door (butt-joint) instead of letting aresample grind at max rate
                                * forever against an implausible step. PTV_NO_AGLUE_CEIL=1 reverts. */   /* 1.0.1-pre17 (finding 1): mv birth-trim WINDOW — post-preroll backlog is
@@ -219,7 +220,7 @@ int g_vmap = 1;
  * bank ceiling (g_cushion_max_ms); PTV_MAX_DELAY_MS overrides. */
 int64_t g_max_delay_us = -1;
 static pthread_mutex_t vmap_lock = PTHREAD_MUTEX_INITIALIZER;
-static int64_t vmap_src[PTV_VMAP_N], vmap_out[PTV_VMAP_N];
+static int64_t vmap_src[PTV_VMAP_N], vmap_out[PTV_VMAP_N], vmap_wc[PTV_VMAP_N];
 static int     vmap_w, vmap_n;                  /* next write slot, entries held */
 
 void ptv_vmap_push(int64_t src_us, int64_t out_us)
@@ -229,10 +230,40 @@ void ptv_vmap_push(int64_t src_us, int64_t out_us)
         vmap_n = 0;                             /* the content timeline stepped back: a new epoch */
     vmap_src[vmap_w] = src_us;
     vmap_out[vmap_w] = out_us;
+    vmap_wc[vmap_w]  = av_gettime_relative();
     vmap_w = (vmap_w + 1) % PTV_VMAP_N;
     if (vmap_n < PTV_VMAP_N)
         vmap_n++;
     pthread_mutex_unlock(&vmap_lock);
+}
+
+/* 2.0.0 T-335: the newest frame the video put on air, once its last two frames were both shown after since_wc, it has
+ * run 1 s on since the first of them, and they run on together (no leap: not the pre-gap PES tail lavf releases after an outage, T-074). 1 = *src_us / *out_us set */
+int ptv_vmap_newest(int64_t since_wc, int64_t *src_us, int64_t *out_us)
+{
+    int a, b, ret = 0;
+    pthread_mutex_lock(&vmap_lock);
+    if (vmap_n >= 2) {
+        a = (vmap_w + PTV_VMAP_N - 1) % PTV_VMAP_N;
+        b = (vmap_w + PTV_VMAP_N - 2) % PTV_VMAP_N;
+        int k, first = b;
+        for (k = 2; k < vmap_n; k++) {              /* the first frame shown after since_wc */
+            int i = (vmap_w + PTV_VMAP_N - 1 - k) % PTV_VMAP_N;
+            if (vmap_wc[i] <= since_wc)
+                break;
+            first = i;
+        }
+        /* ... and the video has run 1 s on since then: after a source restart the rejoin mapping still moved the
+         * first frames (the cue after a 50 fps kill_return went out 5 frames off on one run of three) */
+        if (vmap_wc[b] > since_wc && vmap_wc[a] - vmap_wc[first] >= 1000000 &&
+            FFABS((vmap_src[a] - vmap_src[b]) - (vmap_out[a] - vmap_out[b])) < 1000000) {
+            *src_us = vmap_src[a];
+            *out_us = vmap_out[a];
+            ret = 1;
+        }
+    }
+    pthread_mutex_unlock(&vmap_lock);
+    return ret;
 }
 
 /* 1 = the video has shown content at or after c_us: *out_us = c_us on the timeline of the first such frame and
@@ -1048,6 +1079,36 @@ void vring_put(VOutRing *r, int64_t src_us, int64_t out_us)
     int i = (int)(r->n % PTV_VRING);
     r->src[i] = src_us; r->out[i] = out_us; r->n++;
     pthread_mutex_unlock(&r->lock);
+}
+
+/* 2.0.0 T-342: ptv_vmap_lookup's contract on a multiview slot's ring (the slot's displayed content -> mosaic output
+ * time): 1 = the cell has shown content at or after c_us (*out_us = c_us on the timeline of the first such frame,
+ * *gap_us = how far past c_us it lies), 0 = not yet (or only the newest frame: wait for one more), -1 = c_us is older
+ * than everything held by > 1 s */
+int vring_shown(VOutRing *r, int64_t c_us, int64_t *out_us, int64_t *gap_us)
+{
+    int64_t cnt, k;
+    int hit = -1, newest, ret;
+    pthread_mutex_lock(&r->lock);
+    cnt = r->n < PTV_VRING ? r->n : PTV_VRING;
+    newest = (int)((r->n + PTV_VRING - 1) % PTV_VRING);
+    for (k = 0; k < cnt; k++) {                 /* newest -> oldest: the oldest entry still >= c_us */
+        int i = (int)((r->n - 1 - k) % PTV_VRING);
+        if (r->src[i] < c_us)
+            break;
+        hit = i;
+    }
+    if (hit < 0 || hit == newest)
+        ret = 0;
+    else if (k == cnt && r->src[hit] - c_us > 1000000)
+        ret = -1;
+    else {
+        *out_us = r->out[hit] - (r->src[hit] - c_us);
+        *gap_us = r->src[hit] - c_us;
+        ret = 1;
+    }
+    pthread_mutex_unlock(&r->lock);
+    return ret;
 }
 
 /* nearest-by-content lookup: of all kept entries, return the out_v and matched src of the one
@@ -6014,6 +6075,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         d->reopen    = live && is_net_url(inputs[kk].url) &&                     /* 2.0.0-pre5: single input too */
                        (multiview || !getenv("PTV_NO_REOPEN"));
         d->single    = !multiview;
+        d->mv_vring  = multiview ? &inputs[kk].vring : NULL;   /* 2.0.0 T-342 */
         d->ifmt_home = &inputs[kk].ifmt;
         d->disc = g_layera ? &inputs[kk].disc : NULL;   /* legacy-0004 buffer (NULL when off) */
         d->vq_shed_req = &inputs[kk].vq_shed_req;       /* 1.0.1-pre8 (a): overflow -> request head-GOP shed */
@@ -6875,6 +6937,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_CADDISARM")) g_cad_disarm = 0;  /* v0.9.18.1 M7: revert to flag-only pulldown disarm (dropouts drain frame_q again) */
     if (getenv("PTV_NO_MV_EXACTTICK")) g_mv_exacttick = 0;  /* v0.9.12: revert mv measurement axes to integer tick (re-enables the enforced ~10ppm mosaic drift) */
     if (getenv("PTV_NO_RESIDENCE")) g_mv_residence = 0;     /* v0.9.13: revert to one-pop-per-tick (rate-mismatched slots batch dups + fast-forward after starvation) */
+    if (getenv("PTV_NO_MV_REPRIME")) g_mv_reprime = 0;      /* 2.0.0 T-339 */
     if (getenv("PTV_NO_MV_BIRTHTRIM")) g_mv_birthtrim = 0;  /* pre17: one-shot trim only (re-enables the birth catch-up slide) */
     if (getenv("PTV_NO_AGLUE_CEIL"))   g_aglue_ceil = 0;     /* pre17 fix round: unbounded refused-step pursuit (pre-Fashion posture) */
     /* genlock preroll default + the three deep-prime side-cars moved to resolve_cushions() (0.9.18 M1) */

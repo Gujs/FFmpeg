@@ -254,6 +254,15 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
             int64_t lead = g_vmap && !c->multi ? FFMIN(c->ka_lead_us, -PTV_CC_DEBOUNCE_US) : c->ka_lead_us;
             if (pos > 0 && pos + lead < house_us)
                 house_us = FFMAX(pos + lead, c->last_dts + 1000);
+        } else if (c->multi && g_vmap && c->ka_real_wc) {
+            /* 2.0.0 T-338: a mosaic publishes no output position, so the chain ran 1 s past the last stamp on the wall
+             * clock — and a caption stamped on its own frame (up to the assembly wait earlier than the moment it is
+             * known) landed behind a keepalive sent meanwhile and was bumped late (MV-01: 40 bumps, captions up to
+             * +300 ms). Follow the last real event on the wall clock, the assembly window behind: never ahead of a
+             * caption still on its way, and no drift on a long silence. */
+            int64_t h = c->ka_real_us + (av_gettime_relative() - c->ka_real_wc) - PTV_CC_DEBOUNCE_US;
+            if (h < house_us)
+                house_us = FFMAX(h, c->last_dts + 1000);
         }
     } else if (ev->vmapped) {
         house_us = ev->vm_out_us;        /* 2.0.0 T-100: where the video put this caption's frame */
@@ -261,8 +270,12 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
         /* content_index() wants the source pts in the rung's own out_tb. h0_lock is held
          * because on multiview the compositor's REANCHOR2 mutates this slot's h0 at runtime
          * (every other reader of it takes the lock too). */
+        /* 2.0.0 T-338: a mosaic slot has no video record (T-100 is single input), so a caption took the content time its
+         * page became KNOWN — its frame + the assembly wait: +300 ms on air while its erase was on its own frame (every
+         * caption 300 ms less on screen, the single-input T-312 defect). It goes on its own frame here too. */
+        int64_t src = ev->src_us - (c->multi && g_vmap ? ev->vm_delay_us : 0);
         pthread_mutex_lock(v->h0_lock);
-        idx = content_index(v, av_rescale_q(ev->src_us, AV_TIME_BASE_Q, v->out_tb));
+        idx = content_index(v, av_rescale_q(src, AV_TIME_BASE_Q, v->out_tb));
         pthread_mutex_unlock(v->h0_lock);
         if (idx < 0) {                   /* h0 not anchored yet (pre-first-video caption) */
             atomic_fetch_add_explicit(&g_cc_dropped, 1, memory_order_relaxed);
@@ -491,6 +504,10 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
     pkt->duration = (int64_t)ev->end_ms * 1000;
     pkt->pos      = -1;
     c->last_dts     = house_us;
+    if (ev->kind != PTV_CC_KEEPALIVE) {           /* T-338: a mosaic's keepalives follow the last real event */
+        c->ka_real_us = house_us;
+        c->ka_real_wc = av_gettime_relative();
+    }
     if (ev->src_us != AV_NOPTS_VALUE) {           /* 2.0.0 T-098: the lead a synthetic keepalive rides */
         int64_t pos = atomic_load_explicit(&g_house_out_us, memory_order_relaxed);
         if (pos > 0) {

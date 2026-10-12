@@ -5,6 +5,43 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre13 — video-only outages, SCTE-35 on its frame with B-frames, multiview captions / subtitles / returns
+
+- **A video-only outage no longer silences the sound (T-345).** 20 s with the video PID gone and the audio flowing
+  (shorter than -lost_after): pre12 put out 18 s of silence and then A/V +20 s. The rejoin classifier judged the second
+  packet after the gap, still a pre-gap tail frame, called the return a delivery burst, the burst armed the 12 s bank,
+  the bank switched the wall evidence off and the real 20 s hole was erased as a splice. Now up to two more tail frames
+  are skipped, and the wall evidence stays on for one PID's gap while the input itself keeps flowing (the banked /
+  deep-prime path showed the same erase: 15 s of silence). vnull_20 lip sync passes at 25 / 29.97 / 50 / 59.94.
+- **SCTE-35 at a video-only outage's return (T-335).** The PCR rides the video PID: cues read while only the video is gone
+  carry no time (after an input reopen) or a stale one (the last PCR). They were placed with the read-time stamp
+  (+8.8…8.96 s off) or the pre-outage offset (+2.07 s); now they wait for the video's offset. Two cues released on
+  the same frame are both sent. vnull_40: every cue +0.0 ms at four rates.
+- **SCTE-35 cues on their frame with a B-frame encoder (T-346, patch 0007).** The muxer shifts every packet by the
+  encoder's first negative dts (2 frames with -bf 2, production NVENC); the splice time inside the section did not
+  move: every cue landed 2 frames early (x264 -bf 2: −80 ms at 25, −66.7 ms at 29.97). The SCTE-35 section writer
+  now adds the muxer's shift to pts_adjustment. VideoToolbox / no B-frames: unchanged (0).
+- **Multiview CC→teletext captions on their own frame (T-338).** The mosaic path stamped captions with the page-known
+  time (+300 ms) and keepalives bumped them: caption screen time was 300 ms short on every slot; now 0 ms (MV-01, 4 runs).
+- **Multiview copied subtitles on their slot's picture (T-342).** A copied DVB sub rode the slot's house_skew while
+  the cell moved on the mosaic timeline (25i slot in a 29.97 1x2: −37…+111 ms); it now waits until its cell has shown
+  its content (the single-input rule). Every sub and clear +0.0 ms (MV-02, 3 runs).
+- **A multiview slot back from an outage, a flap or a restart keeps lip sync (T-339).** It showed its first returning
+  frame from an empty jitter buffer and the ±2 % servo refilled it over ~60 s: the picture slid ~0.9 s while its audio
+  chased it; and the PLL's one-shot correction was sized on a still-converging average (padded 1386 of ~1750 ms on a
+  restart) and TRACK walked off the rest at 10 ms/s. Now a slot back from an outage or a > 0.5 s dry spell keeps its
+  slate until the buffer holds its primed depth (cap 3 s), and the correction is sized on the median of the last 32
+  readings. 30–60 s after the event (3 runs each): flapping −81…−87 → −0.8…−1.5 ms, restart −76…−82 → −1.0…+0.6 ms,
+  gap_20 −74 → −1.4 ms. Left: the first 10 s after a gap_20 return (+32…+34 ms on 3 pairs). PTV_NO_MV_REPRIME=1 off.
+- **A source restart keeps lip sync (T-336).** The wall-evidence split erased each stream's own flowing part of the
+  relabel; a restart does not cut the streams at one point, so audio's erase came out up to 123 ms short (sound late
+  for good). One source event now gets one erase. jump_return_50 within ±2 ms at four rates (11 runs).
+- **Short gaps and flapping (T-321, T-327).** A short gap's return kept the gap-grown house_skew at the audio door
+  (flashes without sound); a clean cut on a flapping 50 fps return leapt the clock (1.68 s video hole). Both fixed.
+- Known, not fixed: the first 10 s after a multiview slot's gap return (+32…+34 ms on 3 pairs, T-339), T-343 clean-start
+  step (−37 ms), cross-slot wire delay (T-340), a cue / DVB sub exactly at a video-only outage's return at 50 / 59.94, audio format switch findings
+  (T-347…T-349), bursts > 6 s (T-316).
+
 ## 2.0.0-pre12 — heavy packet loss: bars and silence until the input plays cleanly; pop-on captions use the teletext row
 
 - **Heavy loss no longer opens holes in the output (T-324).** Canary 2026-10-11, Cinestar 50 % datagram loss for 60 s:

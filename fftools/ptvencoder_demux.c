@@ -328,8 +328,10 @@ static int64_t ptv_wallev_w(DemuxArgs *d, int sidx, int64_t jump_us)
      * eligible: d->autobank is set on every single-input live channel and must NOT gate
      * this) or an operator-declared deep prime (Fintech-class §13 channels run
      * PTV_PREROLL_MS ≥ 4000 precisely because their delivery stalls multi-second). */
-    if (atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 ||
-        (int64_t)g_preroll_ms >= 4000) {
+    /* 2.0.0 T-345: ... unless the input itself kept flowing through this stream's whole gap (a video-only
+     * outage: the audio arrived throughout) — then the absence is this PID's, content evidence on any channel */
+    if ((atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 || (int64_t)g_preroll_ms >= 4000) &&
+        d->any_stall_wc >= d->wrap_wall_last[sidx] - gap) {
         int64_t now = av_gettime_relative();
         if (now - d->wallev_fb_log_us >= 60000000) {
             d->wallev_fb_log_us = now;
@@ -357,6 +359,34 @@ static int64_t ptv_wallev_w(DemuxArgs *d, int sidx, int64_t jump_us)
 static int ptv_wallev_full(int64_t w, int64_t jump_us)
 {
     return w > 0 && w >= jump_us - FFMAX(g_gap_min_us, jump_us / 8);
+}
+
+/* 2.0.0 T-336: one source event, one erase. The flowing part J−W is measured per stream from that stream's own
+ * labels and delivery, and a source restart does not cut the streams at the same point nor resume them with the
+ * old mux interleave: jump_return_50 (NEW DOMAIN rejoin, both splits within the same ms) read audio J−W 123 ms
+ * below video (J −83 ms, W +40 ms), and erasing each stream's own reading left the sound 120-123 ms late for good
+ * (the [PTV-RSYNC] edit ledgers ev−ea = −123 ms, the output mapping dm flat). The relabel is the source's — one
+ * amount for every stream: a split whose J−W lies within 500 ms of another stream's split in the same straddle
+ * window adopts that erase (0 when that one kept its whole step as a hole), clamped to its own step. Otherwise
+ * its own erase is recorded for the siblings. */
+static int64_t ptv_wallev_shared_flow(DemuxArgs *d, int sidx, int64_t jump_us, int64_t w_us,
+                                      int64_t flow_us, int64_t wall_now)
+{
+    int64_t est = jump_us - w_us;
+    if (d->wev_ev_wall && wall_now - d->wev_ev_wall <= g_progoff_debounce_us && d->wev_ev_sidx != sidx &&
+        llabs(est - d->wev_ev_est) <= 500000) {
+        int64_t f = av_clip64(d->wev_ev_flow, 0, jump_us);
+        if (f != flow_us)
+            av_log(NULL, AV_LOG_WARNING, "[PTV-WALLEV] stream %d: erases %"PRId64"ms like stream %d's split of the "
+                   "same event (own reading %"PRId64"ms) — one erase for every stream\n",
+                   sidx, f / 1000, d->wev_ev_sidx, flow_us / 1000);
+        return f;
+    }
+    d->wev_ev_sidx = sidx;
+    d->wev_ev_est  = est;
+    d->wev_ev_flow = flow_us;
+    d->wev_ev_wall = wall_now;
+    return flow_us;
 }
 
 /* pre24 #63 provenance: post `w_us` of UNEVIDENCED real-content deletion on stream s —
@@ -1814,7 +1844,9 @@ static int demux_pass_one(DemuxArgs *d, AVPacket *out, int64_t vm_out_us)
             ps->dup_real = atomic_load_explicit(&g_dup_out_us, memory_order_relaxed);
         }
         if (out->dts != AV_NOPTS_VALUE) {
-            if (d->pass[pi].last_dts != AV_NOPTS_VALUE && out->dts <= d->pass[pi].last_dts && vm_out_us != AV_NOPTS_VALUE) {
+            if (d->pass[pi].last_dts != AV_NOPTS_VALUE && out->dts <= d->pass[pi].last_dts && vm_out_us != AV_NOPTS_VALUE &&
+                d->ifmt->streams[d->pass[pi].in_index]->codecpar->codec_id != AV_CODEC_ID_SCTE_35) {
+                /* SCTE-35 is always sent (T-335: two cues released on the same frame shared its stamp) */
                 d->vm_late++;                    /* 2.0.0 T-100: stamped behind what is on the wire: its moment passed */
                 if (d->pass[pi].sil)
                     pthread_mutex_unlock(&d->pass_lock);
@@ -1900,6 +1932,12 @@ static void park_drain(DemuxArgs *d, int force)
  * never shown (skipped, erased, lost in the outage) or whose moment on the output passed more than 1 s ago is dropped:
  * shown now it would sit off its picture. SCTE-35 is always sent (its splice point lies ahead). force = the queue is
  * full: what the video has not reached yet takes the old stamp. */
+/* where the video showed content c_us: the single-input record, or (2.0.0 T-342) this multiview slot's own ring */
+static int copy_shown(DemuxArgs *d, int64_t c_us, int64_t *out_us, int64_t *gap_us)
+{
+    return d->mv_vring ? vring_shown(d->mv_vring, c_us, out_us, gap_us) : ptv_vmap_lookup(c_us, out_us, gap_us);
+}
+
 static void vwait_drain(DemuxArgs *d, int force)
 {
     int pi;
@@ -1911,9 +1949,26 @@ static void vwait_drain(DemuxArgs *d, int force)
         while (k < ps->nvwait) {
             AVPacket *p = ps->vwait[k];
             int64_t ts = p->dts != AV_NOPTS_VALUE ? p->dts : p->pts, o = AV_NOPTS_VALUE, gap = 0;
-            int r = ts == AV_NOPTS_VALUE ? -1 : ptv_vmap_lookup(av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q), &o, &gap);
+            int r = ts == AV_NOPTS_VALUE ? -1 : copy_shown(d, av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q), &o, &gap);
             if (r == 0 && !force)
                 break;                          /* its content is not on the output yet */
+            if (r < 0 && scte && !force) {
+                /* 2.0.0 T-335: a cue with no usable time of its own (the PCR rides the video PID: none while only the
+                 * video is gone, or a stale one) took the read-time stamp, +8.96 s off its splice picture at a
+                 * video-only outage's return. Its splice point lies ahead: it goes out with the offset the video runs
+                 * on once it is back, up to 12 s (the output delay pin), then the old way */
+                int64_t ns, no;
+                if (!d->mv_vring && ptv_vmap_newest(ps->vwait_wc[k], &ns, &no)) {
+                    p->pts = p->dts = av_rescale_q(ns, AV_TIME_BASE_Q, ps->in_tb);
+                    d->vm_po = d->prog_off;     /* the video's content is unwrapped with the current prog_off */
+                    demux_pass_one(d, p, no);
+                    d->vm_ok++;
+                    k++;
+                    continue;
+                }
+                if (now - ps->vwait_wc[k] < 12000000)
+                    break;
+            }
             if (r == 1 && !scte && (gap > 1000000 || o < pos - 1000000)) {
                 av_packet_free(&p);
                 d->vm_late++;
@@ -1957,7 +2012,8 @@ static int demux_pass(DemuxArgs *d, AVPacket *out)
 {
     int pi;
     park_drain(d, 0);
-    if (d->single && g_vmap) {              /* 2.0.0 T-100: sparse copies wait for the video to show their content */
+    if ((d->single || d->mv_vring) && g_vmap) {   /* 2.0.0 T-100: sparse copies wait for the video to show their content
+                                                   * (T-342: on a multiview slot, its own cell) */
         pthread_mutex_lock(&d->pass_lock);
         vwait_drain(d, 0);
         for (pi = 0; pi < d->n_pass; pi++) {
@@ -1972,6 +2028,18 @@ static int demux_pass(DemuxArgs *d, AVPacket *out)
                 break;                          /* demux_pass_one drops a copy before the anchor */
             if (ps->nvwait == PTV_VWAIT_MAX)
                 vwait_drain(d, 1);
+            if (d->ifmt->streams[ps->in_index]->codecpar->codec_id == AV_CODEC_ID_SCTE_35 &&
+                out->dts != AV_NOPTS_VALUE && d->n_audio > 0 && d->wrap_last[d->astream[0]] != AV_NOPTS_VALUE) {
+                /* 2.0.0 T-345: a cue's time comes from the PCR, which rides the video PID: while only the video is gone
+                 * it stays at the last PCR (every cue of a 20 s video outage read 30.700 s), so the cue was placed with
+                 * the offset the video had before the outage — 2.07 s off its splice once the video came back on
+                 * another one (rich sync_vnull_20, marker 50). More than 1 s behind the audio, which flows on: no
+                 * time of its own — it waits for the video's offset like a cue without one (T-335) */
+                const AVStream *as = d->ifmt->streams[d->astream[0]];
+                int64_t at = av_rescale_q(d->wrap_last[d->astream[0]] + d->wrap_off[d->astream[0]], as->time_base, AV_TIME_BASE_Q);
+                if (av_rescale_q(out->dts, ps->in_tb, AV_TIME_BASE_Q) < at - 1000000)
+                    out->dts = out->pts = AV_NOPTS_VALUE;
+            }
             ps->vwait_wc[ps->nvwait] = av_gettime_relative();
             ps->vwait_po[ps->nvwait] = d->prog_off;
             ps->vwait[ps->nvwait++]  = out;
@@ -2167,6 +2235,9 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
     if (raw != AV_NOPTS_VALUE) {
         int64_t wall_now = av_gettime_relative();
         int64_t last = d->wrap_last[pkt->stream_index];
+        if (d->any_wall_last && wall_now - d->any_wall_last >= g_gap_min_us)
+            d->any_stall_wc = wall_now;         /* 2.0.0 T-345: the whole input paused (delivery, not one PID) */
+        d->any_wall_last = wall_now;
         /* pre24 #63: preserve THIS packet's pre-update delivery wall gap and fold quiet gaps
          * into the per-stream cadence EMA (burst-period reading — the rr15 R2 door pattern).
          * The LAYERA loop runs AFTER wrap_wall_last below has advanced to this packet, so the
@@ -2177,6 +2248,15 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
             int64_t pwl = d->wrap_wall_last[pkt->stream_index];
             int64_t pg  = pwl > 0 ? wall_now - pwl : 0;
             d->pkt_wall_gap_us[pkt->stream_index] = pg;
+            /* T-327: a video pause (> 500 ms with no video packet) is damage evidence for the output clock: a content gap
+             * behind it is content lost in the pause, filled at tick rate like a loss gap, not leapt. The post-gap frames
+             * come out of the decoder right behind the pre-gap tail (lavf PES tail, decoder delay), so a pause measured
+             * at the decoder output misses them; measured here it covers them (emit_video tags frames for 5 s). Flapping
+             * at 50 fps: the one return whose cut carried no corrupt PES was leapt — a 1.68 s video PTS hole. Not after
+             * a hold (STALLED): that return has its own rejoin mapping (kill_return_20 at 50 fps read 0.86 live share
+             * on 3 of 3 runs with it, the control 0.86 / 0.89 / PASS). */
+            if (pg > 500000 && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && !ptv_src_holding())
+                atomic_store_explicit(&g_vdmg_wc, wall_now, memory_order_relaxed);
             /* 2.0.0-pre4c PES-TAIL carry (measured 2026-10-03): lavf completes a video PES only when
              * the NEXT one starts (unbounded PES length), so after a real outage the first video
              * packet out is the pre-gap TAIL frame — it carries the wall gap but no content jump —
@@ -2377,6 +2457,13 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                         int64_t wev_w    = !veto_supp ? ptv_wallev_w(d, pkt->stream_index, jump_us) : 0;
                         int     wev_full = g_wallev && wev_w > 0 && ptv_wallev_full(wev_w, jump_us);
                         int     wev_comp = g_wallev && wev_w > 0 && !wev_full;
+                        int64_t wev_flow = 0;
+                        if (wev_full || wev_comp) {   /* T-336: the event's erase, shared with a sibling's split */
+                            wev_flow = ptv_wallev_shared_flow(d, pkt->stream_index, jump_us, wev_w,
+                                                              wev_full ? 0 : jump_us - wev_w, wall_now);
+                            wev_full = wev_flow == 0;
+                            wev_comp = wev_flow > 0;
+                        }
                         if (wev_full ||
                             ((!g_wallev || wev_w == 0) &&
                              !vcrossed && !veto_supp && wall_gap >= FFMAX(g_gap_min_us, jump_us / 2))) {
@@ -2516,7 +2603,7 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                              * LATE) or |W| (erase path, audio EARLY — capped at J/2 by the
                              * old boundary = Avivando's half-step bake). Propagate the
                              * continuity ref so no LAYERA cycle arms on the remaining W. */
-                            int64_t flow_us = jump_us - wev_w;
+                            int64_t flow_us = wev_flow;
                             d->wrap_off[pkt->stream_index] -=
                                 av_rescale_q(flow_us, AV_TIME_BASE_Q, st->time_base);
                             rsync_post_edit(d, pkt->stream_index, -flow_us);   /* flow-evidenced erase */
@@ -2588,7 +2675,8 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                         int64_t vw = ptv_wallev_w(d, pkt->stream_index, vjump_us);
                         if (vw > 0) {
                             int vfull = ptv_wallev_full(vw, vjump_us);
-                            int64_t vflow_us = vfull ? 0 : vjump_us - vw;
+                            int64_t vflow_us = ptv_wallev_shared_flow(d, pkt->stream_index, vjump_us, vw,   /* T-336 */
+                                                                      vfull ? 0 : vjump_us - vw, wall_now);
                             int64_t dukf_thresh = av_rescale(g_dukf_min_ms, st->time_base.den,
                                                              (int64_t)st->time_base.num * 1000);
                             if (vflow_us > 0) {
@@ -2856,6 +2944,19 @@ bad:
 
 static void by_count_gap(DemuxArgs *d, int64_t gap, int64_t now);   /* 2.0.0-pre4, defined below */
 
+/* 2.0.0 T-345: raw (a video packet after a gap) is still on the pre-gap timeline: 0..500 ms past ref (33-bit wrap) */
+static int src_tail_more(const AVStream *vst, int64_t raw, int64_t ref)
+{
+    int64_t delta = raw - ref;
+    if (vst->pts_wrap_bits > 0 && vst->pts_wrap_bits < 63) {
+        int64_t m = 1LL << vst->pts_wrap_bits;
+        delta &= m - 1;
+        if (delta >= m >> 1) delta -= m;
+    }
+    delta = av_rescale_q(delta, vst->time_base, AV_TIME_BASE_Q);
+    return delta >= 0 && delta < 500000;
+}
+
 void *demux_thread(void *arg)
 {
     DemuxArgs *d = arg;
@@ -3109,6 +3210,14 @@ void *demux_thread(void *arg)
                             d->src_pend     = 1;
                             d->src_pend_w   = now - d->src_last_vwall;
                             d->src_pend_raw = d->src_last_vdts_raw;   /* last packet BEFORE the gap */
+                        } else if (d->src_pend < 3 && src_tail_more(vst, raw, d->src_pend_raw)) {
+                            /* 2.0.0 T-345: a cut can leave TWO pre-gap tail frames (T-089): the second was classified,
+                             * A = +0.04 s → BURST after a 20 s video-only outage (rich50b sync_vnull_20; the jump to the
+                             * live content came one packet later). BURST counted the gap toward AUTO-BANK, the armed
+                             * bank disabled the wall evidence and the real 20 s hole was erased as a splice: 18 s of
+                             * silence, A/V +20 s. Up to two more packets still on the old timeline are tail too; a real
+                             * burst stays contiguous and is classified BURST on the next one */
+                            d->src_pend++;
                         } else {                            /* second: the first post-gap content */
                             int64_t delta = raw - d->src_pend_raw, A, W = d->src_pend_w;
                             if (vst->pts_wrap_bits > 0 && vst->pts_wrap_bits < 63) {   /* nearest 33-bit wrap */
