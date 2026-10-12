@@ -137,6 +137,7 @@ extern const FFFilter ff_af_highpass;
 extern const FFFilter ff_af_highshelf;
 extern const FFFilter ff_af_join;
 extern const FFFilter ff_af_ladspa;
+extern const FFFilter ff_af_loudlive;
 extern const FFFilter ff_af_loudnorm;
 extern const FFFilter ff_af_lowpass;
 extern const FFFilter ff_af_lowshelf;
