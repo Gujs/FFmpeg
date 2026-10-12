@@ -5,6 +5,28 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre15 — pre14 + multiview slot recovery: a slot's source restart, a damaged return, packet loss on a slot
+
+- **A multiview slot's source restart keeps lip sync from the start (T-339).** A restart steps the slot's A/V offset by
+  seconds in one reading; the step inflated the PLL's noise threshold to its 1500 ms cap and the ACQUIRE waited ~8 s for
+  the EMA to climb: the audio 1.3–2 s early for the first ~10 s (every build). When 32 raw readings agree but sit far
+  from the EMA, the EMA is re-seeded at their median (not in the first 30 s). MV-04 kill_return_20, first 10 s:
+  −1769…−1903 ms → −4…−7 ms (3 runs each, 2 lanes, pre14 interleaved).
+- **The outage of a damaged multiview return is counted once (T-350a, canary Grid_2x2 Cinestar cell, 10 s gap).** The
+  first audio frame after a gap can be the corrupt pre-gap PES tail with its old label; MP2 / AC-3 decode it (AAC rejects
+  it). It read "behind the fill", the slot's silence fill was judged a hold (+8 s), and the real return was padded by
+  the whole outage on top (+10 s): the cell's sound late / silent ~10 s, then a 10 s PLL drop. A forward step of at least
+  half the hold within 1 s now undoes it. MP2 slot, cuts that split an audio PES: pre14 +8.0 s hold + 10.0 s pad, 4–5
+  flashes without sound → +2.0 s pad, lip sync 0.0 ms in the first 10 s.
+- **Packet loss on a multiview slot no longer leaves its audio off (T-350b, canary C4 / C5).** Lost frames drained the
+  slot's jitter buffer (no dry spell, so no re-prime) and the ±2 % servo refilled it over ~75 s after the loss — the
+  picture slid while its audio chased it — and the slot's PLL acquired 0.6–2.5 s on readings taken during the loss. Now
+  a damaged slot (corrupt video in the last 5 s) 3 frames short of its primed depth re-primes at once, the slot's PLL
+  takes no readings and makes no correction while the slot is damaged (+3 s), and its first agreeing clean window is
+  corrected at once. 1 % / 10 % / 50 % loss on MP2 and AAC slots (6 runs): 30–60 s after −70…+466 ms → +0.4…+0.7 ms,
+  first 10 s −2.6…+2.7 ms. Also gone: the first 10 s after a 20 s gap return (+34 ms → 0.0).
+- Single-input: unchanged (every change is in the multiview compositor / the multiview audio-follow PLL).
+
 ## 2.0.0-pre14 — pre13 + the video-only hold ends on new content
 
 - **No 17 s of silence after a video-only outage (T-345, a race left in pre13).** The hold that keeps a video-only
