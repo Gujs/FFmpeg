@@ -1694,25 +1694,25 @@ static int audio_drain_fg(AudioState *a)
                     /* 2.0.0 T-339: a LEVEL STEP is not noise. A slot's source restart moved the offset +39 → +1832 ms in one
                      * reading (probe); the step fed the noise estimate (dev 3 → 556 ms), the noise-adaptive threshold rose to
                      * its 1500 ms cap, and the ACQUIRE waited for the EMA (tau ~2.7 s) to climb past it: 7.9 s of audio 1.8 s
-                     * early. When the last 8 readings agree with each other (within the tick quantum) but sit far from the
+                     * early. When the last 32 readings (~0.7 s) agree with each other (within the tick quantum) but sit far from the
                      * EMA, the EMA is re-seeded at their median and the step is kept out of the noise estimate: the
                      * large-and-flat test then passes on its own windows (~2 s). A jittery leg never agrees: unchanged. Not in
                      * the first 30 s: there the startup bank settles while the slot's video lag still moves, and re-seeding on
-                     * it acquired early (untouched slots +23…+61 ms before any event, 4 of 5 runs) */
+                     * it acquired early (untouched slots +23…+61 ms before any event, 4 of 5 runs); 8 readings were too few
+                     * after a gap return, while the re-primed slot's lag still settled (59.94 slot +42…+47 ms for 10 s) */
                     int pll_level = 0;
-                    if (a->pll_raw_n >= 8 && a->out_frames * a->frame_size >= 30LL * a->out_rate) {
-                        int64_t w[8], band = FFMAX(g_pll_acquire_us, a->tick_dur_us > 0 ? 3 * a->tick_dur_us / 2 : 0);
+                    if (a->pll_raw_n >= 32 && a->out_frames * a->frame_size >= 30LL * a->out_rate) {
+                        int64_t w[32], band = FFMAX(g_pll_acquire_us, a->tick_dur_us > 0 ? 3 * a->tick_dur_us / 2 : 0);
                         int x, y;
-                        for (x = 0; x < 8; x++)
-                            w[x] = a->pll_raw[(a->pll_raw_n - 1 - x) % 32];
-                        for (x = 1; x < 8; x++) {                       /* insertion sort */
+                        memcpy(w, a->pll_raw, sizeof(w));
+                        for (x = 1; x < 32; x++) {                      /* insertion sort */
                             int64_t t = w[x];
                             for (y = x; y > 0 && w[y - 1] > t; y--) w[y] = w[y - 1];
                             w[y] = t;
                         }
-                        if (w[7] - w[0] <= band && FFABS(w[4] - a->pll_ema) > 4 * band) {
-                            a->pll_ema      = w[4];
-                            a->pll_dbnc_ref = w[4];
+                        if (w[31] - w[0] <= band && FFABS(w[16] - a->pll_ema) > 4 * band) {
+                            a->pll_ema      = w[16];
+                            a->pll_dbnc_ref = w[16];
                             pll_level       = 1;
                         }
                     }
