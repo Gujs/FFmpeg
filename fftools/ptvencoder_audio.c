@@ -4700,6 +4700,27 @@ static void hold_fill_quantum(AudioState *a)
         atomic_store_explicit(&g_afill_us[a->dbg_k], a->hold_fill_us, memory_order_relaxed);
 }
 
+/* 2.0.0-pre18 T-316: replay the pre-h0 ring as soon as h0 is known. It used to be replayed only by the NEXT
+ * decoded audio frame — 21 ms later on a steady source, but on a burst source the whole first burst sits in the
+ * ring and the next frame comes with the next burst: no audio on the output for 8 s (sync_bursty_8: video released
+ * alone after 6 s, the first segments without audio, a default-probing HLS segmenter could not open the output). */
+static int aq_replay_if_anchored(AudioState *a)
+{
+    int64_t h0;
+    int i, ret = 0;
+    if (a->pts_set || !a->aq_npending)
+        return 0;
+    pthread_mutex_lock(a->h0_lock); h0 = *a->h0; pthread_mutex_unlock(a->h0_lock);
+    if (h0 == AV_NOPTS_VALUE)
+        return 0;
+    for (i = 0; i < a->aq_npending; i++) {
+        if (ret >= 0) ret = audio_anchor_and_feed(a, a->aq_pending[i], h0);
+        av_frame_free(&a->aq_pending[i]);
+    }
+    a->aq_npending = 0;
+    return ret;
+}
+
 void *audio_thread(void *arg)
 {
     AudioState *a = arg;
@@ -4710,7 +4731,17 @@ void *audio_thread(void *arg)
     if (!frame)
         goto done;
     for (;;) {
-        ret = av_thread_message_queue_recv(a->audio_q, &pkt, 0);
+        if (!a->pts_set && a->aq_npending) {       /* T-316: frames wait for h0 — poll, replay the moment it is known */
+            ret = av_thread_message_queue_recv(a->audio_q, &pkt, AV_THREAD_MESSAGE_NONBLOCK);
+            if (ret == AVERROR(EAGAIN)) {
+                if ((ret = aq_replay_if_anchored(a)) < 0)
+                    break;
+                if (!a->pts_set)
+                    av_usleep(5000);
+                continue;
+            }
+        } else
+            ret = av_thread_message_queue_recv(a->audio_q, &pkt, 0);
         if (ret < 0) break;
         if (pkt && (pkt->flags & PTV_PKT_FLAG_NBS_FILL)) {
             /* pre15 §3 FILL sentinel — NOT a packet: must not feed the decoder and must not

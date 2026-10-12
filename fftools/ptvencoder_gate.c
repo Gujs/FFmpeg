@@ -45,7 +45,7 @@ static int     g_videoq = 512;       /* v0.9.14: default 256->512 — headroom f
                                       * (compressed packets, ~KBs each; 512 covers a 12s bank at 30fps
                                       * with margin, and removes the manual PTV_VIDEOQ for bursty channels) */
 static int     g_preroll_set;        /* PTV_PREROLL_MS set explicitly → suppresses the v0.9.0 genlock ~1-GOP default */
-static int     g_aq_cap = 256;       /* §13: effective pre-h0 audio ring depth (<= PTV_AQ_PREROLL). Default 256 = historical (byte-identical); raised to PTV_AQ_PREROLL only for a deep prime so audio buffers through the long video-decode delay. */
+static int     g_aq_cap = 576;       /* §13: effective pre-h0 audio ring depth (<= PTV_AQ_PREROLL). 2.0.0-pre18 T-316: 576 (~12.3 s at 48 kHz = the pinned 12 s delay; was 256 = 5.5 s: a burst source's audio head was dropped and replaced by silence); raised to PTV_AQ_PREROLL for a deep prime so audio buffers through the long video-decode delay. */
 static _Atomic int64_t g_delivery_cap_us = 3000000;   /* PTV_DELIVERY_CAP_MS: force-release ceiling (≥ max encoder latency).
                                                 * v0.9.16.2: _Atomic — runtime writer is the master output thread
                                                 * (cushion GROW/SHRINK), readers are demux (bank stores) + init.
@@ -714,6 +714,19 @@ void cushion_escalate(CushionEvent ev, int64_t a0, int64_t a1)
     }
     }
     pthread_mutex_unlock(&rt->lock);
+}
+
+/* 2.0.0-pre18 T-316: the first 30 s after the first decoded frame count as a STARTUP window in which the master
+ * rung's frame queue is lossless, as with an armed bank. A burst source's first burst (8 s of content in ~0.1 s)
+ * overflowed the 160-frame queue before any stall had armed the bank: 34 frames skipped = a 1.4 s video PTS hole
+ * at 0.1 s on every sync_bursty_8 start. The burst now waits in video_q (512 packets) instead. */
+int ptv_fq_startup_lossless(void)
+{
+    static _Atomic int64_t t0;
+    int64_t now = av_gettime_relative(), z = 0;
+    if (!atomic_load_explicit(&t0, memory_order_relaxed))
+        atomic_compare_exchange_strong(&t0, &z, now);
+    return now - atomic_load_explicit(&t0, memory_order_relaxed) < 30000000;
 }
 
 /* hand a frame to one rung's jitter buffer; drop-oldest in live so a stalled

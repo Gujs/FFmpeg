@@ -2406,6 +2406,7 @@ void dlv_video_cfg(DlvGate *g, int64_t band_us, int64_t cap_us, int vmaxq);   /*
 int  dlv_video_deliver(DlvGate *g, AVPacket *pkt, int64_t dts_us);            /* §7.5b: video output thread only */
 void dlv_video_drain(DlvGate *g);                                             /* §7.5b: video output thread only */
 void cushion_escalate(CushionEvent ev, int64_t a0, int64_t a1);
+int  ptv_fq_startup_lossless(void);
 void push_frame_q(AVThreadMessageQueue *q, int live, int64_t *framedrop, AVFrame *out);
 void resolve_cushions(CushionPlan *cp, int live, int multiview,
                       AVRational out_fps, int n_audio);
