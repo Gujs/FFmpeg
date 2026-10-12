@@ -176,6 +176,16 @@ int ff_ebur128_loudness_global(FFEBUR128State * st, double *out);
  */
 int ff_ebur128_loudness_shortterm(FFEBUR128State * st, double *out);
 
+/** \brief Get momentary loudness (last 400 ms) in LUFS.
+ *
+ *  @param st library state.
+ *  @param out momentary loudness in LUFS. -HUGE_VAL if result is negative
+ *             infinity.
+ *  @return
+ *    - 0 on success.
+ */
+int ff_ebur128_loudness_momentary(FFEBUR128State * st, double *out);
+
 /** \brief Get loudness range (LRA) of programme in LU.
  *
  *  Calculates loudness range according to EBU 3342.

@@ -29,7 +29,10 @@
  * holds 3 s of audio; here the gain is smoothed by a one-pole filter and applied
  * to the samples as they arrive: no added latency, nothing held when the input
  * pauses. The gain is held while the input is quiet (below the relative gate).
- * Peaks are not limited here; follow with alimiter.
+ * Without lookahead a sudden loud passage shows in the short-term loudness only
+ * over 3 s, so the momentary loudness (400 ms) also caps the gain at once: the
+ * output's momentary loudness stays within fast LU of target + LRA/2.
+ * Peaks are not limited here; follow with alimiter (oversampled for true peak).
  */
 
 #include <math.h>
@@ -46,6 +49,7 @@ typedef struct LoudLiveContext {
     double target_i;
     double target_lra;
     double smooth;
+    double fast;
     int dual_mono;
 
     FFEBUR128State *r128;
@@ -67,6 +71,7 @@ static const AVOption loudlive_options[] = {
     { "LRA",       "set loudness range target",           OFFSET(target_lra), AV_OPT_TYPE_DOUBLE, {.dbl =   7.},   1., 50., FLAGS },
     { "lra",       "set loudness range target",           OFFSET(target_lra), AV_OPT_TYPE_DOUBLE, {.dbl =   7.},   1., 50., FLAGS },
     { "smooth",    "set gain smoothing time constant (s)", OFFSET(smooth),    AV_OPT_TYPE_DOUBLE, {.dbl = 0.4},    0., 10., FLAGS },
+    { "fast",      "set momentary excess over target + LRA/2 that cuts the gain at once (LU)", OFFSET(fast), AV_OPT_TYPE_DOUBLE, {.dbl = 0.}, 0., 99., FLAGS },
     { "dual_mono", "treat mono input as dual-mono",       OFFSET(dual_mono),  AV_OPT_TYPE_BOOL,   {.i64 = 0},      0,   1,  FLAGS },
     { NULL }
 };
@@ -77,9 +82,10 @@ static void update_gain(AVFilterContext *ctx)
 {
     LoudLiveContext *s = ctx->priv;
     AVFilterLink *inlink = ctx->inputs[0];
-    double global, shortterm, relative_threshold, lra2 = s->target_lra / 2., want;
+    double global, shortterm, momentary, relative_threshold, lra2 = s->target_lra / 2., want, ceiling;
 
     ff_ebur128_loudness_global(s->r128, &global);
+    ff_ebur128_loudness_momentary(s->r128, &momentary);
     ff_ebur128_relative_threshold(s->r128, &relative_threshold);
     /* the short-term window is not full yet: steer on the integrated loudness alone */
     if (s->nb_in < 3LL * inlink->sample_rate)
@@ -87,15 +93,23 @@ static void update_gain(AVFilterContext *ctx)
     else
         ff_ebur128_loudness_shortterm(s->r128, &shortterm);
 
-    if (global <= -70. || shortterm <= -70. || shortterm < relative_threshold)
-        return;
+    if (global > -70. && shortterm > -70. && shortterm >= relative_threshold) {
+        want = s->target_i - shortterm + av_clipd(shortterm - global, -lra2, lra2);
+        if (!s->have_gain) {
+            s->gain_db   = want;
+            s->have_gain = 1;
+        } else {
+            s->gain_db  += s->alpha * (want - s->gain_db);
+        }
+    }
 
-    want = s->target_i - shortterm + av_clipd(shortterm - global, -lra2, lra2);
-    if (!s->have_gain) {
-        s->gain_db   = want;
+    /* A sudden loud passage takes the short-term window up to 3 s to show; loudnorm sees it coming
+     * through its lookahead. Without one, the momentary loudness (400 ms) caps the gain at once, so
+     * the output's momentary loudness stays within fast LU of the top of the range. */
+    ceiling = s->target_i + lra2 + s->fast - momentary;
+    if (momentary > -70. && s->gain_db > ceiling) {
+        s->gain_db   = ceiling;
         s->have_gain = 1;
-    } else {
-        s->gain_db  += s->alpha * (want - s->gain_db);
     }
 }
 
