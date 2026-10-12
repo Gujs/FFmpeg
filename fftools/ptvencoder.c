@@ -959,6 +959,7 @@ int64_t g_pair_ttl_us = PTV_PAIR_EXPECT_TTL_US;
 int64_t g_nbs_quantum_us = 100000;             /* fill quantum: 100ms of silence per sentinel */
 _Atomic int64_t g_acorrupt;
 _Atomic int64_t g_adamage_wc[PTV_MAX_AUDIO];   /* 2.0.0-pre9.3 (T-080 A2) */
+_Atomic int64_t g_mv_vdmg_wc[PTV_MAX_INPUT];   /* T-350 */
 _Atomic int64_t g_adec_frame_wc[PTV_MAX_AUDIO];
 _Atomic int64_t g_pad_pub_step[PTV_MAX_AUDIO];
 _Atomic int64_t g_pad_pub_wc[PTV_MAX_AUDIO];

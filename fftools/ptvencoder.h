@@ -1043,6 +1043,7 @@ typedef struct AudioState {
     int64_t          pll_dbnc_ref;                    /* ema value when the debounce window started (flatness reference) */
     int              pll_refractory;                  /* frames remaining before acquire may re-arm (bumpless-credit backstop) */
     int              pll_acq_win;                     /* 1.0.1: consecutive completed above-threshold debounce windows (fire at 3; PTV_ACQ_INSTANT reverts) */
+    int              pll_frozen;                      /* T-350: readings + corrections paused while the slot's input is damaged */
     int              pll_yielded;                     /* 1.0.1-pre21 #24: PLL actuators currently yielded to the steering corrector (transition-logged) */
     int64_t          pll_yield_bias_us;               /* #24 bumpless resume: alignment reference adopted at yield-resume — the PLL measures RELATIVE to the corrector's realized walk (never undoes it) */
     int              pll_bias_stale;                  /* rr21 A1: bias calibration voided by a label-baseline event — actuators suspended until the settled-window re-adoption */
@@ -2307,6 +2308,7 @@ extern int64_t g_nbs_quantum_us;         /* fill quantum (100ms; PTV_NBS_QUANTUM
 extern _Atomic int64_t g_acorrupt;                        /* total corrupt-discarded AUDIO pkts (acor= stats) */
 extern _Atomic int64_t g_adamage_wc[PTV_MAX_AUDIO];      /* 2.0.0-pre9.3 (T-080 A2): per global track, wall us of the
                                                            * last corrupt-discarded packet (demux → audio thread) */
+extern _Atomic int64_t g_mv_vdmg_wc[PTV_MAX_INPUT];     /* T-350: per multiview slot, wall us of its last corrupt video (compositor) */
 extern _Atomic int64_t g_adec_frame_wc[PTV_MAX_AUDIO];    /* wall µs of track k's last DECODED frame (audio
                                                            * thread stamps; demux reads = the E6 starvation
                                                            * discriminator: packets arrive, nothing decodes) */

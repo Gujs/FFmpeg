@@ -1675,6 +1675,33 @@ static int audio_drain_fg(AudioState *a)
                             ptv_pll_bias_mark(a, "label baseline moved (ledger/glue)", 0);
                         }
                     }
+                    /* T-350: while the slot's input is damaged (corrupt video on the slot or damaged audio on the track in
+                     * the last 3 s) the offset readings are not the slot's lip sync: lost video frames, fills and pads land
+                     * on the two halves at different moments (MV mp2 loss_100: vlag +40 / +560 / -40 ms between readings).
+                     * The PLL acted on them — ACQUIREs of 0.6..2.4 s during the loss, the slot +200..+470 ms 30-60 s after
+                     * (live Grid_2x2 Cinestar cell C5: pad 2517 ms during 10 % loss, audio 1.5 s late for ~50 s). No
+                     * readings and no correction until the input is clean; then the readings restart from empty, so the
+                     * level / ACQUIRE tests see clean readings only. The frame is still emitted on the applied offset. */
+                    {
+                        int64_t dl = a->dmg_wc, nw = av_gettime_relative();
+                        int frz;
+                        if (a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO)
+                            dl = FFMAX(dl, atomic_load_explicit(&g_adamage_wc[a->dbg_k], memory_order_relaxed));
+                        if (a->dbg_in >= 0 && a->dbg_in < PTV_MAX_INPUT)
+                            dl = FFMAX(dl, atomic_load_explicit(&g_mv_vdmg_wc[a->dbg_in], memory_order_relaxed));
+                        frz = dl && nw - dl < 3000000;
+                        if (frz != a->pll_frozen) {
+                            a->pll_frozen = frz;
+                            if (!frz) { a->pll_raw_n = 0; a->pll_dbnc = 0; a->pll_acq_win = 0; a->pll_dbnc_ref = a->pll_ema; }
+                            av_log(NULL, AV_LOG_WARNING, frz ? "[PTV-PLL] a%d(in%d) FROZEN — the slot's input is damaged: "
+                                   "no readings, no correction (ema %+"PRId64"ms applied %+"PRId64"ms)\n"
+                                   : "[PTV-PLL] a%d(in%d) resumed — the slot's input clean for 3 s, readings restart "
+                                   "(ema %+"PRId64"ms applied %+"PRId64"ms)\n",
+                                   a->dbg_k, a->dbg_in, a->pll_ema / 1000, a->af_applied_us / 1000);
+                        }
+                        if (frz)
+                            goto pll_emit;
+                    }
                     /* #24 bumpless resume: measure RELATIVE to the alignment reference adopted
                      * after each corrector engagement (0 until one ends). Without the rebase,
                      * the corrector's DELIBERATE content shift (R walked to 0, PARK) reads as
@@ -1935,6 +1962,7 @@ static int audio_drain_fg(AudioState *a)
                         if (step < -lim) step = -lim;
                         a->af_steer_us += step;
                     }
+pll_emit:
                     if (a->pll_refractory > 0) a->pll_refractory--;   /* ticks on every EMITTED (non-dropped) frame */
                     while (a->pll_pad > 0) {                  /* PAD: emit pending one-shot silence on THIS base before the real frame */
                         AVFrame *s = av_frame_alloc();
