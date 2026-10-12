@@ -1004,6 +1004,7 @@ void *output_thread(void *arg)
         AVFrame *nextf = NULL;
         int next_have = 0, film_arm = 0, held_extra = 0;
         int64_t vo_extra = 0;   /* 2.0.0-pre9.8 (T-076): video-only repeat ticks kept out of house_skew */
+        int64_t vo_prev_c = -1; int vo_fresh_n = 0;   /* 2.0.0 T-345: content of the previous fresh frame; fresh frames since a vo hold */
         int vgap_park = 0;                          /* 2.0.0-pre9.4 (T-083): nextf is a frame parked behind a content gap */
         int64_t vgap_filled = 0, vgap_log_wc = 0;   /* ticks filled since the last [PTV-VFILL] line */
         int64_t svo_cr = 0, svo_dmg_wc = 0;        /* T-083: corrupt count seen by the servo + when it last moved */
@@ -1442,10 +1443,21 @@ void *output_thread(void *arg)
                 int64_t vr = atomic_load_explicit(&g_src_vread_wc, memory_order_relaxed);
                 int64_t ar = atomic_load_explicit(&g_src_aread_wc, memory_order_relaxed);
                 vo_rep = vr && ar && nwv - vr >= 500000 && nwv - ar < 1000000;
-                if (vo_rep) vo_extra++;
+                if (vo_rep) { vo_extra++; vo_fresh_n = 0; }
             }
-            if (g_vo_hold && fresh && !dup_tick)
-                vo_extra = 0;   /* content moves again: house_skew back on the formula (the rejoin's map step lands here) */
+            /* content moves again: house_skew back on the formula (the rejoin's map step lands here). 2.0.0 T-345: not on
+             * the pre-gap PES tail — the first frame out after a video-only outage carries the OLD content (T-074), and
+             * clearing on it published house_skew = the whole outage for that one frame (+17.9 s for 39-102 ms): an audio
+             * frame crossing the AVLOCK door then stepped +17.95 s and aresample filled it with 17 s of silence (59.94
+             * vnull_20, 2 of 2 runs; at 50 fps no audio frame happened to cross). Cleared on the post-gap content jump
+             * (> 1 s), or after 3 fresh frames when the video comes back contiguous */
+            if (g_vo_hold && fresh && !dup_tick && vo_extra &&
+                ((vo_prev_c >= 0 && content_vpts - vo_prev_c > 1000000 / FFMAX(v->tick_dur_us, 1)) || ++vo_fresh_n >= 3)) {
+                vo_extra   = 0;
+                vo_fresh_n = 0;
+            }
+            if (fresh && content_vpts >= 0)
+                vo_prev_c = content_vpts;
             if (v->is_master && v->house_skew && content_vpts >= 0)   /* against RAW content: −rejoin map (pre6.1) */
                 *v->house_skew = (vpts - content_vpts - held_extra - vo_extra) * v->tick_dur_us -
                                  (src_ts != AV_NOPTS_VALUE ? ptv_rj_off(av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q)) : 0);
