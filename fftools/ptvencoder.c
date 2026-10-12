@@ -237,8 +237,8 @@ void ptv_vmap_push(int64_t src_us, int64_t out_us)
     pthread_mutex_unlock(&vmap_lock);
 }
 
-/* 2.0.0 T-335: the newest frame the video put on air, once its last two frames were both shown after since_wc and
- * run on together (no leap: not the pre-gap PES tail lavf releases after an outage, T-074). 1 = *src_us / *out_us set */
+/* 2.0.0 T-335: the newest frame the video put on air, once its last two frames were both shown after since_wc, it has
+ * run 1 s on since the first of them, and they run on together (no leap: not the pre-gap PES tail lavf releases after an outage, T-074). 1 = *src_us / *out_us set */
 int ptv_vmap_newest(int64_t since_wc, int64_t *src_us, int64_t *out_us)
 {
     int a, b, ret = 0;
@@ -246,7 +246,16 @@ int ptv_vmap_newest(int64_t since_wc, int64_t *src_us, int64_t *out_us)
     if (vmap_n >= 2) {
         a = (vmap_w + PTV_VMAP_N - 1) % PTV_VMAP_N;
         b = (vmap_w + PTV_VMAP_N - 2) % PTV_VMAP_N;
-        if (vmap_wc[b] > since_wc &&
+        int k, first = b;
+        for (k = 2; k < vmap_n; k++) {              /* the first frame shown after since_wc */
+            int i = (vmap_w + PTV_VMAP_N - 1 - k) % PTV_VMAP_N;
+            if (vmap_wc[i] <= since_wc)
+                break;
+            first = i;
+        }
+        /* ... and the video has run 1 s on since then: after a source restart the rejoin mapping still moved the
+         * first frames (the cue after a 50 fps kill_return went out 5 frames off on one run of three) */
+        if (vmap_wc[b] > since_wc && vmap_wc[a] - vmap_wc[first] >= 1000000 &&
             FFABS((vmap_src[a] - vmap_src[b]) - (vmap_out[a] - vmap_out[b])) < 1000000) {
             *src_us = vmap_src[a];
             *out_us = vmap_out[a];
