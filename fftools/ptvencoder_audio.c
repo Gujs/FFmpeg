@@ -1872,9 +1872,14 @@ static int audio_drain_fg(AudioState *a)
                     if (FFABS(a->pll_ema) <= thr)
                         a->pll_acq_win = 0;                               /* condition lapsed → windows no longer consecutive */
                     /* T-350: the first 32 clean readings after a damage freeze that agree (within the tick quantum) are
-                     * corrected at once, from 20 ms: the slot's re-prime during the damage held its picture a frame or a few
-                     * (1 % loss: +40 ms), under the 1.5-tick ACQUIRE floor, and TRACK walked it off over ~15 s (MV mp2 loss_10:
-                     * b -40 ms, c 0). Readings that never agree within ~6 s fall back to the normal tests. */
+                     * acted on at once: the slot's re-prime during the damage held its picture a frame or a few (1 % loss:
+                     * +40 ms, under the 1.5-tick ACQUIRE floor) and TRACK, integrating from the stale EMA, took ~15 s (MV mp2
+                     * loss_10: b -40 ms, c 0). Above the ACQUIRE threshold: the one-step drop/pad. From 20 ms up to it: one
+                     * drop/pad per 2 minutes — pre16: after every freeze it ping-ponged on the +-1 tick reading quantum (cor-3
+                     * Curiosity mosaic, 25 fps slots in 29.97: ~21 audible cuts / h, 42 of 44 right after a freeze; local
+                     * sync_sparse_6 on a 25i slot in 29.97: 7-8 cuts of 21-85 ms per run); otherwise the EMA is re-seeded at
+                     * their median and TRACK (the inaudible resampler steer) walks it off in ~6 s.
+                     * Readings that never agree within ~6 s fall back to the normal tests. */
                     if (a->pll_postfrz && a->pll_raw_n >= 32) {
                         int64_t w[32], band = FFMAX(g_pll_acquire_us, a->tick_dur_us > 0 ? 3 * a->tick_dur_us / 2 : 0);
                         int x, y;
@@ -1886,8 +1891,16 @@ static int audio_drain_fg(AudioState *a)
                         }
                         if (w[31] - w[0] <= band) {
                             a->pll_postfrz = 0;
-                            if (FFABS(w[16]) >= 20000 && !pll_yield && !a->pll_bias_stale)
+                            int64_t nwc = av_gettime_relative();
+                            if (!pll_yield && !a->pll_bias_stale && (FFABS(w[16]) > thr ||
+                                (FFABS(w[16]) >= 20000 && (!a->pll_postfrz_cut_wc ||
+                                                           nwc - a->pll_postfrz_cut_wc >= 120000000)))) {
                                 may_acq = 1;
+                                a->pll_postfrz_cut_wc = nwc;
+                            } else if (FFABS(w[16]) >= 20000) {
+                                a->pll_ema      = w[16];
+                                a->pll_dbnc_ref = w[16];
+                            }
                         } else if (a->pll_raw_n >= 256)
                             a->pll_postfrz = 0;
                     }

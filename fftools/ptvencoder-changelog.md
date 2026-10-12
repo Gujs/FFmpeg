@@ -5,6 +5,20 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre16 — pre15 + no audio-cut ping-pong on mosaic slots with recurring small damage; 0007 folded into 0002
+
+- **A mosaic slot with recurring small corruption no longer gets an audible audio cut after every damage event (T-350,
+  canary soak of pre15).** pre15 corrected every post-freeze offset from 20 ms with a one-step drop/pad; the readings sit
+  on the ±1 picture-frame quantum, so on 25 fps slots in a 29.97 mosaic with a corrupt packet every few minutes it
+  ping-ponged (cor-3 MV_2x2_Curiosity_Channels: ~21 cuts / h, 42 of 44 right after a freeze; pre14 2.5 / h). Now a small
+  offset (20 ms up to the normal ACQUIRE floor) is cut at most once per 2 minutes per slot; otherwise the PLL average is
+  re-seeded at the measured level and the inaudible resampler steer walks it off (~6 s). Above the floor: unchanged.
+  New local case MV-06 (one lost datagram every 6 s): cuts 5 → 1 (25p slot), 9/8 → 2/2 (25i slot in 29.97, one of them
+  the startup snap); 1 % / 10 % loss, the PES-tail cut and MV-04 unchanged from pre15.
+- **Patch 0007 (SCTE-35 cue on its frame with B-frames, T-346) is folded into 0002** — canary-confirmed on cor-3 AWE Plus
+  (NVENC -bf 2). Same source tree as pre15's 0002 + 0007 (verified tree-identical); the series is 0001–0006 again.
+- Single-input: unchanged.
+
 ## 2.0.0-pre15 — pre14 + multiview slot recovery: a slot's source restart, a damaged return, packet loss on a slot
 
 - **A multiview slot's source restart keeps lip sync from the start (T-339).** A restart steps the slot's A/V offset by
