@@ -3100,6 +3100,51 @@ void *demux_thread(void *arg)
             av_packet_unref(pkt);
             continue;
         }
+        /* 2.0.0-pre17 T-348 (see aac_next): a frame without its own PES label (pos < 0: lavf split it out of the
+         * PES and interpolated its label) gets the previous label + the previous frame's ADTS duration */
+        if (pkt->stream_index < PTV_AAC_LBL && pkt->size >= 7 &&
+            d->ifmt->streams[pkt->stream_index]->codecpar->codec_id == AV_CODEC_ID_AAC &&
+            pkt->data[0] == 0xFF && (pkt->data[1] & 0xF6) == 0xF0) {
+            static const int adts_rate[16] = { 96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050,
+                                               16000, 12000, 11025, 8000, 7350 };
+            const AVStream *ast = d->ifmt->streams[pkt->stream_index];
+            int si = pkt->stream_index, rate = adts_rate[(pkt->data[2] >> 2) & 0xF];
+            /* only a STABLE header rate (3 frames in a row) counts, and only while it differs from the rate lavf times
+             * the frames with: one damaged header (bit flips, loss) must never re-time a PES — it did (+405 ms for
+             * good after sync_bitflip_100, -555 ms after loss_100: a forward re-time padded, the next PES label then
+             * read as a backward relabel and was erased). An unswitched stream is left exactly as lavf labels it. */
+            if (rate == d->aac_rate_cand[si]) {
+                if (d->aac_rate_n[si] < 3 && ++d->aac_rate_n[si] == 3)
+                    d->aac_rate_stable[si] = rate;
+            } else {
+                d->aac_rate_cand[si] = rate;
+                d->aac_rate_n[si]    = 1;
+            }
+            rate = d->aac_rate_stable[si];
+            if (rate > 0 && ast->codecpar->sample_rate > 0 &&     /* lavf: frame_size / sample_rate (2048 for HE-AAC) */
+                av_rescale_q(ast->codecpar->frame_size > 0 ? ast->codecpar->frame_size : 1024,
+                             (AVRational){ 1, ast->codecpar->sample_rate }, ast->time_base) !=
+                av_rescale_q(1024, (AVRational){ 1, rate }, ast->time_base)) {
+                int64_t dur = av_rescale_q(1024, (AVRational){ 1, rate }, ast->time_base);
+                if (pkt->pos < 0 && d->aac_ok[si] && pkt->pts != AV_NOPTS_VALUE && pkt->pts != d->aac_next[si] &&
+                    !(pkt->flags & AV_PKT_FLAG_CORRUPT)) {
+                    if (rate != d->aac_rate[si]) {
+                        d->aac_rate[si] = rate;
+                        av_log(NULL, AV_LOG_WARNING, "[PTV-DEMUX] input '%s': stream #%d (pid 0x%x) AAC now %d Hz "
+                               "(lavf times its frames at %d Hz) — labels inside a PES re-derived from the ADTS "
+                               "header\n", d->url, si, ast->id, rate, ast->codecpar->sample_rate);
+                    }
+                    pkt->pts = pkt->dts = d->aac_next[si];
+                    d->aac_fixed++;
+                }
+                if (pkt->pts != AV_NOPTS_VALUE) {
+                    d->aac_next[si] = pkt->pts + dur;
+                    d->aac_ok[si]   = 1;
+                    pkt->duration   = dur;
+                }
+            } else
+                d->aac_ok[si] = 0;                 /* lavf's timing is right: nothing to chain */
+        }
         if (g_diag) {
             int64_t now = av_gettime_relative();
             if (now - diag_last >= 1000000) {

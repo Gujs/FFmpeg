@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.0-pre16"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.0-pre17"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -5585,7 +5585,16 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
          * seed an IMPOSSIBLE rate instead so the first cleanly decoded frame is guaranteed to
          * differ and route through the [PTV-AFMT] hysteresis+rebuild — the skip is self-healing
          * once the source recovers (ffmpeg-parity behavior) instead of permanent. */
-        if (a->use_fg || a->swr) {
+        if (a->use_fg) {
+            /* 2.0.0-pre17 T-347/T-349: the graph's input is fixed (set by build_audio_filter); the converter in front
+             * of it takes the probed source format — unknown/garbage params (a dead phase at open) leave it unformed,
+             * the first 5 confirmed clean frames form it [PTV-AFMT] */
+            a->cv_rate = -1;
+            if (a->dec->sample_rate > 0 && a->dec->sample_fmt != AV_SAMPLE_FMT_NONE && a->dec->ch_layout.nb_channels > 0 &&
+                ptv_cv_setup(a, a->dec->sample_rate, a->dec->sample_fmt, &a->dec->ch_layout) < 0)
+                av_log(NULL, AV_LOG_WARNING, "audio track %d: no converter for the probed format — forms from the first "
+                       "clean frames [PTV-AFMT]\n", k);
+        } else if (a->swr) {
             a->fg_in_rate = a->dec->sample_rate;   /* live path: seed real params (no false trigger on frame 1) */
             a->fg_in_fmt  = a->dec->sample_fmt;
             av_channel_layout_copy(&a->fg_in_chl, &a->dec->ch_layout);
@@ -6269,6 +6278,8 @@ end:
     }
     for (k = 0; k < n_audio; k++) {
         if (as[k].swr)  swr_free(&as[k].swr);
+        swr_free(&as[k].cv_swr);
+        av_channel_layout_uninit(&as[k].cv_chl);
         if (as[k].fifo) av_audio_fifo_free(as[k].fifo);
         avfilter_graph_free(&as[k].afg);
         for (r = 0; r < n_rung; r++)             /* shared encoders are aliased: free once */

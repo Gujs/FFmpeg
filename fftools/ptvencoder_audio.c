@@ -2312,7 +2312,8 @@ pll_emit:
                      * ACQUIRE + (b)'s re-seed already restore honesty within ~12s. */
                     if (g_rebuild_reanchor && a->reanch_wc &&
                         (a->multiview && g_audio_follow)) {
-                        a->reanch_wc = 0;                         /* mv follow: PLL owns it */
+                        a->reanch_wc = 0;                         /* mv follow: PLL owns it (a format switch's splice
+                                                                   * edit is returned exactly at the switch: T-352) */
                     } else if (g_rebuild_reanchor && a->reanch_wc) {
                         if (nowr - a->reanch_wc > PTV_REANCH_WIN_US) {
                             a->reanch_wc = 0;                     /* window closed — never fires late */
@@ -2918,10 +2919,99 @@ static void afmt_q_add(AudioState *a, const AVFrame *frame)
     }
 }
 
+/* 2.0.0-pre17 T-347/T-349: the source-format converter in front of the fixed-input graph (see cv_swr) */
+static int fmt_is(const AVFrame *f, int rate, enum AVSampleFormat fmt, const AVChannelLayout *chl)
+{
+    return f->sample_rate == rate && f->format == fmt && !av_channel_layout_compare(&f->ch_layout, chl);
+}
+
+/* the graph's fixed input params: 48 kHz float planar in the track's output layout */
+void ptv_graph_in_params(AudioState *a)
+{
+    a->fg_in_rate = 48000;
+    a->fg_in_fmt  = AV_SAMPLE_FMT_FLTP;
+    av_channel_layout_uninit(&a->fg_in_chl);
+    av_channel_layout_copy(&a->fg_in_chl, &a->out_chl);
+}
+
+/* (re)form the converter for a source format; rate <= 0 = not known yet (the first confirmed frames form it) */
+int ptv_cv_setup(AudioState *a, int rate, enum AVSampleFormat fmt, const AVChannelLayout *chl)
+{
+    swr_free(&a->cv_swr);
+    av_channel_layout_uninit(&a->cv_chl);
+    a->cv_rate = -1; a->cv_fmt = AV_SAMPLE_FMT_NONE;
+    if (rate <= 0 || fmt == AV_SAMPLE_FMT_NONE || !chl || chl->nb_channels <= 0)
+        return 0;
+    if (rate != a->fg_in_rate || fmt != a->fg_in_fmt || av_channel_layout_compare(chl, &a->fg_in_chl)) {
+        /* rematrix_maxval 1: a downmix is scaled to stay within full scale, as swr does for integer output — for
+         * float output it is NOT by default: a 5.1 ruler downmixed +7.8 dB hot (measured), and loudnorm then rode a
+         * level jump the source never had (the integer-output graph of pre16 got the scaled one) */
+        if (swr_alloc_set_opts2(&a->cv_swr, &a->fg_in_chl, a->fg_in_fmt, a->fg_in_rate,
+                                chl, fmt, rate, 0, NULL) < 0 ||
+            av_opt_set_double(a->cv_swr, "rematrix_maxval", 1.0, 0) < 0 || swr_init(a->cv_swr) < 0) {
+            swr_free(&a->cv_swr);
+            return AVERROR(EINVAL);
+        }
+    }
+    a->cv_rate = rate; a->cv_fmt = fmt;
+    av_channel_layout_copy(&a->cv_chl, chl);
+    return 0;
+}
+
+static int audio_feed(AudioState *a, AVFrame *frame);
+
+/* convert one source frame to the graph's input and feed it. Its label = the source label minus what the converter
+ * still holds (the output starts that much earlier in source time). */
+static int cv_feed(AudioState *a, const AVFrame *in)
+{
+    AVFrame *cv;
+    int64_t held_us;
+    int n, ret;
+    cv = av_frame_alloc();
+    if (!cv)
+        return AVERROR(ENOMEM);
+    av_frame_copy_props(cv, in);
+    cv->format      = a->fg_in_fmt;
+    cv->sample_rate = a->fg_in_rate;
+    av_channel_layout_copy(&cv->ch_layout, &a->fg_in_chl);
+    cv->nb_samples  = swr_get_out_samples(a->cv_swr, in->nb_samples);
+    if (cv->nb_samples <= 0 || av_frame_get_buffer(cv, 0) < 0) {
+        av_frame_free(&cv);
+        return 0;
+    }
+    held_us = swr_get_delay(a->cv_swr, 1000000);
+    n = swr_convert(a->cv_swr, cv->extended_data, cv->nb_samples, (const uint8_t **)in->extended_data, in->nb_samples);
+    if (n <= 0) {
+        av_frame_free(&cv);
+        return n;
+    }
+    cv->nb_samples = n;
+    if (in->pts != AV_NOPTS_VALUE)
+        cv->pts = in->pts - av_rescale_q(held_us, AV_TIME_BASE_Q, a->ist_tb);
+    if (in->best_effort_timestamp != AV_NOPTS_VALUE)
+        cv->best_effort_timestamp = in->best_effort_timestamp - av_rescale_q(held_us, AV_TIME_BASE_Q, a->ist_tb);
+    cv->duration = av_rescale_q(n, (AVRational){ 1, a->fg_in_rate }, a->ist_tb);
+    a->cv_feeding = 1;
+    ret = audio_feed(a, cv);
+    a->cv_feeding = 0;
+    av_frame_free(&cv);
+    return ret;
+}
+
 static int audio_feed(AudioState *a, AVFrame *frame)
 {
     uint8_t **out = NULL;
     int out_max, got, ret = 0;
+    if (a->cv_feeding)
+        goto graph_in;                             /* a converted frame: vetted by its source frame's pass */
+    if (a->multiview && g_audio_follow && a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO) {   /* T-352 ledger history */
+        int64_t hw = av_gettime_relative();
+        if (hw - a->ea_hist_wc[(a->ea_hist_i + PTV_EA_HIST - 1) % PTV_EA_HIST] >= 500000) {
+            a->ea_hist_wc[a->ea_hist_i] = hw;
+            a->ea_hist_v[a->ea_hist_i]  = atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed);
+            a->ea_hist_i = (a->ea_hist_i + 1) % PTV_EA_HIST;
+        }
+    }
     if (frame->best_effort_timestamp != AV_NOPTS_VALUE)
         a->dbg_last_src = frame->best_effort_timestamp;   /* probe: latest fed source pts */
     /* 2.0.0-pre6/pre8.1: real frames after a filled hold must meet the POST-rejoin house_skew. It is written on the
@@ -2963,6 +3053,116 @@ static int audio_feed(AudioState *a, AVFrame *frame)
             }
         }
         rj_flush(a);
+    }
+
+    /* 2.0.0-pre17 T-347/T-349: with a graph, a source format switch only re-forms the converter in front of it (same
+     * 5-frame hysteresis: a lone corrupt frame is held, not converted into a noise burst). The graph and its state
+     * (loudnorm, aresample history, the anchor) carry on. The full rebuild below remains for a torn-down / failed
+     * path (ACHOP, init failure → plain swr). */
+    if (a->use_fg && a->afg) {
+        if (a->hold_feeding || a->nbs_feeding)
+            goto graph_in;                         /* fills are synthesized in the graph's own format */
+        /* the source's CURRENT format is cv_* (also when it is the graph's own: no converter then). A change — a
+         * return to the graph's format included — is a switch: confirmed, re-anchored (measured: the 5.1 -> stereo
+         * return taken as plain frames left its splice -107 ms absorbed, +128 ms late for good) */
+        {
+            int same_pending;
+            if (a->cv_rate > 0 && fmt_is(frame, a->cv_rate, a->cv_fmt, &a->cv_chl)) {
+                if (a->afmt_stable) {              /* a candidate that did not confirm: transient */
+                    a->afmt_stable = 0;
+                    afmt_q_reset(a);
+                    av_channel_layout_uninit(&a->afmt_pending_chl);
+                    a->afmt_pending_rate = 0; a->afmt_pending_fmt = AV_SAMPLE_FMT_NONE;
+                }
+                if (a->cv_swr)
+                    return cv_feed(a, frame);
+                goto graph_in;
+            }
+            same_pending = a->afmt_stable && fmt_is(frame, a->afmt_pending_rate, a->afmt_pending_fmt, &a->afmt_pending_chl);
+            if (!same_pending) {
+                a->afmt_pending_rate = frame->sample_rate;
+                a->afmt_pending_fmt  = frame->format;
+                av_channel_layout_uninit(&a->afmt_pending_chl);
+                av_channel_layout_copy(&a->afmt_pending_chl, &frame->ch_layout);
+                a->afmt_stable = 1;
+                afmt_q_reset(a);
+                afmt_q_add(a, frame);
+                return 0;
+            }
+            if (++a->afmt_stable < PTV_AFMT_HYSTERESIS) {
+                afmt_q_add(a, frame);
+                return 0;
+            }
+            {
+                char ochl[64], nchl[64], gchl[64];
+                int qi, qn = a->afmt_qn, qret = 0;
+                AVFrame *q[PTV_AFMT_QMAX];
+                if (a->cv_rate > 0)
+                    av_channel_layout_describe(&a->cv_chl, ochl, sizeof ochl);
+                else
+                    snprintf(ochl, sizeof ochl, "unknown");
+                av_channel_layout_describe(&frame->ch_layout, nchl, sizeof nchl);
+                av_channel_layout_describe(&a->fg_in_chl, gchl, sizeof gchl);
+                av_log(NULL, AV_LOG_WARNING,
+                       "[PTV-AFMT] a%d(in%d) audio input changed %dHz %s %s -> %dHz %s %s (confirmed %d frames) — "
+                       "%s %s/%dHz in front of the unchanged audio path\n", a->dbg_k, a->dbg_in,
+                       a->cv_rate > 0 ? a->cv_rate : a->fg_in_rate,
+                       a->cv_rate > 0 ? av_get_sample_fmt_name(a->cv_fmt) : av_get_sample_fmt_name(a->fg_in_fmt), ochl,
+                       frame->sample_rate, av_get_sample_fmt_name(frame->format), nchl, a->afmt_stable,
+                       fmt_is(frame, a->fg_in_rate, a->fg_in_fmt, &a->fg_in_chl) ? "no conversion: it is the" : "converted to",
+                       gchl, a->fg_in_rate);
+                a->afmt_stable = 0;
+                av_channel_layout_uninit(&a->afmt_pending_chl);
+                a->afmt_pending_rate = 0; a->afmt_pending_fmt = AV_SAMPLE_FMT_NONE;
+                memcpy(q, a->afmt_q, qn * sizeof(*q));
+                a->afmt_qn = 0;
+                if (ptv_cv_setup(a, frame->sample_rate, frame->format, &frame->ch_layout) < 0) {
+                    av_log(NULL, AV_LOG_ERROR, "[PTV-AFMT] a%d(in%d) converter for the new format failed — frames "
+                           "dropped until the next format\n", a->dbg_k, a->dbg_in);
+                    for (qi = 0; qi < qn; qi++)
+                        av_frame_free(&q[qi]);
+                    return 0;
+                }
+                a->cv_switches++;
+                /* a format switch is a splice: the source's own labels are its A/V truth from here on, as at a
+                 * rebuild (1.0.1-pre20) — measured: the splice's audio steps back 171 ms (overlap), the demux absorbs
+                 * it as continuous, and without the re-anchor the new stretch stayed +192 ms late for good. The graph
+                 * carries on, so no emission guard (its aresample drops the overlap and keeps the output monotonic). */
+                a->afmt_rebuilds++;                /* corrector event (§4.4) */
+                ptv_rebuild_reanchor(a, qn ? q[0] : frame);
+                if (a->multiview && g_audio_follow && a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO) {
+                    /* T-352: the demux absorbed the splice's audio step as continuous (a label edit, posted to the ea
+                     * ledger); the slot's PLL reads the label-domain pairing and cannot see it (MV sync_aswitch_1:
+                     * +348 ms for good). At a format switch the source's labels are the truth: return exactly the
+                     * ledger change of the last ~4 s (the demux reads ahead of the decoder) to the labels. The PLL
+                     * keeps running (measured: it does not re-track the step; a forced stale-mark instead locked in the
+                     * moment's reading: +68 ms for good on a switch WITHOUT an edit, sync_aswitch_96). */
+                    int64_t nw = av_gettime_relative(), ea_now, ea_then = AV_NOPTS_VALUE, best = INT64_MAX;
+                    int hi;
+                    ea_now = atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed);
+                    for (hi = 0; hi < PTV_EA_HIST; hi++) {
+                        int64_t age = nw - a->ea_hist_wc[hi];
+                        if (a->ea_hist_wc[hi] && age >= 4000000 && age < best) {
+                            best = age;
+                            ea_then = a->ea_hist_v[hi];
+                        }
+                    }
+                    if (ea_then != AV_NOPTS_VALUE && ea_now != ea_then) {
+                        a->glue_off_us -= ea_now - ea_then;
+                        a->acomp_exp_us = AV_NOPTS_VALUE;     /* deliberate, not a click risk */
+                        av_log(NULL, AV_LOG_WARNING, "[PTV-AFMT] a%d(in%d) splice edit %+"PRId64"ms returned to the "
+                               "labels at the switch (mosaic slot: the source's labels are its A/V truth)\n",
+                               a->dbg_k, a->dbg_in, (ea_now - ea_then) / 1000);
+                    }
+                }
+                for (qi = 0; qi < qn; qi++) {
+                    if (qret >= 0)
+                        qret = audio_feed(a, q[qi]);
+                    av_frame_free(&q[qi]);
+                }
+                return qret < 0 ? qret : audio_feed(a, frame);
+            }
+        }
     }
 
     /* Source audio format change (stereo↔mono, sample-rate, fmt) at a splice: the graph/swr was
@@ -3092,10 +3292,17 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                            "disables)\n",
                            a->dbg_k, a->dbg_in, a->afmt_rebuilds, a->afmt_backoff_us / 1e6);
             }
-            a->fg_in_rate = a->dec->sample_rate;   /* the path is now configured for these */
-            a->fg_in_fmt  = a->dec->sample_fmt;
-            av_channel_layout_uninit(&a->fg_in_chl);
-            av_channel_layout_copy(&a->fg_in_chl, &a->dec->ch_layout);
+            if (a->use_fg) {                       /* pre17: the rebuilt graph takes the fixed input, the converter the source */
+                ptv_graph_in_params(a);
+                if (ptv_cv_setup(a, frame->sample_rate, frame->format, &frame->ch_layout) < 0)
+                    av_log(NULL, AV_LOG_ERROR, "[PTV-AFMT] a%d(in%d) converter for the rebuilt path failed\n",
+                           a->dbg_k, a->dbg_in);
+            } else {
+                a->fg_in_rate = a->dec->sample_rate;   /* the path is now configured for these */
+                a->fg_in_fmt  = a->dec->sample_fmt;
+                av_channel_layout_uninit(&a->fg_in_chl);
+                av_channel_layout_copy(&a->fg_in_chl, &a->dec->ch_layout);
+            }
             av_channel_layout_uninit(&a->afmt_pending_chl);
             a->afmt_pending_rate = 0; a->afmt_pending_fmt = AV_SAMPLE_FMT_NONE;
             /* 1.0.1-pre20: the rebuilt path gets a BIRTH-EQUIVALENT base derived from the
@@ -3130,9 +3337,10 @@ static int audio_feed(AudioState *a, AVFrame *frame)
              * than a->dec's layout means reads through nonexistent plane pointers. If the
              * frame no longer matches the just-configured input params, drop it; the next
              * frame re-enters the normal AFMT detection. */
-            if (frame->sample_rate != a->fg_in_rate ||
-                frame->format      != a->fg_in_fmt  ||
-                av_channel_layout_compare(&frame->ch_layout, &a->fg_in_chl)) {
+            if (!a->use_fg &&                      /* pre17: a graph takes it through the converter */
+                (frame->sample_rate != a->fg_in_rate ||
+                 frame->format      != a->fg_in_fmt  ||
+                 av_channel_layout_compare(&frame->ch_layout, &a->fg_in_chl))) {
                 av_log(NULL, AV_LOG_WARNING,
                        "[PTV-AFMT] a%d(in%d) decoder context diverged from the confirmed frame "
                        "params during rebuild — frame dropped, detection re-arms\n",
@@ -3186,6 +3394,8 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                 if (qret < 0)
                     return qret;
             }
+            if (a->use_fg)                         /* pre17: this frame, too, goes through the converter */
+                return audio_feed(a, frame);
         }
     } else if (a->afmt_stable) {                   /* params returned to normal → transient filtered out */
         a->afmt_stable = 0;
@@ -3194,6 +3404,7 @@ static int audio_feed(AudioState *a, AVFrame *frame)
         a->afmt_pending_rate = 0; a->afmt_pending_fmt = AV_SAMPLE_FMT_NONE;
     }
 
+graph_in:
     if (a->use_fg) {
         /* -af: feed the graph; aresample async + loudness emit fixed-size frames
          * whose PTS already carries async's A/V correction — drain them straight
@@ -4590,11 +4801,15 @@ int build_audio_filter(AudioState *a, AVCodecContext *adec, AVRational tb,
     a->afg = avfilter_graph_alloc();
     if (!a->afg) { ret = AVERROR(ENOMEM); goto end; }
 
-    av_channel_layout_describe(&adec->ch_layout, chl, sizeof chl);
+    /* 2.0.0-pre17 T-347/T-349: the input is FIXED (48 kHz fltp, the track's output layout) — the source format is
+     * converted in front of it (cv_swr), so the graph is the same whatever the source carries, now or later */
+    (void)adec;
+    ptv_graph_in_params(a);
+    av_channel_layout_describe(&a->fg_in_chl, chl, sizeof chl);
     snprintf(args, sizeof args,
              "time_base=%d/%d:sample_rate=%d:sample_fmt=%s:channel_layout=%s",
-             tb.num, tb.den, adec->sample_rate,
-             av_get_sample_fmt_name(adec->sample_fmt), chl);
+             tb.num, tb.den, a->fg_in_rate,
+             av_get_sample_fmt_name(a->fg_in_fmt), chl);
     if ((ret = avfilter_graph_create_filter(&a->afsrc, bsrc, "in", args, NULL, a->afg)) < 0) goto end;
     if ((ret = avfilter_graph_create_filter(&a->afsink, bsink, "out", NULL, NULL, a->afg)) < 0) goto end;
 
