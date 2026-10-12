@@ -1691,13 +1691,37 @@ static int audio_drain_fg(AudioState *a)
                     if (!a->pll_seed) { a->pll_ema = off; a->pll_dbnc_ref = off; a->pll_seed = 1; }
                     else a->pll_ema += (off - a->pll_ema) >> g_pll_ema_shift;   /* smooth ±vlag jitter (N6: toward −∞, sub-ms, negligible) */
                     a->pll_raw[a->pll_raw_n++ % 32] = off;
+                    /* 2.0.0 T-339: a LEVEL STEP is not noise. A slot's source restart moved the offset +39 → +1832 ms in one
+                     * reading (probe); the step fed the noise estimate (dev 3 → 556 ms), the noise-adaptive threshold rose to
+                     * its 1500 ms cap, and the ACQUIRE waited for the EMA (tau ~2.7 s) to climb past it: 7.9 s of audio 1.8 s
+                     * early. When the last 8 readings agree with each other (within the tick quantum) but sit far from the
+                     * EMA, the EMA is re-seeded at their median and the step is kept out of the noise estimate: the
+                     * large-and-flat test then passes on its own windows (~2 s). A jittery leg never agrees: unchanged */
+                    int pll_level = 0;
+                    if (a->pll_raw_n >= 8) {
+                        int64_t w[8], band = FFMAX(g_pll_acquire_us, a->tick_dur_us > 0 ? 3 * a->tick_dur_us / 2 : 0);
+                        int x, y;
+                        for (x = 0; x < 8; x++)
+                            w[x] = a->pll_raw[(a->pll_raw_n - 1 - x) % 32];
+                        for (x = 1; x < 8; x++) {                       /* insertion sort */
+                            int64_t t = w[x];
+                            for (y = x; y > 0 && w[y - 1] > t; y--) w[y] = w[y - 1];
+                            w[y] = t;
+                        }
+                        if (w[7] - w[0] <= band && FFABS(w[4] - a->pll_ema) > 4 * band) {
+                            a->pll_ema      = w[4];
+                            a->pll_dbnc_ref = w[4];
+                            pll_level       = 1;
+                        }
+                    }
                     /* v0.6.22: NOISE-ADAPTIVE acquire threshold. Track the leg's offset jitter (slow EMA of
                      * |off−ema|, seeded 0 so it ramps AFTER the startup bank is caught) and raise the threshold
                      * above it: thr = max(g_pll_acquire_us, k·dev), capped. Clean legs (dev≈0) keep the tight
                      * 40ms; jittery legs (dev ~150ms) get thr ~450ms so steady-state noise can't re-fire the
                      * acquire (the 0.6.20/0.6.21 limit cycle) — while the big DC startup bank still acquires
                      * while dev is still low. */
-                    a->pll_dev += (FFABS(off - a->pll_ema) - a->pll_dev) >> g_pll_dev_shift;
+                    if (!pll_level)
+                        a->pll_dev += (FFABS(off - a->pll_ema) - a->pll_dev) >> g_pll_dev_shift;
                     int64_t thr = (int64_t)g_pll_acquire_us;
                     /* 1.0.1: TICK-QUANTIZATION dead-band. vlag (the video half of the measured
                      * offset) is quantized to the house video tick — the vring records first-
