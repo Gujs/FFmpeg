@@ -5,6 +5,29 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre18 — pre17 + switch overlap trim, burst-source startup, PES alignment, loudlive (opt-in)
+
+- **A format switch on a low-latency audio chain no longer puts a backward audio step on the wire.** pre17 keeps the
+  graph running through a switch; a splice that overlaps by less than 30 ms (an AAC encoder's priming frame, or the
+  first frames after a rate switch still timed at the old rate) passed stock `aresample=async` as an overlap. loudnorm
+  (the fleet default) hid it; without it (`SV_LOUDNORM=false`, loudlive) the switch suite failed 2 of 6. The overlap is
+  now trimmed at the graph door over the switch replay; labels unchanged. Switch suite 16/16 on both chains.
+- **Burst-source startup (T-316 part 1).** Audio decoded before the start (h0) was replayed only by the NEXT audio
+  frame — on a bursty source the next burst, seconds later; it is now replayed at once (pre-h0 ring 256 → 576). The
+  frame queue is lossless for the first 30 s, so a startup burst is buffered, never skipped (it was a video PTS hole).
+- **Every video and audio PES carries data_alignment_indicator (T-325, new patch 0007).** Metropolitan's monitor counted
+  "Align. err" on every ptvencoder output (0 on provider channels): lavf's mpegts muxer set the flag only on subtitle /
+  data PES. Muxed size and content unchanged; FATE lavf-ts reference updated.
+- **New filter `loudlive` (T-353, new patch 0008) — not used unless a channel opts in** (ptvencoder.sh
+  `SV_LOUDNORM_LIVE=true`): loudnorm's gain law without its 3 s lookahead, so the audio PID no longer goes dark ~3 s at
+  every input pause (bursty sources: max audio gap 0.06–0.20 s vs 2.9–3.2 s). Same level as loudnorm within 0.2 LU on
+  3.6 h of channel audio, −2 dBTP (limiter at 192 kHz), 2.4× less CPU. Owner listening before any channel uses it.
+- Release gate (frozen kit `6202071`, all 206 keys, on the upstream-patched candidate with all eight patches): against
+  pre17, 5 fixed (vt/bursty; burstjump 50 / 59.94, kill_return_20 50 and gap2_10 59.94 content live share) and 3 changed:
+  two multiview cases (mv02 gap_20, mv04 flapping) PASS 3/3 on reruns (known intermittents); rich2997b
+  jump_return_50 loses one DVB subtitle (marker 20) intermittently — pre18 2 of 5 runs, pre17 1 of 8, pre16 0 of 4 (more
+  reruns in the README). Package smoke = pre17's (+ low-latency switches, loudlive on bursts, PES alignment PASS).
+
 ## 2.0.0-pre17 — pre16 + audio format switches without a graph rebuild (sample rate, channel layout, codec)
 
 - **A source audio format switch no longer rebuilds the -af graph (T-347 / T-348 / T-349).** Every source format is now
