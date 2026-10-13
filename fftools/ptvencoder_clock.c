@@ -1481,10 +1481,6 @@ void *output_thread(void *arg)
                                       ? av_rescale(vpts, 1000000LL * v->out_fps.den, v->out_fps.num)
                                       : vpts * v->tick_dur_us, memory_order_relaxed);
                 atomic_store_explicit(&g_house_tick_us, v->tick_dur_us, memory_order_relaxed);
-                /* 2.0.0 T-316: on held pictures too — the copies on the last picture before the hold go out now, not
-                 * after it (the demux thread sleeps in the read meanwhile) */
-                if (g_vmap && !fresh && !v->passthrough && v->hold_da)
-                    ptv_copy_vwait(v->hold_da);
             }
             if (src_ts != AV_NOPTS_VALUE)   /* [PTV-CHAIN] video source-content being emitted (us); any rung (same content) */
                 atomic_store_explicit(&g_ch_vout_src, av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q), memory_order_relaxed);

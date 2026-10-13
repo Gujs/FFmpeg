@@ -3420,7 +3420,10 @@ void *demux_thread(void *arg)
             int active = d->rj_skip != 1;
             int64_t vs = atomic_load_explicit(&g_ch_vsrc, memory_order_relaxed);
             int64_t vo = atomic_load_explicit(&g_ch_vout_src, memory_order_relaxed), ref;
+            int64_t tick = atomic_load_explicit(&g_house_tick_us, memory_order_relaxed);
             int fresh;
+            if (tick <= 0 && vst->avg_frame_rate.num > 0)   /* before the first output tick (a start-up burst) */
+                tick = av_rescale(1000000, vst->avg_frame_rate.den, vst->avg_frame_rate.num);
             if (vo != d->door_vo) {
                 d->door_vo    = vo;
                 d->door_vo_wc = nw;
@@ -3454,9 +3457,14 @@ void *demux_thread(void *arg)
             }
             if (!active || maxd <= 0) {
                 d->door = 0;
-            } else if (d->door != 1 && isv && raw != AV_NOPTS_VALUE && vs && ref && vs - ref > maxd) {
+            } else if (d->door != 1 && isv && raw != AV_NOPTS_VALUE && vs && ref && vs - ref > maxd &&
+                       (int64_t)(av_thread_message_queue_nb_elems(d->video_q) +
+                                 atomic_load_explicit(&g_frameq_depth, memory_order_relaxed)) * tick >= maxd - 2000000) {
                 /* also right after a resume: a whole burst can arrive while the other streams finish that cut
-                 * (59.94: it did, and the video queue shed on its own again) */
+                 * (59.94: it did, and the video queue shed on its own again). The labels alone are not enough: the
+                 * frames actually buffered must hold most of the max delay too — a label jump with nothing queued is
+                 * not a burst (pre19 gate: a LIVE LOSS rejoin's lone pre-gap tail on air read 20.1 s, a bit-flipped
+                 * PTS 93.9 s; the door cut live content: a 0.8 s video PTS hole, lip sync −3.4 s) */
                 d->door     = 1;
                 d->door_raw0 = out->pts != AV_NOPTS_VALUE ? out->pts : raw;   /* PTS: the clock vs and the copies use */
                 d->door_us0  = vs;
