@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.0-pre17"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.0-pre18"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -3127,7 +3127,7 @@ static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
             if (i == d->n_rung - 1) { out = av_frame_alloc(); if (out) av_frame_move_ref(out, frame); }
             else                    { out = av_frame_clone(frame); }
             if (out && i == 0) atomic_store_explicit(&g_fq0_tail_pts, out->pts, memory_order_relaxed);
-            if (out) push_frame_q(d->frame_q[i], ((d->deep_prime_packets > 0 || atomic_load_explicit(&g_bank_pkts, memory_order_relaxed) > 0) && i == 0) ? 0 : d->live, &d->framedrop[i], out);
+            if (out) push_frame_q(d->frame_q[i], ((d->deep_prime_packets > 0 || atomic_load_explicit(&g_bank_pkts, memory_order_relaxed) > 0 || ptv_fq_startup_lossless()) && i == 0) ? 0 : d->live, &d->framedrop[i], out);
             else if (i == d->n_rung - 1) av_frame_unref(frame);
         }
         return;
@@ -3145,7 +3145,7 @@ static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
             }
             out = av_frame_alloc();
             if (out && i == 0) atomic_store_explicit(&g_fq0_tail_pts, filt->pts, memory_order_relaxed);
-            if (out) { av_frame_move_ref(out, filt); push_frame_q(d->frame_q[i], ((d->deep_prime_packets > 0 || atomic_load_explicit(&g_bank_pkts, memory_order_relaxed) > 0) && i == 0) ? 0 : d->live, &d->framedrop[i], out); }
+            if (out) { av_frame_move_ref(out, filt); push_frame_q(d->frame_q[i], ((d->deep_prime_packets > 0 || atomic_load_explicit(&g_bank_pkts, memory_order_relaxed) > 0 || ptv_fq_startup_lossless()) && i == 0) ? 0 : d->live, &d->framedrop[i], out); }
             else     { av_frame_unref(filt); }
         }
     }
@@ -3725,7 +3725,7 @@ static void *decode_thread(void *arg)
         for (i = 0; i < d->n_rung; i++)
             while (av_buffersink_get_frame(d->fsink[i], filt) >= 0) {
                 AVFrame *out = filt->opaque == &ptv_hold_tag ? NULL : av_frame_alloc();   /* pre9: no hold picture */
-                if (out) { av_frame_move_ref(out, filt); push_frame_q(d->frame_q[i], ((d->deep_prime_packets > 0 || atomic_load_explicit(&g_bank_pkts, memory_order_relaxed) > 0) && i == 0) ? 0 : d->live, &d->framedrop[i], out); }
+                if (out) { av_frame_move_ref(out, filt); push_frame_q(d->frame_q[i], ((d->deep_prime_packets > 0 || atomic_load_explicit(&g_bank_pkts, memory_order_relaxed) > 0 || ptv_fq_startup_lossless()) && i == 0) ? 0 : d->live, &d->framedrop[i], out); }
                 else     { av_frame_unref(filt); }
             }
     }

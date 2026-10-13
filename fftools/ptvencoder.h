@@ -994,6 +994,9 @@ typedef struct AudioState {
     AVChannelLayout  cv_chl;
     int              cv_feeding;           /* audio_feed re-entered with a converted frame */
     int              cv_switches;          /* source format switches taken by the converter */
+    int              cv_trim_left;         /* single input: frames after a converter switch (its replay) trimmed to the */
+    int64_t          cv_trim_exp_us;       /* door's expected next label (a splice overlap must not reach the graph) */
+    int64_t          cv_trim_us;           /* overlap trimmed at switches (total, us) */
     /* 2.0.0-pre18 T-352: the ea ledger sampled every 0.5 s (mosaic slots) — the splice edit a format switch returns */
 #define PTV_EA_HIST 16
     int64_t          ea_hist_v[PTV_EA_HIST], ea_hist_wc[PTV_EA_HIST];
@@ -2403,6 +2406,7 @@ void dlv_video_cfg(DlvGate *g, int64_t band_us, int64_t cap_us, int vmaxq);   /*
 int  dlv_video_deliver(DlvGate *g, AVPacket *pkt, int64_t dts_us);            /* §7.5b: video output thread only */
 void dlv_video_drain(DlvGate *g);                                             /* §7.5b: video output thread only */
 void cushion_escalate(CushionEvent ev, int64_t a0, int64_t a1);
+int  ptv_fq_startup_lossless(void);
 void push_frame_q(AVThreadMessageQueue *q, int live, int64_t *framedrop, AVFrame *out);
 void resolve_cushions(CushionPlan *cp, int live, int multiview,
                       AVRational out_fps, int n_audio);

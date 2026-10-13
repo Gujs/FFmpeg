@@ -1789,8 +1789,10 @@ static void mpegts_write_pes(AVFormatContext *s, AVStream *st,
                 *q++ = len >> 8;
                 *q++ = len;
                 val  = 0x80;
-                /* data alignment indicator is required for subtitle and data streams */
-                if (st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE || st->codecpar->codec_type == AVMEDIA_TYPE_DATA)
+                /* data alignment indicator is required for subtitle and data streams; a video or audio
+                 * PES also always starts with the first byte of a packet (an access unit / a syncword) */
+                if (st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE || st->codecpar->codec_type == AVMEDIA_TYPE_DATA ||
+                    st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO    || st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
                     val |= 0x04;
                 *q++ = val;
                 *q++ = flags;

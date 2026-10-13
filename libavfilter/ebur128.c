@@ -628,6 +628,21 @@ int ff_ebur128_loudness_shortterm(FFEBUR128State * st, double *out)
     return 0;
 }
 
+int ff_ebur128_loudness_momentary(FFEBUR128State * st, double *out)
+{
+    double energy;
+    int error = ebur128_energy_in_interval(st, st->d->samples_in_100ms * 4,
+                                           &energy);
+    if (error) {
+        return error;
+    } else if (energy <= 0.0) {
+        *out = -HUGE_VAL;
+        return 0;
+    }
+    *out = ebur128_energy_to_loudness(energy);
+    return 0;
+}
+
 /* EBU - TECH 3342 */
 int ff_ebur128_loudness_range_multiple(FFEBUR128State ** sts, size_t size,
                                        double *out)

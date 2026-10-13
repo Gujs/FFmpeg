@@ -5852,6 +5852,53 @@ Modify the @var{N}-th control value.
 If the specified value is not valid, it is ignored and prior one is kept.
 @end table
 
+@section loudlive
+
+EBU R128 loudness normalization for live streams, without lookahead.
+
+The gain follows the law of the loudnorm filter's dynamic mode: target minus the
+integrated loudness, with short-term excursions of more than half the loudness
+range pulled back to target plus or minus half the range. The gain is updated
+every 100 ms, smoothed, and applied to the samples as they arrive, so the filter
+adds no latency and holds no audio when its input pauses. It is held while the
+input is below the relative gate. Because a sudden loud passage reaches the
+short-term loudness only gradually, the momentary loudness also caps the gain at
+once (see @option{fast}). Peaks are not limited; follow this filter with the
+alimiter filter.
+
+The filter accepts the following options:
+
+@table @option
+@item I, i
+Set the integrated loudness target. Range is -70.0 - -5.0. Default value is -24.0.
+
+@item LRA, lra
+Set the loudness range target. Range is 1.0 - 50.0. Default value is 7.0.
+
+@item smooth
+Set the time constant of the gain smoothing, in seconds. Range is 0 - 10.
+Default value is 0.4.
+
+@item fast
+Set how far, in LU, the momentary loudness of the output may rise above the
+target plus half the loudness range before the gain is cut at once. Range is
+0 - 99. Default value is 0.
+
+@item dual_mono
+Treat mono input as dual-mono, as loudnorm does. Default is false.
+@end table
+
+@subsection Example
+
+@itemize
+@item
+Normalize to -23 LUFS with true peaks at most -2 dBTP (the limiter runs
+oversampled, so it sees the peaks between samples):
+@example
+loudlive=I=-23:LRA=11,aresample=192000,alimiter=limit=0.794:level=0:latency=1,aresample=48000
+@end example
+@end itemize
+
 @section loudnorm
 
 EBU R128 loudness normalization. Includes both dynamic and linear normalization modes.

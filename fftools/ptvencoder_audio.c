@@ -3127,7 +3127,16 @@ static int audio_feed(AudioState *a, AVFrame *frame)
                 /* a format switch is a splice: the source's own labels are its A/V truth from here on, as at a
                  * rebuild (1.0.1-pre20) — measured: the splice's audio steps back 171 ms (overlap), the demux absorbs
                  * it as continuous, and without the re-anchor the new stretch stayed +192 ms late for good. The graph
-                 * carries on, so no emission guard (its aresample drops the overlap and keeps the output monotonic). */
+                 * carries on, so the overlap must not reach it: aresample=async drops an overlap only above
+                 * min_hard_comp (30 ms); a smaller one — an AAC encoder's priming frame at the splice, 21.3 ms measured —
+                 * passes as a backward step onto the wire (stock aresample, reproduced with ffmpeg; loudnorm's
+                 * re-stamping hid it, any low-latency chain shows it). Single input: trim it at the door (below). */
+                if (!a->multiview && a->acomp_exp_us != AV_NOPTS_VALUE) {
+                    a->cv_trim_left   = qn + 1;   /* the replay: after a rate switch its first frames still carry
+                                                   * lavf's old-rate timing (half-length steps) until the demux
+                                                   * relabel has 3 stable headers — measured −10.7 ms twice at 96→48 */
+                    a->cv_trim_exp_us = a->acomp_exp_us;
+                }
                 a->afmt_rebuilds++;                /* corrector event (§4.4) */
                 ptv_rebuild_reanchor(a, qn ? q[0] : frame);
                 if (a->multiview && g_audio_follow && a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO) {
@@ -4067,6 +4076,31 @@ graph_in:
                 a->mvf_hi_us = door_us;
             }
         }
+        /* pre18: the overlap of a splice the converter took (armed at the switch for its replay) — a frame's head
+         * that lies before the door's expected next label (the end of the frame fed before it) is dropped; the
+         * rest keeps its labels (what aresample's hard compensation does above 30 ms, for any size up to 1 s).
+         * A frame wholly inside the overlap is dropped. */
+        if (a->cv_trim_left > 0 && frame->pts != AV_NOPTS_VALUE && frame->sample_rate > 0) {
+            int64_t exp = a->acomp_exp_us != AV_NOPTS_VALUE ? a->acomp_exp_us : a->cv_trim_exp_us;
+            int64_t ov  = exp - av_rescale_q(frame->pts, a->ist_tb, AV_TIME_BASE_Q);
+            int64_t k   = ov > 0 && ov <= 1000000 ? av_rescale(ov, frame->sample_rate, 1000000) : 0;
+            a->cv_trim_left--;
+            if (k >= frame->nb_samples) {
+                a->cv_trim_us += av_rescale(frame->nb_samples, 1000000, frame->sample_rate);
+                return 0;
+            }
+            if (k > 0) {
+                if ((ret = av_frame_make_writable(frame)) < 0)
+                    return ret;
+                av_samples_copy(frame->extended_data, frame->extended_data, 0, (int)k,
+                                frame->nb_samples - (int)k, frame->ch_layout.nb_channels, frame->format);
+                frame->nb_samples -= (int)k;
+                frame->pts += av_rescale_q(k, (AVRational){ 1, frame->sample_rate }, a->ist_tb);
+                a->cv_trim_us += av_rescale(k, 1000000, frame->sample_rate);
+                av_log(NULL, AV_LOG_INFO, "[PTV-AFMT] a%d(in%d) splice overlap %.1f ms trimmed at the switch "
+                       "(labels kept; total %.1f ms)\n", a->dbg_k, a->dbg_in, ov / 1000.0, a->cv_trim_us / 1000.0);
+            }
+        }
         /* 1.0.1-pre3 [PTV-ACOMP] — swr hard-compensation proxy (always-on, log rate-limited to
          * ~1/10s per track). aresample=async realizes a graph-input pts step beyond
          * min_hard_comp (~30ms in the production chain) as an INSTANTANEOUS sample insert/drop
@@ -4666,6 +4700,27 @@ static void hold_fill_quantum(AudioState *a)
         atomic_store_explicit(&g_afill_us[a->dbg_k], a->hold_fill_us, memory_order_relaxed);
 }
 
+/* 2.0.0-pre18 T-316: replay the pre-h0 ring as soon as h0 is known. It used to be replayed only by the NEXT
+ * decoded audio frame — 21 ms later on a steady source, but on a burst source the whole first burst sits in the
+ * ring and the next frame comes with the next burst: no audio on the output for 8 s (sync_bursty_8: video released
+ * alone after 6 s, the first segments without audio, a default-probing HLS segmenter could not open the output). */
+static int aq_replay_if_anchored(AudioState *a)
+{
+    int64_t h0;
+    int i, ret = 0;
+    if (a->pts_set || !a->aq_npending)
+        return 0;
+    pthread_mutex_lock(a->h0_lock); h0 = *a->h0; pthread_mutex_unlock(a->h0_lock);
+    if (h0 == AV_NOPTS_VALUE)
+        return 0;
+    for (i = 0; i < a->aq_npending; i++) {
+        if (ret >= 0) ret = audio_anchor_and_feed(a, a->aq_pending[i], h0);
+        av_frame_free(&a->aq_pending[i]);
+    }
+    a->aq_npending = 0;
+    return ret;
+}
+
 void *audio_thread(void *arg)
 {
     AudioState *a = arg;
@@ -4676,7 +4731,17 @@ void *audio_thread(void *arg)
     if (!frame)
         goto done;
     for (;;) {
-        ret = av_thread_message_queue_recv(a->audio_q, &pkt, 0);
+        if (!a->pts_set && a->aq_npending) {       /* T-316: frames wait for h0 — poll, replay the moment it is known */
+            ret = av_thread_message_queue_recv(a->audio_q, &pkt, AV_THREAD_MESSAGE_NONBLOCK);
+            if (ret == AVERROR(EAGAIN)) {
+                if ((ret = aq_replay_if_anchored(a)) < 0)
+                    break;
+                if (!a->pts_set)
+                    av_usleep(5000);
+                continue;
+            }
+        } else
+            ret = av_thread_message_queue_recv(a->audio_q, &pkt, 0);
         if (ret < 0) break;
         if (pkt && (pkt->flags & PTV_PKT_FLAG_NBS_FILL)) {
             /* pre15 §3 FILL sentinel — NOT a packet: must not feed the decoder and must not
