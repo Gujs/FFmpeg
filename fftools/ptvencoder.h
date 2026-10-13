@@ -2210,6 +2210,9 @@ int  ptv_hold_slate_load(const char *path);
 void ptv_hold_render(DecodeCtx *d);      /* decode thread, video_q empty: render one picture when due */
 void ptv_hold_note_frame(DecodeCtx *d, const AVFrame *frame);   /* emit_video: a real decoded frame */
 void ptv_hold_route(AVFrame *out, int rung);   /* a rendered picture leaving the graph → the rung's slot */
+AVFrame *ptv_hold_cell_pic(void **state, const AVFrame *ref, int64_t elapsed_us);   /* 2.0.0: a dead mosaic cell's
+                                                                                    * no-signal picture (-hold), ref's shape */
+void ptv_hold_cell_free(void **state);
 void ptv_hold_uninit(DecodeCtx *d);
 extern int64_t         g_freeze_max_us;  /* 2.0.0-pre6: -freeze_max, 0 = inf */
 extern int64_t         g_fallback_rebind_us;   /* 2.0.0-pre7: -fallback_rebind, 0 = off */

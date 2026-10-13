@@ -171,6 +171,40 @@ static int build_pic(HoldPic *hp, const AVFrame *ref, int kind, int step, int di
     return 0;
 }
 
+/* 2.0.0: the no-signal picture of a dead mosaic cell (owner 2026-10-13: "bars for dead mosaic cells") — the same
+ * picture -hold gives single input (EBU 75 % bars by default, black, or the slate), shifted every -bars_shift, in the
+ * shape of ref (the cell's black frame, which matches the slot's buffersrc). *state is the caller's per-slot cache. */
+AVFrame *ptv_hold_cell_pic(void **state, const AVFrame *ref, int64_t elapsed_us)
+{
+    HoldPic *hp = *state;
+    int kind = g_hold_mode == PTV_HOLD_BARS ? PIC_BARS : g_hold_mode == PTV_HOLD_SLATE && slate_src ? PIC_SLATE : PIC_BLACK;
+    int step = kind != PIC_BLACK && g_bars_shift_us > 0 ? (int)((elapsed_us / g_bars_shift_us) % 8) : -1;
+    int dim  = kind == PIC_BARS && g_bars_dim_after_us > 0 && elapsed_us >= g_bars_dim_after_us;
+    if (!ref || ref->hw_frames_ctx)
+        return NULL;
+    if (!hp) {
+        if (!(hp = *state = av_mallocz(sizeof(*hp))))
+            return NULL;
+        hp->fmt = -1;
+    }
+    if (build_pic(hp, ref, kind, step, dim) < 0)
+        return NULL;
+    return av_frame_clone(hp->pic);
+}
+
+void ptv_hold_cell_free(void **state)
+{
+    HoldPic *hp = *state;
+    if (!hp)
+        return;
+    av_frame_free(&hp->pic);
+    av_frame_free(&hp->yuv);
+    av_frame_free(&hp->slate);
+    sws_freeContext(hp->sws_slate);
+    sws_freeContext(hp->sws_out);
+    av_freep(state);
+}
+
 void ptv_hold_route(AVFrame *out, int rung)
 {
     AVFrame *old = atomic_exchange_explicit(&g_hold_pic[rung], out, memory_order_acq_rel);
