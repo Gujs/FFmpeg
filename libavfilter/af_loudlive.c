@@ -50,12 +50,14 @@ typedef struct LoudLiveContext {
     double target_lra;
     double smooth;
     double fast;
+    double hold;
     int dual_mono;
 
     FFEBUR128State *r128;
     int block;          ///< samples per gain update (100 ms)
     int pos;            ///< samples into the current block
     int64_t nb_in;      ///< samples measured so far
+    int64_t hold_until; ///< no gain increase before this sample count (after a fast cut)
     double alpha;       ///< smoothing coefficient per block
     double gain_db;     ///< smoothed gain
     int have_gain;
@@ -72,6 +74,7 @@ static const AVOption loudlive_options[] = {
     { "lra",       "set loudness range target",           OFFSET(target_lra), AV_OPT_TYPE_DOUBLE, {.dbl =   7.},   1., 50., FLAGS },
     { "smooth",    "set gain smoothing time constant (s)", OFFSET(smooth),    AV_OPT_TYPE_DOUBLE, {.dbl = 0.4},    0., 10., FLAGS },
     { "fast",      "set momentary excess over target + LRA/2 that cuts the gain at once (LU)", OFFSET(fast), AV_OPT_TYPE_DOUBLE, {.dbl = 0.}, 0., 99., FLAGS },
+    { "hold",      "set how long the gain may not rise after a fast cut (s)", OFFSET(hold), AV_OPT_TYPE_DOUBLE, {.dbl = 0.}, 0., 10., FLAGS },
     { "dual_mono", "treat mono input as dual-mono",       OFFSET(dual_mono),  AV_OPT_TYPE_BOOL,   {.i64 = 0},      0,   1,  FLAGS },
     { NULL }
 };
@@ -83,6 +86,7 @@ static void update_gain(AVFilterContext *ctx)
     LoudLiveContext *s = ctx->priv;
     AVFilterLink *inlink = ctx->inputs[0];
     double global, shortterm, momentary, relative_threshold, lra2 = s->target_lra / 2., want, ceiling;
+    double prev = s->gain_db;
 
     ff_ebur128_loudness_global(s->r128, &global);
     ff_ebur128_loudness_momentary(s->r128, &momentary);
@@ -106,10 +110,14 @@ static void update_gain(AVFilterContext *ctx)
     /* A sudden loud passage takes the short-term window up to 3 s to show; loudnorm sees it coming
      * through its lookahead. Without one, the momentary loudness (400 ms) caps the gain at once, so
      * the output's momentary loudness stays within fast LU of the top of the range. */
+    if (s->nb_in < s->hold_until && s->gain_db > prev)
+        s->gain_db = prev;
+
     ceiling = s->target_i + lra2 + s->fast - momentary;
     if (momentary > -70. && s->gain_db > ceiling) {
-        s->gain_db   = ceiling;
-        s->have_gain = 1;
+        s->gain_db    = ceiling;
+        s->have_gain  = 1;
+        s->hold_until = s->nb_in + (int64_t)(s->hold * inlink->sample_rate);
     }
 }
 
