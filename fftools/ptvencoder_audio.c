@@ -4101,6 +4101,41 @@ graph_in:
                        "(labels kept; total %.1f ms)\n", a->dbg_k, a->dbg_in, ov / 1000.0, a->cv_trim_us / 1000.0);
             }
         }
+        /* 2.0.0 T-356: the graph input never steps BACK unless a deliberate relabel reset the expectation (those paths
+         * set acomp_exp_us = NOPTS). A video-only outage that reaches LOST: audio kept its own clock, then the rejoin
+         * map moved house_skew −2.1 s and the audio's input stepped back by that — swr hard compensation and, at 50 /
+         * 59.94, frames backward into the encoder: 8–54 AAC overlaps (vnull_40; loudnorm's lookahead had hidden it,
+         * loudlive does not). What lies before the expected next label is dropped (labels kept: the audio follows the
+         * video's new mapping, one forward cut instead of a replay); a step beyond 5 s is left as before */
+        if (frame->pts != AV_NOPTS_VALUE && frame->sample_rate > 0 && a->acomp_exp_us != AV_NOPTS_VALUE) {
+            int64_t ov = a->acomp_exp_us - av_rescale_q(frame->pts, a->ist_tb, AV_TIME_BASE_Q);
+            if (a->bk_trim_us && ov <= 0) {      /* the overlap ended on a frame boundary */
+                av_log(NULL, AV_LOG_INFO, "[PTV-ATRIM] a%d(in%d) %.1f ms dropped in all\n",
+                       a->dbg_k, a->dbg_in, a->bk_trim_us / 1000.0);
+                a->bk_trim_us = 0;
+            }
+            /* a trim under way takes every remaining overlap (29.97: the last 15 ms reached the encoder) */
+            if (ov > (a->bk_trim_us ? 0 : 25000) && ov <= 5000000) {
+                int64_t k = av_rescale(ov, frame->sample_rate, 1000000);
+                if (!a->bk_trim_us)
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-ATRIM] a%d(in%d) input stepped back %.0f ms — the overlap is "
+                           "dropped at the graph door (labels kept)\n", a->dbg_k, a->dbg_in, ov / 1000.0);
+                if (k >= frame->nb_samples) {
+                    a->bk_trim_us += av_rescale(frame->nb_samples, 1000000, frame->sample_rate);
+                    return 0;
+                }
+                if ((ret = av_frame_make_writable(frame)) < 0)
+                    return ret;
+                av_samples_copy(frame->extended_data, frame->extended_data, 0, (int)k,
+                                frame->nb_samples - (int)k, frame->ch_layout.nb_channels, frame->format);
+                frame->nb_samples -= (int)k;
+                frame->pts += av_rescale_q(k, (AVRational){ 1, frame->sample_rate }, a->ist_tb);
+                a->bk_trim_us += av_rescale(k, 1000000, frame->sample_rate);
+                av_log(NULL, AV_LOG_INFO, "[PTV-ATRIM] a%d(in%d) %.1f ms dropped in all\n",
+                       a->dbg_k, a->dbg_in, a->bk_trim_us / 1000.0);
+                a->bk_trim_us = 0;
+            }
+        }
         /* 1.0.1-pre3 [PTV-ACOMP] — swr hard-compensation proxy (always-on, log rate-limited to
          * ~1/10s per track). aresample=async realizes a graph-input pts step beyond
          * min_hard_comp (~30ms in the production chain) as an INSTANTANEOUS sample insert/drop

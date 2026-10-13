@@ -997,6 +997,7 @@ typedef struct AudioState {
     int              cv_trim_left;         /* single input: frames after a converter switch (its replay) trimmed to the */
     int64_t          cv_trim_exp_us;       /* door's expected next label (a splice overlap must not reach the graph) */
     int64_t          cv_trim_us;           /* overlap trimmed at switches (total, us) */
+    int64_t          bk_trim_us;           /* 2.0.0 T-356: backward graph-input step being trimmed (us so far) */
     /* 2.0.0-pre18 T-352: the ea ledger sampled every 0.5 s (mosaic slots) — the splice edit a format switch returns */
 #define PTV_EA_HIST 16
     int64_t          ea_hist_v[PTV_EA_HIST], ea_hist_wc[PTV_EA_HIST];
@@ -1798,6 +1799,14 @@ typedef struct DemuxArgs {
     int64_t               rj_skip_target, rj_skip_cut, rj_skip_wc, rj_skip_n;
     int64_t               rj_hs_base;       /* house_skew at the last skip's cut: the delay kept since is house_skew minus it
                                              * (a skip glues the skipped stretch over, house_skew keeps its repeats) */
+    /* 2.0.0 T-316: the depth door — a live burst that would hold more than the max delay is cut at arrival, the same
+     * content on every stream (the queues' own overflow sheds took different content per stream) */
+    int                   door;             /* 1 = dropping arriving content, 2 = resumed at a keyframe: the other streams
+                                             * drop what lies before it */
+    int                   door_hold;        /* the output is held: depth is measured from the content it resumes at */
+    int                   door_v0_arm;      /* a cut (or the start) was made: the next video let in is that content */
+    int64_t               door_raw0, door_us0, door_cut, door_wc, door_n, door_v0, door_vo, door_vo_wc, door_vs_hold;
+    int64_t               dbg_door_wc;      /* T-316 diag: [PTV-DOORDBG] rate limit */
     int64_t               src_gap_pending;  /* 2.0.0-pre4: a hold's arrival gap awaiting its rejoin class */
     int64_t              *tail_gap_us;      /* 2.0.0-pre4c: per stream, wall gap of the last packet if it was a gapped PES tail */
     int64_t              *tail_wc_us;       /* 2.0.0 T-089: per stream, wall time that carry was taken (bounds a multi-packet tail) */
@@ -2210,6 +2219,9 @@ int  ptv_hold_slate_load(const char *path);
 void ptv_hold_render(DecodeCtx *d);      /* decode thread, video_q empty: render one picture when due */
 void ptv_hold_note_frame(DecodeCtx *d, const AVFrame *frame);   /* emit_video: a real decoded frame */
 void ptv_hold_route(AVFrame *out, int rung);   /* a rendered picture leaving the graph → the rung's slot */
+AVFrame *ptv_hold_cell_pic(void **state, const AVFrame *ref, int64_t elapsed_us);   /* 2.0.0: a dead mosaic cell's
+                                                                                    * no-signal picture (-hold), ref's shape */
+void ptv_hold_cell_free(void **state);
 void ptv_hold_uninit(DecodeCtx *d);
 extern int64_t         g_freeze_max_us;  /* 2.0.0-pre6: -freeze_max, 0 = inf */
 extern int64_t         g_fallback_rebind_us;   /* 2.0.0-pre7: -fallback_rebind, 0 = off */

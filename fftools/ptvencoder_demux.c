@@ -1952,6 +1952,18 @@ static void vwait_drain(DemuxArgs *d, int force)
             int r = ts == AV_NOPTS_VALUE ? -1 : copy_shown(d, av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q), &o, &gap);
             if (r == 0 && !force)
                 break;                          /* its content is not on the output yet */
+            if (r < 0 && scte && !force && ts != AV_NOPTS_VALUE) {
+                /* 2.0.0 T-316: copies now wait from before the anchor (a start-up burst); a cue whose content precedes
+                 * the start was never on the output — dropped, as it was when it arrived before the anchor */
+                int64_t h0;
+                pthread_mutex_lock(d->h0_lock); h0 = *d->h0; pthread_mutex_unlock(d->h0_lock);
+                if (h0 != AV_NOPTS_VALUE && av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q) < h0) {
+                    av_packet_free(&p);
+                    d->vm_late++;
+                    k++;
+                    continue;
+                }
+            }
             if (r < 0 && scte && !force) {
                 /* 2.0.0 T-335: a cue with no usable time of its own (the PCR rides the video PID: none while only the
                  * video is gone, or a stale one) took the read-time stamp, +8.96 s off its splice picture at a
@@ -2018,14 +2030,12 @@ static int demux_pass(DemuxArgs *d, AVPacket *out)
         vwait_drain(d, 0);
         for (pi = 0; pi < d->n_pass; pi++) {
             PassStream *ps = &d->pass[pi];
-            int anchored;
             if (ps->gated || out->stream_index != ps->in_index)
                 continue;
-            pthread_mutex_lock(d->h0_lock);
-            anchored = *d->h0 != AV_NOPTS_VALUE;
-            pthread_mutex_unlock(d->h0_lock);
-            if (!anchored)
-                break;                          /* demux_pass_one drops a copy before the anchor */
+            /* 2.0.0 T-316: queued from before the anchor too. A bursty source delivers its first 6-10 s at once,
+             * before the first frame is decoded (h0): every subtitle / cue of that burst was dropped here while its
+             * video was buffered and shown (rich bursty_6: DVB sub 4-6, SCTE-35 5, DVB clear 3 lost). Waiting, they
+             * go out on their pictures; content before the start is still dropped (the record never shows it). */
             if (ps->nvwait == PTV_VWAIT_MAX)
                 vwait_drain(d, 1);
             if (d->ifmt->streams[ps->in_index]->codecpar->codec_id == AV_CODEC_ID_SCTE_35 &&
@@ -2895,7 +2905,7 @@ static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const ReopenShape *o
     AVFormatContext *nf = NULL;
     AVDictionary *o2 = NULL;
     int r;
-    unsigned i;
+    unsigned i, nb;
     if (!(nf = avformat_alloc_context()))
         return AVERROR(ENOMEM);
     if (d->single)
@@ -2910,7 +2920,14 @@ static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const ReopenShape *o
         goto bad;
     nf->max_probe_packets = 1;      /* 1.2.2 T-073: no codec probe for streams born after the open */
     r = d->single ? PTV_REOPEN_RESHAPED : AVERROR(EINVAL);
-    if (nf->nb_streams != old_nb)
+    /* lavf adds a synthetic EPG stream (PID 0x12, in no program) when an EIT section arrives within the probe: RAV
+     * (cor-3, 2026-10-13) came back from a 57 s video outage with video / audio / SCTE-35 as before plus that stream,
+     * read as RESHAPED and restarted (~25 s dark). Trailing EPG streams beyond the open layout are ignored like any
+     * stream born after the open (T-064: their packets are dropped before anything indexes them) */
+    nb = nf->nb_streams;
+    while (nb > old_nb && nf->streams[nb - 1]->codecpar->codec_id == AV_CODEC_ID_EPG)
+        nb--;
+    if (nb != old_nb)
         goto bad;
     for (i = 0; i < old_nb; i++) {
         ReopenShape now;
@@ -3275,15 +3292,25 @@ void *demux_thread(void *arg)
                             /* 2.0.0 T-103: the delay this pause would keep (house_skew has grown through the hold) */
                             int64_t kept = (d->house_skew ? *d->house_skew : 0) - d->rj_hs_base;
                             int64_t maxd = g_max_delay_us >= 0 ? g_max_delay_us : g_cushion_max_ms * 1000;
-                            int skip = burst && d->single && maxd > 0 && kept > maxd;
+                            /* 2.0.0 T-316 (bursts longer than the ceiling): the delay this return would carry is at least
+                             * W — the hold came after the queues ran dry, so the first returning content is W behind the
+                             * source. house_skew's growth alone missed the bank the output had played out before the hold
+                             * (sync_bursty_20: kept 5.7 s, W 19.9 s): no skip, the burst overflowed the queues and video and
+                             * audio each shed different content (59.94: video GOPs, audio +1…+2.4 s late; 25 fps: audio
+                             * oldest-first, −6…−9.7 s). A channel with the bank armed keeps the bank's worth of the burst
+                             * (the next pause needs it): the cut leaves bank (≤ max delay) of delay, the same content on
+                             * every stream; otherwise the skip goes to the live content, as before. */
+                            int64_t bank = atomic_load_explicit(&g_bank_us, memory_order_relaxed);
+                            int64_t keep = bank > 0 ? FFMIN(bank, maxd) : 0;
+                            int skip = burst && d->single && maxd > 0 && FFMAX(kept, W) > maxd;
                             if (skip) {
                                 d->rj_skip        = 1;
-                                d->rj_skip_target = d->src_pend_raw + av_rescale_q(W, AV_TIME_BASE_Q, vst->time_base);
+                                d->rj_skip_target = d->src_pend_raw + av_rescale_q(W - keep, AV_TIME_BASE_Q, vst->time_base);
                                 d->rj_skip_wc     = now;
                                 d->rj_skip_n      = 0;
                                 av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 rejoin: keeping this pause would hold %.1f s of "
-                                       "delay (max %.0f s) — skipping the catch-up to the live content (PTV_MAX_DELAY_MS=0 "
-                                       "keeps it)\n", kept / 1e6, maxd / 1e6);
+                                       "delay (max %.0f s) — skipping the catch-up to %s (PTV_MAX_DELAY_MS=0 keeps it)\n",
+                                       FFMAX(kept, W) / 1e6, maxd / 1e6, keep > 0 ? "the bank's depth" : "the live content");
                             }
                             av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 rejoin class %s (A=%+.2f s, W=%.2f s)%s\n",
                                    burst ? "BURST" :
@@ -3340,6 +3367,9 @@ void *demux_thread(void *arg)
                     d->rj_skip     = 2;
                     d->rj_skip_cut = raw;
                     d->rj_skip_wc  = nw;
+                    d->door_v0      = 0;          /* T-316: the held output resumes here — the door measures from it */
+                    d->door_v0_arm  = 1;
+                    d->door_vs_hold = atomic_load_explicit(&g_ch_vsrc, memory_order_relaxed);
                     if (at_live && d->house_skew)
                         d->rj_hs_base = *d->house_skew;   /* the hold's repeats are not delay any more */
                     /* settle when the hold ends (BURST's rule): the content lands on the house position — nothing for
@@ -3370,6 +3400,130 @@ void *demux_thread(void *arg)
             }
             if (d->rj_skip == 2 && nw - d->rj_skip_wc > 3000000)
                 d->rj_skip = 0;
+        }
+        /* 2.0.0 T-316: the depth door. A burst longer than the max delay arriving while LIVE overflowed the queues, and each
+         * queue shed on its own: video whole GOPs at its head and tail, audio its oldest frames — different content per
+         * stream, so the output lost lip sync by seconds (sync_bursty_20: 25 fps audio −2.5…−6.5 s, 59.94 video +2.9…+6.4 s).
+         * Content already past the queues cannot be taken back consistently (audio runs seconds ahead of video into the
+         * delivery gate), so the cut is made here, at arrival: once the content held between this door and the output
+         * (the newest video read minus the video on air) passes the max delay, every stream drops what arrives; video
+         * resumes at a keyframe once the depth is back 1 s under it, the other streams at that keyframe's content (what
+         * arrives late for content before the door closed still passes: a subtitle trails its picture in the mux). The door
+         * stands aside only while a rejoin skip (T-103 above) drops to its cut; after the cut it holds the returning burst to
+         * the same max (sync_bursty_20 59.94: 16 s came in behind a skip while the hold ended, and the queues shed on their
+         * own again). It keeps dropping while the rejoin classifies, so no stray packets carry a second content step. */
+        if (d->single && g_src_watch && g_src_hold_act) {
+            const AVStream *vst = d->ifmt->streams[d->vstream], *st = d->ifmt->streams[out->stream_index];
+            int64_t raw = out->dts != AV_NOPTS_VALUE ? out->dts : out->pts, nw = av_gettime_relative();
+            int64_t maxd = g_max_delay_us >= 0 ? g_max_delay_us : g_cushion_max_ms * 1000;
+            int isv = out->stream_index == d->vstream;
+            int active = d->rj_skip != 1;
+            int64_t vs = atomic_load_explicit(&g_ch_vsrc, memory_order_relaxed);
+            int64_t vo = atomic_load_explicit(&g_ch_vout_src, memory_order_relaxed), ref;
+            int64_t tick = atomic_load_explicit(&g_house_tick_us, memory_order_relaxed);
+            int fresh;
+            if (tick <= 0 && vst->avg_frame_rate.num > 0)   /* before the first output tick (a start-up burst) */
+                tick = av_rescale(1000000, vst->avg_frame_rate.den, vst->avg_frame_rate.num);
+            if (vo != d->door_vo) {
+                d->door_vo    = vo;
+                d->door_vo_wc = nw;
+            }
+            /* the output's content: what is on air while it plays new content; while it is held (nothing new on air for
+             * 0.5 s, or nothing yet at the start), the content it resumes at — the first video let in after a cut made
+             * during the hold (a rejoin skip's or this door's), or at the start. A hold without a cut (a real loss: the
+             * first packet back is the pre-gap PES tail, then content far ahead) gives no reading: the door stays open,
+             * and one already closed reopens at the next keyframe. */
+            fresh = vo && nw - d->door_vo_wc < 500000;
+            if (fresh)
+                d->door_hold = 0;
+            else if (!d->door_hold) {
+                d->door_hold    = 1;
+                d->door_vs_hold = vs;
+                d->door_v0      = 0;
+                d->door_v0_arm  = !vo;
+            }
+            if (d->door_v0_arm && vs != d->door_vs_hold) {
+                d->door_v0     = vs;
+                d->door_v0_arm = 0;
+            }
+            ref = fresh ? vo : d->door_v0;
+            if (g_diag && isv && nw - d->dbg_door_wc >= 1000000) {   /* T-316 diag */
+                d->dbg_door_wc = nw;
+                av_log(NULL, AV_LOG_INFO, "[PTV-DOORDBG] door=%d active=%d fresh=%d hold=%d vs=%.3f vo=%.3f v0=%.3f ref=%.3f "
+                       "depth=%.3f st=%d rj=%d pend=%d vq=%d\n", d->door, active, fresh, d->door_hold, vs / 1e6, vo / 1e6,
+                       d->door_v0 / 1e6, ref / 1e6, ref ? (vs - ref) / 1e6 : -1.0,
+                       atomic_load_explicit(&g_src_state, memory_order_relaxed), d->rj_skip, d->src_pend,
+                       av_thread_message_queue_nb_elems(d->video_q));
+            }
+            if (!active || maxd <= 0) {
+                d->door = 0;
+            } else if (d->door != 1 && isv && raw != AV_NOPTS_VALUE && vs && ref && vs - ref > maxd &&
+                       (int64_t)(av_thread_message_queue_nb_elems(d->video_q) +
+                                 atomic_load_explicit(&g_frameq_depth, memory_order_relaxed)) * tick >= maxd - 2000000) {
+                /* also right after a resume: a whole burst can arrive while the other streams finish that cut
+                 * (59.94: it did, and the video queue shed on its own again). The labels alone are not enough: the
+                 * frames actually buffered must hold most of the max delay too — a label jump with nothing queued is
+                 * not a burst (pre19 gate: a LIVE LOSS rejoin's lone pre-gap tail on air read 20.1 s, a bit-flipped
+                 * PTS 93.9 s; the door cut live content: a 0.8 s video PTS hole, lip sync −3.4 s) */
+                d->door     = 1;
+                d->door_raw0 = out->pts != AV_NOPTS_VALUE ? out->pts : raw;   /* PTS: the clock vs and the copies use */
+                d->door_us0  = vs;
+                d->door_wc   = nw;
+                d->door_n    = 0;
+                av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 burst: %.1f s of content held (max %.0f s) — dropping the "
+                       "arriving content on every stream until it is back under\n", (vs - ref) / 1e6, maxd / 1e6);
+            } else if (d->door == 1) {
+                int resume = 0;
+                if (isv && raw != AV_NOPTS_VALUE && (out->flags & AV_PKT_FLAG_KEY)) {
+                    int64_t dl = (out->pts != AV_NOPTS_VALUE ? out->pts : raw) - d->door_raw0;
+                    if (vst->pts_wrap_bits > 0 && vst->pts_wrap_bits < 63) {
+                        int64_t m = 1LL << vst->pts_wrap_bits;
+                        dl &= m - 1;
+                        if (dl >= m >> 1) dl -= m;
+                    }
+                    /* a held output that has played out everything let in resumes at this keyframe */
+                    resume = !ref || d->door_us0 + av_rescale_q(dl, vst->time_base, AV_TIME_BASE_Q) - ref <= maxd - 1000000;
+                }
+                if (resume) {
+                    d->door     = 2;
+                    d->door_cut = raw;
+                    d->door_wc  = nw;
+                    d->door_v0      = 0;
+                    d->door_v0_arm  = 1;
+                    d->door_vs_hold = vs;
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 burst: back under the max delay — resuming at a keyframe, "
+                           "picture and sound together (%"PRId64" packets dropped)\n", d->door_n);
+                } else {
+                    int early = 0;
+                    if (!isv && raw != AV_NOPTS_VALUE) {
+                        int64_t dl = raw - av_rescale_q(d->door_raw0, vst->time_base, st->time_base);
+                        if (st->pts_wrap_bits > 0 && st->pts_wrap_bits < 63) {
+                            int64_t m = 1LL << st->pts_wrap_bits;
+                            dl &= m - 1;
+                            if (dl >= m >> 1) dl -= m;
+                        }
+                        early = dl <= 0;      /* content up to the picture that closed the door is on air */
+                    }
+                    if (!early) {
+                        d->door_n++;
+                        av_packet_free(&out);
+                        continue;
+                    }
+                }
+            } else if (d->door == 2 && !isv && raw != AV_NOPTS_VALUE) {
+                int64_t dl = raw - av_rescale_q(d->door_cut, vst->time_base, st->time_base);
+                if (st->pts_wrap_bits > 0 && st->pts_wrap_bits < 63) {
+                    int64_t m = 1LL << st->pts_wrap_bits;
+                    dl &= m - 1;
+                    if (dl >= m >> 1) dl -= m;
+                }
+                if (dl < 0) {
+                    av_packet_free(&out);
+                    continue;
+                }
+            }
+            if (d->door == 2 && nw - d->door_wc > 3000000)
+                d->door = 0;
         }
         demux_unwrap(d, out);               /* 33-bit source wrap -> monotonic extended ts (ONCE) */
 

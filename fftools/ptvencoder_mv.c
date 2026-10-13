@@ -80,6 +80,8 @@ void *compositor_thread(void *arg)
     CompositorCtx *c = arg;
     int n = c->n_input, R = c->n_rung, k, r;
     AVFrame *blackf[PTV_MAX_INPUT] = {0};
+    void    *cellpic[PTV_MAX_INPUT] = {0};    /* 2.0.0: per-slot no-signal picture cache (ptv_hold_cell_pic) */
+    int64_t  cell_dead_us[PTV_MAX_INPUT] = {0};   /* when the cell went to its placeholder (0 = showing the slot) */
     AVFrame *last[PTV_MAX_INPUT] = {0};       /* last frame popped per input (dup source) */
     AVFrame *pending[PTV_MAX_INPUT] = {0};    /* content-clamp: a frame popped but held back because its
                                                * content-time leads the house clock (gap); shown when out catches up */
@@ -657,8 +659,33 @@ void *compositor_thread(void *arg)
                     }
                 }
             }
-            if (last[k] && !stale) st = av_frame_clone(last[k]);
-            else                   st = blackf[k] ? av_frame_clone(blackf[k]) : NULL;
+            if (last[k] && !stale) {
+                st = av_frame_clone(last[k]);
+                cell_dead_us[k] = 0;
+            } else {
+                /* 2.0.0 (owner 2026-10-13, Cinestar outage on Grid_2x2: a dead cell was black — the same as a live
+                 * channel sending black): a dead cell (no fresh frame for slate_after_us, or none at all that long
+                 * after the start) shows the no-signal picture single input shows (-hold: bars by default), in the
+                 * black frame's shape so the slot's buffersrc sees no parameter change; black if it cannot be built. */
+                int64_t nwc = av_gettime_relative();
+                st = NULL;
+                if (last[k] || (c->slate_after_us > 0 && nwc - diag_t0 > c->slate_after_us)) {
+                    if (!cell_dead_us[k]) {
+                        cell_dead_us[k] = nwc;
+                        av_log(NULL, AV_LOG_WARNING, "[PTV-MV] in%d no signal \xe2\x86\x92 %s in its cell\n", k,
+                               g_hold_mode == PTV_HOLD_BARS ? "bars" : g_hold_mode == PTV_HOLD_SLATE ? "slate" : "black");
+                    }
+                    AVFrame *bp = blackf[k] ? ptv_hold_cell_pic(&cellpic[k], blackf[k], nwc - cell_dead_us[k]) : NULL;
+                    /* the black frame's own properties, only the pixels replaced: the slot's buffersrc must see
+                     * exactly the frame it was configured for */
+                    if (bp && (st = av_frame_clone(blackf[k])) &&
+                        (av_frame_make_writable(st) < 0 || av_frame_copy(st, bp) < 0))
+                        av_frame_free(&st);
+                    av_frame_free(&bp);
+                }
+                if (!st)
+                    st = blackf[k] ? av_frame_clone(blackf[k]) : NULL;
+            }
             if (!st) continue;
             st->pts = tick; st->pkt_dts = AV_NOPTS_VALUE;
             /* v0.9.16: add_frame consumes only the REFERENCE (frame reset, struct still ours) —
@@ -852,6 +879,7 @@ void *compositor_thread(void *arg)
         }
 done:
     av_frame_free(&filt);
+    for (k = 0; k < n; k++) ptv_hold_cell_free(&cellpic[k]);
     for (k = 0; k < n; k++) { if (blackf[k]) av_frame_free(&blackf[k]); if (last[k]) av_frame_free(&last[k]); if (pending[k]) av_frame_free(&pending[k]); }
     for (r = 0; r < R; r++) av_thread_message_queue_set_err_recv(c->frame_q[r], AVERROR_EOF);
     return NULL;
