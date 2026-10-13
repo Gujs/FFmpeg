@@ -1798,6 +1798,14 @@ typedef struct DemuxArgs {
     int64_t               rj_skip_target, rj_skip_cut, rj_skip_wc, rj_skip_n;
     int64_t               rj_hs_base;       /* house_skew at the last skip's cut: the delay kept since is house_skew minus it
                                              * (a skip glues the skipped stretch over, house_skew keeps its repeats) */
+    /* 2.0.0 T-316: the depth door — a live burst that would hold more than the max delay is cut at arrival, the same
+     * content on every stream (the queues' own overflow sheds took different content per stream) */
+    int                   door;             /* 1 = dropping arriving content, 2 = resumed at a keyframe: the other streams
+                                             * drop what lies before it */
+    int                   door_hold;        /* the output is held: depth is measured from the content it resumes at */
+    int                   door_v0_arm;      /* a cut (or the start) was made: the next video let in is that content */
+    int64_t               door_raw0, door_us0, door_cut, door_wc, door_n, door_v0, door_vo, door_vo_wc, door_vs_hold;
+    int64_t               dbg_door_wc;      /* T-316 diag: [PTV-DOORDBG] rate limit */
     int64_t               src_gap_pending;  /* 2.0.0-pre4: a hold's arrival gap awaiting its rejoin class */
     int64_t              *tail_gap_us;      /* 2.0.0-pre4c: per stream, wall gap of the last packet if it was a gapped PES tail */
     int64_t              *tail_wc_us;       /* 2.0.0 T-089: per stream, wall time that carry was taken (bounds a multi-packet tail) */
