@@ -997,6 +997,7 @@ typedef struct AudioState {
     int              cv_trim_left;         /* single input: frames after a converter switch (its replay) trimmed to the */
     int64_t          cv_trim_exp_us;       /* door's expected next label (a splice overlap must not reach the graph) */
     int64_t          cv_trim_us;           /* overlap trimmed at switches (total, us) */
+    int64_t          bk_trim_us;           /* 2.0.0 T-356: backward graph-input step being trimmed (us so far) */
     /* 2.0.0-pre18 T-352: the ea ledger sampled every 0.5 s (mosaic slots) — the splice edit a format switch returns */
 #define PTV_EA_HIST 16
     int64_t          ea_hist_v[PTV_EA_HIST], ea_hist_wc[PTV_EA_HIST];
