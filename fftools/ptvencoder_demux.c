@@ -2905,7 +2905,7 @@ static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const ReopenShape *o
     AVFormatContext *nf = NULL;
     AVDictionary *o2 = NULL;
     int r;
-    unsigned i;
+    unsigned i, nb;
     if (!(nf = avformat_alloc_context()))
         return AVERROR(ENOMEM);
     if (d->single)
@@ -2920,7 +2920,14 @@ static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const ReopenShape *o
         goto bad;
     nf->max_probe_packets = 1;      /* 1.2.2 T-073: no codec probe for streams born after the open */
     r = d->single ? PTV_REOPEN_RESHAPED : AVERROR(EINVAL);
-    if (nf->nb_streams != old_nb)
+    /* lavf adds a synthetic EPG stream (PID 0x12, in no program) when an EIT section arrives within the probe: RAV
+     * (cor-3, 2026-10-13) came back from a 57 s video outage with video / audio / SCTE-35 as before plus that stream,
+     * read as RESHAPED and restarted (~25 s dark). Trailing EPG streams beyond the open layout are ignored like any
+     * stream born after the open (T-064: their packets are dropped before anything indexes them) */
+    nb = nf->nb_streams;
+    while (nb > old_nb && nf->streams[nb - 1]->codecpar->codec_id == AV_CODEC_ID_EPG)
+        nb--;
+    if (nb != old_nb)
         goto bad;
     for (i = 0; i < old_nb; i++) {
         ReopenShape now;
