@@ -1952,6 +1952,18 @@ static void vwait_drain(DemuxArgs *d, int force)
             int r = ts == AV_NOPTS_VALUE ? -1 : copy_shown(d, av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q), &o, &gap);
             if (r == 0 && !force)
                 break;                          /* its content is not on the output yet */
+            if (r < 0 && scte && !force && ts != AV_NOPTS_VALUE) {
+                /* 2.0.0 T-316: copies now wait from before the anchor (a start-up burst); a cue whose content precedes
+                 * the start was never on the output — dropped, as it was when it arrived before the anchor */
+                int64_t h0;
+                pthread_mutex_lock(d->h0_lock); h0 = *d->h0; pthread_mutex_unlock(d->h0_lock);
+                if (h0 != AV_NOPTS_VALUE && av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q) < h0) {
+                    av_packet_free(&p);
+                    d->vm_late++;
+                    k++;
+                    continue;
+                }
+            }
             if (r < 0 && scte && !force) {
                 /* 2.0.0 T-335: a cue with no usable time of its own (the PCR rides the video PID: none while only the
                  * video is gone, or a stale one) took the read-time stamp, +8.96 s off its splice picture at a
@@ -2018,14 +2030,12 @@ static int demux_pass(DemuxArgs *d, AVPacket *out)
         vwait_drain(d, 0);
         for (pi = 0; pi < d->n_pass; pi++) {
             PassStream *ps = &d->pass[pi];
-            int anchored;
             if (ps->gated || out->stream_index != ps->in_index)
                 continue;
-            pthread_mutex_lock(d->h0_lock);
-            anchored = *d->h0 != AV_NOPTS_VALUE;
-            pthread_mutex_unlock(d->h0_lock);
-            if (!anchored)
-                break;                          /* demux_pass_one drops a copy before the anchor */
+            /* 2.0.0 T-316: queued from before the anchor too. A bursty source delivers its first 6-10 s at once,
+             * before the first frame is decoded (h0): every subtitle / cue of that burst was dropped here while its
+             * video was buffered and shown (rich bursty_6: DVB sub 4-6, SCTE-35 5, DVB clear 3 lost). Waiting, they
+             * go out on their pictures; content before the start is still dropped (the record never shows it). */
             if (ps->nvwait == PTV_VWAIT_MAX)
                 vwait_drain(d, 1);
             if (d->ifmt->streams[ps->in_index]->codecpar->codec_id == AV_CODEC_ID_SCTE_35 &&
