@@ -5,6 +5,39 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre19 — pre18 + bursts longer than the delay pin, start-up burst copies, dead mosaic cell bars, EPG reopen, no audio step-back
+
+- **A burst longer than the max delay (12 s) keeps lip sync (T-316).** A source sending more content at once than the
+  pinned output delay overflowed the queues, and each queue shed on its own — video whole GOPs, audio its oldest
+  frames — so picture and sound lost different content: 20 s bursts came out −2.5…−6.5 s (25 fps) / +2.9…+6.4 s
+  (59.94) off. The demux now cuts at arrival: once the content held between the read and the picture on air passes
+  the max delay, every stream drops what arrives; video resumes at a keyframe, the rest at that keyframe's content.
+  Each 20 s burst then plays ~13 s and shows bars for the rest of the pause, in sync. The cut needs the frames actually
+  queued to hold the max delay too, so a timestamp jump (a real loss, a corrupt PTS) never triggers it. Residual: a
+  subtitle on the very last picture before such a cut can be dropped. A rejoin skip now counts the pause
+  itself toward the delay and keeps the burst bank's depth. `PTV_MAX_DELAY_MS=0` keeps every burst (no cut, no skip).
+- **Subtitles and SCTE-35 of a start-up burst go out on their pictures (T-316).** A bursty source delivers its first
+  6–10 s at once, before the first frame is decoded: every subtitle / cue of that burst was dropped. They now wait for
+  their pictures like every later one (bursty_6 at every rate: DVB sub 4–6, SCTE-35 5, DVB clear 3 were lost).
+- **A dead mosaic cell shows the no-signal bars (T-355).** A cell with no fresh picture for 5 s showed black —
+  indistinguishable from a live channel sending black (Cinestar provider outage 2026-10-13). It now shows the `-hold`
+  picture (EBU 75 % bars by default) in that cell; the other cells are untouched.
+- **A source that returns with EIT no longer restarts the channel.** After an outage long enough to reopen the input,
+  lavf can add a synthetic EPG stream (PID 0x12, outside the program) when an EIT section arrives within the probe;
+  the reopen check read it as a reshaped source and exited for a re-probe (RAV on cor-3: ~25 s dark instead of bars
+  and a rejoin). Trailing EPG streams are now ignored like any stream that appears after the open.
+- **No audio overlaps after a long video-only outage (T-356).** When only the video stops for 30 s or more (the input is
+  reopened), the rejoin moved the audio's timeline 2.1 s back: at 50 / 59.94 fps frames went backward into the encoder
+  (8–54 AAC overlaps; loudnorm's lookahead had hidden it, loudlive did not — live on the canaries since pre18). Audio
+  now never steps back where it enters the filter graph: the overlap is dropped, one forward cut, in sync.
+- Release gate (frozen kit `ead0bc9`, all 212 runs, on the upstream-patched candidate with all eight patches): against
+  pre18 **15 fixed** (start-up bursts `bursty_6` / `bursty_10` at every rate: SCTE-35 / DVB subs / clears no longer lost,
+  audio PID no longer dark), **0 regressions** in the binary — the flagged ones are the kit's loudlive PROD graph
+  (`ac3_bitflip_100` AAC hole: pre18 identical on this kit, T-357), the 59.94 low-motion checker (T-354; PASS 2/2 on pre19
+  and pre18 with the fixed kit) and the pre9.9 control. A first gate on c32558cbca found a crash at every LOST reopen and
+  false cuts of the depth door; both fixed (304c6227e5) before this gate. New `sync_bursty_20` (6 rates): lip sync /
+  structure / SCTE-35 PASS everywhere; the subtitle on the last picture before a cut is lost at 29.97 / 59.94 (T-360).
+
 ## 2.0.0-pre18 — pre17 + switch overlap trim, burst-source startup, PES alignment, loudlive (opt-in)
 
 - **A format switch on a low-latency audio chain no longer puts a backward audio step on the wire.** pre17 keeps the
