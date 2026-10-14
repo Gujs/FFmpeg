@@ -5650,6 +5650,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
             memset(&pass[n_pass], 0, sizeof pass[n_pass]);
             pass[n_pass].input    = kk;
             pass[n_pass].in_index = sidx;
+            pass[n_pass].is_scte  = ist->codecpar->codec_id == AV_CODEC_ID_SCTE_35;
+            pass[n_pass].cname    = avcodec_get_name(ist->codecpar->codec_id);
             pass[n_pass].in_tb    = ist->time_base;
             pass[n_pass].last_dts = AV_NOPTS_VALUE;
             pass[n_pass].gated    = (ist->codecpar->codec_type == AVMEDIA_TYPE_AUDIO);  /* §7.5a: dense AC-3/MP2 ride the gate; sparse subs/data/SCTE-35 bypass */
