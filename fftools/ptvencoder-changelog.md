@@ -5,6 +5,31 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre20 — pre19 + a restart or one burst no longer banks a channel for hours, start-up backlog without a timestamp jump, a reopen crash
+
+- **A restart or a single burst no longer leaves a clean channel banked for hours (T-363).** cor-3's all-channel pre19
+  restart: 32 channels waited 7 s for their GPU while the reader queued ~12 s of video. The depth door cut that
+  backlog, and its own drop span counted as a 13.8 s source stall, which armed the burst bank at 12 s for 6 h on six
+  clean sources: 25–490 repeated frames an hour since (0 on cor-1, same sources). Packets the door drops now count as
+  arrivals. A single ≥ 3 s stall still arms the bank for that event (it keeps picture and sound together while the
+  catch-up burst is absorbed), but that bank holds only what came, adds no latency, and retires after 10 min; the
+  absorbed delay drains at the 0.6 % catch-up (one 6 s pause: 5.5 → 1.4 s over 13 min, was 1.3 → 9.6 s and held). A
+  second stall within 30 min, or a cadence of stalls, is a pattern: the bank fills as before. The bank now retires
+  after 1 h of quiet instead of 6 h.
+- **A start-up backlog no longer leaves a 13 s timestamp jump (T-364).** The same restart: the door's cut of the
+  start-up backlog was read as a real source hole, so the video timestamps jumped 13 s while the audio padded, and an
+  HLS packager would log a discontinuity on every segment after it (~34 000 warnings in the fixture). A cut that began
+  before the first picture was on air, while the source stays live, is now erased like a splice. Cuts after the start
+  are unchanged (a burst source's silence is still repeated through).
+- **No crash at an input reopen while subtitles / SCTE-35 wait (T-365).** The output thread read the input's stream
+  table to release waiting sparse copies; a LOST reopen closes the input under it (SIGSEGV). Present since pre18; the
+  copies now carry what they need from the bind.
+- Release gate (frozen kit `ead0bc9`, all 212 runs, on the patched candidate with all eight patches): against
+  pre19 **0 regressions** in the binary, 2 fixed — the 5 flagged runs are a multiview lip-sync median at the ±25 ms edge
+  (−26.2 vs pre19 −25.0 ms, same per-marker spread), the 59.94 low-motion checker (T-354; reruns PASS on both kits) and the
+  rules file's known roll-up teletext intermittent (reruns PASS 2/2). New fixture cases `sync_burst_once_6` /
+  `sync_startstall_12` settle (pre19 fails both); `sync_bursty_20` PASS on all six rich media.
+
 ## 2.0.0-pre19 — pre18 + bursts longer than the delay pin, start-up burst copies, dead mosaic cell bars, EPG reopen, no audio step-back
 
 - **A burst longer than the max delay (12 s) keeps lip sync (T-316).** A source sending more content at once than the
