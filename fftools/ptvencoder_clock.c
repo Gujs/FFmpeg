@@ -802,7 +802,9 @@ static int64_t house_rate_corr_ppm(HouseRateState *hr, const RateEstimator *est,
          * (counting video_q alone would overshoot by frame_q's depth, ~5s) */
         int64_t have = ((int64_t)atomic_load_explicit(&g_vq_elems, memory_order_relaxed) + occ)
                        * tick_dur_us;
-        if (bt > 0 && !repriming && hr->occ_ema_milli >= (int64_t)base_sp * 1000 &&
+        if (bt > 0 && !atomic_load_explicit(&g_bank_lone, memory_order_relaxed) &&   /* pre20: a lone stall's bank
+                                                                                     * holds what came, adds nothing */
+            !repriming && hr->occ_ema_milli >= (int64_t)base_sp * 1000 &&
             have < bt && corr < 6000)
             corr = 6000;
     }

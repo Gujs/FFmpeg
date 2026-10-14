@@ -231,7 +231,8 @@ void ptv_print_log_legend(int full)
         "             6.6 dec/s on a clean 59.94pps wire), an unpaced burst only spikes)\n"
         "  bank       (v0.9.14, shown when armed) AUTO-BANK actual/target ms: a bursty channel's\n"
         "             self-escalated compressed video_q cushion (1.5x worst stall, cap 12s); fills\n"
-        "             from the stalls' own retained latency, retires after 6h quiet\n");
+        "             from the stalls' own retained latency, retires after 1 h quiet; a lone\n"
+        "             >=3 s stall's bank (pre20) holds only what came and retires after 10 min\n");
     av_log(NULL, AV_LOG_INFO,
         "  cf         (v0.9.15, shown when notable) coarse source-CLOCK estimate (ppm vs realtime,\n"
         "             `?` = not yet locked ~60s). |cf|>5000 locked => output+PCR FOLLOW the source's\n"

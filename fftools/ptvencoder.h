@@ -1879,6 +1879,8 @@ typedef struct DemuxArgs {
     int                   by_gap_cnt;       /* completed gaps >=1.5s in the window */
     int                   autobank;         /* v0.9.14: runtime bank escalation armed for this input (single-input live) */
     int64_t               by_bank_last_q;   /* v0.9.14: wall time of the last QUALIFYING stall (decay reference) */
+    int64_t               by_big_wc;        /* 2.0.0-pre20: wall time of the last >=3 s stall (a lone one does not arm) */
+    int64_t               by_big_gap;       /* its length (us) */
                                             /* (by_bank_advise_us moved to CushionRt.bank_advise_us — 0.9.18 M3) */
     int64_t               vcorrupt;       /* video packets flagged AV_PKT_FLAG_CORRUPT (discarded if g_discardcorrupt) */
     pthread_mutex_t       pass_lock;        /* 2.0.0-pre6: copy state shared with the master's AC-3 fill */
@@ -2161,6 +2163,7 @@ extern int64_t g_cushion_max_ms;
 extern int64_t g_bank_decay_us;
 extern _Atomic int     g_bank_pkts;
 extern _Atomic int64_t g_bank_us;
+extern _Atomic int     g_bank_lone;
 extern _Atomic int     g_vq_elems;
 extern _Atomic int     g_fq_hw;
 extern int     g_exacttick;

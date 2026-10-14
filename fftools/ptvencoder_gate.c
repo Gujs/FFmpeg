@@ -550,7 +550,7 @@ CushionRt g_curt = { .lock = PTHREAD_MUTEX_INITIALIZER };
  *                   a1 = the just-ended episode duration (us, log only)
  *   CUSHION_SHRINK: args unused
  *   BANK_ESCALATE:  a0 = worst observed stall (us), a1 = now (wall us, advisory limiter)
- *   BANK_RETIRE:    args unused
+ *   BANK_RETIRE:    a0 = the quiet time that retired it (us, log only)
  *   BANK_RELEASE:   a0 = starvation-contradiction duration (us, log only)
  *   CUSHION_RELEASE: a0 = starvation-contradiction duration (us, log only)
  * NOTE (map §3.5, deliberate): GROW/SHRINK do NOT touch the live gate->cap_us — exactly
@@ -679,6 +679,7 @@ void cushion_escalate(CushionEvent ev, int64_t a0, int64_t a1)
     }
     case BANK_RETIRE: {
         int r2;
+        atomic_store_explicit(&g_bank_lone, 0, memory_order_relaxed);
         atomic_store_explicit(&g_bank_us, 0, memory_order_relaxed);
         atomic_store_explicit(&g_bank_pkts, 0, memory_order_relaxed);
         for (r2 = 0; r2 < rt->n_gate; r2++)
@@ -686,7 +687,7 @@ void cushion_escalate(CushionEvent ev, int64_t a0, int64_t a1)
                 atomic_store_explicit(&rt->gate[r2]->cap_us, g_delivery_cap_us, memory_order_relaxed);
         av_log(NULL, AV_LOG_INFO,
                "[PTV-CUSHION] BANK retired after %llds without qualifying stalls; banked latency drains via catch-up\n",
-               (long long)(g_bank_decay_us / 1000000));
+               (long long)((a0 > 0 ? a0 : g_bank_decay_us) / 1000000));
         break;
     }
     case BANK_RELEASE: {
@@ -694,12 +695,13 @@ void cushion_escalate(CushionEvent ev, int64_t a0, int64_t a1)
          * (a0 = duration, us) with input FLOWING while the bank held latency and the gates held
          * audio for it. Holding latency for a buffer that is empty is a contradiction (the #32
          * wedge/aftermath shape: dlvhold ratcheted 12-25s, wucr_buf ~0, clean wire) — release
-         * NOW instead of the 6h decay: same stores as BANK_RETIRE, honest log. The master
+         * NOW instead of the decay: same stores as BANK_RETIRE, honest log. The master
          * rung's blocking push disarms with g_bank_pkts, so the retained latency drains via
          * the normal catch-up path. Normal deep-bank operation (buffers full / input absent)
          * never reaches here. */
         int64_t held = atomic_load_explicit(&g_bank_us, memory_order_relaxed);
         int r5;
+        atomic_store_explicit(&g_bank_lone, 0, memory_order_relaxed);
         atomic_store_explicit(&g_bank_us, 0, memory_order_relaxed);
         atomic_store_explicit(&g_bank_pkts, 0, memory_order_relaxed);
         for (r5 = 0; r5 < rt->n_gate; r5++)
@@ -951,7 +953,7 @@ void resolve_cushions(CushionPlan *cp, int live, int multiview,
     { const char *pe = getenv("PTV_PREROLL_MS"); if (pe) { int v = atoi(pe); if (v < 0) v = 0; if (v > 30000) v = 30000; g_preroll_ms = v; g_preroll_set = 1; } }  /* §13: startup cushion target (ms), bounded 0-30s */
     { const char *vq = getenv("PTV_VIDEOQ"); if (vq && atoi(vq) > 0) g_videoq = atoi(vq); }   /* video_q depth (startup-burst absorb) */
     { const char *cm = getenv("PTV_CUSHION_MAX_MS"); if (cm && atoi(cm) > 0) g_cushion_max_ms = atoi(cm); }  /* v0.9.14: AUTO-BANK ceiling (default 12000) */
-    { const char *bd = getenv("PTV_BANK_DECAY_S"); if (bd && atoi(bd) > 0) g_bank_decay_us = (int64_t)atoi(bd) * 1000000; }  /* v0.9.14: quiet time before bank retires (test hook; default 6h) */
+    { const char *bd = getenv("PTV_BANK_DECAY_S"); if (bd && atoi(bd) > 0) g_bank_decay_us = (int64_t)atoi(bd) * 1000000; }  /* v0.9.14: quiet time before bank retires (test hook; default 1 h since pre20) */
     if (g_genlock && !g_preroll_set) g_preroll_ms = 1000;  /* v0.9.1: default the single-input prime to ~1s (frame_q cushion) — smooths decode-rate dips while video+gate-hold stays under the 3s gate cap (cap scaling stays dormant). Deep video_q prime + cap-scale remain available for explicit high PTV_PREROLL_MS (bursty Fintech-class). PTV_PREROLL_MS overrides, PTV_NO_GENLOCK reverts to 350. */
     if (g_preroll_ms > 1600) g_delivery_cap_us += (int64_t)g_preroll_ms * 1000;  /* v0.9.0: the deep input prime delays VIDEO ~g_preroll_ms; the §7.5a gate holds audio+copy to match (it IS the audio-side of the whole-stream delay), so size its cap to the prime — else it force-releases and audio leaks ahead (TruBLU dlvforced). Explicit PTV_DELIVERY_CAP_MS (below) overrides. */
     if (g_preroll_ms > 1600) g_delivery_maxq = FFMAX(g_delivery_maxq, (int)(g_delivery_cap_us / 1000000 * 256));  /* v0.9.0: the deeper hold needs more FIFO nodes (≤ cap_s × Σ stream pkt-rates); without this a multi-audio channel (2 transcoded + copied AC-3) hits the maxq backstop and back-pressure-stalls before the cap. Explicit PTV_DELIVERY_MAXQ (below) overrides. */

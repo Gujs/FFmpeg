@@ -3505,6 +3505,11 @@ void *demux_thread(void *arg)
                         early = dl <= 0;      /* content up to the picture that closed the door is on air */
                     }
                     if (!early) {
+                        /* a dropped picture still arrived (as the DUKF / corrupt drops): without the stamp the door's
+                         * own drop span read as one stall and escalated the bank to 12 s for hours (cor-3 restart
+                         * 2026-10-13: a 13.8 s "stall" that was this door, then BURSTY churn on clean sources) */
+                        if (isv)
+                            d->by_last_v_wall = nw;
                         d->door_n++;
                         av_packet_free(&out);
                         continue;
@@ -3726,8 +3731,29 @@ static void by_count_gap(DemuxArgs *d, int64_t gap, int64_t now)
 {
     d->by_gap_cnt++;
     if (gap > d->by_max_gap) d->by_max_gap = gap;
-    if (d->autobank && gap >= 3000000)      /* one BIG stall qualifies immediately (sparse-glitch class) */
-        ptv_autobank_escalate(d, gap, now);
+    if (d->autobank && gap >= 3000000) {    /* BIG stalls (sparse-glitch class) */
+        /* 2.0.0-pre20 (owner 2026-10-14): one stall is an incident, a second within 30 min a pattern. A lone stall used
+         * to arm the bank for 6 h and fill it: the channel then held 9-12 s of latency (fixture: one 6 s pause, 1.3 ->
+         * 9.6 s), or under real delivery jitter churned repeats (cor-3 restart 2026-10-13: 25-490 repeated frames an
+         * hour on six clean sources, 0 on cor-1). The bank still arms for the stall itself — it is what keeps picture
+         * and sound together while the catch-up burst is absorbed (not arming shed 24 video frames from the full frame
+         * queue: sound +801 ms for 5 s) — but a LONE stall's bank does not top up and retires after 10 min of quiet */
+        int recent = d->by_big_wc && now - d->by_big_wc <= 1800000000LL;
+        int armed  = atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0;
+        if (recent || (armed && !atomic_load_explicit(&g_bank_lone, memory_order_relaxed))) {
+            if (atomic_exchange_explicit(&g_bank_lone, 0, memory_order_relaxed))
+                av_log(NULL, AV_LOG_INFO, "[PTV-BURSTY] a second %.1f s stall within 30 min — a pattern: the bank stays "
+                       "and fills, retires after %llds of quiet\n", gap / 1e6, (long long)(g_cp.bank_decay_us / 1000000));
+            ptv_autobank_escalate(d, recent ? FFMAX(gap, d->by_big_gap) : gap, now);
+        } else {
+            atomic_store_explicit(&g_bank_lone, 1, memory_order_relaxed);
+            ptv_autobank_escalate(d, gap, now);
+            av_log(NULL, AV_LOG_INFO, "[PTV-BURSTY] one %.1f s stall — banked for this one only: no top-up, retires after "
+                   "10 min of quiet unless another comes within 30 min\n", gap / 1e6);
+        }
+        d->by_big_wc  = now;
+        d->by_big_gap = gap;
+    }
 }
 
 /* v0.9.0 genlock estimator: recover the source frame rate as a SLIDING-window FLL. Each ~4s
@@ -4004,6 +4030,9 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                     }
                     if (d->by_gap_cnt >= 3) {                   /* HLS-burst cadence */
                         if (d->autobank) {
+                            if (atomic_exchange_explicit(&g_bank_lone, 0, memory_order_relaxed))   /* a cadence: a pattern */
+                                av_log(NULL, AV_LOG_INFO, "[PTV-BURSTY] stalls in a cadence — a pattern: the bank stays and "
+                                       "fills, retires after %llds of quiet\n", (long long)(g_cp.bank_decay_us / 1000000));
                             ptv_autobank_escalate(d, d->by_max_gap, bw);
                         } else if ((int64_t)g_preroll_ms < (d->by_max_gap * 12 / 10) / 1000) {
                             int64_t need_ms = (d->by_max_gap * 3 / 2) / 1000;   /* 1.5x worst gap */
@@ -4028,8 +4057,10 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                                (long long)(g_bank_decay_us / 1000000), d->by_gap_cnt);
                     if (d->autobank && d->by_bank_last_q &&
                         atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 &&
-                        bw - d->by_bank_last_q > g_cp.bank_decay_us)
-                        cushion_escalate(BANK_RETIRE, 0, 0);   /* 0.9.18 M3: write body moved */
+                        bw - d->by_bank_last_q > (atomic_load_explicit(&g_bank_lone, memory_order_relaxed) ?
+                                                  600000000LL : g_cp.bank_decay_us))
+                        cushion_escalate(BANK_RETIRE, atomic_load_explicit(&g_bank_lone, memory_order_relaxed) ?
+                                         600000000LL : g_cp.bank_decay_us, 0);   /* 0.9.18 M3: write body moved */
                     d->by_win_start = bw; d->by_gap_cnt = 0; d->by_max_gap = 0;
                 }
                 atomic_store_explicit(&g_vq_elems, av_thread_message_queue_nb_elems(d->video_q), memory_order_relaxed);
