@@ -29,6 +29,13 @@ the v2 `0001` patch (additive, travels with the source to the build box).
     lip sync. `[PTV-DOORDBG]` (DIAG) prints on a state change, `[PTV-AFLOW]` once per stats period.
   - Removed: the `[WUCR] active` start-up line, the `[PTV-AVSYNC2]` probe (`PTV_AVSYNC_PROBE`), `[PTV-SWRDELAY] sensor
     armed`.
+- Release gate (gate22, frozen kit `e127726` on the frozen media set `9b168c694c4e` — the first gate on byte-identical,
+  checksummed media; pre21 and pre20 side by side, 221 runs each): **0 binary regressions**. The three keys that differed
+  repeat identically on both binaries (3 runs each): `rich50b/sync_kill_return_20` 2/3 on both (the harness killed the
+  sender by the wall clock 0.1 s after a caption — made content-exact since), `rich25b/sync_bursty_20` 3/3 on both (a
+  phase-dependent single AAC overlap, T-374), `mv02/sync_gap_20` 2/3 on both (T-343). Pre-existing failures the new media
+  exposed, identical on pre20: a bit-flipped SPS frame rate moves the video labels (T-371) and a bit-flipped SPS picture
+  size freezes the picture for good (T-373) — both fixed for pre22.
 
 ## 2.0.0-pre20 — pre19 + a restart or one burst no longer banks a channel for hours, start-up backlog without a timestamp jump, a reopen crash
 
