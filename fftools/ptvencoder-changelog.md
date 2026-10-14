@@ -5,6 +5,31 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre21 — pre20 + no timestamp holes after a start-up backlog, the 2.0.0 logging
+
+- **A start-up backlog kept under the delay pin no longer leaves video timestamp holes (T-367).** cor-3's pre20 restart:
+  ten channels dropped 38–168 frames 31–34 s after start. The start-up window (the frame queue lossless for the first
+  30 s) closed on its timer while the start-up backlog still filled the queue, and drop-oldest shed the rest — video
+  only, so the video timestamps jumped (fixture `sync_startstall_11`: holes up to 5.4 s). The window now closes once
+  30 s have passed and the backlog has drained into the queue; it drains at the 0.6 % catch-up, the depth door bounds it.
+- **A start-up cut that begins after the first picture is erased too (T-368).** Azorse_TV started with 11.6 s queued,
+  went over the 12 s pin once on air, and the door cut kept a 12.9 s video timestamp hole. A door cut is erased while
+  the source stays live, whenever it began; a source pause inside the cut still keeps it as a hole repeated through.
+- **Logging for 2.0.0 (T-369; owner: the default log is the status line every 10 s, otherwise only when something
+  happens; PTV_DIAG may carry anything).**
+  - New: `[PTV-START]` — when the first picture went on air, with source live / set-up (GPU + encoders) done / first
+    picture decoded and the content queued behind it; when the start-up window closed (a kept backlog says so) and when
+    that backlog drained. `[PTV-FRAMEQ]` — a frame queue starts / stops dropping its oldest pictures (count). The
+    burst-door resume line says whether the cut is erased (source stayed live) or kept as a hole (source paused).
+  - Identical consecutive log lines collapse to "Last message repeated N times" (also with PTV_LOG_TS).
+  - Moved to PTV_DIAG (they repeated on a healthy channel): the mosaic per-slot `[PTV-RSYNC]` every 30 s (its R is the
+    stats line's inK:lipsync), `[PTV-CLOCK] estimator unlatched`, `[PTV-PULLDOWN]` arm/disarm (the stats `pd=` carries
+    it), the `[PTV-EMPTY]` sub-2 s summary and its 5 s "still empty" heartbeat (`[PTV-SRC] still STALLED` covers outages).
+  - `[PTV-LIPSYNC]` (DIAG) only on single input, once per stats period: on a mosaic slot its err was the async pad, not
+    lip sync. `[PTV-DOORDBG]` (DIAG) prints on a state change, `[PTV-AFLOW]` once per stats period.
+  - Removed: the `[WUCR] active` start-up line, the `[PTV-AVSYNC2]` probe (`PTV_AVSYNC_PROBE`), `[PTV-SWRDELAY] sensor
+    armed`.
+
 ## 2.0.0-pre20 — pre19 + a restart or one burst no longer banks a channel for hours, start-up backlog without a timestamp jump, a reopen crash
 
 - **A restart or a single burst no longer leaves a clean channel banked for hours (T-363).** cor-3's all-channel pre19
