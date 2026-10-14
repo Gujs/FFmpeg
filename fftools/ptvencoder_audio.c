@@ -1620,7 +1620,7 @@ static int audio_drain_fg(AudioState *a)
                 a->dbg_sink_dur_us = av_rescale(filt->nb_samples, 1000000, a->out_rate);
                 a->dbg_out_samp += filt->nb_samples;
                 int64_t nowf = av_gettime_relative();
-                if (nowf - a->dbg_flow_last_us >= 5000000) {
+                if (nowf - a->dbg_flow_last_us >= FFMAX(5000000, g_stats_period_us)) {   /* 2.0.0: per stats period */
                     a->dbg_flow_last_us = nowf;
                     av_log(NULL, AV_LOG_INFO,
                            "[PTV-AFLOW] a%d in_samp=%lld out_samp=%lld imbalance=%+lldms in_pts=%lldms sink_pts=%lldms\n",
@@ -2403,8 +2403,8 @@ pll_emit:
                 }
             }
             /* ====================================================================================
-             * [PTV-AVSYNC2] — A/V PLL redesign Phase A READ-ONLY measurement probe
-             *   (analysis/ptvencoder-avsync-pll-redesign-plan.md §3). Measures the REAL per-track
+             * A/V offset sensor (A/V PLL redesign Phase A, analysis/ptvencoder-avsync-pll-redesign-plan.md
+             *   §3; its verbose [PTV-AVSYNC2] print was removed in 2.0.0). Measures the REAL per-track
              *   lip-sync offset, NOT a proxy: for the source content C this emitted audio frame
              *   carries, look up the output time the VIDEO showed that SAME content (the per-input
              *   ring, written by the compositor / single-input output thread) and compare:
@@ -2444,35 +2444,12 @@ pll_emit:
                     vring_lookup(a->vring, content, &out_v, &msrc) == 0) {
                     int64_t vlag   = out_v    - (msrc    - h0_us);   /* video realized output − content (at msrc) */
                     int64_t alag   = out_a_us - (content - h0_us);   /* audio realized output − content (at content) */
-                    int64_t paird  = msrc - content;                 /* pairing residual: msrc and content differ when the
-                                                                       * video ring hasn't yet composited the audio's content
-                                                                       * (deep video prime → composition lags the audio drain
-                                                                       * in WALL time; invisible to the player). */
-                    int64_t ring   = out_v - out_a_us;               /* raw direct out_v−out_a — CONTAMINATED by paird */
-                    int64_t offset = vlag - alag;                    /* = ring − paird: the content-referenced (via shared h0),
-                                                                       * pairδ-corrected lip-sync the PLAYER sees. PRIMARY. */
-                    if (!a->av_seed) { a->av_vlag_ema = vlag; a->av_alag_ema = alag; a->av_seed = 1; }
-                    else { a->av_vlag_ema += (vlag - a->av_vlag_ema) >> 8;   /* slow baseline (~5s @47fps) */
-                           a->av_alag_ema += (alag - a->av_alag_ema) >> 8; }
-                    /* Latch the latest measurement for the always-on [PTV-AVSYNC] status line (§8). */
+                    int64_t offset = vlag - alag;                    /* the content-referenced (via shared h0) lip-sync the
+                                                                       * PLAYER sees — not the raw out_v−out_a, which carries
+                                                                       * the pairing residual msrc−content (deep video prime →
+                                                                       * composition lags the audio drain in WALL time). */
+                    /* Latch the latest measurement for the [PTV-AVSYNC] line (PTV_DIAG-only since v0.9.2). */
                     a->av_offset_us = offset; a->av_vlag_us = vlag; a->av_alag_us = alag; a->av_off_valid = 1;
-                    if (g_avsync_probe) {        /* verbose probe (PTV_AVSYNC_PROBE): the full §3.2 decomposition */
-                        int64_t per = g_stats_period_us > 0 ? g_stats_period_us : 5000000;
-                        int64_t nowp = av_gettime_relative();
-                        if (a->av_probe_last == 0) a->av_probe_last = nowp;
-                        else if (nowp - a->av_probe_last >= per) {
-                            av_log(NULL, AV_LOG_INFO,
-                                "[PTV-AVSYNC2] a%d(in%d) offset=%+"PRId64"ms | "
-                                "vlag=%+"PRId64"ms(base%+"PRId64" dev%+"PRId64") "
-                                "alag=%+"PRId64"ms(base%+"PRId64" dev%+"PRId64") | ring=%+"PRId64"ms pairδ=%+"PRId64"ms"
-                                "  [offset<0 = picture ahead of audio; |pairδ| large ⇒ trust offset(=vlag−alag), not ring]\n",
-                                a->dbg_k, a->dbg_in, offset / 1000,
-                                vlag / 1000, a->av_vlag_ema / 1000, (vlag - a->av_vlag_ema) / 1000,
-                                alag / 1000, a->av_alag_ema / 1000, (alag - a->av_alag_ema) / 1000,
-                                ring / 1000, paird / 1000);
-                            a->av_probe_last = nowp;
-                        }
-                    }
                 }
             }
             /* v0.9.2 — aresample WORK RATE (always-on, primary track only). The honest measure is the
@@ -2592,11 +2569,14 @@ pll_emit:
              * and so read production-buffer lead (+3.5s offline / −0.2s live for the SAME in-sync
              * content), not playback sync. NOTE: this isolates error INTRODUCED BY ptvencoder; a
              * source feed that is itself A/V-misaligned passes through with err≈0 (compare to a
-             * single-input output of the same feed to attribute source-side offset). */
-            if (g_diag) {
+             * single-input output of the same feed to attribute source-side offset).
+             * 2.0.0: single input only, once per stats period. On a mosaic slot err is dominated by
+             * async_pad (−0.2 … −5.4 s read on an in-sync slot) — not lip sync; the slot's sensor is the
+             * inK:lipsync on the mv stats line and [PTV-RSYNC]. */
+            if (g_diag && !a->multiview) {
                 int64_t now = av_gettime_relative();
                 if (a->dbg_first_out == AV_NOPTS_VALUE) a->dbg_first_out = opts;
-                if (now - a->dbg_diag_last >= 1000000) {
+                if (now - a->dbg_diag_last >= FFMAX(1000000, g_stats_period_us)) {
                     int64_t content_us   = av_rescale_q(a->dbg_last_src - a->dbg_first_src, a->ist_tb, AV_TIME_BASE_Q);
                     int64_t outspan_us   = a->out_frames * (int64_t)a->frame_size * 1000000 / a->out_rate;
                     int64_t async_pad_us = outspan_us - content_us;                  /* audio realized output−content */
@@ -4941,9 +4921,6 @@ int build_audio_filter(AudioState *a, AVCodecContext *adec, AVRational tb,
             }
         }
     }
-    if (a->fg_swr && g_diag)   /* 1.0.1-pre20: DIAG-demoted (slip-probe investigation closed pre11;
-                                * the periodic [PTV-SWRDELAY] readout is already DIAG-only) */
-        av_log(NULL, AV_LOG_INFO, "[PTV-SWRDELAY] sensor armed (aresample SwrContext found)\n");
 
     /* deliver encoder-sized frames so we can feed them straight to the AAC
      * encoders carrying their own (async-corrected) PTS — no FIFO repackaging. */

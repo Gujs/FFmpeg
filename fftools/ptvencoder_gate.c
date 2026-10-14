@@ -721,20 +721,112 @@ void cushion_escalate(CushionEvent ev, int64_t a0, int64_t a1)
 /* 2.0.0-pre18 T-316: the first 30 s after the first decoded frame count as a STARTUP window in which the master
  * rung's frame queue is lossless, as with an armed bank. A burst source's first burst (8 s of content in ~0.1 s)
  * overflowed the 160-frame queue before any stall had armed the bank: 34 frames skipped = a 1.4 s video PTS hole
- * at 0.1 s on every sync_bursty_8 start. The burst now waits in video_q (512 packets) instead. */
+ * at 0.1 s on every sync_bursty_8 start. The burst now waits in video_q (512 packets) instead.
+ * 2.0.0-pre21 (T-367): the window closes only once that backlog has drained INTO the frame queue (not full): closed on
+ * the 30 s timer, the queue's drop-oldest shed what was still queued — video only: cor-3's pre20 restart had ten
+ * channels drop 38-80 frames at t = 31 s, and a 11.6 s start-up backlog left a 5.4 s video PTS hole (fixture
+ * sync_startstall_11). Kept, the backlog drains at the house catch-up like any held latency; the depth door bounds it.
+ * Multiview publishes no g_frameq_depth (0): its window still closes at 30 s.
+ * 2.0.0: the close is logged ([PTV-START]); a backlog kept past 30 s arms the "drained" line (ptv_startup_on_air). */
+static _Atomic int64_t g_start_backlog_wc;   /* wall time a kept start-up backlog was noted; 0 = none / reported */
+
+static int64_t start_queued_us(void)          /* content between the newest video read and the picture on air */
+{
+    int64_t vs = atomic_load_explicit(&g_ch_vsrc, memory_order_relaxed);
+    int64_t vo = atomic_load_explicit(&g_ch_vout_src, memory_order_relaxed);
+    return vs && vo ? vs - vo : 0;
+}
+
 int ptv_fq_startup_lossless(void)
 {
     static _Atomic int64_t t0;
-    int64_t now = av_gettime_relative(), z = 0;
+    static _Atomic int     closed;
+    int64_t now = av_gettime_relative(), z = 0, open_us;
+    if (atomic_load_explicit(&closed, memory_order_relaxed))
+        return 0;
     if (!atomic_load_explicit(&t0, memory_order_relaxed))
         atomic_compare_exchange_strong(&t0, &z, now);
-    return now - atomic_load_explicit(&t0, memory_order_relaxed) < 30000000;
+    open_us = now - atomic_load_explicit(&t0, memory_order_relaxed);
+    if (open_us < 30000000 ||
+        atomic_load_explicit(&g_frameq_depth, memory_order_relaxed) >= g_cp.frameq_cap - 8)
+        return 1;
+    atomic_store_explicit(&closed, 1, memory_order_relaxed);
+    if (g_t_setup_us && open_us > 31000000) {   /* single input: held open by a backlog */
+        atomic_store_explicit(&g_start_backlog_wc, now, memory_order_relaxed);
+        av_log(NULL, AV_LOG_INFO, "[PTV-START] start-up window closed after %.0f s, held %.0f s past 30 s by a start-up "
+               "backlog (%.1f s of content queued): kept, it drains at the catch-up\n",
+               open_us / 1e6, open_us / 1e6 - 30, start_queued_us() / 1e6);
+    } else if (g_t_setup_us)
+        av_log(NULL, AV_LOG_INFO, "[PTV-START] start-up window closed after 30 s (%.1f s of content queued)\n",
+               start_queued_us() / 1e6);
+    return 0;
+}
+
+/* 2.0.0: start-up timing, single input (the master rung, per emitted fresh picture). The first call prints where the
+ * start-up time went — the restart analyses inferred the GPU set-up (7 s on cor-3) and the backlog (12 s) from
+ * unrelated lines. Afterwards it reports once when a kept start-up backlog has drained to the cushion (+1 s). */
+void ptv_startup_on_air(int64_t vo_us, int64_t tick_us)
+{
+    static int done;
+    int64_t now = av_gettime_relative(), wc;
+    if (!g_t_setup_us)
+        return;
+    if (!done) {
+        int64_t vs = atomic_load_explicit(&g_ch_vsrc, memory_order_relaxed);
+        int64_t lv = atomic_load_explicit(&g_t_live_us, memory_order_relaxed);
+        int64_t dc = atomic_load_explicit(&g_t_dec_us, memory_order_relaxed);
+        done = 1;
+        av_log(NULL, AV_LOG_INFO, "[PTV-START] first picture on air %.1f s after start: source live at %.1f s, set-up "
+               "(GPU + encoders) done at %.1f s, first picture decoded at %.1f s; %.1f s of content queued behind it\n",
+               (now - g_t_start_us) / 1e6, lv ? (lv - g_t_start_us) / 1e6 : -1.0, (g_t_setup_us - g_t_start_us) / 1e6,
+               dc ? (dc - g_t_start_us) / 1e6 : -1.0, vs && vo_us ? (vs - vo_us) / 1e6 : 0.0);
+        return;
+    }
+    wc = atomic_load_explicit(&g_start_backlog_wc, memory_order_relaxed);
+    if (wc && start_queued_us() <= (int64_t)g_curt.cur_sp * tick_us + 1000000) {
+        atomic_store_explicit(&g_start_backlog_wc, 0, memory_order_relaxed);
+        av_log(NULL, AV_LOG_INFO, "[PTV-START] start-up backlog drained %.1f min after the window closed "
+               "(%.1f s of content queued)\n", (now - wc) / 60e6, start_queued_us() / 1e6);
+    }
+}
+
+/* 2.0.0: [PTV-FRAMEQ] event lines — a drop-oldest is a timestamp hole on the wire, and only the stats drop= counter
+ * showed it. One line when a queue starts dropping, one when it has not dropped for 2 s (count + span). Followed on
+ * the first queue that drops (every rung's queue drops the same pictures). */
+static pthread_mutex_t fq_ep_lock = PTHREAD_MUTEX_INITIALIZER;
+static AVThreadMessageQueue *fq_ep_q;
+static int64_t fq_ep_n, fq_ep_t0, fq_ep_last;
+
+static void frameq_episode(AVThreadMessageQueue *q, int dropped)
+{
+    int64_t now;
+    if (!dropped && fq_ep_q != q)
+        return;
+    now = av_gettime_relative();
+    pthread_mutex_lock(&fq_ep_lock);
+    if (dropped && !fq_ep_q) {
+        fq_ep_q = q; fq_ep_n = 0; fq_ep_t0 = now;
+        av_log(NULL, AV_LOG_WARNING, "[PTV-FRAMEQ] frame queue full (%d pictures): dropping the oldest decoded "
+               "pictures — a timestamp hole on the wire\n", av_thread_message_queue_nb_elems(q));
+    }
+    if (fq_ep_q == q) {
+        if (dropped) {
+            fq_ep_n += dropped;
+            fq_ep_last = now;
+        } else if (now - fq_ep_last >= 2000000) {
+            av_log(NULL, AV_LOG_WARNING, "[PTV-FRAMEQ] stopped dropping: %"PRId64" pictures dropped over %.1f s\n",
+                   fq_ep_n, (fq_ep_last - fq_ep_t0) / 1e6);
+            fq_ep_q = NULL;
+        }
+    }
+    pthread_mutex_unlock(&fq_ep_lock);
 }
 
 /* hand a frame to one rung's jitter buffer; drop-oldest in live so a stalled
  * encoder never blocks the shared decode (same behaviour as before, per rung). */
 void push_frame_q(AVThreadMessageQueue *q, int live, int64_t *framedrop, AVFrame *out)
 {
+    int64_t fd0 = *framedrop;
     if (!live) {                                  /* offline: lossless back-pressure */
         if (av_thread_message_queue_send(q, &out, 0) < 0)
             av_frame_free(&out);
@@ -755,6 +847,7 @@ void push_frame_q(AVThreadMessageQueue *q, int live, int64_t *framedrop, AVFrame
         } else if (ret < 0) {
             av_frame_free(&out);
         }
+        frameq_episode(q, (int)(*framedrop - fd0));
     }
     {   /* 0.9.18 #19: track the deepest any queue has ever been (fqhw=). Runs for the
          * blocking path too — deep-prime/bank-armed masters are exactly the queues

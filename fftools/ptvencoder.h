@@ -273,7 +273,7 @@ typedef struct DlvGate {
 #define PTV_PKT_FLAG_NBS_FILL (1 << 16)
 #define PTV_PKT_FLAG_HOLD_FILL (1 << 17)  /* 2.0.0-pre6: hold-fill sentinel (master output thread → audio_q) */
 
-/* A/V PLL redesign Phase A probe (PTV_AVSYNC_PROBE): per-input ring recording, for each DISTINCT
+/* A/V PLL redesign Phase A probe (always built; feeds the [PTV-AVSYNC] offset=): per-input ring recording, for each DISTINCT
  * video content the cell displayed, the output time it went out at — (abs source pts → out_v, both
  * us). The audio drain pairs its emitted frame's source content against this ring to read the output
  * time the VIDEO showed that SAME content (§3.2b), giving the real lip-sync offset out_v(C)−out_a(C).
@@ -841,7 +841,7 @@ typedef struct VideoCtx {
     _Atomic(AVFrame *) *hold_pic;    /* 2.0.0-pre9: this rung's latest rendered hold picture (single input) */
     RateEstimator   *est;            /* input 0's rate sensor (genlock fallback + cf/diag/stats reads) */
     HouseRateState  *hr;             /* per-house actuation state: master computes+publishes rho, all rungs apply it */
-    VOutRing        *vring;          /* A/V probe: single-input video output ring (PTV_AVSYNC_PROBE) */
+    VOutRing        *vring;          /* A/V probe: single-input video output ring (feeds the [PTV-AVSYNC] offset=) */
     AVCodecContext  *venc;
     AVStream        *ost;
     int64_t          tick_dur_us;
@@ -1044,11 +1044,8 @@ typedef struct AudioState {
     int64_t          avsync_stat_last;               /* [PTV-AVSYNC] status: last print time (us) */
     int64_t          async_stat_last, async_prev_bal; /* v0.9.2: aresample-work rate (g_async_ppm) state (primary track) */
     int64_t          af_acq_drop_us, af_acq_pad_us;  /* cumulative discrete acquire work (us dropped / padded) */
-    /* A/V PLL redesign Phase A probe (PTV_AVSYNC_PROBE, read-only): real per-track A/V offset. */
+    /* A/V PLL redesign Phase A probe (read-only, printed by [PTV-AVSYNC]): real per-track A/V offset. */
     VOutRing        *vring;                           /* video output ring for this track's source input */
-    int64_t          av_vlag_ema, av_alag_ema;        /* slow baselines of video_lag / audio_lag (us) */
-    int              av_seed;                         /* baselines seeded */
-    int64_t          av_probe_last;                   /* [PTV-AVSYNC2]: last print time (us) */
     int64_t          av_offset_us, av_vlag_us, av_alag_us;  /* latest MEASURED A/V offset (always computed, for the always-on [PTV-AVSYNC] line) */
     int              av_off_valid;                    /* a measurement has paired (else the status line prints offset=--) */
     /* A/V PLL redesign Phase B3 — closed-loop two-regime controller on the measured av_offset_us (g_avsync_pll). */
@@ -1808,10 +1805,11 @@ typedef struct DemuxArgs {
                                              * drop what lies before it */
     int                   door_hold;        /* the output is held: depth is measured from the content it resumes at */
     int                   door_v0_arm;      /* a cut (or the start) was made: the next video let in is that content */
-    int                   door_startup;     /* 2.0.0-pre20 T-364: this cut began before the first picture was on air
-                                             * and the source has stayed LIVE since */
+    int                   door_startup;     /* 2.0.0-pre20 T-364: the source has stayed LIVE since this cut began (pre21:
+                                             * at any time; pre20 required it before the first picture) */
     int64_t               door_raw0, door_us0, door_cut, door_wc, door_n, door_v0, door_vo, door_vo_wc, door_vs_hold;
     int64_t               dbg_door_wc;      /* T-316 diag: [PTV-DOORDBG] rate limit */
+    int                   dbg_door_st;      /* 2.0.0: [PTV-DOORDBG] last printed state (door/active/hold/fresh) */
     int64_t               src_gap_pending;  /* 2.0.0-pre4: a hold's arrival gap awaiting its rejoin class */
     int64_t              *tail_gap_us;      /* 2.0.0-pre4c: per stream, wall gap of the last packet if it was a gapped PES tail */
     int64_t              *tail_wc_us;       /* 2.0.0 T-089: per stream, wall time that carry was taken (bounds a multi-packet tail) */
@@ -2156,7 +2154,6 @@ const char *ptv_hb_name(int pos);
 extern int     g_h0_reanchor;
 extern int     g_reanchor2_instant;
 extern int     g_h0_at_display;
-extern int     g_avsync_probe;
 extern int     g_af_pll;
 extern int     g_af_anchor;
 extern int     g_avsync_pll;
@@ -2427,6 +2424,11 @@ int  dlv_video_deliver(DlvGate *g, AVPacket *pkt, int64_t dts_us);            /*
 void dlv_video_drain(DlvGate *g);                                             /* §7.5b: video output thread only */
 void cushion_escalate(CushionEvent ev, int64_t a0, int64_t a1);
 int  ptv_fq_startup_lossless(void);
+void ptv_startup_on_air(int64_t vo_us, int64_t tick_us);
+/* 2.0.0 [PTV-START] start-up timing (wall, av_gettime_relative): process start, source live (in0), set-up done
+ * (single input only — 0 on multiview, which disables the lines), first picture decoded */
+extern int64_t g_t_start_us, g_t_setup_us;
+extern _Atomic int64_t g_t_live_us, g_t_dec_us;
 void push_frame_q(AVThreadMessageQueue *q, int live, int64_t *framedrop, AVFrame *out);
 void resolve_cushions(CushionPlan *cp, int live, int multiview,
                       AVRational out_fps, int n_audio);

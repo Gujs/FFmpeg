@@ -41,7 +41,8 @@ static int64_t ptv_empty_watch(const char *name, int depth, int64_t now,
 {
     if (depth == 0) {
         if (*since == 0) { *since = now; if (hb) *hb = now; }  /* enter empty silently (normal 0-crossings are noise) */
-        else if (hb && now - *hb >= 5000000) {                 /* chronic: heartbeat every 5s so "empty now" is visible */
+        else if (hb && g_diag && now - *hb >= 5000000) {       /* chronic: heartbeat every 5s so "empty now" is visible
+                                                                * (2.0.0: DIAG — [PTV-SRC] still STALLED covers outages) */
             *hb = now;
             av_log(NULL, AV_LOG_INFO, "[PTV-EMPTY] %s still empty %lldms\n",
                    name, (long long)((now - *since) / 1000));
@@ -1160,7 +1161,7 @@ void *output_thread(void *arg)
             int rn = av_popcount(rff_bits & 0xffu);
             if (!film_arm && rn >= 3) {
                 film_arm = 1; cad_dropouts = 0; cad_in_drop = 0;
-                if (v->is_master)
+                if (v->is_master && g_diag)   /* 2.0.0: DIAG — flaps on mixed content (AWE 25/h); stats pd= */
                     av_log(NULL, AV_LOG_INFO, "[PTV-PULLDOWN] armed (telecine cadence detected: %d/8 rff frames)\n", rn);
             } else if (film_arm && rn == 0) {
                 /* v0.9.18.1 M7: disarm needs CONTENT-RATE evidence, not just absent flags (see
@@ -1169,7 +1170,7 @@ void *output_thread(void *arg)
                  * tau 8) and disarms then — the few extra pd holds at the boundary are benign. */
                 if (!g_cad_disarm || cad_ema_us <= v->tick_dur_us + v->tick_dur_us / 8) {
                     film_arm = 0;
-                    if (v->is_master)
+                    if (v->is_master && g_diag)
                         av_log(NULL, AV_LOG_INFO, "[PTV-PULLDOWN] disarmed (cadence ended; %"PRId64" holds, %d flag dropouts ridden)\n",
                                v->pd, cad_dropouts);
                 } else if (!cad_in_drop) {
@@ -1218,8 +1219,9 @@ void *output_thread(void *arg)
                     ep_agg_cnt++;
                     if (!ep_agg_t0) ep_agg_t0 = nw;
                 }
-                if (ep_agg_cnt && nw - ep_agg_t0 >= 60LL * 1000000) {
-                    av_log(NULL, AV_LOG_INFO, "[PTV-EMPTY] frame_q: %lld episodes in %llds (%lld-%lldms)\n",
+                if (ep_agg_cnt && nw - ep_agg_t0 >= 60LL * 1000000) {   /* 2.0.0: the sub-2 s summary is DIAG (film
+                                                                         * content: ~1/min on a healthy channel) */
+                    if (g_diag) av_log(NULL, AV_LOG_INFO, "[PTV-EMPTY] frame_q: %lld episodes in %llds (%lld-%lldms)\n",
                            (long long)ep_agg_cnt, (long long)((nw - ep_agg_t0) / 1000000),
                            (long long)(ep_agg_min / 1000), (long long)(ep_agg_max / 1000));
                     ep_agg_cnt = 0; ep_agg_t0 = nw;
@@ -1469,6 +1471,8 @@ void *output_thread(void *arg)
              * [PTV-MUXGUARD] as a backward subtitle dts — subtitles gone on air). */
             if (v->is_master && fresh && content_vpts >= 0) {
                 atomic_store_explicit(&g_vdisp_skew_us, (vpts - content_vpts) * v->tick_dur_us, memory_order_relaxed);
+                if (src_ts != AV_NOPTS_VALUE)   /* 2.0.0 [PTV-START] start-up timing + backlog drained */
+                    ptv_startup_on_air(av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q), v->tick_dur_us);
                 /* 2.0.0 T-100: record where this content went on air (copies + captions are stamped through it) */
                 if (g_vmap && !v->passthrough && src_ts != AV_NOPTS_VALUE) {
                     ptv_vmap_push(av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q),

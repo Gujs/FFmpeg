@@ -3448,12 +3448,16 @@ void *demux_thread(void *arg)
                 d->door_v0_arm = 0;
             }
             ref = fresh ? vo : d->door_v0;
-            /* T-364: a start-up cut is one only while the source stays LIVE: a source pause inside it is repeated
-             * through, and its wall evidence must stand (sync_bursty_20: the first burst's cut lasted into the silence) */
+            /* T-364: a cut is erased only while the source stays LIVE: a source pause inside it is repeated through,
+             * and its wall evidence must stand (sync_bursty_20: the first burst's cut lasted into the silence) */
             if (d->door_startup && (atomic_load_explicit(&g_src_state, memory_order_relaxed) || d->src_pend || d->rj_skip))
                 d->door_startup = 0;
-            if (g_diag && isv && nw - d->dbg_door_wc >= 1000000) {   /* T-316 diag */
+            /* T-316 diag. 2.0.0: event-driven — on a state change, and 1/s only while the door is closed or the depth is
+             * within 2 s of the max (it was 1/s always: 3 500 lines/h for a door idle 99.9 % of the time) */
+            if (g_diag && isv && ((d->door * 8 + active * 4 + d->door_hold * 2 + fresh) != d->dbg_door_st ||
+                                  ((d->door || (ref && vs - ref > maxd - 2000000)) && nw - d->dbg_door_wc >= 1000000))) {
                 d->dbg_door_wc = nw;
+                d->dbg_door_st = d->door * 8 + active * 4 + d->door_hold * 2 + fresh;
                 av_log(NULL, AV_LOG_INFO, "[PTV-DOORDBG] door=%d active=%d fresh=%d hold=%d vs=%.3f vo=%.3f v0=%.3f ref=%.3f "
                        "depth=%.3f st=%d rj=%d pend=%d vq=%d\n", d->door, active, fresh, d->door_hold, vs / 1e6, vo / 1e6,
                        d->door_v0 / 1e6, ref / 1e6, ref ? (vs - ref) / 1e6 : -1.0,
@@ -3471,7 +3475,7 @@ void *demux_thread(void *arg)
                  * not a burst (pre19 gate: a LIVE LOSS rejoin's lone pre-gap tail on air read 20.1 s, a bit-flipped
                  * PTS 93.9 s; the door cut live content: a 0.8 s video PTS hole, lip sync −3.4 s) */
                 d->door     = 1;
-                d->door_startup = !vo;              /* T-364: a start-up backlog, nothing shown yet */
+                d->door_startup = 1;                /* T-364: the source is LIVE — cleared if it pauses in the cut */
                 d->door_raw0 = out->pts != AV_NOPTS_VALUE ? out->pts : raw;   /* PTS: the clock vs and the copies use */
                 d->door_us0  = vs;
                 d->door_wc   = nw;
@@ -3497,8 +3501,11 @@ void *demux_thread(void *arg)
                     d->door_v0      = 0;
                     d->door_v0_arm  = 1;
                     d->door_vs_hold = vs;
+                    /* 2.0.0: say which way the cut goes (T-364/T-368) — only the kept case used to show (WALLEV) */
                     av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 burst: back under the max delay — resuming at a keyframe, "
-                           "picture and sound together (%"PRId64" packets dropped)\n", d->door_n);
+                           "picture and sound together (%"PRId64" packets dropped; %s)\n", d->door_n, d->door_startup ?
+                           "the source stayed live: the cut is erased, no timestamp jump" :
+                           "the source paused in the cut: it stays as a hole the output repeats through");
                 } else {
                     int early = 0;
                     if (!isv && raw != AV_NOPTS_VALUE) {
@@ -3736,13 +3743,14 @@ static void ptv_autobank_escalate(DemuxArgs *d, int64_t worst_us, int64_t now)
     cushion_escalate(BANK_ESCALATE, worst_us, now);
 }
 
-/* 2.0.0-pre20 T-364: a packet the depth door drops in a START-UP cut (the door closed before the first picture was on
- * air: a mass restart's slow GPU set-up queued ~12 s) still ARRIVED. The wall-evidence split reads a content jump with
- * no arrivals behind it as a real hole the house repeats through; at start-up the output plays the queue and repeats
- * nothing, so the cut must read as flowing (erased) — kept, it left a 13.3 s video PTS hole (audio padded instead) and
- * the ffmpeg HLS segmenter logged ~34 000 timestamp discontinuities. A cut after the start keeps its wall evidence: a
- * burst source's return is repeated through while the source is silent (stamping there erased 8 s of a sync_bursty_20
- * return on video only — audio whole-step under the armed bank: lip sync +8 s) */
+/* 2.0.0-pre20 T-364: a packet the depth door drops while the source is LIVE still ARRIVED. The wall-evidence split reads
+ * a content jump with no arrivals behind it as a real hole the house repeats through; while the source flows the output
+ * plays its queue and repeats nothing, so the cut must read as flowing (erased) — kept, a mass restart's start-up backlog
+ * cut left a 13.3 s video PTS hole (audio padded instead) and the ffmpeg HLS segmenter logged ~34 000 timestamp
+ * discontinuities. Once the source pauses inside the cut, its wall evidence stands: a burst source's silence is repeated
+ * through (stamping there erased 8 s of a sync_bursty_20 return on video only — audio whole-step under the armed bank:
+ * lip sync +8 s). pre21: pre20 required the cut to begin before the first picture; cor-3's pre20 restart had Azorse_TV
+ * start with 11.6 s queued, cadence holds took it over 12 s once on air → the same 12.9 s hole */
 static void door_arrived(DemuxArgs *d, int si, int64_t nw)
 {
     d->any_wall_last = nw;
@@ -3853,7 +3861,8 @@ static void rate_estimator_feed(RateEstimator *e, int64_t c_now, int64_t w_now,
                      * re-acquire instead of holding a value reality keeps contradicting. */
                     if (e->cf_chunks > 20 && ++e->cf_la_tot >= 40) {
                         if (e->cf_la_acc < 10) {
-                            av_log(NULL, AV_LOG_WARNING,
+                            /* 2.0.0: DIAG — an internal re-acquire, every few minutes on a noisy (healthy) source clock */
+                            av_log(NULL, g_diag ? AV_LOG_WARNING : AV_LOG_VERBOSE,
                                    "[PTV-CLOCK] estimator unlatched — locked ema %+lldppm rejected %d/%d "
                                    "recent windows; re-acquiring\n",
                                    (long long)(((e->cf_ema_q20 - (1 << 20)) * 1000000) >> 20),
