@@ -839,7 +839,8 @@ void *compositor_thread(void *arg)
                  * buffer depth, SLATED while the cell is black. Fix round (reviewer V6):
                  * THROTTLED to one round per 30s (~11.5k lines/day on a 4-up, vs ~35k
                  * unthrottled at a 10s stats period) — readability kept, log budget bounded. */
-                if (g_rsync_sense && nows - rsync_in_last >= 30000000) {
+                if (g_diag && g_rsync_sense && nows - rsync_in_last >= 30000000) {   /* 2.0.0: DIAG — the
+                     * default log is the stats line + events (owner); R is the stats line's inK:lipsync */
                     rsync_in_last = nows;
                     for (k = 0; k < n; k++) {
                         char rin[40];

@@ -532,10 +532,6 @@ int     g_reanchor2_instant = 0;   /* 1.0.1 (PTV_REANCHOR2_INSTANT=1 reverts): R
  * no bank, no clamp, no outage. MULTIVIEW ONLY; single-input keeps the decode-thread anchor (BYTE-
  * IDENTICAL). PTV_NO_H0_AT_DISPLAY=1 reverts to the decode-thread anchor (A/B). */
 int     g_h0_at_display = 1;
-/* A/V PLL redesign — Phase A READ-ONLY measurement probe (analysis/ptvencoder-avsync-pll-redesign-plan.md).
- * Off by default; PTV_AVSYNC_PROBE=1 enables the [PTV-AVSYNC2] per-track real A/V offset measurement
- * (out_v(C) − out_a(C), content-paired, video_lag/audio_lag split). Measures only — no actuator. */
-int     g_avsync_probe = 0;
 /* Multiview audio-follow ACTUATOR (P1) — a per-slot two-mode controller for glitch-free A/V tracking.
  * The v0.6.2/0.6.3 audio-follow corrected the per-slot lag only with whole-frame drop/pad fired on a
  * 40ms threshold: it tracked the slow per-slot drift (source-vs-house-clock, e.g. +360ms over 35min)
@@ -729,6 +725,8 @@ static _Atomic int64_t g_muxed_bytes;
  * separates source-inherent A/V drift (raw grows) from demux_unwrap per-stream rebase
  * divergence (unwrap_inj grows) from ptvencoder restamp (introduced). Coarse 10s, relaxed atomics. */
 _Atomic int64_t g_ch_vsrc, g_ch_asrc, g_ch_vout_src, g_ch_aout_src;
+int64_t g_t_start_us, g_t_setup_us;           /* 2.0.0 [PTV-START] start-up timing (see ptvencoder.h) */
+_Atomic int64_t g_t_live_us, g_t_dec_us;
 _Atomic int64_t g_ch_vsrc_raw, g_ch_asrc_raw;   /* [PTV-CHAIN] PRE-unwrap raw source ts (us) */
 /* v0.9.0 source-clock genlock: slave the single-input master output cadence to the recovered source
  * frame rate so the house clock stops drifting vs the channel (no growing output-slower lag), house_skew
@@ -1036,11 +1034,23 @@ _Atomic int64_t g_cc_mux;     /* teletext pkts the mux backward-dts guard droppe
 /* PTV_LOG_TS=1: prefix every log line with a local wall-clock timestamp
  * [YYYY-MM-DD HH:MM:SS.mmm], so production logs are self-dated natively
  * (replaces piping through `ts`). Wraps libav's line formatter; serialized so
- * lines from the demux/decode/encode/mux threads don't interleave. */
+ * lines from the demux/decode/encode/mux threads don't interleave.
+ * 2.0.0: identical consecutive lines collapse to "Last message repeated N times", as the stock
+ * callback does with AV_LOG_SKIP_REPEATED (this wrapper had bypassed it). */
 static pthread_mutex_t g_log_mtx = PTHREAD_MUTEX_INITIALIZER;
+static void ptv_log_ts_stamp(void)
+{
+    int64_t now = av_gettime();
+    time_t s = (time_t)(now / 1000000);
+    struct tm tm; char d[24];
+    localtime_r(&s, &tm);
+    strftime(d, sizeof d, "%Y-%m-%d %H:%M:%S", &tm);
+    fprintf(stderr, "[%s.%03d] ", d, (int)((now % 1000000) / 1000));
+}
 static void ptv_log_ts_callback(void *avcl, int level, const char *fmt, va_list vl)
 {
-    static int print_prefix = 1, at_line_start = 1;
+    static int print_prefix = 1, at_line_start = 1, repeats;
+    static char prev[2048];
     char buf[2048];
     int n, start;
 
@@ -1049,16 +1059,25 @@ static void ptv_log_ts_callback(void *avcl, int level, const char *fmt, va_list 
     pthread_mutex_lock(&g_log_mtx);
     av_log_format_line2(avcl, level, fmt, vl, buf, sizeof buf, &print_prefix);
     n = (int)strlen(buf);
+    if (at_line_start && print_prefix && n && !strcmp(buf, prev)) {   /* a whole line, same as the last */
+        repeats++;
+        pthread_mutex_unlock(&g_log_mtx);
+        return;
+    }
+    if (repeats && at_line_start) {
+        ptv_log_ts_stamp();
+        fprintf(stderr, "    Last message repeated %d times\n", repeats);
+    }
+    repeats = 0;
+    if (at_line_start && print_prefix)
+        av_strlcpy(prev, buf, sizeof prev);
+    else
+        prev[0] = 0;
     for (start = 0; start < n; ) {
         const char *nl = memchr(buf + start, '\n', n - start);
         int end = nl ? (int)(nl - buf) + 1 : n;
         if (at_line_start) {
-            int64_t now = av_gettime();
-            time_t s = (time_t)(now / 1000000);
-            struct tm tm; char d[24];
-            localtime_r(&s, &tm);
-            strftime(d, sizeof d, "%Y-%m-%d %H:%M:%S", &tm);
-            fprintf(stderr, "[%s.%03d] ", d, (int)((now % 1000000) / 1000));
+            ptv_log_ts_stamp();
             at_line_start = 0;
         }
         fwrite(buf + start, 1, (size_t)(end - start), stderr);
@@ -3595,6 +3614,7 @@ static void *decode_thread(void *arg)
                         av_log(NULL, AV_LOG_WARNING,
                                "[PTV-ANCHOR] h0 anchored at %"PRId64"ms (first decoded video frame)\n",
                                *d->h0 / 1000);
+                        atomic_store_explicit(&g_t_dec_us, av_gettime_relative(), memory_order_relaxed);
                     }
                     pthread_mutex_unlock(d->h0_lock);
                 }
@@ -4458,6 +4478,8 @@ static int input_acquire_loop(Input *in, int idx, const AVDictionary *opts)
                            "(after %.1f s, attempt #%d)\n", idx, avcodec_get_name(par->codec_id),
                            par->width, par->height, na, ns, nd,
                            (av_gettime_relative() - t0) / 1e6, attempt);
+                    if (idx == 0 && !atomic_load_explicit(&g_t_live_us, memory_order_relaxed))
+                        atomic_store_explicit(&g_t_live_us, av_gettime_relative(), memory_order_relaxed);
                     in->ifmt->max_probe_packets = 1;   /* 1.2.2 T-073: no probe for later-born streams */
                     in->open_ret = 0;
                     return 0;
@@ -6128,6 +6150,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         av_log(NULL, AV_LOG_INFO, "%s\n", tm);
     }
 
+    if (!multiview)
+        g_t_setup_us = av_gettime_relative();   /* 2.0.0 [PTV-START]: decoders, GPU, filters, encoders, muxers ready */
     av_log(NULL, AV_LOG_INFO,
         "ptvencoder: %s %d input(s) %d rung(s)  house %d/%d fps (%s)  v:%s->enc  a:%s  in:%s  pull-pipeline\n",
         multiview ? "MULTIVIEW" : "single", n_input, n_rung, out_fps.num, out_fps.den,
@@ -6785,6 +6809,7 @@ int main(int argc, char **argv)
     const char *fcomplex = NULL, *hwdev = NULL;
     int mode = -1, ret, gi, hide_banner = 0;
 
+    g_t_start_us = av_gettime_relative();   /* 2.0.0 [PTV-START] */
     init_dynload();
     av_log_set_level(AV_LOG_INFO);
     g_diag = !!getenv("PTV_DIAG");
@@ -6808,11 +6833,8 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_ADAPTIVE")) g_adapt_cushion = 0;   /* fixed preroll target (pre-0.9.10 behavior) */
     /* PTV_CUSHION_MS parse moved to resolve_cushions() (0.9.18 M1) */
     if (getenv("PTV_NO_GENLOCK")) g_genlock = 0; /* v0.9.0: revert to free-run nominal pacing (+ old 350ms prime) = byte-identical */
-    if (getenv("PTV_WUCR")) {                    /* occupancy-ρ video pacing (EMA-filtered + ±1f deadband, gain-6/±6%) + buf/rho readout. AVLOCK KEPT ON: ρ bounds house_skew so AVLOCK's audio-follow is harmless in steady state and keeps A/V matched through unavoidable dups. FLL still computes srcppm for comparison. */
-        g_wucr = 1;
-        av_log(NULL, AV_LOG_INFO, "ptvencoder: [WUCR] active — PROPORTIONAL occupancy-ρ pacing (ρ=500·err, EMA N=16, ±6%% clamp) + AVLOCK ON "
-               "(ρ bounds house_skew; audio follows it so A/V stays matched through dups). Expect: ρ smooth, parks near −(source ppm offset) with no wobble, dlvforced≈0, dup low, speed=1.00x.\n");
-    }
+    if (getenv("PTV_WUCR")) g_wucr = 1;          /* legacy opt-in (WUCR is the default since v0.9.10); its startup
+                                                 * line was removed in 2.0.0 */
     if (getenv("PTV_NO_WUCR")) g_wucr = 0;       /* v0.9.10: WUCR default-on; revert to genlock/free-run */
     if (getenv("PTV_NO_GENLOCK_GUARD")) g_genlock_guard = 0;  /* v0.9.4: revert to the unbounded ±1%-gate FLL (A/B the runaway) */
     /* 0.9.18.7: PTV_GENLOCK_MAX_PPM / PTV_GENLOCK_REJECT_PPM / PTV_GENLOCK_WINDOW_MS /
@@ -6964,7 +6986,6 @@ int main(int argc, char **argv)
     if (getenv("PTV_DELIVERY_MV")) g_delivery_mv = 1;       /* pre-0.9.12.1 opt-in — now the default; kept as a harmless no-op for existing configs */
     if (getenv("PTV_NO_DELIVERY_MV")) g_delivery_mv = 0;    /* v0.9.12.1: revert multiview to ungated wire staging (sync_check-visible audio lead) */
     /* PTV_DELIVERY_CAP_MS / PTV_DELIVERY_MAXQ override parses moved to resolve_cushions() (0.9.18 M1) */
-    if (getenv("PTV_AVSYNC_PROBE")) g_avsync_probe = 1;    /* Phase A: read-only [PTV-AVSYNC2] real A/V offset */
     /* 0.9.18.7: PTV_AF_ACQUIRE_MS (100ms) / PTV_AF_RATE_MS_S (10) internalized —
      * see g_af_acquire_us / g_af_rate_us */
     if (getenv("PTV_NO_AVSYNC_PLL")) g_avsync_pll = 0;     /* B3 closed-loop is DEFAULT-ON (v0.6.20); this reverts to the open-loop B1 content-anchored follow. (PTV_AVSYNC_PLL=1 still honored implicitly = the default.) */
@@ -7035,6 +7056,7 @@ int main(int argc, char **argv)
           g_slow_dec_on_us  = nw0 + (fr ? (int64_t)atoi(fr) * 1000000 : 0);
           g_slow_dec_off_us = fo ? g_slow_dec_on_us + (int64_t)atoi(fo) * 1000000 : 0;
       } }
+    av_log_set_flags(AV_LOG_SKIP_REPEATED);   /* 2.0.0: collapse identical consecutive lines (as the ffmpeg CLI) */
     if (getenv("PTV_LOG_TS") && atoi(getenv("PTV_LOG_TS")))   /* native [timestamp] log prefix */
         av_log_set_callback(ptv_log_ts_callback);
 

@@ -3452,8 +3452,12 @@ void *demux_thread(void *arg)
              * and its wall evidence must stand (sync_bursty_20: the first burst's cut lasted into the silence) */
             if (d->door_startup && (atomic_load_explicit(&g_src_state, memory_order_relaxed) || d->src_pend || d->rj_skip))
                 d->door_startup = 0;
-            if (g_diag && isv && nw - d->dbg_door_wc >= 1000000) {   /* T-316 diag */
+            /* T-316 diag. 2.0.0: event-driven — on a state change, and 1/s only while the door is closed or the depth is
+             * within 2 s of the max (it was 1/s always: 3 500 lines/h for a door idle 99.9 % of the time) */
+            if (g_diag && isv && ((d->door * 8 + active * 4 + d->door_hold * 2 + fresh) != d->dbg_door_st ||
+                                  ((d->door || (ref && vs - ref > maxd - 2000000)) && nw - d->dbg_door_wc >= 1000000))) {
                 d->dbg_door_wc = nw;
+                d->dbg_door_st = d->door * 8 + active * 4 + d->door_hold * 2 + fresh;
                 av_log(NULL, AV_LOG_INFO, "[PTV-DOORDBG] door=%d active=%d fresh=%d hold=%d vs=%.3f vo=%.3f v0=%.3f ref=%.3f "
                        "depth=%.3f st=%d rj=%d pend=%d vq=%d\n", d->door, active, fresh, d->door_hold, vs / 1e6, vo / 1e6,
                        d->door_v0 / 1e6, ref / 1e6, ref ? (vs - ref) / 1e6 : -1.0,
@@ -3497,8 +3501,11 @@ void *demux_thread(void *arg)
                     d->door_v0      = 0;
                     d->door_v0_arm  = 1;
                     d->door_vs_hold = vs;
+                    /* 2.0.0: say which way the cut goes (T-364/T-368) — only the kept case used to show (WALLEV) */
                     av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 burst: back under the max delay — resuming at a keyframe, "
-                           "picture and sound together (%"PRId64" packets dropped)\n", d->door_n);
+                           "picture and sound together (%"PRId64" packets dropped; %s)\n", d->door_n, d->door_startup ?
+                           "the source stayed live: the cut is erased, no timestamp jump" :
+                           "the source paused in the cut: it stays as a hole the output repeats through");
                 } else {
                     int early = 0;
                     if (!isv && raw != AV_NOPTS_VALUE) {
@@ -3854,7 +3861,8 @@ static void rate_estimator_feed(RateEstimator *e, int64_t c_now, int64_t w_now,
                      * re-acquire instead of holding a value reality keeps contradicting. */
                     if (e->cf_chunks > 20 && ++e->cf_la_tot >= 40) {
                         if (e->cf_la_acc < 10) {
-                            av_log(NULL, AV_LOG_WARNING,
+                            /* 2.0.0: DIAG — an internal re-acquire, every few minutes on a noisy (healthy) source clock */
+                            av_log(NULL, g_diag ? AV_LOG_WARNING : AV_LOG_VERBOSE,
                                    "[PTV-CLOCK] estimator unlatched — locked ema %+lldppm rejected %d/%d "
                                    "recent windows; re-acquiring\n",
                                    (long long)(((e->cf_ema_q20 - (1 << 20)) * 1000000) >> 20),
