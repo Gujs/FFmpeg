@@ -721,14 +721,26 @@ void cushion_escalate(CushionEvent ev, int64_t a0, int64_t a1)
 /* 2.0.0-pre18 T-316: the first 30 s after the first decoded frame count as a STARTUP window in which the master
  * rung's frame queue is lossless, as with an armed bank. A burst source's first burst (8 s of content in ~0.1 s)
  * overflowed the 160-frame queue before any stall had armed the bank: 34 frames skipped = a 1.4 s video PTS hole
- * at 0.1 s on every sync_bursty_8 start. The burst now waits in video_q (512 packets) instead. */
+ * at 0.1 s on every sync_bursty_8 start. The burst now waits in video_q (512 packets) instead.
+ * 2.0.0-pre21 (T-367): the window closes only once that backlog has drained INTO the frame queue (not full): closed on
+ * the 30 s timer, the queue's drop-oldest shed what was still queued — video only: cor-3's pre20 restart had ten
+ * channels drop 38-80 frames at t = 31 s, and a 11.6 s start-up backlog left a 5.4 s video PTS hole (fixture
+ * sync_startstall_11). Kept, the backlog drains at the house catch-up like any held latency; the depth door bounds it.
+ * Multiview publishes no g_frameq_depth (0): its window still closes at 30 s. */
 int ptv_fq_startup_lossless(void)
 {
     static _Atomic int64_t t0;
+    static _Atomic int     closed;
     int64_t now = av_gettime_relative(), z = 0;
+    if (atomic_load_explicit(&closed, memory_order_relaxed))
+        return 0;
     if (!atomic_load_explicit(&t0, memory_order_relaxed))
         atomic_compare_exchange_strong(&t0, &z, now);
-    return now - atomic_load_explicit(&t0, memory_order_relaxed) < 30000000;
+    if (now - atomic_load_explicit(&t0, memory_order_relaxed) < 30000000 ||
+        atomic_load_explicit(&g_frameq_depth, memory_order_relaxed) >= g_cp.frameq_cap - 8)
+        return 1;
+    atomic_store_explicit(&closed, 1, memory_order_relaxed);
+    return 0;
 }
 
 /* hand a frame to one rung's jitter buffer; drop-oldest in live so a stalled

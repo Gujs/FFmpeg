@@ -3448,8 +3448,8 @@ void *demux_thread(void *arg)
                 d->door_v0_arm = 0;
             }
             ref = fresh ? vo : d->door_v0;
-            /* T-364: a start-up cut is one only while the source stays LIVE: a source pause inside it is repeated
-             * through, and its wall evidence must stand (sync_bursty_20: the first burst's cut lasted into the silence) */
+            /* T-364: a cut is erased only while the source stays LIVE: a source pause inside it is repeated through,
+             * and its wall evidence must stand (sync_bursty_20: the first burst's cut lasted into the silence) */
             if (d->door_startup && (atomic_load_explicit(&g_src_state, memory_order_relaxed) || d->src_pend || d->rj_skip))
                 d->door_startup = 0;
             if (g_diag && isv && nw - d->dbg_door_wc >= 1000000) {   /* T-316 diag */
@@ -3471,7 +3471,7 @@ void *demux_thread(void *arg)
                  * not a burst (pre19 gate: a LIVE LOSS rejoin's lone pre-gap tail on air read 20.1 s, a bit-flipped
                  * PTS 93.9 s; the door cut live content: a 0.8 s video PTS hole, lip sync −3.4 s) */
                 d->door     = 1;
-                d->door_startup = !vo;              /* T-364: a start-up backlog, nothing shown yet */
+                d->door_startup = 1;                /* T-364: the source is LIVE — cleared if it pauses in the cut */
                 d->door_raw0 = out->pts != AV_NOPTS_VALUE ? out->pts : raw;   /* PTS: the clock vs and the copies use */
                 d->door_us0  = vs;
                 d->door_wc   = nw;
@@ -3736,13 +3736,14 @@ static void ptv_autobank_escalate(DemuxArgs *d, int64_t worst_us, int64_t now)
     cushion_escalate(BANK_ESCALATE, worst_us, now);
 }
 
-/* 2.0.0-pre20 T-364: a packet the depth door drops in a START-UP cut (the door closed before the first picture was on
- * air: a mass restart's slow GPU set-up queued ~12 s) still ARRIVED. The wall-evidence split reads a content jump with
- * no arrivals behind it as a real hole the house repeats through; at start-up the output plays the queue and repeats
- * nothing, so the cut must read as flowing (erased) — kept, it left a 13.3 s video PTS hole (audio padded instead) and
- * the ffmpeg HLS segmenter logged ~34 000 timestamp discontinuities. A cut after the start keeps its wall evidence: a
- * burst source's return is repeated through while the source is silent (stamping there erased 8 s of a sync_bursty_20
- * return on video only — audio whole-step under the armed bank: lip sync +8 s) */
+/* 2.0.0-pre20 T-364: a packet the depth door drops while the source is LIVE still ARRIVED. The wall-evidence split reads
+ * a content jump with no arrivals behind it as a real hole the house repeats through; while the source flows the output
+ * plays its queue and repeats nothing, so the cut must read as flowing (erased) — kept, a mass restart's start-up backlog
+ * cut left a 13.3 s video PTS hole (audio padded instead) and the ffmpeg HLS segmenter logged ~34 000 timestamp
+ * discontinuities. Once the source pauses inside the cut, its wall evidence stands: a burst source's silence is repeated
+ * through (stamping there erased 8 s of a sync_bursty_20 return on video only — audio whole-step under the armed bank:
+ * lip sync +8 s). pre21: pre20 required the cut to begin before the first picture; cor-3's pre20 restart had Azorse_TV
+ * start with 11.6 s queued, cadence holds took it over 12 s once on air → the same 12.9 s hole */
 static void door_arrived(DemuxArgs *d, int si, int64_t nw)
 {
     d->any_wall_last = nw;

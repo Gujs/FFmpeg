@@ -1808,8 +1808,8 @@ typedef struct DemuxArgs {
                                              * drop what lies before it */
     int                   door_hold;        /* the output is held: depth is measured from the content it resumes at */
     int                   door_v0_arm;      /* a cut (or the start) was made: the next video let in is that content */
-    int                   door_startup;     /* 2.0.0-pre20 T-364: this cut began before the first picture was on air
-                                             * and the source has stayed LIVE since */
+    int                   door_startup;     /* 2.0.0-pre20 T-364: the source has stayed LIVE since this cut began (pre21:
+                                             * at any time; pre20 required it before the first picture) */
     int64_t               door_raw0, door_us0, door_cut, door_wc, door_n, door_v0, door_vo, door_vo_wc, door_vs_hold;
     int64_t               dbg_door_wc;      /* T-316 diag: [PTV-DOORDBG] rate limit */
     int64_t               src_gap_pending;  /* 2.0.0-pre4: a hold's arrival gap awaiting its rejoin class */
