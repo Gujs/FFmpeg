@@ -3154,12 +3154,55 @@ static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
         }
         return;
     }
+    {   /* 2.0.0 T-373: a picture in another size / format than the graph was built for is damage (a bit-flipped SPS
+         * decoded one 16x640 picture in a 640x360 stream): bwdif failed on it, lavfi closed the link for good and
+         * every later frame vanished — the picture froze for the rest of the run. Dropped like a lost frame (the
+         * output repeats through it). A change that lasts 2 s is the source's: exit 4 for a re-probe. */
+        const AVFilterLink *in = d->fsrc->outputs[0];
+        int64_t now = av_gettime_relative();
+        if (frame->width != in->w || frame->height != in->h || frame->format != in->format) {
+            if (!d->vf_odd_since) {
+                d->vf_odd_since = now;
+                av_log(NULL, AV_LOG_WARNING, "[PTV-VDEC] in0 decoded a %dx%d %s picture in a %dx%d %s stream — "
+                       "damage, dropped (the output repeats through it)\n", frame->width, frame->height,
+                       av_get_pix_fmt_name(frame->format) ? av_get_pix_fmt_name(frame->format) : "?", in->w, in->h,
+                       av_get_pix_fmt_name(in->format) ? av_get_pix_fmt_name(in->format) : "?");
+            }
+            d->vf_odd_n++;
+            av_frame_unref(frame);
+            if (now - d->vf_odd_since >= 2000000) {
+                av_log(NULL, AV_LOG_ERROR, "[PTV-SRC] in0 video changed to %dx%d %s for 2 s — exiting 4 for a "
+                       "re-probe\n", frame->width, frame->height, av_get_pix_fmt_name(frame->format) ?
+                       av_get_pix_fmt_name(frame->format) : "?");
+                fflush(NULL);
+                _exit(4);
+            }
+            return;
+        }
+        if (d->vf_odd_since) {
+            av_log(NULL, AV_LOG_WARNING, "[PTV-VDEC] in0 %d damaged picture(s) dropped over %.1f s\n",
+                   d->vf_odd_n, (now - d->vf_odd_since) / 1e6);
+            d->vf_odd_since = 0; d->vf_odd_n = 0;
+        }
+        /* any other way a filter fails closes the graph silently too: frames go in, none come out. 2 s of that
+         * (a temporal filter holds a few frames, never seconds) = the graph is dead: exit 4, the wrapper rebuilds */
+        if (!d->vg_out_wc) d->vg_out_wc = now;
+        if (d->vg_in_since_out > 25 && now - d->vg_out_wc > 2000000) {
+            av_log(NULL, AV_LOG_ERROR, "[PTV-VGRAPH] the video filter graph took %"PRId64" frames in %.1f s and "
+                   "returned none (a filter failed) — exiting 4 for a re-probe\n", d->vg_in_since_out,
+                   (now - d->vg_out_wc) / 1e6);
+            fflush(NULL);
+            _exit(4);
+        }
+    }
     frame->pts = frame->best_effort_timestamp;   /* carry source time through the graph */
     if (av_buffersrc_add_frame(d->fsrc, frame) < 0)   /* consumes frame */
         return;
+    d->vg_in_since_out++;
     for (i = 0; i < d->n_rung; i++) {                 /* split branch -> each rung's frame_q */
         while (av_buffersink_get_frame(d->fsink[i], filt) >= 0) {
             AVFrame *out;
+            if (i == 0) { d->vg_in_since_out = 0; d->vg_out_wc = av_gettime_relative(); }
             if (filt->opaque == &ptv_hold_tag) {   /* 2.0.0-pre9: a hold picture a temporal filter released at
                                                     * the rejoin — not content */
                 av_frame_unref(filt);

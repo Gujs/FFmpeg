@@ -2398,10 +2398,14 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                  * −67 ms (under the bar: decimated + 1 tick hs) while audio's −85 ms crossed and was erased alone →
                  * audio 85–107 ms late per event until the corrector's dwell. Both now cross and the shared
                  * first-crosser amount erases them equally. */
-                int64_t bnom = pkt->duration > 0 ? pkt->duration : (ol && ol->nom > 0 ? ol->nom : 0);
+                /* 2.0.0 T-371: the MEASURED step first — pkt->duration comes from the SPS / SEI timing (no CRC): one
+                 * flipped bit in an IDR's num_units_in_tick gave its 25 frames a 360 ms (another seed: 32 s) duration,
+                 * so every normal +40 ms step read as a backward step and was absorbed: +8 s / +735 s of video labels,
+                 * PTS holes and lip sync −8 s after recovery. The duration is only the fallback before a step is known. */
+                int64_t bnom = ol && ol->nom > 0 ? ol->nom : (pkt->duration > 0 ? pkt->duration : 0);
                 if ((fwd_thresh > 0 && delta > fwd_thresh) || (back_thresh > 0 && delta - bnom < -back_thresh)) {
                     int64_t thresh  = delta > 0 ? fwd_thresh : back_thresh;
-                    int64_t nominal = pkt->duration > 0 ? pkt->duration : thresh / 4;
+                    int64_t nominal = ol && ol->nom > 0 ? ol->nom : (pkt->duration > 0 ? pkt->duration : thresh / 4);
                     int64_t adj = delta - nominal;
                     int is_gap = 0;
                     /* 2.0.0-pre9.2 (T-080 B): the mirror case — the PREVIOUS packet was a one-packet FORWARD outlier (under
