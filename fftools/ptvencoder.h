@@ -1428,6 +1428,9 @@ typedef struct AudioState {
 typedef struct PassStream {
     int        input;                 /* source input index (multiview); 0 single-input */
     int        in_index;              /* input stream index being copied 1:1 (within that input) */
+    int        is_scte;               /* 2.0.0-pre20: SCTE-35, set at bind — the master thread's vwait_drain must not read
+                                       * d->ifmt (NULL while a LOST reopen closes the input: SIGSEGV, fixture 2026-10-14) */
+    const char *cname;                /* 2.0.0-pre20: codec name for the master thread's fill logs (same reason) */
     AVStream  *ost[PTV_MAX_RUNG];     /* output stream in each muxer (fan-out) */
     AVRational in_tb;                 /* input/output time_base (copy: identical) */
     int64_t    last_dts;              /* last emitted dts (monotonic guard; NOPTS until first) */
@@ -1805,6 +1808,8 @@ typedef struct DemuxArgs {
                                              * drop what lies before it */
     int                   door_hold;        /* the output is held: depth is measured from the content it resumes at */
     int                   door_v0_arm;      /* a cut (or the start) was made: the next video let in is that content */
+    int                   door_startup;     /* 2.0.0-pre20 T-364: this cut began before the first picture was on air
+                                             * and the source has stayed LIVE since */
     int64_t               door_raw0, door_us0, door_cut, door_wc, door_n, door_v0, door_vo, door_vo_wc, door_vs_hold;
     int64_t               dbg_door_wc;      /* T-316 diag: [PTV-DOORDBG] rate limit */
     int64_t               src_gap_pending;  /* 2.0.0-pre4: a hold's arrival gap awaiting its rejoin class */
@@ -1879,6 +1884,8 @@ typedef struct DemuxArgs {
     int                   by_gap_cnt;       /* completed gaps >=1.5s in the window */
     int                   autobank;         /* v0.9.14: runtime bank escalation armed for this input (single-input live) */
     int64_t               by_bank_last_q;   /* v0.9.14: wall time of the last QUALIFYING stall (decay reference) */
+    int64_t               by_big_wc;        /* 2.0.0-pre20: wall time of the last >=3 s stall (a lone one does not arm) */
+    int64_t               by_big_gap;       /* its length (us) */
                                             /* (by_bank_advise_us moved to CushionRt.bank_advise_us — 0.9.18 M3) */
     int64_t               vcorrupt;       /* video packets flagged AV_PKT_FLAG_CORRUPT (discarded if g_discardcorrupt) */
     pthread_mutex_t       pass_lock;        /* 2.0.0-pre6: copy state shared with the master's AC-3 fill */
@@ -2161,6 +2168,7 @@ extern int64_t g_cushion_max_ms;
 extern int64_t g_bank_decay_us;
 extern _Atomic int     g_bank_pkts;
 extern _Atomic int64_t g_bank_us;
+extern _Atomic int     g_bank_lone;
 extern _Atomic int     g_vq_elems;
 extern _Atomic int     g_fq_hw;
 extern int     g_exacttick;

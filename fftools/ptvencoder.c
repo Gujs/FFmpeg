@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.0-pre19"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.0-pre20"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -618,17 +618,20 @@ int     g_pll_testnoise_frames = 330; /* TEST-ONLY (1.0.1-pre18, #49 gate): half
  * the bank instead of being drained: the channel self-heals within a stall cycle or two, no
  * restart, no viewer-visible fill. Growth is self-limiting (once bank >= gap, stalls stop
  * starving so latency stops growing). The per-rung delivery-gate cap rides the bank so audio
- * waits out long stalls with video. Decays after 6h without qualifying stalls (the drained
- * latency then bleeds via the normal catch-up path). PTV_NO_AUTOBANK reverts to advisor-only;
+ * waits out long stalls with video. Decays after 1 h without qualifying stalls (the drained
+ * latency then bleeds via the normal catch-up path; 2.0.0-pre20: was 6 h — a burst or two a day held 9-12 s of
+ * latency for hours; recurring bursters stall every few seconds to minutes and never see an hour of quiet). A bank
+ * armed by ONE stall (g_bank_lone) does not top up and retires after 10 min unless a second comes within 30 min. PTV_NO_AUTOBANK reverts to advisor-only;
  * an explicit PTV_PREROLL_MS deep prime keeps working and pre-fills at startup as before.
  * Single-input live only (mosaic slots ride cadence-residence starvation-slip; mv bank later). */
 static int     g_autobank = 1;
 int64_t g_cushion_max_ms = 12000;      /* PTV_CUSHION_MAX_MS: bank ceiling (owner: >12s stalls are
                                                * upstream INCIDENTS to surface, not absorb; also = startup
                                                * darkness after every restart if baked into a preroll) */
-int64_t g_bank_decay_us = 6 * 3600 * 1000000LL;   /* PTV_BANK_DECAY_S: quiet time before the bank drops */
+int64_t g_bank_decay_us = 3600 * 1000000LL;   /* PTV_BANK_DECAY_S: quiet time before the bank drops (pre20: 6 h -> 1 h) */
 _Atomic int     g_bank_pkts;           /* >0 = deep-bank semantics armed (master rung blocking push) */
 _Atomic int64_t g_bank_us;             /* current bank TARGET (us) — stats/log readout */
+_Atomic int     g_bank_lone;           /* 2.0.0-pre20: armed by ONE stall — no top-up, retires after 10 min quiet */
 _Atomic int     g_vq_elems;            /* video_q depth (pkts), demux-updated — the bank ACTUAL readout */
 _Atomic int     g_fq_hw;               /* 0.9.18 #19: worst frame-queue depth ever seen (any rung; mv incl.
                                                * hold.q) — one catch-up burst fills a rung to cap and the CUDA frame
@@ -5647,6 +5650,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
             memset(&pass[n_pass], 0, sizeof pass[n_pass]);
             pass[n_pass].input    = kk;
             pass[n_pass].in_index = sidx;
+            pass[n_pass].is_scte  = ist->codecpar->codec_id == AV_CODEC_ID_SCTE_35;
+            pass[n_pass].cname    = avcodec_get_name(ist->codecpar->codec_id);
             pass[n_pass].in_tb    = ist->time_base;
             pass[n_pass].last_dts = AV_NOPTS_VALUE;
             pass[n_pass].gated    = (ist->codecpar->codec_type == AVMEDIA_TYPE_AUDIO);  /* §7.5a: dense AC-3/MP2 ride the gate; sparse subs/data/SCTE-35 bypass */
@@ -6974,7 +6979,7 @@ int main(int argc, char **argv)
     { const char *tn = getenv("PTV_PLL_TESTNOISE_MS");  if (tn && atoi(tn) > 0) g_pll_testnoise_us  = (int64_t)atoi(tn) * 1000; }  /* TEST-ONLY: inject ±N ms offset square wave */
     { const char *tp = getenv("PTV_PLL_TESTNOISE_P");   if (tp && atoi(tp) > 0) g_pll_testnoise_frames = atoi(tp); }              /* TEST-ONLY (#49 gate): square-wave half-period, frames */
     if (getenv("PTV_NO_QSHED"))    g_qshed    = 0;   /* 1.0.1-pre8 (a): revert to per-packet tail-drop on video_q overflow (the #32 fragmenter; A/B only) */
-    if (getenv("PTV_NO_RATCHREL")) g_ratchrel = 0;   /* 1.0.1-pre8 (b): keep the 6h bank decay even under the starvation contradiction */
+    if (getenv("PTV_NO_RATCHREL")) g_ratchrel = 0;   /* 1.0.1-pre8 (b): keep the bank decay even under the starvation contradiction */
     if (getenv("PTV_NO_SELFHEAL")) g_selfheal = 0;   /* 1.0.1-pre8 (c): no internal re-prime on sustained starvation */
     { const char *rs = getenv("PTV_RSYNC_SENSE"); if (rs && !atoi(rs)) g_rsync_sense = 0; }  /* 1.0.1-pre9: passive residual sensor default ON; =0 disables */
     /* 1.0.1-pre14 residual-sync corrector: DEFAULT ON (owner-directed 2026-07-17 — parked and
