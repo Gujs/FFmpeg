@@ -1077,8 +1077,11 @@ void *output_thread(void *arg)
                      * damage a surplus (already-played) frame often comes first, and the frame decimation pops next
                      * sat behind the gap (3 holes of 0.12-0.16 s on Cinestar 10 % loss); that tick shows the surplus
                      * frame as decimation always did, and the repeats start on the next tick. */
+                    /* 2.0.0 T-377: up to the stall threshold (3 s), not 2 s — a gap between the two was handled by
+                     * neither path: at 50 fps a 2 s flap is 101 lost frames = 2020 ms, leapt = a 2.04 s video PTS hole
+                     * (rich50b flapping; 25 fps: 50 frames = 2000 ms, filled). Below the threshold no hold ever starts */
                     int64_t hc = content_index(v, f->pts);
-                    if (hc > last_vpts + 1 && (hc - last_vpts - 1) * v->tick_dur_us <= 2000000 &&
+                    if (hc > last_vpts + 1 && (hc - last_vpts - 1) * v->tick_dur_us <= FFMAX(2000000, g_stall_min_us) &&
                         av_dict_get(f->metadata, "ptv_dmg", NULL, 0)) {   /* damage-era frame (emit_video) */
                         nextf = f; next_have = 1; vgap_park = 1;
                         if (!fresh) {
@@ -1363,7 +1366,7 @@ void *output_thread(void *arg)
                         if (cr != svo_cr) { svo_cr = cr; svo_dmg_wc = nw; }
                         if (svo_dmg_wc && nw - svo_dmg_wc < 5000000 && tp != AV_NOPTS_VALUE) {
                             int64_t span = content_index(v, tp) - last_vpts;
-                            if (span > occ && (span - occ) * v->tick_dur_us <= 2000000)
+                            if (span > occ && (span - occ) * v->tick_dur_us <= FFMAX(2000000, g_stall_min_us))   /* T-377 */
                                 occ = (int)span;
                         }
                     }

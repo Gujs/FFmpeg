@@ -30,6 +30,14 @@ the v2 `0001` patch (additive, travels with the source to the build box).
   the encoder wrote one overlapping AAC frame — gate keys passed or failed run to run on the same media (stop_10,
   stop_20, bursty_20, burstjump). The door now trims any step back over 1 ms (label rounding stays below it).
   rich25b/sync_stop_20: 12/12 PASS (pre22 without it 4/11 FAIL, pre21 1/12).
+- **No 2 s video timestamp hole on a flapping 50 fps source (T-377).** The video gap fill repeated frames into a content
+  gap inside the frame queue only up to 2 s; the outage path starts at the 3 s stall threshold, so a gap in between
+  was leapt. At 50 fps a 2 s flap is 101 lost frames = 2020 ms → one 2.04 s video PTS hole (25 fps: 2000 ms, filled).
+  The fill now reaches the stall threshold.
+- **One bit-flipped subtitle timestamp no longer stops the subtitles (T-378).** A DVB subtitle PES read 1540.7 s
+  between 49.5 and 51.5 s; it waited for the video to show that content and every later subtitle waited behind it
+  (54 subtitles + 17 clears lost to the end of the run). A copied packet stamped more than 15 s ahead of the picture
+  on air (the 12 s delay pin + 3 s) is a corrupt timestamp: dropped, `[PTV-VMAP]` logs it.
 - Release gate: see the pre22 gate line (gate22, frozen kit `860a8b7` — loudlive on every production-graph key, wire
   PID-dark bar 1.5 s — on the frozen media set `513a76f41757`, pre22 twice + pre21 side by side).
 

@@ -1953,6 +1953,25 @@ static void vwait_drain(DemuxArgs *d, int force)
             AVPacket *p = ps->vwait[k];
             int64_t ts = p->dts != AV_NOPTS_VALUE ? p->dts : p->pts, o = AV_NOPTS_VALUE, gap = 0;
             int r = ts == AV_NOPTS_VALUE ? -1 : copy_shown(d, av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q), &o, &gap);
+            if (r == 0 && !force && !scte && !d->mv_vring) {
+                /* 2.0.0 T-378: a copy stamped further ahead of the video on air than the output can ever hold (the 12 s
+                 * delay pin + 3 s) is a corrupt timestamp — one bit-flipped DVB sub PTS (+1491 s, rich50b bitflip) waited
+                 * for content that never came, and every subtitle behind it waited too (54 subs + 17 clears lost to the
+                 * end of the run). It is dropped; the rest of the stream flows on */
+                int64_t hs;
+                if (ptv_vmap_head(&hs) && av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q) > hs + 15000000) {
+                    if (now - d->vm_far_wc >= 60000000) {
+                        d->vm_far_wc = now;
+                        av_log(NULL, AV_LOG_WARNING, "[PTV-VMAP] a copied packet stamped %.1f s ahead of the picture on "
+                               "air — a corrupt timestamp, dropped (it would hold the stream's later packets)\n",
+                               (av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q) - hs) / 1e6);
+                    }
+                    av_packet_free(&p);
+                    d->vm_late++;
+                    k++;
+                    continue;
+                }
+            }
             if (r == 0 && !force)
                 break;                          /* its content is not on the output yet */
             if (r < 0 && scte && !force && ts != AV_NOPTS_VALUE) {
