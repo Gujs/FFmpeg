@@ -3495,12 +3495,17 @@ graph_in:
                             int64_t pp = a->pad_led_us[pf];
                             if (pp > 0 && now_wc - a->pad_led_wc[pf] <= PTV_GLUE_PAD_TTL_US &&
                                 llabs(fstep - pp) <= FFMAX(80000, pp / 4)) {
-                                a->glue_off_us -= pp;
+                                /* 2.0.0 T-370: take back what the flush ADDED (fstep), not the whole pad: a pad
+                                 * larger than the relabel also holds content the flush itself dropped (+23600 vs
+                                 * +23301 ms: 299 ms of real audio) — erasing it left audio 299 ms early for good. The
+                                 * rest stays padded (an erase needs positive evidence) */
+                                int64_t er = FFMIN(pp, fstep);
+                                a->glue_off_us -= er;
                                 a->pad_led_us[pf] = 0;         /* consumed */
                                 ptv_pad_pub(a);
                                 a->glue_events++;
                                 a->flush_relab_seen_wc = fwc;
-                                a->pend_comp_us = -pp;         /* §2.4 tripwire: the drop must realize */
+                                a->pend_comp_us = -er;         /* §2.4 tripwire: the drop must realize */
                                 a->pend_comp_wc = now_wc;
                                 av_log(NULL, AV_LOG_WARNING,
                                        "[PTV-AGLUE] a%d(in%d) LAYERA flush relabel %+"PRId64"ms matches an "

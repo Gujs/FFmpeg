@@ -1070,7 +1070,10 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
          * outlier in the same window → keep NEW baked vid_err 279 s. So: up to ~one PES of frames (8), more back on
          * the old timeline than on the new, and the stream's LAST buffered packet back on the old one. A real splice
          * never returns. */
-        outlier = new_t >= 1 && new_t <= 8 && old_after >= 3 && old_after > new_t && last_tl == 0;
+        /* 2.0.0 T-370: one AAC PES carried 11 frames (a 2^21-tick flip in its PTS, the found seed-1 media) — over the old
+         * cap of 8, so LAYERA kept NEW, freed 14 good old-timeline frames (299 ms) and the rest went wrong downstream
+         * (audio −299 ms for good). 16 frames = one PES of up to ~340 ms AAC; the return rules below still decide. */
+        outlier = new_t >= 1 && new_t <= 16 && old_after >= 3 && old_after > new_t && last_tl == 0;
         if (outlier)
             av_log(NULL, AV_LOG_WARNING, "[PTV-LAYERA] the jump on stream %d was %d corrupt packet(s): %d of its packets "
                    "came back on the old timeline — outlier dropped, no offset\n", t, new_t, old_after);
