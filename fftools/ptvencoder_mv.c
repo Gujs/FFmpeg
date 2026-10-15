@@ -96,6 +96,7 @@ void *compositor_thread(void *arg)
     int64_t res_ema_us[PTV_MAX_INPUT];        /* v0.9.13: EMA of content deltas = the slot's smoothed cadence */
     int64_t res_src_us[PTV_MAX_INPUT];        /* v0.9.13: content time (us) of the last popped frame */
     int64_t pd_cnt[PTV_MAX_INPUT] = {0};      /* v0.9.13: residence holds (correct cadence, not starvation) */
+    int     pd_log[PTV_MAX_INPUT] = {0};      /* 2.0.0 T-343: residence holds logged (the first 3 per slot) */
     int64_t sv_cnt[PTV_MAX_INPUT] = {0};      /* v0.9.13: genuine starvation dups (due but buffer empty) */
     int64_t md_cnt[PTV_MAX_INPUT] = {0};      /* v0.9.13: decimation drops (multiple frames due in one tick) */
     int64_t dmg_cr[PTV_MAX_INPUT] = {0};      /* T-350: the slot's corrupt-video count (demux + decode) last seen */
@@ -325,6 +326,12 @@ void *compositor_thread(void *arg)
                     if (resid && !qhot && hnow + half < res_due_us[k]) {
                         pending[k] = nx;                         /* residence hold: not due yet (deliberate pacing) */
                         if (!cand) pd_cnt[k]++;
+                        if (!cand && tick > 50 && pd_log[k] < 3) {   /* T-343: a matched-rate slot should never hold */
+                            pd_log[k]++;
+                            av_log(NULL, AV_LOG_WARNING, "[PTV-RES] in%d residence hold at tick %"PRId64": occupancy %d, "
+                                   "target %d, cadence %"PRId64" us (one picture shown twice)\n", k, tick,
+                                   av_thread_message_queue_nb_elems(h->q), res_occ_tgt, res_ema_us[k]);
+                        }
                         break;
                     }
                     if (cand) { av_frame_free(&cand); md_cnt[k]++; }   /* superseded within one tick (decimation) */
@@ -357,7 +364,14 @@ void *compositor_thread(void *arg)
                              * long-term consumption always equals arrival even if the cadence
                              * estimate is biased. +-2% authority: enough to null estimator bias,
                              * far too weak to disturb the 5:6 cadence pattern. */
-                            int64_t corr = ((int64_t)av_thread_message_queue_nb_elems(h->q) - res_occ_tgt) * 1000;
+                            int dev = av_thread_message_queue_nb_elems(h->q) - res_occ_tgt;
+                            /* 2.0.0 T-343: a ±1 picture deadband — a slot born one picture under the target ran 0.1 %
+                             * slow until the drift reached half a tick (500 pictures = 20 s at 25 fps) and showed one
+                             * picture twice: a 40 ms audio step in a clean mosaic, which slot by birth jitter.
+                             * PTV_NO_RES_DEADBAND=1 reverts. */
+                            if (g_mv_res_deadband && dev >= -1 && dev <= 1)
+                                dev = 0;
+                            int64_t corr = (int64_t)dev * 1000;
                             corr = av_clip64(corr, -20000, 20000);
                             res_due_us[k] = FFMAX(res_due_us[k], hnow - half)
                                             + res_ema_us[k] - res_ema_us[k] * corr / 1000000;
