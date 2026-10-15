@@ -4099,8 +4099,11 @@ graph_in:
                        a->dbg_k, a->dbg_in, a->bk_trim_us / 1000.0);
                 a->bk_trim_us = 0;
             }
-            /* a trim under way takes every remaining overlap (29.97: the last 15 ms reached the encoder) */
-            if (ov > (a->bk_trim_us ? 0 : 25000) && ov <= 5000000) {
+            /* a trim under way takes every remaining overlap (29.97: the last 15 ms reached the encoder).
+             * 2.0.0 T-374: any overlap over 1 ms (label rounding stays below it), not only > 25 ms — the first real
+             * frame after a hold fill landed 24 ms behind the fill's end on some runs (which tick the fill stops on is
+             * a wall-clock phase), aresample carried it as an 18 ms step back and the encoder wrote one AAC overlap */
+            if (ov > (a->bk_trim_us ? 0 : 1000) && ov <= 5000000) {
                 int64_t k = av_rescale(ov, frame->sample_rate, 1000000);
                 if (!a->bk_trim_us)
                     av_log(NULL, AV_LOG_WARNING, "[PTV-ATRIM] a%d(in%d) input stepped back %.0f ms — the overlap is "

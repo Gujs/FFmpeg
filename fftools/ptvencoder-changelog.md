@@ -24,6 +24,12 @@ the v2 `0001` patch (additive, travels with the source to the build box).
   0.1 % per picture off target, so a slot born one picture under its target held one picture after ~500 pictures (a
   40 ms audio step the corrector slewed back). A ±1 picture deadband (`PTV_NO_RES_DEADBAND=1` reverts); `[PTV-RES]`
   logs the first three residence holds per slot. A/B on one binary: off 3/3 FAIL (−25/−26 ms), on 3/3 PASS (+0 ms).
+- **No AAC overlap where the audio resumes after a source stop or burst (T-374).** The first real audio frame after a
+  hold fill or a burst cut sometimes landed up to 24 ms behind the audio already fed (which tick the fill stops on is a
+  wall-clock phase): the graph door trimmed only steps back over 25 ms, aresample carried the rest as a backward label and
+  the encoder wrote one overlapping AAC frame — gate keys passed or failed run to run on the same media (stop_10,
+  stop_20, bursty_20, burstjump). The door now trims any step back over 1 ms (label rounding stays below it).
+  rich25b/sync_stop_20: 12/12 PASS (pre22 without it 4/11 FAIL, pre21 1/12).
 - Release gate: see the pre22 gate line (gate22, frozen kit `860a8b7` — loudlive on every production-graph key, wire
   PID-dark bar 1.5 s — on the frozen media set `513a76f41757`, pre22 twice + pre21 side by side).
 
