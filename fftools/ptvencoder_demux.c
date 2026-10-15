@@ -4159,7 +4159,16 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                 d->v_last_arr_us = nw;
                 for (k = 0; k < d->n_audio; k++) {
                     AVPacket *fs;
-                    if (!d->a_arr_us[k] || nw - FFMAX(d->a_arr_us[k], d->v_flow_since_us) < 2000000 ||
+                    /* 2.0.0 (T-099 class): 1 s while the input is DAMAGED (corrupt video or a corrupt-discarded packet on
+                     * this track within 5 s) — the 1-2 s interleave blips the 2 s threshold rides over are clean-source
+                     * behaviour; under loss a missing audio stretch is lost audio, and waiting 2 s left the track's PID
+                     * dark 1.8 s on the wire (AWE capture, 10 % loss: source audio absent 2.56 s while video flowed) */
+                    int64_t dw = d->aglobal[k] >= 0 && d->aglobal[k] < PTV_MAX_AUDIO ?
+                                 atomic_load_explicit(&g_adamage_wc[d->aglobal[k]], memory_order_relaxed) : 0;
+                    if (d->single)
+                        dw = FFMAX(dw, atomic_load_explicit(&g_vcorrupt_wc, memory_order_relaxed));
+                    if (!d->a_arr_us[k] || nw - FFMAX(d->a_arr_us[k], d->v_flow_since_us) <
+                                           (dw && nw - dw < 5000000 ? 1000000 : 2000000) ||
                         nw - d->nbs_last_fill_us[k] < g_nbs_quantum_us)
                         continue;
                     d->nbs_last_fill_us[k] = nw;

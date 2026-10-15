@@ -38,6 +38,11 @@ the v2 `0001` patch (additive, travels with the source to the build box).
   between 49.5 and 51.5 s; it waited for the video to show that content and every later subtitle waited behind it
   (54 subtitles + 17 clears lost to the end of the run). A copied packet stamped more than 15 s ahead of the picture
   on air (the 12 s delay pin + 3 s) is a corrupt timestamp: dropped, `[PTV-VMAP]` logs it.
+- **The audio does not go dark for 2 s while a damaged source loses its audio (T-379).** The silence fill engaged
+  after 2 s without audio packets while video flowed (above the 1-2 s interleave blips of clean sources). Under loss a
+  missing audio stretch is lost audio: AWE capture, 10 % loss, source audio absent 2.56 s → the output AAC PID dark
+  1.81 s. While the input is damaged (corrupt video, or a corrupt-discarded packet on the track, within 5 s) the fill
+  engages after 1 s: 0.77 s. Clean sources keep 2 s.
 - Release gate: see the pre22 gate line (gate22, frozen kit `860a8b7` — loudlive on every production-graph key, wire
   PID-dark bar 1.5 s — on the frozen media set `513a76f41757`, pre22 twice + pre21 side by side).
 
