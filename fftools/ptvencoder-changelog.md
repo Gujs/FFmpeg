@@ -5,6 +5,28 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre22 — pre21 + bit-flipped SPS / audio PTS keep lip sync and picture, no repeated picture in a clean mosaic
+
+- **A bit-flipped SPS frame rate no longer moves the video labels (T-371).** The per-stream absorber took the packet
+  duration (from the SPS / SEI timing, no CRC) as the expected step: one flipped bit gave an IDR's GOP 360 ms (another
+  seed: 32 s) per frame, every normal step read as a backward step and was absorbed — +8 s / +735 s of video labels and
+  lip sync −8 s after recovery (since T-088, pre9.7). The measured step comes first now; the duration is only the
+  fallback before one is known.
+- **A bit-flipped SPS picture size no longer freezes the picture for good (T-373).** One 16×640 picture in a 640×360
+  stream failed the deinterlacer, lavfi closed the link and every later frame vanished. A picture in another size /
+  format than the graph input is dropped (`[PTV-VDEC]`); 2 s of it is the source's real change → exit 4 for a re-probe;
+  a graph that takes frames for 2 s and returns none → exit 4 (`[PTV-VGRAPH]`). Single input; the mosaic needs its
+  own test first.
+- **One bit-flipped audio PTS no longer leaves the audio 0.3 s early (T-370).** An 11-frame AAC PES over LAYERA's
+  outlier cap of 8 kept the flipped timeline and freed 299 ms of good frames, then GLUEVETO erased the whole pad. The
+  cap is one PES (16 frames) and GLUEVETO erases only what the flush added (min(pad, relabel)).
+- **A clean mosaic slot no longer shows one picture twice ~20 s after start (T-343).** The residence servo steered at
+  0.1 % per picture off target, so a slot born one picture under its target held one picture after ~500 pictures (a
+  40 ms audio step the corrector slewed back). A ±1 picture deadband (`PTV_NO_RES_DEADBAND=1` reverts); `[PTV-RES]`
+  logs the first three residence holds per slot. A/B on one binary: off 3/3 FAIL (−25/−26 ms), on 3/3 PASS (+0 ms).
+- Release gate: see the pre22 gate line (gate22, frozen kit `860a8b7` — loudlive on every production-graph key, wire
+  PID-dark bar 1.5 s — on the frozen media set `513a76f41757`, pre22 twice + pre21 side by side).
+
 ## 2.0.0-pre21 — pre20 + no timestamp holes after a start-up backlog, the 2.0.0 logging
 
 - **A start-up backlog kept under the delay pin no longer leaves video timestamp holes (T-367).** cor-3's pre20 restart:
