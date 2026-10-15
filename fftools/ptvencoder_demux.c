@@ -1954,17 +1954,17 @@ static void vwait_drain(DemuxArgs *d, int force)
             int64_t ts = p->dts != AV_NOPTS_VALUE ? p->dts : p->pts, o = AV_NOPTS_VALUE, gap = 0;
             int r = ts == AV_NOPTS_VALUE ? -1 : copy_shown(d, av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q), &o, &gap);
             if (r == 0 && !force && !scte && !d->mv_vring) {
-                /* 2.0.0 T-378: a copy stamped further ahead of the video on air than the output can ever hold (the 12 s
-                 * delay pin + 3 s) is a corrupt timestamp — one bit-flipped DVB sub PTS (+1491 s, rich50b bitflip) waited
-                 * for content that never came, and every subtitle behind it waited too (54 subs + 17 clears lost to the
-                 * end of the run). It is dropped; the rest of the stream flows on */
-                int64_t hs;
-                if (ptv_vmap_head(&hs) && av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q) > hs + 15000000) {
+                /* 2.0.0 T-378: a copy stamped far past the newest video the demux has READ is a corrupt timestamp — one
+                 * bit-flipped DVB sub PTS (+1491 s, rich50b bitflip) waited for content that never came, and every
+                 * subtitle behind it waited too (54 subs + 17 clears lost to the end of the run). A real copy is muxed
+                 * with its video (a few seconds either way); the picture ON AIR is no reference: a 20 s burst puts real
+                 * subtitles 29 s ahead of it (the first T-378 bound dropped 8 of them). Dropped; the stream flows on */
+                if (d->vread_set && av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q) > d->vread_us + 10000000) {
                     if (now - d->vm_far_wc >= 60000000) {
                         d->vm_far_wc = now;
-                        av_log(NULL, AV_LOG_WARNING, "[PTV-VMAP] a copied packet stamped %.1f s ahead of the picture on "
-                               "air — a corrupt timestamp, dropped (it would hold the stream's later packets)\n",
-                               (av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q) - hs) / 1e6);
+                        av_log(NULL, AV_LOG_WARNING, "[PTV-VMAP] a copied packet stamped %.1f s past the newest video "
+                               "read — a corrupt timestamp, dropped (it would hold the stream's later packets)\n",
+                               (av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q) - d->vread_us) / 1e6);
                     }
                     av_packet_free(&p);
                     d->vm_late++;
@@ -4254,6 +4254,12 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                     return 0;
                 }
             }
+            /* 2.0.0 T-378: the newest video content read (the copies' timeline) — a copy far past it is a corrupt timestamp */
+            if (out->dts != AV_NOPTS_VALUE || out->pts != AV_NOPTS_VALUE) {
+                d->vread_us  = av_rescale_q(out->dts != AV_NOPTS_VALUE ? out->dts : out->pts,
+                                            d->ifmt->streams[d->vstream]->time_base, AV_TIME_BASE_Q);
+                d->vread_set = 1;
+            }
             /* 1.0.1-pre8 (a) GOP-COHERENT VIDEO OVERFLOW (the #32 wedge core fix). The old
              * policy tail-dropped the ARRIVING packet per-packet, MID-GOP, so under sustained
              * overflow ~70% of packets vanished at random and the decoder received GOP
@@ -4381,6 +4387,13 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
              * never unwrap per-clone — the per-stream wrap state is stateful). */
             if (d->n_audio > 0 && out->stream_index == d->astream[0] && out->pts != AV_NOPTS_VALUE)  /* [PTV-CHAIN] primary-audio source-content at demux (us) */
                 atomic_store_explicit(&g_ch_asrc, av_rescale_q(out->pts, d->ifmt->streams[out->stream_index]->time_base, AV_TIME_BASE_Q), memory_order_relaxed);
+            if (d->n_audio > 0 && out->stream_index == d->astream[0] && out->pts != AV_NOPTS_VALUE) {
+                /* 2.0.0 T-378: the read head follows the audio too — a video-only outage stops the video reads while the
+                 * subtitles flow on with the audio */
+                int64_t au = av_rescale_q(out->pts, d->ifmt->streams[out->stream_index]->time_base, AV_TIME_BASE_Q);
+                d->vread_us  = d->vread_set ? FFMAX(d->vread_us, au) : au;
+                d->vread_set = 1;
+            }
             int k;
             for (k = 0; k < d->n_audio; k++) {
                 AVPacket *c;

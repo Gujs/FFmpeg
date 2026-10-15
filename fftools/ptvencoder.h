@@ -1734,6 +1734,8 @@ typedef struct DemuxArgs {
     PassStream           *pass;          /* copy-passthrough: extra audio, subs, data */
     int64_t               vm_po;                              /* 2.0.0 T-100: prog_off of the copy being released */
     int64_t               vm_far_wc;                          /* 2.0.0 T-378: last far-future copy drop log */
+    int64_t               vread_us;                           /* 2.0.0 T-378: newest video read (us, copies' timeline) */
+    int                   vread_set;
     int64_t               vm_ok, vm_late, vm_fb, vm_log_wc;   /* 2.0.0 T-100: copies stamped through the video's record /
                                                                * dropped (content never shown or its moment passed) / old way (queue full) */
     int                   n_pass;
@@ -2083,7 +2085,6 @@ extern int64_t g_hold_clean_us;   /* 2.0.0 T-324: a hold that saw video damage e
 extern int64_t g_max_delay_us;   /* 2.0.0 T-103: pinned output delay (us; 0 = off) */
 void ptv_vmap_push(int64_t src_us, int64_t out_us);
 int  ptv_vmap_lookup(int64_t c_us, int64_t *out_us, int64_t *gap_us);
-int  ptv_vmap_head(int64_t *src_us);                            /* 2.0.0 T-378 */
 int  ptv_vmap_newest(int64_t since_wc, int64_t *src_us, int64_t *out_us);
 void ptv_copy_vwait(struct DemuxArgs *d);   /* master output thread: release the copies the video has shown */
 extern _Atomic int64_t g_vdisp_skew_us;  /* 2.0.0 T-095: where the master put the last fresh frame vs its content index */

@@ -267,19 +267,6 @@ int ptv_vmap_newest(int64_t since_wc, int64_t *src_us, int64_t *out_us)
     return ret;
 }
 
-/* 2.0.0 T-378: the newest content the video put on air (source content us). 1 = *src_us set */
-int ptv_vmap_head(int64_t *src_us)
-{
-    int ret = 0;
-    pthread_mutex_lock(&vmap_lock);
-    if (vmap_n) {
-        *src_us = vmap_src[(vmap_w + PTV_VMAP_N - 1) % PTV_VMAP_N];
-        ret = 1;
-    }
-    pthread_mutex_unlock(&vmap_lock);
-    return ret;
-}
-
 /* 1 = the video has shown content at or after c_us: *out_us = c_us on the timeline of the first such frame and
  * *gap_us = how far past c_us that frame lies, in content or (across a hold) in output time — > ~1 frame: c_us itself
  * was never shown (skipped, erased, lost in an outage); 0 = not yet (or nothing recorded); -1 = c_us is older than everything held by > 1 s. */

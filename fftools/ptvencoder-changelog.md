@@ -36,8 +36,9 @@ the v2 `0001` patch (additive, travels with the source to the build box).
   The fill now reaches the stall threshold.
 - **One bit-flipped subtitle timestamp no longer stops the subtitles (T-378).** A DVB subtitle PES read 1540.7 s
   between 49.5 and 51.5 s; it waited for the video to show that content and every later subtitle waited behind it
-  (54 subtitles + 17 clears lost to the end of the run). A copied packet stamped more than 15 s ahead of the picture
-  on air (the 12 s delay pin + 3 s) is a corrupt timestamp: dropped, `[PTV-VMAP]` logs it.
+  (54 subtitles + 17 clears lost to the end of the run). A copied packet stamped more than 10 s past the newest
+  audio / video the demux has read is a corrupt timestamp (a real one is muxed with its picture and sound): dropped,
+  `[PTV-VMAP]` logs it. (Not the picture on air: a 20 s burst puts real subtitles 29 s ahead of it.)
 - **The audio does not go dark for 2 s while a damaged source loses its audio (T-379).** The silence fill engaged
   after 2 s without audio packets while video flowed (above the 1-2 s interleave blips of clean sources). Under loss a
   missing audio stretch is lost audio: AWE capture, 10 % loss, source audio absent 2.56 s → the output AAC PID dark
