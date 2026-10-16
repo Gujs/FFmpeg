@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.0-pre21"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.0-pre22"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -77,6 +77,9 @@ int     g_mv_clamp = 0;
  * newest (clean 2:1 decimation instead of hold-queue overflow). A ≥75%-full hold queue
  * bypasses the gate (pressure valve vs a wrong rate estimate). PTV_NO_RESIDENCE reverts. */
 int     g_mv_residence = 1;
+int     g_mv_res_deadband = 0;   /* 2.0.0 T-343: residence occupancy servo ±1 picture deadband — OPT-IN (PTV_RES_DEADBAND=1):
+                                  * on, a slot ran −30 ms for 10 s after a flapping input (mv04 sync_flapping 6/6, off 0/2,
+                                  * 2026-10-16); off = the pre21 servo (T-343's 40 ms step ~20 s after start stays open) */
 int     g_mv_birthtrim = 1;
 int     g_mv_reprime = 1;   /* 2.0.0 T-339: a returning slot re-primes its jitter buffer before it shows; PTV_NO_MV_REPRIME=1 off */
 int     g_aglue_ceil = 1;     /* 1.0.1-pre17 fix round (R3c): erase a tripwire-REFUSED label pursuit at the
@@ -3154,12 +3157,55 @@ static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
         }
         return;
     }
+    {   /* 2.0.0 T-373: a picture in another size / format than the graph was built for is damage (a bit-flipped SPS
+         * decoded one 16x640 picture in a 640x360 stream): bwdif failed on it, lavfi closed the link for good and
+         * every later frame vanished — the picture froze for the rest of the run. Dropped like a lost frame (the
+         * output repeats through it). A change that lasts 2 s is the source's: exit 4 for a re-probe. */
+        const AVFilterLink *in = d->fsrc->outputs[0];
+        int64_t now = av_gettime_relative();
+        if (frame->width != in->w || frame->height != in->h || frame->format != in->format) {
+            if (!d->vf_odd_since) {
+                d->vf_odd_since = now;
+                av_log(NULL, AV_LOG_WARNING, "[PTV-VDEC] in0 decoded a %dx%d %s picture in a %dx%d %s stream — "
+                       "damage, dropped (the output repeats through it)\n", frame->width, frame->height,
+                       av_get_pix_fmt_name(frame->format) ? av_get_pix_fmt_name(frame->format) : "?", in->w, in->h,
+                       av_get_pix_fmt_name(in->format) ? av_get_pix_fmt_name(in->format) : "?");
+            }
+            d->vf_odd_n++;
+            av_frame_unref(frame);
+            if (now - d->vf_odd_since >= 2000000) {
+                av_log(NULL, AV_LOG_ERROR, "[PTV-SRC] in0 video changed to %dx%d %s for 2 s — exiting 4 for a "
+                       "re-probe\n", frame->width, frame->height, av_get_pix_fmt_name(frame->format) ?
+                       av_get_pix_fmt_name(frame->format) : "?");
+                fflush(NULL);
+                _exit(4);
+            }
+            return;
+        }
+        if (d->vf_odd_since) {
+            av_log(NULL, AV_LOG_WARNING, "[PTV-VDEC] in0 %d damaged picture(s) dropped over %.1f s\n",
+                   d->vf_odd_n, (now - d->vf_odd_since) / 1e6);
+            d->vf_odd_since = 0; d->vf_odd_n = 0;
+        }
+        /* any other way a filter fails closes the graph silently too: frames go in, none come out. 2 s of that
+         * (a temporal filter holds a few frames, never seconds) = the graph is dead: exit 4, the wrapper rebuilds */
+        if (!d->vg_out_wc) d->vg_out_wc = now;
+        if (d->vg_in_since_out > 25 && now - d->vg_out_wc > 2000000) {
+            av_log(NULL, AV_LOG_ERROR, "[PTV-VGRAPH] the video filter graph took %"PRId64" frames in %.1f s and "
+                   "returned none (a filter failed) — exiting 4 for a re-probe\n", d->vg_in_since_out,
+                   (now - d->vg_out_wc) / 1e6);
+            fflush(NULL);
+            _exit(4);
+        }
+    }
     frame->pts = frame->best_effort_timestamp;   /* carry source time through the graph */
     if (av_buffersrc_add_frame(d->fsrc, frame) < 0)   /* consumes frame */
         return;
+    d->vg_in_since_out++;
     for (i = 0; i < d->n_rung; i++) {                 /* split branch -> each rung's frame_q */
         while (av_buffersink_get_frame(d->fsink[i], filt) >= 0) {
             AVFrame *out;
+            if (i == 0) { d->vg_in_since_out = 0; d->vg_out_wc = av_gettime_relative(); }
             if (filt->opaque == &ptv_hold_tag) {   /* 2.0.0-pre9: a hold picture a temporal filter released at
                                                     * the rejoin — not content */
                 av_frame_unref(filt);
@@ -6975,7 +7021,9 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_PULLDOWN"))  g_pulldown = 0;    /* v0.9.11: revert telecine-aware emit (film segments back to dup-fill) */
     if (getenv("PTV_NO_CADDISARM")) g_cad_disarm = 0;  /* v0.9.18.1 M7: revert to flag-only pulldown disarm (dropouts drain frame_q again) */
     if (getenv("PTV_NO_MV_EXACTTICK")) g_mv_exacttick = 0;  /* v0.9.12: revert mv measurement axes to integer tick (re-enables the enforced ~10ppm mosaic drift) */
-    if (getenv("PTV_NO_RESIDENCE")) g_mv_residence = 0;     /* v0.9.13: revert to one-pop-per-tick (rate-mismatched slots batch dups + fast-forward after starvation) */
+    if (getenv("PTV_NO_RESIDENCE")) g_mv_residence = 0;
+    if (getenv("PTV_RES_DEADBAND") && atoi(getenv("PTV_RES_DEADBAND"))) g_mv_res_deadband = 1;   /* 2.0.0 T-343 (opt-in) */
+    if (getenv("PTV_NO_RES_DEADBAND")) g_mv_res_deadband = 0;   /* 2.0.0 T-343 */     /* v0.9.13: revert to one-pop-per-tick (rate-mismatched slots batch dups + fast-forward after starvation) */
     if (getenv("PTV_NO_MV_REPRIME")) g_mv_reprime = 0;      /* 2.0.0 T-339 */
     if (getenv("PTV_NO_MV_BIRTHTRIM")) g_mv_birthtrim = 0;  /* pre17: one-shot trim only (re-enables the birth catch-up slide) */
     if (getenv("PTV_NO_AGLUE_CEIL"))   g_aglue_ceil = 0;     /* pre17 fix round: unbounded refused-step pursuit (pre-Fashion posture) */

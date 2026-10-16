@@ -96,6 +96,9 @@ void *compositor_thread(void *arg)
     int64_t res_ema_us[PTV_MAX_INPUT];        /* v0.9.13: EMA of content deltas = the slot's smoothed cadence */
     int64_t res_src_us[PTV_MAX_INPUT];        /* v0.9.13: content time (us) of the last popped frame */
     int64_t pd_cnt[PTV_MAX_INPUT] = {0};      /* v0.9.13: residence holds (correct cadence, not starvation) */
+    int     pd_log[PTV_MAX_INPUT] = {0};      /* 2.0.0 T-343: residence holds logged (the first 3 per slot) */
+    int     res_home[PTV_MAX_INPUT];           /* 2.0.0 T-343b: the occupancy the slot settled at (-1 = not yet) */
+    int64_t res_home_sum[PTV_MAX_INPUT] = {0}, res_home_n[PTV_MAX_INPUT] = {0};
     int64_t sv_cnt[PTV_MAX_INPUT] = {0};      /* v0.9.13: genuine starvation dups (due but buffer empty) */
     int64_t md_cnt[PTV_MAX_INPUT] = {0};      /* v0.9.13: decimation drops (multiple frames due in one tick) */
     int64_t dmg_cr[PTV_MAX_INPUT] = {0};      /* T-350: the slot's corrupt-video count (demux + decode) last seen */
@@ -167,6 +170,7 @@ void *compositor_thread(void *arg)
     if (rs_mv_div < 8) rs_mv_div = 8;
     if (n_prime > g_frameq_cap - 8) n_prime = g_frameq_cap - 8;
     if (n_prime < 0) n_prime = 0;
+    for (int hk = 0; hk < PTV_MAX_INPUT; hk++) res_home[hk] = -1;   /* 2.0.0 T-343b */
     res_occ_tgt = n_prime > 4 ? n_prime : 4;   /* v0.9.13 servo target = the primed jitter depth,
                                                 * clamped below the pressure valve (a deep PTV_PREROLL_MS
                                                 * would otherwise put the target INSIDE the bypass zone
@@ -278,6 +282,24 @@ void *compositor_thread(void *arg)
                 int64_t half = c->tick_dur_us / 2;
                 int   qhot  = av_thread_message_queue_nb_elems(h->q) >= g_frameq_cap - g_frameq_cap / 4;
                 int   pops, reprime = 0;
+                /* 2.0.0 T-343b: the occupancy centre of this slot — once it has settled (the mean of 100 clean ticks from
+                 * 3 s on, within one picture of the target), the occupancy it actually runs at; the servo's deadband and
+                 * the refill after a gap / damage aim there, so the slot comes back at the lag its sound settled on */
+                int   res_ctr = res_occ_tgt;
+                if (resid && g_mv_res_deadband) {
+                    if (res_home[k] >= 0)
+                        res_ctr = res_home[k];
+                    else if (born[k] && tick > 75 && !reprime_us[k] && !slated[k] &&
+                             !(dmg_wc[k] && now_us - dmg_wc[k] < 5000000)) {
+                        res_home_sum[k] += av_thread_message_queue_nb_elems(h->q);
+                        if (++res_home_n[k] >= 100) {
+                            res_home[k] = av_clip((int)((res_home_sum[k] + 50) / 100), res_occ_tgt - 1, res_occ_tgt + 1);
+                            if (g_diag)
+                                av_log(NULL, AV_LOG_INFO, "[PTV-RES] in%d settled at occupancy %d (target %d)\n",
+                                       k, res_home[k], res_occ_tgt);
+                        }
+                    }
+                }
                 /* 2.0.0 T-339: a slot back from an outage (slated) stays on its slate until its jitter buffer holds the
                  * primed depth again (cap 3 s). It used to show the first returning frame at once, from an empty buffer:
                  * the occupancy servo (+-2 %) then refilled it over ~60 s, one held frame every ~2.5 s, so the slot's
@@ -300,11 +322,15 @@ void *compositor_thread(void *arg)
                 }
                 if (resid && g_mv_reprime && last_fresh_us[k] && (slated[k] || now_us - last_fresh_us[k] > 500000 ||
                     (dmg_wc[k] && now_us - dmg_wc[k] < 5000000 &&
-                     (reprime_us[k] || av_thread_message_queue_nb_elems(h->q) < res_occ_tgt - 2)))) {
+                     (reprime_us[k] || av_thread_message_queue_nb_elems(h->q) < res_ctr - 2)))) {
                     int occ = av_thread_message_queue_nb_elems(h->q);
                     if (occ && !reprime_us[k])
                         reprime_us[k] = now_us;
-                    reprime = occ < res_occ_tgt && (!reprime_us[k] || now_us - reprime_us[k] < 3000000);
+                    /* 2.0.0 T-343b: refill to the occupancy the slot ran at, not the static target — with the ±1
+                     * deadband a slot born one picture under the target stays there, and a refill to the target after a
+                     * gap put its picture one picture later than its sound had settled on (mv05 sync_gap_10: −30 ms
+                     * for 10 s after the return, 4 of 5 runs under gate load) */
+                    reprime = occ < res_ctr && (!reprime_us[k] || now_us - reprime_us[k] < 3000000);
                 }
                 for (pops = 0; pops < 4 && !reprime; pops++) {
                     AVFrame *nx = pending[k];
@@ -325,6 +351,12 @@ void *compositor_thread(void *arg)
                     if (resid && !qhot && hnow + half < res_due_us[k]) {
                         pending[k] = nx;                         /* residence hold: not due yet (deliberate pacing) */
                         if (!cand) pd_cnt[k]++;
+                        if (!cand && tick > 50 && pd_log[k] < 3) {   /* T-343: a matched-rate slot should never hold */
+                            pd_log[k]++;
+                            av_log(NULL, AV_LOG_WARNING, "[PTV-RES] in%d residence hold at tick %"PRId64": occupancy %d, "
+                                   "target %d, cadence %"PRId64" us (one picture shown twice)\n", k, tick,
+                                   av_thread_message_queue_nb_elems(h->q), res_occ_tgt, res_ema_us[k]);
+                        }
                         break;
                     }
                     if (cand) { av_frame_free(&cand); md_cnt[k]++; }   /* superseded within one tick (decimation) */
@@ -357,7 +389,14 @@ void *compositor_thread(void *arg)
                              * long-term consumption always equals arrival even if the cadence
                              * estimate is biased. +-2% authority: enough to null estimator bias,
                              * far too weak to disturb the 5:6 cadence pattern. */
-                            int64_t corr = ((int64_t)av_thread_message_queue_nb_elems(h->q) - res_occ_tgt) * 1000;
+                            int dev = av_thread_message_queue_nb_elems(h->q) - res_ctr;
+                            /* 2.0.0 T-343: a ±1 picture deadband — a slot born one picture under the target ran 0.1 %
+                             * slow until the drift reached half a tick (500 pictures = 20 s at 25 fps) and showed one
+                             * picture twice: a 40 ms audio step in a clean mosaic, which slot by birth jitter.
+                             * PTV_NO_RES_DEADBAND=1 reverts. */
+                            if (g_mv_res_deadband && dev >= -1 && dev <= 1)
+                                dev = 0;
+                            int64_t corr = (int64_t)dev * 1000;
                             corr = av_clip64(corr, -20000, 20000);
                             res_due_us[k] = FFMAX(res_due_us[k], hnow - half)
                                             + res_ema_us[k] - res_ema_us[k] * corr / 1000000;

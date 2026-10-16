@@ -5,6 +5,58 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.0-pre22 — pre21 + bit-flipped SPS / audio PTS / subtitle PTS, flapping and damaged sources keep picture, sound and structure
+
+- **A bit-flipped SPS frame rate no longer moves the video labels (T-371).** The per-stream absorber took the packet
+  duration (from the SPS / SEI timing, no CRC) as the expected step: one flipped bit gave an IDR's GOP 360 ms (another
+  seed: 32 s) per frame, every normal step read as a backward step and was absorbed — +8 s / +735 s of video labels and
+  lip sync −8 s after recovery (since T-088, pre9.7). The measured step comes first now; the duration is only the
+  fallback before one is known.
+- **A bit-flipped SPS picture size no longer freezes the picture for good (T-373).** One 16×640 picture in a 640×360
+  stream failed the deinterlacer, lavfi closed the link and every later frame vanished. A picture in another size /
+  format than the graph input is dropped (`[PTV-VDEC]`); 2 s of it is the source's real change → exit 4 for a re-probe;
+  a graph that takes frames for 2 s and returns none → exit 4 (`[PTV-VGRAPH]`). Single input; the mosaic needs its
+  own test first.
+- **One bit-flipped audio PTS no longer leaves the audio 0.3 s early (T-370).** An 11-frame AAC PES over LAYERA's
+  outlier cap of 8 kept the flipped timeline and freed 299 ms of good frames, then GLUEVETO erased the whole pad. The
+  cap is one PES (16 frames) and GLUEVETO erases only what the flush added (min(pad, relabel)).
+- **Mosaic residence deadband (T-343) — built, OPT-IN (`PTV_RES_DEADBAND=1`), default OFF = the pre21 servo.** The
+  residence servo steers at 0.1 % per picture off target, so a slot born one picture under its target holds one picture
+  after ~500 pictures (a 40 ms audio step the corrector slews back; mosaic sync_clean keys at the ±25 ms bar). A ±1
+  picture deadband removes it (A/B: off 3/3 FAIL −25/−26 ms, on 3/3 PASS +0 ms), and T-343b aims the deadband and the
+  refill after a gap / damage at the occupancy the slot settled at (mv05 sync_gap_10 −28 ms 4/5 → 5/5 PASS). But with
+  the deadband a slot ran −30 ms for the 10 s after a FLAPPING input (mv04 sync_flapping 6/6 with it, 0/3 without, pre21
+  0/3) — a new lip-sync error, so the release keeps the pre21 servo; T-343 stays open. `[PTV-RES]` logs the first three
+  residence holds per slot.
+- **No AAC overlap where the audio resumes after a source stop or burst (T-374).** The first real audio frame after a
+  hold fill or a burst cut sometimes landed up to 24 ms behind the audio already fed (which tick the fill stops on is a
+  wall-clock phase): the graph door trimmed only steps back over 25 ms, aresample carried the rest as a backward label and
+  the encoder wrote one overlapping AAC frame — gate keys passed or failed run to run on the same media (stop_10,
+  stop_20, bursty_20, burstjump). The door now trims any step back over 1 ms (label rounding stays below it).
+  rich25b/sync_stop_20: 12/12 PASS (pre22 without it 4/11 FAIL, pre21 1/12).
+- **No 2 s video timestamp hole on a flapping 50 fps source (T-377).** The video gap fill repeated frames into a content
+  gap inside the frame queue only up to 2 s; the outage path starts at the 3 s stall threshold, so a gap in between
+  was leapt. At 50 fps a 2 s flap is 101 lost frames = 2020 ms → one 2.04 s video PTS hole (25 fps: 2000 ms, filled).
+  The fill now reaches the stall threshold.
+- **One bit-flipped subtitle timestamp no longer stops the subtitles (T-378).** A DVB subtitle PES read 1540.7 s
+  between 49.5 and 51.5 s; it waited for the video to show that content and every later subtitle waited behind it
+  (54 subtitles + 17 clears lost to the end of the run). A copied packet stamped more than 10 s past the newest
+  audio / video the demux has read is a corrupt timestamp (a real one is muxed with its picture and sound): dropped,
+  `[PTV-VMAP]` logs it. (Not the picture on air: a 20 s burst puts real subtitles 29 s ahead of it.)
+- **The audio does not go dark for 2 s while a damaged source loses its audio (T-379).** The silence fill engaged
+  after 2 s without audio packets while video flowed (above the 1-2 s interleave blips of clean sources). Under loss a
+  missing audio stretch is lost audio: AWE capture, 10 % loss, source audio absent 2.56 s → the output AAC PID dark
+  1.81 s. While the input is damaged (corrupt video, or a corrupt-discarded packet on the track, within 5 s) the fill
+  engages after 1 s: 0.77 s. Clean sources keep 2 s.
+- Release gate (night 2026-10-15/16, frozen media set `513a76f41757`; loudlive on every production-graph key, wire
+  PID-dark bar 1.5 s): kit24 (`860a8b7`) and kit25 (`c7234fa` = kit24 + content age against the resumed sender's own
+  schedule, real captures replayed on their own PCRs) with the final non-mosaic code side by side with pre21 — kit25:
+  **0 regressions, 19 fixed** (231 keys); every one of the 31 mosaic keys on this build twice (kit25): 0 regressions vs
+  pre21. Each fix's regressions were re-run under gate load against pre21 in the same round (flaky keys: 18/18 PASS).
+  5.4 h local soak (flapping source, ~390 LOST + reopen; dead source): 0 exits, RSS / threads / fds flat. Remaining
+  failures are identical on pre21 and all have a T-number (T-332, T-358, T-360, T-361, T-375 by design, T-381 new, the
+  mosaic cross-slot / mv01 teletext residuals). Report: test-results/pre22-night-20261016/REPORT.md.
+
 ## 2.0.0-pre21 — pre20 + no timestamp holes after a start-up backlog, the 2.0.0 logging
 
 - **A start-up backlog kept under the delay pin no longer leaves video timestamp holes (T-367).** cor-3's pre20 restart:

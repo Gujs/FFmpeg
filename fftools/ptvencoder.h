@@ -768,6 +768,11 @@ typedef struct DecodeCtx {
                                               * continuous / no corrupt data (wall us) */
     int              hc_drop, hc_passed;      /* ... frames discarded until it lasted; the run passed */
     int64_t          hc_last_pts, hc_min_dt;  /* ... its last frame (us), the source's own frame spacing (min seen) */
+    int64_t          vf_odd_since;            /* 2.0.0 T-373: decoded pictures in another size / format than the graph
+                                              * input since (wall us, 0 = none) ... */
+    int              vf_odd_n;                /* ... how many were dropped */
+    int64_t          vg_in_since_out;         /* T-373: frames into the graph since the last one came out, ... */
+    int64_t          vg_out_wc;               /* ... and when the last one came out (wall us) */
     int              rj_dbg_n;                /* 2.0.0-pre8.2: [PTV-RJTRACE] lines left this hold (PTV_DIAG) */
     /* 2.0.0-pre9 (T-078/T-079): hold pictures rendered through the graph while input 0 holds */
     AVFrame         *hr_last;                 /* ref of the last decoded frame (single input; shape + freeze picture) */
@@ -1728,6 +1733,9 @@ typedef struct DemuxArgs {
     int                   drop;          /* non-blocking + drop on full (network input) */
     PassStream           *pass;          /* copy-passthrough: extra audio, subs, data */
     int64_t               vm_po;                              /* 2.0.0 T-100: prog_off of the copy being released */
+    int64_t               vm_far_wc;                          /* 2.0.0 T-378: last far-future copy drop log */
+    int64_t               vread_us;                           /* 2.0.0 T-378: newest video read (us, copies' timeline) */
+    int                   vread_set;
     int64_t               vm_ok, vm_late, vm_fb, vm_log_wc;   /* 2.0.0 T-100: copies stamped through the video's record /
                                                                * dropped (content never shown or its moment passed) / old way (queue full) */
     int                   n_pass;
@@ -1981,6 +1989,7 @@ extern int     g_avlock;
 extern int     g_reanchor;
 extern int     g_mv_clamp;
 extern int     g_mv_residence;
+extern int     g_mv_res_deadband;
 extern int     g_mv_birthtrim;
 extern int     g_mv_reprime;
 extern int     g_aglue_ceil;

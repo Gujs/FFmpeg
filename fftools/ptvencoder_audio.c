@@ -3495,12 +3495,17 @@ graph_in:
                             int64_t pp = a->pad_led_us[pf];
                             if (pp > 0 && now_wc - a->pad_led_wc[pf] <= PTV_GLUE_PAD_TTL_US &&
                                 llabs(fstep - pp) <= FFMAX(80000, pp / 4)) {
-                                a->glue_off_us -= pp;
+                                /* 2.0.0 T-370: take back what the flush ADDED (fstep), not the whole pad: a pad
+                                 * larger than the relabel also holds content the flush itself dropped (+23600 vs
+                                 * +23301 ms: 299 ms of real audio) — erasing it left audio 299 ms early for good. The
+                                 * rest stays padded (an erase needs positive evidence) */
+                                int64_t er = FFMIN(pp, fstep);
+                                a->glue_off_us -= er;
                                 a->pad_led_us[pf] = 0;         /* consumed */
                                 ptv_pad_pub(a);
                                 a->glue_events++;
                                 a->flush_relab_seen_wc = fwc;
-                                a->pend_comp_us = -pp;         /* §2.4 tripwire: the drop must realize */
+                                a->pend_comp_us = -er;         /* §2.4 tripwire: the drop must realize */
                                 a->pend_comp_wc = now_wc;
                                 av_log(NULL, AV_LOG_WARNING,
                                        "[PTV-AGLUE] a%d(in%d) LAYERA flush relabel %+"PRId64"ms matches an "
@@ -4094,8 +4099,11 @@ graph_in:
                        a->dbg_k, a->dbg_in, a->bk_trim_us / 1000.0);
                 a->bk_trim_us = 0;
             }
-            /* a trim under way takes every remaining overlap (29.97: the last 15 ms reached the encoder) */
-            if (ov > (a->bk_trim_us ? 0 : 25000) && ov <= 5000000) {
+            /* a trim under way takes every remaining overlap (29.97: the last 15 ms reached the encoder).
+             * 2.0.0 T-374: any overlap over 1 ms (label rounding stays below it), not only > 25 ms — the first real
+             * frame after a hold fill landed 24 ms behind the fill's end on some runs (which tick the fill stops on is
+             * a wall-clock phase), aresample carried it as an 18 ms step back and the encoder wrote one AAC overlap */
+            if (ov > (a->bk_trim_us ? 0 : 1000) && ov <= 5000000) {
                 int64_t k = av_rescale(ov, frame->sample_rate, 1000000);
                 if (!a->bk_trim_us)
                     av_log(NULL, AV_LOG_WARNING, "[PTV-ATRIM] a%d(in%d) input stepped back %.0f ms — the overlap is "

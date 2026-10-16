@@ -1070,7 +1070,10 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
          * outlier in the same window → keep NEW baked vid_err 279 s. So: up to ~one PES of frames (8), more back on
          * the old timeline than on the new, and the stream's LAST buffered packet back on the old one. A real splice
          * never returns. */
-        outlier = new_t >= 1 && new_t <= 8 && old_after >= 3 && old_after > new_t && last_tl == 0;
+        /* 2.0.0 T-370: one AAC PES carried 11 frames (a 2^21-tick flip in its PTS, the found seed-1 media) — over the old
+         * cap of 8, so LAYERA kept NEW, freed 14 good old-timeline frames (299 ms) and the rest went wrong downstream
+         * (audio −299 ms for good). 16 frames = one PES of up to ~340 ms AAC; the return rules below still decide. */
+        outlier = new_t >= 1 && new_t <= 16 && old_after >= 3 && old_after > new_t && last_tl == 0;
         if (outlier)
             av_log(NULL, AV_LOG_WARNING, "[PTV-LAYERA] the jump on stream %d was %d corrupt packet(s): %d of its packets "
                    "came back on the old timeline — outlier dropped, no offset\n", t, new_t, old_after);
@@ -1950,6 +1953,25 @@ static void vwait_drain(DemuxArgs *d, int force)
             AVPacket *p = ps->vwait[k];
             int64_t ts = p->dts != AV_NOPTS_VALUE ? p->dts : p->pts, o = AV_NOPTS_VALUE, gap = 0;
             int r = ts == AV_NOPTS_VALUE ? -1 : copy_shown(d, av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q), &o, &gap);
+            if (r == 0 && !force && !scte && !d->mv_vring) {
+                /* 2.0.0 T-378: a copy stamped far past the newest video the demux has READ is a corrupt timestamp — one
+                 * bit-flipped DVB sub PTS (+1491 s, rich50b bitflip) waited for content that never came, and every
+                 * subtitle behind it waited too (54 subs + 17 clears lost to the end of the run). A real copy is muxed
+                 * with its video (a few seconds either way); the picture ON AIR is no reference: a 20 s burst puts real
+                 * subtitles 29 s ahead of it (the first T-378 bound dropped 8 of them). Dropped; the stream flows on */
+                if (d->vread_set && av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q) > d->vread_us + 10000000) {
+                    if (now - d->vm_far_wc >= 60000000) {
+                        d->vm_far_wc = now;
+                        av_log(NULL, AV_LOG_WARNING, "[PTV-VMAP] a copied packet stamped %.1f s past the newest video "
+                               "read — a corrupt timestamp, dropped (it would hold the stream's later packets)\n",
+                               (av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q) - d->vread_us) / 1e6);
+                    }
+                    av_packet_free(&p);
+                    d->vm_late++;
+                    k++;
+                    continue;
+                }
+            }
             if (r == 0 && !force)
                 break;                          /* its content is not on the output yet */
             if (r < 0 && scte && !force && ts != AV_NOPTS_VALUE) {
@@ -2398,10 +2420,14 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                  * −67 ms (under the bar: decimated + 1 tick hs) while audio's −85 ms crossed and was erased alone →
                  * audio 85–107 ms late per event until the corrector's dwell. Both now cross and the shared
                  * first-crosser amount erases them equally. */
-                int64_t bnom = pkt->duration > 0 ? pkt->duration : (ol && ol->nom > 0 ? ol->nom : 0);
+                /* 2.0.0 T-371: the MEASURED step first — pkt->duration comes from the SPS / SEI timing (no CRC): one
+                 * flipped bit in an IDR's num_units_in_tick gave its 25 frames a 360 ms (another seed: 32 s) duration,
+                 * so every normal +40 ms step read as a backward step and was absorbed: +8 s / +735 s of video labels,
+                 * PTS holes and lip sync −8 s after recovery. The duration is only the fallback before a step is known. */
+                int64_t bnom = ol && ol->nom > 0 ? ol->nom : (pkt->duration > 0 ? pkt->duration : 0);
                 if ((fwd_thresh > 0 && delta > fwd_thresh) || (back_thresh > 0 && delta - bnom < -back_thresh)) {
                     int64_t thresh  = delta > 0 ? fwd_thresh : back_thresh;
-                    int64_t nominal = pkt->duration > 0 ? pkt->duration : thresh / 4;
+                    int64_t nominal = ol && ol->nom > 0 ? ol->nom : (pkt->duration > 0 ? pkt->duration : thresh / 4);
                     int64_t adj = delta - nominal;
                     int is_gap = 0;
                     /* 2.0.0-pre9.2 (T-080 B): the mirror case — the PREVIOUS packet was a one-packet FORWARD outlier (under
@@ -4133,7 +4159,16 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                 d->v_last_arr_us = nw;
                 for (k = 0; k < d->n_audio; k++) {
                     AVPacket *fs;
-                    if (!d->a_arr_us[k] || nw - FFMAX(d->a_arr_us[k], d->v_flow_since_us) < 2000000 ||
+                    /* 2.0.0 (T-099 class): 1 s while the input is DAMAGED (corrupt video or a corrupt-discarded packet on
+                     * this track within 5 s) — the 1-2 s interleave blips the 2 s threshold rides over are clean-source
+                     * behaviour; under loss a missing audio stretch is lost audio, and waiting 2 s left the track's PID
+                     * dark 1.8 s on the wire (AWE capture, 10 % loss: source audio absent 2.56 s while video flowed) */
+                    int64_t dw = d->aglobal[k] >= 0 && d->aglobal[k] < PTV_MAX_AUDIO ?
+                                 atomic_load_explicit(&g_adamage_wc[d->aglobal[k]], memory_order_relaxed) : 0;
+                    if (d->single)
+                        dw = FFMAX(dw, atomic_load_explicit(&g_vcorrupt_wc, memory_order_relaxed));
+                    if (!d->a_arr_us[k] || nw - FFMAX(d->a_arr_us[k], d->v_flow_since_us) <
+                                           (dw && nw - dw < 5000000 ? 1000000 : 2000000) ||
                         nw - d->nbs_last_fill_us[k] < g_nbs_quantum_us)
                         continue;
                     d->nbs_last_fill_us[k] = nw;
@@ -4218,6 +4253,12 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                     av_packet_free(&out);
                     return 0;
                 }
+            }
+            /* 2.0.0 T-378: the newest video content read (the copies' timeline) — a copy far past it is a corrupt timestamp */
+            if (out->dts != AV_NOPTS_VALUE || out->pts != AV_NOPTS_VALUE) {
+                d->vread_us  = av_rescale_q(out->dts != AV_NOPTS_VALUE ? out->dts : out->pts,
+                                            d->ifmt->streams[d->vstream]->time_base, AV_TIME_BASE_Q);
+                d->vread_set = 1;
             }
             /* 1.0.1-pre8 (a) GOP-COHERENT VIDEO OVERFLOW (the #32 wedge core fix). The old
              * policy tail-dropped the ARRIVING packet per-packet, MID-GOP, so under sustained
@@ -4346,6 +4387,13 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
              * never unwrap per-clone — the per-stream wrap state is stateful). */
             if (d->n_audio > 0 && out->stream_index == d->astream[0] && out->pts != AV_NOPTS_VALUE)  /* [PTV-CHAIN] primary-audio source-content at demux (us) */
                 atomic_store_explicit(&g_ch_asrc, av_rescale_q(out->pts, d->ifmt->streams[out->stream_index]->time_base, AV_TIME_BASE_Q), memory_order_relaxed);
+            if (d->n_audio > 0 && out->stream_index == d->astream[0] && out->pts != AV_NOPTS_VALUE) {
+                /* 2.0.0 T-378: the read head follows the audio too — a video-only outage stops the video reads while the
+                 * subtitles flow on with the audio */
+                int64_t au = av_rescale_q(out->pts, d->ifmt->streams[out->stream_index]->time_base, AV_TIME_BASE_Q);
+                d->vread_us  = d->vread_set ? FFMAX(d->vread_us, au) : au;
+                d->vread_set = 1;
+            }
             int k;
             for (k = 0; k < d->n_audio; k++) {
                 AVPacket *c;
