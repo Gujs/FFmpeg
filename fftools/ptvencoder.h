@@ -776,6 +776,11 @@ typedef struct DecodeCtx {
     int64_t          vf_odd_since;            /* 2.0.0 T-373: decoded pictures in another size / format than the graph
                                               * input since (wall us, 0 = none) ... */
     int              vf_odd_n;                /* ... how many were dropped */
+    AVFrame         *xo;                      /* 2.0.1 T-383: a decoded picture leaping ahead of the last one, held for one */
+    int64_t          xo_prev;                 /* ... the picture before it (ist_tb) */
+    int64_t          xo_last;                 /* ... the last picture handed on (ist_tb) */
+    int64_t          xo_dur;                  /* ... the source's normal picture step (ist_tb, EMA; 0 = unknown) */
+    int              xo_have;                 /* ... xo_last is set */
     int64_t          vg_in_since_out;         /* T-373: frames into the graph since the last one came out, ... */
     int64_t          vg_out_wc;               /* ... and when the last one came out (wall us) */
     int              rj_dbg_n;                /* 2.0.0-pre8.2: [PTV-RJTRACE] lines left this hold (PTV_DIAG) */
@@ -2033,6 +2038,7 @@ extern int     g_wallev;                 /* 1.0.1-pre24 #63 wall-evidence split 
                                           * the action; provenance measurement stays on) */
 extern int     g_pestail;   /* 2.0.0-pre4c: PES-tail wall-gap carry for video wall evidence (PTV_NO_PESTAIL=1 off) */
 extern int     g_rlcheck;   /* 2.0.1 T-087: content check of a backward audio erase (PTV_NO_RLCHECK=1 off) */
+extern int     g_voutlier;  /* 2.0.1 T-383: one-picture timestamp outlier restamped (PTV_NO_VOUTLIER=1 off) */
 extern int     g_recanchor;              /* 1.0.1-pre24 #63 corroborated recovery re-anchor
                                           * (PTV_NO_RECANCHOR=1 disables) */
 extern int64_t g_recanchor_settle_us;    /* quiet+stable window before an engage (PTV_RECANCHOR_SETTLE_S, 300s) */
