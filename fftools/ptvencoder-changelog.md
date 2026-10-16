@@ -35,6 +35,12 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 - **Shorter dark wire at a stall onset (T-099):** a copied audio track's gap fill engages after 1 s on a damaged input
   (Cinestar 10 % loss: every PID ≤ 0.47 s); a mosaic slot whose input reads nothing gets its fill after 1 s (slot audio
   dark 1.19 → 0.21 s).
+- **Steady burst sources keep their cues and captions on their pictures (T-361).** The bank's top-up read video_q at
+  the last arrival plus frame_q now, ran the house fast through each pause and repeated 1-3 frames a cycle (81 in 900 s,
+  SCTE-35 cues 1-3 frames early). It now uses the margin sampled at the last video arrival and stops 1 s under the
+  door's max delay. 10 s bursts for 900 s: 0 repeats, cues 0..0, no door cut.
+- **A start-up caption is no longer bumped behind a keepalive (T-366)** — the keepalive stays the release's 1 s window
+  behind the output (startstall marker 12: +168 ms → 0).
 - **Mosaic: a slot's lipsync= no longer reads +20 s after its input returns (T-362)** — held pictures are not measured;
   the reading reseeds 1 s after the pictures move again (sync_check's pin rule fired on the old reading).
 - **The default GOP (no `-g`) is 2 s of the output rate, rounded** (was 58 frames at 29.97, 118 at 59.94); the wrapper's
