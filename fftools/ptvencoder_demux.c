@@ -2303,7 +2303,12 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
              * video kept its hole, audio erased → audio 10 s early). Per dense stream. */
             if (g_pestail && d->tail_gap_us && pkt->stream_index < d->nb_streams_open) {
                 int64_t *tg = &d->tail_gap_us[pkt->stream_index];
-                if (*tg && pg < *tg) {
+                /* 2.0.1 T-381 (measured, 50 % loss): only a FRESH tail (< 1 s, the T-089 bound) carries. A tail whose
+                 * next packet came after its own 3.6 s gap passed it the old 4.9 s and was cleared, so this packet's
+                 * gap was never recorded as a tail and the content jump right behind it (same read) read 0 ms:
+                 * W = 0, LAYERA erased a real 1.45 s audio hole — sound 1.43 s early for good. */
+                if (*tg && pg < *tg &&
+                    (!d->tail_wc_us || wall_now - d->tail_wc_us[pkt->stream_index] < 1000000)) {
                     d->pkt_wall_gap_us[pkt->stream_index] = *tg + pg;
                     /* 2.0.0 T-089 (measured, MV slot rejoin): a cut can leave TWO pre-gap tail frames — the second
                      * one took the carry and the jump packet after it read a 60 ms gap: video W = 0, the flush

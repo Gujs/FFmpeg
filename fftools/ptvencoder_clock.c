@@ -737,7 +737,7 @@ void *cc_thread(void *arg)
  * state machine and clock-follow latch live in *hr, the published estimator rates in
  * *est (0.9.18 R3/R4). Master thread only — non-reentrant. */
 static int64_t house_rate_corr_ppm(HouseRateState *hr, const RateEstimator *est,
-                                   int occ, int sp, int base_sp, int64_t tick_dur_us)
+                                   int occ, int sp, int base_sp, int64_t tick_dur_us, int damaged)
 {
     /* PROPORTIONAL occupancy servo (v0.9.6). The earlier INTEGRAL servo (corr += K·err)
      * oscillated: the buffer is itself an integrator (ρ → consume-rate → ∫ → occupancy),
@@ -757,7 +757,10 @@ static int64_t house_rate_corr_ppm(HouseRateState *hr, const RateEstimator *est,
     int64_t err_milli = (int64_t)sp * 1000 - hr->occ_ema_milli;          /* setpoint − occ (milli-frames) */
     int64_t corr = (err_milli * 500) / 1000;                           /* ρ = Kp·err, Kp=500 ppm/frame (PROPORTIONAL, no accumulation) */
     int64_t hi = 60000;                                            /* +6% normal positive clamp */
-    if (g_reprime && occ <= (base_sp + 1) / 2) {                   /* RE-PRIME: drained below half the BASE floor (true starvation —
+    /* 2.0.1 T-381 (measured, 50 % loss): no RE-PRIME while the source is damaged — an empty queue there is lost
+     * content (the decoder waits for an IDR), not a buffer to refill: the house ran 0.77x for 10 s and the output
+     * caught up with a 3.32 s video PTS hole when the pictures came back. A damaged phase ends an engagement. */
+    if (g_reprime && !damaged && occ <= (base_sp + 1) / 2) {       /* RE-PRIME: drained below half the BASE floor (true starvation —
                                                                     * NOT the adaptive raised target). Slow the house HARD to refill fast.
                                                                     * 0.9.10.1 state machine: an engagement lasts AT MOST 10s, then a 300s
                                                                     * cooldown applies unconditionally — occupancy oscillating around the
@@ -1359,12 +1362,14 @@ void *output_thread(void *arg)
                      * loss that then drained at ~5 ms/s. Under damage (corrupt packets/frames within 5 s)
                      * the occupancy is the content span (newest queued frame − output cursor), up to the 2 s
                      * the gap fill repeats into. Clean sources (and film cadence) keep the frame count. */
+                    int damaged = 0;
                     if (g_vgapfill) {
                         int64_t cr = (v->dbg_pcorrupt ? *v->dbg_pcorrupt : 0) + (v->dbg_vcorrupt ? *v->dbg_vcorrupt : 0);
                         int64_t tp = atomic_load_explicit(&g_fq0_tail_pts, memory_order_relaxed);
                         int64_t nw = av_gettime_relative();
                         if (cr != svo_cr) { svo_cr = cr; svo_dmg_wc = nw; }
-                        if (svo_dmg_wc && nw - svo_dmg_wc < 5000000 && tp != AV_NOPTS_VALUE) {
+                        damaged = svo_dmg_wc && nw - svo_dmg_wc < 5000000;
+                        if (damaged && tp != AV_NOPTS_VALUE) {
                             int64_t span = content_index(v, tp) - last_vpts;
                             if (span > occ && (span - occ) * v->tick_dur_us <= FFMAX(2000000, g_stall_min_us))   /* T-377 */
                                 occ = (int)span;
@@ -1374,7 +1379,7 @@ void *output_thread(void *arg)
                      * the house at 0.77x, then 1.5 % slow, for as long as the source is gone) */
                     atomic_store_explicit(&v->hr->rho_corr_ppm,
                         ptv_src_holding() ? 0 :
-                        house_rate_corr_ppm(v->hr, v->est, occ, g_curt.cur_sp, base_sp, v->tick_dur_us),
+                        house_rate_corr_ppm(v->hr, v->est, occ, g_curt.cur_sp, base_sp, v->tick_dur_us, damaged),
                         memory_order_relaxed);
                 }
                 int64_t corr = atomic_load_explicit(&v->hr->rho_corr_ppm, memory_order_relaxed);
