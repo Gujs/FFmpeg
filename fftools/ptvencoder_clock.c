@@ -821,6 +821,13 @@ static int64_t house_rate_corr_ppm(HouseRateState *hr, const RateEstimator *est,
      * clock WANDERS -700..-3400ppm and chattered arm/release across 3000 (~15/day);
      * sub-5000 offsets are handled fine unfollowed (WUCR + decimation, proven live),
      * so follow engages only for the genuinely-broken-clock class it was built for. */
+    if (g_clockfollow) {   /* T-090: track how long the servo has been pinned, before the follow term moves it */
+        int sat = corr >= 6000 ? 1 : corr <= -6000 ? -1 : 0;
+        if (sat != hr->cf_sat_dir) {
+            hr->cf_sat_dir   = sat;
+            hr->cf_sat_since = av_gettime_relative();
+        }
+    }
     if (g_clockfollow && atomic_load_explicit(&est->cf_locked, memory_order_relaxed)) {
         int64_t cf_ppm = ((atomic_load_explicit(&est->cf_rate_q20, memory_order_relaxed)
                            - (1 << 20)) * 1000000) >> 20;
@@ -835,7 +842,15 @@ static int64_t house_rate_corr_ppm(HouseRateState *hr, const RateEstimator *est,
                        "[PTV-CLOCK] BURSTY channel (bank armed) — follow released, estimator untrusted\n");
             }
         } else
-        if (!hr->cf_following && llabs(cf_ppm) > 5000) {
+        /* 2.0.1 T-090 (measured on the fleet 2026-10-08): delivery jitter of ±80–100 ms makes the coarse estimator
+         * random-walk (Pure_flix: a real +165 ppm source read +5531, Salem +415 read −5332) — 8–20 false follows a
+         * day per such channel, each swinging latency ±0.3–1.4 s and the PCR ±0.5 % off realtime for minutes. A real
+         * offset beyond the gentle zone pins the occupancy servo at its limit (source fast: frame_q grows, the servo
+         * runs the house fast); the noise never does. Arm only after the servo has been pinned in the offset's
+         * direction for 2 min. */
+        if (!hr->cf_following && llabs(cf_ppm) > 5000 &&
+            hr->cf_sat_dir == (cf_ppm > 0 ? -1 : 1) &&
+            av_gettime_relative() - hr->cf_sat_since >= 120000000) {
             hr->cf_following = 1;
             av_log(NULL, AV_LOG_WARNING,
                    "[PTV-CLOCK] source clock runs %+lldppm off realtime — FOLLOWING it "

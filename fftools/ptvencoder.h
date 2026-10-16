@@ -53,6 +53,8 @@ typedef struct RateEstimator {
  * (master writes, all rungs apply rho_corr_ppm), wired via VideoCtx like h0/house_skew. */
 typedef struct HouseRateState {
     int cf_following;               /* clock-follow hysteresis latch (arm >5000, release <2000 ppm) */
+    int     cf_sat_dir;             /* 2.0.1 T-090: direction the occupancy servo is pinned at its ±0.6 % limit (+1 slow / -1 fast / 0) */
+    int64_t cf_sat_since;           /* 2.0.1 T-090: wall time it got pinned there */
     int64_t occ_ema_milli;          /* WUCR: EMA-filtered master frame_q occupancy (milli-frames); master-thread only, non-atomic */
     int     occ_ema_seeded;         /* WUCR: seed the EMA to the first occupancy sample so there is no startup-ramp transient */
     int64_t reprime_start;          /* 0.9.10.1: wall time the CURRENT reprime engagement began (0 = idle). An
