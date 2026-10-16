@@ -469,7 +469,15 @@ void *compositor_thread(void *arg)
              * compositor keeps ticking: once the cell has shown no fresh frame for 1 s and the track has decoded
              * nothing for 2 s, it sends the same fill sentinels (the quantum fills the wall time elapsed, so a
              * sentinel from the demux as well never doubles the silence). PTV_NO_SRC_FILL=1 off. */
-            if (g_hold_fill && g_glueclass && last_fresh_us[k] > 0 && now_us - last_fresh_us[k] > 1000000) {
+            /* 2.0.1 T-099: ... and once the slot's input has read nothing at all for 1 s (its demux heartbeat), after 1 s
+             * of no decoded audio. The cell plays out its jitter buffer (~1 s) before it shows no fresh frame, so both
+             * waits added up to 2 s past the source stop while the delivered audio covered only ~1 s of it: MV-04
+             * gap_20 slot 0 audio PID dark 1.27 s, and the composite video 0.97 s (the video delivery gate keys on the
+             * slowest live track, which this one stayed for 2 s). */
+            int64_t hbw = c->inputs[k].da.rsync_slot >= 0 && c->inputs[k].da.rsync_slot < PTV_MAX_INPUT ?
+                          atomic_load_explicit(&g_hb_demux_wall[c->inputs[k].da.rsync_slot], memory_order_relaxed) : 0;
+            int quiet = hbw && now_us - hbw > 1000000;
+            if (g_hold_fill && g_glueclass && last_fresh_us[k] > 0 && (quiet || now_us - last_fresh_us[k] > 1000000)) {
                 DemuxArgs *da = &c->inputs[k].da;
                 int64_t nw = av_gettime_relative();
                 int j;
@@ -477,7 +485,7 @@ void *compositor_thread(void *arg)
                     int g = da->aglobal[j];
                     int64_t fw = g >= 0 && g < PTV_MAX_AUDIO ? atomic_load_explicit(&g_adec_frame_wc[g], memory_order_relaxed) : 0;
                     AVPacket *fs;
-                    if (!fw || nw - fw < 2000000 || nw - mv_fill_us[k][j] < g_nbs_quantum_us)
+                    if (!fw || nw - fw < (quiet ? 1000000 : 2000000) || nw - mv_fill_us[k][j] < g_nbs_quantum_us)
                         continue;
                     mv_fill_us[k][j] = nw;
                     if (!(fs = av_packet_alloc())) continue;
