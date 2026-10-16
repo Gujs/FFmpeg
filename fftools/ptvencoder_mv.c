@@ -125,6 +125,9 @@ void *compositor_thread(void *arg)
     int64_t rs_mv_ema[PTV_MAX_INPUT] = {0};
     int     rs_mv_seed[PTV_MAX_INPUT] = {0};
     int64_t rs_mv_div;
+    int64_t rs_mv_src[PTV_MAX_INPUT];         /* 2.0.1 T-362: the slot's last displayed source pts */
+    int64_t rs_mv_adv[PTV_MAX_INPUT] = {0};   /* 2.0.1 T-362: the tick its displayed picture last changed */
+    int64_t rs_mv_rel[PTV_MAX_INPUT] = {0};   /* 2.0.1 T-362: -1 in a hold, else the tick it ended (0 = none) */
     /* 1.0.1-pre17 BIRTH-TRIM WINDOW (finding 1's measured root cause, Grid_2x2 box logs
      * 2026-07-19 00:42-01:10): at a birth where one slot is DEAD, the preroll wait runs its
      * full 3s timeout while the LIVE slots' pipelines keep banking (video_q compressed
@@ -530,10 +533,32 @@ void *compositor_thread(void *arg)
                      * frame is still the displayed content this tick). */
                     if (g_rsync_sense) {
                         int64_t m = mv_tick_us(c, tick) - disp_src;
-                        if (!rs_mv_seed[k]) { rs_mv_ema[k] = m; rs_mv_seed[k] = 1; }
-                        else rs_mv_ema[k] += (m - rs_mv_ema[k]) / rs_mv_div;
-                        atomic_store_explicit(&g_rsx.mv_ema[k], rs_mv_ema[k], memory_order_relaxed);
-                        atomic_store_explicit(&g_rsx.mv_wall[k], now_us, memory_order_relaxed);
+                        /* 2.0.1 T-362 (measured, mv04 sync_gap_20): through a slot's outage the cell keeps its last
+                         * picture, so m grew 1 s per second and the EMA reached +18.5 s by the return; m was back at
+                         * its pre-outage value on the first fresh picture, but lipsync= read +19.9 s decaying over
+                         * minutes (sync_check's pin rule fires on 3 readings over 2 s). A picture held 0.5 s or more
+                         * is no content to measure: the slot stops publishing (reads `--`, as a slated slot) and the
+                         * EMA reseeds 1 s after the pictures move again — the first one after a gap can be the
+                         * pre-gap tail (lavf PES tail), shown 20 s late, which seeded +19.9 s once. Short cadence /
+                         * residence holds still count. */
+                        if (disp_src != rs_mv_src[k] || !rs_mv_adv[k]) {
+                            rs_mv_src[k] = disp_src;
+                            rs_mv_adv[k] = tick;
+                        }
+                        if (mv_tick_us(c, tick) - mv_tick_us(c, rs_mv_adv[k]) >= 500000) {
+                            rs_mv_seed[k] = 0;
+                            rs_mv_rel[k]  = -1;
+                        } else if (rs_mv_rel[k] == -1)
+                            rs_mv_rel[k] = tick;
+                        else if (rs_mv_rel[k] > 0 && mv_tick_us(c, tick) - mv_tick_us(c, rs_mv_rel[k]) < 1000000)
+                            ;
+                        else {
+                            rs_mv_rel[k] = 0;
+                            if (!rs_mv_seed[k]) { rs_mv_ema[k] = m; rs_mv_seed[k] = 1; }
+                            else rs_mv_ema[k] += (m - rs_mv_ema[k]) / rs_mv_div;
+                            atomic_store_explicit(&g_rsx.mv_ema[k], rs_mv_ema[k], memory_order_relaxed);
+                            atomic_store_explicit(&g_rsx.mv_wall[k], now_us, memory_order_relaxed);
+                        }
                     }
                     /* P2 — floor the per-slot lag to ≥0 by re-anchoring h0. A cell that leaps AHEAD of
                      * the house clock (sk very negative: −560ms on a 2x1, up to −2.5s on a 4-up, from an
