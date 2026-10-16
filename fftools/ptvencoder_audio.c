@@ -4286,9 +4286,9 @@ static double afrm_peak(const AVFrame *f)
  * see an erase that broke the source's A/V, T-088), which makes a pure relabel (content continuous, labels lied) read
  * as a desync: measured −300 ms on sync_arelabel (the corrector then moved synced audio −292 ms for good) and −65 ms
  * on TruBLU on air (2026-10-16, content vs source: in sync). The audio itself tells them apart: after a real repeat the
- * S ms before the seam come again, after a relabel they do not. 10 ms RMS envelope of channel 0, 1 s after the seam
- * against the same 1 s S earlier; the same window at other lags must not match as well (a steady tone matches
- * everywhere = no verdict). Relabel → the sensor follows the erase; repeat or no verdict → as before. A video edit
+ * S ms before the seam come again, after a relabel they do not. 10 ms RMS envelope of channel 0: the first S after the
+ * seam (80 ms .. 1 s) against the S before it; the same window at other lags must not match as well, and a window
+ * without structure (silence, a steady tone) gives no verdict. Relabel → the sensor follows the erase; repeat or no verdict → as before. A video edit
  * around the seam (a both-stream step, T-088) keeps the source-domain reading. PTV_NO_RLCHECK=1 reverts. */
 static double rl_corr(const float *env, int64_t a0, int64_t b0, int n)
 {
@@ -4308,7 +4308,7 @@ static double rl_corr(const float *env, int64_t a0, int64_t b0, int n)
 
 static void rl_eval(AudioState *a, int64_t now)
 {
-    const int W = 100;                                  /* 1 s of 10 ms bins */
+    int W = 100;                                        /* up to 1 s of 10 ms bins, see below */
     int64_t sb, lo, base = a->rl_n - PTV_RL_ENV;
     double c_rep = -1, c_oth = -1, mean = 0, var = 0;
     const char *why = NULL;
@@ -4325,6 +4325,9 @@ static void rl_eval(AudioState *a, int64_t now)
     if (a->rl_ev_chg_wc && a->rl_ev_chg_wc >= a->rl_wc - (a->rl_pend == 2 ? 3000000 : 1200000))
         why = "the video was edited around the seam (both streams stepped)";
     sb = (a->rl_S_us + 5000) / 10000;
+    /* a repeat is S long: only the first S after the seam can match the S before it (measured: a 341 ms repeat
+     * against a 1 s window read corr 0.32 = "relabel" — wrong, the corrector then never fixed the +342 ms) */
+    W  = av_clip(sb, 8, 100);
     lo = a->rl_pos - sb - 50;                           /* oldest bin the comparisons need */
     if (!why && (sb < 3 || lo < FFMAX(base, 0)))
         why = "step outside the check's range";
