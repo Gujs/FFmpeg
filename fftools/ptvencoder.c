@@ -124,6 +124,7 @@ int64_t g_novideo_exit_us = 300LL * 1000000; /* 1.0.1-pre23 startup sanity rider
                                            * wedged forever-startup — the probe-OK-never-decodes silent state, #60 arm D).
                                            * PTV_NOVIDEO_EXIT_S overrides; 0 disables. */
 int     g_pestail = 1;             /* 2.0.0-pre4c: see ptvencoder_demux.c (PES-TAIL carry) */
+int     g_rlcheck = 1;             /* 2.0.1 T-087: content check of a backward audio erase (PTV_NO_RLCHECK=1 off) */
 int     g_wallev = 1;              /* 1.0.1-pre24 #63 WALL-EVIDENCE SPLIT (the corrupt-storm desync class): every
                                            * erase engine splits a forward label step J into W = wall-absence-evidenced
                                            * portion (real missing content → PAD) and J−W = flowing/relabel portion
@@ -963,6 +964,7 @@ int64_t g_pair_ttl_us = PTV_PAIR_EXPECT_TTL_US;
 int64_t g_nbs_quantum_us = 100000;             /* fill quantum: 100ms of silence per sentinel */
 _Atomic int64_t g_acorrupt;
 _Atomic int64_t g_adamage_wc[PTV_MAX_AUDIO];   /* 2.0.0-pre9.3 (T-080 A2) */
+_Atomic int64_t g_rl_step_us[PTV_MAX_AUDIO], g_rl_wc[PTV_MAX_AUDIO], g_rl_seq[PTV_MAX_AUDIO], g_rl_undone[PTV_MAX_AUDIO];   /* 2.0.1 T-087 */
 _Atomic int64_t g_mv_vdmg_wc[PTV_MAX_INPUT];   /* T-350 */
 _Atomic int64_t g_adec_frame_wc[PTV_MAX_AUDIO];
 _Atomic int64_t g_pad_pub_step[PTV_MAX_AUDIO];
@@ -6916,6 +6918,7 @@ int main(int argc, char **argv)
     { const char *s = getenv("PTV_CONV_CAP_S");  if (s && atoi(s) > 0) g_conv_cap_us  = (int64_t)atoi(s) * 1000000; }
     { const char *s = getenv("PTV_SEAM_PARK_S"); if (s && atoi(s) > 0) g_seam_park_us = (int64_t)atoi(s) * 1000000; }  /* TEST ONLY (G4) */
     if (getenv("PTV_NO_PESTAIL")) g_pestail = 0;   /* 2.0.0-pre4c: PES-tail carry off */
+    if (getenv("PTV_NO_RLCHECK")) g_rlcheck = 0;   /* 2.0.1 T-087: relabel content check off */
     if (getenv("PTV_NO_WALLEV")) g_wallev = 0;     /* 1.0.1-pre24 #63 revert: erase engines back to the pre23
                                                     * whole-step remedies (butt-joint every >1s hole; the
                                                     * corrupt-storm desync counterfactual — A/B only) */

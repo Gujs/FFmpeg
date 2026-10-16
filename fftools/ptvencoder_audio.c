@@ -4,6 +4,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <time.h>
+#include <math.h>
 
 #include "libavutil/avutil.h"
 #include "libavutil/log.h"
@@ -2287,7 +2288,7 @@ pll_emit:
                         if (dv < 8) dv = 8;
                         a->rs_ma_res += (m - step_us - a->rs_ma_res) / dv;
                     }
-                    a->rs_ma_ema = a->rs_ma_res + step_us;
+                    a->rs_ma_ema = a->rs_ma_res + step_us - a->rl_neutral_us;   /* T-087: relabels judged by content */
                 }
                 atomic_store_explicit(&g_rsx.ma_ema[a->dbg_k], a->rs_ma_ema, memory_order_relaxed);
                 nowr = av_gettime_relative();
@@ -3873,6 +3874,8 @@ graph_in:
                                ptv_self_shed_note(a, sn, sizeof sn));
                     } else if (erase_undo) {
                         a->glue_off_us -= a->rl_last_us;
+                        if (a->rl_pend == 2)
+                            a->rl_pend = 0;          /* 2.0.1 T-087: the erase is undone, nothing to judge */
                         av_log(NULL, AV_LOG_WARNING,
                                "[PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms returns the %+"PRId64"ms relabel erased "
                                "%"PRId64"ms ago — ONE corrupt timestamp: erase undone, no pad (glue total %+"PRId64"ms)%s\n",
@@ -3932,6 +3935,12 @@ graph_in:
                             a->glue_events++;
                             a->rl_last_us = -step;   /* 2.0.0-pre9.2: a matching forward step undoes it */
                             a->rl_last_wc = now_wc;
+                            if (g_rlcheck && !a->rl_pend && a->rl_bin) {   /* 2.0.1 T-087: check the content at this seam */
+                                a->rl_pend = 2;
+                                a->rl_pos  = a->rl_n - frame->nb_samples / a->rl_bin;
+                                a->rl_S_us = -step;
+                                a->rl_wc   = now_wc;
+                            }
                             if (allow)
                                 av_log(NULL, AV_LOG_WARNING,
                                        "[PTV-AGLUE] a%d(in%d) label step %+"PRId64"ms (wall gap %"PRId64"ms) — backward RELABEL erased (glue total %+"PRId64"ms, event %d)%s\n",
@@ -4270,6 +4279,143 @@ static double afrm_peak(const AVFrame *f)
             if (fabs(x) > peak) peak = fabs(x);
         }
     return peak;
+}
+
+/* 2.0.1 T-087 relabel check. A backward audio label step is erased (the 0.9.16.4 rule: content cannot run backwards)
+ * — at the demux absorber or at the graph door (AGLUE). The sensor reads A/V in the SOURCE's label domain (so it can
+ * see an erase that broke the source's A/V, T-088), which makes a pure relabel (content continuous, labels lied) read
+ * as a desync: measured −300 ms on sync_arelabel (the corrector then moved synced audio −292 ms for good) and −65 ms
+ * on TruBLU on air (2026-10-16, content vs source: in sync). The audio itself tells them apart: after a real repeat the
+ * S ms before the seam come again, after a relabel they do not. 10 ms RMS envelope of channel 0, 1 s after the seam
+ * against the same 1 s S earlier; the same window at other lags must not match as well (a steady tone matches
+ * everywhere = no verdict). Relabel → the sensor follows the erase; repeat or no verdict → as before. A video edit
+ * around the seam (a both-stream step, T-088) keeps the source-domain reading. PTV_NO_RLCHECK=1 reverts. */
+static double rl_corr(const float *env, int64_t a0, int64_t b0, int n)
+{
+    double ma = 0, mb = 0, sab = 0, saa = 0, sbb = 0;
+    int i;
+    for (i = 0; i < n; i++) {
+        ma += env[(a0 + i) % PTV_RL_ENV];
+        mb += env[(b0 + i) % PTV_RL_ENV];
+    }
+    ma /= n; mb /= n;
+    for (i = 0; i < n; i++) {
+        double x = env[(a0 + i) % PTV_RL_ENV] - ma, y = env[(b0 + i) % PTV_RL_ENV] - mb;
+        sab += x * y; saa += x * x; sbb += y * y;
+    }
+    return saa > 0 && sbb > 0 ? sab / sqrt(saa * sbb) : 0;
+}
+
+static void rl_eval(AudioState *a, int64_t now)
+{
+    const int W = 100;                                  /* 1 s of 10 ms bins */
+    int64_t sb, lo, base = a->rl_n - PTV_RL_ENV;
+    double c_rep = -1, c_oth = -1, mean = 0, var = 0;
+    const char *why = NULL;
+    int i, d;
+    static const int oth[] = { -50, -25, 25, 50 };
+
+    if (!a->rl_pend || a->rl_n - a->rl_pos < W || now - a->rl_wc < 1200000)
+        return;
+    if (a->rl_pend == 1 && a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO &&
+        atomic_load_explicit(&g_rl_undone[a->dbg_k], memory_order_relaxed) == a->rl_seq) {
+        a->rl_pend = 0;                                 /* the demux reverted the erase (one corrupt timestamp) */
+        return;
+    }
+    if (a->rl_ev_chg_wc && a->rl_ev_chg_wc >= a->rl_wc - (a->rl_pend == 2 ? 3000000 : 1200000))
+        why = "the video was edited around the seam (both streams stepped)";
+    sb = (a->rl_S_us + 5000) / 10000;
+    lo = a->rl_pos - sb - 50;                           /* oldest bin the comparisons need */
+    if (!why && (sb < 3 || lo < FFMAX(base, 0)))
+        why = "step outside the check's range";
+    if (!why) {
+        for (i = 0; i < W; i++)
+            mean += a->rl_env[(a->rl_pos + i) % PTV_RL_ENV];
+        mean /= W;
+        for (i = 0; i < W; i++) {
+            double x = a->rl_env[(a->rl_pos + i) % PTV_RL_ENV] - mean;
+            var += x * x;
+        }
+        if (mean < 1e-4 || sqrt(var / W) < 0.05 * mean)
+            why = "no structure in the audio (silence or a steady tone)";
+    }
+    if (!why) {
+        for (d = -2; d <= 2; d++)
+            c_rep = FFMAX(c_rep, rl_corr(a->rl_env, a->rl_pos, a->rl_pos - sb + d, W));
+        for (i = 0; i < FF_ARRAY_ELEMS(oth); i++)
+            if (a->rl_pos - sb + oth[i] >= lo && a->rl_pos - sb + oth[i] + W <= a->rl_pos)
+                c_oth = FFMAX(c_oth, rl_corr(a->rl_env, a->rl_pos, a->rl_pos - sb + oth[i], W));
+    }
+    if (why)
+        av_log(NULL, AV_LOG_INFO, "[PTV-RELABEL] a%d(in%d) -%"PRId64"ms erase: no verdict — %s; the sensor keeps the "
+               "source's A/V\n", a->dbg_k, a->dbg_in, a->rl_S_us / 1000, why);
+    else if (c_rep < 0.5) {
+        a->rl_neutral_us += a->rl_S_us;
+        av_log(NULL, AV_LOG_WARNING, "[PTV-RELABEL] a%d(in%d) -%"PRId64"ms erase was a RELABEL: the audio after the seam "
+               "does not repeat the %"PRId64" ms before it (corr %.2f) — the sensor follows the erase "
+               "(PTV_NO_RLCHECK reverts)\n", a->dbg_k, a->dbg_in, a->rl_S_us / 1000, a->rl_S_us / 1000, c_rep);
+    } else if (c_rep >= 0.8 && c_rep - c_oth >= 0.3)
+        av_log(NULL, AV_LOG_WARNING, "[PTV-RELABEL] a%d(in%d) -%"PRId64"ms erase: the audio REPEATS (corr %.2f, other "
+               "lags %.2f) — a real backward step; the sensor keeps the source's A/V for the corrector\n",
+               a->dbg_k, a->dbg_in, a->rl_S_us / 1000, c_rep, c_oth);
+    else
+        av_log(NULL, AV_LOG_INFO, "[PTV-RELABEL] a%d(in%d) -%"PRId64"ms erase: no verdict (corr %.2f, other lags %.2f); "
+               "the sensor keeps the source's A/V\n", a->dbg_k, a->dbg_in, a->rl_S_us / 1000, c_rep, c_oth);
+    a->rl_pend = 0;
+}
+
+/* T-087: feed one decoded frame into the envelope ring; arm a seam the demux flagged; evaluate a pending one */
+static void rl_feed(AudioState *a, const AVFrame *f)
+{
+    int64_t now = av_gettime_relative(), ev;
+    int i, n = f->nb_samples, ch = f->ch_layout.nb_channels, planar;
+    enum AVSampleFormat fmt = f->format;
+
+    if (!g_rlcheck || n <= 0 || ch <= 0 || f->sample_rate <= 0)
+        return;
+    planar = av_sample_fmt_is_planar(fmt);
+    fmt = av_get_packed_sample_fmt(fmt);
+    if (fmt != AV_SAMPLE_FMT_FLT && fmt != AV_SAMPLE_FMT_S16 && fmt != AV_SAMPLE_FMT_S32)
+        return;
+    if (!a->rl_bin || a->rl_bin != f->sample_rate / 100) {
+        a->rl_bin   = f->sample_rate / 100;
+        a->rl_acc   = 0;
+        a->rl_acc_n = 0;
+        a->rl_pend  = 0;
+        a->rl_ev_last = a->dbg_in >= 0 && a->dbg_in < PTV_MAX_INPUT ?
+                        atomic_load_explicit(&g_rsx.ev_us[a->dbg_in], memory_order_relaxed) : 0;
+    }
+    ev = a->dbg_in >= 0 && a->dbg_in < PTV_MAX_INPUT ?
+         atomic_load_explicit(&g_rsx.ev_us[a->dbg_in], memory_order_relaxed) : 0;
+    if (ev != a->rl_ev_last) {
+        a->rl_ev_last   = ev;
+        a->rl_ev_chg_wc = now;
+    }
+    if (a->rl_armed && !a->rl_pend && a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO) {
+        a->rl_pend  = 1;
+        a->rl_pos   = a->rl_n;
+        a->rl_S_us  = atomic_load_explicit(&g_rl_step_us[a->dbg_k], memory_order_relaxed);
+        a->rl_wc    = atomic_load_explicit(&g_rl_wc[a->dbg_k], memory_order_relaxed);
+        a->rl_seq   = atomic_load_explicit(&g_rl_seq[a->dbg_k], memory_order_relaxed);
+    }
+    a->rl_armed = 0;
+    for (i = 0; i < n; i++) {
+        double v;
+        if (fmt == AV_SAMPLE_FMT_FLT)
+            v = planar ? ((const float *)f->extended_data[0])[i] : ((const float *)f->data[0])[i * ch];
+        else if (fmt == AV_SAMPLE_FMT_S16)
+            v = (planar ? ((const int16_t *)f->extended_data[0])[i] : ((const int16_t *)f->data[0])[i * ch]) / 32768.0;
+        else
+            v = (planar ? ((const int32_t *)f->extended_data[0])[i] : ((const int32_t *)f->data[0])[i * ch]) / 2147483648.0;
+        a->rl_acc += v * v;
+        if (++a->rl_acc_n >= a->rl_bin) {
+            a->rl_env[a->rl_n % PTV_RL_ENV] = sqrt(a->rl_acc / a->rl_acc_n);
+            a->rl_n++;
+            a->rl_acc = 0;
+            a->rl_acc_n = 0;
+        }
+    }
+    rl_eval(a, now);
 }
 
 static int audio_push(AudioState *a, AVFrame *frame)
@@ -4781,6 +4927,8 @@ void *audio_thread(void *arg)
         }
         a->wd_pkts++;
         if (!a->wd_frame_us) a->wd_frame_us = av_gettime_relative();   /* seed at first packet */
+        if (pkt && (pkt->flags & PTV_PKT_FLAG_RELABEL))
+            a->rl_armed = 1;                     /* 2.0.1 T-087: the next decoded frame starts the seam */
         ret = avcodec_send_packet(a->dec, pkt);
         av_packet_free(&pkt);
         if (ret < 0 && ret != AVERROR(EAGAIN))   /* 1.0.1: decode errors surface here too (eager decode) — count/log them */
@@ -4828,6 +4976,7 @@ void *audio_thread(void *arg)
                 else
                     a->dec_ts_carry = AV_NOPTS_VALUE;
             }
+            rl_feed(a, frame);                   /* 2.0.1 T-087 */
             ret = audio_push(a, frame);
             av_frame_unref(frame);
             if (ret < 0) goto done;

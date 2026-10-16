@@ -274,6 +274,7 @@ typedef struct DlvGate {
  * never leaves the process. */
 #define PTV_PKT_FLAG_NBS_FILL (1 << 16)
 #define PTV_PKT_FLAG_HOLD_FILL (1 << 17)  /* 2.0.0-pre6: hold-fill sentinel (master output thread → audio_q) */
+#define PTV_PKT_FLAG_RELABEL (1 << 18)    /* 2.0.1 T-087: the first audio packet after an audio-first backward erase (demux) */
 
 /* A/V PLL redesign Phase A probe (always built; feeds the [PTV-AVSYNC] offset=): per-input ring recording, for each DISTINCT
  * video content the cell displayed, the output time it went out at — (abs source pts → out_v, both
@@ -1197,6 +1198,17 @@ typedef struct AudioState {
     int64_t          afmt_drop_us;                     /* its withheld partial tail (µs) */
     int64_t          afmt_drain_end_us;                /* door-domain content end the drain is cut at (µs) */
     int64_t          rs_ma_res;                       /* 2.0.0-pre9.6: EMA of m_a − (glue_off + house_skew) (µs) */
+    /* 2.0.1 T-087 relabel check: 10 ms RMS envelope of the decoded audio (channel 0) and one pending seam */
+#define PTV_RL_ENV 512
+    float            rl_env[PTV_RL_ENV];              /* ring of 10 ms RMS bins */
+    int64_t          rl_n;                            /* bins written so far */
+    double           rl_acc;                          /* partial bin: sum of squares */
+    int              rl_acc_n, rl_bin;                /* samples in it, samples per bin */
+    int              rl_armed;                        /* a flagged packet was sent: the next frame starts the seam */
+    int              rl_pend;                         /* 1 = demux erase pending, 2 = graph-door (AGLUE) erase pending */
+    int64_t          rl_pos, rl_S_us, rl_wc, rl_seq;  /* seam bin, erased step, wall time, demux sequence */
+    int64_t          rl_ev_last, rl_ev_chg_wc;        /* this slot's video edit ledger: last value, wall µs of its last change */
+    int64_t          rl_neutral_us;                   /* erases judged relabels: the sensor follows them (subtracted from m_a) */
     int64_t          rs_slip_us;                      /* latest net (dead-banded) resampler slip (DIAG) */
     int64_t          rs_log_last;                     /* [PTV-RSYNC] DIAG rate limit (wall µs) */
     /* 1.0.1-pre14 residual-sync corrector (see CorrState above; design doc §4/§8). The two
@@ -2016,6 +2028,7 @@ extern int64_t g_novideo_exit_us;        /* 1.0.1-pre23 startup sanity: packets 
 extern int     g_wallev;                 /* 1.0.1-pre24 #63 wall-evidence split (PTV_NO_WALLEV=1 reverts
                                           * the action; provenance measurement stays on) */
 extern int     g_pestail;   /* 2.0.0-pre4c: PES-tail wall-gap carry for video wall evidence (PTV_NO_PESTAIL=1 off) */
+extern int     g_rlcheck;   /* 2.0.1 T-087: content check of a backward audio erase (PTV_NO_RLCHECK=1 off) */
 extern int     g_recanchor;              /* 1.0.1-pre24 #63 corroborated recovery re-anchor
                                           * (PTV_NO_RECANCHOR=1 disables) */
 extern int64_t g_recanchor_settle_us;    /* quiet+stable window before an engage (PTV_RECANCHOR_SETTLE_S, 300s) */
@@ -2363,6 +2376,9 @@ extern int     g_glue_htol;              /* §2.3 label-health tolerance, percen
 extern int64_t g_pair_ttl_us;            /* pair-expect TTL (30s; PTV_PAIR_EXPECT_TTL_US — TEST ONLY, G6) */
 extern int64_t g_nbs_quantum_us;         /* fill quantum (100ms; PTV_NBS_QUANTUM_MS — TEST ONLY, G8) */
 extern _Atomic int64_t g_acorrupt;                        /* total corrupt-discarded AUDIO pkts (acor= stats) */
+extern _Atomic int64_t g_rl_step_us[PTV_MAX_AUDIO];      /* 2.0.1 T-087: per global track, the edit the demux posted with its
+                                                           * last audio-first backward erase (+ = labels moved later) */
+extern _Atomic int64_t g_rl_wc[PTV_MAX_AUDIO], g_rl_seq[PTV_MAX_AUDIO], g_rl_undone[PTV_MAX_AUDIO];
 extern _Atomic int64_t g_adamage_wc[PTV_MAX_AUDIO];      /* 2.0.0-pre9.3 (T-080 A2): per global track, wall us of the
                                                            * last corrupt-discarded packet (demux → audio thread) */
 extern _Atomic int64_t g_mv_vdmg_wc[PTV_MAX_INPUT];     /* T-350: per multiview slot, wall us of its last corrupt video (compositor) */

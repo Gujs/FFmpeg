@@ -2350,6 +2350,13 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                     d->prog_off -= ol->pend_dprog;
                     d->splice_adj_us = 0;                    /* no sibling may adopt the bogus amount */
                     rsync_post_edit(d, pkt->stream_index, -av_rescale_q(ol->pend_dw, st->time_base, AV_TIME_BASE_Q));
+                    {   /* 2.0.1 T-087: a pending relabel check of this erase is void */
+                        int j;
+                        for (j = 0; j < d->n_audio; j++)
+                            if (d->astream[j] == pkt->stream_index && d->aglobal[j] >= 0 && d->aglobal[j] < PTV_MAX_AUDIO)
+                                atomic_store_explicit(&g_rl_undone[d->aglobal[j]],
+                                    atomic_load_explicit(&g_rl_seq[d->aglobal[j]], memory_order_relaxed), memory_order_relaxed);
+                    }
                     av_log(NULL, AV_LOG_WARNING, "[PTV-DISCONT] stream %d: the absorbed %+"PRId64"ms step was ONE corrupt "
                            "timestamp (the next packet is back on the old timeline) — absorption reverted\n",
                            pkt->stream_index, -av_rescale_q(ol->pend_dw, st->time_base, (AVRational){1,1000}));
@@ -2758,6 +2765,7 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                         }
                     }
                     int64_t nowb = av_gettime_relative();
+                    int adopted = 0;   /* 2.0.1 T-087: this crossing took a sibling's shared amount */
                     /* 0.9.18.5 fold-in (log-truth only, no behavior coupling): record video forward
                      * crossings BEFORE the LAYERA skip so the audio gap discriminator's `vcrossed`
                      * signal works under g_layera too — it was only set inside the absorber body the
@@ -2788,9 +2796,10 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                         goto absorb_done;
                     } else if (g_progoff_av) {
                         /* §5.A.2 (adopt-on-crossing, SHARED first-crosser amount — PRESERVES source A/V, see g_layera). */
-                        if (nowb - d->splice_adj_us <= g_progoff_debounce_us)
+                        if (nowb - d->splice_adj_us <= g_progoff_debounce_us) {
                             adj = d->splice_adj;                                   /* same splice → adopt shared amount */
-                        else { d->splice_adj = adj; d->splice_adj_us = nowb; }     /* first crosser sets the shared amount */
+                            adopted = 1;
+                        } else { d->splice_adj = adj; d->splice_adj_us = nowb; }   /* first crosser sets the shared amount */
                     }
                     d->wrap_off[pkt->stream_index] -= adj;   /* per-stream rebase AT OWN CROSSING (audio-derived common offset when g_layera) */
                     if (ol && delta < 0) {                   /* 2.0.0-pre9.2: undoable if the next packet says "outlier" */
@@ -2800,6 +2809,21 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                     }
                     rsync_post_edit(d, pkt->stream_index,    /* pre9 sensor: a label EDIT (−adj added to this stream's labels) */
                                     -av_rescale_q(adj, st->time_base, AV_TIME_BASE_Q));
+                    /* 2.0.1 T-087: an audio-FIRST backward erase (no sibling crossed before it) may be a pure relabel
+                     * — the audio thread checks the content across the seam and decides what the sensor reads */
+                    if (g_rlcheck && ct == AVMEDIA_TYPE_AUDIO && delta < 0 && !adopted) {
+                        int j;
+                        for (j = 0; j < d->n_audio; j++)
+                            if (d->astream[j] == pkt->stream_index &&
+                                d->aglobal[j] >= 0 && d->aglobal[j] < PTV_MAX_AUDIO) {
+                                int g = d->aglobal[j];
+                                atomic_store_explicit(&g_rl_step_us[g], -av_rescale_q(adj, st->time_base, AV_TIME_BASE_Q),
+                                                      memory_order_relaxed);
+                                atomic_store_explicit(&g_rl_wc[g], nowb, memory_order_relaxed);
+                                atomic_fetch_add_explicit(&g_rl_seq[g], 1, memory_order_relaxed);
+                                pkt->flags |= PTV_PKT_FLAG_RELABEL;
+                            }
+                    }
                     /* pre24 #63 provenance (measurement only): this absorb ERASES the step; if
                      * its wall evidence said part of it was a REAL hole, that much content was
                      * deleted for real — post it unevidenced (re-anchor corroboration). Under
