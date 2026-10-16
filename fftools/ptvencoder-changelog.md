@@ -48,8 +48,14 @@ the v2 `0001` patch (additive, travels with the source to the build box).
   missing audio stretch is lost audio: AWE capture, 10 % loss, source audio absent 2.56 s → the output AAC PID dark
   1.81 s. While the input is damaged (corrupt video, or a corrupt-discarded packet on the track, within 5 s) the fill
   engages after 1 s: 0.77 s. Clean sources keep 2 s.
-- Release gate: see the pre22 gate line (gate22, frozen kit `860a8b7` — loudlive on every production-graph key, wire
-  PID-dark bar 1.5 s — on the frozen media set `513a76f41757`, pre22 twice + pre21 side by side).
+- Release gate (night 2026-10-15/16, frozen media set `513a76f41757`; loudlive on every production-graph key, wire
+  PID-dark bar 1.5 s): kit24 (`860a8b7`) and kit25 (`c7234fa` = kit24 + content age against the resumed sender's own
+  schedule, real captures replayed on their own PCRs) with the final non-mosaic code side by side with pre21 — kit25:
+  **0 regressions, 19 fixed** (231 keys); every one of the 31 mosaic keys on this build twice (kit25): 0 regressions vs
+  pre21. Each fix's regressions were re-run under gate load against pre21 in the same round (flaky keys: 18/18 PASS).
+  5.4 h local soak (flapping source, ~390 LOST + reopen; dead source): 0 exits, RSS / threads / fds flat. Remaining
+  failures are identical on pre21 and all have a T-number (T-332, T-358, T-360, T-361, T-375 by design, T-381 new, the
+  mosaic cross-slot / mv01 teletext residuals). Report: test-results/pre22-night-20261016/REPORT.md.
 
 ## 2.0.0-pre21 — pre20 + no timestamp holes after a start-up backlog, the 2.0.0 logging
 
