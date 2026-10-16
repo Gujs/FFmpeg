@@ -24,6 +24,10 @@ the v2 `0001` patch (additive, travels with the source to the build box).
   0.1 % per picture off target, so a slot born one picture under its target held one picture after ~500 pictures (a
   40 ms audio step the corrector slewed back). A ±1 picture deadband (`PTV_NO_RES_DEADBAND=1` reverts); `[PTV-RES]`
   logs the first three residence holds per slot. A/B on one binary: off 3/3 FAIL (−25/−26 ms), on 3/3 PASS (+0 ms).
+  The deadband and the refill after a gap / damage aim at the occupancy the slot settled at (T-343b): with the deadband
+  a slot born one picture under the target stays there, and refilling to the static target after a gap put its picture
+  one picture later than its sound had settled on (mv05 sync_gap_10: −28 ms for 10 s after the return, 4 of 5 runs under
+  gate load; with T-343b 5 of 5 PASS, the other 30 mosaic gate keys as before).
 - **No AAC overlap where the audio resumes after a source stop or burst (T-374).** The first real audio frame after a
   hold fill or a burst cut sometimes landed up to 24 ms behind the audio already fed (which tick the fill stops on is a
   wall-clock phase): the graph door trimmed only steps back over 25 ms, aresample carried the rest as a backward label and
