@@ -62,6 +62,8 @@ typedef struct HouseRateState {
                                      * — the 0.9.10 "continuing" clause let occupancy oscillating around the trigger
                                      * re-arm forever (observed live: AWE film segments pinned the house at 0.77x). */
     int64_t reprime_last_end;       /* wall time the last engagement ended (cooldown reference) */
+    int64_t bk_arr_wc;              /* 2.0.1 T-361: the last video read the bank margin was sampled at (0 = none yet) */
+    int     bk_have;                /* 2.0.1 T-361: video_q + frame_q at that read (packets + frames) */
     _Atomic int64_t rho_corr_ppm;   /* WUCR ρ: applied house-rate correction (ppm, corr>0 = house slower); ±6% clamp (±30% under re-prime) */
 } HouseRateState;
 /* 0.9.18 M1 — CushionPlan: ALL cushion/queue sizing derived in ONE place (resolve_cushions()),

@@ -802,10 +802,24 @@ static int64_t house_rate_corr_ppm(HouseRateState *hr, const RateEstimator *est,
      * imperceptible) until video_q holds the bank target; normal servo resumes there. */
     {
         int64_t bt = atomic_load_explicit(&g_bank_us, memory_order_relaxed);
+        int64_t maxd = g_max_delay_us >= 0 ? g_max_delay_us : g_cushion_max_ms * 1000;
         /* margin = TOTAL buffered content: compressed video_q + decoded frame_q
          * (counting video_q alone would overshoot by frame_q's depth, ~5s) */
         int64_t have = ((int64_t)atomic_load_explicit(&g_vq_elems, memory_order_relaxed) + occ)
                        * tick_dur_us;
+        /* 2.0.1 T-361: the margin a stall finds = what was buffered at the last video arrival (sampled by the master,
+         * hr->bk_have). The old reading mixed video_q's depth at the last arrival (the demux writes g_vq_elems only
+         * then) with frame_q's depth NOW: through each pause of a steady 10 s burst source (rich2997b sync_bursty_10)
+         * it read the bank full for the first 6-7 s of the cycle, the servo ran the house 0.6 % fast there, frame_q
+         * ran dry before every burst — 1-3 repeated frames a cycle for good (81 in 900 s, hs +2.7 s), each moving
+         * the content -> output map under a copied SCTE-35 cue's 2.6 s lead (cues 1-3 frames early) and a roll-up
+         * caption. A fully live reading (tried) topped up all cycle long until the held content reached the T-316
+         * door: 12.0 s, two door cuts in 900 s (a 1.03 s video PTS hole, a cue +1.4 s). So the fill stops 1 s under
+         * the door's max delay, where the door resumes */
+        if (hr->bk_arr_wc)
+            have = (int64_t)hr->bk_have * tick_dur_us;
+        if (maxd > 1000000 && bt > maxd - 1000000)
+            bt = maxd - 1000000;
         if (bt > 0 && !atomic_load_explicit(&g_bank_lone, memory_order_relaxed) &&   /* pre20: a lone stall's bank
                                                                                      * holds what came, adds nothing */
             !repriming && hr->occ_ema_milli >= (int64_t)base_sp * 1000 &&
@@ -1392,6 +1406,13 @@ void *output_thread(void *arg)
                     }
                     /* 2.0.0-pre4: a hold is not a rate signal — nominal pacing, no REPRIME (it would run
                      * the house at 0.77x, then 1.5 % slow, for as long as the source is gone) */
+                    if (v->dbg_video_q) {   /* 2.0.1 T-361: the bank margin at the last video arrival */
+                        int64_t arr = atomic_load_explicit(&g_src_vread_wc, memory_order_relaxed);
+                        if (arr && arr != v->hr->bk_arr_wc) {
+                            v->hr->bk_arr_wc = arr;
+                            v->hr->bk_have   = av_thread_message_queue_nb_elems(v->dbg_video_q) + occ;
+                        }
+                    }
                     atomic_store_explicit(&v->hr->rho_corr_ppm,
                         ptv_src_holding() ? 0 :
                         house_rate_corr_ppm(v->hr, v->est, occ, g_curt.cur_sp, base_sp, v->tick_dur_us, damaged),
