@@ -2212,8 +2212,21 @@ static void copy_gap_watch(DemuxArgs *d, int64_t now)
                        ps->cname);
             }
         }
-        if (!ps->sil || ps->real_end == AV_NOPTS_VALUE || now - FFMAX(ps->arr_wc, d->v_flow_since_us) < 2000000)
+        if (!ps->sil || ps->real_end == AV_NOPTS_VALUE || now - FFMAX(ps->arr_wc, d->v_flow_since_us) < 1000000)
             continue;
+        /* 2.0.1 T-099: 1 s while the input is DAMAGED (corrupt video, or a corrupt-discarded packet on a transcoded
+         * track, within 5 s), the T-379 rule of the transcoded track; clean sources keep 2 s. Measured (Cinestar
+         * capture, 10 % loss, VT prod graph): the copied AC-3 PID dark 1.28 s at the onset while the AAC (1 s rule)
+         * was 0.47 s and the video 0.35 s. */
+        if (now - FFMAX(ps->arr_wc, d->v_flow_since_us) < 2000000) {
+            int64_t dw = atomic_load_explicit(&g_vcorrupt_wc, memory_order_relaxed);
+            int k;
+            for (k = 0; k < d->n_audio; k++)
+                if (d->aglobal[k] >= 0 && d->aglobal[k] < PTV_MAX_AUDIO)
+                    dw = FFMAX(dw, atomic_load_explicit(&g_adamage_wc[d->aglobal[k]], memory_order_relaxed));
+            if (!dw || now - dw >= 5000000)
+                continue;
+        }
         target = ps->real_end + av_rescale_q(now - ps->arr_wc - 200000, AV_TIME_BASE_Q, ps->in_tb);
         if (ps->start_fill)   /* the output timeline, not the wall: a long start-up probe leaves a backlog that drains
                                * ahead of the wall (T-084 media: 7.4 s) — the video's output position, 200 ms short */
@@ -2229,9 +2242,9 @@ static void copy_gap_watch(DemuxArgs *d, int64_t now)
         if (!ps->fill_n) {
             ps->fill_cls_seq0 = atomic_load_explicit(&g_rj_cls_seq, memory_order_acquire);
             ps->fill_wc0      = now;
-            av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] copy #%d (%s) gap fill: no usable packets for 2 s while video "
+            av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] copy #%d (%s) gap fill: no usable packets for %.1f s while video "
                    "flows — silent frames (PTV_NO_COPY_GAPFILL=1 disables)\n", ps->in_index,
-                   ps->cname);
+                   ps->cname, (now - FFMAX(ps->arr_wc, d->v_flow_since_us)) / 1e6);
         }
         ps->fill_n  += n;
         ps->fill_end = cur;
