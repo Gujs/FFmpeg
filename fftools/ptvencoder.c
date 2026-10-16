@@ -5300,6 +5300,14 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         /* Take raw 33-bit timestamps; demux_unwrap extends them (libav's
          * correct_ts_overflow extends inconsistently across the B-frame reorder). */
         av_dict_set(&ins->groups[k].format_opts, "correct_ts_overflow", "0", AV_DICT_DONT_OVERWRITE);
+        /* 2.0.1 T-358: keep the subtitles' own PES timestamps. lavf's fix_teletext_pts (default on) re-stamps a DVB
+         * subtitle more than 10 s ahead of the last PCR to that PCR + 0.14 s — and the PCR rides the video PID: while
+         * only the video is gone it stays at the last one, so every subtitle 10 s into a video-only outage read the
+         * frozen PCR (rich sync_vnull_20: 30.841 s for content 41.5-51.5 s), and the one on the first picture back
+         * (marker 50, read just before the first PCR after the outage) was dropped as long past its moment. The copies
+         * are stamped through the video's record by their content time (T-100); a corrupt far-off PTS is dropped
+         * there (T-378) */
+        av_dict_set(&ins->groups[k].format_opts, "fix_teletext_pts", "0", AV_DICT_DONT_OVERWRITE);
     }
 
     /* 2.0.0-pre2: a single live input waits for its source (input_acquire) */

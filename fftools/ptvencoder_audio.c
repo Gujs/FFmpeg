@@ -4568,23 +4568,43 @@ void ptv_adec_opts(AVCodecContext *dec)
  * audio-only. Setting it everywhere is safe: option lookups that miss just leave the entry in
  * the dict (no open failure, non-AAC decoders unaffected; on a stock lavc the entry is simply
  * never consumed). Streams discovered DURING find_stream_info keep the strict default. */
+/* 2.0.1 T-358: the input is opened with lavf's fix_teletext_pts off (DVB subtitles keep their own PES timestamps
+ * through a video-only outage, see the open). lavf's comment says some sources' TELETEXT timestamps cannot be
+ * trusted, and production copies source teletext: an input that carries a teletext PID keeps lavf's fix. */
+static void ptv_teletext_fix(AVFormatContext *ic)
+{
+    unsigned i;
+    for (i = 0; i < ic->nb_streams; i++)
+        if (ic->streams[i]->codecpar->codec_id == AV_CODEC_ID_DVB_TELETEXT) {
+            av_opt_set_int(ic, "fix_teletext_pts", 1, AV_OPT_SEARCH_CHILDREN);
+            return;
+        }
+}
+
 int ptv_find_stream_info(AVFormatContext *ic)
 {
     AVDictionary **opts;
     unsigned i, n = ic->nb_streams;
     int r;
 
-    if (!g_adts_split || !g_tolerant_dec || !n)
-        return avformat_find_stream_info(ic, NULL);
+    if (!g_adts_split || !g_tolerant_dec || !n) {
+        r = avformat_find_stream_info(ic, NULL);
+        ptv_teletext_fix(ic);
+        return r;
+    }
     opts = av_calloc(n, sizeof(*opts));
-    if (!opts)
-        return avformat_find_stream_info(ic, NULL);
+    if (!opts) {
+        r = avformat_find_stream_info(ic, NULL);
+        ptv_teletext_fix(ic);
+        return r;
+    }
     for (i = 0; i < n; i++)
         av_dict_set(&opts[i], "tolerant_ch_alloc", "1", 0);
     r = avformat_find_stream_info(ic, opts);
     for (i = 0; i < n; i++)            /* nb_streams may have grown; only n dicts exist */
         av_dict_free(&opts[i]);
     av_freep(&opts);
+    ptv_teletext_fix(ic);
     return r;
 }
 
