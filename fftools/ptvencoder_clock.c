@@ -252,7 +252,12 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
              * released a moment later carries an EARLIER frame time: stamped behind this keepalive it was bumped one
              * frame late (sync_kill_return_20, the 4th caption after the restart, +41 ms). A keepalive is no picture —
              * keep it behind everything still on its way: the assembly window behind the output. */
-            int64_t lead = g_vmap && !c->multi ? FFMIN(c->ka_lead_us, -PTV_CC_DEBOUNCE_US) : c->ka_lead_us;
+            /* 2.0.1 T-366: ... and the window is the one cc_vq_release() accepts, a caption up to 1 s behind the output
+             * position, not the 500 ms assembly wait. Measured (rich2997long sync_startstall_12, marker 12): after the 12 s
+             * start-up backlog the pop-on caption's event reached the emitter when the output was already 0.90 s past
+             * its frame (vm_out 12.012 s, pos 12.913 s); the keepalive sent 0.33 s earlier sat at pos - 0.5 s = 12.179 s
+             * and the caption was bumped behind it: +168.3 ms on air, exactly the 1 of 147 off */
+            int64_t lead = g_vmap && !c->multi ? FFMIN(c->ka_lead_us, -1000000) : c->ka_lead_us;
             if (pos > 0 && pos + lead < house_us)
                 house_us = FFMAX(pos + lead, c->last_dts + 1000);
         } else if (c->multi && g_vmap && c->ka_real_wc) {
