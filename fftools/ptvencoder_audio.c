@@ -5078,6 +5078,21 @@ int build_audio_filter(AudioState *a, AVCodecContext *adec, AVRational tb,
             }
         }
     }
+    /* 2.0.1 T-357: start the async resampler's compensation stage NOW, while it holds no timestamps. A 48 -> 48 kHz
+     * swr has no resampler until its first SOFT compensation; swr_set_compensation() then creates it by re-running
+     * swr_init(), which resets firstpts, and the next swr_next_pts() re-seeds outpts from the input label — the step
+     * it was asked to stretch over passes through as a label step. Measured (std/sync_ac3_bitflip_100, prod graph):
+     * the first undecodable AAC frame = in-pts +21.3 ms -> lazy swr_init -> aresample out +21.2 ms -> alimiter
+     * (latency=1) re-anchors on the step and loses its 5 ms latency offset -> sink +26.2 ms = an AAC hole at 20.5 s
+     * (48 ms on older media: two frames); every later step was soft-compensated, as designed. A zero compensation
+     * creates the resampler here instead (what the first compensation does anyway, minus the reset). */
+    if (a->fg_swr) {
+        int64_t as = 0;
+        av_opt_get_int(a->fg_swr, "async", 0, &as);
+        if (as && (ret = swr_set_compensation(a->fg_swr, 0, 0)) < 0)
+            av_log(NULL, AV_LOG_WARNING, "ptvencoder: could not start the aresample compensation stage (%s)\n",
+                   av_err2str(ret));
+    }
 
     /* deliver encoder-sized frames so we can feed them straight to the AAC
      * encoders carrying their own (async-corrected) PTS — no FIFO repackaging. */
