@@ -5,6 +5,41 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.1-pre1 — 2.0.0-pre22 + A/V sync that never moves synced audio, the 2.0.0 triage residuals and the wrapper review
+
+- **A source audio relabel no longer moves synced audio (T-087, owner rule GOALS.md #3).** A backward audio label step is
+  erased (content cannot run backwards); the sensor reads A/V in the source's label domain, so a pure relabel read as a
+  desync: a −300 ms relabel made the corrector move the synced audio −292 ms (live: TruBLU on both canaries read
+  −65…−77 ms for hours while in sync). At each audio-first erase the decoded audio is checked: after a real repeat the
+  S ms before the seam come again, after a relabel they do not (10 ms RMS envelope, the first S after the seam against
+  the S before, other lags must not match as well). Relabel → the sensor follows the erase (`[PTV-RELABEL]`); repeat or
+  no verdict → as before. 900 s keys: 600 ms relabel → lipsync +0, corrector never engaged, ruler max 3 ms; 512 / 341 ms
+  real repeats → REPEAT, corrected to +0.8 / +8.2 ms. `PTV_NO_RLCHECK=1` reverts.
+- **No sound 1.43 s early and no 3.32 s video PTS hole after a long loss (T-381).** Only a fresh PES tail (< 1 s) carries
+  its wall gap; no re-prime (house 0.77x) while the source is damaged. 50 % loss for 100 s: lip sync −1429 ms → PASS.
+- **One picture with a corrupt timestamp no longer shifts the output clock (T-383).** A decoded picture more than two
+  steps ahead of the last is held for one picture and restamped between its neighbours when the next one comes back
+  (59.94, one PES +0.347 s: a 0.37 s video PTS hole, a 367 ms PCR step and the audio hard-shifted +316 ms → none).
+  `PTV_NO_VOUTLIER=1` reverts.
+- **A corrupt timestamp near half the 33-bit wrap no longer shifts every later frame by 2^33 (T-320).**
+- **A corrupt multi-frame audio PES timestamp is reverted, not padded (T-329)** — the revert stays armed for the
+  PES's frames (16 packets); 29.97 roll-up bitflip: audio +91 ms for good → 0.2 / 0.6 ms.
+- **No AAC hole at the first soft compensation (T-357)** — the swr compensation stage is created at graph build.
+- **Clock-follow arms only when the occupancy servo is pinned for 2 min (T-090)** — the coarse estimator's ±5000 ppm
+  noise made 8-20 false follows a day on jittery channels (latency ±0.3-1.4 s, PCR ±0.5 % off for minutes).
+- **Roll-up captions on their picture (T-319)** — cc_dec real-time latency 0 (was 200 ms): teletext +167 / +184 ms →
+  +0.0 ms at 29.97 / 59.94. `PTV_CC_RT_LATENCY_MS=200` restores the old cadence.
+- **Subtitles and cues:** a subtitle / cue read before its stepped picture takes the step (T-332, bstep −120 ms → 0); DVB
+  subtitles keep their own timestamps through a video-only outage (T-358: lavf's `fix_teletext_pts` only for inputs that
+  carry teletext); the subtitle on the last picture before a hold is released (T-360, released on the demux thread).
+- **Shorter dark wire at a stall onset (T-099):** a copied audio track's gap fill engages after 1 s on a damaged input
+  (Cinestar 10 % loss: every PID ≤ 0.47 s); a mosaic slot whose input reads nothing gets its fill after 1 s (slot audio
+  dark 1.19 → 0.21 s).
+- **Mosaic: a slot's lipsync= no longer reads +20 s after its input returns (T-362)** — held pictures are not measured;
+  the reading reseeds 1 s after the pictures move again (sync_check's pin rule fired on the old reading).
+- **The default GOP (no `-g`) is 2 s of the output rate, rounded** (was 58 frames at 29.97, 118 at 59.94); the wrapper's
+  fallback start now leaves `-g` to ptvencoder.
+
 ## 2.0.0-pre22 — pre21 + bit-flipped SPS / audio PTS / subtitle PTS, flapping and damaged sources keep picture, sound and structure
 
 - **A bit-flipped SPS frame rate no longer moves the video labels (T-371).** The per-stream absorber took the packet
