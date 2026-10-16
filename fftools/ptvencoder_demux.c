@@ -2023,6 +2023,7 @@ static void vwait_drain(DemuxArgs *d, int force)
             memmove(ps->vwait, ps->vwait + k, (ps->nvwait - k) * sizeof(*ps->vwait));
             memmove(ps->vwait_wc, ps->vwait_wc + k, (ps->nvwait - k) * sizeof(*ps->vwait_wc));
             memmove(ps->vwait_po, ps->vwait_po + k, (ps->nvwait - k) * sizeof(*ps->vwait_po));
+            memmove(ps->vwait_vn, ps->vwait_vn + k, (ps->nvwait - k) * sizeof(*ps->vwait_vn));
             ps->nvwait -= k;
         }
     }
@@ -2074,6 +2075,7 @@ static int demux_pass(DemuxArgs *d, AVPacket *out)
             }
             ps->vwait_wc[ps->nvwait] = av_gettime_relative();
             ps->vwait_po[ps->nvwait] = d->prog_off;
+            ps->vwait_vn[ps->nvwait] = d->vunwrap_n;
             ps->vwait[ps->nvwait++]  = out;
             pthread_mutex_unlock(&d->pass_lock);
             return 0;
@@ -2240,6 +2242,33 @@ static void copy_gap_watch(DemuxArgs *d, int64_t now)
     pthread_mutex_unlock(&d->pass_lock);
 }
 
+/* 2.0.1 T-332: a video packet comes out of lavf two packets after its PES started (the PES completes when the next one
+ * starts, the h264 parser then holds one frame more), so a subtitle / cue that follows a video PES in the mux is read
+ * BEFORE that video packet. When that video packet moves prog_off (a source step absorbed on it), the copies read in
+ * between were unwrapped with the old prog_off although they belong to the new timeline. Measured (rich2997b
+ * sync_bstep, step at content 45 s): the stepped video PES starts at TS packet 59885; the DVB sub at 59913 and the
+ * SCTE-35 cue next to it were read before it (and before the old-timeline frame at 59840) and took prog_off 10800
+ * instead of 21600: both −120 ms on the output. The copies still waiting for their picture that were read since the
+ * video packet before the previous one and lie after this PES in the mux take the step too (a section has no pos:
+ * it is read at its own packet, inside that window). */
+static void vwait_follow_video(DemuxArgs *d, int64_t vpos, int64_t dpo)
+{
+    int pi, k;
+    pthread_mutex_lock(&d->pass_lock);
+    for (pi = 0; pi < d->n_pass; pi++) {
+        PassStream *ps = &d->pass[pi];
+        for (k = ps->nvwait - 1; k >= 0 && ps->vwait_vn[k] >= d->vunwrap_n - 1; k--) {
+            AVPacket *p = ps->vwait[k];
+            if (p->pos >= 0 && vpos >= 0 && p->pos < vpos)
+                continue;
+            if (p->pts != AV_NOPTS_VALUE) p->pts += dpo;
+            if (p->dts != AV_NOPTS_VALUE) p->dts += dpo;
+            ps->vwait_po[k] += dpo;
+        }
+    }
+    pthread_mutex_unlock(&d->pass_lock);
+}
+
 /* Unwrap a packet's MPEG-TS PTS/DTS into a monotonic, extended timeline.
  * The source counter rolls every 2^pts_wrap_bits ticks (33 bits = ~26.5h at
  * 90kHz). The house clock makes that roll invisible to the re-encoded video, but
@@ -2258,6 +2287,7 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
     AVStream *st = d->ifmt->streams[pkt->stream_index];
     int bits = st->pts_wrap_bits;
     int64_t mask, half, raw, off;
+    int64_t po0 = d->prog_off;               /* 2.0.1 T-332: what this packet moves prog_off by */
 
     if (bits <= 0 || bits >= 63)              /* only meaningful for a real TS wrap */
         return;
@@ -2892,6 +2922,11 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
     if (off) {
         if (pkt->pts != AV_NOPTS_VALUE) pkt->pts += off;
         if (pkt->dts != AV_NOPTS_VALUE) pkt->dts += off;
+    }
+    if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+        if (d->prog_off != po0 && g_discont && g_prog_off)
+            vwait_follow_video(d, pkt->pos, d->prog_off - po0);
+        d->vunwrap_n++;
     }
 }
 

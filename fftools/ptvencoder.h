@@ -1486,6 +1486,7 @@ typedef struct PassStream {
     AVPacket  *vwait[PTV_VWAIT_MAX];
     int64_t    vwait_wc[PTV_VWAIT_MAX];
     int64_t    vwait_po[PTV_VWAIT_MAX];   /* DemuxArgs.prog_off when it arrived (the SCTE-35 rebase term) */
+    int64_t    vwait_vn[PTV_VWAIT_MAX];   /* 2.0.1 T-332: DemuxArgs.vunwrap_n when it arrived */
     int        nvwait;
 } PassStream;
 
@@ -1748,6 +1749,7 @@ typedef struct DemuxArgs {
     int                   drop;          /* non-blocking + drop on full (network input) */
     PassStream           *pass;          /* copy-passthrough: extra audio, subs, data */
     int64_t               vm_po;                              /* 2.0.0 T-100: prog_off of the copy being released */
+    int64_t               vunwrap_n;                          /* 2.0.1 T-332: video packets unwrapped (demux thread) */
     int64_t               vm_far_wc;                          /* 2.0.0 T-378: last far-future copy drop log */
     int64_t               vread_us;                           /* 2.0.0 T-378: newest video read (us, copies' timeline) */
     int                   vread_set;
