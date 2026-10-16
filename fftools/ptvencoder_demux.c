@@ -2343,9 +2343,20 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
              * old timeline (+2 frames after the one before the outlier), read +182 ms "ahead", under the 1 s forward
              * threshold — nothing undid it: A/V −200 ms for good. A real step continues on its new timeline. */
             PtvTsOutlier *ol = d->ts_outl && pkt->stream_index < d->nb_streams_open ? &d->ts_outl[pkt->stream_index] : NULL;
+            /* 2.0.1 T-329: the check above ran on the NEXT packet only, but lavf splits one PES into all of its frames
+             * and gives every later one the corrupt label + n frames — an AAC PES carries 8 (170 ms). Measured
+             * (rich2997ru, one audio PES PTS −91 ms = one flipped bit 13): −70 ms absorbed, the second frame read
+             * −48 ms from the pre-step label and disarmed the revert, the next PES (back on the old timeline) stepped
+             * +91 ms under the 1 s forward bar, [PTV-AGLUE] GAP-padded it: audio +91 ms for good. Stay armed while the
+             * stream keeps flowing on the outlier's timeline (16 packets, the T-088 window); revert when a packet lands
+             * on the pre-step timeline projected to it, within one frame. */
             if (ol && ol->pend_last != AV_NOPTS_VALUE) {
                 int64_t from_pre = raw - ol->pend_last;
-                if (ol->nom > 0 && from_pre > 0 && from_pre <= 3 * ol->nom) {   /* back on the pre-step timeline */
+                int keep = 0;
+                ol->pend_n++;
+                if (ol->nom > 0 && from_pre > 0 &&
+                    (ol->pend_n == 1 ? from_pre <= 3 * ol->nom
+                                     : llabs(from_pre - (ol->pend_n + 1) * ol->nom) <= ol->nom)) {   /* back on the pre-step timeline */
                     d->wrap_off[pkt->stream_index] -= ol->pend_dw;
                     d->prog_off -= ol->pend_dprog;
                     d->splice_adj_us = 0;                    /* no sibling may adopt the bogus amount */
@@ -2360,8 +2371,10 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                     av_log(NULL, AV_LOG_WARNING, "[PTV-DISCONT] stream %d: the absorbed %+"PRId64"ms step was ONE corrupt "
                            "timestamp (the next packet is back on the old timeline) — absorption reverted\n",
                            pkt->stream_index, -av_rescale_q(ol->pend_dw, st->time_base, (AVRational){1,1000}));
-                }
-                ol->pend_last = AV_NOPTS_VALUE;
+                } else if (ol->nom > 0 && ol->pend_n < 16 && raw - last > 0 && raw - last <= 2 * ol->nom)
+                    keep = 1;                                /* the outlier PES's next frame */
+                if (!keep)
+                    ol->pend_last = AV_NOPTS_VALUE;
             }
             if (ol && delta > 0 && delta <= av_rescale(250, st->time_base.den, (int64_t)st->time_base.num * 1000) &&
                 (!ol->nom || delta <= 2 * ol->nom))   /* T-088: an excursion is not a normal step */
@@ -2804,6 +2817,7 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                     d->wrap_off[pkt->stream_index] -= adj;   /* per-stream rebase AT OWN CROSSING (audio-derived common offset when g_layera) */
                     if (ol && delta < 0) {                   /* 2.0.0-pre9.2: undoable if the next packet says "outlier" */
                         ol->pend_last  = last;
+                        ol->pend_n     = 0;
                         ol->pend_dw    = -adj;
                         ol->pend_dprog = ct == AVMEDIA_TYPE_VIDEO ? -adj : 0;
                     }
