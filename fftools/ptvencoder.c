@@ -4222,6 +4222,14 @@ static int cc_setup(CcCtx *cc, CcTap *tap, AVThreadMessageQueue **cc_q,
     /* real_time: emit on every CC buffer change instead of waiting for a mode switch — a
      * live channel has no end of stream to flush against. */
     av_opt_set_int(tap->dec, "real_time", 1, AV_OPT_SEARCH_CHILDREN);
+    /* 2.0.1 T-319 (measured, v2 roll-up timing media): cc_dec reports the screen at most every
+     * real_time_latency_msec (default 200), so a roll-up line reached the tap up to 6 frames after the frame that
+     * completed it (+167 ms at 29.97, +184 ms at 59.94). The tap's own debounce / deadline pace the pages: report
+     * every change. PTV_CC_RT_LATENCY_MS=200 restores the old cadence. */
+    {
+        const char *rl = getenv("PTV_CC_RT_LATENCY_MS");
+        av_opt_set_int(tap->dec, "real_time_latency_msec", rl ? atoi(rl) : 0, AV_OPT_SEARCH_CHILDREN);
+    }
     /* FIELD 1 explicitly. cc_dec's data_field defaults to -1 = "pick the first field that
      * appears" and then IGNORES the other one for the rest of the run. Field 2 carries
      * secondary services (CC3/CC4) and XDS, so on a source whose first A53 pair happens to be
