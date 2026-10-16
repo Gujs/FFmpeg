@@ -2445,6 +2445,23 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
             int64_t wl        = d->wrap_wall_last[pkt->stream_index];
             int64_t period_us = av_rescale(mask, (int64_t)st->time_base.num * 1000000, st->time_base.den);
             int64_t guard_us  = g_wrap_guard_us > 0 ? g_wrap_guard_us : period_us / 2;
+            /* 2.0.1 T-320: the wrap branches below read the delta to `last`, so a one-packet outlier near HALF the wrap
+             * takes a wrap step (its delta just past half) that its return does not undo (that delta just inside half).
+             * Measured (rich25b, one video PES PTS bit 32 flipped = +2^32 ticks + one frame from its predecessor): the
+             * outlier took the late-pre-roll step (wrap_off −2^33), the good frames after it all landed 2^33 low, LAYERA
+             * saw 13 of them on its "new" timeline, kept NEW and applied +47721.859 s: picture and sound lost for good.
+             * A packet one normal step on from the packet BEFORE the outlier is back on its timeline: undo the outlier's
+             * wrap step, then LAYERA's outlier rule drops the one corrupt packet. */
+            int64_t wrap_dw = ol ? ol->wrap_dw : 0;
+            if (ol)
+                ol->wrap_dw = 0;
+            if (wrap_dw && ol->nom > 0 && ol->last2 != AV_NOPTS_VALUE &&
+                raw - ol->last2 > 0 && raw - ol->last2 <= 3 * ol->nom) {
+                d->wrap_off[pkt->stream_index] -= wrap_dw;
+                av_log(NULL, AV_LOG_WARNING, "[PTV-DISCONT] stream %d: the %+.3fs wrap step was taken on ONE corrupt "
+                       "timestamp (the next packet is back on the old timeline) — wrap step reverted\n",
+                       pkt->stream_index, wrap_dw * av_q2d(st->time_base));
+            } else
             if (wl > 0 && wall_now - wl > guard_us) {
                 int64_t expect = last + av_rescale(wall_now - wl, st->time_base.den,
                                                    (int64_t)st->time_base.num * 1000000);
@@ -2456,8 +2473,13 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                        "delta heuristic aliases past %.1fh)\n",
                        pkt->stream_index, (wall_now - wl) / 3600.0e6, k, guard_us / 3600.0e6);
             }
-            else if (delta < -half) d->wrap_off[pkt->stream_index] += mask;  /* 33-bit wrap: rolled forward */
-            else if (delta >  half) d->wrap_off[pkt->stream_index] -= mask;  /* late pre-roll pkt */
+            else if (delta < -half) {
+                d->wrap_off[pkt->stream_index] += mask;  /* 33-bit wrap: rolled forward */
+                if (ol) ol->wrap_dw = mask;              /* T-320: undone if the next packet says "outlier" */
+            } else if (delta >  half) {
+                d->wrap_off[pkt->stream_index] -= mask;  /* late pre-roll pkt */
+                if (ol) ol->wrap_dw = -mask;
+            }
             else if (g_discont && (ct == AVMEDIA_TYPE_VIDEO || ct == AVMEDIA_TYPE_AUDIO)) {
                 /* Source PTS discontinuity (a DTS jump, NOT a 33-bit wrap), either direction.
                  * Frames are continuous (one per tick) but the timestamp leaps; absorb the excess

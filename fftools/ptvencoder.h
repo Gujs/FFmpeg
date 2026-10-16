@@ -756,6 +756,7 @@ typedef struct PtvTsOutlier {
     int     pend_n;         /* ... packets since it (2.0.1 T-329: the outlier's PES may carry several frames) */
     int64_t fx_base;        /* 2.0.0 T-088: raw ts before a flowed forward excursion (one corrupt PES = several packets) */
     int     fx_n;           /* ... packets since it (the excursion packet = 1); 0 = none / expired */
+    int64_t wrap_dw;        /* 2.0.1 T-320: the wrap step the LAST packet took (0 = none) — undone if it was an outlier */
 } PtvTsOutlier;
 
 typedef struct DecodeCtx {
