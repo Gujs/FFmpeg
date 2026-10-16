@@ -5535,7 +5535,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         if (rung[r].fhwfr) rung[r].venc->hw_frames_ctx = av_buffer_ref(rung[r].fhwfr);   /* CUDA frames -> NVENC */
         rung[r].venc->time_base = av_inv_q(out_fps); rung[r].venc->framerate = out_fps;
         rung[r].venc->bit_rate = 3000000;
-        rung[r].venc->gop_size = 2 * (out_fps.num / FFMAX(out_fps.den, 1));
+        /* 2.0.1: rounded — 2 * (num / den) truncated first (58 at 29.97, 118 at 59.94); -g still overrides */
+        rung[r].venc->gop_size = (int)((2LL * out_fps.num + FFMAX(out_fps.den, 1) / 2) / FFMAX(out_fps.den, 1));
         if (rung[r].ofmt->oformat->flags & AVFMT_GLOBALHEADER) rung[r].venc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
         {   /* -b:v + forwarded encoder opts (-preset/-rc/-maxrate/-g/-s12m_tc/...) */
             AVDictionary *vopts = NULL;
