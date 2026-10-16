@@ -2999,11 +2999,22 @@ void ptv_acq_heartbeat(void)
     av_log(NULL, AV_LOG_INFO, "frame=    0 fps=0.0 src=waiting hold=%.1f\n", (now - t0) / 1e6);
 }
 
+/* 2.0.1 T-360: the single input's demux thread, for the copy release below */
+static DemuxArgs *icb_da;
+static pthread_t  icb_tid;
+
 int ptv_src_interrupt(void *opaque)
 {
     int64_t vr;
     (void)opaque;
     ptv_acq_heartbeat();
+    /* 2.0.1 T-360: while the output holds (no fresh frame for 100 ms) the demux thread sits in the read and lavf calls
+     * this every <= 100 ms: release the sparse copies on the last picture before the hold here (ptv_vmap_lookup's held
+     * rule), on the demux thread itself. The master output thread did it on held ticks in c32558cbca and crashed every
+     * LOST reopen (304c6227e5); here the reopen runs on the same thread and the drain never reads d->ifmt */
+    if (icb_da && pthread_equal(pthread_self(), icb_tid) &&
+        av_gettime_relative() - atomic_load_explicit(&g_src_fresh_wc, memory_order_relaxed) >= 100000)
+        ptv_copy_vwait(icb_da);
     if (!atomic_load_explicit(&g_src_icb_armed, memory_order_relaxed))
         return 0;
     vr = atomic_load_explicit(&g_src_vread_wc, memory_order_relaxed);
@@ -3102,6 +3113,10 @@ void *demux_thread(void *arg)
 
     if (d->reopen && d->single)     /* 2.0.0-pre5: the no-video read interrupt goes live with the thread */
         atomic_store_explicit(&g_src_icb_armed, 1, memory_order_relaxed);
+    if (d->single && g_vmap) {      /* 2.0.1 T-360: the read interrupt releases held copies on this thread */
+        icb_tid = pthread_self();
+        icb_da  = d;
+    }
 
     if (!pkt)
         goto end;
@@ -3835,6 +3850,8 @@ end:
             av_thread_message_queue_send(d->mux_q[i], &eof, 0);
         }
     }
+    if (icb_da == d)
+        icb_da = NULL;
     av_packet_free(&pkt);
     return NULL;
 }

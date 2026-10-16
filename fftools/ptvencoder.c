@@ -275,7 +275,7 @@ int ptv_vmap_newest(int64_t since_wc, int64_t *src_us, int64_t *out_us)
  * was never shown (skipped, erased, lost in an outage); 0 = not yet (or nothing recorded); -1 = c_us is older than everything held by > 1 s. */
 int ptv_vmap_lookup(int64_t c_us, int64_t *out_us, int64_t *gap_us)
 {
-    int k, i, hit = -1, ret;
+    int k, i, hit = -1, ret, newest, held = 0;
     pthread_mutex_lock(&vmap_lock);
     for (k = 0; k < vmap_n; k++) {             /* newest -> oldest: the oldest entry still >= c_us */
         i = (vmap_w + PTV_VMAP_N - 1 - k) % PTV_VMAP_N;
@@ -283,7 +283,20 @@ int ptv_vmap_lookup(int64_t c_us, int64_t *out_us, int64_t *gap_us)
             break;
         hit = i;
     }
-    if (hit < 0 || hit == (vmap_w + PTV_VMAP_N - 1) % PTV_VMAP_N)
+    newest = hit == (vmap_w + PTV_VMAP_N - 1) % PTV_VMAP_N;
+    if (newest && vmap_n > 1) {
+        /* 2.0.1 T-360: the last picture before a hold has no next frame to vouch for it — a subtitle on it waited out
+         * the hold and was then dropped as late (rich sync_bursty_20 29.97 / 59.94, DVB sub marker 12: the depth door's
+         * cut made 13.433 s the last picture on air; 25 s later the resume read o 26.8 s behind the output and a 28 s
+         * content leap to the next frame). Once the output has run on 3 ticks past it on held pictures, it was shown,
+         * if it came in continuous flow; one that came after a hold may be the pre-gap tail (below) and still waits */
+        int64_t pos = atomic_load_explicit(&g_house_out_us, memory_order_relaxed);
+        int64_t tick = atomic_load_explicit(&g_house_tick_us, memory_order_relaxed);
+        i = (hit + PTV_VMAP_N - 1) % PTV_VMAP_N;
+        held = tick > 0 && pos - vmap_out[hit] >= 3 * tick &&
+               (vmap_out[hit] - vmap_out[i]) - (vmap_src[hit] - vmap_src[i]) <= 1000000;
+    }
+    if (hit < 0 || (newest && !held))
         ret = 0;                                /* wait for one frame more: it tells whether this one was a stale tail */
     else if (k == vmap_n && vmap_src[hit] - c_us > 1000000)
         ret = -1;                               /* older than the record by more than a second */
@@ -300,7 +313,7 @@ int ptv_vmap_lookup(int64_t c_us, int64_t *out_us, int64_t *gap_us)
                                                  * was the pre-gap PES tail lavf releases only after an outage (T-074),
                                                  * shown alone after the hold (then the video waits for a keyframe): nothing
                                                  * belongs on it */
-        if ((vmap_src[i] - vmap_src[hit]) - (vmap_out[i] - vmap_out[hit]) > 1000000)
+        if (!newest && (vmap_src[i] - vmap_src[hit]) - (vmap_out[i] - vmap_out[hit]) > 1000000)
             *gap_us = FFMAX(*gap_us, (vmap_src[i] - vmap_src[hit]) - (vmap_out[i] - vmap_out[hit]));
         ret = 1;
     }
