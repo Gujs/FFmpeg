@@ -22,7 +22,9 @@ the v2 `0001` patch (additive, travels with the source to the build box).
   ±1 picture step only through the PLL's slow slew, so the slot read −30…−40 ms for ~10-13 s after each step: ~20 s
   after a clean start (the gate's "multiview clean b −37 ms"), after damage, after a join. The audio now pads / drops
   the same amount in whole audio frames at once (remainder carried). Residual: the step reaches the sound about one
-  jitter buffer (~1 s) after the picture — at most ~1 s at −40 ms instead of 10-13 s. `PTV_NO_RES_FOLLOW=1` reverts.
+  jitter buffer (~1 s) after the picture — at most ~1 s at −40 ms instead of 10-13 s. Only on slots at the house rate
+  (converged cadence estimate within 2 %): on a rate-converted slot (25 in 29.97, 59.94 in 29.97) the holds /
+  decimations are its cadence, not steps — it keeps the 2.0.1 behaviour. `PTV_NO_RES_FOLLOW=1` reverts.
 - **No more hold/decimate chatter on clean mosaic slots (T-343).** After the servo had drained or filled a picture,
   the slot's display phase sat exactly on the tick edge and the ±1 picture occupancy jitter flipped it every frame: a
   picture shown twice then one skipped, every ~2 ticks, for minutes, on slots with a clean source (2.0.1 servo, clean
