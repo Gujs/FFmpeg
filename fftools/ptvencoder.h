@@ -1986,6 +1986,13 @@ typedef struct Input {
     pthread_t             th_demux, th_decode;
     int                   started_demux, started_decode;
     int                   open_ret;          /* parallel-open result */
+    /* 2.0.2 T-386 (spec §4 -start_on any / -slot_wait, E13): a mosaic slot's own acquire before the start */
+    _Atomic int           acq_abort;         /* the coordinator gave up on this slot (interrupts its open/probe) */
+    _Atomic int           acq_live;          /* the slot has video with known geometry */
+    int64_t               acq_live_wc;       /* ... since (wall us) */
+    pthread_t             acq_th;
+    int                   acq_started;
+    _Atomic int           acq_done;          /* its acquire thread returned */
 } Input;
 
 /* Multiview compositor = the video house clock. Samples each input's hold at

@@ -4495,7 +4495,10 @@ static int is_net_url(const char *u)
  * longer end the run. Kill switch: PTV_NO_WAIT_START=1 (1.2.x: one attempt, exit on failure). */
 #define PTV_PROBING_MAX_US 300000000           /* = the NOVIDEO startup bound */
 static const char *g_start_on   = "video";
+static int         g_start_on_set;               /* 2.0.2 T-386: -start_on given (a mosaic's default is any) */
 static int64_t     g_wait_input_us;              /* 0 = wait forever */
+static int64_t     g_slot_wait_us = 120000000;   /* 2.0.2 T-386: mosaic -slot_wait (0 = inf); spec §4 */
+static _Atomic int g_mv_acq_go;                  /* 2.0.2 T-386: the mosaic starts — live slots stop draining */
 int                g_backoff_s[8] = { 1, 2, 5, 10, 30 };   /* also the 2.0.0-pre5 reopen backoff */
 int                g_backoff_n    = 5;
 
@@ -4568,7 +4571,18 @@ static AVPacket *silent_copy_frame(const AVCodecParameters *par, AVRational tb, 
     return p;
 }
 
-static int input_acquire_loop(Input *in, int idx, const AVDictionary *opts)
+/* 2.0.2 T-386: a mosaic slot's open / probe stops when the coordinator gives up on it (or at -t / EOF). The URL
+ * context keeps a copy of this callback for the whole run, so the opaque is the slot's own Input. */
+static int slot_interrupt(void *opaque)
+{
+    Input *in = opaque;
+    return atomic_load_explicit(&in->acq_abort, memory_order_relaxed) ||
+           atomic_load_explicit(&g_t_stop, memory_order_relaxed);
+}
+
+/* mosaic = 1 (2.0.2 T-386): a mosaic slot's acquire, on its own thread — no 300 s PROBING exit and no -wait_input
+ * (the coordinator decides with -slot_wait), the slot's own interrupt, AVERROR_EXIT once the coordinator gave up */
+static int input_acquire_loop(Input *in, int idx, const AVDictionary *opts, int mosaic)
 {
     int64_t t0 = av_gettime_relative(), next_note = 0, probing_since = 0;
     int attempt = 0, state = -1;                  /* 0 = WAITING (no data), 1 = PROBING (no video geometry) */
@@ -4582,7 +4596,8 @@ static int input_acquire_loop(Input *in, int idx, const AVDictionary *opts)
         attempt++;
         av_dict_copy(&o, opts, 0);                /* open consumes recognized entries: fresh copy per try */
         if (!(in->ifmt = avformat_alloc_context())) { av_dict_free(&o); return AVERROR(ENOMEM); }
-        in->ifmt->interrupt_callback = (AVIOInterruptCB){ ptv_src_interrupt, NULL };   /* 2.0.0-pre5 */
+        in->ifmt->interrupt_callback = mosaic ? (AVIOInterruptCB){ slot_interrupt, in }
+                                              : (AVIOInterruptCB){ ptv_src_interrupt, NULL };   /* 2.0.0-pre5 */
         ret = avformat_open_input(&in->ifmt, in->url, NULL, &o);
         av_dict_free(&o);
         if (ret >= 0) ret = ptv_find_stream_info(in->ifmt);   /* pre19.1: tolerant AUDIO probe */
@@ -4602,7 +4617,7 @@ static int input_acquire_loop(Input *in, int idx, const AVDictionary *opts)
                            "(after %.1f s, attempt #%d)\n", idx, avcodec_get_name(par->codec_id),
                            par->width, par->height, na, ns, nd,
                            (av_gettime_relative() - t0) / 1e6, attempt);
-                    if (idx == 0 && !atomic_load_explicit(&g_t_live_us, memory_order_relaxed))
+                    if (!mosaic && idx == 0 && !atomic_load_explicit(&g_t_live_us, memory_order_relaxed))
                         atomic_store_explicit(&g_t_live_us, av_gettime_relative(), memory_order_relaxed);
                     in->ifmt->max_probe_packets = 1;   /* 1.2.2 T-073: no probe for later-born streams */
                     in->open_ret = 0;
@@ -4618,6 +4633,10 @@ static int input_acquire_loop(Input *in, int idx, const AVDictionary *opts)
             st = 0;
         }
         if (in->ifmt) avformat_close_input(&in->ifmt);
+        if (mosaic && atomic_load_explicit(&in->acq_abort, memory_order_relaxed)) {
+            in->open_ret = AVERROR_EXIT;
+            return in->open_ret;
+        }
 
         now    = av_gettime_relative();
         waited = now - t0;
@@ -4625,13 +4644,13 @@ static int input_acquire_loop(Input *in, int idx, const AVDictionary *opts)
          * check): exit for a supervised respawn rather than wait silently forever (silent-zombie guard) */
         if (st == 1 && !probing_since) probing_since = now;
         if (st == 0) probing_since = 0;
-        if (probing_since && now - probing_since >= PTV_PROBING_MAX_US) {
+        if (!mosaic && probing_since && now - probing_since >= PTV_PROBING_MAX_US) {
             av_log(NULL, AV_LOG_ERROR, "[PTV-SRC] in%d PROBING for %.0f s with packets flowing but no usable "
                    "video: %s on %s — exiting\n", idx, (now - probing_since) / 1e6, what, in->url);
             in->open_ret = AVERROR_INVALIDDATA;
             return in->open_ret;
         }
-        if (g_wait_input_us > 0 && waited >= g_wait_input_us) {
+        if (!mosaic && g_wait_input_us > 0 && waited >= g_wait_input_us) {
             av_log(NULL, AV_LOG_ERROR, "[PTV-SRC] in%d gave up after %.0f s (-wait_input): %s on %s\n",
                    idx, waited / 1e6, what, in->url);
             in->open_ret = AVERROR(ETIMEDOUT);
@@ -4649,8 +4668,8 @@ static int input_acquire_loop(Input *in, int idx, const AVDictionary *opts)
         }
         if (!wait_s && now - at0 < 1000000)
             av_usleep((unsigned)(1000000 - (now - at0)));
-        for (; wait_s > 0; wait_s--) {               /* backoff in 1 s steps: the heartbeat keeps going */
-            ptv_acq_heartbeat();
+        for (; wait_s > 0 && !(mosaic && atomic_load_explicit(&in->acq_abort, memory_order_relaxed)); wait_s--) {
+            ptv_acq_heartbeat();                     /* backoff in 1 s steps: the heartbeat keeps going */
             av_usleep(1000000);
         }
         ptv_acq_heartbeat();
@@ -4662,9 +4681,111 @@ static int input_acquire(Input *in, int idx, const AVDictionary *opts)
 {
     int ret;
     atomic_store_explicit(&g_acq_since, av_gettime_relative(), memory_order_relaxed);
-    ret = input_acquire_loop(in, idx, opts);
+    ret = input_acquire_loop(in, idx, opts, 0);
     atomic_store_explicit(&g_acq_since, 0, memory_order_relaxed);
     return ret;
+}
+
+/* 2.0.2 T-386 (spec §4, E13): one mosaic slot's acquire thread. Once LIVE it waits for the start; a slot that has been
+ * live for 3 s while the coordinator still waits for a sibling reads and drops its packets, so the mosaic does not open
+ * on seconds of stale content (a healthy start, every slot live within 3 s, reads nothing here = as before). */
+typedef struct SlotAcq { Input *in; int idx; } SlotAcq;
+static void *slot_acquire_thread(void *arg)
+{
+    SlotAcq *sa = arg;
+    Input *in = sa->in;
+    AVPacket *pkt;
+
+    if (input_acquire_loop(in, sa->idx, in->da.reopen_opts, 1) >= 0) {
+        in->acq_live_wc = av_gettime_relative();
+        atomic_store_explicit(&in->acq_live, 1, memory_order_release);
+        if ((pkt = av_packet_alloc())) {
+            while (!atomic_load_explicit(&g_mv_acq_go, memory_order_acquire) &&
+                   !atomic_load_explicit(&in->acq_abort, memory_order_relaxed)) {
+                if (av_gettime_relative() - in->acq_live_wc < 3000000 || av_read_frame(in->ifmt, pkt) < 0)
+                    av_usleep(20000);
+                av_packet_unref(pkt);
+            }
+            av_packet_free(&pkt);
+        }
+    }
+    atomic_store_explicit(&in->acq_done, 1, memory_order_release);
+    return NULL;
+}
+
+/* 2.0.2 T-386: the mosaic start (spec §4). -start_on any (mosaic default): every slot LIVE, or -slot_wait expired with
+ * at least one LIVE; -start_on all: every slot LIVE. Returns the number of live slots; the others are aborted and
+ * closed (in->ifmt NULL). Draining slots get 2 s to leave their read once the start is set; one that does not (its
+ * source died during the wait: the read blocks until rw_timeout) is aborted and counts as not live. */
+static int mosaic_acquire(Input *inputs, int n_input)
+{
+    SlotAcq sa[PTV_MAX_INPUT];
+    int64_t t0 = av_gettime_relative(), now;
+    int all = !strcmp(g_start_on, "all"), k, live = 0;
+
+    atomic_store_explicit(&g_acq_since, t0, memory_order_relaxed);
+    for (k = 0; k < n_input; k++) {
+        sa[k] = (SlotAcq){ &inputs[k], k };
+        inputs[k].acq_started = !pthread_create(&inputs[k].acq_th, NULL, slot_acquire_thread, &sa[k]);
+        if (!inputs[k].acq_started)
+            atomic_store_explicit(&inputs[k].acq_done, 1, memory_order_relaxed);
+    }
+    for (;;) {
+        int done = 0;
+        now  = av_gettime_relative();
+        live = 0;
+        for (k = 0; k < n_input; k++) {
+            live += atomic_load_explicit(&inputs[k].acq_live, memory_order_acquire);
+            done += atomic_load_explicit(&inputs[k].acq_done, memory_order_acquire) &&
+                    !atomic_load_explicit(&inputs[k].acq_live, memory_order_acquire);
+        }
+        if (live == n_input || done == n_input)
+            break;
+        if (!all && g_slot_wait_us > 0 && live > 0 && now - t0 >= g_slot_wait_us)
+            break;
+        ptv_acq_heartbeat();
+        av_usleep(100000);
+    }
+    atomic_store_explicit(&g_mv_acq_go, 1, memory_order_release);
+    for (k = 0; k < n_input; k++) {
+        if (!atomic_load_explicit(&inputs[k].acq_live, memory_order_acquire))
+            atomic_store_explicit(&inputs[k].acq_abort, 1, memory_order_relaxed);
+    }
+    for (k = 0; k < n_input; k++) {
+        int64_t w0 = av_gettime_relative();
+        while (inputs[k].acq_started && !atomic_load_explicit(&inputs[k].acq_done, memory_order_acquire) &&
+               av_gettime_relative() - w0 < 2000000)
+            av_usleep(10000);
+        if (!atomic_load_explicit(&inputs[k].acq_done, memory_order_acquire)) {
+            av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in%d went quiet while the mosaic waited for its siblings — "
+                   "treated as not live\n", k);
+            atomic_store_explicit(&inputs[k].acq_abort, 1, memory_order_relaxed);
+            atomic_store_explicit(&inputs[k].acq_live, 0, memory_order_relaxed);
+        }
+        if (inputs[k].acq_started)
+            pthread_join(inputs[k].acq_th, NULL);
+        if (!atomic_load_explicit(&inputs[k].acq_live, memory_order_acquire) && inputs[k].ifmt)
+            avformat_close_input(&inputs[k].ifmt);
+        atomic_store_explicit(&inputs[k].acq_abort, 0, memory_order_relaxed);   /* the URL context keeps the
+                                                                                 * callback: never abort the run */
+    }
+    atomic_store_explicit(&g_acq_since, 0, memory_order_relaxed);
+    live = 0;
+    for (k = 0; k < n_input; k++)
+        live += atomic_load_explicit(&inputs[k].acq_live, memory_order_acquire);
+    {
+        char not_live[64] = "";
+        for (k = 0; k < n_input; k++)
+            if (!atomic_load_explicit(&inputs[k].acq_live, memory_order_acquire))
+                av_strlcatf(not_live, sizeof not_live, "%s%d", *not_live ? "," : "", k);
+        if (live == n_input)
+            av_log(NULL, AV_LOG_INFO, "[PTV-OUT] mosaic start: all %d slots live after %.1f s\n", n_input,
+                   (av_gettime_relative() - t0) / 1e6);
+        else
+            av_log(NULL, AV_LOG_WARNING, "[PTV-OUT] slot_wait %.0f s expired: starting with %d of %d slots live — "
+                   "slot(s) %s not live\n", g_slot_wait_us / 1e6, live, n_input, not_live);
+    }
+    return live;
 }
 
 /* ==================== deterministic output PID plan (-pid_plan) ====================
@@ -5366,10 +5487,32 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
     }
 
     /* 2.0.0-pre2: a single live input waits for its source (input_acquire) */
+    if (!multiview && strcmp(g_start_on, "video")) {                 /* 2.0.2 T-386: any / all are mosaic rules */
+        av_log(NULL, AV_LOG_ERROR, "-start_on %s: a mosaic rule; a single input starts on video\n", g_start_on);
+        ret = AVERROR(EINVAL); goto end;
+    }
     if (n_input == 1 && !multiview && is_net_url(inputs[0].url) && !getenv("PTV_NO_WAIT_START")) {
         av_dict_copy(&inputs[0].da.reopen_opts, ins->groups[0].format_opts, 0);
         if ((ret = input_acquire(&inputs[0], 0, ins->groups[0].format_opts)) < 0) goto end;
         av_dump_format(inputs[0].ifmt, 0, inputs[0].url, 0);
+    } else if (multiview && !getenv("PTV_NO_SLOT_WAIT")) {
+        /* 2.0.2 T-386 (spec §4 -start_on any / -slot_wait, E13): each slot acquires on its own; the mosaic starts when
+         * every slot is live or -slot_wait expired with at least one live. Measured before (2.0.1-pre1, 2x2, slot 2's
+         * source 60 s late): the whole mosaic had no output for 61.5 s; with slot 2 dead, none at all (the joined
+         * parallel open blocked until the 30-min rw_timeout). PTV_NO_SLOT_WAIT=1 = the joined parallel open. */
+        int live;
+        if (!g_start_on_set || !strcmp(g_start_on, "video"))
+            g_start_on = "any";
+        for (k = 0; k < n_input; k++)
+            av_dict_copy(&inputs[k].da.reopen_opts, ins->groups[k].format_opts, 0);
+        live = mosaic_acquire(inputs, n_input);
+        if (live < n_input) {
+            av_log(NULL, AV_LOG_ERROR, "[PTV-OUT] %d of %d slots not live: a mosaic start with a dead slot is not "
+                   "built yet (T-386 S2)\n", n_input - live, n_input);
+            ret = AVERROR(ETIMEDOUT); goto end;
+        }
+        for (k = 0; k < n_input; k++)
+            av_dump_format(inputs[k].ifmt, k, inputs[k].url, 0);
     } else
     /* open ALL inputs in parallel: a dead/slow slot must not delay the others,
      * and a serial open would block on its (long, multiview) rw_timeout. */
@@ -6504,7 +6647,8 @@ static const OptionDef ptv_options[] = {
     { "init_hw_device",   OPT_TYPE_STRING, 0,                        { .off = 0 }, "init hw device", "args" },
     { "filter_hw_device", OPT_TYPE_STRING, 0,                        { .off = 0 }, "filter hw device", "name" },
     { "filter_complex",   OPT_TYPE_STRING, 0,                        { .off = 0 }, "filtergraph", "graph" },
-    { "start_on",         OPT_TYPE_STRING, 0,                        { .off = 0 }, "when outputs start: video (2.0.0; any/all/now come in 2.1)", "when" },
+    { "start_on",         OPT_TYPE_STRING, 0,                        { .off = 0 }, "when outputs start: video (single input), any|all (mosaic, default any; now comes in 2.1)", "when" },
+    { "slot_wait",        OPT_TYPE_STRING, 0,                        { .off = 0 }, "mosaic: wait this long for every slot, then start with the live ones (default 120s; inf)", "dur" },
     { "wait_input",       OPT_TYPE_STRING, 0,                        { .off = 0 }, "give up if the input has no video after this long (default inf)", "dur" },
     { "stall_min",        OPT_TYPE_STRING, 0,                        { .off = 0 }, "content gone + input silent this long = STALLED (default 3s)", "dur" },
     { "lost_after",       OPT_TYPE_STRING, 0,                        { .off = 0 }, "no video packets this long = LOST (default 30s)", "dur" },
@@ -7239,10 +7383,19 @@ int main(int argc, char **argv)
         if (!strcmp(octx.global_opts.opts[gi].key, "hide_banner")) hide_banner = 1; /* suppress startup banner */
         if (!strcmp(octx.global_opts.opts[gi].key, "start_on")) {                   /* 2.0.0-pre2 */
             g_start_on = octx.global_opts.opts[gi].val;
-            if (strcmp(g_start_on, "video")) {
+            g_start_on_set = 1;
+            if (strcmp(g_start_on, "video") && strcmp(g_start_on, "any") && strcmp(g_start_on, "all")) {
                 av_log(NULL, AV_LOG_ERROR, "-start_on %s: %s\n", g_start_on,
-                       !strcmp(g_start_on, "any") || !strcmp(g_start_on, "all") || !strcmp(g_start_on, "now")
-                       ? "comes in 2.1; 2.0.0 supports only 'video'" : "unknown value (video|any|all|now)");
+                       !strcmp(g_start_on, "now") ? "comes in 2.1; supported: video (single input), any|all (mosaic)"
+                                                  : "unknown value (video|any|all)");
+                uninit_parse_context(&octx); return 1;
+            }
+        }
+        if (!strcmp(octx.global_opts.opts[gi].key, "slot_wait")) {                  /* 2.0.2 T-386 */
+            const char *v = octx.global_opts.opts[gi].val;
+            if (!strcmp(v, "inf")) g_slot_wait_us = 0;
+            else if (av_parse_time(&g_slot_wait_us, v, 1) < 0 || g_slot_wait_us <= 0) {
+                av_log(NULL, AV_LOG_ERROR, "-slot_wait %s: expected a duration or inf\n", v);
                 uninit_parse_context(&octx); return 1;
             }
         }
