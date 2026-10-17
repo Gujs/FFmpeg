@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.2-pre2"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.2-pre3"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -954,7 +954,9 @@ RsyncSense g_rsx;
  * machine + control law live in ptvencoder_audio.c (rscorr_*); the stats line prints corr= and
  * the master output thread runs the stale-track disarm watchdog (ptvencoder_clock.c). */
 int     g_rsync_corr      = 1;
-int64_t g_rscorr_engage_us = 80000;      /* §4.2: 80ms engage dead band (supervisor start value) */
+int64_t g_rscorr_engage_us = 40000;      /* §4.2: engage dead band. 2.0.2-pre3: 80 → 40 ms (owner 2026-10-17, T-391):
+                                          * 80 left steady 46-75 ms residuals uncorrected (4 of 245 fleet channels)
+                                          * vs GOALS #2 ±25 ms; 40 keeps 20 ms between engage and the 20 ms park */
 int64_t g_rscorr_dwell_us  = 300000000;  /* §4.3: 5min stable dwell */
 int64_t g_rscorr_quiet_us  = 180000000;  /* §4.4: 3min trailing event-free window */
 int64_t g_rscorr_slew_us_s = 2000;       /* §4: 2ms/s slew clamp (1/5 of pre3's TRACK clamp) */
