@@ -277,6 +277,9 @@ typedef struct DlvGate {
 #define PTV_PKT_FLAG_NBS_FILL (1 << 16)
 #define PTV_PKT_FLAG_HOLD_FILL (1 << 17)  /* 2.0.0-pre6: hold-fill sentinel (master output thread → audio_q) */
 #define PTV_PKT_FLAG_RELABEL (1 << 18)    /* 2.0.1 T-087: the first audio packet after an audio-first backward erase (demux) */
+#define PTV_PKT_FLAG_SLOT_FILL (1 << 19)  /* 2.0.2 T-386: a deferred mosaic slot's track: encode silence up to g_mv_house_us */
+#define PTV_PKT_FLAG_SLOT_BIND (1 << 20)  /* 2.0.2 T-386: a deferred slot bound — pkt->opaque = PtvSlotBind (receiver frees) */
+typedef struct PtvSlotBind { AVCodecParameters *par; AVRational tb, avg; } PtvSlotBind;
 
 /* A/V PLL redesign Phase A probe (always built; feeds the [PTV-AVSYNC] offset=): per-input ring recording, for each DISTINCT
  * video content the cell displayed, the output time it went out at — (abs source pts → out_v, both
@@ -761,6 +764,7 @@ typedef struct PtvTsOutlier {
     int64_t wrap_dw;        /* 2.0.1 T-320: the wrap step the LAST packet took (0 = none) — undone if it was an outlier */
 } PtvTsOutlier;
 
+struct Input;                                  /* 2.0.2 T-386: back-pointers for the late bind */
 typedef struct DecodeCtx {
     AVThreadMessageQueue *video_q;            /* demux -> decode (AVPacket*) */
     AVCodecContext  *vdec;
@@ -837,6 +841,7 @@ typedef struct DecodeCtx {
     int64_t          vgop_last_key_dts;    /* dts of the last KEY packet popped */
     int              vgop_key_seen;        /* first key seen (0 until then) */
     CcTap            cc;                   /* -cc_extract: EIA-608 tap (off = byte-inert) */
+    struct Input    *in;                      /* 2.0.2 T-386: its input (the late bind swaps in the real decoder) */
 } DecodeCtx;
 
 /* Per-rung output side: pop this rung's frame_q on the house clock, stamp the
@@ -1448,6 +1453,14 @@ typedef struct AudioState {
                                                        * resync_owns): the liveness ceiling aborts
                                                        * a walk with no seam/complete progress for
                                                        * PTV_RESYNC_WALK_CEIL_S */
+    int              slot_deferred;               /* 2.0.2 T-386: a mosaic slot not live at the start — the track
+                                                  * carries silence on the house axis until the slot binds */
+    int64_t          pump_next;                   /* 2.0.2 T-386: next silent sample of a deferred track (output
+                                                  * samples, the house axis: 0 = the first tick) */
+    char             bind_spec[32];               /* 2.0.2 T-386: a deferred slot's -map specifier */
+    _Atomic int64_t *res_step;                    /* 2.0.2 T-343: its slot's deliberate picture steps (mosaic) */
+    int64_t          res_step_seen;               /* ... the part already followed (us) */
+    int              res_follow_n;                /* 2.0.2 T-343: [PTV-RESFOLLOW] lines logged */
 } AudioState;
 
 /* ---- demux + mux ---- */
@@ -1810,6 +1823,9 @@ typedef struct DemuxArgs {
                                             * (wrap_*, edit_us, gap_vsnap, wall_cad_us, pkt_wall_gap_us,
                                             * disc) were sized for at open */
     int                   late_stream_max; /* 1.2.2 T-064: highest late-born stream index logged */
+    int64_t               v_last_wc;      /* 2.0.2 T-387: wall time of the last packet of the bound video stream */
+    int                   vmove_n;        /* ... video packets of a late-born video stream while the bound one is silent */
+    int                   vmove_force;    /* ... the video moved to a new PID: reopen now (single input: -> exit 4) */
     /* 2.0.0-pre17 T-348: AAC labels inside a PES. lavf labels the 2nd.. frames of a PES as the previous label
      * + 1024 / codecpar->sample_rate, the rate probed at open: after a 96 -> 48 kHz switch every frame read
      * 10.7 ms long and every PES label jumped +140 ms (aresample: drop, then pad — 4.8 s of silence in 26 s).
@@ -1924,6 +1940,8 @@ typedef struct DemuxArgs {
     int64_t               vcorrupt;       /* video packets flagged AV_PKT_FLAG_CORRUPT (discarded if g_discardcorrupt) */
     pthread_mutex_t       pass_lock;        /* 2.0.0-pre6: copy state shared with the master's AC-3 fill */
     VOutRing             *mv_vring;         /* 2.0.0 T-342: multiview — this slot's displayed content ring (sparse copies) */
+    struct Input    *in;                      /* 2.0.2 T-386: its input (a deferred slot acquires + binds here) */
+    char             abind[PTV_MAX_AUDIO][32];  /* ... each track's -map specifier, resolved at the bind */
 } DemuxArgs;
 
 /* One source input. Single-input uses inputs[0]; multiview uses 1/2/4. Each has
@@ -1986,6 +2004,19 @@ typedef struct Input {
     pthread_t             th_demux, th_decode;
     int                   started_demux, started_decode;
     int                   open_ret;          /* parallel-open result */
+    /* 2.0.2 T-386 (spec §4 -start_on any / -slot_wait, E13): a mosaic slot's own acquire before the start */
+    _Atomic int           acq_abort;         /* the coordinator gave up on this slot (interrupts its open/probe) */
+    _Atomic int           acq_live;          /* the slot has video with known geometry */
+    int64_t               acq_live_wc;       /* ... since (wall us) */
+    pthread_t             acq_th;
+    int                   acq_started;
+    _Atomic int           acq_done;          /* its acquire thread returned */
+    _Atomic int64_t       res_step_us;       /* 2.0.2 T-343: the compositor's deliberate picture steps for this slot (us,
+                                              * + one tick per residence hold, - one per decimation skip) */
+    int                   deferred;          /* 2.0.2 T-386: not live at the mosaic start — placeholder cell, silent
+                                              * audio track, binds when its source arrives */
+    int                   geom_w, geom_h, geom_fmt;   /* ... the cell geometry it takes (the first live sibling's) */
+    AVRational            geom_sar;
 } Input;
 
 /* Multiview compositor = the video house clock. Samples each input's hold at
@@ -2376,6 +2407,9 @@ extern _Atomic int     g_corr_disarm_req[PTV_MAX_AUDIO]; /* master watchdog → 
  * the pre17 sensor fix (the fixed sensor reads true through a sibling slate; this freeze
  * is the §4.4 defense-in-depth for whatever the fix did not anticipate). */
 extern _Atomic int g_mv_slate_mask;
+extern int     g_mv_res_follow;   /* 2.0.2 T-343 */
+extern int     g_mv_res_hyst;     /* 2.0.2 T-343 */
+extern _Atomic int64_t g_mv_house_us;   /* 2.0.2 T-386: the compositor's output time of its current tick (us) */
 /* per-rung wire-send watermark (§3, owner-approved "build it"): wall µs of the last SUCCESSFUL
  * av_interleaved_write_frame on that rung — the only liveness signal that is actually the wire
  * (the Newsmax2 dead rung read calm on every label-domain signal). One relaxed store per packet. */
@@ -2489,6 +2523,7 @@ int build_audio_filter(AudioState *a, AVCodecContext *adec, AVRational tb,
 /* ptvencoder_demux.c */
 void *demux_thread(void *arg);
 int ptv_disc_init(PtvDiscBuf *b, int capacity, int nb_streams);
+int ptv_slot_acquire(struct Input *in, int idx);   /* 2.0.2 T-386 */
 void ptv_disc_free(PtvDiscBuf *b);
 /* ptvencoder_mv.c */
 void *compositor_thread(void *arg);

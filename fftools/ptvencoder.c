@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.1-pre1"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.2-pre1"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -77,6 +77,8 @@ int     g_mv_clamp = 0;
  * newest (clean 2:1 decimation instead of hold-queue overflow). A ≥75%-full hold queue
  * bypasses the gate (pressure valve vs a wrong rate estimate). PTV_NO_RESIDENCE reverts. */
 int     g_mv_residence = 1;
+int     g_mv_res_follow = 1;     /* 2.0.2 T-343: a slot's audio follows each deliberate picture step at once (PTV_NO_RES_FOLLOW=1 off) */
+int     g_mv_res_hyst = 1;       /* 2.0.2 T-343: quarter-tick residence hysteresis, no hold/decimate chatter (PTV_NO_RES_HYST=1 off) */
 int     g_mv_res_deadband = 0;   /* 2.0.0 T-343: residence occupancy servo ±1 picture deadband — OPT-IN (PTV_RES_DEADBAND=1):
                                   * on, a slot ran −30 ms for 10 s after a flapping input (mv04 sync_flapping 6/6, off 0/2,
                                   * 2026-10-16); off = the pre21 servo (T-343's 40 ms step ~20 s after start stays open) */
@@ -878,6 +880,7 @@ _Atomic int     g_src_icb_armed;
 /* 1.0.1-pre17: sibling-slate mask (bit k = input slot k black-slated; compositor writes,
  * rscorr_event_active reads) — no mv corrector engagement while any slot is slated. */
 _Atomic int     g_mv_slate_mask;
+_Atomic int64_t g_mv_house_us;   /* 2.0.2 T-386 */
 /* (d) SELF-MADE-GAP LOG HONESTY: every self-inflicted queue drop (video head/tail shed, audio
  * drop-oldest) stamps these; AGLUE/ASTEP lines within 5s carry " [self: N pkts shed]" so our
  * own drops are never again misread as source burstiness. */
@@ -3302,6 +3305,47 @@ static void video_out_xo(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
     video_out(d, frame, filt);
 }
 
+/* 2.0.2 T-386: the slot's late bind, on its decode thread — the real decoder replaces the geometry-only placeholder
+ * context (the compositor's cell geometry stays: a joiner in another size is normalised there) */
+static void slot_bind_video(DecodeCtx *d, AVPacket *pkt)
+{
+    PtvSlotBind *b = pkt->opaque;
+    const AVCodec *vd;
+    AVCodecContext *nc = NULL;
+    int ret;
+
+    pkt->opaque = NULL;
+    if (!b)
+        return;
+    if (!(vd = avcodec_find_decoder(b->par->codec_id)) || !(nc = avcodec_alloc_context3(vd)) ||
+        avcodec_parameters_to_context(nc, b->par) < 0) {
+        av_log(NULL, AV_LOG_ERROR, "[PTV-BIND] in%d: no video decoder for %s — the cell stays on its placeholder\n",
+               d->hb_slot, avcodec_get_name(b->par->codec_id));
+        goto done;
+    }
+    nc->pkt_timebase = b->tb;
+    if ((ret = avcodec_open2(nc, vd, NULL)) < 0) {
+        av_log(NULL, AV_LOG_ERROR, "[PTV-BIND] in%d: open video decoder %s: %s\n", d->hb_slot, vd->name, av_err2str(ret));
+        goto done;
+    }
+    if (d->in) {
+        avcodec_free_context(&d->in->vdec);
+        d->in->vdec   = nc;
+        d->in->ist_tb = b->tb;
+    }
+    d->vdec   = nc;
+    d->ist_tb = b->tb;
+    if (b->avg.num > 0 && b->avg.den > 0)
+        d->in_pps_decl = (int)(av_q2d(b->avg) + 0.5);
+    av_log(NULL, AV_LOG_INFO, "[PTV-BIND] in%d video %s %dx%d decoder open (slot %d)\n", d->hb_slot, vd->name,
+           b->par->width, b->par->height, d->hb_slot);
+    nc = NULL;
+done:
+    avcodec_free_context(&nc);
+    avcodec_parameters_free(&b->par);
+    av_free(b);
+}
+
 static void *decode_thread(void *arg)
 {
     DecodeCtx *d = arg;
@@ -3562,6 +3606,11 @@ static void *decode_thread(void *arg)
                 av_usleep(5000);
             }
             if (ret < 0) break;
+        }
+        if (pkt->flags & PTV_PKT_FLAG_SLOT_BIND) {      /* 2.0.2 T-386: a deferred slot bound — open its decoder */
+            slot_bind_video(d, pkt);
+            av_packet_free(&pkt);
+            continue;
         }
         /* 1.0.1-pre21 TEST-ONLY stall injection (PTV_TEST_VDEC_STALL_S): once, after 60s of
          * runtime (1.0.1-pre23: PTV_TEST_VDEC_STALL_AT_S overrides the trigger — AT 0 the
@@ -4164,6 +4213,8 @@ typedef struct AOutSpec {
     const char    *filter;                /* -filter:a:N (NULL = global -af) */
     int            ac;                    /* -ac:a:N output channels (0 = default stereo) */
     const char    *lang;                  /* source language (override -metadata later) */
+    int            deferred;              /* 2.0.2 T-386: the slot was not live at the start (stream = -1) */
+    char           bind_spec[32];         /* ... the -map stream specifier, resolved when the slot binds */
 } AOutSpec;
 
 typedef struct Sel {
@@ -4495,7 +4546,10 @@ static int is_net_url(const char *u)
  * longer end the run. Kill switch: PTV_NO_WAIT_START=1 (1.2.x: one attempt, exit on failure). */
 #define PTV_PROBING_MAX_US 300000000           /* = the NOVIDEO startup bound */
 static const char *g_start_on   = "video";
+static int         g_start_on_set;               /* 2.0.2 T-386: -start_on given (a mosaic's default is any) */
 static int64_t     g_wait_input_us;              /* 0 = wait forever */
+static int64_t     g_slot_wait_us = 120000000;   /* 2.0.2 T-386: mosaic -slot_wait (0 = inf); spec §4 */
+static _Atomic int g_mv_acq_go;                  /* 2.0.2 T-386: the mosaic starts — live slots stop draining */
 int                g_backoff_s[8] = { 1, 2, 5, 10, 30 };   /* also the 2.0.0-pre5 reopen backoff */
 int                g_backoff_n    = 5;
 
@@ -4568,7 +4622,18 @@ static AVPacket *silent_copy_frame(const AVCodecParameters *par, AVRational tb, 
     return p;
 }
 
-static int input_acquire_loop(Input *in, int idx, const AVDictionary *opts)
+/* 2.0.2 T-386: a mosaic slot's open / probe stops when the coordinator gives up on it (or at -t / EOF). The URL
+ * context keeps a copy of this callback for the whole run, so the opaque is the slot's own Input. */
+static int slot_interrupt(void *opaque)
+{
+    Input *in = opaque;
+    return atomic_load_explicit(&in->acq_abort, memory_order_relaxed) ||
+           atomic_load_explicit(&g_t_stop, memory_order_relaxed);
+}
+
+/* mosaic = 1 (2.0.2 T-386): a mosaic slot's acquire, on its own thread — no 300 s PROBING exit and no -wait_input
+ * (the coordinator decides with -slot_wait), the slot's own interrupt, AVERROR_EXIT once the coordinator gave up */
+static int input_acquire_loop(Input *in, int idx, const AVDictionary *opts, int mosaic)
 {
     int64_t t0 = av_gettime_relative(), next_note = 0, probing_since = 0;
     int attempt = 0, state = -1;                  /* 0 = WAITING (no data), 1 = PROBING (no video geometry) */
@@ -4582,7 +4647,8 @@ static int input_acquire_loop(Input *in, int idx, const AVDictionary *opts)
         attempt++;
         av_dict_copy(&o, opts, 0);                /* open consumes recognized entries: fresh copy per try */
         if (!(in->ifmt = avformat_alloc_context())) { av_dict_free(&o); return AVERROR(ENOMEM); }
-        in->ifmt->interrupt_callback = (AVIOInterruptCB){ ptv_src_interrupt, NULL };   /* 2.0.0-pre5 */
+        in->ifmt->interrupt_callback = mosaic ? (AVIOInterruptCB){ slot_interrupt, in }
+                                              : (AVIOInterruptCB){ ptv_src_interrupt, NULL };   /* 2.0.0-pre5 */
         ret = avformat_open_input(&in->ifmt, in->url, NULL, &o);
         av_dict_free(&o);
         if (ret >= 0) ret = ptv_find_stream_info(in->ifmt);   /* pre19.1: tolerant AUDIO probe */
@@ -4602,7 +4668,7 @@ static int input_acquire_loop(Input *in, int idx, const AVDictionary *opts)
                            "(after %.1f s, attempt #%d)\n", idx, avcodec_get_name(par->codec_id),
                            par->width, par->height, na, ns, nd,
                            (av_gettime_relative() - t0) / 1e6, attempt);
-                    if (idx == 0 && !atomic_load_explicit(&g_t_live_us, memory_order_relaxed))
+                    if (!mosaic && idx == 0 && !atomic_load_explicit(&g_t_live_us, memory_order_relaxed))
                         atomic_store_explicit(&g_t_live_us, av_gettime_relative(), memory_order_relaxed);
                     in->ifmt->max_probe_packets = 1;   /* 1.2.2 T-073: no probe for later-born streams */
                     in->open_ret = 0;
@@ -4618,6 +4684,10 @@ static int input_acquire_loop(Input *in, int idx, const AVDictionary *opts)
             st = 0;
         }
         if (in->ifmt) avformat_close_input(&in->ifmt);
+        if (mosaic && atomic_load_explicit(&in->acq_abort, memory_order_relaxed)) {
+            in->open_ret = AVERROR_EXIT;
+            return in->open_ret;
+        }
 
         now    = av_gettime_relative();
         waited = now - t0;
@@ -4625,13 +4695,13 @@ static int input_acquire_loop(Input *in, int idx, const AVDictionary *opts)
          * check): exit for a supervised respawn rather than wait silently forever (silent-zombie guard) */
         if (st == 1 && !probing_since) probing_since = now;
         if (st == 0) probing_since = 0;
-        if (probing_since && now - probing_since >= PTV_PROBING_MAX_US) {
+        if (!mosaic && probing_since && now - probing_since >= PTV_PROBING_MAX_US) {
             av_log(NULL, AV_LOG_ERROR, "[PTV-SRC] in%d PROBING for %.0f s with packets flowing but no usable "
                    "video: %s on %s — exiting\n", idx, (now - probing_since) / 1e6, what, in->url);
             in->open_ret = AVERROR_INVALIDDATA;
             return in->open_ret;
         }
-        if (g_wait_input_us > 0 && waited >= g_wait_input_us) {
+        if (!mosaic && g_wait_input_us > 0 && waited >= g_wait_input_us) {
             av_log(NULL, AV_LOG_ERROR, "[PTV-SRC] in%d gave up after %.0f s (-wait_input): %s on %s\n",
                    idx, waited / 1e6, what, in->url);
             in->open_ret = AVERROR(ETIMEDOUT);
@@ -4649,8 +4719,8 @@ static int input_acquire_loop(Input *in, int idx, const AVDictionary *opts)
         }
         if (!wait_s && now - at0 < 1000000)
             av_usleep((unsigned)(1000000 - (now - at0)));
-        for (; wait_s > 0; wait_s--) {               /* backoff in 1 s steps: the heartbeat keeps going */
-            ptv_acq_heartbeat();
+        for (; wait_s > 0 && !(mosaic && atomic_load_explicit(&in->acq_abort, memory_order_relaxed)); wait_s--) {
+            ptv_acq_heartbeat();                     /* backoff in 1 s steps: the heartbeat keeps going */
             av_usleep(1000000);
         }
         ptv_acq_heartbeat();
@@ -4662,9 +4732,117 @@ static int input_acquire(Input *in, int idx, const AVDictionary *opts)
 {
     int ret;
     atomic_store_explicit(&g_acq_since, av_gettime_relative(), memory_order_relaxed);
-    ret = input_acquire_loop(in, idx, opts);
+    ret = input_acquire_loop(in, idx, opts, 0);
     atomic_store_explicit(&g_acq_since, 0, memory_order_relaxed);
     return ret;
+}
+
+/* 2.0.2 T-386: a deferred slot's acquire, on its demux thread (blocks until the source is live; -t / EOF stop it) */
+int ptv_slot_acquire(struct Input *in, int idx)
+{
+    return input_acquire_loop(in, idx, in->da.reopen_opts, 1);
+}
+
+/* 2.0.2 T-386 (spec §4, E13): one mosaic slot's acquire thread. Once LIVE it waits for the start; a slot that has been
+ * live for 3 s while the coordinator still waits for a sibling reads and drops its packets, so the mosaic does not open
+ * on seconds of stale content (a healthy start, every slot live within 3 s, reads nothing here = as before). */
+typedef struct SlotAcq { Input *in; int idx; } SlotAcq;
+static void *slot_acquire_thread(void *arg)
+{
+    SlotAcq *sa = arg;
+    Input *in = sa->in;
+    AVPacket *pkt;
+
+    if (input_acquire_loop(in, sa->idx, in->da.reopen_opts, 1) >= 0) {
+        in->acq_live_wc = av_gettime_relative();
+        atomic_store_explicit(&in->acq_live, 1, memory_order_release);
+        if ((pkt = av_packet_alloc())) {
+            while (!atomic_load_explicit(&g_mv_acq_go, memory_order_acquire) &&
+                   !atomic_load_explicit(&in->acq_abort, memory_order_relaxed)) {
+                if (av_gettime_relative() - in->acq_live_wc < 3000000 || av_read_frame(in->ifmt, pkt) < 0)
+                    av_usleep(20000);
+                av_packet_unref(pkt);
+            }
+            av_packet_free(&pkt);
+        }
+    }
+    atomic_store_explicit(&in->acq_done, 1, memory_order_release);
+    return NULL;
+}
+
+/* 2.0.2 T-386: the mosaic start (spec §4). -start_on any (mosaic default): every slot LIVE, or -slot_wait expired with
+ * at least one LIVE; -start_on all: every slot LIVE. Returns the number of live slots; the others are aborted and
+ * closed (in->ifmt NULL). Draining slots get 2 s to leave their read once the start is set; one that does not (its
+ * source died during the wait: the read blocks until rw_timeout) is aborted and counts as not live. */
+static int mosaic_acquire(Input *inputs, int n_input)
+{
+    SlotAcq sa[PTV_MAX_INPUT];
+    int64_t t0 = av_gettime_relative(), now;
+    int all = !strcmp(g_start_on, "all"), k, live = 0;
+
+    atomic_store_explicit(&g_acq_since, t0, memory_order_relaxed);
+    for (k = 0; k < n_input; k++) {
+        sa[k] = (SlotAcq){ &inputs[k], k };
+        inputs[k].acq_started = !pthread_create(&inputs[k].acq_th, NULL, slot_acquire_thread, &sa[k]);
+        if (!inputs[k].acq_started)
+            atomic_store_explicit(&inputs[k].acq_done, 1, memory_order_relaxed);
+    }
+    for (;;) {
+        int done = 0;
+        now  = av_gettime_relative();
+        live = 0;
+        for (k = 0; k < n_input; k++) {
+            live += atomic_load_explicit(&inputs[k].acq_live, memory_order_acquire);
+            done += atomic_load_explicit(&inputs[k].acq_done, memory_order_acquire) &&
+                    !atomic_load_explicit(&inputs[k].acq_live, memory_order_acquire);
+        }
+        if (live == n_input || done == n_input)
+            break;
+        if (!all && g_slot_wait_us > 0 && live > 0 && now - t0 >= g_slot_wait_us)
+            break;
+        ptv_acq_heartbeat();
+        av_usleep(100000);
+    }
+    atomic_store_explicit(&g_mv_acq_go, 1, memory_order_release);
+    for (k = 0; k < n_input; k++) {
+        if (!atomic_load_explicit(&inputs[k].acq_live, memory_order_acquire))
+            atomic_store_explicit(&inputs[k].acq_abort, 1, memory_order_relaxed);
+    }
+    for (k = 0; k < n_input; k++) {
+        int64_t w0 = av_gettime_relative();
+        while (inputs[k].acq_started && !atomic_load_explicit(&inputs[k].acq_done, memory_order_acquire) &&
+               av_gettime_relative() - w0 < 2000000)
+            av_usleep(10000);
+        if (!atomic_load_explicit(&inputs[k].acq_done, memory_order_acquire)) {
+            av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in%d went quiet while the mosaic waited for its siblings — "
+                   "treated as not live\n", k);
+            atomic_store_explicit(&inputs[k].acq_abort, 1, memory_order_relaxed);
+            atomic_store_explicit(&inputs[k].acq_live, 0, memory_order_relaxed);
+        }
+        if (inputs[k].acq_started)
+            pthread_join(inputs[k].acq_th, NULL);
+        if (!atomic_load_explicit(&inputs[k].acq_live, memory_order_acquire) && inputs[k].ifmt)
+            avformat_close_input(&inputs[k].ifmt);
+        atomic_store_explicit(&inputs[k].acq_abort, 0, memory_order_relaxed);   /* the URL context keeps the
+                                                                                 * callback: never abort the run */
+    }
+    atomic_store_explicit(&g_acq_since, 0, memory_order_relaxed);
+    live = 0;
+    for (k = 0; k < n_input; k++)
+        live += atomic_load_explicit(&inputs[k].acq_live, memory_order_acquire);
+    {
+        char not_live[64] = "";
+        for (k = 0; k < n_input; k++)
+            if (!atomic_load_explicit(&inputs[k].acq_live, memory_order_acquire))
+                av_strlcatf(not_live, sizeof not_live, "%s%d", *not_live ? "," : "", k);
+        if (live == n_input)
+            av_log(NULL, AV_LOG_INFO, "[PTV-OUT] mosaic start: all %d slots live after %.1f s\n", n_input,
+                   (av_gettime_relative() - t0) / 1e6);
+        else
+            av_log(NULL, AV_LOG_WARNING, "[PTV-OUT] slot_wait %.0f s expired: starting with %d of %d slots live — "
+                   "slot(s) %s not live\n", g_slot_wait_us / 1e6, live, n_input, not_live);
+    }
+    return live;
 }
 
 /* ==================== deterministic output PID plan (-pid_plan) ====================
@@ -5366,10 +5544,52 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
     }
 
     /* 2.0.0-pre2: a single live input waits for its source (input_acquire) */
+    if (!multiview && strcmp(g_start_on, "video")) {                 /* 2.0.2 T-386: any / all are mosaic rules */
+        av_log(NULL, AV_LOG_ERROR, "-start_on %s: a mosaic rule; a single input starts on video\n", g_start_on);
+        ret = AVERROR(EINVAL); goto end;
+    }
     if (n_input == 1 && !multiview && is_net_url(inputs[0].url) && !getenv("PTV_NO_WAIT_START")) {
         av_dict_copy(&inputs[0].da.reopen_opts, ins->groups[0].format_opts, 0);
         if ((ret = input_acquire(&inputs[0], 0, ins->groups[0].format_opts)) < 0) goto end;
         av_dump_format(inputs[0].ifmt, 0, inputs[0].url, 0);
+    } else if (multiview && !getenv("PTV_NO_SLOT_WAIT")) {
+        /* 2.0.2 T-386 (spec §4 -start_on any / -slot_wait, E13): each slot acquires on its own; the mosaic starts when
+         * every slot is live or -slot_wait expired with at least one live. Measured before (2.0.1-pre1, 2x2, slot 2's
+         * source 60 s late): the whole mosaic had no output for 61.5 s; with slot 2 dead, none at all (the joined
+         * parallel open blocked until the 30-min rw_timeout). PTV_NO_SLOT_WAIT=1 = the joined parallel open. */
+        int live;
+        if (!g_start_on_set || !strcmp(g_start_on, "video"))
+            g_start_on = "any";
+        for (k = 0; k < n_input; k++)
+            av_dict_copy(&inputs[k].da.reopen_opts, ins->groups[k].format_opts, 0);
+        live = mosaic_acquire(inputs, n_input);
+        if (!live) {
+            av_log(NULL, AV_LOG_ERROR, "[PTV-OUT] no slot live\n");
+            ret = AVERROR(ETIMEDOUT); goto end;
+        }
+        {   /* a slot not live at the start is deferred: its cell takes the first live slot's geometry */
+            const AVCodecParameters *gp = NULL;
+            AVRational gsar = { 0, 1 };
+            for (k = 0; k < n_input && !gp; k++)
+                if (inputs[k].ifmt) {
+                    int vs = av_find_best_stream(inputs[k].ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
+                    if (vs >= 0) { gp = inputs[k].ifmt->streams[vs]->codecpar; gsar = gp->sample_aspect_ratio; }
+                }
+            for (k = 0; k < n_input; k++) {
+                if (inputs[k].ifmt) { av_dump_format(inputs[k].ifmt, k, inputs[k].url, 0); continue; }
+                inputs[k].deferred = 1;
+                inputs[k].geom_w = gp->width; inputs[k].geom_h = gp->height; inputs[k].geom_fmt = gp->format;
+                inputs[k].geom_sar = gsar;
+                av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in%d WAITING (slot %d): placeholder %dx%d cell, silent audio "
+                       "track until its source arrives\n", k, k, gp->width, gp->height);
+                if (cc_want[k]) {        /* spec §9: a slot's CC track exists only if it was live at the start */
+                    cc_want[k] = 0; n_cc--;
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-CC] slot %d not live at the start: no CC track for it this run "
+                           "(the later -cc_slots tracks move up one)\n", k);
+                }
+            }
+            if (cc_on && !n_cc) cc_on = 0;
+        }
     } else
     /* open ALL inputs in parallel: a dead/slow slot must not delay the others,
      * and a serial open would block on its (long, multiview) rw_timeout. */
@@ -5407,6 +5627,18 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
      * input video directly via -map). */
     for (k = 0; k < n_input; k++) {
         int vs; const AVCodec *vd = NULL;
+        if (inputs[k].deferred) {
+            /* 2.0.2 T-386: a geometry-only (never opened) context: the cell's buffersrc and placeholder are built from
+             * it; the decode thread replaces it when the slot binds (an unopened context refuses packets) */
+            if (!(inputs[k].vdec = avcodec_alloc_context3(NULL))) { ret = AVERROR(ENOMEM); goto end; }
+            inputs[k].vdec->codec_type = AVMEDIA_TYPE_VIDEO;
+            inputs[k].vdec->width   = inputs[k].geom_w;  inputs[k].vdec->height = inputs[k].geom_h;
+            inputs[k].vdec->pix_fmt = inputs[k].geom_fmt; inputs[k].vdec->sample_aspect_ratio = inputs[k].geom_sar;
+            inputs[k].ist_tb = inputs[k].vdec->pkt_timebase = (AVRational){ 1, 90000 };   /* mpegts */
+            inputs[k].vstream = -1;
+            vdecs[k] = inputs[k].vdec;
+            continue;
+        }
         if (k == 0 && sel[0].vstream >= 0) { vs = sel[0].vstream; vd = sel[0].vdec; }
         else vs = av_find_best_stream(inputs[k].ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, &vd, 0);
         if (vs < 0 || !vd) { av_log(NULL, AV_LOG_ERROR, "no video stream in input %d\n", k); ret = AVERROR(EINVAL); goto end; }
@@ -5458,8 +5690,12 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                                      inputs[k].ifmt->nb_streams)) < 0) goto end;
         }
     }
-    vdec = inputs[0].vdec; vist = inputs[0].vist;
-    vstream = inputs[0].vstream; vdecoder = inputs[0].vdecoder; (void)vstream;
+    {   /* 2.0.2 T-386: the reference input = the first live slot (slot 0 may be waiting) */
+        int ref = 0;
+        while (ref < n_input - 1 && inputs[ref].deferred) ref++;
+        vdec = inputs[ref].vdec; vist = inputs[ref].vist;
+        vstream = inputs[ref].vstream; vdecoder = inputs[ref].vdecoder; (void)vstream;
+    }
 
     /* house rate: -r on the first output, else preserve the source's actual FRAME
      * rate. Prefer avg_frame_rate over r_frame_rate: for an interlaced source
@@ -5614,8 +5850,11 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
      * the passthrough list below (keeping demux_pass's wrap unwrap + DTS clamp). */
     for (k = 0; k < sel[0].n_aout && n_audio < PTV_MAX_AUDIO; k++) {
         AOutSpec      *spec = &sel[0].aout[k];
-        AVStream      *kist = inputs[spec->input].ifmt->streams[spec->stream];
-        const AVCodec *kdecoder = spec->adec ? spec->adec
+        /* 2.0.2 T-386: a deferred slot's track has no source stream yet — an AAC decoder with default parameters
+         * (48 kHz stereo, mpegts time base) stands in until the slot binds; the track is silent until then */
+        AVStream      *kist = spec->deferred ? NULL : inputs[spec->input].ifmt->streams[spec->stream];
+        AVRational     ktb  = kist ? kist->time_base : (AVRational){ 1, 90000 };
+        const AVCodec *kdecoder = spec->deferred ? avcodec_find_decoder(AV_CODEC_ID_AAC) : spec->adec ? spec->adec
                                 : avcodec_find_decoder(kist->codecpar->codec_id);
         AVCodecContext *kdec, *encs[PTV_MAX_RUNG] = {0};
         AudioState    *a;
@@ -5629,8 +5868,13 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         av_channel_layout_default(&ochl, nch);              /* 2->stereo, 6->5.1, 1->mono */
         kdec = avcodec_alloc_context3(kdecoder);
         if (!kdec) { ret = AVERROR(ENOMEM); goto end; }
-        avcodec_parameters_to_context(kdec, kist->codecpar);
-        kdec->pkt_timebase = kist->time_base;
+        if (kist)
+            avcodec_parameters_to_context(kdec, kist->codecpar);
+        else {
+            kdec->sample_rate = 48000;
+            av_channel_layout_default(&kdec->ch_layout, 2);
+        }
+        kdec->pkt_timebase = ktb;
         ptv_adec_opts(kdec);               /* #38: tolerant AAC decode (by name, optional) */
         if (avcodec_open2(kdec, kdecoder, NULL) < 0) {
             av_log(NULL, AV_LOG_WARNING, "audio track %d decoder failed; skipped\n", k);
@@ -5698,7 +5942,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
             if (!aos) { ret = AVERROR(ENOMEM); goto end; }
             avcodec_parameters_from_context(aos->codecpar, a->enc[r]);
             aos->time_base = a->enc[r]->time_base;
-            if ((klang = av_dict_get(kist->metadata, "language", NULL, 0)))
+            if (kist && (klang = av_dict_get(kist->metadata, "language", NULL, 0)))
                 av_dict_set(&aos->metadata, "language", klang->value, 0);
             apply_stream_meta(&outs->groups[r], 'a', k, aos);   /* CLI -metadata:s:a:N / -disposition:a:N (G5) */
             a->ost[r] = aos;
@@ -5717,13 +5961,18 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         a->frame_size = a->enc[0]->frame_size > 0 ? a->enc[0]->frame_size : 1024;
         a->fifo       = av_audio_fifo_alloc(sfmt, 2, a->frame_size);
         if (!a->fifo) { ret = AVERROR(ENOMEM); goto end; }   /* used by the swr fallback path */
-        a->ist_tb     = kist->time_base;
+        a->ist_tb     = ktb;
         /* pre17 R1: OWNED copies — the demux reopen closes the old AVFormatContext, so an
          * AVStream* would dangle by the time the ADECWD watchdog reopen fires. */
         a->ist_par    = avcodec_parameters_alloc();
-        if (a->ist_par) avcodec_parameters_copy(a->ist_par, kist->codecpar);
-        a->ist_pkt_tb = kist->time_base;
-        if (af && build_audio_filter(a, a->dec, kist->time_base, af, sfmt) < 0) {
+        if (a->ist_par) {
+            if (kist) avcodec_parameters_copy(a->ist_par, kist->codecpar);
+            else      avcodec_parameters_from_context(a->ist_par, kdec);
+        }
+        a->ist_pkt_tb = ktb;
+        a->slot_deferred = spec->deferred;          /* 2.0.2 T-386: silent until the slot binds */
+        av_strlcpy(a->bind_spec, spec->bind_spec, sizeof a->bind_spec);
+        if (af && build_audio_filter(a, a->dec, ktb, af, sfmt) < 0) {
             av_log(NULL, AV_LOG_WARNING, "audio track %d filtergraph failed; plain resample\n", k);
             avfilter_graph_free(&a->afg); a->use_fg = 0;
         }
@@ -5889,14 +6138,14 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                 for (r = 0; r < n_rung; r++) e->ost[r] = rung[r].vc.ost;
                 e->cls = 0; e->mapped = 1; e->ord = 0;
                 e->codec   = avcodec_get_name(rung[0].vc.ost->codecpar->codec_id);
-                e->src_pid = inputs[0].vist->id;
+                e->src_pid = vist ? vist->id : -1;          /* 2.0.2 T-386: the first live slot (slot 0 may wait) */
                 e->src_idx = multiview ? -1 : inputs[0].vstream;
                 if (multiview) snprintf(e->srcs, sizeof e->srcs, "mosaic");
                 else           snprintf(e->srcs, sizeof e->srcs, "in#0:%d", inputs[0].vstream);
             }
             for (k = 0; k < n_audio; k++) {          /* transcoded audio, in -map order */
-                AVStream *ist = inputs[asrc_in[k]].ifmt->streams[asrc[k]];
-                AVDictionaryEntry *lg = av_dict_get(ist->metadata, "language", NULL, 0);
+                AVStream *ist = asrc[k] >= 0 ? inputs[asrc_in[k]].ifmt->streams[asrc[k]] : NULL;   /* T-386: deferred */
+                AVDictionaryEntry *lg = ist ? av_dict_get(ist->metadata, "language", NULL, 0) : NULL;
                 PidEnt *e = &ent[n++];
                 for (r = 0; r < n_rung; r++) e->ost[r] = as[k].ost[r];
                 e->cls = 1; e->mapped = 1; e->ord = k;
@@ -5905,10 +6154,11 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                 e->lang    = lg ? lg->value : NULL;
                 e->ch      = as[k].ost[0]->codecpar->ch_layout.nb_channels;   /* OUTPUT layout */
                 e->rank    = pid_lang_rank(e->lang, e->norm);
-                e->ad      = !!(ist->disposition & (AV_DISPOSITION_VISUAL_IMPAIRED |
-                                                    AV_DISPOSITION_DESCRIPTIONS));
-                e->src_pid = ist->id; e->in_idx = asrc_in[k]; e->src_idx = asrc[k];
-                snprintf(e->srcs, sizeof e->srcs, "in#%d:%d", asrc_in[k], asrc[k]);
+                e->ad      = ist && !!(ist->disposition & (AV_DISPOSITION_VISUAL_IMPAIRED |
+                                                           AV_DISPOSITION_DESCRIPTIONS));
+                e->src_pid = ist ? ist->id : -1; e->in_idx = asrc_in[k]; e->src_idx = asrc[k];
+                if (ist) snprintf(e->srcs, sizeof e->srcs, "in#%d:%d", asrc_in[k], asrc[k]);
+                else     snprintf(e->srcs, sizeof e->srcs, "in#%d:(late)", asrc_in[k]);
             }
             for (k = 0; k < n_cc; k++) {             /* CC->teletext, in -cc_slots slot order */
                 PidEnt *e = &ent[n++];
@@ -6090,6 +6340,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
      * decode stages into hold; the compositor owns the graph + frame_q fan. */
     for (k = 0; k < n_input; k++) {
         DecodeCtx *d = &inputs[k].dc;
+        d->in = &inputs[k];                              /* 2.0.2 T-386 */
         d->video_q = inputs[k].video_q; d->vdec = inputs[k].vdec; d->ist_tb = inputs[k].ist_tb;
         d->hc_last_pts = AV_NOPTS_VALUE;   /* 2.0.0 T-324 */
         d->h0 = &inputs[k].h0; d->h0_lock = &inputs[k].h0_lock; d->live = live;
@@ -6196,6 +6447,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         as[k].audio_q = audio_q[k];
         as[k].h0 = &inputs[asrc_in[k]].h0; as[k].h0_lock = &inputs[asrc_in[k]].h0_lock;
         as[k].house_skew = &inputs[asrc_in[k]].house_skew;
+        as[k].res_step   = n_input > 1 ? &inputs[asrc_in[k]].res_step_us : NULL;   /* 2.0.2 T-343 */
         as[k].house_lag_true = (n_input > 1) ? &inputs[asrc_in[k]].house_lag_true : NULL;  /* multiview: true lag; single: NULL→house_skew */
         as[k].vring = &inputs[asrc_in[k]].vring;         /* A/V probe: pair this track's audio against its input's video ring */
         as[k].multiview = (n_input > 1);                 /* multiview-only: enable deterministic audio-follow */
@@ -6220,6 +6472,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
     }
     for (kk = 0; kk < n_input; kk++) {           /* per-input demux args (pass/n_pass set in copy loop) */
         DemuxArgs *d = &inputs[kk].da;
+        d->in = &inputs[kk];                            /* 2.0.2 T-386 */
         d->ifmt = inputs[kk].ifmt; d->video_q = inputs[kk].video_q;
         d->vstream = inputs[kk].vstream; d->drop = is_net_url(inputs[kk].url); d->n_out = n_rung;
         d->h0 = &inputs[kk].h0; d->h0_lock = &inputs[kk].h0_lock; d->house_skew = &inputs[kk].house_skew;
@@ -6258,6 +6511,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         for (k = 0; k < n_audio; k++)
             if (asrc_in[k] == kk) {
                 d->audio_q[d->n_audio] = audio_q[k]; d->astream[d->n_audio] = asrc[k];
+                av_strlcpy(d->abind[d->n_audio], as[k].bind_spec, sizeof d->abind[0]);   /* 2.0.2 T-386 */
                 d->aglue_exp_step[d->n_audio] = &inputs[kk].aglue_exp_step[k];   /* pre5 (D1): write side of the */
                 d->aglue_exp_dl[d->n_audio]   = &inputs[kk].aglue_exp_dl[k];     /* expected-step handshake      */
                 d->aglobal[d->n_audio] = k;   /* pre15: global track index — keys the per-track
@@ -6504,7 +6758,8 @@ static const OptionDef ptv_options[] = {
     { "init_hw_device",   OPT_TYPE_STRING, 0,                        { .off = 0 }, "init hw device", "args" },
     { "filter_hw_device", OPT_TYPE_STRING, 0,                        { .off = 0 }, "filter hw device", "name" },
     { "filter_complex",   OPT_TYPE_STRING, 0,                        { .off = 0 }, "filtergraph", "graph" },
-    { "start_on",         OPT_TYPE_STRING, 0,                        { .off = 0 }, "when outputs start: video (2.0.0; any/all/now come in 2.1)", "when" },
+    { "start_on",         OPT_TYPE_STRING, 0,                        { .off = 0 }, "when outputs start: video (single input), any|all (mosaic, default any; now comes in 2.1)", "when" },
+    { "slot_wait",        OPT_TYPE_STRING, 0,                        { .off = 0 }, "mosaic: wait this long for every slot, then start with the live ones (default 120s; inf)", "dur" },
     { "wait_input",       OPT_TYPE_STRING, 0,                        { .off = 0 }, "give up if the input has no video after this long (default inf)", "dur" },
     { "stall_min",        OPT_TYPE_STRING, 0,                        { .off = 0 }, "content gone + input silent this long = STALLED (default 3s)", "dur" },
     { "lost_after",       OPT_TYPE_STRING, 0,                        { .off = 0 }, "no video packets this long = LOST (default 30s)", "dur" },
@@ -6795,6 +7050,28 @@ static int resolve_plan(Input *inputs, int n_input, OptionGroup *outg, Sel *s, i
             return AVERROR(EINVAL);
         }
         kfmt = inputs[fidx].ifmt;
+        if (inputs[fidx].deferred) {
+            /* 2.0.2 T-386: a slot not live at the start has no streams yet. Its audio map becomes a placeholder track
+             * (the encoder and the output stream exist from the start, silent until the slot binds; numbered like a
+             * real one, so -c:a:N / -metadata:s:a:N stay on their tracks); other maps of it are skipped (subtitle /
+             * CC tracks of a slot exist only if it had them at the start: spec §9). */
+            if ((!strncmp(spec, "a", 1) && (!spec[1] || spec[1] == ':')) && s->n_aout < PTV_MAX_AUDIO) {
+                int idx = tcnt[1]++;
+                AOutSpec *a = &s->aout[s->n_aout++];
+                const char *acs = og_spec(outg, "ac", 'a', idx);
+                a->input = fidx; a->stream = -1; a->deferred = 1;
+                av_strlcpy(a->bind_spec, spec, sizeof a->bind_spec);
+                a->aenc = og_spec(outg, "c", 'a', idx); a->abr = og_spec(outg, "b", 'a', idx);
+                a->filter = og_spec(outg, "filter", 'a', idx);
+                a->ac = acs ? atoi(acs) : 0;
+                if (verbose)
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-OUT] -map %s: slot %d not live — a:%d silent until it joins\n",
+                           mv, fidx, idx);
+            } else if (verbose && !optional)
+                av_log(NULL, AV_LOG_WARNING, "[PTV-OUT] -map %s: slot %d not live — skipped (spec §9: a slot's "
+                       "subtitle / CC exist only if it had them at the start)\n", mv, fidx);
+            continue;
+        }
         /* a spec whose LAST colon-token is numeric picks one stream (-map 0:3, -map 0:d:1);
          * a bare type letter (-map 0:d?) — or a whole-input map (-map 0, where the digit is
          * the input index, not a stream) — is a wildcard. Only picks the EPG log level. */
@@ -7111,6 +7388,8 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_CADDISARM")) g_cad_disarm = 0;  /* v0.9.18.1 M7: revert to flag-only pulldown disarm (dropouts drain frame_q again) */
     if (getenv("PTV_NO_MV_EXACTTICK")) g_mv_exacttick = 0;  /* v0.9.12: revert mv measurement axes to integer tick (re-enables the enforced ~10ppm mosaic drift) */
     if (getenv("PTV_NO_RESIDENCE")) g_mv_residence = 0;
+    if (getenv("PTV_NO_RES_FOLLOW")) g_mv_res_follow = 0;   /* 2.0.2 T-343 */
+    if (getenv("PTV_NO_RES_HYST")) g_mv_res_hyst = 0;       /* 2.0.2 T-343 */
     if (getenv("PTV_RES_DEADBAND") && atoi(getenv("PTV_RES_DEADBAND"))) g_mv_res_deadband = 1;   /* 2.0.0 T-343 (opt-in) */
     if (getenv("PTV_NO_RES_DEADBAND")) g_mv_res_deadband = 0;   /* 2.0.0 T-343 */     /* v0.9.13: revert to one-pop-per-tick (rate-mismatched slots batch dups + fast-forward after starvation) */
     if (getenv("PTV_NO_MV_REPRIME")) g_mv_reprime = 0;      /* 2.0.0 T-339 */
@@ -7239,10 +7518,19 @@ int main(int argc, char **argv)
         if (!strcmp(octx.global_opts.opts[gi].key, "hide_banner")) hide_banner = 1; /* suppress startup banner */
         if (!strcmp(octx.global_opts.opts[gi].key, "start_on")) {                   /* 2.0.0-pre2 */
             g_start_on = octx.global_opts.opts[gi].val;
-            if (strcmp(g_start_on, "video")) {
+            g_start_on_set = 1;
+            if (strcmp(g_start_on, "video") && strcmp(g_start_on, "any") && strcmp(g_start_on, "all")) {
                 av_log(NULL, AV_LOG_ERROR, "-start_on %s: %s\n", g_start_on,
-                       !strcmp(g_start_on, "any") || !strcmp(g_start_on, "all") || !strcmp(g_start_on, "now")
-                       ? "comes in 2.1; 2.0.0 supports only 'video'" : "unknown value (video|any|all|now)");
+                       !strcmp(g_start_on, "now") ? "comes in 2.1; supported: video (single input), any|all (mosaic)"
+                                                  : "unknown value (video|any|all)");
+                uninit_parse_context(&octx); return 1;
+            }
+        }
+        if (!strcmp(octx.global_opts.opts[gi].key, "slot_wait")) {                  /* 2.0.2 T-386 */
+            const char *v = octx.global_opts.opts[gi].val;
+            if (!strcmp(v, "inf")) g_slot_wait_us = 0;
+            else if (av_parse_time(&g_slot_wait_us, v, 1) < 0 || g_slot_wait_us <= 0) {
+                av_log(NULL, AV_LOG_ERROR, "-slot_wait %s: expected a duration or inf\n", v);
                 uninit_parse_context(&octx); return 1;
             }
         }

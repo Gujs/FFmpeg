@@ -9,6 +9,7 @@
 #include "libavutil/log.h"
 #include "libavutil/opt.h"
 #include "libavutil/time.h"
+#include "libswscale/swscale.h"
 #include "libavutil/parseutils.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/crc.h"
@@ -92,6 +93,9 @@ void *compositor_thread(void *arg)
     int      slated[PTV_MAX_INPUT] = {0};     /* slot is/was black-slated (outage) since last fresh frame */
     int64_t  reprime_us[PTV_MAX_INPUT] = {0}; /* 2.0.0 T-339: wall time the returning slot's first frame was queued */
     int64_t  mv_fill_us[PTV_MAX_INPUT][PTV_MAX_AUDIO] = {{0}};   /* T-093 part 2: last fill sentinel per slot track */
+    int64_t  mv_pump_us[PTV_MAX_INPUT] = {0};   /* 2.0.2 T-386: last silence sentinel per deferred slot */
+    struct SwsContext *norm_sws[PTV_MAX_INPUT] = {0};   /* 2.0.2 T-386: frames in another geometry than the cell's */
+    int      norm_logged[PTV_MAX_INPUT] = {0};
     int64_t res_due_us[PTV_MAX_INPUT] = {0};  /* v0.9.13 residence: house-time the next pop is allowed (0 = immediate) */
     int64_t res_ema_us[PTV_MAX_INPUT];        /* v0.9.13: EMA of content deltas = the slot's smoothed cadence */
     int64_t res_src_us[PTV_MAX_INPUT];        /* v0.9.13: content time (us) of the last popped frame */
@@ -99,6 +103,8 @@ void *compositor_thread(void *arg)
     int     pd_log[PTV_MAX_INPUT] = {0};      /* 2.0.0 T-343: residence holds logged (the first 3 per slot) */
     int     res_home[PTV_MAX_INPUT];           /* 2.0.0 T-343b: the occupancy the slot settled at (-1 = not yet) */
     int64_t res_home_sum[PTV_MAX_INPUT] = {0}, res_home_n[PTV_MAX_INPUT] = {0};
+    int     res_hyst[PTV_MAX_INPUT] = {0};       /* 2.0.2 T-343: last residence step (+1 hold, -1 decimation) */
+    int     res_ema_n[PTV_MAX_INPUT] = {0};      /* 2.0.2 T-343: cadence deltas accepted into res_ema_us */
     int64_t sv_cnt[PTV_MAX_INPUT] = {0};      /* v0.9.13: genuine starvation dups (due but buffer empty) */
     int64_t md_cnt[PTV_MAX_INPUT] = {0};      /* v0.9.13: decimation drops (multiple frames due in one tick) */
     int64_t dmg_cr[PTV_MAX_INPUT] = {0};      /* T-350: the slot's corrupt-video count (demux + decode) last seen */
@@ -168,7 +174,9 @@ void *compositor_thread(void *arg)
      * previously never set the mask because `stale` requires last_fresh_us > 0). Cleared per
      * slot at its first fresh display. No mv corrector engagement until every cell is live. */
     for (k = 0; k < n; k++)
-        atomic_fetch_or_explicit(&g_mv_slate_mask, 1 << k, memory_order_relaxed);
+        if (!c->inputs[k].deferred)   /* 2.0.2 T-386: a slot not live at the start must not freeze the live slots'
+                                       * correction until it joins (GAFamily: 3 days without correction) */
+            atomic_fetch_or_explicit(&g_mv_slate_mask, 1 << k, memory_order_relaxed);
     rs_mv_div = c->tick_dur_us > 0 ? 30000000 / c->tick_dur_us : 750;
     if (rs_mv_div < 8) rs_mv_div = 8;
     if (n_prime > g_frameq_cap - 8) n_prime = g_frameq_cap - 8;
@@ -200,7 +208,8 @@ void *compositor_thread(void *arg)
                 pthread_mutex_lock(&c->inputs[k].hold.lock);
                 if (!c->inputs[k].hold.eof) eofall = 0;
                 pthread_mutex_unlock(&c->inputs[k].hold.lock);
-                if (av_thread_message_queue_nb_elems(c->inputs[k].hold.q) >= (n_prime > 0 ? n_prime : 1)) ready++;
+                if (c->inputs[k].deferred ||                    /* 2.0.2 T-386: nothing to prime yet */
+                    av_thread_message_queue_nb_elems(c->inputs[k].hold.q) >= (n_prime > 0 ? n_prime : 1)) ready++;
             }
             if (ready == n || eofall) break;
             if (av_gettime_relative() - t0 > 3000000) break;   /* 3s: start with what's there */
@@ -241,6 +250,23 @@ void *compositor_thread(void *arg)
             if (now < target) av_usleep((unsigned)(target - now));
         }
         now_us = av_gettime_relative();
+        /* 2.0.2 T-386: a slot not live at the start has an audio track from the first tick: its audio thread encodes
+         * silence up to this tick's output time (the same axis a live slot's audio is anchored on), every 100 ms */
+        atomic_store_explicit(&g_mv_house_us, mv_tick_us(c, tick), memory_order_relaxed);
+        for (k = 0; k < n; k++) {
+            DemuxArgs *da = &c->inputs[k].da;
+            int j;
+            if (!c->inputs[k].deferred || now_us - mv_pump_us[k] < 100000)
+                continue;
+            mv_pump_us[k] = now_us;
+            for (j = 0; j < da->n_audio; j++) {
+                AVPacket *fs = av_packet_alloc();
+                if (!fs) continue;
+                fs->flags |= PTV_PKT_FLAG_SLOT_FILL;
+                if (av_thread_message_queue_send(da->audio_q[j], &fs, AV_THREAD_MESSAGE_NONBLOCK) < 0)
+                    av_packet_free(&fs);
+            }
+        }
 
         for (k = 0; k < n; k++) {                    /* pop ONE frame from this input's jitter
                                                       * buffer (FIFO) -> feed buffersrc k; dup-hold
@@ -323,9 +349,13 @@ void *compositor_thread(void *arg)
                     dmg_cr[k] = cr; dmg_wc[k] = now_us;
                     atomic_store_explicit(&g_mv_vdmg_wc[k], now_us, memory_order_relaxed);
                 }
-                if (resid && g_mv_reprime && last_fresh_us[k] && (slated[k] || now_us - last_fresh_us[k] > 500000 ||
+                /* 2.0.2 T-386: a slot joining late primes the same way before its first picture (measured without: it
+                 * showed from an empty buffer and the servo held a picture four times in 60 s, each a -40 ms step its
+                 * sound slewed back over ~15 s) */
+                if (resid && g_mv_reprime && (c->inputs[k].deferred ||
+                    (last_fresh_us[k] && (slated[k] || now_us - last_fresh_us[k] > 500000 ||
                     (dmg_wc[k] && now_us - dmg_wc[k] < 5000000 &&
-                     (reprime_us[k] || av_thread_message_queue_nb_elems(h->q) < res_ctr - 2)))) {
+                     (reprime_us[k] || av_thread_message_queue_nb_elems(h->q) < res_ctr - 2)))))) {
                     int occ = av_thread_message_queue_nb_elems(h->q);
                     if (occ && !reprime_us[k])
                         reprime_us[k] = now_us;
@@ -351,9 +381,31 @@ void *compositor_thread(void *arg)
                             break;
                         }
                     }
-                    if (resid && !qhot && hnow + half < res_due_us[k]) {
+                    /* 2.0.2 T-343: hysteresis. A hold leaves the slot's phase on the opposite edge (-half), a decimation
+                     * on +half: with the phase parked on that edge (the servo had just drained or filled a picture), the
+                     * +-1 picture occupancy jitter flipped the servo's trim every frame and each flip crossed it again —
+                     * a hold/decimate pair every ~2 ticks on a clean slot (mv05 slot 2: 367/367 in 100 s, phase pinned
+                     * at +-20.0 ms), a picture shown twice then one skipped, and with the audio follow a pad/drop pair.
+                     * The step back needs the phase a quarter tick past the edge; the re-base clamp moves with it. */
+                    /* at the house rate: the cadence estimate converged (>= 64 accepted deltas — it is seeded at the
+                     * house rate, and a 59.94 slot in a 29.97 house sits on its acceptance band's edge and never moves
+                     * it) and within 2 % of the tick */
+                    int     res_matched = res_ema_n[k] >= 64 && FFABS(res_ema_us[k] - c->tick_dur_us) * 50 < c->tick_dur_us;
+                    int64_t hy_hold = g_mv_res_hyst && res_hyst[k] < 0 ? c->tick_dur_us / 4 : 0;
+                    int64_t hy_dec  = g_mv_res_hyst && res_hyst[k] > 0 ? c->tick_dur_us / 4 : 0;
+                    if (resid && !qhot && hnow + half + (cand ? -hy_dec : hy_hold) < res_due_us[k]) {
                         pending[k] = nx;                         /* residence hold: not due yet (deliberate pacing) */
-                        if (!cand) pd_cnt[k]++;
+                        if (!cand) {
+                            pd_cnt[k]++; res_hyst[k] = 1;
+                            /* 2.0.2 T-343: the cell repeats its picture = the slot's picture one tick later; its audio
+                             * follows this at once (audio PLL), not over ~10 s of TRACK slew (the -30..-40 ms dip ~20 s
+                             * after a mosaic start, after damage, after a join). Only on a slot at the house rate: on a
+                             * rate-converted slot the holds / decimations ARE its cadence (25 in 29.97 holds ~5 times a
+                             * second, 59.94 in 29.97 decimates every tick) and move nothing — followed, they padded /
+                             * dropped its sound several times a second (mv02 1x2 29.97: picture with no sound) */
+                            if (res_matched)
+                                atomic_fetch_add_explicit(&c->inputs[k].res_step_us, mv_tick_us(c, 1), memory_order_relaxed);
+                        }
                         if (!cand && tick > 50 && pd_log[k] < 3) {   /* T-343: a matched-rate slot should never hold */
                             pd_log[k]++;
                             av_log(NULL, AV_LOG_WARNING, "[PTV-RES] in%d residence hold at tick %"PRId64": occupancy %d, "
@@ -362,7 +414,11 @@ void *compositor_thread(void *arg)
                         }
                         break;
                     }
-                    if (cand) { av_frame_free(&cand); md_cnt[k]++; }   /* superseded within one tick (decimation) */
+                    if (cand) {                                  /* superseded within one tick (decimation) */
+                        av_frame_free(&cand); md_cnt[k]++; res_hyst[k] = -1;
+                        if (res_matched)                         /* T-343 */
+                            atomic_fetch_sub_explicit(&c->inputs[k].res_step_us, mv_tick_us(c, 1), memory_order_relaxed);
+                    }
                     cand = nx;
                     if (resid) {
                         int64_t src = nx->pts != AV_NOPTS_VALUE ?
@@ -374,8 +430,10 @@ void *compositor_thread(void *arg)
                              * which over-holds, which overflows the buffer, which drops more frames:
                              * a runaway (v1 of this gate ratcheted sk to +23s exactly this way). */
                             int64_t d = src - res_src_us[k];
-                            if (d > res_ema_us[k] / 2 && d < res_ema_us[k] * 2)
+                            if (d > res_ema_us[k] / 2 && d < res_ema_us[k] * 2) {
                                 res_ema_us[k] += (d - res_ema_us[k]) / 16;
+                                if (res_ema_n[k] < 64) res_ema_n[k]++;
+                            }
                             /* hard bounds: 3x house tick covers 10fps..90fps sources in a 29.97 house */
                             res_ema_us[k] = av_clip64(res_ema_us[k], c->tick_dur_us / 3, c->tick_dur_us * 3);
                         }
@@ -401,7 +459,7 @@ void *compositor_thread(void *arg)
                                 dev = 0;
                             int64_t corr = (int64_t)dev * 1000;
                             corr = av_clip64(corr, -20000, 20000);
-                            res_due_us[k] = FFMAX(res_due_us[k], hnow - half)
+                            res_due_us[k] = FFMAX(res_due_us[k], hnow - half - hy_dec)
                                             + res_ema_us[k] - res_ema_us[k] * corr / 1000000;
                         }
                     } else break;                                /* residence off: exactly one pop per tick (legacy) */
@@ -417,6 +475,11 @@ void *compositor_thread(void *arg)
                 f = cand;                                 /* for the re-anchor diag below */
                 if (last[k]) av_frame_free(&last[k]);
                 last[k] = cand; any_fresh = 1; last_fresh_us[k] = now_us;
+                if (c->inputs[k].deferred) {             /* 2.0.2 T-386: the slot's first picture — it joins here */
+                    c->inputs[k].deferred = 0;
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-MV] in%d joined: first picture at tick %"PRId64" (%.3f s)\n",
+                           k, tick, mv_tick_us(c, tick) / 1e6);
+                }
                 if (!born[k]) {                           /* pre17: first display — the slot is live;
                                                            * clear its BIRTH slate-mask bit */
                     born[k] = 1;
@@ -741,7 +804,8 @@ void *compositor_thread(void *arg)
                  * black frame's shape so the slot's buffersrc sees no parameter change; black if it cannot be built. */
                 int64_t nwc = av_gettime_relative();
                 st = NULL;
-                if (last[k] || (c->slate_after_us > 0 && nwc - diag_t0 > c->slate_after_us)) {
+                if (last[k] || c->inputs[k].deferred ||          /* 2.0.2 T-386: placeholder from the first tick */
+                    (c->slate_after_us > 0 && nwc - diag_t0 > c->slate_after_us)) {
                     if (!cell_dead_us[k]) {
                         cell_dead_us[k] = nwc;
                         av_log(NULL, AV_LOG_WARNING, "[PTV-MV] in%d no signal \xe2\x86\x92 %s in its cell\n", k,
@@ -759,6 +823,39 @@ void *compositor_thread(void *arg)
                     st = blackf[k] ? av_frame_clone(blackf[k]) : NULL;
             }
             if (!st) continue;
+            /* 2.0.2 T-386: the slot's buffersrc was configured for blackf's geometry (its own probe, or the first live
+             * sibling's for a slot that joined later). A frame in another size passes buffersrc with only a warning
+             * and bwdif / yadif then read it with the configured size — memory-unsafe (also a slot that reopened on a
+             * reshaped source). Such a frame is scaled to the cell's geometry. */
+            if (blackf[k] && (st->width != blackf[k]->width || st->height != blackf[k]->height ||
+                              st->format != blackf[k]->format)) {
+                AVFrame *nf = av_frame_alloc();
+                norm_sws[k] = sws_getCachedContext(norm_sws[k], st->width, st->height, st->format,
+                                                   blackf[k]->width, blackf[k]->height, blackf[k]->format,
+                                                   SWS_BICUBIC, NULL, NULL, NULL);
+                if (!norm_logged[k]) {
+                    norm_logged[k] = 1;
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-MV] in%d pictures are %dx%d %s, its cell %dx%d %s — scaled to the "
+                           "cell\n", k, st->width, st->height, av_get_pix_fmt_name(st->format) ? av_get_pix_fmt_name(st->format) : "?",
+                           blackf[k]->width, blackf[k]->height,
+                           av_get_pix_fmt_name(blackf[k]->format) ? av_get_pix_fmt_name(blackf[k]->format) : "?");
+                }
+                if (nf && norm_sws[k]) {
+                    nf->width = blackf[k]->width; nf->height = blackf[k]->height; nf->format = blackf[k]->format;
+                    if (av_frame_get_buffer(nf, 0) >= 0 && av_frame_copy_props(nf, st) >= 0 &&
+                        sws_scale(norm_sws[k], (const uint8_t * const *)st->data, st->linesize, 0, st->height,
+                                  nf->data, nf->linesize) > 0) {
+                        av_frame_free(&st);
+                        st = nf; nf = NULL;
+                    }
+                }
+                av_frame_free(&nf);
+                if (st->width != blackf[k]->width || st->height != blackf[k]->height || st->format != blackf[k]->format) {
+                    av_frame_free(&st);                  /* could not normalise: never feed it */
+                    st = av_frame_clone(blackf[k]);
+                    if (!st) continue;
+                }
+            }
             st->pts = tick; st->pkt_dts = AV_NOPTS_VALUE;
             /* v0.9.16: add_frame consumes only the REFERENCE (frame reset, struct still ours) —
              * the clone shell must be freed on success too, else 448B leak per slot per tick
@@ -943,6 +1040,7 @@ void *compositor_thread(void *arg)
     }
 
     for (k = 0; k < n; k++) { int fr = av_buffersrc_add_frame(c->fsrc[k], NULL); (void)fr; }   /* flush graph */
+    for (k = 0; k < n; k++) sws_freeContext(norm_sws[k]);   /* 2.0.2 T-386 */
     for (r = 0; r < R; r++)
         while (av_buffersink_get_frame(c->fsink[r], filt) >= 0) {
             AVFrame *out = av_frame_alloc();

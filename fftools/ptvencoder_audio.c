@@ -1654,7 +1654,27 @@ static int audio_drain_fg(AudioState *a)
                 if (a->pll_drop > 0) {                       /* consume a pending one-shot DROP (advance) */
                     a->pll_drop--; av_frame_unref(filt); continue;
                 }
-                if (!a->af_started) { a->af_applied_us = 0; a->af_started = 1; }  /* seed 0 (house_skew is wrong-sign in the banked regime) */
+                if (!a->af_started) { a->af_applied_us = 0; a->af_started = 1;    /* seed 0 (house_skew is wrong-sign in the banked regime) */
+                    if (a->res_step) a->res_step_seen = atomic_load_explicit(a->res_step, memory_order_relaxed); }
+                /* 2.0.2 T-343: the compositor stepped this slot's picture by whole ticks (residence hold / decimation) —
+                 * the audio takes the same step NOW, the ACQUIRE way (whole audio frames of pad / drop on the same base,
+                 * the rounding rest carried), instead of the readings showing a one-picture offset the TRACK slewed out
+                 * over ~10 s (measured: mosaic start -30 ms at ~20 s; after loss / flapping -26..-41 ms; a joining slot
+                 * -40 ms for 13 s). Not credited to the PLL EMA: the readings never see the step. PTV_NO_RES_FOLLOW=1 */
+                if (g_mv_res_follow && a->res_step) {
+                    int64_t cur = atomic_load_explicit(a->res_step, memory_order_relaxed), dq = cur - a->res_step_seen;
+                    int64_t n = (FFABS(dq) + frame_us / 2) / frame_us;
+                    if (n > 0) {
+                        int64_t dqq = (dq > 0 ? n : -n) * frame_us;
+                        a->res_step_seen += dqq;                 /* the sub-frame rest stays pending */
+                        a->af_applied_us += dqq;
+                        if (dqq < 0) { a->pll_drop += (int)n; a->af_acq_drop_us += -dqq; }
+                        else         { a->pll_pad  += (int)n; a->af_acq_pad_us  +=  dqq; }
+                        if (g_diag || a->res_follow_n++ < 3)
+                            av_log(NULL, AV_LOG_INFO, "[PTV-RESFOLLOW] a%d(in%d) picture stepped %+"PRId64"ms — audio %s %"PRId64"ms\n",
+                                   a->dbg_k, a->dbg_in, dq / 1000, dqq < 0 ? "drop" : "pad", FFABS(dqq) / 1000);
+                    }
+                }
                 if (a->av_off_valid) {
                     /* rr21 A1 label-baseline WATCH: a demux label edit (ea ledger — LAYERA flush
                      * persist / absorber self-rebase / retro-correct; the splice-RETURN erase
@@ -1932,8 +1952,8 @@ static int audio_drain_fg(AudioState *a)
                                                               * level the readings are at, not the lagging EMA) */
                             for (x = 0; x < nw; x++)
                                 a->pll_raw[x] -= dq;
-                            if (dq < 0) { a->pll_drop = (int)(-dq / frame_us); a->af_acq_drop_us += -dq; }  /* advance: drop content */
-                            else        { a->pll_pad  = (int)( dq / frame_us); a->af_acq_pad_us  +=  dq; }   /* delay: pad silence */
+                            if (dq < 0) { a->pll_drop += (int)(-dq / frame_us); a->af_acq_drop_us += -dq; }  /* advance: drop content */
+                            else        { a->pll_pad  += (int)( dq / frame_us); a->af_acq_pad_us  +=  dq; }   /* delay: pad silence */
                             a->pll_acq_count++;
                             /* 1.0.1-pre17: an ACQUIRE REDEFINES this track's content→label
                              * mapping in one step (af_applied jump + content drop/pad) — the
@@ -4191,6 +4211,78 @@ graph_in:
 
 /* Anchor (on the first kept frame) then feed `frame`, given a known h0. Drops frames
  * whose content precedes h0. Used both for live frames and the replayed pre-h0 buffer. */
+/* 2.0.2 T-386: a mosaic slot not live at the start — its track exists from the first tick and carries silence on the
+ * house axis (sample 0 = the first tick, where a live slot's audio is anchored too) up to the compositor's current
+ * tick, straight into the encoders (no source, so no graph). Without it the PID would be declared but empty: sync_check
+ * DEAD_AUDIO_TRACK = a restart loop. At most 2 s per call (a late first call catches up over several). */
+static int slot_pump(AudioState *a)
+{
+    int64_t target, lim;
+    int ret = 0;
+
+    if (!a->slot_deferred || a->pts_set)
+        return 0;
+    target = av_rescale(atomic_load_explicit(&g_mv_house_us, memory_order_relaxed), a->out_rate, 1000000);
+    lim    = a->pump_next + 2 * a->out_rate;
+    while (ret >= 0 && a->pump_next + a->frame_size <= FFMIN(target, lim)) {
+        AVFrame *f = av_frame_alloc();
+        if (!f)
+            return AVERROR(ENOMEM);
+        f->nb_samples  = a->frame_size;
+        f->format      = a->out_sfmt;
+        f->sample_rate = a->out_rate;
+        av_channel_layout_copy(&f->ch_layout, &a->out_chl);
+        if ((ret = av_frame_get_buffer(f, 0)) >= 0) {
+            av_samples_set_silence(f->extended_data, 0, f->nb_samples, f->ch_layout.nb_channels, f->format);
+            f->pts = a->pump_next;
+            a->pump_next += a->frame_size;
+            ret = audio_encode_push(a, f);
+            a->out_frames++;
+        }
+        av_frame_free(&f);
+    }
+    return ret;
+}
+
+/* 2.0.2 T-386: the slot bound — its real decoder replaces the stand-in (the converter in front of the fixed graph
+ * input re-forms from the first clean frames if the source is not 48 kHz stereo: [PTV-AFMT]) */
+static void slot_bind_audio(AudioState *a, AVPacket *pkt)
+{
+    PtvSlotBind *b = pkt->opaque;
+    const AVCodec *c;
+    AVCodecContext *nc = NULL;
+    int ret;
+
+    pkt->opaque = NULL;
+    if (!b)
+        return;
+    if (!(c = avcodec_find_decoder(b->par->codec_id)) || !(nc = avcodec_alloc_context3(c)) ||
+        avcodec_parameters_to_context(nc, b->par) < 0) {
+        av_log(NULL, AV_LOG_ERROR, "[PTV-BIND] a%d(in%d): no decoder for %s — the track stays silent\n",
+               a->dbg_k, a->dbg_in, avcodec_get_name(b->par->codec_id));
+        goto done;
+    }
+    nc->pkt_timebase = b->tb;
+    ptv_adec_opts(nc);
+    if ((ret = avcodec_open2(nc, c, NULL)) < 0) {
+        av_log(NULL, AV_LOG_ERROR, "[PTV-BIND] a%d(in%d): open %s: %s — the track stays silent\n",
+               a->dbg_k, a->dbg_in, c->name, av_err2str(ret));
+        goto done;
+    }
+    avcodec_free_context(&a->dec);
+    a->dec = nc;
+    a->ist_tb = a->ist_pkt_tb = b->tb;
+    if (a->ist_par)
+        avcodec_parameters_copy(a->ist_par, b->par);
+    av_log(NULL, AV_LOG_INFO, "[PTV-BIND] a%d(in%d) decoder %s %d Hz %dch open — silence until its first frame anchors\n",
+           a->dbg_k, a->dbg_in, c->name, b->par->sample_rate, b->par->ch_layout.nb_channels);
+    nc = NULL;
+done:
+    avcodec_free_context(&nc);
+    avcodec_parameters_free(&b->par);
+    av_free(b);
+}
+
 static int audio_anchor_and_feed(AudioState *a, AVFrame *frame, int64_t h0)
 {
     int64_t ts = frame->best_effort_timestamp;
@@ -4199,6 +4291,45 @@ static int audio_anchor_and_feed(AudioState *a, AVFrame *frame, int64_t h0)
         int64_t house_us = av_rescale_q(ts, a->ist_tb, AV_TIME_BASE_Q) - h0;
         int64_t fill_us  = 0;
         if (house_us < 0) { a->anchor_drop_pre++; return 0; }   /* audio precedes video anchor: drop */
+        if (a->slot_deferred) {
+            /* 2.0.2 T-386: a joining slot — the silence covered house 0 .. pump_next; real audio continues from there:
+             * a frame before it is dropped, a gap after it is filled (from the silence's end, not from house 0) */
+            int64_t pump_us = av_rescale(a->pump_next, 1000000, a->out_rate);
+            if (house_us < pump_us) { a->anchor_drop_pre++; return 0; }
+            a->slot_deferred = 0;
+            if (house_us > pump_us && frame->sample_rate > 0 && frame->nb_samples > 0) {
+                /* continuous from the silence's end, the real audio at its own house time: ONE silence frame exactly
+                 * the gap long (any length — the encoder FIFO repackages; whole AAC frames left the audio up to one
+                 * frame early, measured 16 ms) and no timestamp step (output linearity, GOALS.md #1) */
+                int64_t gap_us = house_us - pump_us, src_us = av_rescale_q(ts, a->ist_tb, AV_TIME_BASE_Q);
+                int     ns     = (int)av_rescale(gap_us, frame->sample_rate, 1000000), ret = 0;
+                a->next_pts = a->pump_next;
+                a->pts_set  = 1;
+                a->dbg_first_src = ts;
+                av_log(NULL, AV_LOG_WARNING, "[PTV-ANCHOR] a%d(in%d) joined at house %.3f s (silence to %.3f s, gap %.1f ms "
+                       "filled)\n", a->dbg_k, a->dbg_in, house_us / 1e6, pump_us / 1e6, gap_us / 1e3);
+                if (ns > 0) {
+                    AVFrame *sf = av_frame_alloc();
+                    if (!sf) return AVERROR(ENOMEM);
+                    sf->nb_samples = ns; sf->format = frame->format; sf->sample_rate = frame->sample_rate;
+                    av_channel_layout_copy(&sf->ch_layout, &frame->ch_layout);
+                    if ((ret = av_frame_get_buffer(sf, 0)) >= 0) {
+                        av_samples_set_silence(sf->data, 0, sf->nb_samples, sf->ch_layout.nb_channels, sf->format);
+                        sf->pts = sf->best_effort_timestamp = av_rescale_q(src_us - gap_us, AV_TIME_BASE_Q, a->ist_tb);
+                        ret = audio_feed(a, sf);
+                    }
+                    av_frame_free(&sf);
+                    if (ret < 0) return ret;
+                }
+                return audio_feed(a, frame);
+            }
+            a->next_pts = a->pump_next;
+            a->pts_set  = 1;
+            a->dbg_first_src = ts;
+            av_log(NULL, AV_LOG_WARNING, "[PTV-ANCHOR] a%d(in%d) joined at house %.3f s (silence to %.3f s)\n",
+                   a->dbg_k, a->dbg_in, house_us / 1e6, pump_us / 1e6);
+            return audio_feed(a, frame);
+        }
         /* 1.0.1 ANCHOR HEAD-FILL (PTV_NO_ANCHOR_HEADFILL=1 reverts): when the source's audio
          * HEAD is missing (first kept audio starts >200ms after h0, or the pre-h0 ring
          * overflowed so the kept head is not the true head), the track's first packet used
@@ -4951,6 +5082,17 @@ void *audio_thread(void *arg)
              * a reopen every 45s of a fill phase). */
             av_packet_free(&pkt);
             nbs_fill_quantum(a);
+            continue;
+        }
+        if (pkt && (pkt->flags & PTV_PKT_FLAG_SLOT_BIND)) {   /* 2.0.2 T-386: the slot bound — open its real decoder */
+            slot_bind_audio(a, pkt);
+            av_packet_free(&pkt);
+            continue;
+        }
+        if (pkt && (pkt->flags & PTV_PKT_FLAG_SLOT_FILL)) {   /* 2.0.2 T-386: a deferred slot's silence, not a packet */
+            av_packet_free(&pkt);
+            if ((ret = slot_pump(a)) < 0)
+                break;
             continue;
         }
         if (pkt && (pkt->flags & PTV_PKT_FLAG_HOLD_FILL)) {   /* 2.0.0-pre6 hold-fill sentinel, not a packet */

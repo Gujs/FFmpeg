@@ -3125,6 +3125,106 @@ static int src_tail_more(const AVStream *vst, int64_t raw, int64_t ref)
     return delta >= 0 && delta < 500000;
 }
 
+/* 2.0.2 T-386 (spec §9 late join): a deferred mosaic slot's source arrived — set up what the start-up does for a live
+ * slot (per-stream state, video stream, LAYERA buffer), resolve each of its tracks' -map specifier, and hand the
+ * decoders over to the decode / audio threads through their own queues (BIND sentinels: every AudioState / DecodeCtx
+ * write stays on its owner thread). A later outage of the slot takes the normal reopen. */
+static int slot_bind(DemuxArgs *d)
+{
+    struct Input *in = d->in;
+    AVFormatContext *f = in->ifmt;
+    int nb = f->nb_streams, si, j, vs;
+
+    in->wrap_off        = av_calloc(nb, sizeof(*in->wrap_off));
+    in->wrap_last       = av_malloc_array(nb, sizeof(*in->wrap_last));
+    in->wrap_wall_last  = av_calloc(nb, sizeof(*in->wrap_wall_last));
+    in->edit_us         = av_calloc(nb, sizeof(*in->edit_us));
+    in->gap_vsnap       = av_calloc(nb, sizeof(*in->gap_vsnap));
+    in->wall_cad_us     = av_calloc(nb, sizeof(*in->wall_cad_us));
+    in->pkt_wall_gap_us = av_calloc(nb, sizeof(*in->pkt_wall_gap_us));
+    in->tail_gap_us     = av_calloc(nb, sizeof(*in->tail_gap_us));
+    in->tail_wc_us      = av_calloc(nb, sizeof(*in->tail_wc_us));
+    in->ts_outl         = av_calloc(nb, sizeof(*in->ts_outl));
+    if (!in->wrap_off || !in->wrap_last || !in->wrap_wall_last || !in->edit_us || !in->gap_vsnap ||
+        !in->wall_cad_us || !in->pkt_wall_gap_us || !in->tail_gap_us || !in->tail_wc_us || !in->ts_outl)
+        return AVERROR(ENOMEM);
+    for (si = 0; si < nb; si++) {
+        in->wrap_last[si] = AV_NOPTS_VALUE;
+        in->ts_outl[si].last2 = in->ts_outl[si].pend_last = AV_NOPTS_VALUE;
+    }
+    if (d->disc && ptv_disc_init(d->disc, PTV_DISC_CAPACITY, nb) < 0)
+        return AVERROR(ENOMEM);
+    vs = av_find_best_stream(f, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
+    if (vs < 0)
+        return AVERROR_STREAM_NOT_FOUND;
+    in->vstream = d->vstream = vs;
+    in->vist    = f->streams[vs];
+    d->wrap_off = in->wrap_off; d->wrap_last = in->wrap_last; d->wrap_wall_last = in->wrap_wall_last;
+    d->ts_outl = in->ts_outl; d->edit_us = in->edit_us; d->gap_vsnap = in->gap_vsnap;
+    d->wall_cad_us = in->wall_cad_us; d->pkt_wall_gap_us = in->pkt_wall_gap_us;
+    d->tail_gap_us = in->tail_gap_us; d->tail_wc_us = in->tail_wc_us;
+    d->nb_streams_open = nb;
+    d->late_stream_max = -1;
+    /* audio: each deferred track's -map specifier against the arrived layout; a track whose source has no match keeps
+     * its silence (logged) */
+    for (j = 0; j < d->n_audio; j++) {
+        AVPacket *bp;
+        PtvSlotBind *b;
+        if (d->astream[j] >= 0 || !d->abind[j][0])
+            continue;
+        for (si = 0; si < nb; si++)
+            if (f->streams[si]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
+                avformat_match_stream_specifier(f, f->streams[si], d->abind[j]) > 0)
+                break;
+        if (si == nb) {
+            av_log(NULL, AV_LOG_WARNING, "[PTV-BIND] %d:%s → no such audio in in%d — the track stays silent\n",
+                   d->rsync_slot, d->abind[j], d->rsync_slot);
+            continue;
+        }
+        if (!(bp = av_packet_alloc()) || !(b = av_mallocz(sizeof(*b))) || !(b->par = avcodec_parameters_alloc()) ||
+            avcodec_parameters_copy(b->par, f->streams[si]->codecpar) < 0) {
+            if (bp && bp->opaque) av_free(bp->opaque);
+            av_packet_free(&bp);
+            return AVERROR(ENOMEM);
+        }
+        b->tb = f->streams[si]->time_base;
+        bp->opaque = b;
+        bp->flags |= PTV_PKT_FLAG_SLOT_BIND;
+        if (av_thread_message_queue_send(d->audio_q[j], &bp, 0) < 0) {
+            avcodec_parameters_free(&b->par); av_free(b); av_packet_free(&bp);
+            continue;
+        }
+        d->astream[j] = si;
+        {
+            AVDictionaryEntry *lg = av_dict_get(f->streams[si]->metadata, "language", NULL, 0);
+            av_log(NULL, AV_LOG_INFO, "[PTV-BIND] %d:%s → in%d pid 0x%x %s %dch %s (slot %d)\n", d->rsync_slot,
+                   d->abind[j], d->rsync_slot, f->streams[si]->id, avcodec_get_name(f->streams[si]->codecpar->codec_id),
+                   f->streams[si]->codecpar->ch_layout.nb_channels, lg ? lg->value : "und", d->rsync_slot);
+        }
+    }
+    {   /* video last: the decoder opens before the first packet of the slot reaches it */
+        AVPacket *bp = av_packet_alloc();
+        PtvSlotBind *b = av_mallocz(sizeof(*b));
+        if (!bp || !b || !(b->par = avcodec_parameters_alloc()) ||
+            avcodec_parameters_copy(b->par, f->streams[vs]->codecpar) < 0) {
+            if (b) avcodec_parameters_free(&b->par);
+            av_free(b); av_packet_free(&bp);
+            return AVERROR(ENOMEM);
+        }
+        b->tb  = f->streams[vs]->time_base;
+        b->avg = f->streams[vs]->avg_frame_rate;
+        bp->opaque = b;
+        bp->flags |= PTV_PKT_FLAG_SLOT_BIND;
+        if (av_thread_message_queue_send(d->video_q, &bp, 0) < 0) {
+            avcodec_parameters_free(&b->par); av_free(b); av_packet_free(&bp);
+            return AVERROR_EXIT;
+        }
+    }
+    d->ifmt = f;                                     /* *d->ifmt_home == in->ifmt already (the acquire set it) */
+    av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in%d WAITING → LIVE: slot %d joins the mosaic\n", d->rsync_slot, d->rsync_slot);
+    return 0;
+}
+
 void *demux_thread(void *arg)
 {
     DemuxArgs *d = arg;
@@ -3147,6 +3247,17 @@ void *demux_thread(void *arg)
             av_log(NULL, AV_LOG_INFO, "ptvencoder: -t reached — input '%s' stops pulling (flush to clean exit)\n", d->url);
             break;                                 /* rider (b): ride the file-EOF teardown */
         }
+        if (!d->ifmt) {   /* 2.0.2 T-386: a mosaic slot not live at the start — acquire it here (no heartbeat while
+                           * waiting: a slot without a source is not a wedged decoder), then bind it */
+            if (!d->in || ptv_slot_acquire(d->in, d->rsync_slot) < 0 || slot_bind(d) < 0) {
+                if (d->in && d->in->ifmt && !d->ifmt)
+                    avformat_close_input(&d->in->ifmt);
+                if (atomic_load_explicit(&g_t_stop, memory_order_relaxed))
+                    break;
+                av_usleep(1000000);
+            }
+            continue;
+        }
         /* 1.0.1-pre21 heartbeat: input-flow evidence + video_q depth for the [PTV-STALL]
          * watchdog (a vdec stall only reports while THIS keeps advancing — a dead input is
          * starvation, not a wedge). */
@@ -3159,8 +3270,8 @@ void *demux_thread(void *arg)
         }
         {   /* 2.0.0-pre5: video gone while other packets (audio) keep flowing — reopen after 2 x -lost_after */
             int64_t vr = atomic_load_explicit(&g_src_vread_wc, memory_order_relaxed);
-            rd_force = d->reopen && d->single && vr &&
-                       av_gettime_relative() - vr > 2 * g_lost_after_us;
+            rd_force = (d->reopen && d->single && vr &&
+                        av_gettime_relative() - vr > 2 * g_lost_after_us) || d->vmove_force;
         }
         if (rd_force || (rd_ret = av_read_frame(d->ifmt, pkt)) < 0) {
             /* pre17 R1: a live mv net input must NEVER EOF-latch its slot (rw_timeout expiry
@@ -3182,12 +3293,14 @@ void *demux_thread(void *arg)
                     int64_t vr = atomic_load_explicit(&g_src_vread_wc, memory_order_relaxed);
                     av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 LOST: %s (no video for %.1f s, %d flushed "
                            "PES tails dropped) — reopening\n",
+                           d->vmove_force ? "the video moved to a new PID" :
                            rd_force ? "video gone while other packets flow" : av_err2str(rd_ret),
                            vr ? (lost_t0 - vr) / 1e6 : 0.0, d->tail_flushed);
                     d->tail_flushed = 0;
                     atomic_store_explicit(&g_src_icb_armed, 0, memory_order_relaxed);
                 }
                 rd_force = 0;
+                d->vmove_force = 0; d->vmove_n = 0; d->v_last_wc = 0;
                 /* Close the dead ctx BEFORE retrying: its udp socket (with the fifo reader
                  * thread) stays bound otherwise and STEALS the datagrams from the re-bind —
                  * measured: the reopen loop failed forever after the source resumed (r1 gate,
@@ -3259,6 +3372,23 @@ void *demux_thread(void *arg)
          * routed nowhere (dispatch matches only the streams bound at open): drop its packets here,
          * before any bookkeeping indexes them (was a heap overflow in demux_unwrap). */
         if (pkt->stream_index >= d->nb_streams_open) {
+            /* 2.0.2 T-387: the source moved its video to a new PID (PMT update; cor-3 2026-10-08 Curiosity Now: the
+             * audio flowed on, the slot's picture stayed dead until a restart 200 s later; a single input waited out
+             * 2 x -lost_after, then re-probed). A late-born VIDEO stream that delivers 1 s of packets while the bound
+             * video is silent >= 2 s = the move: reopen now — a mosaic slot resumes on the new PID as after an
+             * outage (same stream count + types), a single input comes back RESHAPED and exits 4 for a re-probe. */
+            if (d->reopen && !d->vmove_force && d->vstream >= 0 &&
+                d->ifmt->streams[pkt->stream_index]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+                int64_t now = av_gettime_relative();
+                if (!d->v_last_wc || now - d->v_last_wc < 2000000)
+                    d->vmove_n = 0;
+                else if (++d->vmove_n >= 25) {
+                    d->vmove_force = 1;
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] input '%s': video moved to pid 0x%x (pid 0x%x silent "
+                           "%.1f s) — reopening\n", d->url, d->ifmt->streams[pkt->stream_index]->id,
+                           d->ifmt->streams[d->vstream]->id, (now - d->v_last_wc) / 1e6);
+                }
+            }
             if (pkt->stream_index > d->late_stream_max) {
                 const AVStream *ls = d->ifmt->streams[pkt->stream_index];
                 d->late_stream_max = pkt->stream_index;
@@ -3272,6 +3402,8 @@ void *demux_thread(void *arg)
             av_packet_unref(pkt);
             continue;
         }
+        if (pkt->stream_index == d->vstream)
+            d->v_last_wc = av_gettime_relative();    /* 2.0.2 T-387 */
         /* 2.0.0-pre17 T-348 (see aac_next): a frame without its own PES label (pos < 0: lavf split it out of the
          * PES and interpolated its label) gets the previous label + the previous frame's ADTS duration */
         if (pkt->stream_index < PTV_AAC_LBL && pkt->size >= 7 &&
