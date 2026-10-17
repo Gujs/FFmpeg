@@ -4488,7 +4488,12 @@ static void rl_eval(AudioState *a, int64_t now)
     if (why)
         av_log(NULL, AV_LOG_INFO, "[PTV-RELABEL] a%d(in%d) -%"PRId64"ms erase: no verdict — %s; the sensor keeps the "
                "source's A/V\n", a->dbg_k, a->dbg_in, a->rl_S_us / 1000, why);
-    else if (c_rep < 0.5) {
+    /* 2.0.2 T-391: a RELABEL verdict blinds the sensor to the erase for good, so it needs clear evidence. A real
+     * ~100 ms repeat (glo-1 Multivisão, HLS segment overlap re-encoded: content cross-correlation proved the erase left
+     * the audio +100 ms late) scored 0.47 / 0.51 / 0.58 on its 9-10 envelope bins and was called a relabel at < 0.5 —
+     * uncorrected for hours, ~+400 ms on air after several. Clear relabels score <= 0.21 (synthetic -0.17, fleet
+     * -0.53 .. 0.21); between 0.3 and 0.8 = no verdict: the sensor keeps the source's A/V and the corrector decides. */
+    else if (c_rep < g_rl_relabel_max) {
         a->rl_neutral_us += a->rl_S_us;
         av_log(NULL, AV_LOG_WARNING, "[PTV-RELABEL] a%d(in%d) -%"PRId64"ms erase was a RELABEL: the audio after the seam "
                "does not repeat the %"PRId64" ms before it (corr %.2f) — the sensor follows the erase "

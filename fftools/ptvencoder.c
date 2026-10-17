@@ -79,6 +79,7 @@ int     g_mv_clamp = 0;
 int     g_mv_residence = 1;
 int     g_mv_res_follow = 1;     /* 2.0.2 T-343: a slot's audio follows each deliberate picture step at once (PTV_NO_RES_FOLLOW=1 off) */
 int     g_mv_res_hyst = 1;       /* 2.0.2 T-343: quarter-tick residence hysteresis, no hold/decimate chatter (PTV_NO_RES_HYST=1 off) */
+int     g_mv_res_occ_avg = 256;  /* 2.0.2 T-343: the occupancy servo reads a ~10 s average of the slot's jitter buffer (frames; PTV_RES_OCC_AVG=1 = instantaneous, 2.0.2-pre1) */
 int     g_mv_res_deadband = 0;   /* 2.0.0 T-343: residence occupancy servo ±1 picture deadband — OPT-IN (PTV_RES_DEADBAND=1):
                                   * on, a slot ran −30 ms for 10 s after a flapping input (mv04 sync_flapping 6/6, off 0/2,
                                   * 2026-10-16); off = the pre21 servo (T-343's 40 ms step ~20 s after start stays open) */
@@ -127,6 +128,7 @@ int64_t g_novideo_exit_us = 300LL * 1000000; /* 1.0.1-pre23 startup sanity rider
                                            * PTV_NOVIDEO_EXIT_S overrides; 0 disables. */
 int     g_pestail = 1;             /* 2.0.0-pre4c: see ptvencoder_demux.c (PES-TAIL carry) */
 int     g_rlcheck = 1;             /* 2.0.1 T-087: content check of a backward audio erase (PTV_NO_RLCHECK=1 off) */
+double  g_rl_relabel_max = 0.3;    /* 2.0.2 T-391: a RELABEL verdict needs the repeat correlation below this (PTV_RL_RELABEL_MAX; 2.0.1: 0.5) */
 int     g_voutlier = 1;            /* 2.0.1 T-383: one-picture timestamp outlier restamped (PTV_NO_VOUTLIER=1 off) */
 int     g_wallev = 1;              /* 1.0.1-pre24 #63 WALL-EVIDENCE SPLIT (the corrupt-storm desync class): every
                                            * erase engine splits a forward label step J into W = wall-absence-evidenced
@@ -7273,6 +7275,7 @@ int main(int argc, char **argv)
     { const char *s = getenv("PTV_SEAM_PARK_S"); if (s && atoi(s) > 0) g_seam_park_us = (int64_t)atoi(s) * 1000000; }  /* TEST ONLY (G4) */
     if (getenv("PTV_NO_PESTAIL")) g_pestail = 0;   /* 2.0.0-pre4c: PES-tail carry off */
     if (getenv("PTV_NO_RLCHECK")) g_rlcheck = 0;   /* 2.0.1 T-087: relabel content check off */
+    if (getenv("PTV_RL_RELABEL_MAX")) g_rl_relabel_max = atof(getenv("PTV_RL_RELABEL_MAX"));   /* 2.0.2 T-391 */
     if (getenv("PTV_NO_VOUTLIER")) g_voutlier = 0; /* 2.0.1 T-383: video timestamp outlier restamp off */
     if (getenv("PTV_NO_WALLEV")) g_wallev = 0;     /* 1.0.1-pre24 #63 revert: erase engines back to the pre23
                                                     * whole-step remedies (butt-joint every >1s hole; the
@@ -7390,6 +7393,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_RESIDENCE")) g_mv_residence = 0;
     if (getenv("PTV_NO_RES_FOLLOW")) g_mv_res_follow = 0;   /* 2.0.2 T-343 */
     if (getenv("PTV_NO_RES_HYST")) g_mv_res_hyst = 0;       /* 2.0.2 T-343 */
+    if (getenv("PTV_RES_OCC_AVG")) g_mv_res_occ_avg = FFMAX(1, atoi(getenv("PTV_RES_OCC_AVG")));   /* 2.0.2 T-343 */
     if (getenv("PTV_RES_DEADBAND") && atoi(getenv("PTV_RES_DEADBAND"))) g_mv_res_deadband = 1;   /* 2.0.0 T-343 (opt-in) */
     if (getenv("PTV_NO_RES_DEADBAND")) g_mv_res_deadband = 0;   /* 2.0.0 T-343 */     /* v0.9.13: revert to one-pop-per-tick (rate-mismatched slots batch dups + fast-forward after starvation) */
     if (getenv("PTV_NO_MV_REPRIME")) g_mv_reprime = 0;      /* 2.0.0 T-339 */
