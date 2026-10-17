@@ -43,6 +43,8 @@ the v2 `0001` patch (additive, travels with the source to the build box).
   behind the output (startstall marker 12: +168 ms → 0).
 - **Mosaic: a slot's lipsync= no longer reads +20 s after its input returns (T-362)** — held pictures are not measured;
   the reading reseeds 1 s after the pictures move again (sync_check's pin rule fired on the old reading).
+- **No relabel verdict across an audio format switch** (gate26 found it: a stereo → mono splice read as a relabel left
+  the audio +192 ms; the check now gives no verdict when the decoded layout changes inside its window).
 - **The default GOP (no `-g`) is 2 s of the output rate, rounded** (was 58 frames at 29.97, 118 at 59.94); the wrapper's
   fallback start now leaves `-g` to ptvencoder.
 
