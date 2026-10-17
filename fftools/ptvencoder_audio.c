@@ -4278,29 +4278,29 @@ static int audio_anchor_and_feed(AudioState *a, AVFrame *frame, int64_t h0)
             if (house_us < pump_us) { a->anchor_drop_pre++; return 0; }
             a->slot_deferred = 0;
             if (house_us > pump_us && frame->sample_rate > 0 && frame->nb_samples > 0) {
-                int64_t dur_us = av_rescale(frame->nb_samples, 1000000, frame->sample_rate);
-                int     nfill  = (int)((house_us - pump_us) / dur_us), i, ret = 0;
-                int64_t src_us = av_rescale_q(ts, a->ist_tb, AV_TIME_BASE_Q);
-                /* continuous from the silence's end: whole-frame gaps are filled, the sub-frame rest (< one frame,
-                 * measured 8 ms) is not written as a timestamp step (output linearity, GOALS.md #1) */
+                /* continuous from the silence's end, the real audio at its own house time: ONE silence frame exactly
+                 * the gap long (any length — the encoder FIFO repackages; whole AAC frames left the audio up to one
+                 * frame early, measured 16 ms) and no timestamp step (output linearity, GOALS.md #1) */
+                int64_t gap_us = house_us - pump_us, src_us = av_rescale_q(ts, a->ist_tb, AV_TIME_BASE_Q);
+                int     ns     = (int)av_rescale(gap_us, frame->sample_rate, 1000000), ret = 0;
                 a->next_pts = a->pump_next;
                 a->pts_set  = 1;
                 a->dbg_first_src = ts;
-                av_log(NULL, AV_LOG_WARNING, "[PTV-ANCHOR] a%d(in%d) joined at house %.3f s (silence to %.3f s, "
-                       "%d fill frame(s))\n", a->dbg_k, a->dbg_in, house_us / 1e6, pump_us / 1e6, nfill);
-                for (i = nfill; i > 0 && ret >= 0; i--) {
+                av_log(NULL, AV_LOG_WARNING, "[PTV-ANCHOR] a%d(in%d) joined at house %.3f s (silence to %.3f s, gap %.1f ms "
+                       "filled)\n", a->dbg_k, a->dbg_in, house_us / 1e6, pump_us / 1e6, gap_us / 1e3);
+                if (ns > 0) {
                     AVFrame *sf = av_frame_alloc();
-                    if (!sf) break;
-                    sf->nb_samples = frame->nb_samples; sf->format = frame->format; sf->sample_rate = frame->sample_rate;
+                    if (!sf) return AVERROR(ENOMEM);
+                    sf->nb_samples = ns; sf->format = frame->format; sf->sample_rate = frame->sample_rate;
                     av_channel_layout_copy(&sf->ch_layout, &frame->ch_layout);
-                    if (av_frame_get_buffer(sf, 0) >= 0) {
+                    if ((ret = av_frame_get_buffer(sf, 0)) >= 0) {
                         av_samples_set_silence(sf->data, 0, sf->nb_samples, sf->ch_layout.nb_channels, sf->format);
-                        sf->pts = sf->best_effort_timestamp = av_rescale_q(src_us - i * dur_us, AV_TIME_BASE_Q, a->ist_tb);
+                        sf->pts = sf->best_effort_timestamp = av_rescale_q(src_us - gap_us, AV_TIME_BASE_Q, a->ist_tb);
                         ret = audio_feed(a, sf);
                     }
                     av_frame_free(&sf);
+                    if (ret < 0) return ret;
                 }
-                if (ret < 0) return ret;
                 return audio_feed(a, frame);
             }
             a->next_pts = a->pump_next;
