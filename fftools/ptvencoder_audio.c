@@ -5119,7 +5119,7 @@ int build_audio_filter(AudioState *a, AVCodecContext *adec, AVRational tb,
      * (latency=1) re-anchors on the step and loses its 5 ms latency offset -> sink +26.2 ms = an AAC hole at 20.5 s
      * (48 ms on older media: two frames); every later step was soft-compensated, as designed. A zero compensation
      * creates the resampler here instead (what the first compensation does anyway, minus the reset). */
-    if (a->fg_swr) {
+    if (a->fg_swr && !getenv("PTV_NO_SWR_UPFRONT")) {   /* PTV_NO_SWR_UPFRONT=1 reverts */
         int64_t as = 0;
         av_opt_get_int(a->fg_swr, "async", 0, &as);
         if (as && (ret = swr_set_compensation(a->fg_swr, 0, 0)) < 0)
