@@ -103,6 +103,7 @@ void *compositor_thread(void *arg)
     int     pd_log[PTV_MAX_INPUT] = {0};      /* 2.0.0 T-343: residence holds logged (the first 3 per slot) */
     int     res_home[PTV_MAX_INPUT];           /* 2.0.0 T-343b: the occupancy the slot settled at (-1 = not yet) */
     int64_t res_home_sum[PTV_MAX_INPUT] = {0}, res_home_n[PTV_MAX_INPUT] = {0};
+    int     res_hyst[PTV_MAX_INPUT] = {0};       /* 2.0.2 T-343: last residence step (+1 hold, -1 decimation) */
     int64_t sv_cnt[PTV_MAX_INPUT] = {0};      /* v0.9.13: genuine starvation dups (due but buffer empty) */
     int64_t md_cnt[PTV_MAX_INPUT] = {0};      /* v0.9.13: decimation drops (multiple frames due in one tick) */
     int64_t dmg_cr[PTV_MAX_INPUT] = {0};      /* T-350: the slot's corrupt-video count (demux + decode) last seen */
@@ -379,10 +380,18 @@ void *compositor_thread(void *arg)
                             break;
                         }
                     }
-                    if (resid && !qhot && hnow + half < res_due_us[k]) {
+                    /* 2.0.2 T-343: hysteresis. A hold leaves the slot's phase on the opposite edge (-half), a decimation
+                     * on +half: with the phase parked on that edge (the servo had just drained or filled a picture), the
+                     * +-1 picture occupancy jitter flipped the servo's trim every frame and each flip crossed it again —
+                     * a hold/decimate pair every ~2 ticks on a clean slot (mv05 slot 2: 367/367 in 100 s, phase pinned
+                     * at +-20.0 ms), a picture shown twice then one skipped, and with the audio follow a pad/drop pair.
+                     * The step back needs the phase a quarter tick past the edge; the re-base clamp moves with it. */
+                    int64_t hy_hold = g_mv_res_hyst && res_hyst[k] < 0 ? c->tick_dur_us / 4 : 0;
+                    int64_t hy_dec  = g_mv_res_hyst && res_hyst[k] > 0 ? c->tick_dur_us / 4 : 0;
+                    if (resid && !qhot && hnow + half + (cand ? -hy_dec : hy_hold) < res_due_us[k]) {
                         pending[k] = nx;                         /* residence hold: not due yet (deliberate pacing) */
                         if (!cand) {
-                            pd_cnt[k]++;
+                            pd_cnt[k]++; res_hyst[k] = 1;
                             /* 2.0.2 T-343: the cell repeats its picture = the slot's picture one tick later; its audio
                              * follows this at once (audio PLL), not over ~10 s of TRACK slew (the -30..-40 ms dip ~20 s
                              * after a mosaic start, after damage, after a join) */
@@ -397,7 +406,7 @@ void *compositor_thread(void *arg)
                         break;
                     }
                     if (cand) {                                  /* superseded within one tick (decimation) */
-                        av_frame_free(&cand); md_cnt[k]++;
+                        av_frame_free(&cand); md_cnt[k]++; res_hyst[k] = -1;
                         atomic_fetch_sub_explicit(&c->inputs[k].res_step_us, mv_tick_us(c, 1), memory_order_relaxed);   /* T-343 */
                     }
                     cand = nx;
@@ -438,7 +447,7 @@ void *compositor_thread(void *arg)
                                 dev = 0;
                             int64_t corr = (int64_t)dev * 1000;
                             corr = av_clip64(corr, -20000, 20000);
-                            res_due_us[k] = FFMAX(res_due_us[k], hnow - half)
+                            res_due_us[k] = FFMAX(res_due_us[k], hnow - half - hy_dec)
                                             + res_ema_us[k] - res_ema_us[k] * corr / 1000000;
                         }
                     } else break;                                /* residence off: exactly one pop per tick (legacy) */

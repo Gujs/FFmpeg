@@ -78,6 +78,7 @@ int     g_mv_clamp = 0;
  * bypasses the gate (pressure valve vs a wrong rate estimate). PTV_NO_RESIDENCE reverts. */
 int     g_mv_residence = 1;
 int     g_mv_res_follow = 1;     /* 2.0.2 T-343: a slot's audio follows each deliberate picture step at once (PTV_NO_RES_FOLLOW=1 off) */
+int     g_mv_res_hyst = 1;       /* 2.0.2 T-343: quarter-tick residence hysteresis, no hold/decimate chatter (PTV_NO_RES_HYST=1 off) */
 int     g_mv_res_deadband = 0;   /* 2.0.0 T-343: residence occupancy servo ±1 picture deadband — OPT-IN (PTV_RES_DEADBAND=1):
                                   * on, a slot ran −30 ms for 10 s after a flapping input (mv04 sync_flapping 6/6, off 0/2,
                                   * 2026-10-16); off = the pre21 servo (T-343's 40 ms step ~20 s after start stays open) */
@@ -7388,6 +7389,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_MV_EXACTTICK")) g_mv_exacttick = 0;  /* v0.9.12: revert mv measurement axes to integer tick (re-enables the enforced ~10ppm mosaic drift) */
     if (getenv("PTV_NO_RESIDENCE")) g_mv_residence = 0;
     if (getenv("PTV_NO_RES_FOLLOW")) g_mv_res_follow = 0;   /* 2.0.2 T-343 */
+    if (getenv("PTV_NO_RES_HYST")) g_mv_res_hyst = 0;       /* 2.0.2 T-343 */
     if (getenv("PTV_RES_DEADBAND") && atoi(getenv("PTV_RES_DEADBAND"))) g_mv_res_deadband = 1;   /* 2.0.0 T-343 (opt-in) */
     if (getenv("PTV_NO_RES_DEADBAND")) g_mv_res_deadband = 0;   /* 2.0.0 T-343 */     /* v0.9.13: revert to one-pop-per-tick (rate-mismatched slots batch dups + fast-forward after starvation) */
     if (getenv("PTV_NO_MV_REPRIME")) g_mv_reprime = 0;      /* 2.0.0 T-339 */

@@ -2408,6 +2408,7 @@ extern _Atomic int     g_corr_disarm_req[PTV_MAX_AUDIO]; /* master watchdog → 
  * is the §4.4 defense-in-depth for whatever the fix did not anticipate). */
 extern _Atomic int g_mv_slate_mask;
 extern int     g_mv_res_follow;   /* 2.0.2 T-343 */
+extern int     g_mv_res_hyst;     /* 2.0.2 T-343 */
 extern _Atomic int64_t g_mv_house_us;   /* 2.0.2 T-386: the compositor's output time of its current tick (us) */
 /* per-rung wire-send watermark (§3, owner-approved "build it"): wall µs of the last SUCCESSFUL
  * av_interleaved_write_frame on that rung — the only liveness signal that is actually the wire
