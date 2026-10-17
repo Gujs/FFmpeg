@@ -825,6 +825,45 @@ ffmpeg -i input.wav -c:a libfdk_aac -profile:a aac_he -b:a 64k output.m4a
 @end example
 @end itemize
 
+@section libfdk-xhe-aac
+
+libfdk-xhe-aac (Extended High-Efficiency Advanced Audio Coding) encoder wrapper.
+
+The libfdk-xhe-aac library is based on the Fraunhofer FDK Extended High
+Efficiency AAC Encoder Software code from the Android project.
+
+Requires the presence of the libfdk-xhe-aac headers and library during
+configuration. You need to explicitly configure the build with
+@code{--enable-libfdk-xhe-aac}. The library is also incompatible with GPL,
+so if you allow the use of GPL, you should configure with
+@code{--enable-gpl --enable-nonfree --enable-libfdk-xhe-aac}.
+
+@subsection Options
+
+The following are private options of the libfdk_xhe_aac encoder.
+
+@table @option
+@item vbr
+Set VBR mode, from 0 to 6. 0 is lowest quality and 6 is highest quality.
+A value of -1 will disable VBR, and CBR (Constant Bit Rate) is enabled.
+
+If not set, the default is CBR.
+
+@item live_loudness_level
+Set the expected loudness level of the stream, between -31 and -10
+dB LUFS. Defaults to -24 dB LUFS if not set.
+
+@item rap_length
+The duration between encoded Random Access Points in the bitstream.
+
+@item stream_id
+A unique ID of the encoded stream within an adaptation set. The ID
+is embedded into the encoded bitstream.
+
+If not set, the encoder tries to generate a hopefully unique ID for
+the stream.
+@end table
+
 @anchor{liblc3-enc}
 @section liblc3
 
@@ -1295,6 +1334,17 @@ Use the default huffman tables. This is the default strategy.
 Compute and use optimal huffman tables.
 
 @end table
+
+@item intra_dc_precision @var{integer}
+Set the precision of the DC coefficient minus 8. Valid range is 0 to 3.
+Higher values quantize DC more finely as the DC entry of the written
+quantization table is 8 >> @var{intra_dc_precision} so 3 gives a DC
+quantizer of 1. Default is 0 which keeps the previous fixed DC
+quantizer of 8.
+
+Combined with @code{-q:v 1} and an @code{intra_matrix} of all 8s,
+a value of 3 produces a quantization table of all ones.
+
 @end table
 
 @anchor{wavpackenc}

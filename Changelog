@@ -16,6 +16,9 @@ version <next>:
 - DSD (dsd_msbf) encoder
 - Rhetorex ADPCM decoder
 - ADPCM IMA Citrix decoder
+- Panasonic RW2 decoder
+- xHE-AAC encoding via libfdk-xhe-aac
+- jpegapp bitstream filter
 
 
 version 9.0:
