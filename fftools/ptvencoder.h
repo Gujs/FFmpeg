@@ -1823,6 +1823,9 @@ typedef struct DemuxArgs {
                                             * (wrap_*, edit_us, gap_vsnap, wall_cad_us, pkt_wall_gap_us,
                                             * disc) were sized for at open */
     int                   late_stream_max; /* 1.2.2 T-064: highest late-born stream index logged */
+    int64_t               v_last_wc;      /* 2.0.2 T-387: wall time of the last packet of the bound video stream */
+    int                   vmove_n;        /* ... video packets of a late-born video stream while the bound one is silent */
+    int                   vmove_force;    /* ... the video moved to a new PID: reopen now (single input: -> exit 4) */
     /* 2.0.0-pre17 T-348: AAC labels inside a PES. lavf labels the 2nd.. frames of a PES as the previous label
      * + 1024 / codecpar->sample_rate, the rate probed at open: after a 96 -> 48 kHz switch every frame read
      * 10.7 ms long and every PES label jumped +140 ms (aresample: drop, then pad — 4.8 s of silence in 26 s).
