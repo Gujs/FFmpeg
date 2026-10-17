@@ -5,6 +5,35 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.2-pre1 — 2.0.1-pre1 + a mosaic starts with a dead slot, mosaic picture steps keep lip sync, a video PID move recovers
+
+- **A mosaic starts without waiting for every slot, and a late slot joins without a restart (T-386).** Each slot
+  acquires on its own; `-start_on any` (mosaic default) starts when one slot is live and the others have had
+  `-slot_wait` (default 120 s; `-start_on all` / `-slot_wait inf` = the old behaviour). A slot not there yet shows
+  bars and carries a continuous silent audio track on its PID (no sync_check DEAD_AUDIO_TRACK); it does not freeze the
+  other slots' corrector. When its source arrives the slot binds in place: decoders opened on its own threads, its
+  jitter buffer primed, its audio continuing from the end of the silence (gap filled exactly), pictures in another
+  size scaled to the cell (a reshaped source through bwdif was memory-unsafe). 2.0.1: slot 2 60 s late = the whole
+  mosaic dark 61.5 s; slot 2 never = no output at all; production cor-2 Curiosity dark 12 h+. Now: output at
+  `-slot_wait`, the joiner in sync from its first picture. The wrapper (transcoder `ptv-202-wrapper`) no longer exits
+  2 for a mosaic slot without video at probe when ptvencoder is >= 2.0.2.
+- **A mosaic slot's sound follows its picture's residence steps at once (T-343).** The cadence servo shows a picture
+  twice (hold) or skips one (decimation) to keep a slot's jitter buffer at its depth; the slot's audio followed that
+  ±1 picture step only through the PLL's slow slew, so the slot read −30…−40 ms for ~10-13 s after each step: ~20 s
+  after a clean start (the gate's "multiview clean b −37 ms"), after damage, after a join. The audio now pads / drops
+  the same amount in whole audio frames at once (remainder carried). Residual: the step reaches the sound about one
+  jitter buffer (~1 s) after the picture — at most ~1 s at −40 ms instead of 10-13 s. `PTV_NO_RES_FOLLOW=1` reverts.
+- **No more hold/decimate chatter on clean mosaic slots (T-343).** After the servo had drained or filled a picture,
+  the slot's display phase sat exactly on the tick edge and the ±1 picture occupancy jitter flipped it every frame: a
+  picture shown twice then one skipped, every ~2 ticks, for minutes, on slots with a clean source (2.0.1 servo, clean
+  slots: up to 565 hold/skip pairs in 120 s). The step back now needs the phase a quarter tick past the edge
+  (hysteresis); one-way cadence patterns (25 in 29.97, 50 in 25) are unchanged. `PTV_NO_RES_HYST=1` reverts.
+- **A source that moves its video to a new PID recovers at once (T-387).** The demux saw the new video PID but kept
+  waiting on the silent old one: a single input was off air ~60 s (read timeout → LOST → RESHAPED → exit 4), a mosaic
+  cell stayed dark until a restart (cor-3 Curiosity Now 2026-10-08). Packets on a newly announced video PID while the
+  bound video has been silent >= 2 s (25 of them) force the reopen: single input exits 4 for the wrapper's re-probe
+  ~3 s after the move, a mosaic slot reopens and rejoins.
+
 ## 2.0.1-pre1 — 2.0.0-pre22 + A/V sync that never moves synced audio, the 2.0.0 triage residuals and the wrapper review
 
 - **A source audio relabel no longer moves synced audio (T-087, owner rule GOALS.md #3).** A backward audio label step is
