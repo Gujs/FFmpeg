@@ -104,6 +104,7 @@ void *compositor_thread(void *arg)
     int     res_home[PTV_MAX_INPUT];           /* 2.0.0 T-343b: the occupancy the slot settled at (-1 = not yet) */
     int64_t res_home_sum[PTV_MAX_INPUT] = {0}, res_home_n[PTV_MAX_INPUT] = {0};
     int     res_hyst[PTV_MAX_INPUT] = {0};       /* 2.0.2 T-343: last residence step (+1 hold, -1 decimation) */
+    int     res_ema_n[PTV_MAX_INPUT] = {0};      /* 2.0.2 T-343: cadence deltas accepted into res_ema_us */
     int64_t sv_cnt[PTV_MAX_INPUT] = {0};      /* v0.9.13: genuine starvation dups (due but buffer empty) */
     int64_t md_cnt[PTV_MAX_INPUT] = {0};      /* v0.9.13: decimation drops (multiple frames due in one tick) */
     int64_t dmg_cr[PTV_MAX_INPUT] = {0};      /* T-350: the slot's corrupt-video count (demux + decode) last seen */
@@ -386,6 +387,10 @@ void *compositor_thread(void *arg)
                      * a hold/decimate pair every ~2 ticks on a clean slot (mv05 slot 2: 367/367 in 100 s, phase pinned
                      * at +-20.0 ms), a picture shown twice then one skipped, and with the audio follow a pad/drop pair.
                      * The step back needs the phase a quarter tick past the edge; the re-base clamp moves with it. */
+                    /* at the house rate: the cadence estimate converged (>= 64 accepted deltas — it is seeded at the
+                     * house rate, and a 59.94 slot in a 29.97 house sits on its acceptance band's edge and never moves
+                     * it) and within 2 % of the tick */
+                    int     res_matched = res_ema_n[k] >= 64 && FFABS(res_ema_us[k] - c->tick_dur_us) * 50 < c->tick_dur_us;
                     int64_t hy_hold = g_mv_res_hyst && res_hyst[k] < 0 ? c->tick_dur_us / 4 : 0;
                     int64_t hy_dec  = g_mv_res_hyst && res_hyst[k] > 0 ? c->tick_dur_us / 4 : 0;
                     if (resid && !qhot && hnow + half + (cand ? -hy_dec : hy_hold) < res_due_us[k]) {
@@ -394,8 +399,12 @@ void *compositor_thread(void *arg)
                             pd_cnt[k]++; res_hyst[k] = 1;
                             /* 2.0.2 T-343: the cell repeats its picture = the slot's picture one tick later; its audio
                              * follows this at once (audio PLL), not over ~10 s of TRACK slew (the -30..-40 ms dip ~20 s
-                             * after a mosaic start, after damage, after a join) */
-                            atomic_fetch_add_explicit(&c->inputs[k].res_step_us, mv_tick_us(c, 1), memory_order_relaxed);
+                             * after a mosaic start, after damage, after a join). Only on a slot at the house rate: on a
+                             * rate-converted slot the holds / decimations ARE its cadence (25 in 29.97 holds ~5 times a
+                             * second, 59.94 in 29.97 decimates every tick) and move nothing — followed, they padded /
+                             * dropped its sound several times a second (mv02 1x2 29.97: picture with no sound) */
+                            if (res_matched)
+                                atomic_fetch_add_explicit(&c->inputs[k].res_step_us, mv_tick_us(c, 1), memory_order_relaxed);
                         }
                         if (!cand && tick > 50 && pd_log[k] < 3) {   /* T-343: a matched-rate slot should never hold */
                             pd_log[k]++;
@@ -407,7 +416,8 @@ void *compositor_thread(void *arg)
                     }
                     if (cand) {                                  /* superseded within one tick (decimation) */
                         av_frame_free(&cand); md_cnt[k]++; res_hyst[k] = -1;
-                        atomic_fetch_sub_explicit(&c->inputs[k].res_step_us, mv_tick_us(c, 1), memory_order_relaxed);   /* T-343 */
+                        if (res_matched)                         /* T-343 */
+                            atomic_fetch_sub_explicit(&c->inputs[k].res_step_us, mv_tick_us(c, 1), memory_order_relaxed);
                     }
                     cand = nx;
                     if (resid) {
@@ -420,8 +430,10 @@ void *compositor_thread(void *arg)
                              * which over-holds, which overflows the buffer, which drops more frames:
                              * a runaway (v1 of this gate ratcheted sk to +23s exactly this way). */
                             int64_t d = src - res_src_us[k];
-                            if (d > res_ema_us[k] / 2 && d < res_ema_us[k] * 2)
+                            if (d > res_ema_us[k] / 2 && d < res_ema_us[k] * 2) {
                                 res_ema_us[k] += (d - res_ema_us[k]) / 16;
+                                if (res_ema_n[k] < 64) res_ema_n[k]++;
+                            }
                             /* hard bounds: 3x house tick covers 10fps..90fps sources in a 29.97 house */
                             res_ema_us[k] = av_clip64(res_ema_us[k], c->tick_dur_us / 3, c->tick_dur_us * 3);
                         }
