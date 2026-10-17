@@ -5,7 +5,7 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
-## 2.0.2-pre3 — 2.0.2-pre2 with the A/V corrector engaging at 40 ms (was 80)
+## 2.0.2-pre3 — 2.0.2-pre2 with the A/V corrector engaging at 40 ms (was 80) + a decoder error no longer ends the channel (T-390)
 
 - **The corrector engages at 40 ms (T-391, owner 2026-10-17).** At 80 ms a steady residual of 46-75 ms was never corrected
   (fleet, 245 single-input channels: Euronews +46, DiverCity −68, Racer_Select −71, Fé_TV −75 ms) — visible to attentive
@@ -13,6 +13,13 @@ the v2 `0001` patch (additive, travels with the source to the build box).
   5 min + 3 min without source events; the corrector steers to ±20 ms and parks, so 40 leaves 20 ms between the two
   (no engage / park cycling for the 12 channels at 20-40 ms). The re-anchor paths keep 80 ms. `PTV_RSCORR_ENGAGE_MS=80`
   reverts.
+- **A video decoder error no longer ends the channel (T-390).** An error the decoder reports when a frame comes out (frame
+  threading returns a damaged frame's error there) ended the decode thread, and with it the whole run: a clean `done`, exit 0,
+  no reason logged, ~0.5 s after a long stall's damaged return. Fleet: 8 cases in 10 days (cor-1 Fintech_247 ×5, glo-2
+  EMBED-Fintech, cor-1 Western_Bound_Portugues, glo-1 TV_Mundial), each a wrapper restart with a dark spell. Now
+  `[PTV-VDEC] in0 decoder error on output (...) — frame lost, decoding continues`, counted as damage like an input-side
+  error (the ffmpeg CLI does the same). A live input whose decoder does stop now says so (`[PTV-SRC] ... the video decoder
+  stopped`). Localized by code-path elimination; the production trigger has no local repro yet — the new line names it.
 
 ## 2.0.2-pre2 — 2.0.2-pre1 with the mosaic audio follow OFF (canary regression) + the relabel-check fix (T-391)
 

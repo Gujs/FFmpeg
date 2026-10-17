@@ -367,6 +367,10 @@ int     g_muxtest_back_type = AVMEDIA_TYPE_AUDIO; /* TEST ONLY (pre27 #62 GH gat
  * upstream and the CC tap never sees them (measured, -8.0s jump -> applied_offset 7.829s,
  * reset=0). 0 = off (default), and the whole path is then byte-inert. */
 int64_t g_cctest_rebase_at_us = 0;
+int     g_test_vdec_rferr = 0;     /* TEST ONLY (T-390): PTV_TEST_VDEC_RFERR_EVERY=N makes every Nth
+                                        * avcodec_receive_frame() of the video decoder report
+                                        * AVERROR_INVALIDDATA (the frame is dropped) — the production
+                                        * trigger (a damaged return after a long stall) has no repro yet */
 int     g_cctest_corrupt = 0;      /* TEST ONLY (F6 gate): PTV_CCTEST_CORRUPT_EVERY=N marks every Nth
                                         * decoded video frame AV_FRAME_FLAG_CORRUPT, which is the one
                                         * thing a file fixture cannot produce on demand (real slice
@@ -3367,6 +3371,7 @@ static void *decode_thread(void *arg)
     int64_t hb_t0 = av_gettime_relative();   /* 1.0.1-pre21: heartbeat + test-stall runtime anchor */
     int     hb_test_done = 0;
     int64_t cctest_seen = 0;   /* TEST ONLY (F6 gate): frames seen, for PTV_CCTEST_CORRUPT_EVERY */
+    int64_t rferr_n = 0, rferr_seen = 0;   /* 2.0.2 T-390: decoder output errors (+ the test counter) */
 
     if (!frame || !filt)
         goto done;
@@ -3723,8 +3728,27 @@ static void *decode_thread(void *arg)
         while (ret >= 0) {
             PTV_HB_VDEC(d->hb_slot, PTV_HB_VDEC_RECVFRAME);
             ret = avcodec_receive_frame(d->vdec, frame);
+            if (g_test_vdec_rferr && ret >= 0 && ++rferr_seen % g_test_vdec_rferr == 0) {
+                av_frame_unref(frame);
+                ret = AVERROR_INVALIDDATA;                    /* TEST ONLY (T-390) */
+            }
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) { ret = 0; break; }
-            if (ret < 0) goto done;
+            if (ret < 0) {
+                /* 2.0.2 T-390: a decode error reported on the OUTPUT side (frame threading returns a
+                 * frame's error here) ended this thread, closed video_q and with it the demux loop:
+                 * a clean 'done' + exit 0 with no reason logged, ~0.5 s after a long stall's damaged
+                 * return (fleet: glo-1 TV_Mundial, cor-1 Fintech_247 ×5 in 10 days, glo-2 EMBED-Fintech,
+                 * cor-1 Western_Bound). The ffmpeg CLI logs it and goes on; so do we: damage evidence
+                 * like a send_packet error, the frame is lost, decoding continues. */
+                atomic_store_explicit(&g_vdmg_wc, av_gettime_relative(), memory_order_relaxed);
+                atomic_store_explicit(&g_vcorrupt_wc, av_gettime_relative(), memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_vcorrupt_n, 1, memory_order_relaxed);
+                if (++rferr_n <= 3 || !(rferr_n % 100))
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-VDEC] in%d decoder error on output (%s) — frame lost, "
+                           "decoding continues (%"PRId64" so far)\n", d->hb_slot, av_err2str(ret), rferr_n);
+                ret = 0;
+                break;
+            }
             if (frame->decode_error_flags) { /* 2.0.0-pre9.4: concealed / missing slices = damage evidence */
                 atomic_store_explicit(&g_vdmg_wc, av_gettime_relative(), memory_order_relaxed);
                 atomic_store_explicit(&g_vcorrupt_wc, av_gettime_relative(), memory_order_relaxed);
@@ -7325,6 +7349,12 @@ int main(int argc, char **argv)
           av_log(NULL, AV_LOG_WARNING,
                  "[PTV-CCTEST] PTV_CCTEST_REBASE_AT_S=%s — ONE forced subtitle baseline rebase "
                  "at that output time. TEST ONLY: never set this in production.\n", s);
+      } }
+    { const char *s = getenv("PTV_TEST_VDEC_RFERR_EVERY");                                                     /* TEST ONLY (T-390) */
+      if (s && atoi(s) > 0) {
+          g_test_vdec_rferr = atoi(s);
+          av_log(NULL, AV_LOG_WARNING, "[PTV-TEST] every %dth video decoder output reports an error — TEST ONLY\n",
+                 g_test_vdec_rferr);
       } }
     { const char *s = getenv("PTV_CCTEST_CORRUPT_EVERY");                                                      /* TEST ONLY (F6 gate) */
       if (s && atoi(s) > 0) {

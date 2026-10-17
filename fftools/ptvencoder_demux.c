@@ -4636,8 +4636,12 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                         }
                         av_packet_free(&out);
                         ret = 0;
-                    } else if (ret < 0)
+                    } else if (ret < 0) {
                         av_packet_free(&out);       /* queue closed */
+                        if (d->reopen)              /* 2.0.2 T-390: a live input never ends silently */
+                            av_log(NULL, AV_LOG_ERROR, "[PTV-SRC] in%d the video decoder stopped (%s) — "
+                                   "the input ends\n", d->rsync_slot, av_err2str(ret));
+                    }
                 }
             } else
                 ret = demux_send(d->video_q, out, d->drop, &d->vdrop);
