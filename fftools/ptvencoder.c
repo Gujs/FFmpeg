@@ -3303,6 +3303,47 @@ static void video_out_xo(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
     video_out(d, frame, filt);
 }
 
+/* 2.0.2 T-386: the slot's late bind, on its decode thread — the real decoder replaces the geometry-only placeholder
+ * context (the compositor's cell geometry stays: a joiner in another size is normalised there) */
+static void slot_bind_video(DecodeCtx *d, AVPacket *pkt)
+{
+    PtvSlotBind *b = pkt->opaque;
+    const AVCodec *vd;
+    AVCodecContext *nc = NULL;
+    int ret;
+
+    pkt->opaque = NULL;
+    if (!b)
+        return;
+    if (!(vd = avcodec_find_decoder(b->par->codec_id)) || !(nc = avcodec_alloc_context3(vd)) ||
+        avcodec_parameters_to_context(nc, b->par) < 0) {
+        av_log(NULL, AV_LOG_ERROR, "[PTV-BIND] in%d: no video decoder for %s — the cell stays on its placeholder\n",
+               d->hb_slot, avcodec_get_name(b->par->codec_id));
+        goto done;
+    }
+    nc->pkt_timebase = b->tb;
+    if ((ret = avcodec_open2(nc, vd, NULL)) < 0) {
+        av_log(NULL, AV_LOG_ERROR, "[PTV-BIND] in%d: open video decoder %s: %s\n", d->hb_slot, vd->name, av_err2str(ret));
+        goto done;
+    }
+    if (d->in) {
+        avcodec_free_context(&d->in->vdec);
+        d->in->vdec   = nc;
+        d->in->ist_tb = b->tb;
+    }
+    d->vdec   = nc;
+    d->ist_tb = b->tb;
+    if (b->avg.num > 0 && b->avg.den > 0)
+        d->in_pps_decl = (int)(av_q2d(b->avg) + 0.5);
+    av_log(NULL, AV_LOG_INFO, "[PTV-BIND] in%d video %s %dx%d decoder open (slot %d)\n", d->hb_slot, vd->name,
+           b->par->width, b->par->height, d->hb_slot);
+    nc = NULL;
+done:
+    avcodec_free_context(&nc);
+    avcodec_parameters_free(&b->par);
+    av_free(b);
+}
+
 static void *decode_thread(void *arg)
 {
     DecodeCtx *d = arg;
@@ -3563,6 +3604,11 @@ static void *decode_thread(void *arg)
                 av_usleep(5000);
             }
             if (ret < 0) break;
+        }
+        if (pkt->flags & PTV_PKT_FLAG_SLOT_BIND) {      /* 2.0.2 T-386: a deferred slot bound — open its decoder */
+            slot_bind_video(d, pkt);
+            av_packet_free(&pkt);
+            continue;
         }
         /* 1.0.1-pre21 TEST-ONLY stall injection (PTV_TEST_VDEC_STALL_S): once, after 60s of
          * runtime (1.0.1-pre23: PTV_TEST_VDEC_STALL_AT_S overrides the trigger — AT 0 the
@@ -4687,6 +4733,12 @@ static int input_acquire(Input *in, int idx, const AVDictionary *opts)
     ret = input_acquire_loop(in, idx, opts, 0);
     atomic_store_explicit(&g_acq_since, 0, memory_order_relaxed);
     return ret;
+}
+
+/* 2.0.2 T-386: a deferred slot's acquire, on its demux thread (blocks until the source is live; -t / EOF stop it) */
+int ptv_slot_acquire(struct Input *in, int idx)
+{
+    return input_acquire_loop(in, idx, in->da.reopen_opts, 1);
 }
 
 /* 2.0.2 T-386 (spec §4, E13): one mosaic slot's acquire thread. Once LIVE it waits for the start; a slot that has been
@@ -5917,6 +5969,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         }
         a->ist_pkt_tb = ktb;
         a->slot_deferred = spec->deferred;          /* 2.0.2 T-386: silent until the slot binds */
+        av_strlcpy(a->bind_spec, spec->bind_spec, sizeof a->bind_spec);
         if (af && build_audio_filter(a, a->dec, ktb, af, sfmt) < 0) {
             av_log(NULL, AV_LOG_WARNING, "audio track %d filtergraph failed; plain resample\n", k);
             avfilter_graph_free(&a->afg); a->use_fg = 0;
@@ -6285,6 +6338,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
      * decode stages into hold; the compositor owns the graph + frame_q fan. */
     for (k = 0; k < n_input; k++) {
         DecodeCtx *d = &inputs[k].dc;
+        d->in = &inputs[k];                              /* 2.0.2 T-386 */
         d->video_q = inputs[k].video_q; d->vdec = inputs[k].vdec; d->ist_tb = inputs[k].ist_tb;
         d->hc_last_pts = AV_NOPTS_VALUE;   /* 2.0.0 T-324 */
         d->h0 = &inputs[k].h0; d->h0_lock = &inputs[k].h0_lock; d->live = live;
@@ -6415,6 +6469,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
     }
     for (kk = 0; kk < n_input; kk++) {           /* per-input demux args (pass/n_pass set in copy loop) */
         DemuxArgs *d = &inputs[kk].da;
+        d->in = &inputs[kk];                            /* 2.0.2 T-386 */
         d->ifmt = inputs[kk].ifmt; d->video_q = inputs[kk].video_q;
         d->vstream = inputs[kk].vstream; d->drop = is_net_url(inputs[kk].url); d->n_out = n_rung;
         d->h0 = &inputs[kk].h0; d->h0_lock = &inputs[kk].h0_lock; d->house_skew = &inputs[kk].house_skew;
@@ -6453,6 +6508,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         for (k = 0; k < n_audio; k++)
             if (asrc_in[k] == kk) {
                 d->audio_q[d->n_audio] = audio_q[k]; d->astream[d->n_audio] = asrc[k];
+                av_strlcpy(d->abind[d->n_audio], as[k].bind_spec, sizeof d->abind[0]);   /* 2.0.2 T-386 */
                 d->aglue_exp_step[d->n_audio] = &inputs[kk].aglue_exp_step[k];   /* pre5 (D1): write side of the */
                 d->aglue_exp_dl[d->n_audio]   = &inputs[kk].aglue_exp_dl[k];     /* expected-step handshake      */
                 d->aglobal[d->n_audio] = k;   /* pre15: global track index — keys the per-track

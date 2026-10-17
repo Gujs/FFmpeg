@@ -4224,6 +4224,45 @@ static int slot_pump(AudioState *a)
     return ret;
 }
 
+/* 2.0.2 T-386: the slot bound — its real decoder replaces the stand-in (the converter in front of the fixed graph
+ * input re-forms from the first clean frames if the source is not 48 kHz stereo: [PTV-AFMT]) */
+static void slot_bind_audio(AudioState *a, AVPacket *pkt)
+{
+    PtvSlotBind *b = pkt->opaque;
+    const AVCodec *c;
+    AVCodecContext *nc = NULL;
+    int ret;
+
+    pkt->opaque = NULL;
+    if (!b)
+        return;
+    if (!(c = avcodec_find_decoder(b->par->codec_id)) || !(nc = avcodec_alloc_context3(c)) ||
+        avcodec_parameters_to_context(nc, b->par) < 0) {
+        av_log(NULL, AV_LOG_ERROR, "[PTV-BIND] a%d(in%d): no decoder for %s — the track stays silent\n",
+               a->dbg_k, a->dbg_in, avcodec_get_name(b->par->codec_id));
+        goto done;
+    }
+    nc->pkt_timebase = b->tb;
+    ptv_adec_opts(nc);
+    if ((ret = avcodec_open2(nc, c, NULL)) < 0) {
+        av_log(NULL, AV_LOG_ERROR, "[PTV-BIND] a%d(in%d): open %s: %s — the track stays silent\n",
+               a->dbg_k, a->dbg_in, c->name, av_err2str(ret));
+        goto done;
+    }
+    avcodec_free_context(&a->dec);
+    a->dec = nc;
+    a->ist_tb = a->ist_pkt_tb = b->tb;
+    if (a->ist_par)
+        avcodec_parameters_copy(a->ist_par, b->par);
+    av_log(NULL, AV_LOG_INFO, "[PTV-BIND] a%d(in%d) decoder %s %d Hz %dch open — silence until its first frame anchors\n",
+           a->dbg_k, a->dbg_in, c->name, b->par->sample_rate, b->par->ch_layout.nb_channels);
+    nc = NULL;
+done:
+    avcodec_free_context(&nc);
+    avcodec_parameters_free(&b->par);
+    av_free(b);
+}
+
 static int audio_anchor_and_feed(AudioState *a, AVFrame *frame, int64_t h0)
 {
     int64_t ts = frame->best_effort_timestamp;
@@ -4232,6 +4271,45 @@ static int audio_anchor_and_feed(AudioState *a, AVFrame *frame, int64_t h0)
         int64_t house_us = av_rescale_q(ts, a->ist_tb, AV_TIME_BASE_Q) - h0;
         int64_t fill_us  = 0;
         if (house_us < 0) { a->anchor_drop_pre++; return 0; }   /* audio precedes video anchor: drop */
+        if (a->slot_deferred) {
+            /* 2.0.2 T-386: a joining slot — the silence covered house 0 .. pump_next; real audio continues from there:
+             * a frame before it is dropped, a gap after it is filled (from the silence's end, not from house 0) */
+            int64_t pump_us = av_rescale(a->pump_next, 1000000, a->out_rate);
+            if (house_us < pump_us) { a->anchor_drop_pre++; return 0; }
+            a->slot_deferred = 0;
+            if (house_us > pump_us && frame->sample_rate > 0 && frame->nb_samples > 0) {
+                int64_t dur_us = av_rescale(frame->nb_samples, 1000000, frame->sample_rate);
+                int     nfill  = (int)((house_us - pump_us) / dur_us), i, ret = 0;
+                int64_t src_us = av_rescale_q(ts, a->ist_tb, AV_TIME_BASE_Q);
+                /* continuous from the silence's end: whole-frame gaps are filled, the sub-frame rest (< one frame,
+                 * measured 8 ms) is not written as a timestamp step (output linearity, GOALS.md #1) */
+                a->next_pts = a->pump_next;
+                a->pts_set  = 1;
+                a->dbg_first_src = ts;
+                av_log(NULL, AV_LOG_WARNING, "[PTV-ANCHOR] a%d(in%d) joined at house %.3f s (silence to %.3f s, "
+                       "%d fill frame(s))\n", a->dbg_k, a->dbg_in, house_us / 1e6, pump_us / 1e6, nfill);
+                for (i = nfill; i > 0 && ret >= 0; i--) {
+                    AVFrame *sf = av_frame_alloc();
+                    if (!sf) break;
+                    sf->nb_samples = frame->nb_samples; sf->format = frame->format; sf->sample_rate = frame->sample_rate;
+                    av_channel_layout_copy(&sf->ch_layout, &frame->ch_layout);
+                    if (av_frame_get_buffer(sf, 0) >= 0) {
+                        av_samples_set_silence(sf->data, 0, sf->nb_samples, sf->ch_layout.nb_channels, sf->format);
+                        sf->pts = sf->best_effort_timestamp = av_rescale_q(src_us - i * dur_us, AV_TIME_BASE_Q, a->ist_tb);
+                        ret = audio_feed(a, sf);
+                    }
+                    av_frame_free(&sf);
+                }
+                if (ret < 0) return ret;
+                return audio_feed(a, frame);
+            }
+            a->next_pts = a->pump_next;
+            a->pts_set  = 1;
+            a->dbg_first_src = ts;
+            av_log(NULL, AV_LOG_WARNING, "[PTV-ANCHOR] a%d(in%d) joined at house %.3f s (silence to %.3f s)\n",
+                   a->dbg_k, a->dbg_in, house_us / 1e6, pump_us / 1e6);
+            return audio_feed(a, frame);
+        }
         /* 1.0.1 ANCHOR HEAD-FILL (PTV_NO_ANCHOR_HEADFILL=1 reverts): when the source's audio
          * HEAD is missing (first kept audio starts >200ms after h0, or the pre-h0 ring
          * overflowed so the kept head is not the true head), the track's first packet used
@@ -4984,6 +5062,11 @@ void *audio_thread(void *arg)
              * a reopen every 45s of a fill phase). */
             av_packet_free(&pkt);
             nbs_fill_quantum(a);
+            continue;
+        }
+        if (pkt && (pkt->flags & PTV_PKT_FLAG_SLOT_BIND)) {   /* 2.0.2 T-386: the slot bound — open its real decoder */
+            slot_bind_audio(a, pkt);
+            av_packet_free(&pkt);
             continue;
         }
         if (pkt && (pkt->flags & PTV_PKT_FLAG_SLOT_FILL)) {   /* 2.0.2 T-386: a deferred slot's silence, not a packet */

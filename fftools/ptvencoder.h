@@ -278,6 +278,8 @@ typedef struct DlvGate {
 #define PTV_PKT_FLAG_HOLD_FILL (1 << 17)  /* 2.0.0-pre6: hold-fill sentinel (master output thread → audio_q) */
 #define PTV_PKT_FLAG_RELABEL (1 << 18)    /* 2.0.1 T-087: the first audio packet after an audio-first backward erase (demux) */
 #define PTV_PKT_FLAG_SLOT_FILL (1 << 19)  /* 2.0.2 T-386: a deferred mosaic slot's track: encode silence up to g_mv_house_us */
+#define PTV_PKT_FLAG_SLOT_BIND (1 << 20)  /* 2.0.2 T-386: a deferred slot bound — pkt->opaque = PtvSlotBind (receiver frees) */
+typedef struct PtvSlotBind { AVCodecParameters *par; AVRational tb, avg; } PtvSlotBind;
 
 /* A/V PLL redesign Phase A probe (always built; feeds the [PTV-AVSYNC] offset=): per-input ring recording, for each DISTINCT
  * video content the cell displayed, the output time it went out at — (abs source pts → out_v, both
@@ -762,6 +764,7 @@ typedef struct PtvTsOutlier {
     int64_t wrap_dw;        /* 2.0.1 T-320: the wrap step the LAST packet took (0 = none) — undone if it was an outlier */
 } PtvTsOutlier;
 
+struct Input;                                  /* 2.0.2 T-386: back-pointers for the late bind */
 typedef struct DecodeCtx {
     AVThreadMessageQueue *video_q;            /* demux -> decode (AVPacket*) */
     AVCodecContext  *vdec;
@@ -838,6 +841,7 @@ typedef struct DecodeCtx {
     int64_t          vgop_last_key_dts;    /* dts of the last KEY packet popped */
     int              vgop_key_seen;        /* first key seen (0 until then) */
     CcTap            cc;                   /* -cc_extract: EIA-608 tap (off = byte-inert) */
+    struct Input    *in;                      /* 2.0.2 T-386: its input (the late bind swaps in the real decoder) */
 } DecodeCtx;
 
 /* Per-rung output side: pop this rung's frame_q on the house clock, stamp the
@@ -1453,6 +1457,7 @@ typedef struct AudioState {
                                                   * carries silence on the house axis until the slot binds */
     int64_t          pump_next;                   /* 2.0.2 T-386: next silent sample of a deferred track (output
                                                   * samples, the house axis: 0 = the first tick) */
+    char             bind_spec[32];               /* 2.0.2 T-386: a deferred slot's -map specifier */
 } AudioState;
 
 /* ---- demux + mux ---- */
@@ -1929,6 +1934,8 @@ typedef struct DemuxArgs {
     int64_t               vcorrupt;       /* video packets flagged AV_PKT_FLAG_CORRUPT (discarded if g_discardcorrupt) */
     pthread_mutex_t       pass_lock;        /* 2.0.0-pre6: copy state shared with the master's AC-3 fill */
     VOutRing             *mv_vring;         /* 2.0.0 T-342: multiview — this slot's displayed content ring (sparse copies) */
+    struct Input    *in;                      /* 2.0.2 T-386: its input (a deferred slot acquires + binds here) */
+    char             abind[PTV_MAX_AUDIO][32];  /* ... each track's -map specifier, resolved at the bind */
 } DemuxArgs;
 
 /* One source input. Single-input uses inputs[0]; multiview uses 1/2/4. Each has
@@ -2506,6 +2513,7 @@ int build_audio_filter(AudioState *a, AVCodecContext *adec, AVRational tb,
 /* ptvencoder_demux.c */
 void *demux_thread(void *arg);
 int ptv_disc_init(PtvDiscBuf *b, int capacity, int nb_streams);
+int ptv_slot_acquire(struct Input *in, int idx);   /* 2.0.2 T-386 */
 void ptv_disc_free(PtvDiscBuf *b);
 /* ptvencoder_mv.c */
 void *compositor_thread(void *arg);

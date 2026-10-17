@@ -9,6 +9,7 @@
 #include "libavutil/log.h"
 #include "libavutil/opt.h"
 #include "libavutil/time.h"
+#include "libswscale/swscale.h"
 #include "libavutil/parseutils.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/crc.h"
@@ -93,6 +94,8 @@ void *compositor_thread(void *arg)
     int64_t  reprime_us[PTV_MAX_INPUT] = {0}; /* 2.0.0 T-339: wall time the returning slot's first frame was queued */
     int64_t  mv_fill_us[PTV_MAX_INPUT][PTV_MAX_AUDIO] = {{0}};   /* T-093 part 2: last fill sentinel per slot track */
     int64_t  mv_pump_us[PTV_MAX_INPUT] = {0};   /* 2.0.2 T-386: last silence sentinel per deferred slot */
+    struct SwsContext *norm_sws[PTV_MAX_INPUT] = {0};   /* 2.0.2 T-386: frames in another geometry than the cell's */
+    int      norm_logged[PTV_MAX_INPUT] = {0};
     int64_t res_due_us[PTV_MAX_INPUT] = {0};  /* v0.9.13 residence: house-time the next pop is allowed (0 = immediate) */
     int64_t res_ema_us[PTV_MAX_INPUT];        /* v0.9.13: EMA of content deltas = the slot's smoothed cadence */
     int64_t res_src_us[PTV_MAX_INPUT];        /* v0.9.13: content time (us) of the last popped frame */
@@ -344,9 +347,13 @@ void *compositor_thread(void *arg)
                     dmg_cr[k] = cr; dmg_wc[k] = now_us;
                     atomic_store_explicit(&g_mv_vdmg_wc[k], now_us, memory_order_relaxed);
                 }
-                if (resid && g_mv_reprime && last_fresh_us[k] && (slated[k] || now_us - last_fresh_us[k] > 500000 ||
+                /* 2.0.2 T-386: a slot joining late primes the same way before its first picture (measured without: it
+                 * showed from an empty buffer and the servo held a picture four times in 60 s, each a -40 ms step its
+                 * sound slewed back over ~15 s) */
+                if (resid && g_mv_reprime && (c->inputs[k].deferred ||
+                    (last_fresh_us[k] && (slated[k] || now_us - last_fresh_us[k] > 500000 ||
                     (dmg_wc[k] && now_us - dmg_wc[k] < 5000000 &&
-                     (reprime_us[k] || av_thread_message_queue_nb_elems(h->q) < res_ctr - 2)))) {
+                     (reprime_us[k] || av_thread_message_queue_nb_elems(h->q) < res_ctr - 2)))))) {
                     int occ = av_thread_message_queue_nb_elems(h->q);
                     if (occ && !reprime_us[k])
                         reprime_us[k] = now_us;
@@ -438,6 +445,11 @@ void *compositor_thread(void *arg)
                 f = cand;                                 /* for the re-anchor diag below */
                 if (last[k]) av_frame_free(&last[k]);
                 last[k] = cand; any_fresh = 1; last_fresh_us[k] = now_us;
+                if (c->inputs[k].deferred) {             /* 2.0.2 T-386: the slot's first picture — it joins here */
+                    c->inputs[k].deferred = 0;
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-MV] in%d joined: first picture at tick %"PRId64" (%.3f s)\n",
+                           k, tick, mv_tick_us(c, tick) / 1e6);
+                }
                 if (!born[k]) {                           /* pre17: first display — the slot is live;
                                                            * clear its BIRTH slate-mask bit */
                     born[k] = 1;
@@ -781,6 +793,39 @@ void *compositor_thread(void *arg)
                     st = blackf[k] ? av_frame_clone(blackf[k]) : NULL;
             }
             if (!st) continue;
+            /* 2.0.2 T-386: the slot's buffersrc was configured for blackf's geometry (its own probe, or the first live
+             * sibling's for a slot that joined later). A frame in another size passes buffersrc with only a warning
+             * and bwdif / yadif then read it with the configured size — memory-unsafe (also a slot that reopened on a
+             * reshaped source). Such a frame is scaled to the cell's geometry. */
+            if (blackf[k] && (st->width != blackf[k]->width || st->height != blackf[k]->height ||
+                              st->format != blackf[k]->format)) {
+                AVFrame *nf = av_frame_alloc();
+                norm_sws[k] = sws_getCachedContext(norm_sws[k], st->width, st->height, st->format,
+                                                   blackf[k]->width, blackf[k]->height, blackf[k]->format,
+                                                   SWS_BICUBIC, NULL, NULL, NULL);
+                if (!norm_logged[k]) {
+                    norm_logged[k] = 1;
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-MV] in%d pictures are %dx%d %s, its cell %dx%d %s — scaled to the "
+                           "cell\n", k, st->width, st->height, av_get_pix_fmt_name(st->format) ? av_get_pix_fmt_name(st->format) : "?",
+                           blackf[k]->width, blackf[k]->height,
+                           av_get_pix_fmt_name(blackf[k]->format) ? av_get_pix_fmt_name(blackf[k]->format) : "?");
+                }
+                if (nf && norm_sws[k]) {
+                    nf->width = blackf[k]->width; nf->height = blackf[k]->height; nf->format = blackf[k]->format;
+                    if (av_frame_get_buffer(nf, 0) >= 0 && av_frame_copy_props(nf, st) >= 0 &&
+                        sws_scale(norm_sws[k], (const uint8_t * const *)st->data, st->linesize, 0, st->height,
+                                  nf->data, nf->linesize) > 0) {
+                        av_frame_free(&st);
+                        st = nf; nf = NULL;
+                    }
+                }
+                av_frame_free(&nf);
+                if (st->width != blackf[k]->width || st->height != blackf[k]->height || st->format != blackf[k]->format) {
+                    av_frame_free(&st);                  /* could not normalise: never feed it */
+                    st = av_frame_clone(blackf[k]);
+                    if (!st) continue;
+                }
+            }
             st->pts = tick; st->pkt_dts = AV_NOPTS_VALUE;
             /* v0.9.16: add_frame consumes only the REFERENCE (frame reset, struct still ours) —
              * the clone shell must be freed on success too, else 448B leak per slot per tick
@@ -965,6 +1010,7 @@ void *compositor_thread(void *arg)
     }
 
     for (k = 0; k < n; k++) { int fr = av_buffersrc_add_frame(c->fsrc[k], NULL); (void)fr; }   /* flush graph */
+    for (k = 0; k < n; k++) sws_freeContext(norm_sws[k]);   /* 2.0.2 T-386 */
     for (r = 0; r < R; r++)
         while (av_buffersink_get_frame(c->fsink[r], filt) >= 0) {
             AVFrame *out = av_frame_alloc();
