@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.0-pre22"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.1-pre1"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -124,6 +124,8 @@ int64_t g_novideo_exit_us = 300LL * 1000000; /* 1.0.1-pre23 startup sanity rider
                                            * wedged forever-startup — the probe-OK-never-decodes silent state, #60 arm D).
                                            * PTV_NOVIDEO_EXIT_S overrides; 0 disables. */
 int     g_pestail = 1;             /* 2.0.0-pre4c: see ptvencoder_demux.c (PES-TAIL carry) */
+int     g_rlcheck = 1;             /* 2.0.1 T-087: content check of a backward audio erase (PTV_NO_RLCHECK=1 off) */
+int     g_voutlier = 1;            /* 2.0.1 T-383: one-picture timestamp outlier restamped (PTV_NO_VOUTLIER=1 off) */
 int     g_wallev = 1;              /* 1.0.1-pre24 #63 WALL-EVIDENCE SPLIT (the corrupt-storm desync class): every
                                            * erase engine splits a forward label step J into W = wall-absence-evidenced
                                            * portion (real missing content → PAD) and J−W = flowing/relabel portion
@@ -274,7 +276,7 @@ int ptv_vmap_newest(int64_t since_wc, int64_t *src_us, int64_t *out_us)
  * was never shown (skipped, erased, lost in an outage); 0 = not yet (or nothing recorded); -1 = c_us is older than everything held by > 1 s. */
 int ptv_vmap_lookup(int64_t c_us, int64_t *out_us, int64_t *gap_us)
 {
-    int k, i, hit = -1, ret;
+    int k, i, hit = -1, ret, newest, held = 0;
     pthread_mutex_lock(&vmap_lock);
     for (k = 0; k < vmap_n; k++) {             /* newest -> oldest: the oldest entry still >= c_us */
         i = (vmap_w + PTV_VMAP_N - 1 - k) % PTV_VMAP_N;
@@ -282,7 +284,20 @@ int ptv_vmap_lookup(int64_t c_us, int64_t *out_us, int64_t *gap_us)
             break;
         hit = i;
     }
-    if (hit < 0 || hit == (vmap_w + PTV_VMAP_N - 1) % PTV_VMAP_N)
+    newest = hit == (vmap_w + PTV_VMAP_N - 1) % PTV_VMAP_N;
+    if (newest && vmap_n > 1) {
+        /* 2.0.1 T-360: the last picture before a hold has no next frame to vouch for it — a subtitle on it waited out
+         * the hold and was then dropped as late (rich sync_bursty_20 29.97 / 59.94, DVB sub marker 12: the depth door's
+         * cut made 13.433 s the last picture on air; 25 s later the resume read o 26.8 s behind the output and a 28 s
+         * content leap to the next frame). Once the output has run on 3 ticks past it on held pictures, it was shown,
+         * if it came in continuous flow; one that came after a hold may be the pre-gap tail (below) and still waits */
+        int64_t pos = atomic_load_explicit(&g_house_out_us, memory_order_relaxed);
+        int64_t tick = atomic_load_explicit(&g_house_tick_us, memory_order_relaxed);
+        i = (hit + PTV_VMAP_N - 1) % PTV_VMAP_N;
+        held = tick > 0 && pos - vmap_out[hit] >= 3 * tick &&
+               (vmap_out[hit] - vmap_out[i]) - (vmap_src[hit] - vmap_src[i]) <= 1000000;
+    }
+    if (hit < 0 || (newest && !held))
         ret = 0;                                /* wait for one frame more: it tells whether this one was a stale tail */
     else if (k == vmap_n && vmap_src[hit] - c_us > 1000000)
         ret = -1;                               /* older than the record by more than a second */
@@ -299,7 +314,7 @@ int ptv_vmap_lookup(int64_t c_us, int64_t *out_us, int64_t *gap_us)
                                                  * was the pre-gap PES tail lavf releases only after an outage (T-074),
                                                  * shown alone after the hold (then the video waits for a keyframe): nothing
                                                  * belongs on it */
-        if ((vmap_src[i] - vmap_src[hit]) - (vmap_out[i] - vmap_out[hit]) > 1000000)
+        if (!newest && (vmap_src[i] - vmap_src[hit]) - (vmap_out[i] - vmap_out[hit]) > 1000000)
             *gap_us = FFMAX(*gap_us, (vmap_src[i] - vmap_src[hit]) - (vmap_out[i] - vmap_out[hit]));
         ret = 1;
     }
@@ -963,6 +978,7 @@ int64_t g_pair_ttl_us = PTV_PAIR_EXPECT_TTL_US;
 int64_t g_nbs_quantum_us = 100000;             /* fill quantum: 100ms of silence per sentinel */
 _Atomic int64_t g_acorrupt;
 _Atomic int64_t g_adamage_wc[PTV_MAX_AUDIO];   /* 2.0.0-pre9.3 (T-080 A2) */
+_Atomic int64_t g_rl_step_us[PTV_MAX_AUDIO], g_rl_wc[PTV_MAX_AUDIO], g_rl_seq[PTV_MAX_AUDIO], g_rl_undone[PTV_MAX_AUDIO];   /* 2.0.1 T-087 */
 _Atomic int64_t g_mv_vdmg_wc[PTV_MAX_INPUT];   /* T-350 */
 _Atomic int64_t g_adec_frame_wc[PTV_MAX_AUDIO];
 _Atomic int64_t g_pad_pub_step[PTV_MAX_AUDIO];
@@ -3234,6 +3250,58 @@ static void stage_hold(VideoHold *h, int live, AVFrame *frame)
     pthread_mutex_unlock(&h->lock);
 }
 
+static void video_out(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
+{
+    if (d->hold) stage_hold(d->hold, d->live, frame);   /* multiview: compositor samples this */
+    else         emit_video(d, frame, filt);
+}
+
+/* 2.0.1 T-383 (measured 2026-10-16, rich5994b sync_ptsone_0.347, pre22k and 2.0.1 identical): ONE video PES whose
+ * PTS/DTS is corrupt by less than the absorber's 1 s bar flows through the demux (only its return is recognised, one
+ * packet later), so its picture reached the output clock 0.35 s ahead of its neighbours. The output stamps pictures from
+ * their content index: it jumped 21 ticks (a 0.37 s video PTS hole + a 367 ms PCR step on the wire), the next pictures
+ * sat behind it, house_skew read +316 ms and the audio was hard-shifted to follow, the clock off-rate for a minute.
+ * A picture more than two picture steps ahead of the last one is held for ONE picture: if the next one is back between
+ * the two (within three steps of the one before), the held picture was the corrupt one and is restamped between its
+ * neighbours; otherwise the source went on from there and it goes out as it came. A real step costs one picture of
+ * delay inside the 1 s frame cushion; steady state is untouched. PTV_NO_VOUTLIER=1 reverts. */
+static void video_out_xo(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
+{
+    int64_t p   = frame->best_effort_timestamp != AV_NOPTS_VALUE ? frame->best_effort_timestamp : frame->pts;
+    int64_t lim = av_rescale_q(PTV_DISC_THRESHOLD_US, AV_TIME_BASE_Q, d->ist_tb);
+    int64_t dmax = av_rescale_q(250000, AV_TIME_BASE_Q, d->ist_tb);
+
+    if (d->xo) {
+        int64_t xp = d->xo->best_effort_timestamp != AV_NOPTS_VALUE ? d->xo->best_effort_timestamp : d->xo->pts;
+        if (p != AV_NOPTS_VALUE && p > d->xo_prev && p < xp && p - d->xo_prev <= 3 * d->xo_dur) {
+            int64_t np = d->xo_prev + (p - d->xo_prev) / 2;
+            av_log(NULL, AV_LOG_WARNING, "[PTV-DISCONT] in0 one picture %+"PRId64"ms ahead of its neighbours (a corrupt "
+                   "timestamp) — restamped between them\n", av_rescale_q(xp - np, d->ist_tb, (AVRational){1, 1000}));
+            d->xo->pts = d->xo->best_effort_timestamp = xp = np;
+        } else if (p != AV_NOPTS_VALUE && p - xp > 2 * d->xo_dur)
+            d->xo_dur = 0;                             /* the source's picture step changed (rate change): relearn */
+        video_out(d, d->xo, filt);
+        av_frame_free(&d->xo);
+        d->xo_last = xp; d->xo_have = 1;
+    }
+    if (p == AV_NOPTS_VALUE || !g_voutlier) {
+        video_out(d, frame, filt);
+        return;
+    }
+    if (d->xo_have) {
+        int64_t dt = p - d->xo_last;
+        if (d->xo_dur > 0 && dt > 2 * d->xo_dur && dt <= lim && (d->xo = av_frame_alloc())) {
+            av_frame_move_ref(d->xo, frame);
+            d->xo_prev = d->xo_last;
+            return;
+        }
+        if (dt > 0 && dt <= dmax && (!d->xo_dur || dt <= 2 * d->xo_dur))
+            d->xo_dur = d->xo_dur ? d->xo_dur + (dt - d->xo_dur) / 8 : dt;
+    }
+    d->xo_last = p; d->xo_have = 1;
+    video_out(d, frame, filt);
+}
+
 static void *decode_thread(void *arg)
 {
     DecodeCtx *d = arg;
@@ -3770,8 +3838,7 @@ static void *decode_thread(void *arg)
             }
             d->dec_frames++;
             PTV_HB_VDEC(d->hb_slot, d->hold ? PTV_HB_VDEC_FQSEND : PTV_HB_VDEC_HWUP);
-            if (d->hold) stage_hold(d->hold, d->live, frame);   /* multiview: compositor samples this */
-            else         emit_video(d, frame, filt);
+            video_out_xo(d, frame, filt);
         }
     }
     /* flush decoder */
@@ -3785,8 +3852,11 @@ static void *decode_thread(void *arg)
         if (d->cc.on || d->cc.strip) cc_tap_frame(&d->cc, frame, d->ist_tb);
         d->dec_frames++;
         PTV_HB_VDEC(d->hb_slot, d->hold ? PTV_HB_VDEC_FQSEND : PTV_HB_VDEC_HWUP);
-        if (d->hold) stage_hold(d->hold, d->live, frame);
-        else         emit_video(d, frame, filt);
+        video_out_xo(d, frame, filt);
+    }
+    if (d->xo) {                                       /* T-383: a picture still held */
+        video_out(d, d->xo, filt);
+        av_frame_free(&d->xo);
     }
     /* flush filter graph: push EOF into the src, drain every rung's sink */
     if (d->filtering) {
@@ -4222,6 +4292,14 @@ static int cc_setup(CcCtx *cc, CcTap *tap, AVThreadMessageQueue **cc_q,
     /* real_time: emit on every CC buffer change instead of waiting for a mode switch — a
      * live channel has no end of stream to flush against. */
     av_opt_set_int(tap->dec, "real_time", 1, AV_OPT_SEARCH_CHILDREN);
+    /* 2.0.1 T-319 (measured, v2 roll-up timing media): cc_dec reports the screen at most every
+     * real_time_latency_msec (default 200), so a roll-up line reached the tap up to 6 frames after the frame that
+     * completed it (+167 ms at 29.97, +184 ms at 59.94). The tap's own debounce / deadline pace the pages: report
+     * every change. PTV_CC_RT_LATENCY_MS=200 restores the old cadence. */
+    {
+        const char *rl = getenv("PTV_CC_RT_LATENCY_MS");
+        av_opt_set_int(tap->dec, "real_time_latency_msec", rl ? atoi(rl) : 0, AV_OPT_SEARCH_CHILDREN);
+    }
     /* FIELD 1 explicitly. cc_dec's data_field defaults to -1 = "pick the first field that
      * appears" and then IGNORES the other one for the rest of the run. Field 2 carries
      * secondary services (CC3/CC4) and XDS, so on a source whose first A53 pair happens to be
@@ -5277,6 +5355,14 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         /* Take raw 33-bit timestamps; demux_unwrap extends them (libav's
          * correct_ts_overflow extends inconsistently across the B-frame reorder). */
         av_dict_set(&ins->groups[k].format_opts, "correct_ts_overflow", "0", AV_DICT_DONT_OVERWRITE);
+        /* 2.0.1 T-358: keep the subtitles' own PES timestamps. lavf's fix_teletext_pts (default on) re-stamps a DVB
+         * subtitle more than 10 s ahead of the last PCR to that PCR + 0.14 s — and the PCR rides the video PID: while
+         * only the video is gone it stays at the last one, so every subtitle 10 s into a video-only outage read the
+         * frozen PCR (rich sync_vnull_20: 30.841 s for content 41.5-51.5 s), and the one on the first picture back
+         * (marker 50, read just before the first PCR after the outage) was dropped as long past its moment. The copies
+         * are stamped through the video's record by their content time (T-100); a corrupt far-off PTS is dropped
+         * there (T-378) */
+        av_dict_set(&ins->groups[k].format_opts, "fix_teletext_pts", "0", AV_DICT_DONT_OVERWRITE);
     }
 
     /* 2.0.0-pre2: a single live input waits for its source (input_acquire) */
@@ -5504,7 +5590,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         if (rung[r].fhwfr) rung[r].venc->hw_frames_ctx = av_buffer_ref(rung[r].fhwfr);   /* CUDA frames -> NVENC */
         rung[r].venc->time_base = av_inv_q(out_fps); rung[r].venc->framerate = out_fps;
         rung[r].venc->bit_rate = 3000000;
-        rung[r].venc->gop_size = 2 * (out_fps.num / FFMAX(out_fps.den, 1));
+        /* 2.0.1: rounded — 2 * (num / den) truncated first (58 at 29.97, 118 at 59.94); -g still overrides */
+        rung[r].venc->gop_size = (int)((2LL * out_fps.num + FFMAX(out_fps.den, 1) / 2) / FFMAX(out_fps.den, 1));
         if (rung[r].ofmt->oformat->flags & AVFMT_GLOBALHEADER) rung[r].venc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
         {   /* -b:v + forwarded encoder opts (-preset/-rc/-maxrate/-g/-s12m_tc/...) */
             AVDictionary *vopts = NULL;
@@ -6908,6 +6995,8 @@ int main(int argc, char **argv)
     { const char *s = getenv("PTV_CONV_CAP_S");  if (s && atoi(s) > 0) g_conv_cap_us  = (int64_t)atoi(s) * 1000000; }
     { const char *s = getenv("PTV_SEAM_PARK_S"); if (s && atoi(s) > 0) g_seam_park_us = (int64_t)atoi(s) * 1000000; }  /* TEST ONLY (G4) */
     if (getenv("PTV_NO_PESTAIL")) g_pestail = 0;   /* 2.0.0-pre4c: PES-tail carry off */
+    if (getenv("PTV_NO_RLCHECK")) g_rlcheck = 0;   /* 2.0.1 T-087: relabel content check off */
+    if (getenv("PTV_NO_VOUTLIER")) g_voutlier = 0; /* 2.0.1 T-383: video timestamp outlier restamp off */
     if (getenv("PTV_NO_WALLEV")) g_wallev = 0;     /* 1.0.1-pre24 #63 revert: erase engines back to the pre23
                                                     * whole-step remedies (butt-joint every >1s hole; the
                                                     * corrupt-storm desync counterfactual — A/B only) */

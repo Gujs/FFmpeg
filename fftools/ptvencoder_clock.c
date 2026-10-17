@@ -252,7 +252,12 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
              * released a moment later carries an EARLIER frame time: stamped behind this keepalive it was bumped one
              * frame late (sync_kill_return_20, the 4th caption after the restart, +41 ms). A keepalive is no picture —
              * keep it behind everything still on its way: the assembly window behind the output. */
-            int64_t lead = g_vmap && !c->multi ? FFMIN(c->ka_lead_us, -PTV_CC_DEBOUNCE_US) : c->ka_lead_us;
+            /* 2.0.1 T-366: ... and the window is the one cc_vq_release() accepts, a caption up to 1 s behind the output
+             * position, not the 500 ms assembly wait. Measured (rich2997long sync_startstall_12, marker 12): after the 12 s
+             * start-up backlog the pop-on caption's event reached the emitter when the output was already 0.90 s past
+             * its frame (vm_out 12.012 s, pos 12.913 s); the keepalive sent 0.33 s earlier sat at pos - 0.5 s = 12.179 s
+             * and the caption was bumped behind it: +168.3 ms on air, exactly the 1 of 147 off */
+            int64_t lead = g_vmap && !c->multi ? FFMIN(c->ka_lead_us, -1000000) : c->ka_lead_us;
             if (pos > 0 && pos + lead < house_us)
                 house_us = FFMAX(pos + lead, c->last_dts + 1000);
         } else if (c->multi && g_vmap && c->ka_real_wc) {
@@ -737,7 +742,7 @@ void *cc_thread(void *arg)
  * state machine and clock-follow latch live in *hr, the published estimator rates in
  * *est (0.9.18 R3/R4). Master thread only — non-reentrant. */
 static int64_t house_rate_corr_ppm(HouseRateState *hr, const RateEstimator *est,
-                                   int occ, int sp, int base_sp, int64_t tick_dur_us)
+                                   int occ, int sp, int base_sp, int64_t tick_dur_us, int damaged)
 {
     /* PROPORTIONAL occupancy servo (v0.9.6). The earlier INTEGRAL servo (corr += K·err)
      * oscillated: the buffer is itself an integrator (ρ → consume-rate → ∫ → occupancy),
@@ -757,7 +762,10 @@ static int64_t house_rate_corr_ppm(HouseRateState *hr, const RateEstimator *est,
     int64_t err_milli = (int64_t)sp * 1000 - hr->occ_ema_milli;          /* setpoint − occ (milli-frames) */
     int64_t corr = (err_milli * 500) / 1000;                           /* ρ = Kp·err, Kp=500 ppm/frame (PROPORTIONAL, no accumulation) */
     int64_t hi = 60000;                                            /* +6% normal positive clamp */
-    if (g_reprime && occ <= (base_sp + 1) / 2) {                   /* RE-PRIME: drained below half the BASE floor (true starvation —
+    /* 2.0.1 T-381 (measured, 50 % loss): no RE-PRIME while the source is damaged — an empty queue there is lost
+     * content (the decoder waits for an IDR), not a buffer to refill: the house ran 0.77x for 10 s and the output
+     * caught up with a 3.32 s video PTS hole when the pictures came back. A damaged phase ends an engagement. */
+    if (g_reprime && !damaged && occ <= (base_sp + 1) / 2) {       /* RE-PRIME: drained below half the BASE floor (true starvation —
                                                                     * NOT the adaptive raised target). Slow the house HARD to refill fast.
                                                                     * 0.9.10.1 state machine: an engagement lasts AT MOST 10s, then a 300s
                                                                     * cooldown applies unconditionally — occupancy oscillating around the
@@ -799,10 +807,24 @@ static int64_t house_rate_corr_ppm(HouseRateState *hr, const RateEstimator *est,
      * imperceptible) until video_q holds the bank target; normal servo resumes there. */
     {
         int64_t bt = atomic_load_explicit(&g_bank_us, memory_order_relaxed);
+        int64_t maxd = g_max_delay_us >= 0 ? g_max_delay_us : g_cushion_max_ms * 1000;
         /* margin = TOTAL buffered content: compressed video_q + decoded frame_q
          * (counting video_q alone would overshoot by frame_q's depth, ~5s) */
         int64_t have = ((int64_t)atomic_load_explicit(&g_vq_elems, memory_order_relaxed) + occ)
                        * tick_dur_us;
+        /* 2.0.1 T-361: the margin a stall finds = what was buffered at the last video arrival (sampled by the master,
+         * hr->bk_have). The old reading mixed video_q's depth at the last arrival (the demux writes g_vq_elems only
+         * then) with frame_q's depth NOW: through each pause of a steady 10 s burst source (rich2997b sync_bursty_10)
+         * it read the bank full for the first 6-7 s of the cycle, the servo ran the house 0.6 % fast there, frame_q
+         * ran dry before every burst — 1-3 repeated frames a cycle for good (81 in 900 s, hs +2.7 s), each moving
+         * the content -> output map under a copied SCTE-35 cue's 2.6 s lead (cues 1-3 frames early) and a roll-up
+         * caption. A fully live reading (tried) topped up all cycle long until the held content reached the T-316
+         * door: 12.0 s, two door cuts in 900 s (a 1.03 s video PTS hole, a cue +1.4 s). So the fill stops 1 s under
+         * the door's max delay, where the door resumes */
+        if (hr->bk_arr_wc)
+            have = (int64_t)hr->bk_have * tick_dur_us;
+        if (maxd > 1000000 && bt > maxd - 1000000)
+            bt = maxd - 1000000;
         if (bt > 0 && !atomic_load_explicit(&g_bank_lone, memory_order_relaxed) &&   /* pre20: a lone stall's bank
                                                                                      * holds what came, adds nothing */
             !repriming && hr->occ_ema_milli >= (int64_t)base_sp * 1000 &&
@@ -818,6 +840,13 @@ static int64_t house_rate_corr_ppm(HouseRateState *hr, const RateEstimator *est,
      * clock WANDERS -700..-3400ppm and chattered arm/release across 3000 (~15/day);
      * sub-5000 offsets are handled fine unfollowed (WUCR + decimation, proven live),
      * so follow engages only for the genuinely-broken-clock class it was built for. */
+    if (g_clockfollow) {   /* T-090: track how long the servo has been pinned, before the follow term moves it */
+        int sat = corr >= 6000 ? 1 : corr <= -6000 ? -1 : 0;
+        if (sat != hr->cf_sat_dir) {
+            hr->cf_sat_dir   = sat;
+            hr->cf_sat_since = av_gettime_relative();
+        }
+    }
     if (g_clockfollow && atomic_load_explicit(&est->cf_locked, memory_order_relaxed)) {
         int64_t cf_ppm = ((atomic_load_explicit(&est->cf_rate_q20, memory_order_relaxed)
                            - (1 << 20)) * 1000000) >> 20;
@@ -832,7 +861,15 @@ static int64_t house_rate_corr_ppm(HouseRateState *hr, const RateEstimator *est,
                        "[PTV-CLOCK] BURSTY channel (bank armed) — follow released, estimator untrusted\n");
             }
         } else
-        if (!hr->cf_following && llabs(cf_ppm) > 5000) {
+        /* 2.0.1 T-090 (measured on the fleet 2026-10-08): delivery jitter of ±80–100 ms makes the coarse estimator
+         * random-walk (Pure_flix: a real +165 ppm source read +5531, Salem +415 read −5332) — 8–20 false follows a
+         * day per such channel, each swinging latency ±0.3–1.4 s and the PCR ±0.5 % off realtime for minutes. A real
+         * offset beyond the gentle zone pins the occupancy servo at its limit (source fast: frame_q grows, the servo
+         * runs the house fast); the noise never does. Arm only after the servo has been pinned in the offset's
+         * direction for 2 min. */
+        if (!hr->cf_following && llabs(cf_ppm) > 5000 &&
+            hr->cf_sat_dir == (cf_ppm > 0 ? -1 : 1) &&
+            av_gettime_relative() - hr->cf_sat_since >= 120000000) {
             hr->cf_following = 1;
             av_log(NULL, AV_LOG_WARNING,
                    "[PTV-CLOCK] source clock runs %+lldppm off realtime — FOLLOWING it "
@@ -1359,12 +1396,14 @@ void *output_thread(void *arg)
                      * loss that then drained at ~5 ms/s. Under damage (corrupt packets/frames within 5 s)
                      * the occupancy is the content span (newest queued frame − output cursor), up to the 2 s
                      * the gap fill repeats into. Clean sources (and film cadence) keep the frame count. */
+                    int damaged = 0;
                     if (g_vgapfill) {
                         int64_t cr = (v->dbg_pcorrupt ? *v->dbg_pcorrupt : 0) + (v->dbg_vcorrupt ? *v->dbg_vcorrupt : 0);
                         int64_t tp = atomic_load_explicit(&g_fq0_tail_pts, memory_order_relaxed);
                         int64_t nw = av_gettime_relative();
                         if (cr != svo_cr) { svo_cr = cr; svo_dmg_wc = nw; }
-                        if (svo_dmg_wc && nw - svo_dmg_wc < 5000000 && tp != AV_NOPTS_VALUE) {
+                        damaged = svo_dmg_wc && nw - svo_dmg_wc < 5000000;
+                        if (damaged && tp != AV_NOPTS_VALUE) {
                             int64_t span = content_index(v, tp) - last_vpts;
                             if (span > occ && (span - occ) * v->tick_dur_us <= FFMAX(2000000, g_stall_min_us))   /* T-377 */
                                 occ = (int)span;
@@ -1372,9 +1411,16 @@ void *output_thread(void *arg)
                     }
                     /* 2.0.0-pre4: a hold is not a rate signal — nominal pacing, no REPRIME (it would run
                      * the house at 0.77x, then 1.5 % slow, for as long as the source is gone) */
+                    if (v->dbg_video_q) {   /* 2.0.1 T-361: the bank margin at the last video arrival */
+                        int64_t arr = atomic_load_explicit(&g_src_vread_wc, memory_order_relaxed);
+                        if (arr && arr != v->hr->bk_arr_wc) {
+                            v->hr->bk_arr_wc = arr;
+                            v->hr->bk_have   = av_thread_message_queue_nb_elems(v->dbg_video_q) + occ;
+                        }
+                    }
                     atomic_store_explicit(&v->hr->rho_corr_ppm,
                         ptv_src_holding() ? 0 :
-                        house_rate_corr_ppm(v->hr, v->est, occ, g_curt.cur_sp, base_sp, v->tick_dur_us),
+                        house_rate_corr_ppm(v->hr, v->est, occ, g_curt.cur_sp, base_sp, v->tick_dur_us, damaged),
                         memory_order_relaxed);
                 }
                 int64_t corr = atomic_load_explicit(&v->hr->rho_corr_ppm, memory_order_relaxed);

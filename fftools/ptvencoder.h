@@ -53,6 +53,8 @@ typedef struct RateEstimator {
  * (master writes, all rungs apply rho_corr_ppm), wired via VideoCtx like h0/house_skew. */
 typedef struct HouseRateState {
     int cf_following;               /* clock-follow hysteresis latch (arm >5000, release <2000 ppm) */
+    int     cf_sat_dir;             /* 2.0.1 T-090: direction the occupancy servo is pinned at its ±0.6 % limit (+1 slow / -1 fast / 0) */
+    int64_t cf_sat_since;           /* 2.0.1 T-090: wall time it got pinned there */
     int64_t occ_ema_milli;          /* WUCR: EMA-filtered master frame_q occupancy (milli-frames); master-thread only, non-atomic */
     int     occ_ema_seeded;         /* WUCR: seed the EMA to the first occupancy sample so there is no startup-ramp transient */
     int64_t reprime_start;          /* 0.9.10.1: wall time the CURRENT reprime engagement began (0 = idle). An
@@ -60,6 +62,8 @@ typedef struct HouseRateState {
                                      * — the 0.9.10 "continuing" clause let occupancy oscillating around the trigger
                                      * re-arm forever (observed live: AWE film segments pinned the house at 0.77x). */
     int64_t reprime_last_end;       /* wall time the last engagement ended (cooldown reference) */
+    int64_t bk_arr_wc;              /* 2.0.1 T-361: the last video read the bank margin was sampled at (0 = none yet) */
+    int     bk_have;                /* 2.0.1 T-361: video_q + frame_q at that read (packets + frames) */
     _Atomic int64_t rho_corr_ppm;   /* WUCR ρ: applied house-rate correction (ppm, corr>0 = house slower); ±6% clamp (±30% under re-prime) */
 } HouseRateState;
 /* 0.9.18 M1 — CushionPlan: ALL cushion/queue sizing derived in ONE place (resolve_cushions()),
@@ -272,6 +276,7 @@ typedef struct DlvGate {
  * never leaves the process. */
 #define PTV_PKT_FLAG_NBS_FILL (1 << 16)
 #define PTV_PKT_FLAG_HOLD_FILL (1 << 17)  /* 2.0.0-pre6: hold-fill sentinel (master output thread → audio_q) */
+#define PTV_PKT_FLAG_RELABEL (1 << 18)    /* 2.0.1 T-087: the first audio packet after an audio-first backward erase (demux) */
 
 /* A/V PLL redesign Phase A probe (always built; feeds the [PTV-AVSYNC] offset=): per-input ring recording, for each DISTINCT
  * video content the cell displayed, the output time it went out at — (abs source pts → out_v, both
@@ -750,8 +755,10 @@ typedef struct PtvTsOutlier {
     int64_t pend_last;      /* a backward step was absorbed: the raw ts before it (AV_NOPTS_VALUE = none) */
     int64_t pend_dw;        /* ... what it added to wrap_off */
     int64_t pend_dprog;     /* ... and to prog_off (video) */
+    int     pend_n;         /* ... packets since it (2.0.1 T-329: the outlier's PES may carry several frames) */
     int64_t fx_base;        /* 2.0.0 T-088: raw ts before a flowed forward excursion (one corrupt PES = several packets) */
     int     fx_n;           /* ... packets since it (the excursion packet = 1); 0 = none / expired */
+    int64_t wrap_dw;        /* 2.0.1 T-320: the wrap step the LAST packet took (0 = none) — undone if it was an outlier */
 } PtvTsOutlier;
 
 typedef struct DecodeCtx {
@@ -771,6 +778,11 @@ typedef struct DecodeCtx {
     int64_t          vf_odd_since;            /* 2.0.0 T-373: decoded pictures in another size / format than the graph
                                               * input since (wall us, 0 = none) ... */
     int              vf_odd_n;                /* ... how many were dropped */
+    AVFrame         *xo;                      /* 2.0.1 T-383: a decoded picture leaping ahead of the last one, held for one */
+    int64_t          xo_prev;                 /* ... the picture before it (ist_tb) */
+    int64_t          xo_last;                 /* ... the last picture handed on (ist_tb) */
+    int64_t          xo_dur;                  /* ... the source's normal picture step (ist_tb, EMA; 0 = unknown) */
+    int              xo_have;                 /* ... xo_last is set */
     int64_t          vg_in_since_out;         /* T-373: frames into the graph since the last one came out, ... */
     int64_t          vg_out_wc;               /* ... and when the last one came out (wall us) */
     int              rj_dbg_n;                /* 2.0.0-pre8.2: [PTV-RJTRACE] lines left this hold (PTV_DIAG) */
@@ -1195,6 +1207,20 @@ typedef struct AudioState {
     int64_t          afmt_drop_us;                     /* its withheld partial tail (µs) */
     int64_t          afmt_drain_end_us;                /* door-domain content end the drain is cut at (µs) */
     int64_t          rs_ma_res;                       /* 2.0.0-pre9.6: EMA of m_a − (glue_off + house_skew) (µs) */
+    /* 2.0.1 T-087 relabel check: 10 ms RMS envelope of the decoded audio (channel 0) and one pending seam */
+#define PTV_RL_ENV 512
+    float            rl_env[PTV_RL_ENV];              /* ring of 10 ms RMS bins */
+    int64_t          rl_n;                            /* bins written so far */
+    double           rl_acc;                          /* partial bin: sum of squares */
+    int              rl_acc_n, rl_bin;                /* samples in it, samples per bin */
+    int              rl_armed;                        /* a flagged packet was sent: the next frame starts the seam */
+    int              rl_pend;                         /* 1 = demux erase pending, 2 = graph-door (AGLUE) erase pending */
+    int64_t          rl_pos, rl_S_us, rl_wc, rl_seq;  /* seam bin, erased step, wall time, demux sequence */
+    int64_t          rl_ev_last, rl_ev_chg_wc;        /* this slot's video edit ledger: last value, wall µs of its last change */
+    int              rl_ch;                           /* T-087: channel count of the last decoded frame */
+    int              rl_fmt_have;                     /* ... and rl_fmt_n is set: */
+    int64_t          rl_fmt_n;                        /* ... the envelope bin where the decoded channel layout last changed */
+    int64_t          rl_neutral_us;                   /* erases judged relabels: the sensor follows them (subtracted from m_a) */
     int64_t          rs_slip_us;                      /* latest net (dead-banded) resampler slip (DIAG) */
     int64_t          rs_log_last;                     /* [PTV-RSYNC] DIAG rate limit (wall µs) */
     /* 1.0.1-pre14 residual-sync corrector (see CorrState above; design doc §4/§8). The two
@@ -1471,6 +1497,7 @@ typedef struct PassStream {
     AVPacket  *vwait[PTV_VWAIT_MAX];
     int64_t    vwait_wc[PTV_VWAIT_MAX];
     int64_t    vwait_po[PTV_VWAIT_MAX];   /* DemuxArgs.prog_off when it arrived (the SCTE-35 rebase term) */
+    int64_t    vwait_vn[PTV_VWAIT_MAX];   /* 2.0.1 T-332: DemuxArgs.vunwrap_n when it arrived */
     int        nvwait;
 } PassStream;
 
@@ -1733,6 +1760,7 @@ typedef struct DemuxArgs {
     int                   drop;          /* non-blocking + drop on full (network input) */
     PassStream           *pass;          /* copy-passthrough: extra audio, subs, data */
     int64_t               vm_po;                              /* 2.0.0 T-100: prog_off of the copy being released */
+    int64_t               vunwrap_n;                          /* 2.0.1 T-332: video packets unwrapped (demux thread) */
     int64_t               vm_far_wc;                          /* 2.0.0 T-378: last far-future copy drop log */
     int64_t               vread_us;                           /* 2.0.0 T-378: newest video read (us, copies' timeline) */
     int                   vread_set;
@@ -2014,6 +2042,8 @@ extern int64_t g_novideo_exit_us;        /* 1.0.1-pre23 startup sanity: packets 
 extern int     g_wallev;                 /* 1.0.1-pre24 #63 wall-evidence split (PTV_NO_WALLEV=1 reverts
                                           * the action; provenance measurement stays on) */
 extern int     g_pestail;   /* 2.0.0-pre4c: PES-tail wall-gap carry for video wall evidence (PTV_NO_PESTAIL=1 off) */
+extern int     g_rlcheck;   /* 2.0.1 T-087: content check of a backward audio erase (PTV_NO_RLCHECK=1 off) */
+extern int     g_voutlier;  /* 2.0.1 T-383: one-picture timestamp outlier restamped (PTV_NO_VOUTLIER=1 off) */
 extern int     g_recanchor;              /* 1.0.1-pre24 #63 corroborated recovery re-anchor
                                           * (PTV_NO_RECANCHOR=1 disables) */
 extern int64_t g_recanchor_settle_us;    /* quiet+stable window before an engage (PTV_RECANCHOR_SETTLE_S, 300s) */
@@ -2361,6 +2391,9 @@ extern int     g_glue_htol;              /* §2.3 label-health tolerance, percen
 extern int64_t g_pair_ttl_us;            /* pair-expect TTL (30s; PTV_PAIR_EXPECT_TTL_US — TEST ONLY, G6) */
 extern int64_t g_nbs_quantum_us;         /* fill quantum (100ms; PTV_NBS_QUANTUM_MS — TEST ONLY, G8) */
 extern _Atomic int64_t g_acorrupt;                        /* total corrupt-discarded AUDIO pkts (acor= stats) */
+extern _Atomic int64_t g_rl_step_us[PTV_MAX_AUDIO];      /* 2.0.1 T-087: per global track, the edit the demux posted with its
+                                                           * last audio-first backward erase (+ = labels moved later) */
+extern _Atomic int64_t g_rl_wc[PTV_MAX_AUDIO], g_rl_seq[PTV_MAX_AUDIO], g_rl_undone[PTV_MAX_AUDIO];
 extern _Atomic int64_t g_adamage_wc[PTV_MAX_AUDIO];      /* 2.0.0-pre9.3 (T-080 A2): per global track, wall us of the
                                                            * last corrupt-discarded packet (demux → audio thread) */
 extern _Atomic int64_t g_mv_vdmg_wc[PTV_MAX_INPUT];     /* T-350: per multiview slot, wall us of its last corrupt video (compositor) */
