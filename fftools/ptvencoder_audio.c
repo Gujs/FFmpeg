@@ -4331,6 +4331,11 @@ static void rl_eval(AudioState *a, int64_t now)
     lo = a->rl_pos - sb - 50;                           /* oldest bin the comparisons need */
     if (!why && (sb < 3 || lo < FFMAX(base, 0)))
         why = "step outside the check's range";
+    /* 2.0.1 gate (vt-as/sync_aswitch_1): a stereo -> mono switch at the seam made channel 0's envelope before it unlike
+     * the mono after it (corr 0.30) — read as a relabel, the sensor followed a −192 ms erase that broke A/V and nothing
+     * corrected it (+192 ms for good; pre22k slewed it back). Across a format change the audio cannot vouch either way */
+    if (!why && a->rl_fmt_have && a->rl_fmt_n >= lo && a->rl_fmt_n <= a->rl_pos + W)
+        why = "the audio format changed at the seam (a splice)";
     if (!why) {
         for (i = 0; i < W; i++)
             mean += a->rl_env[(a->rl_pos + i) % PTV_RL_ENV];
@@ -4402,6 +4407,11 @@ static void rl_feed(AudioState *a, const AVFrame *f)
         a->rl_seq   = atomic_load_explicit(&g_rl_seq[a->dbg_k], memory_order_relaxed);
     }
     a->rl_armed = 0;
+    if (a->rl_ch && ch != a->rl_ch) {                   /* a format switch (splice): its envelopes do not compare */
+        a->rl_fmt_n    = a->rl_n;
+        a->rl_fmt_have = 1;
+    }
+    a->rl_ch = ch;
     for (i = 0; i < n; i++) {
         double v;
         if (fmt == AV_SAMPLE_FMT_FLT)

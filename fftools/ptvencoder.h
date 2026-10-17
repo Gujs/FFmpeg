@@ -1217,6 +1217,9 @@ typedef struct AudioState {
     int              rl_pend;                         /* 1 = demux erase pending, 2 = graph-door (AGLUE) erase pending */
     int64_t          rl_pos, rl_S_us, rl_wc, rl_seq;  /* seam bin, erased step, wall time, demux sequence */
     int64_t          rl_ev_last, rl_ev_chg_wc;        /* this slot's video edit ledger: last value, wall µs of its last change */
+    int              rl_ch;                           /* T-087: channel count of the last decoded frame */
+    int              rl_fmt_have;                     /* ... and rl_fmt_n is set: */
+    int64_t          rl_fmt_n;                        /* ... the envelope bin where the decoded channel layout last changed */
     int64_t          rl_neutral_us;                   /* erases judged relabels: the sensor follows them (subtracted from m_a) */
     int64_t          rs_slip_us;                      /* latest net (dead-banded) resampler slip (DIAG) */
     int64_t          rs_log_last;                     /* [PTV-RSYNC] DIAG rate limit (wall µs) */
