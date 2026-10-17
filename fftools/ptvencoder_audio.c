@@ -76,6 +76,9 @@ static const char *ptv_self_shed_note(AudioState *a, char *buf, size_t sz)
 #define PTV_REANCH_WIN_US   10000000   /* rebuild discontinuity window (µs) */
 #define PTV_REANCH_MIN_FR   10         /* emitted frames before the (c) step may fire (~0.2s settle) */
 #define PTV_REANCH_CAP_US    5000000   /* (c) step authority (µs) */
+#define PTV_REANCH_BAND_US     80000   /* 2.0.2-pre3: the re-anchor paths keep the 2.0.1 80 ms band (a walk
+                                          * ends inside it, a rebuild step fires outside it); only the
+                                          * corrector's engage band moved to 40 ms (g_rscorr_engage_us) */
 
 /* ---- audio path (decode -> resample 48k stereo -> AAC -> mux) ---- */
 
@@ -1459,12 +1462,12 @@ static void ptv_recanchor(AudioState *a, RsyncTrackR *r, int64_t now)
                    a->dbg_k, a->dbg_in, dead ? dead : "new event", R / 1000);
             return;
         }
-        if (llabs(R) <= g_rscorr_engage_us) {   /* done — corrector polishes the remainder */
+        if (llabs(R) <= PTV_REANCH_BAND_US) {   /* done — corrector polishes the remainder */
             a->ra_active = 0;
             ptv_recanchor_amnesty(a, now);      /* pre29: factored (byte-identical) — resync shares it */
             av_log(NULL, AV_LOG_WARNING,
-                   "[PTV-RECANCHOR] a%d(in%d) re-anchor COMPLETE — R=%+"PRId64"ms (inside the "
-                   "engage band); corrector polishes the remainder; cooldown %"PRId64"s\n",
+                   "[PTV-RECANCHOR] a%d(in%d) re-anchor COMPLETE — R=%+"PRId64"ms (inside 80 ms); "
+                   "corrector polishes the remainder; cooldown %"PRId64"s\n",
                    a->dbg_k, a->dbg_in, R / 1000, g_recanchor_cooldown_us / 1000000);
             return;
         }
@@ -2340,7 +2343,7 @@ pll_emit:
                             a->reanch_wc = 0;                     /* window closed — never fires late */
                         } else if (llabs(a->reanch_step_us) < PTV_REANCH_CAP_US &&
                                    ++a->reanch_frames >= PTV_REANCH_MIN_FR &&
-                                   rr.valid && llabs(rr.R_us) > g_rscorr_engage_us) {
+                                   rr.valid && llabs(rr.R_us) > PTV_REANCH_BAND_US) {
                             /* fix round (F1 follow-up): MULTI-STEP inside the one window — a seam's
                              * video-side ledger edit can land AFTER the first step (measured: the
                              * one-shot fired 4ms post-rebuild, the video [PTV-DISCONT] absorb landed
