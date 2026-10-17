@@ -77,6 +77,7 @@ int     g_mv_clamp = 0;
  * newest (clean 2:1 decimation instead of hold-queue overflow). A ≥75%-full hold queue
  * bypasses the gate (pressure valve vs a wrong rate estimate). PTV_NO_RESIDENCE reverts. */
 int     g_mv_residence = 1;
+int     g_mv_res_follow = 1;     /* 2.0.2 T-343: a slot's audio follows each deliberate picture step at once (PTV_NO_RES_FOLLOW=1 off) */
 int     g_mv_res_deadband = 0;   /* 2.0.0 T-343: residence occupancy servo ±1 picture deadband — OPT-IN (PTV_RES_DEADBAND=1):
                                   * on, a slot ran −30 ms for 10 s after a flapping input (mv04 sync_flapping 6/6, off 0/2,
                                   * 2026-10-16); off = the pre21 servo (T-343's 40 ms step ~20 s after start stays open) */
@@ -6445,6 +6446,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         as[k].audio_q = audio_q[k];
         as[k].h0 = &inputs[asrc_in[k]].h0; as[k].h0_lock = &inputs[asrc_in[k]].h0_lock;
         as[k].house_skew = &inputs[asrc_in[k]].house_skew;
+        as[k].res_step   = n_input > 1 ? &inputs[asrc_in[k]].res_step_us : NULL;   /* 2.0.2 T-343 */
         as[k].house_lag_true = (n_input > 1) ? &inputs[asrc_in[k]].house_lag_true : NULL;  /* multiview: true lag; single: NULL→house_skew */
         as[k].vring = &inputs[asrc_in[k]].vring;         /* A/V probe: pair this track's audio against its input's video ring */
         as[k].multiview = (n_input > 1);                 /* multiview-only: enable deterministic audio-follow */
@@ -7385,6 +7387,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_CADDISARM")) g_cad_disarm = 0;  /* v0.9.18.1 M7: revert to flag-only pulldown disarm (dropouts drain frame_q again) */
     if (getenv("PTV_NO_MV_EXACTTICK")) g_mv_exacttick = 0;  /* v0.9.12: revert mv measurement axes to integer tick (re-enables the enforced ~10ppm mosaic drift) */
     if (getenv("PTV_NO_RESIDENCE")) g_mv_residence = 0;
+    if (getenv("PTV_NO_RES_FOLLOW")) g_mv_res_follow = 0;   /* 2.0.2 T-343 */
     if (getenv("PTV_RES_DEADBAND") && atoi(getenv("PTV_RES_DEADBAND"))) g_mv_res_deadband = 1;   /* 2.0.0 T-343 (opt-in) */
     if (getenv("PTV_NO_RES_DEADBAND")) g_mv_res_deadband = 0;   /* 2.0.0 T-343 */     /* v0.9.13: revert to one-pop-per-tick (rate-mismatched slots batch dups + fast-forward after starvation) */
     if (getenv("PTV_NO_MV_REPRIME")) g_mv_reprime = 0;      /* 2.0.0 T-339 */

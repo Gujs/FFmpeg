@@ -381,7 +381,13 @@ void *compositor_thread(void *arg)
                     }
                     if (resid && !qhot && hnow + half < res_due_us[k]) {
                         pending[k] = nx;                         /* residence hold: not due yet (deliberate pacing) */
-                        if (!cand) pd_cnt[k]++;
+                        if (!cand) {
+                            pd_cnt[k]++;
+                            /* 2.0.2 T-343: the cell repeats its picture = the slot's picture one tick later; its audio
+                             * follows this at once (audio PLL), not over ~10 s of TRACK slew (the -30..-40 ms dip ~20 s
+                             * after a mosaic start, after damage, after a join) */
+                            atomic_fetch_add_explicit(&c->inputs[k].res_step_us, mv_tick_us(c, 1), memory_order_relaxed);
+                        }
                         if (!cand && tick > 50 && pd_log[k] < 3) {   /* T-343: a matched-rate slot should never hold */
                             pd_log[k]++;
                             av_log(NULL, AV_LOG_WARNING, "[PTV-RES] in%d residence hold at tick %"PRId64": occupancy %d, "
@@ -390,7 +396,10 @@ void *compositor_thread(void *arg)
                         }
                         break;
                     }
-                    if (cand) { av_frame_free(&cand); md_cnt[k]++; }   /* superseded within one tick (decimation) */
+                    if (cand) {                                  /* superseded within one tick (decimation) */
+                        av_frame_free(&cand); md_cnt[k]++;
+                        atomic_fetch_sub_explicit(&c->inputs[k].res_step_us, mv_tick_us(c, 1), memory_order_relaxed);   /* T-343 */
+                    }
                     cand = nx;
                     if (resid) {
                         int64_t src = nx->pts != AV_NOPTS_VALUE ?

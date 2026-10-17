@@ -1654,7 +1654,27 @@ static int audio_drain_fg(AudioState *a)
                 if (a->pll_drop > 0) {                       /* consume a pending one-shot DROP (advance) */
                     a->pll_drop--; av_frame_unref(filt); continue;
                 }
-                if (!a->af_started) { a->af_applied_us = 0; a->af_started = 1; }  /* seed 0 (house_skew is wrong-sign in the banked regime) */
+                if (!a->af_started) { a->af_applied_us = 0; a->af_started = 1;    /* seed 0 (house_skew is wrong-sign in the banked regime) */
+                    if (a->res_step) a->res_step_seen = atomic_load_explicit(a->res_step, memory_order_relaxed); }
+                /* 2.0.2 T-343: the compositor stepped this slot's picture by whole ticks (residence hold / decimation) —
+                 * the audio takes the same step NOW, the ACQUIRE way (whole audio frames of pad / drop on the same base,
+                 * the rounding rest carried), instead of the readings showing a one-picture offset the TRACK slewed out
+                 * over ~10 s (measured: mosaic start -30 ms at ~20 s; after loss / flapping -26..-41 ms; a joining slot
+                 * -40 ms for 13 s). Not credited to the PLL EMA: the readings never see the step. PTV_NO_RES_FOLLOW=1 */
+                if (g_mv_res_follow && a->res_step) {
+                    int64_t cur = atomic_load_explicit(a->res_step, memory_order_relaxed), dq = cur - a->res_step_seen;
+                    int64_t n = (FFABS(dq) + frame_us / 2) / frame_us;
+                    if (n > 0) {
+                        int64_t dqq = (dq > 0 ? n : -n) * frame_us;
+                        a->res_step_seen += dqq;                 /* the sub-frame rest stays pending */
+                        a->af_applied_us += dqq;
+                        if (dqq < 0) { a->pll_drop += (int)n; a->af_acq_drop_us += -dqq; }
+                        else         { a->pll_pad  += (int)n; a->af_acq_pad_us  +=  dqq; }
+                        if (g_diag || a->res_follow_n++ < 3)
+                            av_log(NULL, AV_LOG_INFO, "[PTV-RESFOLLOW] a%d(in%d) picture stepped %+"PRId64"ms — audio %s %"PRId64"ms\n",
+                                   a->dbg_k, a->dbg_in, dq / 1000, dqq < 0 ? "drop" : "pad", FFABS(dqq) / 1000);
+                    }
+                }
                 if (a->av_off_valid) {
                     /* rr21 A1 label-baseline WATCH: a demux label edit (ea ledger — LAYERA flush
                      * persist / absorber self-rebase / retro-correct; the splice-RETURN erase
@@ -1932,8 +1952,8 @@ static int audio_drain_fg(AudioState *a)
                                                               * level the readings are at, not the lagging EMA) */
                             for (x = 0; x < nw; x++)
                                 a->pll_raw[x] -= dq;
-                            if (dq < 0) { a->pll_drop = (int)(-dq / frame_us); a->af_acq_drop_us += -dq; }  /* advance: drop content */
-                            else        { a->pll_pad  = (int)( dq / frame_us); a->af_acq_pad_us  +=  dq; }   /* delay: pad silence */
+                            if (dq < 0) { a->pll_drop += (int)(-dq / frame_us); a->af_acq_drop_us += -dq; }  /* advance: drop content */
+                            else        { a->pll_pad  += (int)( dq / frame_us); a->af_acq_pad_us  +=  dq; }   /* delay: pad silence */
                             a->pll_acq_count++;
                             /* 1.0.1-pre17: an ACQUIRE REDEFINES this track's content→label
                              * mapping in one step (af_applied jump + content drop/pad) — the

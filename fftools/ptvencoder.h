@@ -1458,6 +1458,9 @@ typedef struct AudioState {
     int64_t          pump_next;                   /* 2.0.2 T-386: next silent sample of a deferred track (output
                                                   * samples, the house axis: 0 = the first tick) */
     char             bind_spec[32];               /* 2.0.2 T-386: a deferred slot's -map specifier */
+    _Atomic int64_t *res_step;                    /* 2.0.2 T-343: its slot's deliberate picture steps (mosaic) */
+    int64_t          res_step_seen;               /* ... the part already followed (us) */
+    int              res_follow_n;                /* 2.0.2 T-343: [PTV-RESFOLLOW] lines logged */
 } AudioState;
 
 /* ---- demux + mux ---- */
@@ -2005,6 +2008,8 @@ typedef struct Input {
     pthread_t             acq_th;
     int                   acq_started;
     _Atomic int           acq_done;          /* its acquire thread returned */
+    _Atomic int64_t       res_step_us;       /* 2.0.2 T-343: the compositor's deliberate picture steps for this slot (us,
+                                              * + one tick per residence hold, - one per decimation skip) */
     int                   deferred;          /* 2.0.2 T-386: not live at the mosaic start — placeholder cell, silent
                                               * audio track, binds when its source arrives */
     int                   geom_w, geom_h, geom_fmt;   /* ... the cell geometry it takes (the first live sibling's) */
@@ -2399,6 +2404,7 @@ extern _Atomic int     g_corr_disarm_req[PTV_MAX_AUDIO]; /* master watchdog → 
  * the pre17 sensor fix (the fixed sensor reads true through a sibling slate; this freeze
  * is the §4.4 defense-in-depth for whatever the fix did not anticipate). */
 extern _Atomic int g_mv_slate_mask;
+extern int     g_mv_res_follow;   /* 2.0.2 T-343 */
 extern _Atomic int64_t g_mv_house_us;   /* 2.0.2 T-386: the compositor's output time of its current tick (us) */
 /* per-rung wire-send watermark (§3, owner-approved "build it"): wall µs of the last SUCCESSFUL
  * av_interleaved_write_frame on that rung — the only liveness signal that is actually the wire
