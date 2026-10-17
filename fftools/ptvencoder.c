@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.2-pre1"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.2-pre2"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -77,9 +77,13 @@ int     g_mv_clamp = 0;
  * newest (clean 2:1 decimation instead of hold-queue overflow). A ≥75%-full hold queue
  * bypasses the gate (pressure valve vs a wrong rate estimate). PTV_NO_RESIDENCE reverts. */
 int     g_mv_residence = 1;
-int     g_mv_res_follow = 1;     /* 2.0.2 T-343: a slot's audio follows each deliberate picture step at once (PTV_NO_RES_FOLLOW=1 off) */
+int     g_mv_res_follow = 0;     /* 2.0.2 T-343: a slot's audio follows each deliberate picture step at once — OPT-IN (PTV_RES_FOLLOW=1).
+                                  * 2.0.2-pre1 had it on: on real multicast the servo steps each slot ±1 picture every ~10-60 s,
+                                  * alternating, and each became a 42 ms silence pad / cut (live-transcoder canary 2026-10-17) */
 int     g_mv_res_hyst = 1;       /* 2.0.2 T-343: quarter-tick residence hysteresis, no hold/decimate chatter (PTV_NO_RES_HYST=1 off) */
-int     g_mv_res_occ_avg = 256;  /* 2.0.2 T-343: the occupancy servo reads a ~10 s average of the slot's jitter buffer (frames; PTV_RES_OCC_AVG=1 = instantaneous, 2.0.2-pre1) */
+int     g_mv_res_occ_avg = 1;    /* 2.0.2 T-343: frames the occupancy servo averages the slot's jitter buffer over — 1 = instantaneous
+                                  * (default, as 2.0.1); PTV_RES_OCC_AVG=256 (~10 s) = the canary experiment against the bursty-arrival
+                                  * phase wander (unmeasured locally: the Mac loopback cannot replay the 1080i bursts) */
 int     g_mv_res_deadband = 0;   /* 2.0.0 T-343: residence occupancy servo ±1 picture deadband — OPT-IN (PTV_RES_DEADBAND=1):
                                   * on, a slot ran −30 ms for 10 s after a flapping input (mv04 sync_flapping 6/6, off 0/2,
                                   * 2026-10-16); off = the pre21 servo (T-343's 40 ms step ~20 s after start stays open) */
@@ -7391,6 +7395,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_CADDISARM")) g_cad_disarm = 0;  /* v0.9.18.1 M7: revert to flag-only pulldown disarm (dropouts drain frame_q again) */
     if (getenv("PTV_NO_MV_EXACTTICK")) g_mv_exacttick = 0;  /* v0.9.12: revert mv measurement axes to integer tick (re-enables the enforced ~10ppm mosaic drift) */
     if (getenv("PTV_NO_RESIDENCE")) g_mv_residence = 0;
+    if (getenv("PTV_RES_FOLLOW") && atoi(getenv("PTV_RES_FOLLOW"))) g_mv_res_follow = 1;   /* 2.0.2 T-343 (opt-in) */
     if (getenv("PTV_NO_RES_FOLLOW")) g_mv_res_follow = 0;   /* 2.0.2 T-343 */
     if (getenv("PTV_NO_RES_HYST")) g_mv_res_hyst = 0;       /* 2.0.2 T-343 */
     if (getenv("PTV_RES_OCC_AVG")) g_mv_res_occ_avg = FFMAX(1, atoi(getenv("PTV_RES_OCC_AVG")));   /* 2.0.2 T-343 */

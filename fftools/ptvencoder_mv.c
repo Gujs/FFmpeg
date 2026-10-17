@@ -105,6 +105,7 @@ void *compositor_thread(void *arg)
     int64_t res_home_sum[PTV_MAX_INPUT] = {0}, res_home_n[PTV_MAX_INPUT] = {0};
     int     res_hyst[PTV_MAX_INPUT] = {0};       /* 2.0.2 T-343: last residence step (+1 hold, -1 decimation) */
     int     res_ema_n[PTV_MAX_INPUT] = {0};      /* 2.0.2 T-343: cadence deltas accepted into res_ema_us */
+    double  res_occ_f[PTV_MAX_INPUT];            /* 2.0.2 T-343: averaged occupancy the servo reads (< 0 = reseed) */
     int64_t sv_cnt[PTV_MAX_INPUT] = {0};      /* v0.9.13: genuine starvation dups (due but buffer empty) */
     int64_t md_cnt[PTV_MAX_INPUT] = {0};      /* v0.9.13: decimation drops (multiple frames due in one tick) */
     int64_t dmg_cr[PTV_MAX_INPUT] = {0};      /* T-350: the slot's corrupt-video count (demux + decode) last seen */
@@ -194,6 +195,7 @@ void *compositor_thread(void *arg)
                                                * acceptance band and keeps the house-rate estimate — the pressure
                                                * valve then bounds it to today's overflow-decimation behavior. */
         res_ema_us[k] = mv_tick_us(c, 1);
+        res_occ_f[k] = -1;
         res_src_us[k] = AV_NOPTS_VALUE;
     }
 
@@ -357,8 +359,10 @@ void *compositor_thread(void *arg)
                     (dmg_wc[k] && now_us - dmg_wc[k] < 5000000 &&
                      (reprime_us[k] || av_thread_message_queue_nb_elems(h->q) < res_ctr - 2)))))) {
                     int occ = av_thread_message_queue_nb_elems(h->q);
-                    if (occ && !reprime_us[k])
+                    if (occ && !reprime_us[k]) {
                         reprime_us[k] = now_us;
+                        res_occ_f[k] = -1;               /* 2.0.2 T-343: the average restarts from the refilled buffer */
+                    }
                     /* 2.0.0 T-343b: refill to the occupancy the slot ran at, not the static target — with the ±1
                      * deadband a slot born one picture under the target stays there, and a refill to the target after a
                      * gap put its picture one picture later than its sound had settled on (mv05 sync_gap_10: −30 ms
@@ -450,14 +454,24 @@ void *compositor_thread(void *arg)
                              * long-term consumption always equals arrival even if the cadence
                              * estimate is biased. +-2% authority: enough to null estimator bias,
                              * far too weak to disturb the 5:6 cadence pattern. */
-                            int dev = av_thread_message_queue_nb_elems(h->q) - res_ctr;
+                            /* 2.0.2 T-343: the servo reads the AVERAGED occupancy. On real multicast a slot's buffer swings
+                             * ±8 pictures within seconds (bursty arrival; live-transcoder Grid_2x1 slot 0: occ 17..33 every
+                             * 1-2 s); read instantaneously, the ±2 % trim moved the display phase ~20 ms/s back and forth, a
+                             * hold and a decimation every ~10-60 s (162 / 156 in 85 min) — with the audio follow each one a
+                             * 42 ms silence pad / cut. The servo is for the long-term balance only (estimator bias). */
+                            int occ_now = av_thread_message_queue_nb_elems(h->q);
+                            double dev_f;
+                            if (res_occ_f[k] < 0) res_occ_f[k] = occ_now;
+                            res_occ_f[k] += (occ_now - res_occ_f[k]) / g_mv_res_occ_avg;
+                            dev_f = res_occ_f[k] - res_ctr;
+                            int dev = (int)lrint(dev_f);
                             /* 2.0.0 T-343: a ±1 picture deadband — a slot born one picture under the target ran 0.1 %
                              * slow until the drift reached half a tick (500 pictures = 20 s at 25 fps) and showed one
                              * picture twice: a 40 ms audio step in a clean mosaic, which slot by birth jitter.
                              * PTV_NO_RES_DEADBAND=1 reverts. */
                             if (g_mv_res_deadband && dev >= -1 && dev <= 1)
                                 dev = 0;
-                            int64_t corr = (int64_t)dev * 1000;
+                            int64_t corr = g_mv_res_deadband ? (int64_t)dev * 1000 : (int64_t)lrint(dev_f * 1000);
                             corr = av_clip64(corr, -20000, 20000);
                             res_due_us[k] = FFMAX(res_due_us[k], hnow - half - hy_dec)
                                             + res_ema_us[k] - res_ema_us[k] * corr / 1000000;
