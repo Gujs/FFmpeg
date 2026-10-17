@@ -4191,6 +4191,39 @@ graph_in:
 
 /* Anchor (on the first kept frame) then feed `frame`, given a known h0. Drops frames
  * whose content precedes h0. Used both for live frames and the replayed pre-h0 buffer. */
+/* 2.0.2 T-386: a mosaic slot not live at the start — its track exists from the first tick and carries silence on the
+ * house axis (sample 0 = the first tick, where a live slot's audio is anchored too) up to the compositor's current
+ * tick, straight into the encoders (no source, so no graph). Without it the PID would be declared but empty: sync_check
+ * DEAD_AUDIO_TRACK = a restart loop. At most 2 s per call (a late first call catches up over several). */
+static int slot_pump(AudioState *a)
+{
+    int64_t target, lim;
+    int ret = 0;
+
+    if (!a->slot_deferred || a->pts_set)
+        return 0;
+    target = av_rescale(atomic_load_explicit(&g_mv_house_us, memory_order_relaxed), a->out_rate, 1000000);
+    lim    = a->pump_next + 2 * a->out_rate;
+    while (ret >= 0 && a->pump_next + a->frame_size <= FFMIN(target, lim)) {
+        AVFrame *f = av_frame_alloc();
+        if (!f)
+            return AVERROR(ENOMEM);
+        f->nb_samples  = a->frame_size;
+        f->format      = a->out_sfmt;
+        f->sample_rate = a->out_rate;
+        av_channel_layout_copy(&f->ch_layout, &a->out_chl);
+        if ((ret = av_frame_get_buffer(f, 0)) >= 0) {
+            av_samples_set_silence(f->extended_data, 0, f->nb_samples, f->ch_layout.nb_channels, f->format);
+            f->pts = a->pump_next;
+            a->pump_next += a->frame_size;
+            ret = audio_encode_push(a, f);
+            a->out_frames++;
+        }
+        av_frame_free(&f);
+    }
+    return ret;
+}
+
 static int audio_anchor_and_feed(AudioState *a, AVFrame *frame, int64_t h0)
 {
     int64_t ts = frame->best_effort_timestamp;
@@ -4951,6 +4984,12 @@ void *audio_thread(void *arg)
              * a reopen every 45s of a fill phase). */
             av_packet_free(&pkt);
             nbs_fill_quantum(a);
+            continue;
+        }
+        if (pkt && (pkt->flags & PTV_PKT_FLAG_SLOT_FILL)) {   /* 2.0.2 T-386: a deferred slot's silence, not a packet */
+            av_packet_free(&pkt);
+            if ((ret = slot_pump(a)) < 0)
+                break;
             continue;
         }
         if (pkt && (pkt->flags & PTV_PKT_FLAG_HOLD_FILL)) {   /* 2.0.0-pre6 hold-fill sentinel, not a packet */

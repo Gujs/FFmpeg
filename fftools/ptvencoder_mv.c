@@ -92,6 +92,7 @@ void *compositor_thread(void *arg)
     int      slated[PTV_MAX_INPUT] = {0};     /* slot is/was black-slated (outage) since last fresh frame */
     int64_t  reprime_us[PTV_MAX_INPUT] = {0}; /* 2.0.0 T-339: wall time the returning slot's first frame was queued */
     int64_t  mv_fill_us[PTV_MAX_INPUT][PTV_MAX_AUDIO] = {{0}};   /* T-093 part 2: last fill sentinel per slot track */
+    int64_t  mv_pump_us[PTV_MAX_INPUT] = {0};   /* 2.0.2 T-386: last silence sentinel per deferred slot */
     int64_t res_due_us[PTV_MAX_INPUT] = {0};  /* v0.9.13 residence: house-time the next pop is allowed (0 = immediate) */
     int64_t res_ema_us[PTV_MAX_INPUT];        /* v0.9.13: EMA of content deltas = the slot's smoothed cadence */
     int64_t res_src_us[PTV_MAX_INPUT];        /* v0.9.13: content time (us) of the last popped frame */
@@ -168,7 +169,9 @@ void *compositor_thread(void *arg)
      * previously never set the mask because `stale` requires last_fresh_us > 0). Cleared per
      * slot at its first fresh display. No mv corrector engagement until every cell is live. */
     for (k = 0; k < n; k++)
-        atomic_fetch_or_explicit(&g_mv_slate_mask, 1 << k, memory_order_relaxed);
+        if (!c->inputs[k].deferred)   /* 2.0.2 T-386: a slot not live at the start must not freeze the live slots'
+                                       * correction until it joins (GAFamily: 3 days without correction) */
+            atomic_fetch_or_explicit(&g_mv_slate_mask, 1 << k, memory_order_relaxed);
     rs_mv_div = c->tick_dur_us > 0 ? 30000000 / c->tick_dur_us : 750;
     if (rs_mv_div < 8) rs_mv_div = 8;
     if (n_prime > g_frameq_cap - 8) n_prime = g_frameq_cap - 8;
@@ -200,7 +203,8 @@ void *compositor_thread(void *arg)
                 pthread_mutex_lock(&c->inputs[k].hold.lock);
                 if (!c->inputs[k].hold.eof) eofall = 0;
                 pthread_mutex_unlock(&c->inputs[k].hold.lock);
-                if (av_thread_message_queue_nb_elems(c->inputs[k].hold.q) >= (n_prime > 0 ? n_prime : 1)) ready++;
+                if (c->inputs[k].deferred ||                    /* 2.0.2 T-386: nothing to prime yet */
+                    av_thread_message_queue_nb_elems(c->inputs[k].hold.q) >= (n_prime > 0 ? n_prime : 1)) ready++;
             }
             if (ready == n || eofall) break;
             if (av_gettime_relative() - t0 > 3000000) break;   /* 3s: start with what's there */
@@ -241,6 +245,23 @@ void *compositor_thread(void *arg)
             if (now < target) av_usleep((unsigned)(target - now));
         }
         now_us = av_gettime_relative();
+        /* 2.0.2 T-386: a slot not live at the start has an audio track from the first tick: its audio thread encodes
+         * silence up to this tick's output time (the same axis a live slot's audio is anchored on), every 100 ms */
+        atomic_store_explicit(&g_mv_house_us, mv_tick_us(c, tick), memory_order_relaxed);
+        for (k = 0; k < n; k++) {
+            DemuxArgs *da = &c->inputs[k].da;
+            int j;
+            if (!c->inputs[k].deferred || now_us - mv_pump_us[k] < 100000)
+                continue;
+            mv_pump_us[k] = now_us;
+            for (j = 0; j < da->n_audio; j++) {
+                AVPacket *fs = av_packet_alloc();
+                if (!fs) continue;
+                fs->flags |= PTV_PKT_FLAG_SLOT_FILL;
+                if (av_thread_message_queue_send(da->audio_q[j], &fs, AV_THREAD_MESSAGE_NONBLOCK) < 0)
+                    av_packet_free(&fs);
+            }
+        }
 
         for (k = 0; k < n; k++) {                    /* pop ONE frame from this input's jitter
                                                       * buffer (FIFO) -> feed buffersrc k; dup-hold
@@ -741,7 +762,8 @@ void *compositor_thread(void *arg)
                  * black frame's shape so the slot's buffersrc sees no parameter change; black if it cannot be built. */
                 int64_t nwc = av_gettime_relative();
                 st = NULL;
-                if (last[k] || (c->slate_after_us > 0 && nwc - diag_t0 > c->slate_after_us)) {
+                if (last[k] || c->inputs[k].deferred ||          /* 2.0.2 T-386: placeholder from the first tick */
+                    (c->slate_after_us > 0 && nwc - diag_t0 > c->slate_after_us)) {
                     if (!cell_dead_us[k]) {
                         cell_dead_us[k] = nwc;
                         av_log(NULL, AV_LOG_WARNING, "[PTV-MV] in%d no signal \xe2\x86\x92 %s in its cell\n", k,

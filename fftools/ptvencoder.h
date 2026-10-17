@@ -277,6 +277,7 @@ typedef struct DlvGate {
 #define PTV_PKT_FLAG_NBS_FILL (1 << 16)
 #define PTV_PKT_FLAG_HOLD_FILL (1 << 17)  /* 2.0.0-pre6: hold-fill sentinel (master output thread → audio_q) */
 #define PTV_PKT_FLAG_RELABEL (1 << 18)    /* 2.0.1 T-087: the first audio packet after an audio-first backward erase (demux) */
+#define PTV_PKT_FLAG_SLOT_FILL (1 << 19)  /* 2.0.2 T-386: a deferred mosaic slot's track: encode silence up to g_mv_house_us */
 
 /* A/V PLL redesign Phase A probe (always built; feeds the [PTV-AVSYNC] offset=): per-input ring recording, for each DISTINCT
  * video content the cell displayed, the output time it went out at — (abs source pts → out_v, both
@@ -1448,6 +1449,10 @@ typedef struct AudioState {
                                                        * resync_owns): the liveness ceiling aborts
                                                        * a walk with no seam/complete progress for
                                                        * PTV_RESYNC_WALK_CEIL_S */
+    int              slot_deferred;               /* 2.0.2 T-386: a mosaic slot not live at the start — the track
+                                                  * carries silence on the house axis until the slot binds */
+    int64_t          pump_next;                   /* 2.0.2 T-386: next silent sample of a deferred track (output
+                                                  * samples, the house axis: 0 = the first tick) */
 } AudioState;
 
 /* ---- demux + mux ---- */
@@ -1993,6 +1998,10 @@ typedef struct Input {
     pthread_t             acq_th;
     int                   acq_started;
     _Atomic int           acq_done;          /* its acquire thread returned */
+    int                   deferred;          /* 2.0.2 T-386: not live at the mosaic start — placeholder cell, silent
+                                              * audio track, binds when its source arrives */
+    int                   geom_w, geom_h, geom_fmt;   /* ... the cell geometry it takes (the first live sibling's) */
+    AVRational            geom_sar;
 } Input;
 
 /* Multiview compositor = the video house clock. Samples each input's hold at
@@ -2383,6 +2392,7 @@ extern _Atomic int     g_corr_disarm_req[PTV_MAX_AUDIO]; /* master watchdog → 
  * the pre17 sensor fix (the fixed sensor reads true through a sibling slate; this freeze
  * is the §4.4 defense-in-depth for whatever the fix did not anticipate). */
 extern _Atomic int g_mv_slate_mask;
+extern _Atomic int64_t g_mv_house_us;   /* 2.0.2 T-386: the compositor's output time of its current tick (us) */
 /* per-rung wire-send watermark (§3, owner-approved "build it"): wall µs of the last SUCCESSFUL
  * av_interleaved_write_frame on that rung — the only liveness signal that is actually the wire
  * (the Newsmax2 dead rung read calm on every label-domain signal). One relaxed store per packet. */

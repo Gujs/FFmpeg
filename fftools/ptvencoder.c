@@ -878,6 +878,7 @@ _Atomic int     g_src_icb_armed;
 /* 1.0.1-pre17: sibling-slate mask (bit k = input slot k black-slated; compositor writes,
  * rscorr_event_active reads) — no mv corrector engagement while any slot is slated. */
 _Atomic int     g_mv_slate_mask;
+_Atomic int64_t g_mv_house_us;   /* 2.0.2 T-386 */
 /* (d) SELF-MADE-GAP LOG HONESTY: every self-inflicted queue drop (video head/tail shed, audio
  * drop-oldest) stamps these; AGLUE/ASTEP lines within 5s carry " [self: N pkts shed]" so our
  * own drops are never again misread as source burstiness. */
@@ -4164,6 +4165,8 @@ typedef struct AOutSpec {
     const char    *filter;                /* -filter:a:N (NULL = global -af) */
     int            ac;                    /* -ac:a:N output channels (0 = default stereo) */
     const char    *lang;                  /* source language (override -metadata later) */
+    int            deferred;              /* 2.0.2 T-386: the slot was not live at the start (stream = -1) */
+    char           bind_spec[32];         /* ... the -map stream specifier, resolved when the slot binds */
 } AOutSpec;
 
 typedef struct Sel {
@@ -5506,13 +5509,33 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         for (k = 0; k < n_input; k++)
             av_dict_copy(&inputs[k].da.reopen_opts, ins->groups[k].format_opts, 0);
         live = mosaic_acquire(inputs, n_input);
-        if (live < n_input) {
-            av_log(NULL, AV_LOG_ERROR, "[PTV-OUT] %d of %d slots not live: a mosaic start with a dead slot is not "
-                   "built yet (T-386 S2)\n", n_input - live, n_input);
+        if (!live) {
+            av_log(NULL, AV_LOG_ERROR, "[PTV-OUT] no slot live\n");
             ret = AVERROR(ETIMEDOUT); goto end;
         }
-        for (k = 0; k < n_input; k++)
-            av_dump_format(inputs[k].ifmt, k, inputs[k].url, 0);
+        {   /* a slot not live at the start is deferred: its cell takes the first live slot's geometry */
+            const AVCodecParameters *gp = NULL;
+            AVRational gsar = { 0, 1 };
+            for (k = 0; k < n_input && !gp; k++)
+                if (inputs[k].ifmt) {
+                    int vs = av_find_best_stream(inputs[k].ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
+                    if (vs >= 0) { gp = inputs[k].ifmt->streams[vs]->codecpar; gsar = gp->sample_aspect_ratio; }
+                }
+            for (k = 0; k < n_input; k++) {
+                if (inputs[k].ifmt) { av_dump_format(inputs[k].ifmt, k, inputs[k].url, 0); continue; }
+                inputs[k].deferred = 1;
+                inputs[k].geom_w = gp->width; inputs[k].geom_h = gp->height; inputs[k].geom_fmt = gp->format;
+                inputs[k].geom_sar = gsar;
+                av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in%d WAITING (slot %d): placeholder %dx%d cell, silent audio "
+                       "track until its source arrives\n", k, k, gp->width, gp->height);
+                if (cc_want[k]) {        /* spec §9: a slot's CC track exists only if it was live at the start */
+                    cc_want[k] = 0; n_cc--;
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-CC] slot %d not live at the start: no CC track for it this run "
+                           "(the later -cc_slots tracks move up one)\n", k);
+                }
+            }
+            if (cc_on && !n_cc) cc_on = 0;
+        }
     } else
     /* open ALL inputs in parallel: a dead/slow slot must not delay the others,
      * and a serial open would block on its (long, multiview) rw_timeout. */
@@ -5550,6 +5573,18 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
      * input video directly via -map). */
     for (k = 0; k < n_input; k++) {
         int vs; const AVCodec *vd = NULL;
+        if (inputs[k].deferred) {
+            /* 2.0.2 T-386: a geometry-only (never opened) context: the cell's buffersrc and placeholder are built from
+             * it; the decode thread replaces it when the slot binds (an unopened context refuses packets) */
+            if (!(inputs[k].vdec = avcodec_alloc_context3(NULL))) { ret = AVERROR(ENOMEM); goto end; }
+            inputs[k].vdec->codec_type = AVMEDIA_TYPE_VIDEO;
+            inputs[k].vdec->width   = inputs[k].geom_w;  inputs[k].vdec->height = inputs[k].geom_h;
+            inputs[k].vdec->pix_fmt = inputs[k].geom_fmt; inputs[k].vdec->sample_aspect_ratio = inputs[k].geom_sar;
+            inputs[k].ist_tb = inputs[k].vdec->pkt_timebase = (AVRational){ 1, 90000 };   /* mpegts */
+            inputs[k].vstream = -1;
+            vdecs[k] = inputs[k].vdec;
+            continue;
+        }
         if (k == 0 && sel[0].vstream >= 0) { vs = sel[0].vstream; vd = sel[0].vdec; }
         else vs = av_find_best_stream(inputs[k].ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, &vd, 0);
         if (vs < 0 || !vd) { av_log(NULL, AV_LOG_ERROR, "no video stream in input %d\n", k); ret = AVERROR(EINVAL); goto end; }
@@ -5601,8 +5636,12 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                                      inputs[k].ifmt->nb_streams)) < 0) goto end;
         }
     }
-    vdec = inputs[0].vdec; vist = inputs[0].vist;
-    vstream = inputs[0].vstream; vdecoder = inputs[0].vdecoder; (void)vstream;
+    {   /* 2.0.2 T-386: the reference input = the first live slot (slot 0 may be waiting) */
+        int ref = 0;
+        while (ref < n_input - 1 && inputs[ref].deferred) ref++;
+        vdec = inputs[ref].vdec; vist = inputs[ref].vist;
+        vstream = inputs[ref].vstream; vdecoder = inputs[ref].vdecoder; (void)vstream;
+    }
 
     /* house rate: -r on the first output, else preserve the source's actual FRAME
      * rate. Prefer avg_frame_rate over r_frame_rate: for an interlaced source
@@ -5757,8 +5796,11 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
      * the passthrough list below (keeping demux_pass's wrap unwrap + DTS clamp). */
     for (k = 0; k < sel[0].n_aout && n_audio < PTV_MAX_AUDIO; k++) {
         AOutSpec      *spec = &sel[0].aout[k];
-        AVStream      *kist = inputs[spec->input].ifmt->streams[spec->stream];
-        const AVCodec *kdecoder = spec->adec ? spec->adec
+        /* 2.0.2 T-386: a deferred slot's track has no source stream yet — an AAC decoder with default parameters
+         * (48 kHz stereo, mpegts time base) stands in until the slot binds; the track is silent until then */
+        AVStream      *kist = spec->deferred ? NULL : inputs[spec->input].ifmt->streams[spec->stream];
+        AVRational     ktb  = kist ? kist->time_base : (AVRational){ 1, 90000 };
+        const AVCodec *kdecoder = spec->deferred ? avcodec_find_decoder(AV_CODEC_ID_AAC) : spec->adec ? spec->adec
                                 : avcodec_find_decoder(kist->codecpar->codec_id);
         AVCodecContext *kdec, *encs[PTV_MAX_RUNG] = {0};
         AudioState    *a;
@@ -5772,8 +5814,13 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         av_channel_layout_default(&ochl, nch);              /* 2->stereo, 6->5.1, 1->mono */
         kdec = avcodec_alloc_context3(kdecoder);
         if (!kdec) { ret = AVERROR(ENOMEM); goto end; }
-        avcodec_parameters_to_context(kdec, kist->codecpar);
-        kdec->pkt_timebase = kist->time_base;
+        if (kist)
+            avcodec_parameters_to_context(kdec, kist->codecpar);
+        else {
+            kdec->sample_rate = 48000;
+            av_channel_layout_default(&kdec->ch_layout, 2);
+        }
+        kdec->pkt_timebase = ktb;
         ptv_adec_opts(kdec);               /* #38: tolerant AAC decode (by name, optional) */
         if (avcodec_open2(kdec, kdecoder, NULL) < 0) {
             av_log(NULL, AV_LOG_WARNING, "audio track %d decoder failed; skipped\n", k);
@@ -5841,7 +5888,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
             if (!aos) { ret = AVERROR(ENOMEM); goto end; }
             avcodec_parameters_from_context(aos->codecpar, a->enc[r]);
             aos->time_base = a->enc[r]->time_base;
-            if ((klang = av_dict_get(kist->metadata, "language", NULL, 0)))
+            if (kist && (klang = av_dict_get(kist->metadata, "language", NULL, 0)))
                 av_dict_set(&aos->metadata, "language", klang->value, 0);
             apply_stream_meta(&outs->groups[r], 'a', k, aos);   /* CLI -metadata:s:a:N / -disposition:a:N (G5) */
             a->ost[r] = aos;
@@ -5860,13 +5907,17 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         a->frame_size = a->enc[0]->frame_size > 0 ? a->enc[0]->frame_size : 1024;
         a->fifo       = av_audio_fifo_alloc(sfmt, 2, a->frame_size);
         if (!a->fifo) { ret = AVERROR(ENOMEM); goto end; }   /* used by the swr fallback path */
-        a->ist_tb     = kist->time_base;
+        a->ist_tb     = ktb;
         /* pre17 R1: OWNED copies — the demux reopen closes the old AVFormatContext, so an
          * AVStream* would dangle by the time the ADECWD watchdog reopen fires. */
         a->ist_par    = avcodec_parameters_alloc();
-        if (a->ist_par) avcodec_parameters_copy(a->ist_par, kist->codecpar);
-        a->ist_pkt_tb = kist->time_base;
-        if (af && build_audio_filter(a, a->dec, kist->time_base, af, sfmt) < 0) {
+        if (a->ist_par) {
+            if (kist) avcodec_parameters_copy(a->ist_par, kist->codecpar);
+            else      avcodec_parameters_from_context(a->ist_par, kdec);
+        }
+        a->ist_pkt_tb = ktb;
+        a->slot_deferred = spec->deferred;          /* 2.0.2 T-386: silent until the slot binds */
+        if (af && build_audio_filter(a, a->dec, ktb, af, sfmt) < 0) {
             av_log(NULL, AV_LOG_WARNING, "audio track %d filtergraph failed; plain resample\n", k);
             avfilter_graph_free(&a->afg); a->use_fg = 0;
         }
@@ -6032,14 +6083,14 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                 for (r = 0; r < n_rung; r++) e->ost[r] = rung[r].vc.ost;
                 e->cls = 0; e->mapped = 1; e->ord = 0;
                 e->codec   = avcodec_get_name(rung[0].vc.ost->codecpar->codec_id);
-                e->src_pid = inputs[0].vist->id;
+                e->src_pid = vist ? vist->id : -1;          /* 2.0.2 T-386: the first live slot (slot 0 may wait) */
                 e->src_idx = multiview ? -1 : inputs[0].vstream;
                 if (multiview) snprintf(e->srcs, sizeof e->srcs, "mosaic");
                 else           snprintf(e->srcs, sizeof e->srcs, "in#0:%d", inputs[0].vstream);
             }
             for (k = 0; k < n_audio; k++) {          /* transcoded audio, in -map order */
-                AVStream *ist = inputs[asrc_in[k]].ifmt->streams[asrc[k]];
-                AVDictionaryEntry *lg = av_dict_get(ist->metadata, "language", NULL, 0);
+                AVStream *ist = asrc[k] >= 0 ? inputs[asrc_in[k]].ifmt->streams[asrc[k]] : NULL;   /* T-386: deferred */
+                AVDictionaryEntry *lg = ist ? av_dict_get(ist->metadata, "language", NULL, 0) : NULL;
                 PidEnt *e = &ent[n++];
                 for (r = 0; r < n_rung; r++) e->ost[r] = as[k].ost[r];
                 e->cls = 1; e->mapped = 1; e->ord = k;
@@ -6048,10 +6099,11 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                 e->lang    = lg ? lg->value : NULL;
                 e->ch      = as[k].ost[0]->codecpar->ch_layout.nb_channels;   /* OUTPUT layout */
                 e->rank    = pid_lang_rank(e->lang, e->norm);
-                e->ad      = !!(ist->disposition & (AV_DISPOSITION_VISUAL_IMPAIRED |
-                                                    AV_DISPOSITION_DESCRIPTIONS));
-                e->src_pid = ist->id; e->in_idx = asrc_in[k]; e->src_idx = asrc[k];
-                snprintf(e->srcs, sizeof e->srcs, "in#%d:%d", asrc_in[k], asrc[k]);
+                e->ad      = ist && !!(ist->disposition & (AV_DISPOSITION_VISUAL_IMPAIRED |
+                                                           AV_DISPOSITION_DESCRIPTIONS));
+                e->src_pid = ist ? ist->id : -1; e->in_idx = asrc_in[k]; e->src_idx = asrc[k];
+                if (ist) snprintf(e->srcs, sizeof e->srcs, "in#%d:%d", asrc_in[k], asrc[k]);
+                else     snprintf(e->srcs, sizeof e->srcs, "in#%d:(late)", asrc_in[k]);
             }
             for (k = 0; k < n_cc; k++) {             /* CC->teletext, in -cc_slots slot order */
                 PidEnt *e = &ent[n++];
@@ -6939,6 +6991,28 @@ static int resolve_plan(Input *inputs, int n_input, OptionGroup *outg, Sel *s, i
             return AVERROR(EINVAL);
         }
         kfmt = inputs[fidx].ifmt;
+        if (inputs[fidx].deferred) {
+            /* 2.0.2 T-386: a slot not live at the start has no streams yet. Its audio map becomes a placeholder track
+             * (the encoder and the output stream exist from the start, silent until the slot binds; numbered like a
+             * real one, so -c:a:N / -metadata:s:a:N stay on their tracks); other maps of it are skipped (subtitle /
+             * CC tracks of a slot exist only if it had them at the start: spec §9). */
+            if ((!strncmp(spec, "a", 1) && (!spec[1] || spec[1] == ':')) && s->n_aout < PTV_MAX_AUDIO) {
+                int idx = tcnt[1]++;
+                AOutSpec *a = &s->aout[s->n_aout++];
+                const char *acs = og_spec(outg, "ac", 'a', idx);
+                a->input = fidx; a->stream = -1; a->deferred = 1;
+                av_strlcpy(a->bind_spec, spec, sizeof a->bind_spec);
+                a->aenc = og_spec(outg, "c", 'a', idx); a->abr = og_spec(outg, "b", 'a', idx);
+                a->filter = og_spec(outg, "filter", 'a', idx);
+                a->ac = acs ? atoi(acs) : 0;
+                if (verbose)
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-OUT] -map %s: slot %d not live — a:%d silent until it joins\n",
+                           mv, fidx, idx);
+            } else if (verbose && !optional)
+                av_log(NULL, AV_LOG_WARNING, "[PTV-OUT] -map %s: slot %d not live — skipped (spec §9: a slot's "
+                       "subtitle / CC exist only if it had them at the start)\n", mv, fidx);
+            continue;
+        }
         /* a spec whose LAST colon-token is numeric picks one stream (-map 0:3, -map 0:d:1);
          * a bare type letter (-map 0:d?) — or a whole-input map (-map 0, where the digit is
          * the input index, not a stream) — is a wildcard. Only picks the EPG log level. */

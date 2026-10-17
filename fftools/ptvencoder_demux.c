@@ -3147,6 +3147,11 @@ void *demux_thread(void *arg)
             av_log(NULL, AV_LOG_INFO, "ptvencoder: -t reached — input '%s' stops pulling (flush to clean exit)\n", d->url);
             break;                                 /* rider (b): ride the file-EOF teardown */
         }
+        if (!d->ifmt) {   /* 2.0.2 T-386: a mosaic slot not live at the start — nothing to read until it binds; no
+                           * heartbeat (a slot without a source is not a wedged decoder) */
+            av_usleep(100000);
+            continue;
+        }
         /* 1.0.1-pre21 heartbeat: input-flow evidence + video_q depth for the [PTV-STALL]
          * watchdog (a vdec stall only reports while THIS keeps advancing — a dead input is
          * starvation, not a wedge). */
