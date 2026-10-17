@@ -5,6 +5,22 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.2-pre2 — 2.0.2-pre1 with the mosaic audio follow OFF (canary regression) + the relabel-check fix (T-391)
+
+- **Mosaic audio follow is opt-in again (`PTV_RES_FOLLOW=1`).** On the live-transcoder canary (2.0.2-pre1, 2026-10-17) the
+  residence servo stepped every mosaic slot ±1 picture every ~10-60 s, alternating (real multicast arrives in bursts: a slot's
+  buffer swings ±8 pictures within seconds and the servo's trim follows it), and the follow turned each step into a 42 ms
+  silence pad or cut — ~6 audible gaps a minute per slot. Mosaic audio is back to the 2.0.1 behaviour; everything else in
+  2.0.2 stays. The follow returns once it acts on lasting steps only.
+- **Averaged servo occupancy as a canary experiment (`PTV_RES_OCC_AVG=256`, default off).** Feeding the servo a ~10 s average
+  of the slot's buffer should stop the back-and-forth steps; not measurable locally (the Mac loopback cannot replay the 1080i
+  bursts), so it is measured on one canary mosaic first.
+- **A RELABEL verdict needs clear evidence (T-391).** A real ~100 ms audio repeat (glo-1 Multivisão, HLS segment overlap) scored
+  0.47-0.58 and was called a relabel at < 0.5: the sensor then ignored the erase's +100 ms for good (several of them: ~+400 ms
+  on air by content cross-correlation while lipsync= read ~0). RELABEL now needs corr < 0.3 (`PTV_RL_RELABEL_MAX`); between,
+  no verdict: the corrector decides. Replay: +100 ms → −15 ms after ~11 min (pre1: +100 ms for good); the relabel / repeat
+  gate keys unchanged.
+
 ## 2.0.2-pre1 — 2.0.1-pre1 + a mosaic starts with a dead slot, mosaic picture steps keep lip sync, a video PID move recovers
 
 - **A mosaic starts without waiting for every slot, and a late slot joins without a restart (T-386).** Each slot

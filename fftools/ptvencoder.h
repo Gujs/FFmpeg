@@ -2074,6 +2074,7 @@ extern int     g_wallev;                 /* 1.0.1-pre24 #63 wall-evidence split 
                                           * the action; provenance measurement stays on) */
 extern int     g_pestail;   /* 2.0.0-pre4c: PES-tail wall-gap carry for video wall evidence (PTV_NO_PESTAIL=1 off) */
 extern int     g_rlcheck;   /* 2.0.1 T-087: content check of a backward audio erase (PTV_NO_RLCHECK=1 off) */
+extern double  g_rl_relabel_max;   /* 2.0.2 T-391 */
 extern int     g_voutlier;  /* 2.0.1 T-383: one-picture timestamp outlier restamped (PTV_NO_VOUTLIER=1 off) */
 extern int     g_recanchor;              /* 1.0.1-pre24 #63 corroborated recovery re-anchor
                                           * (PTV_NO_RECANCHOR=1 disables) */
@@ -2409,6 +2410,7 @@ extern _Atomic int     g_corr_disarm_req[PTV_MAX_AUDIO]; /* master watchdog → 
 extern _Atomic int g_mv_slate_mask;
 extern int     g_mv_res_follow;   /* 2.0.2 T-343 */
 extern int     g_mv_res_hyst;     /* 2.0.2 T-343 */
+extern int     g_mv_res_occ_avg;  /* 2.0.2 T-343 */
 extern _Atomic int64_t g_mv_house_us;   /* 2.0.2 T-386: the compositor's output time of its current tick (us) */
 /* per-rung wire-send watermark (§3, owner-approved "build it"): wall µs of the last SUCCESSFUL
  * av_interleaved_write_frame on that rung — the only liveness signal that is actually the wire
