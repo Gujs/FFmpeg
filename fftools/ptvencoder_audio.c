@@ -608,7 +608,9 @@ static void rscorr_update(AudioState *a, RsyncTrackR *r, int64_t f_us, int64_t n
     if (g_rscorr_ceil &&
         (c->state == PTV_CORR_ARMED || c->state == PTV_CORR_DWELL ||
          c->state == PTV_CORR_DISARMED)) {
-        if (!r->valid || dead || c->implaus_wc || llabs(R) <= g_rscorr_engage_us) {
+        if (!r->valid || dead || c->implaus_wc || llabs(R) <= g_rscorr_engage_us ||
+            a->nbs_fill_active) {   /* 2.0.2: R on a filled track is synthetic (rule above) — live-transcoder Grid_2x2 slot 2
+                                     * 2026-10-18 ceiling-ENGAGED at a flat −237 ms after its source dropped the audio PID */
             c->starve_wc = 0;
         } else if (!c->starve_wc ||
                    llabs(R - c->starve_r0) >= FFMAX(40000, llabs(R) / 4)) {

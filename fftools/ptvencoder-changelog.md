@@ -5,6 +5,37 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.2-pre4 — 2.0.2-pre3 + mosaic servo band ±6 on house-rate slots (T-343, T-397), honest lipsync= while stalled / filled (T-389), mosaic decoder damage re-primes (T-393), mosaic captions on their picture (T-396)
+
+- **Mosaic slots stop stepping back and forth (T-343, owner 2026-10-18).** The residence servo acted on burst noise: real
+  multicast/SRT arrives in bursts, a slot's buffer swings −6…+3 pictures around its target, and the servo held / skipped a
+  picture on every swing (live-transcoder Grid_2x1 sources over SRT, 38 min: 130 / 69 steps per slot, net zero, ~70 %
+  alternating). The servo now averages the occupancy over ~10 s (`PTV_RES_OCC_AVG=256`) and acts only on the excess beyond
+  ±6 pictures (`PTV_RES_DEADBAND=6`): same window, 0 / 1 steps, no slot ran dry, lip sync unchanged. A FIFO drained at the
+  house rate keeps its content delay whatever its depth — only a hold or skip moves the picture — so the wider swing shifts
+  nothing. Kit (3 runs each): mv04 clean / gap_20 / flapping 3/3 (2.0.2-pre3: 0/3, 0/3, 2/3), mv05 gap_10 3/3. Revert:
+  `PTV_RES_DEADBAND=0 PTV_RES_OCC_AVG=1`.
+  **Only on slots at the house rate (T-397).** On a rate-converted slot (59.94 in a 29.97 mosaic — the RAV layout) the
+  cadence estimate takes ~40 s to converge and the sound follows a step only by the slow 2.0.1 slew: under the band its
+  buffer swelled to 38-42 pictures (target 29), the picture 250 ms late and the sound 130-147 ms early from ~20 to ~45 s
+  after start (MV-01, 5 runs of 5), then stayed at the band's edge (+100…150 ms). Rate-converted slots keep the 2.0.2-pre3
+  servo (MV-01 end lag 33 ms 3/3). `PTV_RES_BAND_ALL=1` = the band on every slot.
+- **Mosaic captions go on air with their picture (T-396).** CC→teletext captions of a mosaic slot were stamped on the
+  slot's content index, while the cell shows that content later by the slot's real picture lag: one frame early on
+  2.0.2-pre3 (MV-01 slot 0 median −33 ms), 4-5 frames under the band. They now wait for the slot's own cell to show their
+  frame — the path single input (T-100) and mosaic copies (T-342) already use: MV-01 −17…0 ms. `PTV_NO_MV_CCVMAP=1` reverts.
+- **`lipsync=` reads `--` while there is nothing to compare (T-389).** A single input whose source is STALLED, and any
+  track being filled with silence (`afill=`: no source audio), printed a number that was the hold's or the fill's own drift:
+  glo-1 Atlântico (a source gone 83 % of the time) read −1…−2.6 s on `src=stalled` lines and was restarted by sync_check
+  PIN twice on 10-18; live-transcoder Grid_2x2 slot 2 (its source dropped the audio PID) read a flat −237 ms. Replay of the
+  Atlântico capture: 12 numbers on 91 stalled lines → 0 of 90. The corrector ignored both states already, except its
+  15-minute starvation ceiling, which engaged on the filled track (frozen, nothing moved): it now skips a silence fill too.
+- **A mosaic slot whose video is damaged inside a clean transport keeps lip sync (T-393).** A bit-flipped SPS (one
+  16x640 picture, then ~2 s undecodable) emptied the slot's buffer; decoder errors were not counted as the slot's damage, so
+  it was not re-primed: the servo refilled it one held picture per ~2 s, the picture slid +480 ms and the audio chasing it
+  ended −64…−69 ms early (2.0.1 / pre2 / pre3 alike). Decoder errors now count as the slot's damage → the T-350 re-prime holds
+  the picture through the damage (kit mv sync_vsize: slot 0 PASS ×4, was FAIL ×4). Single input already handled this (T-373).
+
 ## 2.0.2-pre3 — 2.0.2-pre2 with the A/V corrector engaging at 40 ms (was 80) + a decoder error no longer ends the channel (T-390)
 
 - **The corrector engages at 40 ms (T-391, owner 2026-10-17).** At 80 ms a steady residual of 46-75 ms was never corrected

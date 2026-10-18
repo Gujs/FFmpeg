@@ -45,7 +45,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.2-pre3"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.2-pre4"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -81,12 +81,16 @@ int     g_mv_res_follow = 0;     /* 2.0.2 T-343: a slot's audio follows each del
                                   * 2.0.2-pre1 had it on: on real multicast the servo steps each slot ±1 picture every ~10-60 s,
                                   * alternating, and each became a 42 ms silence pad / cut (live-transcoder canary 2026-10-17) */
 int     g_mv_res_hyst = 1;       /* 2.0.2 T-343: quarter-tick residence hysteresis, no hold/decimate chatter (PTV_NO_RES_HYST=1 off) */
-int     g_mv_res_occ_avg = 1;    /* 2.0.2 T-343: frames the occupancy servo averages the slot's jitter buffer over — 1 = instantaneous
-                                  * (default, as 2.0.1); PTV_RES_OCC_AVG=256 (~10 s) = the canary experiment against the bursty-arrival
-                                  * phase wander (unmeasured locally: the Mac loopback cannot replay the 1080i bursts) */
-int     g_mv_res_deadband = 0;   /* 2.0.0 T-343: residence occupancy servo ±1 picture deadband — OPT-IN (PTV_RES_DEADBAND=1):
+int     g_mv_res_occ_avg = 256;  /* 2.0.2 T-343: frames the occupancy servo averages the slot's jitter buffer over (~10 s);
+                                  * 2.0.2-pre4 DEFAULT with the ±6 band below (owner 2026-10-18); PTV_RES_OCC_AVG=1 = instantaneous (2.0.1) */
+int     g_mv_res_deadband = 6;   /* 2.0.0 T-343: residence occupancy servo ±N picture deadband (PTV_RES_DEADBAND=N, 0 = off; 1 = the
+                                  * 2.0.0 band; N > 1 acts on the excess beyond ±N). 2.0.2-pre4 DEFAULT ±6 (owner 2026-10-18): on real SRT
+                                  * jitter the averaged servo + ±6 cut the alternating steps 130/69 → 0/1 per slot in 38 min, no
+                                  * starvation; kit mv04 clean / gap_20 / flapping 3/3 each (default 0/3, 0/3, 2/3). History:
                                   * on, a slot ran −30 ms for 10 s after a flapping input (mv04 sync_flapping 6/6, off 0/2,
                                   * 2026-10-16); off = the pre21 servo (T-343's 40 ms step ~20 s after start stays open) */
+int     g_mv_res_band_all = 0;  /* 2.0.2 T-397: 1 = the averaged occupancy + band on rate-converted slots too (PTV_RES_BAND_ALL=1,
+                                 * the pre4c1 behaviour); 0 = house-rate slots only */
 int     g_mv_birthtrim = 1;
 int     g_mv_reprime = 1;   /* 2.0.0 T-339: a returning slot re-primes its jitter buffer before it shows; PTV_NO_MV_REPRIME=1 off */
 int     g_aglue_ceil = 1;     /* 1.0.1-pre17 fix round (R3c): erase a tripwire-REFUSED label pursuit at the
@@ -228,6 +232,11 @@ _Atomic int64_t g_house_out_us, g_house_tick_us;
  * read — that skew moves between the read and the display (holds, rejoins, bursts) and they landed seconds off
  * their frame. Single input. PTV_NO_VMAP=1 reverts. */
 int g_vmap = 1;
+/* 2.0.2 T-396: a mosaic slot's captions wait for the slot's own cell to show their frame too (T-342 did it for its sparse
+ * copies) — on the content index alone they went on air the slot's real picture lag early: one frame at the old ±1
+ * residence band, 4-5 frames under the T-343 ±6 band (MV-01 slot 0 teletext median -133 ms, the jitter buffer 7 frames
+ * above its target). PTV_NO_MV_CCVMAP=1 reverts. */
+int g_mv_ccvmap = 1;
 /* 2.0.0 T-103 (owner 2026-10-10): bursty input is absorbed up to the bank ceiling, never more — a pause that would keep
  * more delay than this skips the catch-up to live instead. 0 = keep every pause as delay (the pre-T-103 rule). -1 = the
  * bank ceiling (g_cushion_max_ms); PTV_MAX_DELAY_MS overrides. */
@@ -3721,6 +3730,7 @@ static void *decode_thread(void *arg)
         ret = avcodec_send_packet(d->vdec, pkt);
         av_packet_free(&pkt);
         if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) { /* 2.0.0-pre9.4: damage evidence (bit errors */
+            d->vdecerr++;                                                                      /* 2.0.2 T-393: per input */
             atomic_store_explicit(&g_vdmg_wc, av_gettime_relative(), memory_order_relaxed);   /* inside valid packets) */
             atomic_store_explicit(&g_vcorrupt_wc, av_gettime_relative(), memory_order_relaxed);
             atomic_fetch_add_explicit(&g_vcorrupt_n, 1, memory_order_relaxed);
@@ -3740,6 +3750,7 @@ static void *decode_thread(void *arg)
                  * return (fleet: glo-1 TV_Mundial, cor-1 Fintech_247 ×5 in 10 days, glo-2 EMBED-Fintech,
                  * cor-1 Western_Bound). The ffmpeg CLI logs it and goes on; so do we: damage evidence
                  * like a send_packet error, the frame is lost, decoding continues. */
+                d->vdecerr++;
                 atomic_store_explicit(&g_vdmg_wc, av_gettime_relative(), memory_order_relaxed);
                 atomic_store_explicit(&g_vcorrupt_wc, av_gettime_relative(), memory_order_relaxed);
                 atomic_fetch_add_explicit(&g_vcorrupt_n, 1, memory_order_relaxed);
@@ -3750,6 +3761,7 @@ static void *decode_thread(void *arg)
                 break;
             }
             if (frame->decode_error_flags) { /* 2.0.0-pre9.4: concealed / missing slices = damage evidence */
+                d->vdecerr++;
                 atomic_store_explicit(&g_vdmg_wc, av_gettime_relative(), memory_order_relaxed);
                 atomic_store_explicit(&g_vcorrupt_wc, av_gettime_relative(), memory_order_relaxed);
                 atomic_fetch_add_explicit(&g_vcorrupt_n, 1, memory_order_relaxed);
@@ -6460,6 +6472,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         cc[k].clk            = rung[0].vc;       /* copy the cadence fields... */
         cc[k].clk.h0         = &inputs[in].h0;   /* ...then re-point the anchor at this slot */
         cc[k].clk.h0_lock    = &inputs[in].h0_lock;
+        cc[k].vring          = n_input > 1 && g_mv_ccvmap ? &inputs[in].vring : NULL;   /* 2.0.2 T-396 */
         cc[k].vc             = &cc[k].clk;
         cc[k].q              = cc_q[k];
         cc[k].n_out          = n_rung;
@@ -7399,6 +7412,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_AF_NO_ANCHOR")) g_af_anchor = 0;        /* A/B: revert B1 → pre-B1 free-running counter */
     /* PTV_PREROLL_MS / PTV_VIDEOQ / PTV_CUSHION_MAX_MS / PTV_BANK_DECAY_S parses moved to resolve_cushions() (0.9.18 M1) */
     if (getenv("PTV_NO_AUTOBANK")) g_autobank = 0;
+    if (getenv("PTV_NO_MV_CCVMAP")) g_mv_ccvmap = 0;   /* 2.0.2 T-396 */
     if (getenv("PTV_NO_VMAP")) g_vmap = 0;            /* 2.0.0 T-100: copies + captions on the read-time skew again */
     {   /* 2.0.0 T-103: pinned output delay (default: the bank ceiling, resolved where it is used) */
         const char *md = getenv("PTV_MAX_DELAY_MS");
@@ -7431,7 +7445,9 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_RES_FOLLOW")) g_mv_res_follow = 0;   /* 2.0.2 T-343 */
     if (getenv("PTV_NO_RES_HYST")) g_mv_res_hyst = 0;       /* 2.0.2 T-343 */
     if (getenv("PTV_RES_OCC_AVG")) g_mv_res_occ_avg = FFMAX(1, atoi(getenv("PTV_RES_OCC_AVG")));   /* 2.0.2 T-343 */
-    if (getenv("PTV_RES_DEADBAND") && atoi(getenv("PTV_RES_DEADBAND"))) g_mv_res_deadband = 1;   /* 2.0.0 T-343 (opt-in) */
+    if (getenv("PTV_RES_DEADBAND"))                         /* 2.0.0 T-343; 2.0.2: N = ±N pictures, 0 = off */
+        g_mv_res_deadband = FFMAX(0, atoi(getenv("PTV_RES_DEADBAND")));
+    if (getenv("PTV_RES_BAND_ALL")) g_mv_res_band_all = 1;   /* 2.0.2 T-397 */
     if (getenv("PTV_NO_RES_DEADBAND")) g_mv_res_deadband = 0;   /* 2.0.0 T-343 */     /* v0.9.13: revert to one-pop-per-tick (rate-mismatched slots batch dups + fast-forward after starvation) */
     if (getenv("PTV_NO_MV_REPRIME")) g_mv_reprime = 0;      /* 2.0.0 T-339 */
     if (getenv("PTV_NO_MV_BIRTHTRIM")) g_mv_birthtrim = 0;  /* pre17: one-shot trim only (re-enables the birth catch-up slide) */

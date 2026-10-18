@@ -629,7 +629,8 @@ static int cc_vq_release(CcCtx *c, int force)
     while (k < c->nvq) {
         CcEvent *ev = &c->vq[k];
         int64_t o = AV_NOPTS_VALUE, gap = 0;
-        int r = ptv_vmap_lookup(ev->src_us - ev->vm_delay_us, &o, &gap);   /* T-318/T-312: on the caption's own frame */
+        int r = c->vring ? vring_shown(c->vring, ev->src_us - ev->vm_delay_us, &o, &gap)   /* T-396: the slot's cell */
+                         : ptv_vmap_lookup(ev->src_us - ev->vm_delay_us, &o, &gap);   /* T-318/T-312: on the caption's own frame */
         if (r == 0 && !force)
             break;
         if (ev->kind != PTV_CC_ERASE && (r < 0 || (r == 1 && (gap > 1000000 || o < pos - 1000000)))) {
@@ -678,7 +679,8 @@ void *cc_thread(void *arg)
     for (;;) {
         CcEvent ev;
         int ret = av_thread_message_queue_recv(c->q, &ev, AV_THREAD_MESSAGE_NONBLOCK);
-        if (ret >= 0 && g_vmap && !c->multi) {    /* 2.0.0 T-100: wait for the video to show this frame */
+        if (ret >= 0 && g_vmap && (!c->multi || c->vring)) {   /* 2.0.0 T-100: wait for the video to show this frame
+                                                                * (2.0.2 T-396: on a mosaic, the slot's own cell) */
             if (c->nvq == PTV_CC_VQ)
                 cc_vq_release(c, 1);
             c->vq[c->nvq] = ev;
