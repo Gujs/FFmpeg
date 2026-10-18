@@ -466,17 +466,30 @@ void *compositor_thread(void *arg)
                             double dev_f;
                             if (res_occ_f[k] < 0) res_occ_f[k] = occ_now;
                             res_occ_f[k] += (occ_now - res_occ_f[k]) / g_mv_res_occ_avg;
-                            dev_f = res_occ_f[k] - res_ctr;
+                            /* 2.0.2 T-397: the averaged occupancy and the wide band are for HOUSE-RATE slots — the step storm they
+                             * stop was measured there, and there the T-343 follow moves the sound with every step. On a
+                             * rate-converted slot the sound follows only by the slow 2.0.1 slew: MV-01 slot 0 (59.94 in a 29.97
+                             * mosaic, its cadence estimate ~40 s to converge from the house-tick seed) swelled to 38-42 pictures
+                             * under the band (target 29: picture 250 ms late, the sound 130-147 ms early from ~20 to ~45 s, 5 runs
+                             * of 5) and stayed at the band's edge after (+100..150 ms). Rate-converted slots keep the pre3 servo
+                             * (instantaneous occupancy, no band): end lag 33 ms 3/3. Tried and dropped: the band once the estimate
+                             * settled (< 1 % / 64 deltas) — no transient, but the slot then sat 83 ms deep and mv01 gap_20 failed
+                             * 2/3. PTV_RES_BAND_ALL=1 = the band on every slot (pre4c1). */
+                            if (!res_matched && !g_mv_res_band_all)
+                                dev_f = occ_now - res_ctr;
+                            else
+                                dev_f = res_occ_f[k] - res_ctr;
                             int dev = (int)lrint(dev_f);
+                            int band = res_matched || g_mv_res_band_all ? g_mv_res_deadband : 0;
                             /* 2.0.0 T-343: a ±1 picture deadband — a slot born one picture under the target ran 0.1 %
                              * slow until the drift reached half a tick (500 pictures = 20 s at 25 fps) and showed one
                              * picture twice: a 40 ms audio step in a clean mosaic, which slot by birth jitter.
                              * PTV_NO_RES_DEADBAND=1 reverts. */
-                            if (g_mv_res_deadband && dev >= -g_mv_res_deadband && dev <= g_mv_res_deadband)
+                            if (band && dev >= -band && dev <= band)
                                 dev = 0;
-                            else if (g_mv_res_deadband > 1)   /* 2.0.2 T-343: a wide band acts on the excess only */
-                                dev = dev > 0 ? dev - g_mv_res_deadband : dev + g_mv_res_deadband;
-                            int64_t corr = g_mv_res_deadband ? (int64_t)dev * 1000 : (int64_t)lrint(dev_f * 1000);
+                            else if (band > 1)                /* 2.0.2 T-343: a wide band acts on the excess only */
+                                dev = dev > 0 ? dev - band : dev + band;
+                            int64_t corr = band ? (int64_t)dev * 1000 : (int64_t)lrint(dev_f * 1000);
                             corr = av_clip64(corr, -20000, 20000);
                             res_due_us[k] = FFMAX(res_due_us[k], hnow - half - hy_dec)
                                             + res_ema_us[k] - res_ema_us[k] * corr / 1000000;

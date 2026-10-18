@@ -89,6 +89,8 @@ int     g_mv_res_deadband = 6;   /* 2.0.0 T-343: residence occupancy servo ±N p
                                   * starvation; kit mv04 clean / gap_20 / flapping 3/3 each (default 0/3, 0/3, 2/3). History:
                                   * on, a slot ran −30 ms for 10 s after a flapping input (mv04 sync_flapping 6/6, off 0/2,
                                   * 2026-10-16); off = the pre21 servo (T-343's 40 ms step ~20 s after start stays open) */
+int     g_mv_res_band_all = 0;  /* 2.0.2 T-397: 1 = the averaged occupancy + band on rate-converted slots too (PTV_RES_BAND_ALL=1,
+                                 * the pre4c1 behaviour); 0 = house-rate slots only */
 int     g_mv_birthtrim = 1;
 int     g_mv_reprime = 1;   /* 2.0.0 T-339: a returning slot re-primes its jitter buffer before it shows; PTV_NO_MV_REPRIME=1 off */
 int     g_aglue_ceil = 1;     /* 1.0.1-pre17 fix round (R3c): erase a tripwire-REFUSED label pursuit at the
@@ -7445,6 +7447,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_RES_OCC_AVG")) g_mv_res_occ_avg = FFMAX(1, atoi(getenv("PTV_RES_OCC_AVG")));   /* 2.0.2 T-343 */
     if (getenv("PTV_RES_DEADBAND"))                         /* 2.0.0 T-343; 2.0.2: N = ±N pictures, 0 = off */
         g_mv_res_deadband = FFMAX(0, atoi(getenv("PTV_RES_DEADBAND")));
+    if (getenv("PTV_RES_BAND_ALL")) g_mv_res_band_all = 1;   /* 2.0.2 T-397 */
     if (getenv("PTV_NO_RES_DEADBAND")) g_mv_res_deadband = 0;   /* 2.0.0 T-343 */     /* v0.9.13: revert to one-pop-per-tick (rate-mismatched slots batch dups + fast-forward after starvation) */
     if (getenv("PTV_NO_MV_REPRIME")) g_mv_reprime = 0;      /* 2.0.0 T-339 */
     if (getenv("PTV_NO_MV_BIRTHTRIM")) g_mv_birthtrim = 0;  /* pre17: one-shot trim only (re-enables the birth catch-up slide) */

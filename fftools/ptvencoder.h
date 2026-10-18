@@ -2052,6 +2052,7 @@ extern int     g_reanchor;
 extern int     g_mv_clamp;
 extern int     g_mv_residence;
 extern int     g_mv_res_deadband;
+extern int     g_mv_res_band_all;   /* 2.0.2 T-397 */
 extern int     g_mv_birthtrim;
 extern int     g_mv_reprime;
 extern int     g_aglue_ceil;
