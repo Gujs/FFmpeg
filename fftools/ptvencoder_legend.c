@@ -246,7 +246,8 @@ void ptv_print_log_legend(int full)
         "             (ms, + = audio EARLY): per-stream source→output content mapping difference\n"
         "             (video EMA(out−src) + demux edit ledger vs audio ledger m_a) — sees\n"
         "             relabel-erases, wrong glues and parked resampler slip; shared latency (hs)\n"
-        "             cancels. `--` = a side not flowing. On mv each track pairs against ITS OWN\n"
+        "             cancels. `--` = a side not flowing, or (2.0.2, single input) the source\n"
+        "             STALLED (no content to compare). On mv each track pairs against ITS OWN\n"
         "             slot's video (aK: prefix always; track→slot map = the startup [PTV-RSYNC]\n"
         "             tracks: line). 1.0.1-pre11: the slip probe is scoped to the async-aresample\n"
         "             boundary — a buffering -af's hold (loudnorm ~3s) is label-preserving latency,\n"
@@ -466,6 +467,10 @@ void ptv_stats_lipsync(char *buf, size_t size, int64_t now_us, int force_idx)
         int64_t mvw = atomic_load_explicit(&g_rsx.mv_wall[in], memory_order_relaxed);
         int64_t maw = atomic_load_explicit(&g_rsx.ma_wall[ki], memory_order_relaxed);
         int fresh = mvw && maw && now_us - mvw < 3000000 && now_us - maw < 3000000;
+        /* 2.0.2 T-389: a single input whose source is STALLED has no content on either side — the reading is the
+         * hold's own drift (Atlantico 2026-10-18: −0.4 … −2.9 s while stalled, sync_check PIN restarts on it) */
+        if (g_src_watch && atomic_load_explicit(&g_src_state, memory_order_relaxed))
+            fresh = 0;
         if (force_idx || g_rsx.n_a > 1)
             nn += snprintf(buf + nn, size - nn, "%sa%d:", ki ? "," : "", ki);
         if (fresh) {                                 /* R = (m_v+E_v) − (m_a+E_a); stale side → -- (no stale anchors) */
