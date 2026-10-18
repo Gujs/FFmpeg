@@ -805,6 +805,7 @@ typedef struct DecodeCtx {
     int64_t          framedrop[PTV_MAX_RUNG];
     /* shared counters (the master output thread reports them) */
     int64_t          dec_frames, vcorrupt;
+    int64_t          vdecerr;              /* 2.0.2 T-393: decoder errors (send / output / concealed) — the mosaic slot's damage evidence */
     int              deep_prime_packets;   /* §13: if >0, delay decode start until video_q banks this many packets (deep bursty-input cushion; single-input only) */
     /* 1.0.1-pre8 (a) GOP-coherent overflow: the decode side executes the head-GOP shed the
      * demux requests on video_q overflow (only the consumer can pop the queue head). */

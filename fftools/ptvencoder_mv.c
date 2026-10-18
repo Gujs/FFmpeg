@@ -346,7 +346,10 @@ void *compositor_thread(void *arg)
                  * Grid_2x2 Cinestar cell C4 / C5). Damaged and 3 frames short of the primed depth = re-prime now: the
                  * picture holds a few frames during the damage instead of sliding after it. The slot's PLL reads nothing
                  * while damaged (g_mv_vdmg_wc, ptvencoder_audio.c). */
-                int64_t cr = c->inputs[k].da.vcorrupt + c->inputs[k].dc.vcorrupt;
+                /* 2.0.2 T-393: + the slot's DECODER errors — H.264 damage inside a clean transport (a bit-flipped SPS: one
+                 * 16x640 picture, then ~2 s undecodable) emptied the buffer with no demux corrupt flag, so no re-prime:
+                 * the servo refilled it over ~30 s (14 holds, the picture +480 ms later), its audio chased it, −64…−69 ms */
+                int64_t cr = c->inputs[k].da.vcorrupt + c->inputs[k].dc.vcorrupt + c->inputs[k].dc.vdecerr;
                 if (cr != dmg_cr[k]) {
                     dmg_cr[k] = cr; dmg_wc[k] = now_us;
                     atomic_store_explicit(&g_mv_vdmg_wc[k], now_us, memory_order_relaxed);

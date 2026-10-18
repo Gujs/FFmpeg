@@ -3722,6 +3722,7 @@ static void *decode_thread(void *arg)
         ret = avcodec_send_packet(d->vdec, pkt);
         av_packet_free(&pkt);
         if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) { /* 2.0.0-pre9.4: damage evidence (bit errors */
+            d->vdecerr++;                                                                      /* 2.0.2 T-393: per input */
             atomic_store_explicit(&g_vdmg_wc, av_gettime_relative(), memory_order_relaxed);   /* inside valid packets) */
             atomic_store_explicit(&g_vcorrupt_wc, av_gettime_relative(), memory_order_relaxed);
             atomic_fetch_add_explicit(&g_vcorrupt_n, 1, memory_order_relaxed);
@@ -3741,6 +3742,7 @@ static void *decode_thread(void *arg)
                  * return (fleet: glo-1 TV_Mundial, cor-1 Fintech_247 ×5 in 10 days, glo-2 EMBED-Fintech,
                  * cor-1 Western_Bound). The ffmpeg CLI logs it and goes on; so do we: damage evidence
                  * like a send_packet error, the frame is lost, decoding continues. */
+                d->vdecerr++;
                 atomic_store_explicit(&g_vdmg_wc, av_gettime_relative(), memory_order_relaxed);
                 atomic_store_explicit(&g_vcorrupt_wc, av_gettime_relative(), memory_order_relaxed);
                 atomic_fetch_add_explicit(&g_vcorrupt_n, 1, memory_order_relaxed);
@@ -3751,6 +3753,7 @@ static void *decode_thread(void *arg)
                 break;
             }
             if (frame->decode_error_flags) { /* 2.0.0-pre9.4: concealed / missing slices = damage evidence */
+                d->vdecerr++;
                 atomic_store_explicit(&g_vdmg_wc, av_gettime_relative(), memory_order_relaxed);
                 atomic_store_explicit(&g_vcorrupt_wc, av_gettime_relative(), memory_order_relaxed);
                 atomic_fetch_add_explicit(&g_vcorrupt_n, 1, memory_order_relaxed);
