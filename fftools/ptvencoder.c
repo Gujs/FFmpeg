@@ -230,6 +230,11 @@ _Atomic int64_t g_house_out_us, g_house_tick_us;
  * read — that skew moves between the read and the display (holds, rejoins, bursts) and they landed seconds off
  * their frame. Single input. PTV_NO_VMAP=1 reverts. */
 int g_vmap = 1;
+/* 2.0.2 T-396: a mosaic slot's captions wait for the slot's own cell to show their frame too (T-342 did it for its sparse
+ * copies) — on the content index alone they went on air the slot's real picture lag early: one frame at the old ±1
+ * residence band, 4-5 frames under the T-343 ±6 band (MV-01 slot 0 teletext median -133 ms, the jitter buffer 7 frames
+ * above its target). PTV_NO_MV_CCVMAP=1 reverts. */
+int g_mv_ccvmap = 1;
 /* 2.0.0 T-103 (owner 2026-10-10): bursty input is absorbed up to the bank ceiling, never more — a pause that would keep
  * more delay than this skips the catch-up to live instead. 0 = keep every pause as delay (the pre-T-103 rule). -1 = the
  * bank ceiling (g_cushion_max_ms); PTV_MAX_DELAY_MS overrides. */
@@ -6465,6 +6470,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         cc[k].clk            = rung[0].vc;       /* copy the cadence fields... */
         cc[k].clk.h0         = &inputs[in].h0;   /* ...then re-point the anchor at this slot */
         cc[k].clk.h0_lock    = &inputs[in].h0_lock;
+        cc[k].vring          = n_input > 1 && g_mv_ccvmap ? &inputs[in].vring : NULL;   /* 2.0.2 T-396 */
         cc[k].vc             = &cc[k].clk;
         cc[k].q              = cc_q[k];
         cc[k].n_out          = n_rung;
@@ -7404,6 +7410,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_AF_NO_ANCHOR")) g_af_anchor = 0;        /* A/B: revert B1 → pre-B1 free-running counter */
     /* PTV_PREROLL_MS / PTV_VIDEOQ / PTV_CUSHION_MAX_MS / PTV_BANK_DECAY_S parses moved to resolve_cushions() (0.9.18 M1) */
     if (getenv("PTV_NO_AUTOBANK")) g_autobank = 0;
+    if (getenv("PTV_NO_MV_CCVMAP")) g_mv_ccvmap = 0;   /* 2.0.2 T-396 */
     if (getenv("PTV_NO_VMAP")) g_vmap = 0;            /* 2.0.0 T-100: copies + captions on the read-time skew again */
     {   /* 2.0.0 T-103: pinned output delay (default: the bank ceiling, resolved where it is used) */
         const char *md = getenv("PTV_MAX_DELAY_MS");

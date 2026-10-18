@@ -909,6 +909,8 @@ typedef struct CcCtx {
     int              n_out;
     int              slot;                    /* input index this extraction belongs to (0 single) */
     int              multi;                   /* 1 = multiview: log lines carry the slot */
+    VOutRing        *vring;                   /* 2.0.2 T-396: multiview = this slot's displayed-content ring (the
+                                               * captions' video record, T-342's for copies); NULL single input */
     int64_t          last_dts;                /* house-domain us; strictly-increasing guard */
     int64_t          last_emit_wc;            /* wall clock of the last emitted packet — the
                                                * synthetic-keepalive timer for a frameless input */
@@ -2143,6 +2145,7 @@ extern _Atomic int64_t g_house_out_us, g_house_tick_us;   /* master: last emitte
 /* 2.0.0 T-100: the video's content -> output record (ptvencoder.c) */
 #define PTV_VMAP_N 4096
 extern int g_vmap;
+extern int g_mv_ccvmap;        /* 2.0.2 T-396: mosaic captions wait for their slot's cell (PTV_NO_MV_CCVMAP=1 off) */
 extern int     g_cc_rewrap;       /* 2.0.0 T-023(b): re-wrap pop-on captions to the teletext row (PTV_CC_NO_REWRAP=1 off) */
 extern int64_t g_hold_clean_us;   /* 2.0.0 T-324: a hold that saw video damage ends after this much clean video */
 extern int64_t g_max_delay_us;   /* 2.0.0 T-103: pinned output delay (us; 0 = off) */
