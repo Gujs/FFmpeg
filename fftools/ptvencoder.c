@@ -84,7 +84,8 @@ int     g_mv_res_hyst = 1;       /* 2.0.2 T-343: quarter-tick residence hysteres
 int     g_mv_res_occ_avg = 1;    /* 2.0.2 T-343: frames the occupancy servo averages the slot's jitter buffer over — 1 = instantaneous
                                   * (default, as 2.0.1); PTV_RES_OCC_AVG=256 (~10 s) = the canary experiment against the bursty-arrival
                                   * phase wander (unmeasured locally: the Mac loopback cannot replay the 1080i bursts) */
-int     g_mv_res_deadband = 0;   /* 2.0.0 T-343: residence occupancy servo ±1 picture deadband — OPT-IN (PTV_RES_DEADBAND=1):
+int     g_mv_res_deadband = 0;   /* 2.0.0 T-343: residence occupancy servo ±N picture deadband — OPT-IN (PTV_RES_DEADBAND=N; 1 = the
+                                  * 2.0.0 band; N > 1 acts on the excess beyond ±N, 2.0.2 experiment against the bursty-arrival steps):
                                   * on, a slot ran −30 ms for 10 s after a flapping input (mv04 sync_flapping 6/6, off 0/2,
                                   * 2026-10-16); off = the pre21 servo (T-343's 40 ms step ~20 s after start stays open) */
 int     g_mv_birthtrim = 1;
@@ -7431,7 +7432,8 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_RES_FOLLOW")) g_mv_res_follow = 0;   /* 2.0.2 T-343 */
     if (getenv("PTV_NO_RES_HYST")) g_mv_res_hyst = 0;       /* 2.0.2 T-343 */
     if (getenv("PTV_RES_OCC_AVG")) g_mv_res_occ_avg = FFMAX(1, atoi(getenv("PTV_RES_OCC_AVG")));   /* 2.0.2 T-343 */
-    if (getenv("PTV_RES_DEADBAND") && atoi(getenv("PTV_RES_DEADBAND"))) g_mv_res_deadband = 1;   /* 2.0.0 T-343 (opt-in) */
+    if (getenv("PTV_RES_DEADBAND") && atoi(getenv("PTV_RES_DEADBAND")) > 0)   /* 2.0.0 T-343 (opt-in); 2.0.2: N = ±N pictures */
+        g_mv_res_deadband = atoi(getenv("PTV_RES_DEADBAND"));
     if (getenv("PTV_NO_RES_DEADBAND")) g_mv_res_deadband = 0;   /* 2.0.0 T-343 */     /* v0.9.13: revert to one-pop-per-tick (rate-mismatched slots batch dups + fast-forward after starvation) */
     if (getenv("PTV_NO_MV_REPRIME")) g_mv_reprime = 0;      /* 2.0.0 T-339 */
     if (getenv("PTV_NO_MV_BIRTHTRIM")) g_mv_birthtrim = 0;  /* pre17: one-shot trim only (re-enables the birth catch-up slide) */

@@ -469,8 +469,10 @@ void *compositor_thread(void *arg)
                              * slow until the drift reached half a tick (500 pictures = 20 s at 25 fps) and showed one
                              * picture twice: a 40 ms audio step in a clean mosaic, which slot by birth jitter.
                              * PTV_NO_RES_DEADBAND=1 reverts. */
-                            if (g_mv_res_deadband && dev >= -1 && dev <= 1)
+                            if (g_mv_res_deadband && dev >= -g_mv_res_deadband && dev <= g_mv_res_deadband)
                                 dev = 0;
+                            else if (g_mv_res_deadband > 1)   /* 2.0.2 T-343: a wide band acts on the excess only */
+                                dev = dev > 0 ? dev - g_mv_res_deadband : dev + g_mv_res_deadband;
                             int64_t corr = g_mv_res_deadband ? (int64_t)dev * 1000 : (int64_t)lrint(dev_f * 1000);
                             corr = av_clip64(corr, -20000, 20000);
                             res_due_us[k] = FFMAX(res_due_us[k], hnow - half - hy_dec)
