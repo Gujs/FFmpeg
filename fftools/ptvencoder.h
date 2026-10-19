@@ -762,6 +762,7 @@ typedef struct PtvTsOutlier {
     int64_t fx_base;        /* 2.0.0 T-088: raw ts before a flowed forward excursion (one corrupt PES = several packets) */
     int     fx_n;           /* ... packets since it (the excursion packet = 1); 0 = none / expired */
     int64_t wrap_dw;        /* 2.0.1 T-320: the wrap step the LAST packet took (0 = none) — undone if it was an outlier */
+    int64_t dmg_wc;         /* 2.0.2 T-402: wall time (us) a corrupt packet of this stream was last discarded (0 = never) */
 } PtvTsOutlier;
 
 struct Input;                                  /* 2.0.2 T-386: back-pointers for the late bind */
@@ -1945,6 +1946,8 @@ typedef struct DemuxArgs {
     VOutRing             *mv_vring;         /* 2.0.0 T-342: multiview — this slot's displayed content ring (sparse copies) */
     struct Input    *in;                      /* 2.0.2 T-386: its input (a deferred slot acquires + binds here) */
     char             abind[PTV_MAX_AUDIO][32];  /* ... each track's -map specifier, resolved at the bind */
+    int64_t               dmg_keep_n;     /* 2.0.2 T-402: video backward steps after corrupt discards left unabsorbed */
+    int64_t               dmg_keep_log_us; /* ... its log rate limit (10 s) */
 } DemuxArgs;
 
 /* One source input. Single-input uses inputs[0]; multiview uses 1/2/4. Each has
@@ -2076,6 +2079,7 @@ extern int64_t g_novideo_exit_us;        /* 1.0.1-pre23 startup sanity: packets 
                                           * (PTV_NOVIDEO_EXIT_S, default 300s; 0 disables) */
 extern int     g_wallev;                 /* 1.0.1-pre24 #63 wall-evidence split (PTV_NO_WALLEV=1 reverts
                                           * the action; provenance measurement stays on) */
+extern int     g_dmgstat;   /* 2.0.2 T-402: no step / cadence statistics across corrupt-discarded packets (PTV_NO_DMGSTAT=1 off) */
 extern int     g_pestail;   /* 2.0.0-pre4c: PES-tail wall-gap carry for video wall evidence (PTV_NO_PESTAIL=1 off) */
 extern int     g_rlcheck;   /* 2.0.1 T-087: content check of a backward audio erase (PTV_NO_RLCHECK=1 off) */
 extern double  g_rl_relabel_max;   /* 2.0.2 T-391 */
