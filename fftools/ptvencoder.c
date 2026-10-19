@@ -6425,7 +6425,9 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         comp.out_fps = out_fps;                      /* v0.9.12 MV-EXACTTICK: exact measurement axis */
         comp.gate0 = delivery_on ? &rung[0].gate : NULL;   /* v0.9.13: dlvhold=/dlvforced= in the mv stats line */
         comp.live = live;
-        comp.slate_after_us = live ? 5 * (int64_t)AV_TIME_BASE : 0;   /* stale cell -> black after 5s */
+        /* stale cell -> bars after -freeze_max (2.0.2 T-385 row 16: was a fixed 5 s, -freeze_max ignored on a mosaic; the
+         * default is the same 5 s; -freeze_max inf = 0 = the cell keeps its last picture, as on a single input) */
+        comp.slate_after_us = live ? g_freeze_max_us : 0;
         for (k = 0; k < n_input; k++) comp.fsrc[k] = fsrc[k];
         for (r = 0; r < n_rung; r++) { comp.fsink[r] = vsink[r]; comp.frame_q[r] = rung[r].frame_q; }
     }
