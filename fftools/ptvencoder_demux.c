@@ -2301,6 +2301,7 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
     int bits = st->pts_wrap_bits;
     int64_t mask, half, raw, off;
     int64_t po0 = d->prog_off;               /* 2.0.1 T-332: what this packet moves prog_off by */
+    int dmg = 0;
 
     if (bits <= 0 || bits >= 63)              /* only meaningful for a real TS wrap */
         return;
@@ -2310,6 +2311,13 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
     if (raw != AV_NOPTS_VALUE) {
         int64_t wall_now = av_gettime_relative();
         int64_t last = d->wrap_last[pkt->stream_index];
+        /* 2.0.2 T-402: the stream is in a damage phase (a corrupt packet of it discarded in the last 3 s, the T-350 window):
+         * its delivered packets come out of a mangled PES stream — no "normal step" / delivery-cadence learning from them
+         * and no small label edit on their evidence (see the step EMA and the video absorber below) */
+        if (g_dmgstat && d->ts_outl && pkt->stream_index < d->nb_streams_open) {
+            int64_t dw = d->ts_outl[pkt->stream_index].dmg_wc;
+            dmg = dw && wall_now - dw < 3000000;
+        }
         if (d->any_wall_last && wall_now - d->any_wall_last >= g_gap_min_us)
             d->any_stall_wc = wall_now;         /* 2.0.0 T-345: the whole input paused (delivery, not one PID) */
         d->any_wall_last = wall_now;
@@ -2369,7 +2377,7 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                         d->tail_wc_us[pkt->stream_index] = wall_now;
                 }
             }
-            if (d->wall_cad_us && pg > 5000 && pg < 2000000) {
+            if (d->wall_cad_us && pg > 5000 && pg < 2000000 && !dmg) {
                 if (!d->wall_cad_us[pkt->stream_index])
                     d->wall_cad_us[pkt->stream_index] = pg;
                 else
@@ -2419,8 +2427,16 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                 if (!keep)
                     ol->pend_last = AV_NOPTS_VALUE;
             }
+            /* 2.0.2 T-402: not across corrupt-discarded packets. In a corruption storm (live RAV slot 2, 2026-10-19: every
+             * video PES corrupt for 50 min, the few intact ones 2-3 frames apart) the steps between delivered packets
+             * spanned the discarded frames and walked the "normal step" from 33 to ~87 ms (each step up to twice it is
+             * learned) — then a repeated label (a PES lavf emits twice) read as an 87 ms backward step, over the 80 ms bar,
+             * and was absorbed: +87 ms on every later video label, ~21 times, while the all-discarded audio kept its
+             * labels; the delivery cadence (above) walked to ~850 ms the same way and a 2168 ms hole lost 792 ms as
+             * "flowing". Net video +1092 ms vs audio 0 = the slot's sound 1.1 s early after the storm on both canaries
+             * (the edit ledgers ev / ea, content -1130 ms). PTV_NO_DMGSTAT=1 reverts. */
             if (ol && delta > 0 && delta <= av_rescale(250, st->time_base.den, (int64_t)st->time_base.num * 1000) &&
-                (!ol->nom || delta <= 2 * ol->nom))   /* T-088: an excursion is not a normal step */
+                (!ol->nom || delta <= 2 * ol->nom) && !dmg)   /* T-088: an excursion is not a normal step */
                 ol->nom = ol->nom ? ol->nom + (delta - ol->nom) / 8 : delta;   /* the normal step */
             /* 2.0.0 T-088: remember a forward excursion under the absorber's 1 s bar (it flows), for 16 packets — a
              * corrupt PES header shifts every frame lavf splits out of that PES (AC-3: three), so the return to the
@@ -2515,6 +2531,24 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                  * so every normal +40 ms step read as a backward step and was absorbed: +8 s / +735 s of video labels,
                  * PTS holes and lip sync −8 s after recovery. The duration is only the fallback before a step is known. */
                 int64_t bnom = ol && ol->nom > 0 ? ol->nom : (pkt->duration > 0 ? pkt->duration : 0);
+                /* 2.0.2 T-402: a VIDEO backward step under 1 s in the stream's damage phase is not a source step: in a damage
+                 * storm the intact packets come out of a mangled PES stream (a duplicate sender's older copy interleaved:
+                 * -33..-133 ms steps, each back and forth; a PES emitted twice: the same label). Only the backward half was
+                 * absorbed (a forward step under 1 s flows), so every swing moved all later video labels forward while the
+                 * all-discarded audio kept its own — local 5 ms duplicate storm +39 s of video labels in 3 min, live RAV slot
+                 * 2 +1.1 s. The labels stay as sent (video survives a backward label: the compositor / output clock re-stamps
+                 * it; audio keeps its absorber — aresample needs a monotonic input). A >1 s step stays LAYERA's.
+                 * PTV_NO_DMGSTAT=1 reverts. */
+                if (dmg && ct == AVMEDIA_TYPE_VIDEO && delta < 0 &&
+                    av_rescale_q(-delta, st->time_base, AV_TIME_BASE_Q) <= PTV_DISC_THRESHOLD_US) {
+                    d->dmg_keep_n++;
+                    if (wall_now - d->dmg_keep_log_us >= 10000000) {
+                        av_log(NULL, AV_LOG_INFO, "[PTV-DISCONT] stream %d: %+"PRId64"ms backward step in the stream's "
+                               "damage phase (corrupt packets in the last 3 s) — labels kept as sent, not absorbed (%"PRId64" so far)\n", pkt->stream_index,
+                               av_rescale_q(delta, st->time_base, (AVRational){1,1000}), d->dmg_keep_n);
+                        d->dmg_keep_log_us = wall_now;
+                    }
+                } else
                 if ((fwd_thresh > 0 && delta > fwd_thresh) || (back_thresh > 0 && delta - bnom < -back_thresh)) {
                     int64_t thresh  = delta > 0 ? fwd_thresh : back_thresh;
                     int64_t nominal = ol && ol->nom > 0 ? ol->nom : (pkt->duration > 0 ? pkt->duration : thresh / 4);
@@ -2800,7 +2834,9 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                         int64_t vjump_us = av_rescale_q(delta, st->time_base, AV_TIME_BASE_Q);
                         int64_t vw = ptv_wallev_w(d, pkt->stream_index, vjump_us);
                         if (vw > 0) {
-                            int vfull = ptv_wallev_full(vw, vjump_us);
+                            /* 2.0.2 T-402: a hole that spans corrupt-discarded packets is missing content (an erase needs
+                             * positive evidence of a relabel): kept whole, no "flowing" part (live RAV slot 2: 792 ms erased) */
+                            int vfull = dmg || ptv_wallev_full(vw, vjump_us);
                             int64_t vflow_us = ptv_wallev_shared_flow(d, pkt->stream_index, vjump_us, vw,   /* T-336 */
                                                                       vfull ? 0 : vjump_us - vw, wall_now);
                             int64_t dukf_thresh = av_rescale(g_dukf_min_ms, st->time_base.den,
@@ -4212,6 +4248,8 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
 {
     int ret = 0;
     if ((out->flags & AV_PKT_FLAG_CORRUPT) && g_discardcorrupt) {
+        if (d->ts_outl && out->stream_index < d->nb_streams_open)   /* 2.0.2 T-402: the stream's damage phase (demux_unwrap) */
+            d->ts_outl[out->stream_index].dmg_wc = av_gettime_relative();
         /* = -fflags +discardcorrupt, ALL streams — but COUNTED (video) so frame loss shows in stats
          * (libavformat's own flag discards silently, hiding the count). Drop before decode: a corrupt
          * frame, like a dropped one, becomes a content gap the position-anchored composite leaps
