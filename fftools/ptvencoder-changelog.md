@@ -5,6 +5,20 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.2-pre5 — 2.0.2-pre4 + no label edits in a stream's damage phase (T-402), a mosaic's dead cell honours -freeze_max (T-385 row 16)
+
+- **A slot / channel keeps lip sync through a corruption storm (T-402).** Live 2026-10-19, both canaries on 2.0.2-pre4:
+  MV_2x2_RAV slot 2 played its sound 1.1 s early after a 50-min corruption storm at the origin (content −1130 ms). During
+  the storm every video PES was corrupt and the few intact ones came 2-3 frames apart: the demux learned its "normal step"
+  (33 → ~87 ms) and delivery cadence (→ ~850 ms) from them, absorbed every repeated label as an 87 ms backward step and
+  erased 792 ms of a real hole as "flowing" — +1092 ms on the video labels, 0 on the all-discarded audio; the PLL then
+  aligned the labels. In a stream's damage phase (a corrupt packet of it discarded in the last 3 s) the demux now learns no
+  step / cadence, absorbs no video backward step under 1 s (the labels stay as sent) and keeps a video hole whole. Replay of
+  the real slot-2 source under the RAV production command with a duplicate-sender storm: video label edits +40 s → 0, slot 2
+  by content −40.3 s → within ±70 ms. Revert: `PTV_NO_DMGSTAT=1`.
+- **A mosaic's dead cell honours `-freeze_max` (T-385 row 16).** It turned to bars after a fixed 5 s; the default stays 5 s,
+  `-freeze_max inf` keeps the cell's last picture. With `-freeze_max 2` a slot gap shows bars 2.9 s earlier.
+
 ## 2.0.2-pre4 — 2.0.2-pre3 + mosaic servo band ±6 on house-rate slots (T-343, T-397), honest lipsync= while stalled / filled (T-389), mosaic decoder damage re-primes (T-393), mosaic captions on their picture (T-396)
 
 - **Mosaic slots stop stepping back and forth (T-343, owner 2026-10-18).** The residence servo acted on burst noise: real
