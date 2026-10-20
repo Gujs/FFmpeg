@@ -5,6 +5,17 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.2-pre7 — 2.0.2-pre6 + the mosaic PLL keeps only the corrector's walk after an engagement (T-407)
+
+- **A slot keeps lip sync when its picture moves while the corrector steers (T-407).** live-transcoder and cor-3 2026-10-20,
+  both on pre6: MV_2x2_RAV slot 2 (OAN) was restarted by sync_check at +2.2 s. After an outage the corrector's ceiling
+  engaged and the slot's PLL yielded to it; the slot's video then fell 2.4 s behind its audio, nobody followed it, and when
+  the engagement ended the PLL took its whole +3.18 s reading as the new zero. The PLL now keeps only what the corrector's
+  own walk accounts for (its reading at the yield plus −Δcorr, held within the walk) and corrects the rest as usual.
+  Kit (sync_vdelay_2400, 2x2 mosaic): pre6 slot 2 by content −2197 ms to the end, pre7 back to the corrector's held
+  +163 ms after one 2.3 s pad. A clean outage during an engagement: pre6 +246 ms, pre7 +166 ms (= the corrector's walk).
+  Tracks that never engage are unchanged. `PTV_NO_BIAS_CAP=1` reverts.
+
 ## 2.0.2-pre6 — 2.0.2-pre5 + corrector ceiling on the edit ledgers (T-404), silent audio-only erase undone (T-395)
 
 - **The corrector's starvation ceiling is not reset by the PLL's own steps (T-404).** live-transcoder MV_2x2_RAV slot 2
