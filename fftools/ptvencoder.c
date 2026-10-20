@@ -242,6 +242,7 @@ int g_mv_ccvmap = 1;
  * more delay than this skips the catch-up to live instead. 0 = keep every pause as delay (the pre-T-103 rule). -1 = the
  * bank ceiling (g_cushion_max_ms); PTV_MAX_DELAY_MS overrides. */
 int64_t g_max_delay_us = -1;
+int64_t g_door_max_us = 20000000;   /* 2.0.2 T-398: the burst door's max delay (ptvencoder_demux.c); PTV_DOOR_MAX_MS */
 static pthread_mutex_t vmap_lock = PTHREAD_MUTEX_INITIALIZER;
 static int64_t vmap_src[PTV_VMAP_N], vmap_out[PTV_VMAP_N], vmap_wc[PTV_VMAP_N];
 static int     vmap_w, vmap_n;                  /* next write slot, entries held */
@@ -7422,6 +7423,9 @@ int main(int argc, char **argv)
         const char *md = getenv("PTV_MAX_DELAY_MS");
         if (md)
             g_max_delay_us = (int64_t)atoll(md) * 1000;
+        md = getenv("PTV_DOOR_MAX_MS");   /* 2.0.2 T-398: burst door only; 12000 = the 2.0.2-pre5 door */
+        if (md && atoll(md) > 0)
+            g_door_max_us = (int64_t)atoll(md) * 1000;
     }   /* v0.9.14: revert to advisor-only (manual PTV_PREROLL_MS recipe) */
     if (getenv("PTV_NO_CLOCKFOLLOW")) g_clockfollow = 0;   /* v0.9.15: never follow a large source-clock offset (buffers pin + resampler churns on such sources) */
     if (getenv("PTV_NO_VGAPFILL")) g_vgapfill = 0;          /* 2.0.0-pre9.4 (T-083) kill switch */

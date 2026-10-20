@@ -3738,7 +3738,13 @@ void *demux_thread(void *arg)
         if (d->single && g_src_watch && g_src_hold_act) {
             const AVStream *vst = d->ifmt->streams[d->vstream], *st = d->ifmt->streams[out->stream_index];
             int64_t raw = out->dts != AV_NOPTS_VALUE ? out->dts : out->pts, nw = av_gettime_relative();
-            int64_t maxd = g_max_delay_us >= 0 ? g_max_delay_us : g_cushion_max_ms * 1000;
+            /* 2.0.2 T-398 (owner 2026-10-20): the burst door sits at g_door_max_us (20 s), above the bank ceiling (12 s).
+             * A sender that relays ~6 s HLS segments over SRT in bursts (Growing_Your_Faith, AGROBRASIL) held 12.1 s
+             * against the 12 s door ~46 times an hour; each drop resumed at a keyframe with a -20...+20 ms A/V step the
+             * sensor cannot see (+29 ms after 1 h on the production replay, +276 ms live). With the door at 20 s: 0 drops,
+             * content A/V flat -0.6 ms; the bank (the channel's base delay) stays at 12 s. Only the door: a stall's
+             * catch-up (rejoin) and the bank top-up keep the bank ceiling. PTV_MAX_DELAY_MS still pins all three. */
+            int64_t maxd = g_max_delay_us >= 0 ? g_max_delay_us : FFMAX(g_door_max_us, g_cushion_max_ms * 1000);
             int isv = out->stream_index == d->vstream;
             int active = d->rj_skip != 1;
             int64_t vs = atomic_load_explicit(&g_ch_vsrc, memory_order_relaxed);
