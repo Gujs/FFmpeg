@@ -4485,8 +4485,10 @@ static void rl_eval(AudioState *a, int64_t now)
             double x = a->rl_env[(a->rl_pos + i) % PTV_RL_ENV] - mean;
             var += x * x;
         }
-        if (mean < 1e-4 || sqrt(var / W) < 0.05 * mean)
-            why = "no structure in the audio (silence or a steady tone)";
+        if (mean < 1e-4)
+            why = "no structure in the audio (silence)";
+        else if (sqrt(var / W) < 0.05 * mean)
+            why = "no structure in the audio (a steady tone)";
     }
     if (!why) {
         for (d = -2; d <= 2; d++)
@@ -4495,7 +4497,19 @@ static void rl_eval(AudioState *a, int64_t now)
             if (a->rl_pos - sb + oth[i] >= lo && a->rl_pos - sb + oth[i] + W <= a->rl_pos)
                 c_oth = FFMAX(c_oth, rl_corr(a->rl_env, a->rl_pos, a->rl_pos - sb + oth[i], W));
     }
-    if (why)
+    /* 2.0.2 T-395: an audio-only erase over SILENCE has no evidence either way, and the no-verdict path ends at the
+     * source's A/V anyway (the corrector steers back to it after its dwell). On a restless input that dwell never
+     * completes: glo-1 Atlântico_TV 2026-10-19 22:18, a −76 ms audio-only absorb after a rejoin, sensor −94…−131 ms
+     * for 11 h (640 disarm/re-arm cycles); Fé_TV 2026-10-18 the same shape. Undo the erase instead — S of audio is
+     * dropped at the door (the RESYNC whole-step), only while the audio there is silent too (inaudible), within 10 s;
+     * single input (the live cases; a mosaic slot's door is shared). A steady tone keeps the old path (owner
+     * 2026-10-20: silence only). A both-stream step never gets here (its 'video was edited' reason comes first). */
+    if (why && g_rlundo && !a->multiview && a->rl_S_us > 0 && !strcmp(why, "no structure in the audio (silence)")) {
+        a->rl_undo_us = a->rl_S_us;
+        a->rl_undo_dl = now + 10000000;
+        av_log(NULL, AV_LOG_INFO, "[PTV-RELABEL] a%d(in%d) -%"PRId64"ms erase: no verdict — %s; the erase will be "
+               "undone at the next silent audio (PTV_NO_RLUNDO reverts)\n", a->dbg_k, a->dbg_in, a->rl_S_us / 1000, why);
+    } else if (why)
         av_log(NULL, AV_LOG_INFO, "[PTV-RELABEL] a%d(in%d) -%"PRId64"ms erase: no verdict — %s; the sensor keeps the "
                "source's A/V\n", a->dbg_k, a->dbg_in, a->rl_S_us / 1000, why);
     /* 2.0.2 T-391: a RELABEL verdict blinds the sensor to the erase for good, so it needs clear evidence. A real
@@ -4533,6 +4547,7 @@ static void rl_feed(AudioState *a, const AVFrame *f)
         return;
     if (!a->rl_bin || a->rl_bin != f->sample_rate / 100) {
         a->rl_bin   = f->sample_rate / 100;
+        a->rl_undo_us = 0;
         a->rl_acc   = 0;
         a->rl_acc_n = 0;
         a->rl_pend  = 0;
@@ -4575,6 +4590,27 @@ static void rl_feed(AudioState *a, const AVFrame *f)
         }
     }
     rl_eval(a, now);
+    if (a->rl_undo_us) {                                /* 2.0.2 T-395: apply a scheduled undo at silent audio */
+        int64_t k, kb = av_clip((a->rl_undo_us + 5000) / 10000 + 5, 8, 100);
+        double m = 0;
+        if (a->rsn_active || now > a->rl_undo_dl) {
+            av_log(NULL, AV_LOG_INFO, "[PTV-RELABEL] a%d(in%d) -%"PRId64"ms erase stays: %s — the sensor keeps the "
+                   "source's A/V\n", a->dbg_k, a->dbg_in, a->rl_undo_us / 1000,
+                   a->rsn_active ? "a resync walk is running" : "no silent audio within 10 s");
+            a->rl_undo_us = 0;
+        } else if (a->rl_n >= kb) {
+            for (k = a->rl_n - kb; k < a->rl_n; k++)
+                m += a->rl_env[k % PTV_RL_ENV];
+            if (m / kb < 1e-4) {
+                ptv_resync_step(a, -a->rl_undo_us, now);
+                av_log(NULL, AV_LOG_WARNING, "[PTV-RELABEL] a%d(in%d) -%"PRId64"ms erase UNDONE: silent audio at the seam and "
+                       "now, no evidence for the erase — %"PRId64" ms of silence dropped, the audio keeps the source's A/V "
+                       "(glue %+"PRId64"ms; PTV_NO_RLUNDO reverts)\n", a->dbg_k, a->dbg_in, a->rl_undo_us / 1000,
+                       a->rl_undo_us / 1000, a->glue_off_us / 1000);
+                a->rl_undo_us = 0;
+            }
+        }
+    }
 }
 
 static int audio_push(AudioState *a, AVFrame *frame)
