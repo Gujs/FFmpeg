@@ -1844,11 +1844,17 @@ static int audio_drain_fg(AudioState *a)
                     int pll_yield = g_pll_yield && a->corr.state == PTV_CORR_ENGAGED;
                     if (pll_yield != a->pll_yielded) {
                         a->pll_yielded = pll_yield;
-                        if (pll_yield)
+                        if (pll_yield) {
                             av_log(NULL, AV_LOG_WARNING,
                                    "[PTV-RSCORR] a%d(in%d) PLL yields (corrector steering; PTV_NO_PLL_YIELD reverts)\n",
                                    a->dbg_k, a->dbg_in);
-                        else {
+                            /* T-407: the reading the corrector's walk will be added to (a re-adoption still
+                             * pending keeps its own prediction and walk) */
+                            if (!(a->pll_bias_stale && a->pll_bias_capped)) {
+                                a->pll_bias_cap_us  = a->pll_seed ? a->pll_ema : 0;
+                                a->pll_bias_walk_us = 0;
+                            }
+                        } else {
                             /* bumpless resume (see the bias note at the off computation) —
                              * rr21 A1: DEFERRED. Mark the bias stale (force: this is where the
                              * calibration is CREATED); the settled-window re-adoption below
@@ -1858,6 +1864,19 @@ static int audio_drain_fg(AudioState *a)
                                    "[PTV-RSCORR] a%d(in%d) PLL resumes (corrector left steering) — "
                                    "bumpless: re-adoption deferred to a settled window (ema %+"PRId64"ms)\n",
                                    a->dbg_k, a->dbg_in, a->pll_ema / 1000);
+                            /* T-407: what the corrector realized during this engagement moves the PLL's reading
+                             * by −Δcorr (corr_us shifts the audio labels; the reading is vlag − alag). The
+                             * reading the walk alone predicts is the reading at the yield plus the walk, held
+                             * within the walk (a walk that cancelled what the PLL saw keeps only the rest). That
+                             * is what the re-adoption keeps; anything else that formed while the PLL was
+                             * yielded is the PLL's to correct. */
+                            {
+                                int64_t w = -(a->corr.corr_us - a->corr.engaged_corr0);
+                                a->pll_bias_walk_us += w;
+                                a->pll_bias_cap_us   = av_clip64(a->pll_bias_cap_us + w, FFMIN(0, a->pll_bias_walk_us),
+                                                                 FFMAX(0, a->pll_bias_walk_us));
+                                a->pll_bias_capped   = g_bias_cap;
+                            }
                             ptv_pll_bias_mark(a, "corrector engagement ended", 1);
                         }
                     }
@@ -1872,7 +1891,25 @@ static int audio_drain_fg(AudioState *a)
                         if ((a->pll_bias_settle >= 128 &&
                              FFABS(off - a->pll_ema) <= (int64_t)g_pll_acquire_us) ||
                             a->pll_bias_settle >= 1280) {
-                            a->pll_yield_bias_us += a->pll_ema;
+                            /* T-407: after a corrector engagement only the corrector's part of the reading is
+                             * adopted (pll_bias_cap_us, set at the resume); the rest formed while the PLL was
+                             * yielded and stays the PLL's to correct. live-transcoder MV_2x2_RAV slot 2
+                             * 2026-10-20 20:07: corr held −971 ms, the slot's video had fallen 2.4 s behind
+                             * meanwhile, the whole +3184 ms reading was adopted as the new zero and the slot sat
+                             * +2.2 s off until sync_check restarted it (both canaries). */
+                            int64_t adopt = a->pll_ema;
+                            if (a->pll_bias_capped) {
+                                adopt = a->pll_bias_cap_us;
+                                if (FFABS(a->pll_ema - adopt) > (int64_t)g_pll_acquire_us)
+                                    av_log(NULL, AV_LOG_WARNING,
+                                           "[PTV-RSCORR] a%d(in%d) PLL keeps %+"PRId64"ms of its %+"PRId64"ms reading "
+                                           "(the corrector's walk %+"PRId64"ms): %+"PRId64"ms stays the PLL's to correct "
+                                           "(PTV_NO_BIAS_CAP reverts)\n",
+                                           a->dbg_k, a->dbg_in, adopt / 1000, a->pll_ema / 1000,
+                                           a->pll_bias_walk_us / 1000, (a->pll_ema - adopt) / 1000);
+                                a->pll_bias_capped = 0;
+                            }
+                            a->pll_yield_bias_us += adopt;
                             a->pll_bias_stale = 0;
                             a->pll_seed    = 0;
                             a->pll_raw_n   = 0;      /* T-339: readings on the old baseline */
@@ -1881,7 +1918,7 @@ static int audio_drain_fg(AudioState *a)
                             av_log(NULL, AV_LOG_WARNING,
                                    "[PTV-RSCORR] a%d(in%d) PLL bias re-adopted %+"PRId64"ms after a "
                                    "%d-frame settle (total bias %+"PRId64"ms) — actuators resume\n",
-                                   a->dbg_k, a->dbg_in, a->pll_ema / 1000, a->pll_bias_settle,
+                                   a->dbg_k, a->dbg_in, adopt / 1000, a->pll_bias_settle,
                                    a->pll_yield_bias_us / 1000);
                         }
                     }
@@ -2759,6 +2796,8 @@ static void ptv_pll_bias_mark(AudioState *a, const char *why, int force)
                a->dbg_k, a->dbg_in, why, a->pll_yield_bias_us / 1000);
     a->pll_bias_stale  = 1;
     a->pll_bias_settle = 0;
+    if (!force)
+        a->pll_bias_capped = 0;   /* T-407: a label-baseline move re-calibrates the whole reading (as before) */
     a->pll_seed        = 0;
     a->pll_dbnc        = 0;
     a->pll_acq_win     = 0;
