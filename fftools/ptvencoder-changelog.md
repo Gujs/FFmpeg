@@ -5,14 +5,8 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
-## 2.0.2-pre6 — 2.0.2-pre5 + burst door 20 s (T-398), corrector ceiling on the edit ledgers (T-404), silent audio-only erase undone (T-395)
+## 2.0.2-pre6 — 2.0.2-pre5 + corrector ceiling on the edit ledgers (T-404), silent audio-only erase undone (T-395)
 
-- **Bursty sources keep lip sync (T-398).** Growing_Your_Faith (cor-1, SRT ingest relaying HLS-style bursts) drifted to
-  +276…+400 ms audio late within hours, sensor blind. Every content step fell on a T-103 burst door drop (12 s max delay):
-  the door cut is re-glued by the LAYERA flush with the audio-derived offset, which leaves ±20 ms content steps that add up
-  as a random walk while both edit ledgers stay equal. The burst door now holds up to 20 s (`PTV_DOOR_MAX_MS`, 12000 = the
-  pre5 door); the AUTO-BANK ceiling is unchanged. Replay of 1 h of the real source under GYF's production command: burst
-  drops 46 → 0, A/V by content −0 … −4 ms in all 54 one-minute blocks (pre5: walked).
 - **The corrector's starvation ceiling is not reset by the PLL's own steps (T-404).** live-transcoder MV_2x2_RAV slot 2
   (2026-10-19) sat at R ≈ +1.1 s from 17:36, all of it the video edit ledger, while each PLL ACQUIRE swung the measured term
   ±150–430 ms for 10–80 s and restarted the 15-min flatness span (72 of 102 restarts); the ceiling engaged at 21:19. The
