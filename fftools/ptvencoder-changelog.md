@@ -5,6 +5,20 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.2-pre6 — 2.0.2-pre5 + corrector ceiling on the edit ledgers (T-404), silent audio-only erase undone (T-395)
+
+- **The corrector's starvation ceiling is not reset by the PLL's own steps (T-404).** live-transcoder MV_2x2_RAV slot 2
+  (2026-10-19) sat at R ≈ +1.1 s from 17:36, all of it the video edit ledger, while each PLL ACQUIRE swung the measured term
+  ±150–430 ms for 10–80 s and restarted the 15-min flatness span (72 of 102 restarts); the ceiling engaged at 21:19. The
+  span now judges flatness on the ledger part of R (ev − ea). Replaying the logged sequence: 21:20 (= live) → 17:51.
+  `PTV_NO_CEIL_LEDGER=1` reverts.
+- **An audio-only erase over silence is undone (T-395).** A backward audio step without a video partner is erased and the
+  relabel check decides what the sensor reads; over silence it has no verdict and the corrector had to steer back after its
+  dwell — never, on a restless input (glo-1 Atlântico_TV: −99 ms for 11 h after a rejoin; Fé_TV 10-18 the same shape). Now
+  S of audio is dropped at the door while the audio there is silent (within 10 s), single input; a steady tone keeps the
+  old path. Kit repro (106 ms real repeat inside digital silence on the ruler): pre5 +107 ms late, pre6 0.0 ms.
+  `PTV_NO_RLUNDO=1` reverts.
+
 ## 2.0.2-pre5 — 2.0.2-pre4 + no label edits in a stream's damage phase (T-402), a mosaic's dead cell honours -freeze_max (T-385 row 16)
 
 - **A slot / channel keeps lip sync through a corruption storm (T-402).** Live 2026-10-19, both canaries on 2.0.2-pre4:

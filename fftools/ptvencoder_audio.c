@@ -178,7 +178,7 @@ static int audio_drain_fifo(AudioState *a)
  * INPUT SLOT's video terms. 1.0.1-pre16: g_rsx carries PER-SLOT video ledgers and the slot
  * hard-wire died here — mv_wall/mv_ema/ev_us are read at a->dbg_in (identically slot 0 on
  * single input). Nothing else in the corrector changed — exactly the §8.3 promise. */
-typedef struct RsyncTrackR { int valid; int64_t R_us, mv_wall, ma_wall; } RsyncTrackR;
+typedef struct RsyncTrackR { int valid; int64_t R_us, L_us, mv_wall, ma_wall; } RsyncTrackR;  /* L_us: the ledger part ev − ea (2.0.2) */
 /* TEST-ONLY (PTV_RSCORR_TESTWALK, µs/s; PTV_PLL_TESTNOISE_MS precedent): add a linearly
  * walking offset to the R the CORRECTOR reads (the sensor/stats stay untouched) — the
  * "maximally lying-but-plausible sensor" of §6's damage bound, the only way to exercise the
@@ -205,7 +205,7 @@ static int64_t g_rscorr_testwalk_pause_at_us = 0, g_rscorr_testwalk_pause_len_us
 static int64_t g_rscorr_testwalk_pause2_at_us = 0, g_rscorr_testwalk_pause2_len_us = 0;
 static RsyncTrackR rsync_track_R(const AudioState *a, int64_t now)
 {
-    RsyncTrackR r = { 0, 0, 0, 0 };
+    RsyncTrackR r = { 0, 0, 0, 0, 0 };
     int k = a->dbg_k, in = a->dbg_in;
     if (k < 0 || k >= PTV_MAX_AUDIO || in < 0 || in >= PTV_MAX_INPUT || !a->rs_ma_seed)
         return r;
@@ -216,10 +216,9 @@ static RsyncTrackR rsync_track_R(const AudioState *a, int64_t now)
      * cell = video-side stale = no reading (the single-input stale-anchor rule). */
     if (!r.mv_wall || !r.ma_wall || now - r.mv_wall > 3000000 || now - r.ma_wall > 3000000)
         return r;
-    r.R_us = (atomic_load_explicit(&g_rsx.mv_ema[in], memory_order_relaxed)
-            + atomic_load_explicit(&g_rsx.ev_us[in],  memory_order_relaxed))
-           - (a->rs_ma_ema
-            + atomic_load_explicit(&g_rsx.ea_us[k], memory_order_relaxed));
+    r.L_us = atomic_load_explicit(&g_rsx.ev_us[in], memory_order_relaxed)
+           - atomic_load_explicit(&g_rsx.ea_us[k],  memory_order_relaxed);
+    r.R_us = atomic_load_explicit(&g_rsx.mv_ema[in], memory_order_relaxed) - a->rs_ma_ema + r.L_us;
     if (g_rscorr_testwalk_us_s == 0) {
         const char *tw = getenv("PTV_RSCORR_TESTWALK");
         const char *ta = getenv("PTV_RSCORR_TESTWALK_AT_S");
@@ -266,6 +265,7 @@ static RsyncTrackR rsync_track_R(const AudioState *a, int64_t now)
                                           g_rscorr_testwalk_pause2_len_us)
             w = 0;                                 /* pre30 FX-I: second designed gap (TEST-ONLY) */
         r.R_us += w;
+        r.L_us += w;   /* the walk stands in for a ledger bake (the ceiling's flatness reads it) */
     }
     r.valid = 1;
     return r;
@@ -604,7 +604,12 @@ static void rscorr_update(AudioState *a, RsyncTrackR *r, int64_t f_us, int64_t n
      * ceiling-engage. Sensor-invalid, delivery-dead and implausible R all CLOSE the span
      * (they must keep blocking); the storm-disarm holdoff deliberately does NOT (that is
      * the point of the ceiling). Runs in ARMED/DWELL/DISARMED; steering/parked states
-     * clear the span. PTV_NO_RSCORR_CEIL=1 reverts; PTV_RSCORR_CEIL_MIN tunes (15min). */
+     * clear the span. PTV_NO_RSCORR_CEIL=1 reverts; PTV_RSCORR_CEIL_MIN tunes (15min).
+     * 2.0.2: flatness is judged on the LEDGER part of R (ev − ea), not on the dm term the PLL
+     * moves with its own pads / drops: live-transcoder MV_2x2_RAV slot 2 2026-10-19 sat at
+     * R ≈ +1.1 s (ev +1092 ms, flat) for 3.7 h while each PLL ACQUIRE swung dm ±150–430 ms
+     * for 10–80 s and restarted the span (72 of 102 restarts within 40 s of an ACQUIRE).
+     * PTV_NO_CEIL_LEDGER=1 reverts to the whole R. */
     if (g_rscorr_ceil &&
         (c->state == PTV_CORR_ARMED || c->state == PTV_CORR_DWELL ||
          c->state == PTV_CORR_DISARMED)) {
@@ -613,9 +618,9 @@ static void rscorr_update(AudioState *a, RsyncTrackR *r, int64_t f_us, int64_t n
                                      * 2026-10-18 ceiling-ENGAGED at a flat −237 ms after its source dropped the audio PID */
             c->starve_wc = 0;
         } else if (!c->starve_wc ||
-                   llabs(R - c->starve_r0) >= FFMAX(40000, llabs(R) / 4)) {
+                   llabs((g_ceil_ledger ? r->L_us : R) - c->starve_r0) >= FFMAX(40000, llabs(R) / 4)) {
             c->starve_wc = now;      /* open — or churning R: restart from here */
-            c->starve_r0 = R;
+            c->starve_r0 = g_ceil_ledger ? r->L_us : R;
         } else if (now - c->starve_wc >= g_rscorr_ceil_us && !resync_owns) {
             /* (pre29: !resync_owns holds the ceiling engage — span stays open — while the
              * RESYNC path can act on the same band; it re-fires the moment resync cannot.)
@@ -4480,8 +4485,10 @@ static void rl_eval(AudioState *a, int64_t now)
             double x = a->rl_env[(a->rl_pos + i) % PTV_RL_ENV] - mean;
             var += x * x;
         }
-        if (mean < 1e-4 || sqrt(var / W) < 0.05 * mean)
-            why = "no structure in the audio (silence or a steady tone)";
+        if (mean < 1e-4)
+            why = "no structure in the audio (silence)";
+        else if (sqrt(var / W) < 0.05 * mean)
+            why = "no structure in the audio (a steady tone)";
     }
     if (!why) {
         for (d = -2; d <= 2; d++)
@@ -4490,7 +4497,19 @@ static void rl_eval(AudioState *a, int64_t now)
             if (a->rl_pos - sb + oth[i] >= lo && a->rl_pos - sb + oth[i] + W <= a->rl_pos)
                 c_oth = FFMAX(c_oth, rl_corr(a->rl_env, a->rl_pos, a->rl_pos - sb + oth[i], W));
     }
-    if (why)
+    /* 2.0.2 T-395: an audio-only erase over SILENCE has no evidence either way, and the no-verdict path ends at the
+     * source's A/V anyway (the corrector steers back to it after its dwell). On a restless input that dwell never
+     * completes: glo-1 Atlântico_TV 2026-10-19 22:18, a −76 ms audio-only absorb after a rejoin, sensor −94…−131 ms
+     * for 11 h (640 disarm/re-arm cycles); Fé_TV 2026-10-18 the same shape. Undo the erase instead — S of audio is
+     * dropped at the door (the RESYNC whole-step), only while the audio there is silent too (inaudible), within 10 s;
+     * single input (the live cases; a mosaic slot's door is shared). A steady tone keeps the old path (owner
+     * 2026-10-20: silence only). A both-stream step never gets here (its 'video was edited' reason comes first). */
+    if (why && g_rlundo && !a->multiview && a->rl_S_us > 0 && !strcmp(why, "no structure in the audio (silence)")) {
+        a->rl_undo_us = a->rl_S_us;
+        a->rl_undo_dl = now + 10000000;
+        av_log(NULL, AV_LOG_INFO, "[PTV-RELABEL] a%d(in%d) -%"PRId64"ms erase: no verdict — %s; the erase will be "
+               "undone at the next silent audio (PTV_NO_RLUNDO reverts)\n", a->dbg_k, a->dbg_in, a->rl_S_us / 1000, why);
+    } else if (why)
         av_log(NULL, AV_LOG_INFO, "[PTV-RELABEL] a%d(in%d) -%"PRId64"ms erase: no verdict — %s; the sensor keeps the "
                "source's A/V\n", a->dbg_k, a->dbg_in, a->rl_S_us / 1000, why);
     /* 2.0.2 T-391: a RELABEL verdict blinds the sensor to the erase for good, so it needs clear evidence. A real
@@ -4528,6 +4547,7 @@ static void rl_feed(AudioState *a, const AVFrame *f)
         return;
     if (!a->rl_bin || a->rl_bin != f->sample_rate / 100) {
         a->rl_bin   = f->sample_rate / 100;
+        a->rl_undo_us = 0;
         a->rl_acc   = 0;
         a->rl_acc_n = 0;
         a->rl_pend  = 0;
@@ -4570,6 +4590,27 @@ static void rl_feed(AudioState *a, const AVFrame *f)
         }
     }
     rl_eval(a, now);
+    if (a->rl_undo_us) {                                /* 2.0.2 T-395: apply a scheduled undo at silent audio */
+        int64_t k, kb = av_clip((a->rl_undo_us + 5000) / 10000 + 5, 8, 100);
+        double m = 0;
+        if (a->rsn_active || now > a->rl_undo_dl) {
+            av_log(NULL, AV_LOG_INFO, "[PTV-RELABEL] a%d(in%d) -%"PRId64"ms erase stays: %s — the sensor keeps the "
+                   "source's A/V\n", a->dbg_k, a->dbg_in, a->rl_undo_us / 1000,
+                   a->rsn_active ? "a resync walk is running" : "no silent audio within 10 s");
+            a->rl_undo_us = 0;
+        } else if (a->rl_n >= kb) {
+            for (k = a->rl_n - kb; k < a->rl_n; k++)
+                m += a->rl_env[k % PTV_RL_ENV];
+            if (m / kb < 1e-4) {
+                ptv_resync_step(a, -a->rl_undo_us, now);
+                av_log(NULL, AV_LOG_WARNING, "[PTV-RELABEL] a%d(in%d) -%"PRId64"ms erase UNDONE: silent audio at the seam and "
+                       "now, no evidence for the erase — %"PRId64" ms of silence dropped, the audio keeps the source's A/V "
+                       "(glue %+"PRId64"ms; PTV_NO_RLUNDO reverts)\n", a->dbg_k, a->dbg_in, a->rl_undo_us / 1000,
+                       a->rl_undo_us / 1000, a->glue_off_us / 1000);
+                a->rl_undo_us = 0;
+            }
+        }
+    }
 }
 
 static int audio_push(AudioState *a, AVFrame *frame)

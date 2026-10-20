@@ -2717,6 +2717,7 @@ static int aac_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     default:
         err = aac_decode_frame_int(avctx, frame, got_frame_ptr, &gb, avpkt);
     }
+    ac->frame = NULL;
     if (err < 0)
         return err;
 
