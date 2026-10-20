@@ -429,7 +429,8 @@ typedef struct CorrState {          /* all owned by that track's audio thread (�
      * corrector could not complete a dwell (resets, storm holdoffs included — the span runs
      * through ARMED/DWELL/DISARMED). Span ≥ the ceiling → ENGAGE anyway (rscorr_update). */
     int64_t starve_wc;              /* span start (wall µs); 0 = no open span */
-    int64_t starve_r0;              /* R at span start (the whole-span flatness reference) */
+    int64_t starve_r0;              /* ledger part of R (ev − ea) at span start — the whole-span flatness
+                                     * reference (whole R with PTV_NO_CEIL_LEDGER) */
     int     perm_disarm;            /* 1.0.1-pre21 #24: lifetime-cap disarm is FINAL for this
                                      * process (10s of trim failed to close R — re-arming would
                                      * walk the same doomed staircase); logged once at the cap */
@@ -2453,6 +2454,7 @@ extern int     g_glueveto;               /* veto + inverse guard + E5 flush-rela
 extern int     g_hstick_filter;          /* #51a: ≤1-tick hs steps are not corrector events; PTV_NO_HSTICK_FILTER=1 reverts */
 extern int     g_rscorr_ceil;            /* #51b: starvation-ceiling engage; PTV_NO_RSCORR_CEIL=1 reverts */
 extern int64_t g_rscorr_ceil_us;         /* #51b ceiling span (15min default; PTV_RSCORR_CEIL_MIN minutes) */
+extern int     g_ceil_ledger;           /* 2.0.2: ceiling flatness on ev − ea, not the PLL-moved dm; PTV_NO_CEIL_LEDGER=1 reverts */
 extern int     g_perstream_wm;           /* §7.5b per-stream watermarks (slowest-live key); PTV_NO_PERSTREAM_WM=1 reverts */
 extern int     g_rebuild_reanchor;       /* 1.0.1-pre20: AFMT-rebuild birth-equivalent re-anchor; PTV_NO_REBUILD_REANCHOR=1 reverts */
 extern int     g_acq_backoff;            /* #49: repeated-ACQUIRE threshold backoff; PTV_NO_ACQ_BACKOFF=1 reverts */

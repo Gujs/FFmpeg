@@ -178,7 +178,7 @@ static int audio_drain_fifo(AudioState *a)
  * INPUT SLOT's video terms. 1.0.1-pre16: g_rsx carries PER-SLOT video ledgers and the slot
  * hard-wire died here — mv_wall/mv_ema/ev_us are read at a->dbg_in (identically slot 0 on
  * single input). Nothing else in the corrector changed — exactly the §8.3 promise. */
-typedef struct RsyncTrackR { int valid; int64_t R_us, mv_wall, ma_wall; } RsyncTrackR;
+typedef struct RsyncTrackR { int valid; int64_t R_us, L_us, mv_wall, ma_wall; } RsyncTrackR;  /* L_us: the ledger part ev − ea (2.0.2) */
 /* TEST-ONLY (PTV_RSCORR_TESTWALK, µs/s; PTV_PLL_TESTNOISE_MS precedent): add a linearly
  * walking offset to the R the CORRECTOR reads (the sensor/stats stay untouched) — the
  * "maximally lying-but-plausible sensor" of §6's damage bound, the only way to exercise the
@@ -205,7 +205,7 @@ static int64_t g_rscorr_testwalk_pause_at_us = 0, g_rscorr_testwalk_pause_len_us
 static int64_t g_rscorr_testwalk_pause2_at_us = 0, g_rscorr_testwalk_pause2_len_us = 0;
 static RsyncTrackR rsync_track_R(const AudioState *a, int64_t now)
 {
-    RsyncTrackR r = { 0, 0, 0, 0 };
+    RsyncTrackR r = { 0, 0, 0, 0, 0 };
     int k = a->dbg_k, in = a->dbg_in;
     if (k < 0 || k >= PTV_MAX_AUDIO || in < 0 || in >= PTV_MAX_INPUT || !a->rs_ma_seed)
         return r;
@@ -216,10 +216,9 @@ static RsyncTrackR rsync_track_R(const AudioState *a, int64_t now)
      * cell = video-side stale = no reading (the single-input stale-anchor rule). */
     if (!r.mv_wall || !r.ma_wall || now - r.mv_wall > 3000000 || now - r.ma_wall > 3000000)
         return r;
-    r.R_us = (atomic_load_explicit(&g_rsx.mv_ema[in], memory_order_relaxed)
-            + atomic_load_explicit(&g_rsx.ev_us[in],  memory_order_relaxed))
-           - (a->rs_ma_ema
-            + atomic_load_explicit(&g_rsx.ea_us[k], memory_order_relaxed));
+    r.L_us = atomic_load_explicit(&g_rsx.ev_us[in], memory_order_relaxed)
+           - atomic_load_explicit(&g_rsx.ea_us[k],  memory_order_relaxed);
+    r.R_us = atomic_load_explicit(&g_rsx.mv_ema[in], memory_order_relaxed) - a->rs_ma_ema + r.L_us;
     if (g_rscorr_testwalk_us_s == 0) {
         const char *tw = getenv("PTV_RSCORR_TESTWALK");
         const char *ta = getenv("PTV_RSCORR_TESTWALK_AT_S");
@@ -266,6 +265,7 @@ static RsyncTrackR rsync_track_R(const AudioState *a, int64_t now)
                                           g_rscorr_testwalk_pause2_len_us)
             w = 0;                                 /* pre30 FX-I: second designed gap (TEST-ONLY) */
         r.R_us += w;
+        r.L_us += w;   /* the walk stands in for a ledger bake (the ceiling's flatness reads it) */
     }
     r.valid = 1;
     return r;
@@ -604,7 +604,12 @@ static void rscorr_update(AudioState *a, RsyncTrackR *r, int64_t f_us, int64_t n
      * ceiling-engage. Sensor-invalid, delivery-dead and implausible R all CLOSE the span
      * (they must keep blocking); the storm-disarm holdoff deliberately does NOT (that is
      * the point of the ceiling). Runs in ARMED/DWELL/DISARMED; steering/parked states
-     * clear the span. PTV_NO_RSCORR_CEIL=1 reverts; PTV_RSCORR_CEIL_MIN tunes (15min). */
+     * clear the span. PTV_NO_RSCORR_CEIL=1 reverts; PTV_RSCORR_CEIL_MIN tunes (15min).
+     * 2.0.2: flatness is judged on the LEDGER part of R (ev − ea), not on the dm term the PLL
+     * moves with its own pads / drops: live-transcoder MV_2x2_RAV slot 2 2026-10-19 sat at
+     * R ≈ +1.1 s (ev +1092 ms, flat) for 3.7 h while each PLL ACQUIRE swung dm ±150–430 ms
+     * for 10–80 s and restarted the span (72 of 102 restarts within 40 s of an ACQUIRE).
+     * PTV_NO_CEIL_LEDGER=1 reverts to the whole R. */
     if (g_rscorr_ceil &&
         (c->state == PTV_CORR_ARMED || c->state == PTV_CORR_DWELL ||
          c->state == PTV_CORR_DISARMED)) {
@@ -613,9 +618,9 @@ static void rscorr_update(AudioState *a, RsyncTrackR *r, int64_t f_us, int64_t n
                                      * 2026-10-18 ceiling-ENGAGED at a flat −237 ms after its source dropped the audio PID */
             c->starve_wc = 0;
         } else if (!c->starve_wc ||
-                   llabs(R - c->starve_r0) >= FFMAX(40000, llabs(R) / 4)) {
+                   llabs((g_ceil_ledger ? r->L_us : R) - c->starve_r0) >= FFMAX(40000, llabs(R) / 4)) {
             c->starve_wc = now;      /* open — or churning R: restart from here */
-            c->starve_r0 = R;
+            c->starve_r0 = g_ceil_ledger ? r->L_us : R;
         } else if (now - c->starve_wc >= g_rscorr_ceil_us && !resync_owns) {
             /* (pre29: !resync_owns holds the ceiling engage — span stays open — while the
              * RESYNC path can act on the same band; it re-fires the moment resync cannot.)

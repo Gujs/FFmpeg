@@ -1036,6 +1036,7 @@ int     g_hstick_filter = 1;
  * block. PTV_NO_RSCORR_CEIL=1 reverts; PTV_RSCORR_CEIL_MIN (minutes, default 15) tunes. */
 int     g_rscorr_ceil = 1;
 int64_t g_rscorr_ceil_us = 900000000;
+int     g_ceil_ledger = 1;   /* 2.0.2: ceiling flatness on the ledger part of R (ev − ea); PTV_NO_CEIL_LEDGER=1 reverts */
 /* 1.0.1-pre18 — per-stream delivery watermarks (pre17 (B) KNOWN OPEN, owner-approved; owner
  * mandate: af-independent transport on single input AND mv): the §7.5b video hold keys on
  * the SLOWEST currently-LIVE gated audio stream's delivered watermark, staleness-excluded
@@ -7495,6 +7496,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_GLUEVETO")) g_glueveto = 0;   /* 1.0.1-pre18 #50: gap-verdict-vs-LAYERA one-remedy invariant off */
     if (getenv("PTV_NO_HSTICK_FILTER")) g_hstick_filter = 0;   /* 1.0.1-pre18 #51a: hs-tick steps count as corrector events again */
     if (getenv("PTV_NO_RSCORR_CEIL")) g_rscorr_ceil = 0;       /* 1.0.1-pre18 #51b: no starvation-ceiling engage */
+    if (getenv("PTV_NO_CEIL_LEDGER")) g_ceil_ledger = 0;       /* 2.0.2: ceiling flatness on the whole R again */
     { const char *s = getenv("PTV_RSCORR_CEIL_MIN"); if (s && atoi(s) > 0) g_rscorr_ceil_us = (int64_t)atoi(s) * 60000000; }  /* #51b ceiling, minutes */
     if (getenv("PTV_NO_PERSTREAM_WM")) g_perstream_wm = 0;     /* 1.0.1-pre18: §7.5b back to the aggregate (least-delayed) key */
     if (getenv("PTV_NO_REBUILD_REANCHOR")) g_rebuild_reanchor = 0;  /* 1.0.1-pre20: AFMT rebuild carries the old base again (residual + corrector walk) */
