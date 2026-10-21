@@ -784,6 +784,11 @@ typedef struct DecodeCtx {
     int64_t          vf_odd_since;            /* 2.0.0 T-373: decoded pictures in another size / format than the graph
                                               * input since (wall us, 0 = none) ... */
     int              vf_odd_n;                /* ... how many were dropped */
+    int              vf_new_w, vf_new_h, vf_new_fmt, vf_new_n;   /* T-406: the odd size seen on consecutive pictures, how many */
+    int              vf_adopted;              /* T-406: that size is the source's: its pictures are scaled to the graph input */
+    int              vf_seen_n, vf_seen[8][2];   /* T-406: sizes already logged (a switching source logs each size once) */
+    int              vf_switches;             /* T-406: rendition switches adopted */
+    struct SwsContext *vf_sws;                /* T-406: the scaler to the graph input */
     AVFrame         *xo;                      /* 2.0.1 T-383: a decoded picture leaping ahead of the last one, held for one */
     int64_t          xo_prev;                 /* ... the picture before it (ist_tb) */
     int64_t          xo_last;                 /* ... the last picture handed on (ist_tb) */
@@ -2457,6 +2462,7 @@ extern int     g_glueveto;               /* veto + inverse guard + E5 flush-rela
 extern int     g_hstick_filter;          /* #51a: ≤1-tick hs steps are not corrector events; PTV_NO_HSTICK_FILTER=1 reverts */
 extern int     g_rscorr_ceil;            /* #51b: starvation-ceiling engage; PTV_NO_RSCORR_CEIL=1 reverts */
 extern int64_t g_rscorr_ceil_us;         /* #51b ceiling span (15min default; PTV_RSCORR_CEIL_MIN minutes) */
+extern int     g_vresize;               /* T-406: a lasting size change is scaled in-process; PTV_NO_VRESIZE=1 reverts */
 extern int     g_bias_cap;              /* T-407: the PLL re-adopts at most the corrector's walk; PTV_NO_BIAS_CAP=1 reverts */
 extern int     g_ceil_ledger;           /* 2.0.2: ceiling flatness on ev − ea, not the PLL-moved dm; PTV_NO_CEIL_LEDGER=1 reverts */
 extern int     g_rlundo;                /* 2.0.2 T-395: undo an audio-only erase whose check found silence; PTV_NO_RLUNDO=1 reverts */
