@@ -7364,6 +7364,8 @@ int main(int argc, char **argv)
     if (getenv("PTV_TIMELINE") && atoi(getenv("PTV_TIMELINE")) > 0) {   /* 2.1 T-409 (development switch) */
         g_timeline = 1;
         g_layera   = 0;                       /* the timeline owns what the LAYERA buffer did */
+        g_resync   = 0;                       /* owner 2026-10-21: RESYNC + RECANCHOR go in 2.1-pre1 (escapes from dead */
+        g_recanchor = 0;                      /* zones the old remedies made; the corrector stays the safety net) */
         if (getenv("PTV_TL_OPEN_MS") && atoi(getenv("PTV_TL_OPEN_MS")) > 0)
             g_tl_open_us = atoi(getenv("PTV_TL_OPEN_MS")) * 1000LL;
     }
