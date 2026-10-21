@@ -3591,7 +3591,10 @@ graph_in:
                     }
                 }
             }
-            if (a->glue_raw_last_us != AV_NOPTS_VALUE) {
+            /* 2.1 T-409 (PTV_TIMELINE): the labels arriving here were decided once by the demux's timeline —
+             * continuous but for kept holes and an erase's sub-frame rest. No second classification: the door realizes
+             * them as they are (aresample pads forward, ATRIM trims backward, both by the labels). */
+            if (!g_timeline && a->glue_raw_last_us != AV_NOPTS_VALUE) {
                 int64_t step = raw_us - (a->glue_raw_last_us + a->glue_raw_dur_us);
                 /* 2.0.0 T-093 part 2: a multiview slot's silence fill (the compositor drives it while the slot's source is
                  * gone) advances the labels with wall time. A source that comes back where it stopped (a restart the
