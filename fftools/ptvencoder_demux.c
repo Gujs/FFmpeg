@@ -2069,7 +2069,7 @@ static void vwait_drain(DemuxArgs *d, int force)
             AVPacket *p = ps->vwait[k];
             int64_t ts = p->dts != AV_NOPTS_VALUE ? p->dts : p->pts, o = AV_NOPTS_VALUE, gap = 0;
             int r = ts == AV_NOPTS_VALUE ? -1 : copy_shown(d, av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q), &o, &gap);
-            if (r == 0 && !force && !scte && !d->mv_vring && !ps->gated) {   /* (dense audio runs on through a video outage) */
+            if (r == 0 && !force && !scte && !d->mv_vring) {
                 /* 2.0.0 T-378: a copy stamped far past the newest video the demux has READ is a corrupt timestamp — one
                  * bit-flipped DVB sub PTS (+1491 s, rich50b bitflip) waited for content that never came, and every
                  * subtitle behind it waited too (54 subs + 17 clears lost to the end of the run). A real copy is muxed
@@ -2088,16 +2088,8 @@ static void vwait_drain(DemuxArgs *d, int force)
                     continue;
                 }
             }
-            if (r == 0 && !force && !(ps->gated && now - ps->vwait_wc[k] >= 1500000))
+            if (r == 0 && !force)
                 break;                          /* its content is not on the output yet */
-            if (ps->gated && r != 1) {
-                /* a dense copy is never dropped for timing: not shown within 1.5 s (a video-only outage, a dead video
-                 * PID) or older than the record — stamped the old way (house_skew), the track stays continuous */
-                demux_pass_one(d, p, AV_NOPTS_VALUE);
-                d->vm_fb++;
-                k++;
-                continue;
-            }
             if (r < 0 && scte && !force && ts != AV_NOPTS_VALUE) {
                 /* 2.0.0 T-316: copies now wait from before the anchor (a start-up burst); a cue whose content precedes
                  * the start was never on the output — dropped, as it was when it arrived before the anchor */
@@ -2127,11 +2119,7 @@ static void vwait_drain(DemuxArgs *d, int force)
                 if (now - ps->vwait_wc[k] < 12000000)
                     break;
             }
-            if (r == 1 && ps->gated && gap > 1000000) {
-                demux_pass_one(d, p, AV_NOPTS_VALUE);   /* sound the video did not show as content (its own outage):
-                                                         * kept, stamped the old way */
-                d->vm_fb++;
-            } else if (r == 1 && !scte && !ps->gated && (gap > 1000000 || o < pos - 1000000)) {
+            if (r == 1 && !scte && (gap > 1000000 || o < pos - 1000000)) {
                 av_packet_free(&p);
                 d->vm_late++;
             } else if (r == 1) {
@@ -2181,11 +2169,7 @@ static int demux_pass(DemuxArgs *d, AVPacket *out)
         vwait_drain(d, 0);
         for (pi = 0; pi < d->n_pass; pi++) {
             PassStream *ps = &d->pass[pi];
-            /* 2.1 T-409: with the timeline the dense copies (AC-3 / MP2) wait too — the labels carry every kept hole
-             * and erase, so house_skew at READ time is no longer the offset the video will show them with (a source
-             * restart: +14 s while holding, -1.6 s after the rejoin map — the AC-3 landed behind its own hold fill and
-             * was dropped for 15 s, gate sync_ac3_kill_return_20). See vwait_drain for their release rules */
-            if ((ps->gated && !g_timeline) || out->stream_index != ps->in_index)
+            if (ps->gated || out->stream_index != ps->in_index)
                 continue;
             /* 2.0.0 T-316: queued from before the anchor too. A bursty source delivers its first 6-10 s at once,
              * before the first frame is decoded (h0): every subtitle / cue of that burst was dropped here while its
