@@ -355,6 +355,20 @@ static int64_t ptv_wallev_w(DemuxArgs *d, int sidx, int64_t jump_us)
     return w;
 }
 
+/* 2.0.2 T-408: wall absence is evidence once. The PES-tail carry hands a gapped packet's wall gap to the next packet
+ * (the first post-gap packet is usually the pre-gap tail, no jump of its own); when that first packet already carried a
+ * jump and kept W of it as a hole, the next packet read the same gap again. Nothing_But_Sportz (cor-3 + cor-1,
+ * 2026-10-20 23:40:43, a reopen after a 43.7 s outage): video +40.3 s then +13.7 s, both kept whole against 43.7 s
+ * (54 s held for 43.7 s of wall), the audio's one +54.2 s step erased 10.1 s — sound 10.1 s early for good. A split
+ * spends its W from the carry, so the next packet inherits only what is left (3.4 s: +10.2 s flowing, the audio's
+ * erase). */
+static void ptv_wallev_spend(DemuxArgs *d, int sidx, int64_t w_us)
+{
+    if (g_wev_spend && g_pestail && d->tail_gap_us && sidx >= 0 && sidx < d->nb_streams_open &&
+        d->tail_gap_us[sidx] > 0 && w_us > 0)
+        d->tail_gap_us[sidx] = FFMAX(d->tail_gap_us[sidx] - w_us, 0);
+}
+
 /* W covers J up to the evidence floor (or J/8 for large J) = the whole step is a real gap */
 static int ptv_wallev_full(int64_t w, int64_t jump_us)
 {
@@ -2725,6 +2739,7 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                                                               wev_full ? 0 : jump_us - wev_w, wall_now);
                             wev_full = wev_flow == 0;
                             wev_comp = wev_flow > 0;
+                            ptv_wallev_spend(d, pkt->stream_index, wev_w);   /* T-408 */
                         }
                         if (wev_full ||
                             ((!g_wallev || wev_w == 0) &&
@@ -2943,6 +2958,7 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                                                                       vfull ? 0 : vjump_us - vw, wall_now);
                             int64_t dukf_thresh = av_rescale(g_dukf_min_ms, st->time_base.den,
                                                              (int64_t)st->time_base.num * 1000);
+                            ptv_wallev_spend(d, pkt->stream_index, vw);   /* T-408 */
                             if (vflow_us > 0) {
                                 int64_t vflow_tb = av_rescale_q(vflow_us, AV_TIME_BASE_Q, st->time_base);
                                 d->wrap_off[pkt->stream_index] -= vflow_tb;

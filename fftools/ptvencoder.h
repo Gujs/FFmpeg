@@ -2465,6 +2465,7 @@ extern int     g_hstick_filter;          /* #51a: ≤1-tick hs steps are not cor
 extern int     g_rscorr_ceil;            /* #51b: starvation-ceiling engage; PTV_NO_RSCORR_CEIL=1 reverts */
 extern int64_t g_rscorr_ceil_us;         /* #51b ceiling span (15min default; PTV_RSCORR_CEIL_MIN minutes) */
 extern int     g_olr_zero;              /* T-405: a LAYERA outlier flush applies no offset; PTV_NO_OLR_ZERO=1 reverts */
+extern int     g_wev_spend;             /* T-408: a split spends its W from the PES-tail carry; PTV_NO_WEV_SPEND=1 reverts */
 extern int     g_vresize;               /* T-406: a lasting size change is scaled in-process; PTV_NO_VRESIZE=1 reverts */
 extern int     g_bias_cap;              /* T-407: the PLL re-adopts at most the corrector's walk; PTV_NO_BIAS_CAP=1 reverts */
 extern int     g_ceil_ledger;           /* 2.0.2: ceiling flatness on ev − ea, not the PLL-moved dm; PTV_NO_CEIL_LEDGER=1 reverts */
