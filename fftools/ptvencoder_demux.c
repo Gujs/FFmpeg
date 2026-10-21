@@ -3943,7 +3943,7 @@ void *demux_thread(void *arg)
                     d->door_v0_arm  = 1;
                     d->door_vs_hold = vs;
                     d->door_erased  = 0;
-                    if (g_door_erase && d->door_startup && d->door_vhi_ok && out->pts != AV_NOPTS_VALUE &&
+                    if (g_timeline && d->door_startup && d->door_vhi_ok && out->pts != AV_NOPTS_VALUE &&
                         vst->avg_frame_rate.num > 0 && vst->avg_frame_rate.den > 0)
                         door_erase(d, vst, out->pts);
                     /* 2.0.0: say which way the cut goes (T-364/T-368) — only the kept case used to show (WALLEV) */
@@ -3961,7 +3961,7 @@ void *demux_thread(void *arg)
                             if (dl >= m >> 1) dl -= m;
                         }
                         early = dl <= 0;      /* content up to the picture that closed the door is on air */
-                        if (g_door_erase && d->door_vhi_ok && vst->avg_frame_rate.num > 0) {
+                        if (g_timeline && d->door_vhi_ok && vst->avg_frame_rate.num > 0) {
                             /* T-398: ... up to the end of the newest picture let through, where the erase joins */
                             int64_t va = d->door_vhi + av_rescale_q(1, av_inv_q(vst->avg_frame_rate), vst->time_base);
                             dl = raw - av_rescale_q(va, vst->time_base, st->time_base);
@@ -4246,39 +4246,26 @@ static void ptv_autobank_escalate(DemuxArgs *d, int64_t worst_us, int64_t now)
  * AGLUE padding the audio by its own label step while the house took whole ticks back (ATRIM) — each leaving a sub-frame
  * remainder as a permanent content A/V step: GYF's production replay walked −4 → +39 ms in an hour of 12 s burst cuts
  * (one step at every cut, 20 ms the largest). The door knows the cut: from the end of the newest picture let through to
- * the keyframe it resumes at, whole pictures. Every dense stream's labels move by that span here (wrap_off; wrap_last
- * with them, so no step is seen downstream), the sparse ones with prog_off, both edit ledgers alike; the audio is let
- * through on the same boundaries, its sub-frame rest is the audio's own continuity (padded / trimmed by its labels). */
+ * the keyframe it resumes at, whole pictures. 2.1 T-409 (PTV_TIMELINE): the cut is erased from the program offset (the
+ * timeline moves every stream alike); the audio is let through on the same boundaries, its sub-frame rest is the
+ * audio's own continuity (padded / trimmed by its labels). */
 static void door_erase(DemuxArgs *d, const AVStream *vst, int64_t vb)
 {
     int64_t fd = av_rescale_q(1, av_inv_q(vst->avg_frame_rate), vst->time_base);
     int64_t cut = vb - (d->door_vhi + fd), cut_us;
-    unsigned s;
     if (vst->pts_wrap_bits > 0 && vst->pts_wrap_bits < 63) {
         int64_t m = 1LL << vst->pts_wrap_bits;
         cut &= m - 1;
         if (cut >= m >> 1) cut -= m;
     }
     cut_us = av_rescale_q(cut, vst->time_base, AV_TIME_BASE_Q);
-    if (cut <= 0 || cut_us > 60 * (int64_t)AV_TIME_BASE)
+    if (cut <= 0 || cut_us > 60 * (int64_t)AV_TIME_BASE || !d->tl)
         return;
-    for (s = 0; s < d->ifmt->nb_streams && s < (unsigned)d->nb_streams_open; s++) {
-        const AVStream *st = d->ifmt->streams[s];
-        int ct = st->codecpar->codec_type;
-        int64_t c;
-        if (ct != AVMEDIA_TYPE_VIDEO && ct != AVMEDIA_TYPE_AUDIO)
-            continue;
-        c = av_rescale_q(cut, vst->time_base, st->time_base);
-        d->wrap_off[s] -= c;
-        if (d->wrap_last[s] != AV_NOPTS_VALUE)
-            d->wrap_last[s] += c;
-        rsync_post_edit(d, s, -cut_us);
-    }
-    d->prog_off   -= av_rescale_q(cut, vst->time_base, (AVRational){ 1, 90000 });
+    ptv_tl_cut(d, cut_us);                   /* 2.1 T-409: the program offset, every stream alike */
     d->door_erased = 1;
     d->door_vb     = vb;
     av_log(NULL, AV_LOG_INFO, "[PTV-SRC] in0 burst: the cut is erased at the door — %.3f s (%"PRId64" pictures) on every "
-           "stream, joined on the pictures' boundaries (PTV_NO_DOOR_ERASE=1 reverts)\n", cut_us / 1e6, cut / fd);
+           "stream, joined on the pictures' boundaries (PTV_TIMELINE)\n", cut_us / 1e6, cut / fd);
 }
 
 /* 2.0.0-pre20 T-364: a packet the depth door drops while the source is LIVE still ARRIVED. The wall-evidence split reads

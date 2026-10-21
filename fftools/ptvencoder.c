@@ -1038,7 +1038,6 @@ int     g_hstick_filter = 1;
  * block. PTV_NO_RSCORR_CEIL=1 reverts; PTV_RSCORR_CEIL_MIN (minutes, default 15) tunes. */
 int     g_rscorr_ceil = 1;
 int64_t g_rscorr_ceil_us = 900000000;
-int     g_door_erase = 1;    /* T-398: see the depth door in ptvencoder_demux.c; PTV_NO_DOOR_ERASE=1 reverts */
 int     g_wev_spend = 1;     /* T-408: see ptv_wallev_spend() in ptvencoder_demux.c; PTV_NO_WEV_SPEND=1 reverts */
 int     g_olr_zero = 1;      /* T-405: a LAYERA outlier flush keeps the old timeline with no offset (the previous event's stale offset was re-applied), places every stream by the trigger's bases and holds a stream's next step for the next cycle; PTV_NO_OLR_ZERO=1 reverts */
 int     g_vresize = 1;       /* T-406: a lasting source size change is scaled to the graph input in-process (no exit 4); PTV_NO_VRESIZE=1 reverts */
@@ -7584,7 +7583,6 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_GLUEVETO")) g_glueveto = 0;   /* 1.0.1-pre18 #50: gap-verdict-vs-LAYERA one-remedy invariant off */
     if (getenv("PTV_NO_HSTICK_FILTER")) g_hstick_filter = 0;   /* 1.0.1-pre18 #51a: hs-tick steps count as corrector events again */
     if (getenv("PTV_NO_RSCORR_CEIL")) g_rscorr_ceil = 0;       /* 1.0.1-pre18 #51b: no starvation-ceiling engage */
-    if (getenv("PTV_NO_DOOR_ERASE")) g_door_erase = 0;        /* T-398: the downstream paths erase the door's cut again */
     if (getenv("PTV_NO_WEV_SPEND")) g_wev_spend = 0;          /* T-408: the PES-tail carry passes the whole gap on again */
     if (getenv("PTV_NO_OLR_ZERO")) g_olr_zero = 0;            /* T-405: the outlier flush re-applies the last offset again */
     if (getenv("PTV_NO_VRESIZE")) g_vresize = 0;              /* T-406: a lasting size change exits 4 for a re-probe again */
