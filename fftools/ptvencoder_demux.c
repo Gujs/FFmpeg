@@ -3265,6 +3265,7 @@ bad:
 
 static void by_count_gap(DemuxArgs *d, int64_t gap, int64_t now);   /* 2.0.0-pre4, defined below */
 static void door_arrived(DemuxArgs *d, int si, int64_t nw);          /* 2.0.0-pre20 T-364, defined below */
+static void door_erase(DemuxArgs *d, const AVStream *vst, int64_t vb);   /* 2.0.2 T-398, defined below */
 
 /* 2.0.0 T-345: raw (a video packet after a gap) is still on the pre-gap timeline: 0..500 ms past ref (33-bit wrap) */
 static int src_tail_more(const AVStream *vst, int64_t raw, int64_t ref)
@@ -3941,6 +3942,10 @@ void *demux_thread(void *arg)
                     d->door_v0      = 0;
                     d->door_v0_arm  = 1;
                     d->door_vs_hold = vs;
+                    d->door_erased  = 0;
+                    if (g_door_erase && d->door_startup && d->door_vhi_ok && out->pts != AV_NOPTS_VALUE &&
+                        vst->avg_frame_rate.num > 0 && vst->avg_frame_rate.den > 0)
+                        door_erase(d, vst, out->pts);
                     /* 2.0.0: say which way the cut goes (T-364/T-368) — only the kept case used to show (WALLEV) */
                     av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 burst: back under the max delay — resuming at a keyframe, "
                            "picture and sound together (%"PRId64" packets dropped; %s)\n", d->door_n, d->door_startup ?
@@ -3956,6 +3961,17 @@ void *demux_thread(void *arg)
                             if (dl >= m >> 1) dl -= m;
                         }
                         early = dl <= 0;      /* content up to the picture that closed the door is on air */
+                        if (g_door_erase && d->door_vhi_ok && vst->avg_frame_rate.num > 0) {
+                            /* T-398: ... up to the end of the newest picture let through, where the erase joins */
+                            int64_t va = d->door_vhi + av_rescale_q(1, av_inv_q(vst->avg_frame_rate), vst->time_base);
+                            dl = raw - av_rescale_q(va, vst->time_base, st->time_base);
+                            if (st->pts_wrap_bits > 0 && st->pts_wrap_bits < 63) {
+                                int64_t m = 1LL << st->pts_wrap_bits;
+                                dl &= m - 1;
+                                if (dl >= m >> 1) dl -= m;
+                            }
+                            early = dl < 0;
+                        }
                     }
                     if (!early) {
                         /* a dropped picture still arrived (as the DUKF / corrupt drops): without the stamp the door's
@@ -3969,6 +3985,22 @@ void *demux_thread(void *arg)
                         av_packet_free(&out);
                         continue;
                     }
+                }
+            } else if (d->door == 2 && d->door_erased && raw != AV_NOPTS_VALUE &&
+                       (isv || st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)) {
+                /* T-398: an erased cut joins at the keyframe's PTS — what lies before it (the keyframe's leading pictures,
+                 * the sound before its picture) belongs to the erased span */
+                int64_t t  = out->pts != AV_NOPTS_VALUE ? out->pts : raw;
+                int64_t dl = t - av_rescale_q(d->door_vb, vst->time_base, st->time_base);
+                if (st->pts_wrap_bits > 0 && st->pts_wrap_bits < 63) {
+                    int64_t m = 1LL << st->pts_wrap_bits;
+                    dl &= m - 1;
+                    if (dl >= m >> 1) dl -= m;
+                }
+                if (dl < 0) {
+                    door_arrived(d, out->stream_index, nw);
+                    av_packet_free(&out);
+                    continue;
                 }
             } else if (d->door == 2 && !isv && raw != AV_NOPTS_VALUE) {
                 int64_t dl = raw - av_rescale_q(d->door_cut, vst->time_base, st->time_base);
@@ -3986,6 +4018,18 @@ void *demux_thread(void *arg)
             }
             if (d->door == 2 && nw - d->door_wc > 3000000)
                 d->door = 0;
+            if (isv && out->pts != AV_NOPTS_VALUE) {   /* T-398: the newest picture let through (wrap-aware) */
+                int64_t dl = out->pts - d->door_vhi;
+                if (vst->pts_wrap_bits > 0 && vst->pts_wrap_bits < 63) {
+                    int64_t m = 1LL << vst->pts_wrap_bits;
+                    dl &= m - 1;
+                    if (dl >= m >> 1) dl -= m;
+                }
+                if (!d->door_vhi_ok || dl > 0 || dl < -(int64_t)av_rescale_q(10 * AV_TIME_BASE, AV_TIME_BASE_Q, vst->time_base)) {
+                    d->door_vhi    = out->pts;
+                    d->door_vhi_ok = 1;
+                }
+            }
         }
         demux_unwrap(d, out);               /* 33-bit source wrap -> monotonic extended ts (ONCE) */
         if (g_timeline) {                   /* 2.1 T-409: one classifier, one remedy for every stream of the input */
@@ -4195,6 +4239,46 @@ static void ptv_autobank_escalate(DemuxArgs *d, int64_t worst_us, int64_t now)
 {
     d->by_bank_last_q = now;
     cushion_escalate(BANK_ESCALATE, worst_us, now);
+}
+
+/* 2.0.2 T-398: the depth door erases its own cut. Left to the paths downstream, a cut was erased by whichever one its
+ * label step reached — LAYERA with the audio's offset (whole AAC frames: the pictures moved off the house grid), or
+ * AGLUE padding the audio by its own label step while the house took whole ticks back (ATRIM) — each leaving a sub-frame
+ * remainder as a permanent content A/V step: GYF's production replay walked −4 → +39 ms in an hour of 12 s burst cuts
+ * (one step at every cut, 20 ms the largest). The door knows the cut: from the end of the newest picture let through to
+ * the keyframe it resumes at, whole pictures. Every dense stream's labels move by that span here (wrap_off; wrap_last
+ * with them, so no step is seen downstream), the sparse ones with prog_off, both edit ledgers alike; the audio is let
+ * through on the same boundaries, its sub-frame rest is the audio's own continuity (padded / trimmed by its labels). */
+static void door_erase(DemuxArgs *d, const AVStream *vst, int64_t vb)
+{
+    int64_t fd = av_rescale_q(1, av_inv_q(vst->avg_frame_rate), vst->time_base);
+    int64_t cut = vb - (d->door_vhi + fd), cut_us;
+    unsigned s;
+    if (vst->pts_wrap_bits > 0 && vst->pts_wrap_bits < 63) {
+        int64_t m = 1LL << vst->pts_wrap_bits;
+        cut &= m - 1;
+        if (cut >= m >> 1) cut -= m;
+    }
+    cut_us = av_rescale_q(cut, vst->time_base, AV_TIME_BASE_Q);
+    if (cut <= 0 || cut_us > 60 * (int64_t)AV_TIME_BASE)
+        return;
+    for (s = 0; s < d->ifmt->nb_streams && s < (unsigned)d->nb_streams_open; s++) {
+        const AVStream *st = d->ifmt->streams[s];
+        int ct = st->codecpar->codec_type;
+        int64_t c;
+        if (ct != AVMEDIA_TYPE_VIDEO && ct != AVMEDIA_TYPE_AUDIO)
+            continue;
+        c = av_rescale_q(cut, vst->time_base, st->time_base);
+        d->wrap_off[s] -= c;
+        if (d->wrap_last[s] != AV_NOPTS_VALUE)
+            d->wrap_last[s] += c;
+        rsync_post_edit(d, s, -cut_us);
+    }
+    d->prog_off   -= av_rescale_q(cut, vst->time_base, (AVRational){ 1, 90000 });
+    d->door_erased = 1;
+    d->door_vb     = vb;
+    av_log(NULL, AV_LOG_INFO, "[PTV-SRC] in0 burst: the cut is erased at the door — %.3f s (%"PRId64" pictures) on every "
+           "stream, joined on the pictures' boundaries (PTV_NO_DOOR_ERASE=1 reverts)\n", cut_us / 1e6, cut / fd);
 }
 
 /* 2.0.0-pre20 T-364: a packet the depth door drops while the source is LIVE still ARRIVED. The wall-evidence split reads

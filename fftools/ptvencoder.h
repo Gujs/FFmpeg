@@ -1878,6 +1878,11 @@ typedef struct DemuxArgs {
     int                   door_startup;     /* 2.0.0-pre20 T-364: the source has stayed LIVE since this cut began (pre21:
                                              * at any time; pre20 required it before the first picture) */
     int64_t               door_raw0, door_us0, door_cut, door_wc, door_n, door_v0, door_vo, door_vo_wc, door_vs_hold;
+    /* 2.0.2 T-398: the door erases its own cut on the pictures' boundaries (see the door block) */
+    int64_t               door_vhi;         /* PTS (video tb) of the newest picture let through */
+    int                   door_vhi_ok;
+    int                   door_erased;      /* this cut was erased at the door: drop what lies before door_vb */
+    int64_t               door_vb;          /* PTS (video tb) of the keyframe the door resumed at */
     int64_t               dbg_door_wc;      /* T-316 diag: [PTV-DOORDBG] rate limit */
     int                   dbg_door_st;      /* 2.0.0: [PTV-DOORDBG] last printed state (door/active/hold/fresh) */
     int64_t               src_gap_pending;  /* 2.0.0-pre4: a hold's arrival gap awaiting its rejoin class */
@@ -2468,6 +2473,7 @@ extern int     g_hstick_filter;          /* #51a: ≤1-tick hs steps are not cor
 extern int     g_rscorr_ceil;            /* #51b: starvation-ceiling engage; PTV_NO_RSCORR_CEIL=1 reverts */
 extern int64_t g_rscorr_ceil_us;         /* #51b ceiling span (15min default; PTV_RSCORR_CEIL_MIN minutes) */
 extern int     g_olr_zero;              /* T-405: a LAYERA outlier flush applies no offset; PTV_NO_OLR_ZERO=1 reverts */
+extern int     g_door_erase;            /* T-398: the burst door erases its cut on picture boundaries; PTV_NO_DOOR_ERASE=1 reverts */
 extern int     g_wev_spend;             /* T-408: a split spends its W from the PES-tail carry; PTV_NO_WEV_SPEND=1 reverts */
 extern int     g_vresize;               /* T-406: a lasting size change is scaled in-process; PTV_NO_VRESIZE=1 reverts */
 extern int     g_bias_cap;              /* T-407: the PLL re-adopts at most the corrector's walk; PTV_NO_BIAS_CAP=1 reverts */
