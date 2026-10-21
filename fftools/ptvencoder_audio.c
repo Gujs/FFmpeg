@@ -2892,7 +2892,11 @@ static int rj_release_ok(AudioState *a)
     if (a->rj_t0 && now - a->rj_t0 > 4000000)
         return 1;                                            /* bounded: never hold audio longer */
     if (!ptv_src_holding() && rj <= a->hold_fill_wc0)       /* a short repeat run, no hold: a fresh frame after */
-        return atomic_load_explicit(&g_src_fresh_wc, memory_order_acquire) > a->hold_fill_last_wc;   /* the fill */
+        /* 2.1 T-409: with the timeline the labels carry a kept hole and house_skew keeps its pre-gap value (T-321):
+         * nothing to wait for. Waiting raced the video's own freeze — a fill begun late, as the last pre-gap picture
+         * was still showing, held the return to the post-gap picture (sync_flapping: audio dark 1.77 s, 5 of 6 runs) */
+        return g_timeline ||
+               atomic_load_explicit(&g_src_fresh_wc, memory_order_acquire) > a->hold_fill_last_wc;   /* the fill */
     return ptv_rj_settled(a->rj_cls_seq0, now);   /* hold over, rejoin classified, its house_skew shown (NEW DOMAIN:
                                                    * 200 ms — 1 s of holding cost a 0.9 s dark wire for nothing) */
 }
@@ -4081,6 +4085,15 @@ graph_in:
                         else                 a->glue_cad_us += (wg - a->glue_cad_us) / 8;
                     }
                 }
+            }
+            /* 2.1 T-409: without the step verdicts, still track the arrival cadence (rr15 R2 above) — the silence fill's
+             * patience. At 0 every PES-burst pause after a return (150-300 ms) started a fill and the rejoin buffer
+             * held the real frames ~1 s for a fresh picture (sync_flapping: 3-5 flashes without their beep). */
+            if (g_timeline && g_glueclass && a->glue_raw_last_us != AV_NOPTS_VALUE &&
+                llabs(raw_us - (a->glue_raw_last_us + a->glue_raw_dur_us)) <= (int64_t)g_aglue_ms * 1000) {
+                int64_t wg = now_wc - a->glue_wall_last_us;
+                if (wg > 5000 && wg < 2000000)
+                    a->glue_cad_us = a->glue_cad_us ? a->glue_cad_us + (wg - a->glue_cad_us) / 8 : wg;
             }
             if (a->hold_fill_us &&   /* 2.0.0-pre6: 2 s after video resumed, the rejoin's step verdicts are in */
                 atomic_load_explicit(&g_src_fresh_wc, memory_order_relaxed) >= a->hold_fill_wc0) {
