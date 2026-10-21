@@ -401,7 +401,8 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
         if (t->st[si].dense && t->st[si].res == 1)
             av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO, " [s%d %+.3f s]", si,
                    (t->st[si].new_first_us - t->st[si].old_end_us) / 1e6);
-    av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO, " (PTV_TIMELINE)\n");
+    av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO, " window %.2f s, %d held (PTV_TIMELINE)\n",
+           (av_gettime_relative() - t->open_wc) / 1e6, t->nheld);
 
     if (prog_event)
         k_move(d, t, k_new - k_old);
@@ -479,6 +480,8 @@ int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
         t->open_s_us = s_us;
         t->nheld     = 1;
         h->pkt = pkt; h->s_us = s_us; h->k_at = t->k_us; h->wc = nw; h->si = si; h->path = 0;
+        for (int i = 0; i < t->nst; i++)       /* a stream the window never classifies keeps its path */
+            t->st[i].old_end_us = t->st[i].last_us;
         if (d->disturb_epoch)
             atomic_fetch_add_explicit(d->disturb_epoch, 1, memory_order_relaxed);
         return 0;
