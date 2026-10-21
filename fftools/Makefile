@@ -47,6 +47,7 @@ OBJS-ptvencoder +=                    \
     fftools/ptvencoder_hold.o         \
     fftools/ptvencoder_legend.o       \
     fftools/ptvencoder_mv.o           \
+    fftools/ptvencoder_timeline.o     \
 
 OBJS-ffprobe +=                       \
     fftools/textformat/avtextformat.o \

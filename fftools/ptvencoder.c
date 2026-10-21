@@ -7361,6 +7361,12 @@ int main(int argc, char **argv)
     if (getenv("PTV_REPRIME")) g_reprime = 1;     /* fast buffer re-prime after a glue (default ON since v0.9.10; kept for compat) */
     if (getenv("PTV_NO_REPRIME")) g_reprime = 0;
     if (getenv("PTV_NO_LAYERA"))  g_layera  = 0;  /* v0.9.10: WUCR/LAYERA/REPRIME are default-on; NO_* revert */
+    if (getenv("PTV_TIMELINE") && atoi(getenv("PTV_TIMELINE")) > 0) {   /* 2.1 T-409 (development switch) */
+        g_timeline = 1;
+        g_layera   = 0;                       /* the timeline owns what the LAYERA buffer did */
+        if (getenv("PTV_TL_OPEN_MS") && atoi(getenv("PTV_TL_OPEN_MS")) > 0)
+            g_tl_open_us = atoi(getenv("PTV_TL_OPEN_MS")) * 1000LL;
+    }
     if (getenv("PTV_LAYERA_FULLSKIP")) g_layera_fullskip = 1;  /* 0.9.18.5 revert: LAYERA skips the demux absorber for ALL
                                                                 * super-threshold jumps again (restores the sub-1s no-owner
                                                                 * band = the In-Touch audio-late accumulator; A/B only) */

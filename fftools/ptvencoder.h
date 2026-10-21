@@ -1742,6 +1742,8 @@ typedef struct PtvDiscBuf {
     int64_t             fl_delta_us;        /* the trigger stream's jump delta at that flush (µs) */
 } PtvDiscBuf;
 
+typedef struct PtvTimeline PtvTimeline;   /* 2.1 T-409: the program timeline, source stage (ptvencoder_timeline.c) */
+
 typedef struct DemuxArgs {
     AVFormatContext      *ifmt;
     AVThreadMessageQueue *video_q;
@@ -1883,6 +1885,7 @@ typedef struct DemuxArgs {
     int64_t              *tail_wc_us;       /* 2.0.0 T-089: per stream, wall time that carry was taken (bounds a multi-packet tail) */
     int                   src_gap_class;    /* 2.0.0-pre4: class known before the gap was counted: 1 BURST, 2 other */
     PtvDiscBuf           *disc;           /* legacy-0004 buffer-classify-discard (g_layera only; NULL otherwise) */
+    PtvTimeline          *tl;             /* 2.1 T-409: the program timeline (g_timeline only; NULL otherwise) */
     int64_t               video_fwd_us;   /* wall-clock (us) of the last VIDEO forward-discontinuity crossing (whole-program-splice indicator) */
     int64_t               prog_off;       /* P2 (§7.1): program-level discontinuity offset (90kHz, detected on the
                                            * DENSE video reference) applied to SPARSE copied streams (sub/data/SCTE)
@@ -2551,6 +2554,16 @@ int build_audio_filter(AudioState *a, AVCodecContext *adec, AVRational tb,
                        const char *af, enum AVSampleFormat out_fmt);
 /* ptvencoder_demux.c */
 void *demux_thread(void *arg);
+/* 2.1 T-409: the program timeline (ptvencoder_timeline.c) and the demux helpers it calls */
+extern int     g_timeline;               /* PTV_TIMELINE=1: one classifier per input owns every source timing remedy */
+extern int64_t g_tl_open_us;             /* a dense packet this far off its path opens an event (PTV_TL_OPEN_MS, 500) */
+PtvTimeline *ptv_tl_alloc(int nb_streams);
+void ptv_tl_free(PtvTimeline **t);
+int  ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt);
+void ptv_tl_cut(DemuxArgs *d, int64_t cut_us);
+int  ptv_demux_dispatch(DemuxArgs *d, AVPacket *pkt);
+void ptv_rsync_post_edit(DemuxArgs *d, int s, int64_t delta_us);
+extern int64_t g_gap_min_us;
 int ptv_disc_init(PtvDiscBuf *b, int capacity, int nb_streams);
 int ptv_slot_acquire(struct Input *in, int idx);   /* 2.0.2 T-386 */
 void ptv_disc_free(PtvDiscBuf *b);

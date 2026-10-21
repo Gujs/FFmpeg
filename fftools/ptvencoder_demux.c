@@ -40,7 +40,7 @@
  * absorb in both directions.) thresholds internalized 0.9.18.7 (were PTV_DISCONT_MS forward / PTV_DISCONT_BACK_MS backward). */
 static int     g_discont_ms = 1000;       /* forward jump threshold (internalized 0.9.18.7; was PTV_DISCONT_MS) */
 static int     g_discont_back_ms = 80;    /* backward jump threshold (keep small — anti-stall) (internalized 0.9.18.7; was PTV_DISCONT_BACK_MS) */
-static int64_t g_gap_min_us = 700000;     /* min wall-absence (us) to call a forward audio jump a real GAP when video did not also cross (internalized 0.9.18.7; was PTV_GAP_MIN_MS) */
+int64_t g_gap_min_us = 700000;            /* min wall-absence (us) to call a forward audio jump a real GAP when video did not also cross (internalized 0.9.18.7; was PTV_GAP_MIN_MS) */
 static int64_t g_progoff_debounce_us = 1000000;   /* coalesce a V/A straddle into one bump (internalized 0.9.18.7; was PTV_PROGOFF_DEBOUNCE_MS) */
 static int64_t g_disc_viderr_sum;    /* PTV-FLUSHAV: running total of per-flush vid_err (source A/V misalignment absorbed at glues, us) — correlate its growth vs the oracle drift to test whether flushes leak into audio-behind */
 static int64_t g_dukf_escape_us = 5000000;   /* force-resume if no IDR within this (internalized 0.9.18.7; was PTV_DUKF_ESCAPE_MS) */
@@ -2612,7 +2612,7 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                 d->wrap_off[pkt->stream_index] -= mask;  /* late pre-roll pkt */
                 if (ol) ol->wrap_dw = -mask;
             }
-            else if (g_discont && (ct == AVMEDIA_TYPE_VIDEO || ct == AVMEDIA_TYPE_AUDIO)) {
+            else if (g_discont && !g_timeline && (ct == AVMEDIA_TYPE_VIDEO || ct == AVMEDIA_TYPE_AUDIO)) {   /* 2.1: the timeline owns it */
                 /* Source PTS discontinuity (a DTS jump, NOT a 33-bit wrap), either direction.
                  * Frames are continuous (one per tick) but the timestamp leaps; absorb the excess
                  * so the effective timeline stays continuous (re-base to last + one nominal frame),
@@ -3988,6 +3988,17 @@ void *demux_thread(void *arg)
                 d->door = 0;
         }
         demux_unwrap(d, out);               /* 33-bit source wrap -> monotonic extended ts (ONCE) */
+        if (g_timeline) {                   /* 2.1 T-409: one classifier, one remedy for every stream of the input */
+            if (!d->tl && !(d->tl = ptv_tl_alloc(d->nb_streams_open))) {
+                av_packet_free(&out);
+                ret = AVERROR(ENOMEM);
+                break;
+            }
+            ret = ptv_tl_ingest(d, out);
+            if (ret < 0)
+                break;
+            continue;
+        }
 
         /* legacy-0004 TS-discontinuity buffer (g_layera only). Dense V/A get
          * detect→buffer→classify→discard-OLD→single-offset; sparse SUBTITLE/DATA
@@ -4145,6 +4156,7 @@ void *demux_thread(void *arg)
             break;
     }
 end:
+    ptv_tl_free(&d->tl);                     /* 2.1 T-409: held packets of an open window are dropped at the end */
     /* producer done → signal CONSUMERS to drain then get EOF. recv() returns
      * err_recv (set_err_send is invisible to receivers), so this MUST be
      * set_err_recv or decode/audio block forever (the offline-EOF deadlock). */
@@ -4360,6 +4372,16 @@ static void rate_estimator_feed(RateEstimator *e, int64_t c_now, int64_t w_now,
             e->c0 = c_now; e->w0 = w_now;                      /* slide to the next sub-window */
         }
     }
+}
+
+int ptv_demux_dispatch(DemuxArgs *d, AVPacket *pkt)   /* 2.1 T-409: the timeline releases through here */
+{
+    return demux_dispatch(d, pkt);
+}
+
+void ptv_rsync_post_edit(DemuxArgs *d, int s, int64_t delta_us)
+{
+    rsync_post_edit(d, s, delta_us);
 }
 
 static int demux_dispatch(DemuxArgs *d, AVPacket *out)

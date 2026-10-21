@@ -1,0 +1,501 @@
+/*
+ * ptvencoder — 2.1 T-409: the program timeline, source stage (M_in).
+ *
+ * ONE classifier per input decides every source timing event and applies ONE remedy to every stream of the input
+ * (design: analysis/t409-timeline-map-design.md). It replaces, when PTV_TIMELINE=1, the demux absorber, the wall-evidence
+ * split, the LAYERA buffer and the door's downstream re-discovery of its own cut.
+ *
+ * The remedy is the program offset k: every packet of the input leaves the demux labelled L = S + k, S = its source
+ * time after the 33-bit unwrap. k is realized through the existing offset state — wrap_off[] of every dense stream and
+ * prog_off of the sparse ones (so SCTE-35 pts_adjustment and the copies follow unchanged) — and only this file writes it
+ * (one writer). An event changes k by whole pictures, for all streams at once: after the demux, the labels of every
+ * stream are continuous except at holes deliberately kept.
+ *
+ * An event: the first dense packet more than PTV_TL_OPEN_MS off its stream's path opens a window; every packet of the
+ * input is held until each flowing dense stream has resolved (crossed to a new path, come back to the old one, or
+ * passed the crossing point without crossing) or the window times out. Then, once:
+ *   - packets off every path that do not continue (one corrupt PES, the first piece of a split step) are dropped;
+ *   - the video and at least one audio crossed by the same amount: a PROGRAM event. J = the video's step on its picture
+ *     grid; W = the input's wall silence before it (no evidence under an armed bank / deep prime); a damaged crossing
+ *     keeps its whole step. keep = min(J, W) in whole pictures, erase = J − keep, k −= erase. The sound after the last
+ *     old picture and before the first new one is dropped; the audio's sub-frame rest is the audio's own continuity;
+ *   - only one stream crossed: a single-stream step, labels as sent (the content path pads / trims, RELABEL may repair).
+ */
+
+#include "ptvencoder.h"
+#include "libavutil/mathematics.h"
+#include "libavutil/time.h"
+
+#define TL_HELD_MAX   4096
+#define TL_WIN_US     1000000       /* an event window closes after 1 s of wall at the latest */
+#define TL_PASS_US    300000        /* a partner whose own timeline passed the crossing point by this did not cross */
+#define TL_STRAG_US   2000000       /* after an event, packets on a stream's old path are stragglers for this long */
+
+typedef struct TlPkt {
+    AVPacket *pkt;
+    int64_t   s_us;    /* source time (DTS, or PTS when no DTS), us; AV_NOPTS_VALUE = none */
+    int64_t   k_at;    /* the k its labels were given by demux_unwrap */
+    int64_t   wc;      /* arrival wall */
+    int       si;
+    int       path;    /* 0 old, 1 new, 2 drop */
+} TlPkt;
+
+typedef struct TlStream {
+    int     dense, ok;
+    int64_t last_us, step_us, last_wc;
+    int64_t strag_last_us, strag_until_wc;   /* the old path after an event (stragglers are dropped) */
+    /* classification scratch */
+    int     res;        /* 0 unresolved/old, 1 crossed, 2 came back (outlier) */
+    int64_t old_end_us, new_first_us, new_last_us;
+    int     new_n;
+} TlStream;
+
+struct PtvTimeline {
+    int64_t   k_us;
+    int64_t   ev_n, strag_n, drop_n;
+    int       active, trig, nst;
+    int64_t   open_wc, open_s_us;
+    int64_t   last_any_wc, gap_us, gap_end_wc;   /* the input's last silence >= g_gap_min_us */
+    TlStream *st;
+    TlPkt     held[TL_HELD_MAX];
+    int       nheld;
+};
+
+int     g_timeline = 0;
+int64_t g_tl_open_us = 500000;
+
+PtvTimeline *ptv_tl_alloc(int nb_streams)
+{
+    PtvTimeline *t = av_mallocz(sizeof(*t));
+    if (!t)
+        return NULL;
+    t->st = av_calloc(FFMAX(nb_streams, 1), sizeof(*t->st));
+    if (!t->st) {
+        av_free(t);
+        return NULL;
+    }
+    t->nst = nb_streams;
+    return t;
+}
+
+void ptv_tl_free(PtvTimeline **pt)
+{
+    PtvTimeline *t = *pt;
+    int i;
+    if (!t)
+        return;
+    for (i = 0; i < t->nheld; i++)
+        av_packet_free(&t->held[i].pkt);
+    av_free(t->st);
+    av_freep(pt);
+}
+
+static int is_dense(const DemuxArgs *d, int si)
+{
+    int ct = d->ifmt->streams[si]->codecpar->codec_type;
+    return ct == AVMEDIA_TYPE_VIDEO || ct == AVMEDIA_TYPE_AUDIO;
+}
+
+static int64_t pkt_s_us(const DemuxArgs *d, const AVPacket *p, int64_t k_us)
+{
+    int64_t ts = p->dts != AV_NOPTS_VALUE ? p->dts : p->pts;
+    if (ts == AV_NOPTS_VALUE)
+        return AV_NOPTS_VALUE;
+    return av_rescale_q(ts, d->ifmt->streams[p->stream_index]->time_base, AV_TIME_BASE_Q) - k_us;
+}
+
+static int64_t pkt_dur_us(const DemuxArgs *d, const AVPacket *p)
+{
+    const AVStream *st = d->ifmt->streams[p->stream_index];
+    if (p->duration > 0)
+        return av_rescale_q(p->duration, st->time_base, AV_TIME_BASE_Q);
+    if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && st->avg_frame_rate.num > 0)
+        return av_rescale(AV_TIME_BASE, st->avg_frame_rate.den, st->avg_frame_rate.num);
+    if (st->codecpar->sample_rate > 0 && st->codecpar->frame_size > 0)
+        return av_rescale(AV_TIME_BASE, st->codecpar->frame_size, st->codecpar->sample_rate);
+    return 0;
+}
+
+static int64_t tol_us(const TlStream *s)
+{
+    return FFMAX(g_tl_open_us / 2, 3 * s->step_us);
+}
+
+/* the normal-path bookkeeping of a packet on its stream's path */
+static void path_take(TlStream *s, int64_t s_us, int64_t wc)
+{
+    if (s->ok) {
+        int64_t dl = s_us - s->last_us;
+        if (dl > 0 && dl <= 250000)
+            s->step_us = s->step_us ? s->step_us + (dl - s->step_us) / 8 : dl;
+    }
+    s->last_us = s_us;
+    s->last_wc = wc;
+    s->ok      = 1;
+}
+
+/* shift a packet's labels from the k it was given to k_to */
+static void relabel(const DemuxArgs *d, AVPacket *p, int64_t k_from, int64_t k_to)
+{
+    const AVStream *st = d->ifmt->streams[p->stream_index];
+    int64_t dl;
+    if (k_to == k_from)
+        return;
+    dl = av_rescale_q(k_to - k_from, AV_TIME_BASE_Q, st->time_base);
+    if (p->pts != AV_NOPTS_VALUE) p->pts += dl;
+    if (p->dts != AV_NOPTS_VALUE) p->dts += dl;
+}
+
+/* move the program offset: every dense stream's wrap_off and the sparse streams' prog_off, both edit ledgers alike */
+static void k_move(DemuxArgs *d, PtvTimeline *t, int64_t dk_us)
+{
+    unsigned s;
+    if (!dk_us)
+        return;
+    for (s = 0; s < d->ifmt->nb_streams && s < (unsigned)d->nb_streams_open; s++) {
+        if (!is_dense(d, s))
+            continue;
+        d->wrap_off[s] += av_rescale_q(dk_us, AV_TIME_BASE_Q, d->ifmt->streams[s]->time_base);
+        ptv_rsync_post_edit(d, s, dk_us);
+    }
+    d->prog_off += av_rescale_q(dk_us, AV_TIME_BASE_Q, (AVRational){ 1, 90000 });
+    t->k_us     += dk_us;
+}
+
+/* Walk one stream's held packets (arrival order) against its path: mark old / new (the run it ends on) / drop (runs
+ * that do not continue). Fills the scratch fields; returns the stream's resolution. `final` = the window is closing. */
+static int classify_stream(PtvTimeline *t, int si, int final, int64_t cross_s_us)
+{
+    TlStream *s = &t->st[si];
+    int64_t old_last = s->last_us, step = s->step_us ? s->step_us : 20000, tol = tol_us(s);
+    int64_t run_first = AV_NOPTS_VALUE, run_last = AV_NOPTS_VALUE, run_base = AV_NOPTS_VALUE;
+    int run_n = 0, i, back_n = 0, seen = 0, ended_old = 0;
+
+    s->res = 0; s->new_n = 0; s->old_end_us = old_last;
+    for (i = 0; i < t->nheld; i++) {
+        TlPkt *h = &t->held[i];
+        if (h->si != si || h->s_us == AV_NOPTS_VALUE)
+            continue;
+        seen++;
+        if (!s->ok || llabs(h->s_us - (old_last + step)) <= tol) {
+            h->path = 0;
+            old_last = h->s_us;
+            ended_old = 1;
+            if (run_n)
+                back_n++;
+            continue;
+        }
+        ended_old = 0;
+        if (run_n && llabs(h->s_us - (run_last + step)) <= tol) {
+            h->path = 1;
+            run_last = h->s_us;
+            run_n++;
+            continue;
+        }
+        /* a new run: an earlier one did not continue */
+        if (run_n) {
+            int j;
+            for (j = 0; j < i; j++)
+                if (t->held[j].si == si && t->held[j].path == 1)
+                    t->held[j].path = 2;
+        }
+        h->path   = 1;
+        run_first = run_last = h->s_us;
+        run_base  = old_last;
+        run_n     = 1;
+        back_n    = 0;
+    }
+    if (run_n && (ended_old || (final && run_n < 2))) {
+        /* came back to the old path (or a lone packet at the end): the run was corrupt */
+        for (i = 0; i < t->nheld; i++)
+            if (t->held[i].si == si && t->held[i].path == 1)
+                t->held[i].path = 2;
+        s->res = back_n || final ? 2 : 0;
+        s->old_end_us = old_last;
+        return s->res;
+    }
+    if (run_n >= 2 || (final && run_n)) {
+        s->res          = 1;
+        s->old_end_us   = run_base;
+        s->new_first_us = run_first;
+        s->new_last_us  = run_last;
+        s->new_n        = run_n;
+        return 1;
+    }
+    if (run_n)
+        return 0;                              /* one packet off: wait for the next */
+    s->old_end_us = old_last;
+    /* never left its path: resolved "did not cross" once its own time passed the crossing point */
+    if (cross_s_us != AV_NOPTS_VALUE && seen && old_last > cross_s_us + TL_PASS_US)
+        return 3;
+    return 0;
+}
+
+/* a stream was flowing if it delivered within 2 s of the input's last activity before the event (before the silence
+ * the window opened behind, if any) */
+static int flowing(const PtvTimeline *t, const TlStream *s)
+{
+    int64_t ref = t->gap_end_wc && t->open_wc - t->gap_end_wc <= 1000000 ? t->gap_end_wc - t->gap_us : t->open_wc;
+    return s->dense && s->ok && ref - s->last_wc <= 2000000;
+}
+
+static int has_held(const PtvTimeline *t, int si)
+{
+    int i;
+    for (i = 0; i < t->nheld; i++)
+        if (t->held[i].si == si && t->held[i].s_us != AV_NOPTS_VALUE)
+            return 1;
+    return 0;
+}
+
+static int window_resolved(DemuxArgs *d, PtvTimeline *t, int final)
+{
+    int si, all = 1, r;
+    int64_t cross = AV_NOPTS_VALUE;
+    r = classify_stream(t, t->trig, final, AV_NOPTS_VALUE);
+    if (r == 1)
+        cross = t->st[t->trig].old_end_us;
+    else if (r != 2)
+        return final;
+    if (r == 2)
+        return 1;                              /* the trigger was one corrupt run: nothing else to wait for */
+    for (si = 0; si < t->nst; si++) {
+        TlStream *s = &t->st[si];
+        if (si == t->trig || !s->dense)
+            continue;
+        if (!flowing(t, s) && !(final && has_held(t, si)))
+            continue;                          /* not flowing before the event: no partner to wait for */
+        r = classify_stream(t, si, final, cross);
+        if (r == 0 && flowing(t, s))
+            all = 0;
+    }
+    return all || final;
+}
+
+static int64_t input_wall_gap(PtvTimeline *t, int64_t first_new_wc)
+{
+    int64_t w = 0, prev = AV_NOPTS_VALUE;
+    int i;
+    if (t->gap_end_wc && t->open_wc - t->gap_end_wc <= 1000000)
+        w = t->gap_us;                         /* the silence the window opened behind (the PES tail came first) */
+    for (i = 0; i < t->nheld && t->held[i].wc <= first_new_wc; i++) {
+        if (prev != AV_NOPTS_VALUE && t->held[i].wc - prev > w)
+            w = t->held[i].wc - prev;
+        prev = t->held[i].wc;
+    }
+    return w >= g_gap_min_us ? w : 0;
+}
+
+static int release(DemuxArgs *d, PtvTimeline *t, int64_t k_old, int64_t k_new, int prog_event,
+                   int64_t va_us, int64_t vb_us)
+{
+    int i, ret = 0;
+    for (i = 0; i < t->nheld; i++) {
+        TlPkt *h = &t->held[i];
+        AVPacket *p = h->pkt;
+        int64_t k = k_old;
+        h->pkt = NULL;
+        if (h->path == 2) {
+            t->drop_n++;
+            av_packet_free(&p);
+            continue;
+        }
+        if (h->s_us != AV_NOPTS_VALUE && h->si < t->nst && t->st[h->si].dense) {
+            if (h->path == 1 && t->st[h->si].res == 1)
+                k = k_new;
+            if (prog_event && d->ifmt->streams[h->si]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                int64_t end = h->s_us + pkt_dur_us(d, p);
+                /* the sound after the last old picture / before the first new one belongs to the erased span */
+                if ((k == k_old && h->s_us >= va_us) || (k == k_new && end <= vb_us)) {
+                    t->drop_n++;
+                    av_packet_free(&p);
+                    continue;
+                }
+            }
+        } else if (prog_event && h->s_us != AV_NOPTS_VALUE) {
+            k = llabs(h->s_us - vb_us) < llabs(h->s_us - va_us) ? k_new : k_old;   /* sparse: the nearer side */
+        }
+        relabel(d, p, h->k_at, k);
+        if (ret >= 0)
+            ret = ptv_demux_dispatch(d, p);
+        else
+            av_packet_free(&p);
+    }
+    t->nheld = 0;
+    return ret;
+}
+
+static int close_window(DemuxArgs *d, PtvTimeline *t)
+{
+    int si, vs = d->vstream, n_aud_cross = 0, n_aud_flow = 0, prog_event = 0, dmg = 0;
+    int64_t k_old = t->k_us, k_new = t->k_us, J = 0, W = 0, keep = 0, erase = 0, fd = 0;
+    int64_t va = AV_NOPTS_VALUE, vb = AV_NOPTS_VALUE, first_new_wc = INT64_MAX, nw = av_gettime_relative();
+    const char *cls = "outlier";
+    int ret;
+
+    window_resolved(d, t, 1);
+    for (si = 0; si < t->nst; si++) {
+        TlStream *s = &t->st[si];
+        if (!s->dense || si == vs)
+            continue;
+        if (d->ifmt->streams[si]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && (flowing(t, s) || has_held(t, si)))
+            n_aud_flow++;
+        if (s->res == 1)
+            n_aud_cross++;
+    }
+    for (si = 0; si < t->nheld; si++)
+        if (t->held[si].path == 1 && t->held[si].wc < first_new_wc)
+            first_new_wc = t->held[si].wc;
+    if (vs >= 0 && vs < t->nst && t->st[vs].res == 1 && (n_aud_cross || !n_aud_flow)) {
+        const AVStream *vst = d->ifmt->streams[vs];
+        TlStream *v = &t->st[vs];
+        fd = vst->avg_frame_rate.num > 0 ? av_rescale(AV_TIME_BASE, vst->avg_frame_rate.den, vst->avg_frame_rate.num)
+                                         : FFMAX(v->step_us, 1);
+        va = v->old_end_us + fd;               /* the end of the last old picture */
+        vb = v->new_first_us;                  /* the first new picture */
+        J  = vb - va;
+        J  = (J >= 0 ? J + fd / 2 : J - fd / 2) / fd * fd;   /* whole pictures */
+        W  = (atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 || (int64_t)g_preroll_ms >= 4000) ? 0 :
+             input_wall_gap(t, first_new_wc);
+        for (si = 0; si < t->nst; si++)
+            if (t->st[si].res == 1 && d->ts_outl && si < d->nb_streams_open &&
+                d->ts_outl[si].dmg_wc && nw - d->ts_outl[si].dmg_wc < W + 3000000)
+                dmg = 1;
+        if (J > 0) {
+            keep = dmg ? J : FFMIN(J, (W + fd / 2) / fd * fd);
+            erase = J - keep;
+        } else
+            erase = J;                         /* a step back: the new content follows on directly */
+        k_new = k_old - erase;
+        prog_event = 1;
+        cls = J > 0 && keep == J ? "hole kept" : keep ? "hole, flowing part erased" : J > 0 ? "relabel erased" :
+              "step back erased";
+        if (erase && !d->drop_until_kf && g_drop_until_kf) {
+            int i;
+            for (i = 0; i < t->nheld; i++)
+                if (t->held[i].si == vs && t->held[i].path == 1) {
+                    if (!(t->held[i].pkt->flags & AV_PKT_FLAG_KEY)) {
+                        d->drop_until_kf = 1;  /* the new content resumes at a keyframe */
+                        d->kf_arm_us     = nw;
+                        d->kf_arm_vdrop  = d->vdrop;
+                    }
+                    break;
+                }
+        }
+    } else {
+        for (si = 0; si < t->nst; si++)
+            if (t->st[si].res == 1) {
+                cls = "single-stream step, labels as sent";
+                break;
+            }
+    }
+    t->ev_n++;
+    av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO,
+           "[PTV-TL] event #%"PRId64" (stream %d opened): %s", t->ev_n, t->trig, cls);
+    if (prog_event)
+        av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO,
+               " — J %+.3f s, wall %.3f s%s, kept %.3f s, erased %.3f s (%"PRId64" pictures), k %+.3f s",
+               J / 1e6, W / 1e6, dmg ? " (damaged: kept whole)" : "", keep / 1e6, erase / 1e6, fd ? erase / fd : 0,
+               k_new / 1e6);
+    for (si = 0; si < t->nst; si++)
+        if (t->st[si].dense && t->st[si].res == 1)
+            av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO, " [s%d %+.3f s]", si,
+                   (t->st[si].new_first_us - t->st[si].old_end_us) / 1e6);
+    av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO, " (PTV_TIMELINE)\n");
+
+    if (prog_event)
+        k_move(d, t, k_new - k_old);
+    ret = release(d, t, k_old, k_new, prog_event, va, vb);
+    /* the paths go on where each stream ended */
+    for (si = 0; si < t->nst; si++) {
+        TlStream *s = &t->st[si];
+        if (!s->dense)
+            continue;
+        if (s->res == 1) {
+            if (prog_event) {
+                s->strag_last_us  = s->old_end_us;
+                s->strag_until_wc = nw + TL_STRAG_US;
+            }
+            s->last_us = s->new_last_us;
+            s->last_wc = nw;
+        } else if (s->ok)
+            s->last_us = s->old_end_us;
+        s->res = 0;
+    }
+    t->active = 0;
+    return ret;
+}
+
+int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
+{
+    PtvTimeline *t = d->tl;
+    int si = pkt->stream_index;
+    int64_t nw = av_gettime_relative(), s_us;
+    TlStream *s;
+
+    if (t->last_any_wc && nw - t->last_any_wc >= g_gap_min_us) {
+        t->gap_us     = nw - t->last_any_wc;
+        t->gap_end_wc = nw;
+    }
+    t->last_any_wc = nw;
+    s_us = pkt_s_us(d, pkt, t->k_us);
+    if (si >= t->nst)
+        return ptv_demux_dispatch(d, pkt);
+    s = &t->st[si];
+    s->dense = is_dense(d, si);
+
+    if (t->active) {
+        if (t->nheld < TL_HELD_MAX) {
+            TlPkt *h = &t->held[t->nheld++];
+            h->pkt = pkt; h->s_us = s_us; h->k_at = t->k_us; h->wc = nw; h->si = si; h->path = 0;
+        } else {
+            av_packet_free(&pkt);              /* cannot happen in a 1 s window; never block the demux */
+            t->drop_n++;
+        }
+        if (nw - t->open_wc >= TL_WIN_US || t->nheld >= TL_HELD_MAX || window_resolved(d, t, 0))
+            return close_window(d, t);
+        return 0;
+    }
+    if (!s->dense || s_us == AV_NOPTS_VALUE)
+        return ptv_demux_dispatch(d, pkt);
+    if (!s->ok) {
+        path_take(s, s_us, nw);
+        return ptv_demux_dispatch(d, pkt);
+    }
+    /* a straggler of the old path after an event: content of the erased span, never shown */
+    if (s->strag_until_wc && nw < s->strag_until_wc &&
+        llabs(s_us - (s->strag_last_us + s->step_us)) <= tol_us(s) &&
+        llabs(s_us - (s->last_us + s->step_us)) > tol_us(s)) {
+        s->strag_last_us = s_us;
+        t->strag_n++;
+        av_packet_free(&pkt);
+        return 0;
+    }
+    if (llabs(s_us - (s->last_us + s->step_us)) > g_tl_open_us) {
+        TlPkt *h = &t->held[0];
+        t->active    = 1;
+        t->trig      = si;
+        t->open_wc   = nw;
+        t->open_s_us = s_us;
+        t->nheld     = 1;
+        h->pkt = pkt; h->s_us = s_us; h->k_at = t->k_us; h->wc = nw; h->si = si; h->path = 0;
+        if (d->disturb_epoch)
+            atomic_fetch_add_explicit(d->disturb_epoch, 1, memory_order_relaxed);
+        return 0;
+    }
+    path_take(s, s_us, nw);
+    return ptv_demux_dispatch(d, pkt);
+}
+
+/* our own cut (the depth door): the span [Va, Vb) was dropped on every stream on the pictures' boundaries — erase it
+ * from the program offset; every path re-seeds on its next packet (the door made them continuous) */
+void ptv_tl_cut(DemuxArgs *d, int64_t cut_us)
+{
+    PtvTimeline *t = d->tl;
+    int si;
+    if (!t || cut_us <= 0)
+        return;
+    k_move(d, t, -cut_us);
+    for (si = 0; si < t->nst; si++)
+        t->st[si].ok = 0;
+}
