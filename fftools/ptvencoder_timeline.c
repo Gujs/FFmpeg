@@ -533,6 +533,28 @@ int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
         av_packet_free(&pkt);
         return 0;
     }
+    /* below the window threshold, an audio stream stepping on its own: the 0.9.16.4 rule (g_aglue_ms) owned here — back on
+     * clean audio = a relabel, repaired on that stream; forward by about a repair = its return leg; any other forward step
+     * = that stream's loss, labels as sent (the audio door pads). Gate std/sync_arelabel (-300 ms) took no window */
+    if (g_aglue_ms > 0 && d->ifmt->streams[si]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
+        !(d->ts_outl && si < d->nb_streams_open && d->ts_outl[si].dmg_wc && nw - d->ts_outl[si].dmg_wc < 3000000)) {
+        int64_t js = s_us - (s->last_us + s->step_us), rp = 0;
+        if (js < -(int64_t)g_aglue_ms * 1000 && js >= -g_tl_open_us)
+            rp = -js;
+        else if (js > (int64_t)g_aglue_ms * 1000 && js <= g_tl_open_us && s->rep_us > 0)
+            rp = -FFMIN(js, s->rep_us);
+        if (rp) {
+            s->rep_us += rp;
+            d->wrap_off[si] += av_rescale_q(rp, AV_TIME_BASE_Q, d->ifmt->streams[si]->time_base);
+            ptv_rsync_post_edit(d, si, rp);
+            relabel(d, pkt, 0, rp);
+            s_us += rp;
+            t->ev_n++;
+            av_log(NULL, AV_LOG_INFO, "[PTV-TL] event #%"PRId64" (stream %d): single-stream %s %+.3f s on the stream "
+                   "(repair now %+.3f s) (PTV_TIMELINE)\n", t->ev_n, si, rp > 0 ? "relabel, repaired" :
+                   "return leg, repair undone", rp / 1e6, s->rep_us / 1e6);
+        }
+    }
     if (llabs(s_us - (s->last_us + s->step_us)) > g_tl_open_us) {
         TlPkt *h = &t->held[0];
         t->active    = 1;
