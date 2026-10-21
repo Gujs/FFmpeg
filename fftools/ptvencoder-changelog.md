@@ -5,6 +5,27 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.0.2-pre8 — 2.0.2-pre7 + a source that switches picture size is scaled in-process (T-406), one timeline after a LAYERA outlier (T-405), wall absence counted once (T-408)
+
+- **A source that switches its picture size keeps running (T-406).** glo-3's four Stingray channels exited ~2,300 times a day:
+  their ingest flips between ABR renditions every 4–18 s and each new size ended the run (exit 4, re-probe, restart).
+  A size that lasts (three consecutive pictures; a single odd picture stays the T-373 bit-flipped-SPS case) is now scaled to
+  the graph's input size in-process, fit and centred on black (aspect kept within 1 %), and each size is logged once.
+  Replay of the captured source: pre7 exits at the first switch, pre8 runs through every switch. `PTV_NO_VRESIZE=1` reverts.
+- **One timeline after a corrupt-label verdict (T-405).** glo-2 AlrightTV (twice on 2026-10-21): the origin restarted both
+  streams 120 s back, ~0.3 s of the old timeline intruded, then it restarted again 5 s back. The flush that judged the
+  intrusion a corrupt outlier re-applied the previous event's +120 s, kept the video's intrusion and released the audio's
+  −5 s step raw while the video was glued alone: sound 120 s (then 5 s) early until sync_check restarted the channel. An
+  outlier flush now moves no labels, places every stream by the trigger's bases, and holds a stream that steps again so
+  every stream crosses that step in one cycle. Replay through the channel's production command: pre7 video PTS hole
+  +231 s, lip sync −5.16 s; pre8 lip sync 0/−1 ms, output linear. `PTV_NO_OLR_ZERO=1` reverts.
+- **An outage's wall time is evidence once (T-408).** Nothing_But_Sportz (cor-3 + cor-1, 2026-10-20): after a 43.7 s
+  outage the video's +54 s label step came in two packets, the PES-tail carry handed the first one's wall gap to the
+  second and both were kept as a real hole (54 s for 43.7 s of wall), while the audio's one step was split and 10.1 s
+  of it erased: sound 10.1 s early, steady. A split now spends its wall evidence. Fixture built from the channel's
+  capture: pre7 lip sync +7.6 s, pre8 +0…+9 ms. `PTV_NO_WEV_SPEND=1` reverts.
+- Upstream FFmpeg `adfe258a6a` merged (no conflict).
+
 ## 2.0.2-pre7 — 2.0.2-pre6 + the mosaic PLL keeps only the corrector's walk after an engagement (T-407)
 
 - **A slot keeps lip sync when its picture moves while the corrector steers (T-407).** live-transcoder and cor-3 2026-10-20,
