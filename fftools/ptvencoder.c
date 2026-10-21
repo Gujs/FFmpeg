@@ -1038,6 +1038,7 @@ int     g_hstick_filter = 1;
  * block. PTV_NO_RSCORR_CEIL=1 reverts; PTV_RSCORR_CEIL_MIN (minutes, default 15) tunes. */
 int     g_rscorr_ceil = 1;
 int64_t g_rscorr_ceil_us = 900000000;
+int     g_olr_zero = 1;      /* T-405: a LAYERA outlier flush keeps the old timeline with no offset (the previous event's stale offset was re-applied), places every stream by the trigger's bases and holds a stream's next step for the next cycle; PTV_NO_OLR_ZERO=1 reverts */
 int     g_vresize = 1;       /* T-406: a lasting source size change is scaled to the graph input in-process (no exit 4); PTV_NO_VRESIZE=1 reverts */
 int     g_bias_cap = 1;      /* T-407: the PLL's bias re-adoption is limited to the corrector's own walk; PTV_NO_BIAS_CAP=1 reverts */
 int     g_ceil_ledger = 1;   /* 2.0.2: ceiling flatness on the ledger part of R (ev − ea); PTV_NO_CEIL_LEDGER=1 reverts */
@@ -7575,6 +7576,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_GLUEVETO")) g_glueveto = 0;   /* 1.0.1-pre18 #50: gap-verdict-vs-LAYERA one-remedy invariant off */
     if (getenv("PTV_NO_HSTICK_FILTER")) g_hstick_filter = 0;   /* 1.0.1-pre18 #51a: hs-tick steps count as corrector events again */
     if (getenv("PTV_NO_RSCORR_CEIL")) g_rscorr_ceil = 0;       /* 1.0.1-pre18 #51b: no starvation-ceiling engage */
+    if (getenv("PTV_NO_OLR_ZERO")) g_olr_zero = 0;            /* T-405: the outlier flush re-applies the last offset again */
     if (getenv("PTV_NO_VRESIZE")) g_vresize = 0;              /* T-406: a lasting size change exits 4 for a re-probe again */
     if (getenv("PTV_NO_BIAS_CAP")) g_bias_cap = 0;            /* T-407: the PLL re-adopts its whole reading again */
     if (getenv("PTV_NO_CEIL_LEDGER")) g_ceil_ledger = 0;       /* 2.0.2: ceiling flatness on the whole R again */
