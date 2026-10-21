@@ -1831,6 +1831,13 @@ static void copy_emit_sil(DemuxArgs *d, PassStream *ps, int64_t ts)
  * subtitle, data/SCTE-35) straight to the muxer, rebased onto the same h0 house
  * timeline the encoded streams use so everything stays in sync. Packets that
  * precede the anchor are dropped (exactly like audio_push). */
+/* 2.1 T-409: vwait_drain() releases dense copies with pass_lock already held (its callers take it) — demux_pass_one() then
+ * must not take it again (non-recursive: the master deadlocked on the first picture). Per thread: the demux thread and
+ * the master both drain the queue. */
+static _Thread_local int t_pass_held;
+static void pass_lock_take(DemuxArgs *d) { if (!t_pass_held) pthread_mutex_lock(&d->pass_lock); }
+static void pass_lock_give(DemuxArgs *d) { if (!t_pass_held) pthread_mutex_unlock(&d->pass_lock); }
+
 static int demux_pass_one(DemuxArgs *d, AVPacket *out, int64_t vm_out_us)
 {
     int pi, i;
@@ -1883,7 +1890,7 @@ static int demux_pass_one(DemuxArgs *d, AVPacket *out, int64_t vm_out_us)
          * the same amount so pts>=dts still holds. (On-wire SCTE-35 splice timing rides
          * pts_adjustment, not container dts, so a sub-ms nudge is invisible there.) */
         if (d->pass[pi].sil)                 /* 2.0.0-pre6 D17: the master's AC-3 fill shares this state */
-            pthread_mutex_lock(&d->pass_lock);
+            pass_lock_take(d);
         if (d->pass[pi].sil && out->dts != AV_NOPTS_VALUE) {
             PassStream *ps = &d->pass[pi];
             int64_t exp = ps->real_end;              /* where this track's next frame belongs */
@@ -1903,7 +1910,7 @@ static int demux_pass_one(DemuxArgs *d, AVPacket *out, int64_t vm_out_us)
                 if (out->dts < ps->fill_end &&
                     (int64_t)ps->drop_n * ps->sil_dur < av_rescale_q(2000000, AV_TIME_BASE_Q, ps->in_tb)) {
                     ps->drop_n++;
-                    pthread_mutex_unlock(&d->pass_lock);
+                    pass_lock_give(d);
                     av_packet_free(&out);
                     return 0;
                 }
@@ -1937,7 +1944,7 @@ static int demux_pass_one(DemuxArgs *d, AVPacket *out, int64_t vm_out_us)
                 if ((gap <= -half && gap >= -av_rescale_q(1000000, AV_TIME_BASE_Q, ps->in_tb) + FFMIN(hsd, 0)) ||
                     (wire_behind > half && wire_behind <= av_rescale_q(5000000, AV_TIME_BASE_Q, ps->in_tb))) {
                     ps->ovl_n++;
-                    pthread_mutex_unlock(&d->pass_lock);
+                    pass_lock_give(d);
                     av_packet_free(&out);
                     return 0;
                 }
@@ -1968,7 +1975,7 @@ static int demux_pass_one(DemuxArgs *d, AVPacket *out, int64_t vm_out_us)
                 /* SCTE-35 is always sent (T-335: two cues released on the same frame shared its stamp) */
                 d->vm_late++;                    /* 2.0.0 T-100: stamped behind what is on the wire: its moment passed */
                 if (d->pass[pi].sil)
-                    pthread_mutex_unlock(&d->pass_lock);
+                    pass_lock_give(d);
                 av_packet_free(&out);
                 return 0;
             }
@@ -1994,7 +2001,7 @@ static int demux_pass_one(DemuxArgs *d, AVPacket *out, int64_t vm_out_us)
                 demux_send(d->mux_q[i], c, d->drop, &d->pdrop);   /* sparse subs/data/SCTE-35 bypass */
         }
         if (d->pass[pi].sil)
-            pthread_mutex_unlock(&d->pass_lock);
+            pass_lock_give(d);
         av_packet_free(&out);
         return 0;
     }
@@ -2060,6 +2067,7 @@ static int copy_shown(DemuxArgs *d, int64_t c_us, int64_t *out_us, int64_t *gap_
 static void vwait_drain(DemuxArgs *d, int force)
 {
     int pi;
+    t_pass_held = 1;                   /* every caller holds pass_lock */
     int64_t now = av_gettime_relative(), pos = atomic_load_explicit(&g_house_out_us, memory_order_relaxed);
     for (pi = 0; pi < d->n_pass; pi++) {
         PassStream *ps = &d->pass[pi];
@@ -2155,10 +2163,12 @@ static void vwait_drain(DemuxArgs *d, int force)
             ps->nvwait -= k;
         }
     }
+    t_pass_held = 0;
     if ((d->vm_late || d->vm_fb) && now - d->vm_log_wc >= 60000000) {
-        av_log(NULL, AV_LOG_WARNING, "[PTV-VMAP] sparse copies: %"PRId64" stamped where the video showed their content, "
+        av_log(NULL, AV_LOG_WARNING, "[PTV-VMAP] %s: %"PRId64" stamped where the video showed their content, "
                "%"PRId64" dropped (content never shown, or its moment had passed), %"PRId64" stamped the old way (queue "
-               "full) — PTV_NO_VMAP=1 disables\n", d->vm_ok, d->vm_late, d->vm_fb);
+               "full, or a dense copy not shown in time) — PTV_NO_VMAP=1 disables\n",
+               g_timeline ? "copies" : "sparse copies", d->vm_ok, d->vm_late, d->vm_fb);
         d->vm_ok = d->vm_late = d->vm_fb = 0;
         d->vm_log_wc = now;
     }
