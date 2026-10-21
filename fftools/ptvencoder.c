@@ -37,6 +37,8 @@
 #include "libavfilter/buffersrc.h"
 #include "libavfilter/buffersink.h"
 #include "libswresample/swresample.h"
+#include "libswscale/swscale.h"
+#include "libavutil/imgutils.h"
 
 #include "cmdutils.h"
 #include "ptvencoder.h"
@@ -45,7 +47,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.2-pre7"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.0.2-pre8"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -1036,6 +1038,9 @@ int     g_hstick_filter = 1;
  * block. PTV_NO_RSCORR_CEIL=1 reverts; PTV_RSCORR_CEIL_MIN (minutes, default 15) tunes. */
 int     g_rscorr_ceil = 1;
 int64_t g_rscorr_ceil_us = 900000000;
+int     g_wev_spend = 1;     /* T-408: see ptv_wallev_spend() in ptvencoder_demux.c; PTV_NO_WEV_SPEND=1 reverts */
+int     g_olr_zero = 1;      /* T-405: a LAYERA outlier flush keeps the old timeline with no offset (the previous event's stale offset was re-applied), places every stream by the trigger's bases and holds a stream's next step for the next cycle; PTV_NO_OLR_ZERO=1 reverts */
+int     g_vresize = 1;       /* T-406: a lasting source size change is scaled to the graph input in-process (no exit 4); PTV_NO_VRESIZE=1 reverts */
 int     g_bias_cap = 1;      /* T-407: the PLL's bias re-adoption is limited to the corrector's own walk; PTV_NO_BIAS_CAP=1 reverts */
 int     g_ceil_ledger = 1;   /* 2.0.2: ceiling flatness on the ledger part of R (ev − ea); PTV_NO_CEIL_LEDGER=1 reverts */
 /* 1.0.1-pre18 — per-stream delivery watermarks (pre17 (B) KNOWN OPEN, owner-approved; owner
@@ -3204,31 +3209,106 @@ static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
     {   /* 2.0.0 T-373: a picture in another size / format than the graph was built for is damage (a bit-flipped SPS
          * decoded one 16x640 picture in a 640x360 stream): bwdif failed on it, lavfi closed the link for good and
          * every later frame vanished — the picture froze for the rest of the run. Dropped like a lost frame (the
-         * output repeats through it). A change that lasts 2 s is the source's: exit 4 for a re-probe. */
+         * output repeats through it).
+         * T-406: a source that changes its size for real (an adaptive-bitrate origin switching renditions: glo-3
+         * Stingray 256x144 / 640x360 / 842x474 / 1280x720 / 1920x1080 every 4-18 s, each switch on a keyframe) sends
+         * the new size on every following picture; the damage was one picture. Three consecutive pictures in the same
+         * new size are the source's: from the third on they are scaled to the graph's input size here, so the graph
+         * and the encoders keep their sizes (1.2.1 passed them into the graph and ran 13 h through 11122 switches a
+         * day; 2.0.1-pre1..2.0.2-pre7 dropped them and exited 4 after 2 s, ~1,900 restarts a day per channel). The
+         * wrapper's ladder never goes above the start size, so the scale loses nothing the ladder shows. Hardware
+         * frames (or PTV_NO_VRESIZE=1): the old 2 s exit for a re-probe. */
         const AVFilterLink *in = d->fsrc->outputs[0];
         int64_t now = av_gettime_relative();
         if (frame->width != in->w || frame->height != in->h || frame->format != in->format) {
-            if (!d->vf_odd_since) {
-                d->vf_odd_since = now;
-                av_log(NULL, AV_LOG_WARNING, "[PTV-VDEC] in0 decoded a %dx%d %s picture in a %dx%d %s stream — "
-                       "damage, dropped (the output repeats through it)\n", frame->width, frame->height,
-                       av_get_pix_fmt_name(frame->format) ? av_get_pix_fmt_name(frame->format) : "?", in->w, in->h,
-                       av_get_pix_fmt_name(in->format) ? av_get_pix_fmt_name(in->format) : "?");
+            int fw = frame->width, fh = frame->height, ff = frame->format;
+            if (fw != d->vf_new_w || fh != d->vf_new_h || ff != d->vf_new_fmt) {
+                d->vf_new_w = fw; d->vf_new_h = fh; d->vf_new_fmt = ff; d->vf_new_n = 0; d->vf_adopted = 0;
             }
-            d->vf_odd_n++;
-            av_frame_unref(frame);
-            if (now - d->vf_odd_since >= 2000000) {
-                av_log(NULL, AV_LOG_ERROR, "[PTV-SRC] in0 video changed to %dx%d %s for 2 s — exiting 4 for a "
-                       "re-probe\n", frame->width, frame->height, av_get_pix_fmt_name(frame->format) ?
-                       av_get_pix_fmt_name(frame->format) : "?");
-                fflush(NULL);
-                _exit(4);
+            d->vf_new_n++;
+            if (g_vresize && !frame->hw_frames_ctx && (d->vf_adopted || d->vf_new_n >= 3)) {
+                AVFrame *sc = av_frame_alloc();
+                int k, seen = 0, ret = sc ? 0 : AVERROR(ENOMEM);
+                if (!d->vf_adopted) {
+                    d->vf_adopted = 1; d->vf_switches++;
+                    for (k = 0; k < d->vf_seen_n; k++)
+                        if (d->vf_seen[k][0] == fw && d->vf_seen[k][1] == fh) seen = 1;
+                    if (!seen) {
+                        if (d->vf_seen_n < 8) { d->vf_seen[d->vf_seen_n][0] = fw; d->vf_seen[d->vf_seen_n][1] = fh; d->vf_seen_n++; }
+                        av_log(NULL, AV_LOG_WARNING, "[PTV-VDEC] in0 the source changed to %dx%d %s (3 pictures in a row) — "
+                               "scaled to fit the graph's %dx%d in-process (switch #%d; each new size is logged once; "
+                               "PTV_NO_VRESIZE=1 reverts)\n", fw, fh, av_get_pix_fmt_name(ff) ? av_get_pix_fmt_name(ff) : "?",
+                               in->w, in->h, d->vf_switches);
+                    }
+                    d->vf_odd_since = 0; d->vf_odd_n = 0;
+                }
+                if (sc) {   /* fit and centre (spec D19: a different shape keeps its proportions, black bars) */
+                    AVRational sa = frame->sample_aspect_ratio.num > 0 ? frame->sample_aspect_ratio : (AVRational){ 1, 1 };
+                    AVRational ga = in->sample_aspect_ratio.num > 0 ? in->sample_aspect_ratio : (AVRational){ 1, 1 };
+                    double src_dar = (double)fw * sa.num / sa.den / fh, dst_dar = (double)in->w * ga.num / ga.den / in->h;
+                    int rw = in->w, rh = in->h;
+                    if (src_dar > dst_dar * 1.01)      rh = FFALIGN((int)lrint(in->h * dst_dar / src_dar), 2);
+                    else if (src_dar < dst_dar / 1.01) rw = FFALIGN((int)lrint(in->w * src_dar / dst_dar), 2);
+                    sc->width = in->w; sc->height = in->h; sc->format = in->format;
+                    if (!d->vf_sws && !(d->vf_sws = sws_alloc_context()))
+                        ret = AVERROR(ENOMEM);
+                    if (ret >= 0 && (rw != in->w || rh != in->h)) {   /* letter- / pillarbox: scale into a black frame */
+                        AVFrame *fit = av_frame_alloc();
+                        ptrdiff_t ls[4];
+                        int ox = (in->w - rw) / 2 & ~1, oy = (in->h - rh) / 2 & ~1, k2;
+                        const AVPixFmtDescriptor *pd = av_pix_fmt_desc_get(in->format);
+                        ret = fit ? av_frame_get_buffer(sc, 0) : AVERROR(ENOMEM);
+                        if (ret >= 0) {
+                            for (k2 = 0; k2 < 4; k2++) ls[k2] = sc->linesize[k2];
+                            ret = av_image_fill_black(sc->data, ls, in->format, frame->color_range, in->w, in->h);
+                        }
+                        if (ret >= 0) {
+                            fit->width = rw; fit->height = rh; fit->format = in->format;
+                            ret = sws_scale_frame(d->vf_sws, fit, frame);
+                        }
+                        if (ret >= 0 && pd) {          /* copy the fitted picture into the centre, plane by plane */
+                            for (k2 = 0; k2 < 4 && fit->data[k2]; k2++) {
+                                int sx = k2 == 1 || k2 == 2 ? pd->log2_chroma_w : 0, sy = k2 == 1 || k2 == 2 ? pd->log2_chroma_h : 0;
+                                int bpp = av_get_padded_bits_per_pixel(pd) > 0 && pd->nb_components ? (pd->comp[0].step > 0 ? pd->comp[0].step : 1) : 1;
+                                av_image_copy_plane(sc->data[k2] + (oy >> sy) * sc->linesize[k2] + (ox >> sx) * bpp, sc->linesize[k2],
+                                                    fit->data[k2], fit->linesize[k2], AV_CEIL_RSHIFT(rw, sx) * bpp,
+                                                    AV_CEIL_RSHIFT(rh, sy));
+                            }
+                        }
+                        av_frame_free(&fit);
+                    } else if (ret >= 0)
+                        ret = sws_scale_frame(d->vf_sws, sc, frame);
+                    if (ret >= 0) ret = av_frame_copy_props(sc, frame);
+                    if (ret >= 0) sc->sample_aspect_ratio = in->sample_aspect_ratio;
+                }
+                if (ret < 0) {
+                    av_log(NULL, AV_LOG_ERROR, "[PTV-VDEC] in0 scaling a %dx%d picture to %dx%d failed (%s) — dropped\n",
+                           fw, fh, in->w, in->h, av_err2str(ret));
+                    av_frame_free(&sc);
+                    av_frame_unref(frame);
+                    return;
+                }
+                av_frame_unref(frame);
+                av_frame_move_ref(frame, sc);
+                av_frame_free(&sc);
+            } else {
+                if (!d->vf_odd_since)
+                    d->vf_odd_since = now;
+                d->vf_odd_n++;
+                av_frame_unref(frame);
+                if (now - d->vf_odd_since >= 2000000) {
+                    av_log(NULL, AV_LOG_ERROR, "[PTV-SRC] in0 video changed to %dx%d %s for 2 s — exiting 4 for a "
+                           "re-probe\n", fw, fh, av_get_pix_fmt_name(ff) ? av_get_pix_fmt_name(ff) : "?");
+                    fflush(NULL);
+                    _exit(4);
+                }
+                return;
             }
-            return;
-        }
+        } else
+            d->vf_new_w = d->vf_new_h = d->vf_new_n = d->vf_adopted = 0;
         if (d->vf_odd_since) {
-            av_log(NULL, AV_LOG_WARNING, "[PTV-VDEC] in0 %d damaged picture(s) dropped over %.1f s\n",
-                   d->vf_odd_n, (now - d->vf_odd_since) / 1e6);
+            av_log(NULL, AV_LOG_WARNING, "[PTV-VDEC] in0 %d damaged picture(s) in another size dropped over %.1f s (the "
+                   "output repeated through them)\n", d->vf_odd_n, (now - d->vf_odd_since) / 1e6);
             d->vf_odd_since = 0; d->vf_odd_n = 0;
         }
         /* any other way a filter fails closes the graph silently too: frames go in, none come out. 2 s of that
@@ -3968,6 +4048,8 @@ static void *decode_thread(void *arg)
 done:
     av_frame_free(&filt);
     av_frame_free(&frame);
+    sws_freeContext(d->vf_sws);             /* T-406 */
+    d->vf_sws = NULL;
     ptv_hold_uninit(d);                     /* 2.0.0-pre9 */
     if (d->hold) {                          /* multiview: signal terminal EOF to the compositor */
         pthread_mutex_lock(&d->hold->lock);
@@ -7495,6 +7577,9 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_GLUEVETO")) g_glueveto = 0;   /* 1.0.1-pre18 #50: gap-verdict-vs-LAYERA one-remedy invariant off */
     if (getenv("PTV_NO_HSTICK_FILTER")) g_hstick_filter = 0;   /* 1.0.1-pre18 #51a: hs-tick steps count as corrector events again */
     if (getenv("PTV_NO_RSCORR_CEIL")) g_rscorr_ceil = 0;       /* 1.0.1-pre18 #51b: no starvation-ceiling engage */
+    if (getenv("PTV_NO_WEV_SPEND")) g_wev_spend = 0;          /* T-408: the PES-tail carry passes the whole gap on again */
+    if (getenv("PTV_NO_OLR_ZERO")) g_olr_zero = 0;            /* T-405: the outlier flush re-applies the last offset again */
+    if (getenv("PTV_NO_VRESIZE")) g_vresize = 0;              /* T-406: a lasting size change exits 4 for a re-probe again */
     if (getenv("PTV_NO_BIAS_CAP")) g_bias_cap = 0;            /* T-407: the PLL re-adopts its whole reading again */
     if (getenv("PTV_NO_CEIL_LEDGER")) g_ceil_ledger = 0;       /* 2.0.2: ceiling flatness on the whole R again */
     { const char *s = getenv("PTV_RSCORR_CEIL_MIN"); if (s && atoi(s) > 0) g_rscorr_ceil_us = (int64_t)atoi(s) * 60000000; }  /* #51b ceiling, minutes */

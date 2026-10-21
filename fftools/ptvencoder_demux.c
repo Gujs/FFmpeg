@@ -355,6 +355,20 @@ static int64_t ptv_wallev_w(DemuxArgs *d, int sidx, int64_t jump_us)
     return w;
 }
 
+/* 2.0.2 T-408: wall absence is evidence once. The PES-tail carry hands a gapped packet's wall gap to the next packet
+ * (the first post-gap packet is usually the pre-gap tail, no jump of its own); when that first packet already carried a
+ * jump and kept W of it as a hole, the next packet read the same gap again. Nothing_But_Sportz (cor-3 + cor-1,
+ * 2026-10-20 23:40:43, a reopen after a 43.7 s outage): video +40.3 s then +13.7 s, both kept whole against 43.7 s
+ * (54 s held for 43.7 s of wall), the audio's one +54.2 s step erased 10.1 s — sound 10.1 s early for good. A split
+ * spends its W from the carry, so the next packet inherits only what is left (3.4 s: +10.2 s flowing, the audio's
+ * erase). */
+static void ptv_wallev_spend(DemuxArgs *d, int sidx, int64_t w_us)
+{
+    if (g_wev_spend && g_pestail && d->tail_gap_us && sidx >= 0 && sidx < d->nb_streams_open &&
+        d->tail_gap_us[sidx] > 0 && w_us > 0)
+        d->tail_gap_us[sidx] = FFMAX(d->tail_gap_us[sidx] - w_us, 0);
+}
+
 /* W covers J up to the evidence floor (or J/8 for large J) = the whole step is a real gap */
 static int ptv_wallev_full(int64_t w, int64_t jump_us)
 {
@@ -440,6 +454,7 @@ static int ptv_disc_add(PtvDiscBuf *b, AVPacket *pkt, int stream_idx, int64_t ra
     dp->raw_dts    = raw_dts;
     dp->timeline   = -1;
     dp->own_cont   = own_cont;
+    dp->arrival    = b->nb_packets;
     b->packets[b->nb_packets++] = dp;
     return 0;
 }
@@ -873,7 +888,8 @@ static void ptv_disc_cancel(DemuxArgs *d, PtvDiscBuf *b)
 static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
 {
     int i, ret = 0;
-    int old_count = 0, new_count = 0, keep_timeline, outlier = 0;
+    int old_count = 0, new_count = 0, keep_timeline, outlier = 0, s3, n_def = 0;   /* T-405: n_def = packets held for the next cycle */
+    PtvDiscPacket **def = NULL;
     int cont_count = 0;          /* 1.0.1-pre7: continuing-stream packets kept at offset 0 */
     int any_started = 0;
     int64_t vid_off = 0, aud_off = 0;
@@ -1077,6 +1093,36 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
         if (outlier)
             av_log(NULL, AV_LOG_WARNING, "[PTV-LAYERA] the jump on stream %d was %d corrupt packet(s): %d of its packets "
                    "came back on the old timeline — outlier dropped, no offset\n", t, new_t, old_after);
+        /* 2.0.2 T-405: one verdict, one timeline for every stream. A sibling that crossed inside this cycle has bases
+         * of its own, and their order follows whichever side it was on first: AlrightTV's video was already on the
+         * intrusion when the cycle opened, so its "old" WAS the intrusion — keeping timeline 0 kept the intrusion for
+         * video and dropped its real packets. Under the outlier verdict every packet is placed by the trigger's bases. */
+        if (outlier && g_olr_zero && t < b->nb_streams && b->stream_state[t].has_new_base) {
+            int64_t ob = b->stream_state[t].old_timeline_base, nb = b->stream_state[t].new_timeline_base;
+            for (i = 0; i < b->nb_packets; i++) {
+                PtvDiscPacket *dp = b->packets[i];
+                if (dp && dp->stream_idx != t && (dp->timeline == 0 || dp->timeline == 1) && dp->raw_dts != AV_NOPTS_VALUE)
+                    dp->timeline = llabs(dp->raw_dts - ob) <= llabs(dp->raw_dts - nb) ? 0 : 1;
+            }
+            /* ... and a stream whose kept packets step again after the intrusion (AlrightTV: the origin restarted a
+             * second time, both streams 5 s back) did not come back where it was: that step is the NEXT event.
+             * Its packets from the step on (arrival order) are held out of this flush and open the next cycle, so
+             * every stream crosses that event together (one shared offset) instead of this one releasing a raw
+             * backward step while the sibling is glued alone. */
+            for (s3 = 0; s3 < b->nb_streams; s3++) {
+                int64_t prev = b->stream_state[s3].last_sent_dts;   /* where the stream was before this cycle */
+                int later = 0;
+                for (i = 0; i < b->nb_packets; i++) {
+                    PtvDiscPacket *dp = b->packets[i];
+                    if (!dp || dp->stream_idx != s3 || dp->timeline != 0 || dp->raw_dts == AV_NOPTS_VALUE)
+                        continue;
+                    if (!later && prev != AV_NOPTS_VALUE && llabs(dp->raw_dts - prev) > PTV_DISC_THRESHOLD_US)
+                        later = 1;
+                    if (later) { dp->timeline = 3; n_def++; }
+                    else prev = dp->raw_dts;
+                }
+            }
+        }
     }
 
     qsort(b->packets, b->nb_packets, sizeof(PtvDiscPacket *), ptv_disc_compare);
@@ -1128,6 +1174,18 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
                 ptv_wallev_post_unev(d, i, ss->jump_wallev_us);
         }
     }
+
+    /* 2.0.2 T-405: an outlier flush keeps the old timeline and moves no labels ("no offset"). The per-stream offsets
+     * above are only recomputed when NEW is kept, so a crossing stream still carried the PREVIOUS event's offset into
+     * this flush and the persist below applied it a second time. glo-2 AlrightTV (2026-10-21 06:14, twice a day): the
+     * origin restarted both streams 120 s back (glued +120 s), then ~0.3 s of the old timeline intruded on both; the
+     * audio intrusion was judged an outlier, the flush re-applied +120 s to both streams' labels and moved the video's
+     * continuity 120 s past its real labels, the next video packet opened a video-only -120 s cycle (+120.04 s) and the
+     * sound ran 120 s early until sync_check restarted the channel. PTV_NO_OLR_ZERO=1 reverts. */
+    if (outlier && g_olr_zero)
+        for (i = 0; i < b->nb_streams; i++)
+            if (b->stream_state[i].has_new_base)
+                b->stream_state[i].cumulative_ts_offset = 0;
 
     /* Gather each media type's own offset. ONE of them is applied to ALL streams (one offset
      * preserves relative A/V alignment): under the 1.0.1-pre4 shared flush VIDEO's offset
@@ -1466,11 +1524,20 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
         av_free(ts);
     }
 
+    if (n_def)
+        def = av_calloc(n_def, sizeof(*def));
+    n_def = 0;
     for (i = 0; i < b->nb_packets; i++) {
         PtvDiscPacket *dp = b->packets[i];
         AVStream *st;
         int64_t pkt_off, eff_off;
 
+        if (dp->timeline == 3) {                     /* T-405: held for the next cycle (or dropped if no memory) */
+            if (def) def[n_def++] = dp;
+            else { av_packet_free(&dp->pkt); av_free(dp); }
+            b->packets[i] = NULL;
+            continue;
+        }
         if (dp->timeline != keep_timeline && (dp->timeline == 0 || dp->timeline == 1)) {
             av_packet_free(&dp->pkt);
             av_freep(&b->packets[i]);
@@ -1689,6 +1756,55 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
 
     b->flushing = 0;
     ptv_disc_reset(b);
+    if (n_def) {   /* T-405: the held packets open the next cycle, in arrival order (the sort above was by dts) */
+        int k, first = -1;
+        uint8_t held_seen[64] = { 0 };   /* per stream: its first held packet was measured against last_sent_dts */
+        for (k = 1; k < n_def; k++) {               /* restore arrival order: the buffer order is the classifier's */
+            int m;
+            for (m = k; m > 0 && def[m - 1]->arrival > def[m]->arrival; m--)
+                FFSWAP(PtvDiscPacket *, def[m - 1], def[m]);
+        }
+        for (k = 0; k < n_def; k++) {
+            PtvDiscPacket *dp = def[k];
+            int s = dp->stream_idx;
+            if (ret >= 0 && s >= 0 && s < b->nb_streams) {
+                /* measured from where the stream was before the outlier cycle: its continuity already moved onto
+                 * these packets as they arrived */
+                int seen = s < 64 ? held_seen[s] : 1;
+                int64_t last = b->stream_state[s].last_sent_dts != AV_NOPTS_VALUE && !seen ?
+                               b->stream_state[s].last_sent_dts : b->stream_state[s].last_dts_us;
+                if (s < 64) held_seen[s] = 1;
+                if (first < 0) {
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-LAYERA] stream %d came back %+.3fs off its timeline after the "
+                           "outlier — %d held packet(s) open the next cycle, for every stream to cross together "
+                           "(PTV_NO_OLR_ZERO=1 reverts)\n", s, (double)(dp->raw_dts - last) / AV_TIME_BASE, n_def);
+                    first = s;
+                }
+                /* the same detection the demux loop runs on an arriving packet */
+                if (!b->active && ptv_disc_detect_jump(d, b, s, dp->raw_dts, last)) {
+                    b->active            = 1;
+                    b->cycle_trigger     = s;
+                    b->buffer_start_time = av_gettime_relative();
+                    b->cycle_open_us     = b->buffer_start_time;
+                    if (d->disturb_epoch)
+                        atomic_fetch_add_explicit(d->disturb_epoch, 1, memory_order_relaxed);
+                } else if (b->active && !b->stream_state[s].has_new_base)
+                    /* a sibling held across the same step records bases of its own, never the opener's borrowed
+                     * ones: classified NEW by them it stayed untransitioned and the cycle flushed one stream alone */
+                    ptv_disc_detect_jump(d, b, s, dp->raw_dts, last);
+                if (b->active) {
+                    ret = ptv_disc_add(b, dp->pkt, s, dp->raw_dts, 0);
+                    if (b->stream_state[s].has_new_base && ptv_disc_classify(b, s, dp->raw_dts) == 1)
+                        b->stream_transitioned[s] = 1;
+                } else
+                    ret = demux_dispatch(d, av_packet_clone(dp->pkt));
+                b->stream_state[s].last_dts_us = dp->raw_dts;
+            }
+            av_packet_free(&dp->pkt);
+            av_free(dp);
+        }
+        av_free(def);
+    }
     return ret;
 }
 
@@ -2623,6 +2739,7 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                                                               wev_full ? 0 : jump_us - wev_w, wall_now);
                             wev_full = wev_flow == 0;
                             wev_comp = wev_flow > 0;
+                            ptv_wallev_spend(d, pkt->stream_index, wev_w);   /* T-408 */
                         }
                         if (wev_full ||
                             ((!g_wallev || wev_w == 0) &&
@@ -2841,6 +2958,7 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                                                                       vfull ? 0 : vjump_us - vw, wall_now);
                             int64_t dukf_thresh = av_rescale(g_dukf_min_ms, st->time_base.den,
                                                              (int64_t)st->time_base.num * 1000);
+                            ptv_wallev_spend(d, pkt->stream_index, vw);   /* T-408 */
                             if (vflow_us > 0) {
                                 int64_t vflow_tb = av_rescale_q(vflow_us, AV_TIME_BASE_Q, st->time_base);
                                 d->wrap_off[pkt->stream_index] -= vflow_tb;
