@@ -2885,6 +2885,17 @@ static void ptv_rebuild_reanchor(AudioState *a, const AVFrame *frame)
 
 /* Feed one h0-anchored decoded audio frame into the -af graph (or swr fallback). */
 /* 2.0.0-pre8.1: may the real frames buffered after a filled hold go to the door now? */
+/* 2.1 T-409: the label glue (AGLUE) stays on under the timeline until the exact audio door replaces it (P2): its
+ * hold-fill rules realign the returning labels with the fill (sync_storm 430 s without them: +24 s input step after a
+ * 47.7 s fill, the sound 24 s late). PTV_TL_NO_AGLUE=1 = the bypass (development). */
+static int tl_no_aglue(void)
+{
+    static int v = -1;
+    if (v < 0)
+        v = g_timeline && getenv("PTV_TL_NO_AGLUE");
+    return v;
+}
+
 static int rj_release_ok(AudioState *a)
 {
     int64_t now = av_gettime_relative();
@@ -3595,10 +3606,10 @@ graph_in:
                     }
                 }
             }
-            /* 2.1 T-409 (PTV_TIMELINE): the labels arriving here were decided once by the demux's timeline —
-             * continuous but for kept holes and an erase's sub-frame rest. No second classification: the door realizes
-             * them as they are (aresample pads forward, ATRIM trims backward, both by the labels). */
-            if (!g_timeline && a->glue_raw_last_us != AV_NOPTS_VALUE) {
+            /* 2.1 T-409: under the timeline the labels arrive decided (holes kept / erased, relabels repaired), so these
+             * verdicts see continuous labels except kept holes; the hold-fill rules here stay until the exact audio door
+             * (P2) takes over. PTV_TL_NO_AGLUE=1 bypasses them (see tl_no_aglue). */
+            if (!tl_no_aglue() && a->glue_raw_last_us != AV_NOPTS_VALUE) {
                 int64_t step = raw_us - (a->glue_raw_last_us + a->glue_raw_dur_us);
                 /* 2.0.0 T-093 part 2: a multiview slot's silence fill (the compositor drives it while the slot's source is
                  * gone) advances the labels with wall time. A source that comes back where it stopped (a restart the
@@ -4089,7 +4100,7 @@ graph_in:
             /* 2.1 T-409: without the step verdicts, still track the arrival cadence (rr15 R2 above) — the silence fill's
              * patience. At 0 every PES-burst pause after a return (150-300 ms) started a fill and the rejoin buffer
              * held the real frames ~1 s for a fresh picture (sync_flapping: 3-5 flashes without their beep). */
-            if (g_timeline && g_glueclass && a->glue_raw_last_us != AV_NOPTS_VALUE &&
+            if (tl_no_aglue() && g_glueclass && a->glue_raw_last_us != AV_NOPTS_VALUE &&
                 llabs(raw_us - (a->glue_raw_last_us + a->glue_raw_dur_us)) <= (int64_t)g_aglue_ms * 1000) {
                 int64_t wg = now_wc - a->glue_wall_last_us;
                 if (wg > 5000 && wg < 2000000)

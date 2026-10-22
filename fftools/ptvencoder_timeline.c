@@ -62,6 +62,8 @@ struct PtvTimeline {
     int64_t   last_any_wc, gap_us, gap_end_wc;   /* the input's last silence >= g_gap_min_us */
     int64_t   dmg_seen_wc, dmg_start_wc;         /* the input's damage phase: corrupt packets <= 3 s apart */
     int64_t   er_lo, er_hi;                      /* source time the last program event erased (audio arriving late) */
+    int64_t   ev_va, ev_dk, ev_wc;               /* the last program event: old content ends at ev_va; its offset move */
+    _Atomic int64_t prog_wc;                     /* wall time of the last program event (read by the copy path) */
     TlStream *st;
     TlPkt     held[TL_HELD_MAX];
     int       nheld;
@@ -126,6 +128,14 @@ static int64_t tol_us(const TlStream *s)
 {
     /* two of the stream's own steps: a backward step of 3 pictures (gate sync_bstep -120 ms at 25p) leaves the path */
     return av_clip64(2 * s->step_us, 40000, g_tl_open_us / 2);
+}
+
+/* a window's 1 s runs on live input: an input silence inside it restarts it, so every stream can still cross after the
+ * input returns. Decided while the input was silent, an audio-first crossing went out as a single-stream step with the old
+ * offset and the video's erase a moment later left it 16.8 s off its pictures (sync_storm 430 s) */
+static int64_t win_from(const PtvTimeline *t)
+{
+    return FFMAX(t->open_wc, t->gap_end_wc);
 }
 
 /* a packet off its stream's path by this opens a window: forward the open threshold (smaller forward steps are the
@@ -226,6 +236,18 @@ static int classify_stream(PtvTimeline *t, int si, int final, int64_t cross_s_us
         run_base  = old_last;
         run_n     = 1;
         back_n    = 0;
+    }
+    /* a lone packet after an input silence whose jump the silence explains (J ~ W: live content resuming between two
+     * outages of a storm) is no corrupt outlier — the wall clock corroborates it (sync_storm 430 s: such scraps dropped,
+     * and the next event merged two holes into one J against one W) */
+    if (final && run_n == 1 && !ended_old && t->gap_us >= g_gap_min_us &&
+        llabs((run_first - (run_base + step)) - t->gap_us) <= FFMAX(1000000, t->gap_us / 10)) {
+        s->res          = 1;
+        s->old_end_us   = run_base;
+        s->new_first_us = run_first;
+        s->new_last_us  = run_last;
+        s->new_n        = 1;
+        return 1;
     }
     if (run_n && (ended_old || (final && run_n < 2))) {
         /* came back to the old path (or a lone packet at the end): the run was corrupt */
@@ -483,8 +505,16 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
     av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO, " window %.2f s, %d held (PTV_TIMELINE)\n",
            (av_gettime_relative() - t->open_wc) / 1e6, t->nheld);
 
-    if (prog_event)
+    if (prog_event) {
+        atomic_store_explicit(&t->prog_wc, nw, memory_order_relaxed);
         k_move(d, t, k_new - k_old);
+        if (k_new != k_old) {
+            ptv_vwait_rebase(d, vb, av_rescale_q(k_new - k_old, AV_TIME_BASE_Q, (AVRational){ 1, 90000 }));
+            t->ev_va = va;
+            t->ev_dk = k_new - k_old;
+            t->ev_wc = nw;
+        }
+    }
     ret = release(d, t, k_old, k_new, prog_event, va, vb);
     /* the paths go on where each stream ended */
     for (si = 0; si < t->nst; si++) {
@@ -527,6 +557,18 @@ int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
     TlStream *s;
 
     if (t->last_any_wc && nw - t->last_any_wc >= g_gap_min_us) {
+        /* the input went silent inside a window the video opened: decide it on the evidence before this silence (a lone
+         * picture = an outlier, dropped), then this packet starts afresh with J and W from the same old-path picture.
+         * Waiting through the silence gave each storm event the silence AFTER its jump as W and merged a content scrap
+         * with the next outage — 14 s of real loss erased (sync_storm 430 s). An audio-first crossing (the video not yet
+         * crossed) keeps waiting (win_from) */
+        if (t->active && t->trig == d->vstream) {
+            int r = close_window(d, t);
+            if (r < 0) {
+                av_packet_free(&pkt);
+                return r;
+            }
+        }
         t->gap_us     = nw - t->last_any_wc;
         t->gap_end_wc = nw;
     }
@@ -553,7 +595,7 @@ int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
             llabs(s_us - (s->last_us + s->step_us)) <= tol_us(s)) {
             path_take(s, s_us, nw);
             s->win_passed = 1;
-            if (nw - t->open_wc >= TL_WIN_US || window_resolved(d, t, 0)) {
+            if (nw - win_from(t) >= TL_WIN_US || window_resolved(d, t, 0)) {
                 ret = ptv_demux_dispatch(d, pkt);
                 return ret < 0 ? ret : close_window(d, t);
             }
@@ -566,10 +608,14 @@ int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
             av_packet_free(&pkt);              /* cannot happen in a 1 s window; never block the demux */
             t->drop_n++;
         }
-        if (nw - t->open_wc >= TL_WIN_US || t->nheld >= TL_HELD_MAX || window_resolved(d, t, 0))
+        if (nw - win_from(t) >= TL_WIN_US || t->nheld >= TL_HELD_MAX || window_resolved(d, t, 0))
             return close_window(d, t);
         return 0;
     }
+    /* a sparse copy of the OLD content arriving after a program event (source time before its last old picture) takes the
+     * old offset back: it was unwrapped with the new one */
+    if (!s->dense && s_us != AV_NOPTS_VALUE && t->ev_dk && nw - t->ev_wc < 10000000 && s_us < t->ev_va)
+        relabel(d, pkt, 0, -t->ev_dk);
     if (!s->dense || s_us == AV_NOPTS_VALUE)
         return ptv_demux_dispatch(d, pkt);
     /* sound of a span the last program event erased, arriving after it (the audio was not flowing at the event: a storm,
@@ -647,4 +693,16 @@ void ptv_tl_cut(DemuxArgs *d, int64_t cut_us)
     k_move(d, t, -cut_us);
     for (si = 0; si < t->nst; si++)
         t->st[si].ok = 0;
+}
+
+/* the copy path: dense copies take the video's placement while the map settles — within 30 s of a program event, or
+ * while the source holds — and the old stamping otherwise (house_skew is where the video puts them in steady flow; their
+ * wait for the shown picture read as a gap to the copy watch: AC-3 dark 1.8 s under heavy loss, gate vt-cin loss_100) */
+int ptv_tl_settling(DemuxArgs *d)
+{
+    int64_t pw;
+    if (!d->tl)
+        return 0;
+    pw = atomic_load_explicit(&d->tl->prog_wc, memory_order_relaxed);
+    return ptv_src_holding() || (pw && av_gettime_relative() - pw < 30000000);
 }

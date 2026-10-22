@@ -2195,7 +2195,7 @@ static int demux_pass(DemuxArgs *d, AVPacket *out)
              * and erase, so house_skew at READ time is no longer the offset the video will show them with (a source
              * restart: +14 s while holding, -1.6 s after the rejoin map — the AC-3 landed behind its own hold fill and
              * was dropped for 15 s, gate sync_ac3_kill_return_20). See vwait_drain for their release rules */
-            if ((ps->gated && !g_timeline) || out->stream_index != ps->in_index)
+            if ((ps->gated && !(g_timeline && (ps->nvwait || ptv_tl_settling(d)))) || out->stream_index != ps->in_index)
                 continue;
             /* 2.0.0 T-316: queued from before the anchor too. A bursty source delivers its first 6-10 s at once,
              * before the first frame is decoded (h0): every subtitle / cue of that burst was dropped here while its
@@ -2406,6 +2406,35 @@ static void copy_gap_watch(DemuxArgs *d, int64_t now)
  * instead of 21600: both −120 ms on the output. The copies still waiting for their picture that were read since the
  * video packet before the previous one and lie after this PES in the mux take the step too (a section has no pos:
  * it is read at its own packet, inside that window). */
+/* 2.1 T-409: the timeline moved the program offset by dpo (90 kHz) at a picture boundary of source time from_us. Copies
+ * queued for the video whose SOURCE time (label minus the prog_off they were unwrapped with) lies at or after it belong
+ * to the new content — subtitles and cues are muxed ahead of their pictures, so they were read with the old offset
+ * (gate sync_bstep: SCTE-35 / DVB subs 120 ms early after a -120 ms step erase). */
+void ptv_vwait_rebase(DemuxArgs *d, int64_t from_us, int64_t dpo)
+{
+    int pi, k;
+    if (!dpo)
+        return;
+    pthread_mutex_lock(&d->pass_lock);
+    for (pi = 0; pi < d->n_pass; pi++) {
+        PassStream *ps = &d->pass[pi];
+        for (k = 0; k < ps->nvwait; k++) {
+            AVPacket *p = ps->vwait[k];
+            int64_t ts = p->dts != AV_NOPTS_VALUE ? p->dts : p->pts, src;
+            if (ts == AV_NOPTS_VALUE)
+                continue;
+            src = av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q) -
+                  av_rescale_q(ps->vwait_po[k], (AVRational){ 1, 90000 }, AV_TIME_BASE_Q);
+            if (src < from_us)
+                continue;
+            if (p->pts != AV_NOPTS_VALUE) p->pts += av_rescale_q(dpo, (AVRational){ 1, 90000 }, ps->in_tb);
+            if (p->dts != AV_NOPTS_VALUE) p->dts += av_rescale_q(dpo, (AVRational){ 1, 90000 }, ps->in_tb);
+            ps->vwait_po[k] += dpo;
+        }
+    }
+    pthread_mutex_unlock(&d->pass_lock);
+}
+
 static void vwait_follow_video(DemuxArgs *d, int64_t vpos, int64_t dpo)
 {
     int pi, k;
