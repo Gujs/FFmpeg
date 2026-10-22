@@ -39,6 +39,9 @@ the v2 `0001` patch (additive, travels with the source to the build box).
   content time (the film-cadence path, its residence cap set by the cadence): measured 2-2-2 ticks for 29.97 in 59.94 and
   the exact 2/3 mix for 25 in 59.94. Residence does not move lip sync (house_skew excludes it). A rate change held 30 s is
   logged: `[PTV-SRC] in0 source frame rate changed 59.94 → 29.97 fps (house 59.94 fps: …)`.
+  The source period is the shortest picture step of the last 2–4 s (lost pictures lengthen the average: 50 % loss on a
+  25p source read 1.5 ticks, armed the path and left holes in the output timeline), and the path stands down while the
+  input is damaged (corrupt data within 5 s), where the gap fill keeps the output linear.
 - **A caption source that is not extracted says so (T-400).** Whether a channel makes teletext from CEA-608 is decided by
   the wrapper's start-up probe (`SV_CC_EXTRACT=auto`), which can miss captions under load (cor-3 RAV / RAV_Espanol at a
   mass restart ran without teletext). As in a professional encoder the caption output is per-channel configuration; the
