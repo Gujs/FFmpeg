@@ -77,25 +77,25 @@ static int64_t mv_tick_us(CompositorCtx *c, int64_t t);
  * the slot's sound, placed at its source time + L, needs no step for either (the count-paced residence let losses pull
  * the picture forward and re-primes push it back, and the PLL chased both ~3.6 s later: cor-3 Curiosity 2026-10-22).
  * L moves only by
- *  - a re-lock: the first picture after the input ran dry (0.5 s), or one more than 0.5 s late, re-locks behind it with
- *    the primed jitter-buffer depth as margin (the picture holds that long, as the re-prime did); a picture more than
- *    1 s early with nothing shown for 1 s (content ahead of the labels' time) re-locks onto it. The sound steps exactly;
- *  - a depth re-lock: the buffer's averaged depth (pictures x cadence) off the primed depth by more than 4 ticks (or a
- *    quarter of it) for 5 s — 1 s in the slot's first 20 s: a start-up backlog (mv04: slots 1-3 born ~1 s deep, which the birth
- *    trim threw away picture by picture) — re-locks by the excess at once;
- *  - the drift servo: below that, the averaged depth held within 2 pictures of the primed depth, built up at most 1 ms/s
- *    and taken a whole tick at a time — a source clock off the house clock. The sound follows the realized lag to the
- *    whole audio frame. */
+ *  - a re-lock: pictures more than 0.5 s late for 1 s without catching up (a delayed source, not a backlog) re-lock
+ *    behind them with the primed jitter-buffer depth as margin (grows only); content more than 10 s past the margin
+ *    ahead with nothing shown for 3 s re-locks onto it;
+ *  - the buffer's minimum depth: a start-up backlog it never drains below is shed in one step; after the slot's first
+ *    20 s (60 s of evidence after any step): what the last 60 s never went below, past the primed depth + 2 ticks, is
+ *    shed in one step; below a quarter of it in every 10 s = a source clock slower than the house, one tick more.
+ *    Bursty or jittery arrival and a lone source hole move nothing; a backlog catching up is skipped, not kept.
+ * Every step takes effect at a content boundary for the picture and the sound (mv_tl_step). */
 typedef struct MvTlSlot {
-    int64_t lag, cad, last_src, shown_wc, pop_wc, relock_wc, exc_wc;
+    int64_t lag, cad, last_src, shown_wc, pop_wc, relock_wc;
     int64_t real;                                   /* the realized lag: the shown pictures' output - source, averaged */
     int64_t shown_src;                              /* source time of the last picture shown */
     int64_t first_wc;                               /* the slot's first picture (wall) */
-    double  acc;                                    /* the drift servo's correction not yet taken (us) */
     int     reseed;                                 /* the lag moved: re-seed the sensor's video side at the next
                                                      * picture shown (the move shows from then on) */
     int     tails;                                  /* stale pictures dropped since the input ran dry */
-    double  occ_f;
+    int64_t late_wc, late_ref;                      /* pictures more than 0.5 s late: since when, how late then */
+    int64_t wmin, win_wc, mins[6];                  /* the buffer's minimum depth: this window, its start, the last 6 */
+    int     nmin;
     int     stepping;                               /* a lag step is scheduled: ... */
     int64_t nlag, nat;                              /* ... the lag from content nat (h0 axis) on */
 } MvTlSlot;
@@ -117,8 +117,9 @@ static void mv_tl_step(CompositorCtx *c, int k, MvTlSlot *s, int64_t lag, int64_
     }
     s->nlag      = lag;
     s->relock_wc = now_us;
-    s->exc_wc    = 0;
-    s->occ_f     = -1;
+    s->nmin      = 0;                               /* the depth history read the old lag: 60 s of fresh evidence
+                                                     * before the next drift step (one 0.7 s source hole stepped
+                                                     * +40 ms every 10 s to +240 ms: Curiosity replay) */
     atomic_store_explicit(&c->inputs[k].tl_nlag_us, s->real + (lag - s->lag), memory_order_relaxed);
     atomic_store_explicit(&c->inputs[k].tl_at_us, h0 != AV_NOPTS_VALUE ? s->nat + h0 : INT64_MIN, memory_order_release);
 }
@@ -175,12 +176,11 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
             s->cad += (fs - s->last_src - s->cad) / 8;
         s->last_src = fs;
         if (fs > out - mv_tl_lag(s, fs) + half) {
-            /* content ahead of its time with nothing shown for 1 s (a return the labels put early): re-lock behind it
-             * with the primed margin — the picture keeps holding until the buffer is that deep (re-locked onto it
-             * directly, the buffer was empty and the depth re-lock moved the picture back 5 s later: mv02 -1061 then
-             * +1117 ms) */
-            if (!cand && fs - (out - mv_tl_lag(s, fs)) > margin + 1000000 && now_us - s->shown_wc > 1000000 &&
-                now_us - s->relock_wc > 1000000) {
+            /* content far ahead of its time (10 s past the margin) with nothing shown for 3 s — labels the timeline
+             * left ahead: re-lock behind it with the primed margin. Content a burst brings ahead of its time is
+             * normal for a bursty source and waits (re-locking on 1 s churned an HLS-burst slot every few seconds) */
+            if (!cand && fs - (out - mv_tl_lag(s, fs)) > margin + 10000000 && now_us - s->shown_wc > 3000000 &&
+                now_us - s->relock_wc > 3000000) {
                 av_log(NULL, AV_LOG_INFO, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (content ahead)\n",
                        k, (out - fs + margin - s->lag) / 1000);
                 mv_tl_step(c, k, s, out - fs + margin, h0, now_us);
@@ -209,12 +209,25 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
     if (cand) {
         if (s->stepping && src != AV_NOPTS_VALUE && src >= s->nat)
             mv_tl_commit(c, k, s);
-        if (src != AV_NOPTS_VALUE && !s->stepping &&
-            (dry || (out - s->lag - src > 500000 && !occ)))
-            relock = out - src + margin;            /* back from a dry spell / delayed: hold for the primed margin */
-        if (relock != AV_NOPTS_VALUE && FFABS(relock - s->lag) >= c->tick_dur_us) {
-            av_log(NULL, AV_LOG_INFO, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (%s)\n", k,
-                   (relock - s->lag) / 1000, dry ? "back from a dry spell" : "delayed");
+        /* late = skip while the slot catches up; re-lock only behind pictures that STAY late. A backlog (this
+         * process or its decode stalled) arrives faster than real time and each picture is less late than the one
+         * before — re-locking on its first picture kept it as latency (+1..2.5 s per slot after a 6 s stall) and as
+         * memory; a delayed source stays late at real-time pace. The buffer refills by itself after an outage when
+         * the source comes back on time: no re-prime (it added the margin to the lag at every outage) */
+        if (src != AV_NOPTS_VALUE && !s->stepping) {
+            int64_t late = out - s->lag - src;
+            if (late <= 500000)
+                s->late_wc = 0;
+            else if (!s->late_wc || late < s->late_ref - 2 * c->tick_dur_us) {
+                s->late_wc  = now_us;               /* late, or catching up: (re)start the second */
+                s->late_ref = late;
+            } else if (now_us - s->late_wc >= 1000000)
+                relock = out - src + margin;        /* late for 1 s at real-time pace: hold for the primed margin */
+        }
+        if (relock != AV_NOPTS_VALUE && relock - s->lag >= c->tick_dur_us) {   /* grows only */
+            av_log(NULL, AV_LOG_INFO, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (late for 1 s)\n", k,
+                   (relock - s->lag) / 1000);
+            s->late_wc = 0;
             mv_tl_step(c, k, s, relock, h0, now_us);
         } else
             relock = AV_NOPTS_VALUE;
@@ -242,35 +255,50 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
         s->tails    = 0;
     } else if (occ)
         s->pop_wc = now_us;                         /* pictures waiting: not dry */
-    if (cand && h0 != AV_NOPTS_VALUE && !s->stepping) {
-        double err;
-        /* in the slot's first 20 s its depth settles in one re-lock from 2 pictures off (a slot joining late with a
-         * shallow buffer was otherwise built up by the servo a tick at a time: 2 pairs at -40 ms around its steps) */
-        int64_t band = now_us - s->first_wc < 20000000 ? 2 * s->cad : FFMAX(4 * c->tick_dur_us, margin / 4);
-        if (s->occ_f < 0)
-            s->occ_f = occ;
-        s->occ_f += (occ - s->occ_f) / 64;
-        err = s->occ_f * s->cad - margin;           /* + = more buffered than primed: the source runs fast */
-        if (fabs(err) <= band)
-            s->exc_wc = 0;
-        else if (!s->exc_wc)
-            s->exc_wc = now_us;
-        else if (now_us - s->exc_wc >= (now_us - s->first_wc < 20000000 ? 1000000 : 5000000)) {
-            av_log(NULL, AV_LOG_INFO, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (buffer %.0f ms deep, primed %"PRId64
-                   " ms)\n", k, (int64_t)-err / 1000, s->occ_f * s->cad / 1000, margin / 1000);
-            mv_tl_step(c, k, s, s->lag - (int64_t)err, h0, now_us);
+    /* the buffer's MINIMUM depth over a window says what the lag must do; its average does not — bursty or jittery
+     * arrival swings the depth by design (cor-3 Curiosity slot 1: 0.7..1.3 s every minute, re-locked +-300 ms each time;
+     * an HLS-burst slot re-locked every few seconds). In the slot's first 20 s (5 s windows) a start-up backlog the
+     * buffer never drains below is shed in one step; after that (10 s windows, the last 60 s): never below the primed
+     * depth + 2 ticks = latency nobody uses, shed in one step; below a quarter of it in EVERY window = a source clock
+     * slower than the house, one tick more (one hole drains the buffer once: content lost, not drift); after any step
+     * 60 s of fresh windows. Pictures that stay late re-lock above. */
+    if (h0 != AV_NOPTS_VALUE && s->first_wc) {
+        int64_t depth = (int64_t)occ * s->cad, wl = now_us - s->first_wc < 20000000 ? 5000000 : 10000000;
+        if (!s->win_wc) {
+            s->win_wc = now_us;
+            s->wmin   = depth;
         }
-        /* drift, a frame sync's way: the correction builds up and L moves by a whole tick at once (one picture repeated /
-         * skipped), its sound stepped with it at the same instant — moved continuously, every tick L crossed moved the
-         * picture at once and the sound ~1 s later with the averaged lag (late-joining slot: 5 pairs at -40 ms). A dead
-         * band of 2 pictures: a clean slot does not hunt */
-        if (now_us - s->relock_wc > 5000000 && fabs(err) > 2 * s->cad)
-            s->acc -= av_clipd((err > 0 ? err - 2 * s->cad : err + 2 * s->cad) / 1000,
-                               -c->tick_dur_us / 1000.0, c->tick_dur_us / 1000.0);
-        if (!s->stepping && fabs(s->acc) >= c->tick_dur_us) {
-            int64_t st = s->acc > 0 ? c->tick_dur_us : -c->tick_dur_us;
-            s->acc -= st;
-            mv_tl_step(c, k, s, s->lag + st, h0, now_us);
+        s->wmin = FFMIN(s->wmin, depth);
+        if (now_us - s->win_wc >= wl) {
+            int64_t wm = s->wmin;
+            s->mins[s->nmin++ % 6] = wm;
+            s->win_wc = now_us;
+            s->wmin   = depth;
+            if (!s->stepping && now_us - s->relock_wc >= 10000000) {
+                if (wl == 5000000) {
+                    if (wm > margin + 2 * s->cad) {
+                        av_log(NULL, AV_LOG_INFO, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (start-up backlog: "
+                               "the buffer never below %"PRId64" ms, primed %"PRId64" ms)\n", k, -(wm - margin) / 1000,
+                               wm / 1000, margin / 1000);
+                        mv_tl_step(c, k, s, s->lag - (wm - margin), h0, now_us);
+                    }
+                } else if (s->nmin >= 6) {
+                    int64_t lo = s->mins[0], hi = s->mins[0];
+                    int x;
+                    for (x = 1; x < 6; x++) {
+                        lo = FFMIN(lo, s->mins[x]);
+                        hi = FFMAX(hi, s->mins[x]);
+                    }
+                    if (lo > margin + 2 * c->tick_dur_us) {   /* unused latency: never needed in 60 s */
+                        av_log(NULL, AV_LOG_INFO, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (the buffer never "
+                               "below %"PRId64" ms in 60 s, primed %"PRId64" ms)\n", k, -(lo - margin) / 1000,
+                               lo / 1000, margin / 1000);
+                        mv_tl_step(c, k, s, s->lag - (lo - margin), h0, now_us);
+                    }
+                    else if (hi < margin / 4)
+                        mv_tl_step(c, k, s, s->lag + c->tick_dur_us, h0, now_us);   /* about to starve */
+                }
+            }
         }
     }
     atomic_store_explicit(&c->inputs[k].tl_lag_us, s->real, memory_order_relaxed);
@@ -409,7 +437,6 @@ void *compositor_thread(void *arg)
         memset(&tl_slot[k], 0, sizeof(tl_slot[k]));
         tl_slot[k].cad      = mv_tick_us(c, 1);
         tl_slot[k].last_src = AV_NOPTS_VALUE;
-        tl_slot[k].occ_f    = -1;
     }
 
     /* preroll: prime every input's jitter buffer to ~PTV_PREROLL_MS so bursty

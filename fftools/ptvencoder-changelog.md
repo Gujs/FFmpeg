@@ -5,6 +5,25 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.1.0-pre2 — 2.1.0-pre1 + mosaic slots keep their lag through jitter, holes and backlogs (T-410), no start-up / stall memory peak (T-412)
+
+- **A mosaic slot's lag no longer follows arrival jitter (T-410).** 2.1.0-pre1 re-locked on the buffer's AVERAGE depth: a
+  jittery source (cor-3 Curiosity slot 1: depth 0.7–1.3 s every minute) re-locked ±100–300 ms every few minutes, each a
+  visible step and a −16 ms lip-sync step. The lag now moves only on evidence that lasts: pictures late for 1 s at
+  real-time pace (a delayed source) re-lock behind them; a start-up backlog the buffer never drains below is shed in one
+  step; after the first 20 s, depth the buffer never used in 60 s is shed in one step, and a buffer that runs low in every
+  10 s of a minute (a slower source clock) gets one tick more; after any step, 60 s of fresh evidence. Arrival jitter, a
+  lone source hole and bursts move nothing. Replay of the real Curiosity slots with their arrival timing: slot 1 content
+  A/V 0.0…+0.7 ms, 0 re-locks (2.1.0-pre1: −8…+8 ms, 6 re-locks; 2.0.2-pre8 0.0…+0.2 ms).
+- **A backlog is skipped, not kept (T-412).** After this process or its decoding stalled (a mass restart: cor-3 RAV
+  2425 MB on pre1 vs 1620 MB on 2.0.2-pre7, flat after the first 30 min), pre1 re-locked behind the first late picture
+  and kept the backlog as latency (+1…2.5 s per slot) and as memory (every slot's queue full: 160 pictures). A backlog
+  catches up faster than real time — each picture less late than the one before — and is now skipped, the lag unchanged
+  (late = skip). There is no re-prime after an outage any more: the buffer refills by itself when the source comes back on
+  time (it added the margin to the lag at every outage). 6 s stall test: peak 661 MB, lags back to 0 (pre1 1063 MB,
+  2.0.2-pre8 665 MB).
+- Known open: a bursty (HLS-burst) mosaic slot's content-ahead re-lock never commits (T-411; no production mosaic has one).
+
 ## 2.1.0-pre1 — one decision per source event (T-409): the program timeline, the record door, mosaic frame synchronizers; RESYNC and RECANCHOR deleted
 
 - **One classifier per input decides every timing event once, for all its streams.** A gap, a relabel, a restart, our own
