@@ -175,7 +175,10 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
         if (s->last_src != AV_NOPTS_VALUE && fs - s->last_src > s->cad / 4 && fs - s->last_src < 3 * s->cad)
             s->cad += (fs - s->last_src - s->cad) / 8;
         s->last_src = fs;
-        if (fs > out - mv_tl_lag(s, fs) + half) {
+        /* the picture nearest the tick: due half a picture ahead of it — half a tick, or half the slot's own period
+         * when it is faster than the house. A 59.94 slot in 29.97 put every second picture ON the half-tick line,
+         * and a 1/90000 s stamp difference moved it across: 1-3-1-3 pictures a tick instead of 2 (T-341) */
+        if (fs > out - mv_tl_lag(s, fs) + FFMIN(half, s->cad / 2)) {
             /* content far ahead of its time (10 s past the margin) with nothing shown for 3 s — labels the timeline
              * left ahead: re-lock behind it with the primed margin. Content a burst brings ahead of its time is
              * normal for a bursty source and waits (re-locking on 1 s churned an HLS-burst slot every few seconds) */

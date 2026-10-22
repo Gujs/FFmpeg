@@ -45,6 +45,12 @@ the v2 `0001` patch (additive, travels with the source to the build box).
   encoder's job is the alarm: `[PTV-CC] inK the source carries EIA-608 captions (A/53) but -cc_extract is not set for it`,
   once, after 10 real 608 pairs (A/53 with null padding only — sent by many encoders — is no carrier and stays silent).
   The fleet's logs then name the channels to pin to `SV_CC_EXTRACT=true` in the transcoder repo.
+- **A mosaic slot faster than the mosaic decimates evenly (T-341).** A slot picture was due half a tick ahead of its tick;
+  in a 59.94 slot of a 29.97 mosaic (the RAV 2x2) every second picture sits exactly on that line, and a 1/90000 s
+  difference in its stamp (1501 or 1502) decided which tick it went to: 1-3-1-3 pictures a tick instead of 2, uneven
+  motion. The picture nearest the tick is now shown: due half the slot's own period ahead when the slot is faster than the
+  mosaic (half a tick otherwise, unchanged). MV-01 with alternating stamps: 2 pictures every tick, both neighbours 8.3 ms
+  from the line (pre2 before the fix: 1 and 3 alternating for the whole run); lip sync unchanged.
 - Known open: a bursty (HLS-burst) mosaic slot's content-ahead re-lock never commits (T-411; no production mosaic has one).
 
 ## 2.1.0-pre1 — one decision per source event (T-409): the program timeline, the record door, mosaic frame synchronizers; RESYNC and RECANCHOR deleted
