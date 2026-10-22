@@ -279,6 +279,10 @@ typedef struct DlvGate {
 #define PTV_PKT_FLAG_RELABEL (1 << 18)    /* 2.0.1 T-087: the first audio packet after an audio-first backward erase (demux) */
 #define PTV_PKT_FLAG_SLOT_FILL (1 << 19)  /* 2.0.2 T-386: a deferred mosaic slot's track: encode silence up to g_mv_house_us */
 #define PTV_PKT_FLAG_SLOT_BIND (1 << 20)  /* 2.0.2 T-386: a deferred slot bound — pkt->opaque = PtvSlotBind (receiver frees) */
+#define PTV_PKT_FLAG_CC_ONLY (1 << 21)    /* 2.1 T-326: the EIA-608 data of a corrupt-discarded video packet (A53 side data);
+                                           * dts = its dts step after the previous video packet, pts = its pts - dts */
+#define PTV_CC_PEND       8               /* T-326: such captions waiting for their place in display order */
+#define PTV_CC_PEND_BYTES 96              /* ... cc_data of one picture: up to 31 triplets */
 typedef struct PtvSlotBind { AVCodecParameters *par; AVRational tb, avg; } PtvSlotBind;
 
 /* A/V PLL redesign Phase A probe (always built; feeds the [PTV-AVSYNC] offset=): per-input ring recording, for each DISTINCT
@@ -840,6 +844,11 @@ typedef struct DecodeCtx {
     _Atomic int64_t *shed_wall;            /* -> Input.shed_wall */
     _Atomic int64_t *shed_cnt;             /* -> Input.shed_cnt */
     CcTap            cc;                   /* -cc_extract: EIA-608 tap (off = byte-inert) */
+    /* 2.1 T-326: captions of corrupt-discarded video packets, tapped in display order before the next later picture */
+    int64_t          cc_last_dts;          /* dts of the last video packet sent to the decoder (stream tb) */
+    int              cc_pend_n;
+    int64_t          cc_kept;              /* such captions tapped (log) */
+    struct { int64_t pts; int n; uint8_t d[PTV_CC_PEND_BYTES]; } cc_pend[PTV_CC_PEND];
     struct Input    *in;                      /* 2.0.2 T-386: its input (the late bind swaps in the real decoder) */
 } DecodeCtx;
 
@@ -1757,6 +1766,7 @@ typedef struct DemuxArgs {
     int                   pmt_n;          /* ... its streams: count and PIDs */
     int                   pmt_pid[PTV_SRC_PIDS];
     unsigned              a_silent;       /* mapped audio track j (bit j) logged silent while the video flows */
+    int64_t               cc_raw_dts;     /* 2.1 T-326: raw dts of the last video packet (corrupt or not) */
     /* 2.0.0-pre17 T-348: AAC labels inside a PES. lavf labels the 2nd.. frames of a PES as the previous label
      * + 1024 / codecpar->sample_rate, the rate probed at open: after a 96 -> 48 kHz switch every frame read
      * 10.7 ms long and every PES label jumped +140 ms (aresample: drop, then pad — 4.8 s of silence in 26 s).

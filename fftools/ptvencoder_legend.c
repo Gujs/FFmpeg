@@ -307,6 +307,8 @@ void ptv_print_log_legend(int full)
         "             counter exists because reading only rect 0 used to classify the whole packet\n"
         "             by the ERASE and throw the text away. Nonzero is NORMAL for such a source,\n"
         "             not a fault. One [PTV-CC] INFO line names it the first time it happens.\n"
+        "             (2.1 T-326) [PTV-CC] inK captions of a corrupt-discarded picture kept: the picture is\n"
+        "             dropped before decode, its EIA-608 pair still reaches the tap in display order\n"
         "  ccerr      (shown when >0) cc_dec + teletext encoder errors — rate-limited [PTV-CC] lines\n"
         "  ccdrop     (shown when >0) caption events LOST: event queue full (emitter slower than\n"
         "             decode — never blocks video), captions arriving before the h0 anchor exists,\n"

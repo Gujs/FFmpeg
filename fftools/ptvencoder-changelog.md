@@ -26,6 +26,12 @@ the v2 `0001` patch (additive, travels with the source to the build box).
   gone: …` when the source's program changes, and `[PTV-SRC] inK audio track N (stream #S, pid …, lang) silent for 10 s while
   the video flows` / `… flowing again` for a mapped audio stream (sync_check restarts such a channel as DEAD_AUDIO_TRACK with
   nothing in our log to say why; a whole-source outage is not counted). Checked once a second; log only.
+- **Captions survive a corrupt picture (T-326).** A video packet flagged corrupt is dropped before decode, and the EIA-608
+  pair its SEI carried went with it ("oice" for "choice" on TruBLU, 32–47 corrupt packets an hour). The SEI leads the
+  access unit and usually survives a damaged tail: its captions now go on as a caption-only packet and reach the tap in
+  display order. Test (TruBLU 5-min capture, 785 non-reference pictures flagged corrupt): text 336 / 336 words identical to
+  the undamaged source (without: 219, "generaons", "parentsave"). Log: `[PTV-CC] inK captions of a corrupt-discarded
+  picture kept (N so far)`.
 - Known open: a bursty (HLS-burst) mosaic slot's content-ahead re-lock never commits (T-411; no production mosaic has one).
 
 ## 2.1.0-pre1 — one decision per source event (T-409): the program timeline, the record door, mosaic frame synchronizers; RESYNC and RECANCHOR deleted

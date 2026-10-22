@@ -3373,6 +3373,52 @@ done:
     av_free(b);
 }
 
+/* 2.1 T-326: a corrupt-discarded video packet's captions (PTV_PKT_FLAG_CC_ONLY) wait here, by display time, for the
+ * first decoded picture after them — cc_dec must see every pair once and in display order (the tap's invariant). */
+static void cc_pend_tap(DecodeCtx *d, int i)
+{
+    AVFrame *f = av_frame_alloc();
+    AVFrameSideData *sd = f ? av_frame_new_side_data(f, AV_FRAME_DATA_A53_CC, d->cc_pend[i].n) : NULL;
+    if (sd) {
+        memcpy(sd->data, d->cc_pend[i].d, d->cc_pend[i].n);
+        f->best_effort_timestamp = d->cc_pend[i].pts;
+        cc_tap_frame(&d->cc, f, d->ist_tb);
+        if (!(d->cc_kept++ % 100))
+            av_log(NULL, AV_LOG_INFO, "[PTV-CC] in%d captions of a corrupt-discarded picture kept (%"PRId64" so far)\n",
+                   d->hb_slot, d->cc_kept);
+    }
+    av_frame_free(&f);
+    d->cc_pend_n--;
+    memmove(&d->cc_pend[i], &d->cc_pend[i + 1], (d->cc_pend_n - i) * sizeof(d->cc_pend[0]));
+}
+
+static void cc_pend_add(DecodeCtx *d, const AVPacket *pkt)
+{
+    size_t n;
+    const uint8_t *cc = av_packet_get_side_data(pkt, AV_PKT_DATA_A53_CC, &n);
+    int i;
+    if (!d->cc.on || !cc || !n || n > PTV_CC_PEND_BYTES || d->cc_last_dts == AV_NOPTS_VALUE)
+        return;                                     /* off, or no picture yet to place it after */
+    if (d->cc_pend_n == PTV_CC_PEND)
+        cc_pend_tap(d, 0);                          /* full: the earliest goes now */
+    for (i = d->cc_pend_n; i > 0 && d->cc_pend[i - 1].pts > d->cc_last_dts + pkt->dts + pkt->pts; i--)
+        d->cc_pend[i] = d->cc_pend[i - 1];
+    d->cc_pend[i].pts = d->cc_last_dts + pkt->dts + pkt->pts;   /* the previous packet's dts + its step + reorder */
+    d->cc_pend[i].n   = n;
+    memcpy(d->cc_pend[i].d, cc, n);
+    d->cc_pend_n++;
+    d->cc_last_dts += pkt->dts;                     /* the discarded picture holds its place in the dts sequence */
+}
+
+/* the tap, preceded by the waiting captions that come before this picture */
+static void cc_tap_ordered(DecodeCtx *d, AVFrame *frame)
+{
+    while (d->cc_pend_n && (frame->best_effort_timestamp == AV_NOPTS_VALUE ||
+                            d->cc_pend[0].pts < frame->best_effort_timestamp))
+        cc_pend_tap(d, 0);
+    cc_tap_frame(&d->cc, frame, d->ist_tb);
+}
+
 static void *decode_thread(void *arg)
 {
     DecodeCtx *d = arg;
@@ -3388,6 +3434,7 @@ static void *decode_thread(void *arg)
     int64_t cctest_seen = 0;   /* TEST ONLY (F6 gate): frames seen, for PTV_CCTEST_CORRUPT_EVERY */
     int64_t rferr_n = 0, rferr_seen = 0;   /* 2.0.2 T-390: decoder output errors (+ the test counter) */
 
+    d->cc_last_dts = AV_NOPTS_VALUE;
     if (!frame || !filt)
         goto done;
     /* §13 deep bursty-input prime: wait for the demux to bank ≥ deep_prime_packets in video_q
@@ -3500,6 +3547,11 @@ static void *decode_thread(void *arg)
             av_packet_free(&pkt);
             continue;
         }
+        if (pkt->flags & PTV_PKT_FLAG_CC_ONLY) {        /* 2.1 T-326: a discarded picture's captions, not a picture */
+            cc_pend_add(d, pkt);
+            av_packet_free(&pkt);
+            continue;
+        }
         /* 1.0.1-pre21 TEST-ONLY stall injection (PTV_TEST_VDEC_STALL_S): once, after 60s of
          * runtime (1.0.1-pre23: PTV_TEST_VDEC_STALL_AT_S overrides the trigger — AT 0 the
          * stall lands BEFORE the first decode, the startup-wedge shape the [PTV-NOVIDEO]
@@ -3573,6 +3625,8 @@ static void *decode_thread(void *arg)
                 av_usleep(g_slow_dec);
         }
         PTV_HB_VDEC(d->hb_slot, PTV_HB_VDEC_SENDPKT);
+        if (pkt->dts != AV_NOPTS_VALUE)
+            d->cc_last_dts = pkt->dts;               /* 2.1 T-326: where a discarded picture's captions go */
         ret = avcodec_send_packet(d->vdec, pkt);
         av_packet_free(&pkt);
         if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) { /* 2.0.0-pre9.4: damage evidence (bit errors */
@@ -3642,7 +3696,7 @@ static void *decode_thread(void *arg)
                  * whatever control code it now spells (a spurious EDM/EOC/RCL, i.e. a wrongly
                  * cleared or re-based caption). Nothing here or in cc_dec can detect that;
                  * ccerr= counts only the pairs cc_dec rejects outright. */
-                if (d->cc.on || d->cc.strip) cc_tap_frame(&d->cc, frame, d->ist_tb);
+                if (d->cc.on || d->cc.strip) cc_tap_ordered(d, frame);
                 av_frame_unref(frame);
                 continue;
             }
@@ -3650,7 +3704,7 @@ static void *decode_thread(void *arg)
              * because cc_dec must see each frame's 608 pair exactly once in order, and this
              * is the last point upstream of the frame_q drop-oldest / dup / QSHED paths.
              * Always strips the A53 side data (so the video encoder cannot re-inject it). */
-            if (d->cc.on || d->cc.strip) cc_tap_frame(&d->cc, frame, d->ist_tb);
+            if (d->cc.on || d->cc.strip) cc_tap_ordered(d, frame);
             int64_t ts = frame->best_effort_timestamp;
             if (ts != AV_NOPTS_VALUE) {
                 int unset;
@@ -3784,15 +3838,17 @@ static void *decode_thread(void *arg)
     avcodec_send_packet(d->vdec, NULL);
     while (avcodec_receive_frame(d->vdec, frame) >= 0) {
         if (frame->flags & AV_FRAME_FLAG_CORRUPT) {
-            if (d->cc.on || d->cc.strip) cc_tap_frame(&d->cc, frame, d->ist_tb);  /* see above */
+            if (d->cc.on || d->cc.strip) cc_tap_ordered(d, frame);  /* see above */
             av_frame_unref(frame);
             continue;
         }
-        if (d->cc.on || d->cc.strip) cc_tap_frame(&d->cc, frame, d->ist_tb);
+        if (d->cc.on || d->cc.strip) cc_tap_ordered(d, frame);
         d->dec_frames++;
         PTV_HB_VDEC(d->hb_slot, d->hold ? PTV_HB_VDEC_FQSEND : PTV_HB_VDEC_HWUP);
         video_out_xo(d, frame, filt);
     }
+    while (d->cc_pend_n)                               /* 2.1 T-326: captions after the last picture */
+        cc_pend_tap(d, 0);
     if (d->xo) {                                       /* T-383: a picture still held */
         video_out(d, d->xo, filt);
         av_frame_free(&d->xo);
@@ -5577,6 +5633,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         }
         inputs[k].da.nb_streams_open = inputs[k].ifmt->nb_streams;   /* 1.2.2 T-064: the size above */
         inputs[k].da.late_stream_max = -1;
+        inputs[k].da.cc_raw_dts = AV_NOPTS_VALUE;   /* 2.1 T-326 */
         if (g_layera) {   /* legacy-0004 buffer-classify-discard state (only when enabled) */
             if ((ret = ptv_disc_init(&inputs[k].disc, PTV_DISC_CAPACITY,
                                      inputs[k].ifmt->nb_streams)) < 0) goto end;

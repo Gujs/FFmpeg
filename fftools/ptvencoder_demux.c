@@ -3344,6 +3344,7 @@ static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const ReopenShape *o
     d->ifmt = nf;
     if (d->ifmt_home) *d->ifmt_home = nf;      /* teardown close target follows the swap */
     d->pmt_seen = 0;                           /* T-003: the new open's PMT is the reference */
+    d->cc_raw_dts = AV_NOPTS_VALUE;            /* T-326: a new open's labels are a new domain */
     d->reopen_cnt++;
     if (d->rsync_slot >= 0 && d->rsync_slot < PTV_MAX_INPUT)   /* rider (a), rr191 F3: the ASTAMP
                                                                 * extrapolation carry must not span the reopen */
@@ -3417,6 +3418,7 @@ static int slot_bind(DemuxArgs *d)
     d->tail_gap_us = in->tail_gap_us; d->tail_wc_us = in->tail_wc_us;
     d->nb_streams_open = nb;
     d->late_stream_max = -1;
+    d->cc_raw_dts = AV_NOPTS_VALUE;
     /* audio: each deferred track's -map specifier against the arrived layout; a track whose source has no match keeps
      * its silence (logged) */
     for (j = 0; j < d->n_audio; j++) {
@@ -3475,6 +3477,97 @@ static int slot_bind(DemuxArgs *d)
     d->ifmt = f;                                     /* *d->ifmt_home == in->ifmt already (the acquire set it) */
     av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in%d WAITING → LIVE: slot %d joins the mosaic\n", d->rsync_slot, d->rsync_slot);
     return 0;
+}
+
+/* 2.1 T-326: the EIA-608 data of an H.264 access unit (SEI user_data_registered, ATSC A/53 "GA94" cc_data) — the bytes the
+ * decoder would export as AV_FRAME_DATA_A53_CC: cc_count triplets. Checked as the decoder checks them (T.35 country 0xB5,
+ * provider 0x0031, GA94, type 3, process_cc_data_flag, the 0xFF marker after the triplets). Returns the byte count. */
+static int ptv_a53_from_h264(const uint8_t *buf, int size, uint8_t *out, int cap)
+{
+    uint8_t rbsp[1024];
+    int i = 0, n = 0;
+    while (i + 3 < size) {
+        int s, e, r = 0, z = 0, k;
+        if (buf[i] || buf[i + 1] || buf[i + 2] != 1) {
+            i++;
+            continue;
+        }
+        s = i + 3;
+        for (e = s; e + 2 < size && (buf[e] || buf[e + 1] || buf[e + 2] > 1); e++) ;
+        if (e + 2 >= size)
+            e = size;
+        i = e;
+        if ((buf[s] & 0x1f) != 6)                   /* SEI */
+            continue;
+        for (k = s + 1; k < e && r < (int)sizeof(rbsp); k++) {   /* drop the emulation prevention bytes */
+            if (z >= 2 && buf[k] == 3) {
+                z = 0;
+                continue;
+            }
+            z = buf[k] ? 0 : z + 1;
+            rbsp[r++] = buf[k];
+        }
+        for (k = 0; k + 2 < r && rbsp[k] != 0x80; ) {
+            int type = 0, len = 0;
+            while (k < r && rbsp[k] == 0xff) type += rbsp[k++];
+            if (k >= r) break;
+            type += rbsp[k++];
+            while (k < r && rbsp[k] == 0xff) len += rbsp[k++];
+            if (k >= r) break;
+            len += rbsp[k++];
+            if (k + len > r)
+                break;
+            if (type == 4 && len >= 11 && rbsp[k] == 0xb5 && rbsp[k + 1] == 0x00 && rbsp[k + 2] == 0x31 &&
+                !memcmp(rbsp + k + 3, "GA94", 4) && rbsp[k + 7] == 3 && (rbsp[k + 8] & 0x40)) {
+                int cnt = rbsp[k + 8] & 0x1f;
+                if (10 + 3 * cnt < len && rbsp[k + 10 + 3 * cnt] == 0xff && n + 3 * cnt <= cap) {
+                    memcpy(out + n, rbsp + k + 10, 3 * cnt);
+                    n += 3 * cnt;
+                }
+            }
+            k += len;
+        }
+    }
+    return n;
+}
+
+/* 2.1 T-326: a corrupt video packet is discarded before decode, and the EIA-608 pair its SEI carried went with it ("oice"
+ * for "choice" on TruBLU). The SEI leads the access unit and usually survives a damaged tail: send its captions on as a
+ * caption-only packet. Its timestamps here are raw (unwrap and timeline come later), so it carries them relative to the
+ * previous video packet — the decode thread places it on that packet's dts. */
+static void ptv_cc_salvage(DemuxArgs *d, AVPacket *pkt)
+{
+    const AVStream *st = d->ifmt->streams[pkt->stream_index];
+    int64_t prev = d->cc_raw_dts;
+    d->cc_raw_dts = pkt->dts;
+    if (!(pkt->flags & AV_PKT_FLAG_CORRUPT) || !g_discardcorrupt || st->codecpar->codec_id != AV_CODEC_ID_H264 ||
+        prev == AV_NOPTS_VALUE || pkt->dts == AV_NOPTS_VALUE || pkt->pts == AV_NOPTS_VALUE) {
+        return;
+    } else {
+        uint8_t cc[PTV_CC_PEND_BYTES];
+        int n = ptv_a53_from_h264(pkt->data, pkt->size, cc, sizeof(cc));
+        int64_t m = st->pts_wrap_bits > 0 && st->pts_wrap_bits < 63 ? 1LL << st->pts_wrap_bits : 0;
+        int64_t step = pkt->dts - prev, reord = pkt->pts - pkt->dts;
+        AVPacket *cp;
+        uint8_t *sd;
+        if (m) {                                    /* nearest 33-bit wrap */
+            step &= m - 1; if (step >= m >> 1) step -= m;
+            reord &= m - 1; if (reord >= m >> 1) reord -= m;
+        }
+        if (!n || step <= 0 || av_rescale_q(step, st->time_base, AV_TIME_BASE_Q) > 1000000 ||
+            llabs(av_rescale_q(reord, st->time_base, AV_TIME_BASE_Q)) > 1000000 || !(cp = av_packet_alloc()))
+            return;                                 /* no captions, or labels no neighbour can place */
+        if (!(sd = av_packet_new_side_data(cp, AV_PKT_DATA_A53_CC, n))) {
+            av_packet_free(&cp);
+            return;
+        }
+        memcpy(sd, cc, n);
+        cp->stream_index = pkt->stream_index;
+        cp->flags        = PTV_PKT_FLAG_CC_ONLY;
+        cp->dts          = step;
+        cp->pts          = reord;
+        demux_send(d->video_q, cp, d->drop, &(int64_t){ 0 });   /* a full queue drops it uncounted: not a picture */
+    }
 }
 
 /* 2.1 T-003 step 1: what changed in the source, logged once — the PMT's version (with the PIDs it added and dropped) and
@@ -3837,6 +3930,8 @@ void *demux_thread(void *arg)
                 out->pts = AV_NOPTS_VALUE;
             }
         }
+        if (out->stream_index == d->vstream)
+            ptv_cc_salvage(d, out);         /* 2.1 T-326: a corrupt picture's captions go on without it */
         if ((out->flags & AV_PKT_FLAG_CORRUPT) && g_discardcorrupt) {
             ret = demux_dispatch(d, out);   /* dispatch = the existing counted discard path */
             if (ret < 0) break;
