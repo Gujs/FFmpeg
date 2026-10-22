@@ -32,6 +32,13 @@ the v2 `0001` patch (additive, travels with the source to the build box).
   display order. Test (TruBLU 5-min capture, 785 non-reference pictures flagged corrupt): text 336 / 336 words identical to
   the undamaged source (without: 219, "generaons", "parentsave"). Log: `[PTV-CC] inK captions of a corrupt-discarded
   picture kept (N so far)`.
+- **A source slower than the output rate converts evenly (T-011).** The output rate stays what the channel started with (the
+  ladder's cadence, as a frame synchronizer keeps it); a slower source's pictures were shown as they arrived and decode
+  delivers them bunched: 29.97 in a 59.94 house went 1-3-1-3 ticks a picture, 25 in 59.94 1…5 — judder until a restart
+  (Greater Love TV, 59.94 → 29.97 mid-run, days of choppy output). A source at ≥ 1.5 ticks a picture is now shown by
+  content time (the film-cadence path, its residence cap set by the cadence): measured 2-2-2 ticks for 29.97 in 59.94 and
+  the exact 2/3 mix for 25 in 59.94. Residence does not move lip sync (house_skew excludes it). A rate change held 30 s is
+  logged: `[PTV-SRC] in0 source frame rate changed 59.94 → 29.97 fps (house 59.94 fps: …)`.
 - Known open: a bursty (HLS-burst) mosaic slot's content-ahead re-lock never commits (T-411; no production mosaic has one).
 
 ## 2.1.0-pre1 — one decision per source event (T-409): the program timeline, the record door, mosaic frame synchronizers; RESYNC and RECANCHOR deleted

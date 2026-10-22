@@ -1024,6 +1024,8 @@ void *output_thread(void *arg)
         /* v0.9.11 pulldown state: 1-frame lookahead + film-mode detector (see g_pulldown comment) */
         AVFrame *nextf = NULL;
         int next_have = 0, film_arm = 0, held_extra = 0;
+        int slow_arm = 0;                           /* 2.1 T-011: a source slower than the house (>= 1.5 ticks a picture) */
+        int64_t rate_ref_us = 0, rate_new_wc = 0;   /* T-011: the source cadence on record, and since when it differs */
         int64_t vo_extra = 0;   /* 2.0.0-pre9.8 (T-076): video-only repeat ticks kept out of house_skew */
         int64_t vo_prev_c = -1; int vo_fresh_n = 0;   /* 2.0.0 T-345: content of the previous fresh frame; fresh frames since a vo hold */
         int vgap_park = 0;                          /* 2.0.0-pre9.4 (T-083): nextf is a frame parked behind a content gap */
@@ -1040,7 +1042,7 @@ void *output_thread(void *arg)
         int fresh = 0, cadence_hold = 0;
         if (v->is_master)
             PTV_HB_OUT(PTV_HB_OUT_LOOP);   /* 1.0.1-pre21 heartbeat: stats-thread loop top */
-        if (g_pulldown && film_arm && have) {       /* film cadence: pop via content-projected lookahead */
+        if (g_pulldown && (film_arm || slow_arm) && have) {   /* film cadence / a slower source: pop by content time */
             if (!next_have) {
                 ret = av_thread_message_queue_recv(v->frame_q, &f, AV_THREAD_MESSAGE_NONBLOCK);
                 if (ret >= 0) { nextf = f; next_have = 1; }
@@ -1048,7 +1050,10 @@ void *output_thread(void *arg)
             }
             if (next_have) {
                 int64_t nc = content_index(v, nextf->pts);
-                if (nc < 0 || nc <= last_vpts + 1 || held_extra >= 1) {   /* due, unstampable, or residence CAP hit */
+                /* residence CAP: film holds a picture 1 tick extra at most (3:2); a slower source as many as its
+                 * cadence needs (29.97 in 59.94: 1, 25 in 59.94: 2) */
+                int cap = film_arm ? 1 : (int)((cad_ema_us + v->tick_dur_us - 1) / v->tick_dur_us) - 1;
+                if (nc < 0 || nc <= last_vpts + 1 || held_extra >= cap) {   /* due, unstampable, or residence CAP hit */
                     av_frame_unref(held); av_frame_move_ref(held, nextf); av_frame_free(&nextf);
                     next_have = 0; fresh = 1; held_src_pts = held->pts; held_extra = 0; vgap_park = 0;
                 } else
@@ -1177,6 +1182,31 @@ void *output_thread(void *arg)
                     cad_ema_us += (dt - cad_ema_us) / 8;
             }
             cad_prev_src = held_src_pts;
+            /* 2.1 T-011: a source slower than the house is shown by content time — each picture on its due ticks.
+             * Shown as it arrived, a 29.97 source in a 59.94 house went 1-3-1-3 (decode delivers pictures bunched):
+             * judder until a restart (Greater Love TV, 59.94 -> 29.97 mid-run). A frame synchronizer converts the
+             * rate and keeps the output rate (the ladder's cadence); the change is logged */
+            if (!slow_arm && cad_ema_us >= v->tick_dur_us * 3 / 2)
+                slow_arm = 1;
+            else if (slow_arm && cad_ema_us <= v->tick_dur_us * 5 / 4)
+                slow_arm = 0;
+            if (v->is_master) {
+                int64_t nw = av_gettime_relative();
+                if (!rate_ref_us) {
+                    if (!rate_new_wc) rate_new_wc = nw;
+                    else if (nw - rate_new_wc >= 10000000) { rate_ref_us = cad_ema_us; rate_new_wc = 0; }
+                } else if (llabs(cad_ema_us - rate_ref_us) * 10 < rate_ref_us)
+                    rate_new_wc = 0;
+                else if (!rate_new_wc)
+                    rate_new_wc = nw;
+                else if (nw - rate_new_wc >= 30000000) {
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 source frame rate changed %.2f \xe2\x86\x92 %.2f fps "
+                           "(house %.2f fps: %s)\n", 1e6 / rate_ref_us, 1e6 / cad_ema_us, 1e6 / v->tick_dur_us,
+                           slow_arm ? "each picture shown on its due ticks" : "converted by repeat / skip");
+                    rate_ref_us = cad_ema_us;
+                    rate_new_wc = 0;
+                }
+            }
             rff_bits = (rff_bits << 1) |
                        (held->repeat_pict == 1 && !(held->flags & AV_FRAME_FLAG_INTERLACED));
             int rn = av_popcount(rff_bits & 0xffu);
