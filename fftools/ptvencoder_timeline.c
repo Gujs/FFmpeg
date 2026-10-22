@@ -467,7 +467,10 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
              * repair is its return leg and undoes it (T-080 B2: -X/+X nets to zero). Any other forward step is that
              * stream's own loss: labels as sent, the audio door pads it. Gate std/sync_arelabel: -300 ms without it */
             js = s->new_first_us - (s->old_end_us + step);
-            if (js < -step)
+            /* from 150 ms: a few frames back is the PES interpolation's own jitter (the next PES's label lands under the
+             * interpolated cursor), no relabel — repaired, GYF's audio moved +95 ms (43-75 ms steps, labels as sent: the
+             * overlap is absorbed). The relabel keys step 300 / 600 ms */
+            if (js < -150000)
                 s->rep_new = -js;
             else if (js > step && s->rep_us > 0)
                 s->rep_new = -FFMIN(js, s->rep_us);
@@ -619,8 +622,10 @@ int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
     }
     /* a sparse copy of the OLD content arriving after a program event (source time before its last old picture) takes the
      * old offset back: it was unwrapped with the new one */
-    if (!s->dense && s_us != AV_NOPTS_VALUE && t->ev_dk && nw - t->ev_wc < 10000000 && s_us < t->ev_va)
-        relabel(d, pkt, 0, -t->ev_dk);
+    if (!s->dense && s_us != AV_NOPTS_VALUE && t->ev_dk < 0 && nw - t->ev_wc < 10000000 && s_us < t->ev_va)
+        relabel(d, pkt, 0, -t->ev_dk);        /* forward events only: after a step back / restart the NEW content's source
+                                               * time lies below the old end too (rich sync_kill_return_20: 6 subs + 2
+                                               * clears pushed -40 s and lost) */
     if (!s->dense || s_us == AV_NOPTS_VALUE)
         return ptv_demux_dispatch(d, pkt);
     /* sound of a span the last program event erased, arriving after it (the audio was not flowing at the event: a storm,

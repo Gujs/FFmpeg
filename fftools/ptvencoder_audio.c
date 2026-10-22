@@ -5161,6 +5161,25 @@ static void hold_fill_quantum(AudioState *a)
      * at the delivery gate). The sentinels keep coming while a track buffers, so look again on each. */
     if (a->rj_n && !a->rj_released && rj_release_ok(a))
         rj_flush(a);
+    /* 2.1 T-409 (PTV_TL_VMDOOR): with the audio placed by the video's record, the fill follows WHERE THE VIDEO IS ON AIR
+     * (house output + h0, the placement's own domain) 200 ms behind, instead of time / dup counts since the last real
+     * frame: queued sound belongs to content not shown yet, so it lands at or after that point — the fill can never cover
+     * it, and the returning frames meet the fill within the margin (aresample pads the rest) */
+    if (vm_mode(a) && a->pts_set && a->use_fg && a->fg_in_rate > 0 && a->acomp_exp_us != AV_NOPTS_VALUE) {
+        int64_t h0, pos = atomic_load_explicit(&g_house_out_us, memory_order_relaxed);
+        pthread_mutex_lock(a->h0_lock); h0 = *a->h0; pthread_mutex_unlock(a->h0_lock);
+        if (h0 == AV_NOPTS_VALUE || pos <= 0)
+            return;
+        dur_us = av_rescale(1024, 1000000, a->fg_in_rate);
+        target = pos + h0 + a->corr.corr_us - 200000;
+        door   = a->acomp_exp_us;
+        if (target - door > 2000000)
+            target = door + 2000000;
+        n = dur_us > 0 ? (int)((target - door) / dur_us) : 0;
+        if (n < 1)
+            return;
+        goto fill;
+    }
     if (!a->pts_set || !a->use_fg || a->multiview || a->fg_in_rate <= 0 ||
         a->glue_raw_last_us == AV_NOPTS_VALUE || a->acomp_exp_us == AV_NOPTS_VALUE ||
         now - a->glue_wall_last_us < FFMAX(150000, 3 * a->glue_cad_us))   /* the track's own arrival cadence */
@@ -5180,6 +5199,7 @@ static void hold_fill_quantum(AudioState *a)
     n = dur_us > 0 ? (int)((target - door) / dur_us) : 0;
     if (n < 1)
         return;
+fill:
     if (!a->hold_fill_us) {
         a->hold_fill_wc0 = now;
         a->hold_fresh_wc = 0;
