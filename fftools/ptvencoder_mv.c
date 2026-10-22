@@ -1151,10 +1151,6 @@ void *compositor_thread(void *arg)
                 char cvs[10 + PTV_MAX_AUDIO * 16];   /* pre23 rr23: conv= (aK: forced, as corr=);
                                                       * absent while every track's fold total is 0 */
                 ptv_stats_conv(cvs, sizeof cvs, nows, 1);
-                char rsn[10 + PTV_MAX_AUDIO * 16];   /* pre29 #69: rsn= (resync fires; only ever
-                                                      * nonzero on a non-follow mv track — the
-                                                      * follow path never runs ptv_recanchor) */
-                ptv_stats_rsn(rsn, sizeof rsn, 1);
                 char ls[768]; int lp = 0;   /* 4 slots x ~122 chars once the counters grow: at 448
                                              * the 4th slot's whole token silently vanished — the
                                              * one the per-slot cc= exists to make visible */   /* per-slot: qdrop=input-q overflow, corrupt=demux+decode,
@@ -1198,8 +1194,8 @@ void *compositor_thread(void *arg)
                         snprintf(ccg, sizeof ccg, " ccmux=%lld", (long long)cx);
                 }
                 av_log(NULL, AV_LOG_INFO,   /* v0.9.13 parity: size/bitrate/speed/genlock dropped (v0.9.10 single-input rationale) */
-                    "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f dup=%"PRId64" drop=%"PRId64"%s%s%s%s%s%s%s\n",
-                    c->emitted, fps, hh, mm, ss, c->dup, c->framedrop[0], dlv, aco, ls, ccg, crs, cvs, rsn);
+                    "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f dup=%"PRId64" drop=%"PRId64"%s%s%s%s%s%s\n",
+                    c->emitted, fps, hh, mm, ss, c->dup, c->framedrop[0], dlv, aco, ls, ccg, crs, cvs);
                 /* 1.0.1-pre17 (owner-floated): per-INPUT always-on [PTV-RSYNC] summary, ONE
                  * compact line per input — the soak forensics that used to need PTV_DIAG.
                  * R = this input's track reading(s) (same builder as the stats token), ev =

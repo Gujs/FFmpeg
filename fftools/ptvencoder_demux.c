@@ -313,8 +313,8 @@ static void rsync_post_edit(DemuxArgs *d, int s, int64_t delta_us)
  * containing a real gap W): pad W, erase J−W. Evidence floor g_gap_min_us (700ms — the
  * same bar the v0.8.2 gap discriminator uses); bursty/banked delivery falls back to W=0
  * (wall absence there is delivery jitter, not content evidence). ALWAYS measured — the
- * ACTION is g_wallev-gated at each site, but the measurement feeds the re-anchor
- * corroboration provenance (ptv_wallev_post_unev) in both modes. */
+ * ACTION is g_wallev-gated at each site, but the measurement feeds the provenance
+ * ledgers (ptv_wallev_post_unev) in both modes. */
 static int64_t ptv_wallev_w(DemuxArgs *d, int sidx, int64_t jump_us)
 {
     int64_t gap, cad, w;
@@ -406,7 +406,7 @@ static int64_t ptv_wallev_shared_flow(DemuxArgs *d, int sidx, int64_t jump_us, i
 /* pre24 #63 provenance: post `w_us` of UNEVIDENCED real-content deletion on stream s —
  * an erase whose event-time wall evidence said the content was genuinely missing (the #63
  * leak term, per stream). Always measured, even under PTV_NO_WALLEV; read ONLY by the
- * recovery re-anchor's corroboration (never a control input on its own). Demux thread. */
+ * [PTV-WALLEV] conservation diag (never a control input on its own). Demux thread. */
 static void ptv_wallev_post_unev(DemuxArgs *d, int s, int64_t w_us)
 {
     int j;
@@ -1391,8 +1391,8 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
                      * mism < 0 the override COLLAPSES that much of the preserved hole out of
                      * the labels (worst corner mism ≈ −W: door step ≈ 0, structurally
                      * nothing left to pad) — the collapsed portion is real content deleted
-                     * with no label representation, posted as UNEVIDENCED provenance so the
-                     * recovery re-anchor can corroborate and walk it back (Part 2). W = 0
+                     * with no label representation, posted as UNEVIDENCED provenance (the
+                     * [PTV-WALLEV] conservation diag). W = 0
                      * (flowing / fallback / PTV_NO_WALLEV) keeps all of this byte-identical
                      * to pre23. */
                     int64_t mism = b->applied_offset - ss->cumulative_ts_offset;
@@ -1407,7 +1407,7 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
                         av_log(NULL, AV_LOG_WARNING,
                                "[PTV-WALLEV] flush override collapsed %"PRId64"ms of stream %d's "
                                "wall-evidenced hole (door step %+"PRId64"ms, W=%"PRId64"ms) — "
-                               "posted as unevidenced provenance for the recovery re-anchor\n",
+                               "posted as unevidenced provenance\n",
                                coll / 1000, i, exp_step / 1000, wevr / 1000);
                     }
                     ss->pair_applied_us = b->applied_offset;
@@ -3154,7 +3154,7 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                     }
                     /* pre24 #63 provenance (measurement only): this absorb ERASES the step; if
                      * its wall evidence said part of it was a REAL hole, that much content was
-                     * deleted for real — post it unevidenced (re-anchor corroboration). Under
+                     * deleted for real — post it unevidenced ([PTV-WALLEV] diag). Under
                      * g_wallev the W>0 paths exited above, so this posts only in the
                      * counterfactual/fallback modes where the erase actually happens. */
                     if (delta > 0) {
@@ -4164,17 +4164,6 @@ void *demux_thread(void *arg)
                 if (g_glueclass && !b->active && !b->flushing && sidx < b->nb_streams) {
                     ptv_glue_h_feed(&b->stream_state[sidx], raw_dts, last_dts,
                                     av_gettime_relative());
-                    /* pre24 #63: publish the audio stream's label health H for the recovery
-                     * re-anchor's gate (audio thread reads; 0 = no reading yet). */
-                    if (ct == AVMEDIA_TYPE_AUDIO && b->stream_state[sidx].h_wins > 0) {
-                        int jh;
-                        for (jh = 0; jh < d->n_audio; jh++)
-                            if (d->astream[jh] == sidx &&
-                                d->aglobal[jh] >= 0 && d->aglobal[jh] < PTV_MAX_AUDIO)
-                                atomic_store_explicit(&g_rsx.hh_q10[d->aglobal[jh]],
-                                                      b->stream_state[sidx].h_ema_q10,
-                                                      memory_order_relaxed);
-                    }
                 }
                 /* Arm buffering on a fresh jump. */
                 if (!b->active && ptv_disc_detect_jump(d, b, sidx, raw_dts, last_dts)) {
