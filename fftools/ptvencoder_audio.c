@@ -1650,7 +1650,47 @@ static int audio_drain_fg(AudioState *a)
              * (gapless, monotonic), DROPPING content when the audio is behind the video (advance)
              * or PADDING silence when ahead (delay). Single-input / PTV_NO_AUDIO_FOLLOW keep the
              * content-stamped opts path untouched. */
-            if (a->multiview && g_audio_follow && g_avsync_pll) {
+            if (a->multiview && g_timeline && a->tl_lag) {
+                /* 2.1 T-409 (design §5.4a): the slot is a frame synchronizer — its picture shows source time S at
+                 * S - h0 + L (mv_tl_pick). The sound goes to the same place, by construction: no measurement, no
+                 * PLL. Emitted gapless; the error to that place (the labels + L; the corrector's walk is in the
+                 * labels) is taken exactly, to the whole frame, once it reaches half a frame (silence padded / late
+                 * frames dropped, like a frame sync's audio); the residue stays within half a frame. L is the picture's
+                 * REALIZED lag (tick rounding and decimation included), published by the compositor */
+                int     nb = filt->nb_samples;
+                int64_t L  = atomic_load_explicit(a->tl_lag, memory_order_relaxed);
+                int64_t exact = opts + av_rescale(L, a->out_rate, 1000000), cont, err;
+                if (!a->af_out_set) {
+                    if (exact < 0) { av_frame_unref(filt); continue; }
+                    a->af_last_out = exact - nb;
+                    a->af_out_set  = 1;
+                }
+                cont = a->af_last_out + nb;
+                err  = exact - cont;                           /* samples: + = the sound belongs later */
+                if (err <= -nb / 2) {
+                    av_frame_unref(filt);                      /* late: dropped (the next frames meet the place) */
+                    continue;
+                }
+                if (err >= nb / 2) {
+                    int64_t n = (err + nb / 2) / nb;
+                    while (n-- > 0) {                          /* a hole: silence where the sound is missing */
+                        AVFrame *s = av_frame_alloc();
+                        if (s) {
+                            s->nb_samples = nb; s->format = filt->format; s->sample_rate = a->out_rate;
+                            av_channel_layout_copy(&s->ch_layout, &filt->ch_layout);
+                            if (av_frame_get_buffer(s, 0) >= 0) {
+                                av_samples_set_silence(s->data, 0, nb, s->ch_layout.nb_channels, s->format);
+                                s->pts = a->af_last_out + nb; a->af_last_out = s->pts;
+                                audio_encode_push(a, s); a->out_frames++;
+                            }
+                            av_frame_free(&s);
+                        }
+                    }
+                    cont = a->af_last_out + nb;
+                }
+                a->af_last_out = cont;
+                filt->pts = cont;
+            } else if (a->multiview && g_audio_follow && g_avsync_pll) {
                 /* B3 (Phase B3) — CLOSED-LOOP two-regime controller on the MEASURED av_offset_us.
                  * Emits on this SAME content-anchored base (want = opts + applied) so ACQUIRE and TRACK
                  * share one base: the acquire's content-drop (opts jumps +Δq) and applied += Δq CANCEL

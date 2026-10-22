@@ -1481,6 +1481,7 @@ typedef struct AudioState {
     _Atomic int64_t *res_step;                    /* 2.0.2 T-343: its slot's deliberate picture steps (mosaic) */
     int64_t          res_step_seen;               /* ... the part already followed (us) */
     int              res_follow_n;                /* 2.0.2 T-343: [PTV-RESFOLLOW] lines logged */
+    _Atomic int64_t *tl_lag;                      /* 2.1 T-409: its slot's realized picture lag (mosaic frame sync) */
 } AudioState;
 
 /* ---- demux + mux ---- */
@@ -2045,6 +2046,7 @@ typedef struct Input {
     _Atomic int           acq_done;          /* its acquire thread returned */
     _Atomic int64_t       res_step_us;       /* 2.0.2 T-343: the compositor's deliberate picture steps for this slot (us,
                                               * + one tick per residence hold, - one per decimation skip) */
+    _Atomic int64_t       tl_lag_us;         /* 2.1 T-409: the slot's realized picture lag (output - (source - h0)), us */
     int                   deferred;          /* 2.0.2 T-386: not live at the mosaic start — placeholder cell, silent
                                               * audio track, binds when its source arrives */
     int                   geom_w, geom_h, geom_fmt;   /* ... the cell geometry it takes (the first live sibling's) */
