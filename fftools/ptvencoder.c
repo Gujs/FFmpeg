@@ -892,6 +892,7 @@ _Atomic int64_t g_src_vread_wc;
 _Atomic int64_t g_src_aread_wc;   /* 2.0.0-pre9.8 (T-076): last transcoded-audio packet read (single input) */
 int             g_src_hold_act;
 _Atomic int64_t g_src_rejoin_wall;
+_Atomic int64_t g_tl_prog_wc;
 _Atomic int64_t g_src_fresh_wc;          /* 2.0.0-pre6: wall us of the master's last FRESH frame */
 _Atomic int64_t g_afill_us[PTV_MAX_AUDIO];   /* 2.0.0-pre8: afill= */
 _Atomic int     g_rj_cls_seq, g_rj_cls;      /* 2.0.0-pre8.1 */

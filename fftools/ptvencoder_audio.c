@@ -3025,6 +3025,51 @@ int ptv_cv_setup(AudioState *a, int rate, enum AVSampleFormat fmt, const AVChann
 
 static int audio_feed(AudioState *a, AVFrame *frame);
 
+/* 2.1 T-409 (P1, design §3.3/§5.2): the audio is placed where the VIDEO showed the same content (its record, vmap), not
+ * with the house_skew of the moment the frame reaches the door — the video shows a label ~1 s after its sound arrives, and
+ * around an event that skew moves in between (sync_storm: holes in quick succession inside one hold put the returning
+ * sound +15 / -15 / +24 s off its fill). Real frames wait until their content is on air, at most 1.5 s; content the video
+ * never showed as such (a video-only outage), or not shown in time, takes the house_skew placement as before. Single input. */
+static int vm_mode(const AudioState *a)
+{
+    static int on = -1;
+    int64_t pw;
+    if (on < 0)
+        on = !!getenv("PTV_TL_VMDOOR");    /* development: fixes sync_storm, but the old time-driven silence fill fights it
+                                            * (flapping / bursty: audio PID dark 3.6 / 12.6 s) — needs the exact door's fill
+                                            * (fill = the space between placed frames), design §5.2 */
+    if (!on || !g_timeline || !g_vmap || a->multiview || !g_avlock || !a->house_skew)
+        return 0;
+    if (a->vm_n)
+        return 1;                                   /* drain in order */
+    pw = atomic_load_explicit(&g_tl_prog_wc, memory_order_relaxed);
+    return ptv_src_holding() || (pw && av_gettime_relative() - pw < 30000000);
+}
+
+static int vm_drain(AudioState *a, int force)
+{
+    int64_t now = av_gettime_relative(), tick = atomic_load_explicit(&g_house_tick_us, memory_order_relaxed);
+    int ret = 0;
+    while (a->vm_n && ret >= 0) {
+        AVFrame *f = a->vm_q[0];
+        int64_t o = AV_NOPTS_VALUE, gap = 0, lab = av_rescale_q(f->best_effort_timestamp, a->ist_tb, AV_TIME_BASE_Q);
+        int r = ptv_vmap_lookup(lab, &o, &gap);
+        if (r == 0 && !force && (now - a->vm_wc[0] < 3000000 ||
+            now - atomic_load_explicit(&g_src_fresh_wc, memory_order_relaxed) < 500000))
+            break;                                  /* not on air yet: wait while the video still shows new pictures (a burst
+                                                     * backlog waits its whole bank delay), at least 3 s */
+        a->vm_out_us = r == 1 && gap <= FFMAX(2 * tick, 50000) ? o : AV_NOPTS_VALUE;
+        memmove(a->vm_q, a->vm_q + 1, (a->vm_n - 1) * sizeof(*a->vm_q));
+        memmove(a->vm_wc, a->vm_wc + 1, (a->vm_n - 1) * sizeof(*a->vm_wc));
+        a->vm_n--;
+        a->vm_feeding = 1;
+        ret = audio_feed(a, f);
+        a->vm_feeding = 0;
+        av_frame_free(&f);
+    }
+    return ret;
+}
+
 /* convert one source frame to the graph's input and feed it. Its label = the source label minus what the converter
  * still holds (the output starts that much earlier in source time). */
 static int cv_feed(AudioState *a, const AVFrame *in)
@@ -3079,6 +3124,19 @@ static int audio_feed(AudioState *a, AVFrame *frame)
     }
     if (frame->best_effort_timestamp != AV_NOPTS_VALUE)
         a->dbg_last_src = frame->best_effort_timestamp;   /* probe: latest fed source pts */
+    if (!a->vm_feeding && !a->hold_feeding && !a->rj_releasing && frame->best_effort_timestamp != AV_NOPTS_VALUE &&
+        vm_mode(a)) {
+        AVFrame *c;
+        if (a->hold_fill_us && ptv_src_holding() && !ptv_rj_burst_since(a->rj_cls_seq0))
+            return 0;                               /* a fragment during the hold: the fill covers it (T-083) */
+        if (a->vm_n == PTV_VMQ && (ret = vm_drain(a, 1)) < 0)
+            return ret;
+        if (!(c = av_frame_clone(frame)))
+            return AVERROR(ENOMEM);
+        a->vm_wc[a->vm_n]  = av_gettime_relative();
+        a->vm_q[a->vm_n++] = c;
+        return vm_drain(a, 0);
+    }
     /* 2.0.0-pre6/pre8.1: real frames after a filled hold must meet the POST-rejoin house_skew. It is written on the
      * tick that shows the post-gap content; fed earlier, a LIVE LOSS rejoin counts the hole twice at the door (labels
      * +W and the hold-grown house_skew +W): aresample pads ~W and drops it again at the snap — the program's audio
@@ -3087,7 +3145,7 @@ static int audio_feed(AudioState *a, AVFrame *frame)
      * showed is not enough: the fill can start while the frame queue still drains (B), and the first fresh frame
      * after a hold can be the pre-gap PES tail while the post-gap frames are dropped until the next IDR (A). Now the
      * frames are BUFFERED (the audio thread keeps serving fill sentinels) until rj_release_ok(). */
-    if (!a->hold_feeding && !a->rj_releasing && a->hold_fill_us && !a->rj_released) {
+    if (!a->hold_feeding && !a->rj_releasing && !a->vm_feeding && a->hold_fill_us && !a->rj_released) {
         /* 2.0.0-pre9.4 (T-083): while the source still HOLDS, a real frame is a fragment that survived the damage (the
          * video is dead, bars are on air). Fed — at once or from this buffer after its 4 s cap — it met the hold-grown
          * house_skew AND its own label jump (Cinestar 50 % loss: one AAC frame 88 s after the last, +95 s of
@@ -4128,7 +4186,12 @@ graph_in:
             if (a->glue_off_us)
                 frame->pts += av_rescale_q(a->glue_off_us, AV_TIME_BASE_Q, a->ist_tb);
         }
-        if (g_avlock && a->house_skew && !(a->multiview && g_audio_follow) && frame->pts != AV_NOPTS_VALUE &&
+        if (a->vm_feeding && a->vm_out_us != AV_NOPTS_VALUE && frame->pts != AV_NOPTS_VALUE) {
+            int64_t h0;
+            pthread_mutex_lock(a->h0_lock); h0 = *a->h0; pthread_mutex_unlock(a->h0_lock);
+            if (h0 != AV_NOPTS_VALUE)               /* output = door - h0: exactly where the video put this content */
+                frame->pts = av_rescale_q(a->vm_out_us + h0, AV_TIME_BASE_Q, a->ist_tb);
+        } else if (g_avlock && a->house_skew && !(a->multiview && g_audio_follow) && frame->pts != AV_NOPTS_VALUE &&
             !a->hold_feeding) {
             int64_t sk = hs_door(a, frame, *a->house_skew);
             if (sk) frame->pts += av_rescale_q(sk, AV_TIME_BASE_Q, a->ist_tb);
@@ -5089,6 +5152,9 @@ static void hold_fill_quantum(AudioState *a)
 {
     int64_t dur_us, door, target, now = av_gettime_relative();
     int n, i, ret = 0;
+
+    if (a->vm_n)
+        vm_drain(a, 0);                             /* 2.1 T-409: frames whose content went on air since */
 
     /* 2.0.0-pre8.1: the wait can end between real frames — a post-gap burst is often all buffered before the video
      * shows the jump, and the next frame came 265 ms later (sync_gap_20: a 0.32 s dark wire, video waiting for audio

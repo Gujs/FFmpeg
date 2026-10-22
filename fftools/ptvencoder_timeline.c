@@ -510,6 +510,8 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
 
     if (prog_event) {
         atomic_store_explicit(&t->prog_wc, nw, memory_order_relaxed);
+        if (d->single)
+            atomic_store_explicit(&g_tl_prog_wc, nw, memory_order_relaxed);
         k_move(d, t, k_new - k_old);
         if (k_new != k_old) {
             ptv_vwait_rebase(d, vb, va, t->open_wc, av_rescale_q(k_new - k_old, AV_TIME_BASE_Q, (AVRational){ 1, 90000 }));
