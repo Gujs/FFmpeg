@@ -5,6 +5,34 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.1.0-pre1 — one decision per source event (T-409): the program timeline, the record door, mosaic frame synchronizers; RESYNC and RECANCHOR deleted
+
+- **One classifier per input decides every timing event once, for all its streams.** A gap, a relabel, a restart, our own
+  burst cut or a corrupt timestamp used to be detected and remedied independently in up to eight places (demux absorber,
+  wall-evidence split, LAYERA, the door, AGLUE / ATRIM, RELABEL, house clock + corrector), each on one stream's labels;
+  sync depended on the remedies cancelling (T-398, T-405, T-408). Now one window per event decides: hole kept, the flowing
+  part erased (labels jumped further than the wall time), a relabel or step back erased, a restart as a new domain with
+  its gap kept, corrupt labels dropped, or a single-stream step left as sent. The remedy is one program offset applied to
+  every stream in whole pictures. Log: `[PTV-TL] event #N`. GYF 1 h production replay (38 burst cuts): content A/V
+  −0.9…0.0 ms (2.0.2-pre8: walks to +30 ms).
+- **Single input: the sound is placed where its picture was shown (the record door)** around events (within 30 s of a
+  program event and while the source holds); the silence fill follows the picture on air. Fixes several holes inside one
+  hold (sync_storm: 34 flashes without sound), burst cuts and flapping. `PTV_TL_NO_VMDOOR=1` = the house_skew placement (A/B).
+- **Mosaic: every slot is a frame synchronizer.** Its picture is shown by content time at a lag: a lost picture repeats, a
+  late one is skipped, rate conversion repeats / decimates — none of that moves the lag, so the slot's sound needs no step.
+  The lag moves only by a re-lock (back from an outage with the primed margin, a start-up backlog, a buffer far off its
+  depth; `[PTV-MV] inK re-locked`) or a whole-tick drift step, and the sound takes exactly the same step. The slot PLL
+  (ACQUIRE / TRACK / FROZEN / backoff / bias), the count-paced residence, re-prime, birth trim and REANCHOR2 are not run.
+  Measured first on cor-3 Curiosity: the PLL's steps were right but followed each damage step ~3.6 s late; content age
+  of a slot 1.2 s (was 1.25–1.5 s). Stats line: `inK:sk=` is now the slot's realized lag, `pd=` / `sv=` count cadence /
+  starvation repeats.
+- **RESYNC and RECANCHOR are deleted** (owner 2026-10-21: escapes from dead zones the old remedies made; the corrector
+  stays the slow safety net). Their env switches, the video IDR-skip executor and the `rsn=` stats token are gone. The
+  timeline has no off switch. Retired but still compiled (deleted after the 2.1 canary soak): LAYERA, the demux absorber,
+  the AGLUE verdicts (`PTV_TL_AGLUE=1` = on, A/B), the slot PLL.
+- Known open: under 50 % packet loss one hole can be classified kept or part-erased by timing; the kept variant loses
+  ~0.4 s of pictures right after a long stall return (gate vt-cin50-s2 loss_500, intermittent on the 2.1 dev builds).
+
 ## 2.0.2-pre8 — 2.0.2-pre7 + a source that switches picture size is scaled in-process (T-406), one timeline after a LAYERA outlier (T-405), wall absence counted once (T-408)
 
 - **A source that switches its picture size keeps running (T-406).** glo-3's four Stingray channels exited ~2,300 times a day:

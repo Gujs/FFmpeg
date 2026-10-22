@@ -2,8 +2,9 @@
  * ptvencoder — 2.1 T-409: the program timeline, source stage (M_in).
  *
  * ONE classifier per input decides every source timing event and applies ONE remedy to every stream of the input
- * (design: analysis/t409-timeline-map-design.md). It replaces, when PTV_TIMELINE=1, the demux absorber, the wall-evidence
- * split, the LAYERA buffer and the door's downstream re-discovery of its own cut.
+ * (design: analysis/t409-timeline-map-design.md). Since 2.1.0 it is the only path: it replaces the demux absorber, the
+ * wall-evidence split, the LAYERA buffer and the door's downstream re-discovery of its own cut (their code stays, not
+ * run, until the 2.1 canary soak — design §7 P5 — then it is deleted).
  *
  * The remedy is the program offset k: every packet of the input leaves the demux labelled L = S + k, S = its source
  * time after the 33-bit unwrap. k is realized through the existing offset state — wrap_off[] of every dense stream and
@@ -508,7 +509,7 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
         if (t->st[si].dense && t->st[si].res == 1)
             av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO, " [s%d %+.3f s]", si,
                    (t->st[si].new_first_us - t->st[si].old_end_us) / 1e6);
-    av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO, " window %.2f s, %d held (PTV_TIMELINE)\n",
+    av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO, " window %.2f s, %d held\n",
            (av_gettime_relative() - t->open_wc) / 1e6, t->nheld);
 
     if (prog_event) {
@@ -668,7 +669,7 @@ int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
             s_us += rp;
             t->ev_n++;
             av_log(NULL, AV_LOG_INFO, "[PTV-TL] event #%"PRId64" (stream %d): single-stream %s %+.3f s on the stream "
-                   "(repair now %+.3f s) (PTV_TIMELINE)\n", t->ev_n, si, rp > 0 ? "relabel, repaired" :
+                   "(repair now %+.3f s)\n", t->ev_n, si, rp > 0 ? "relabel, repaired" :
                    "return leg, repair undone", rp / 1e6, s->rep_us / 1e6);
         }
     }
@@ -681,7 +682,7 @@ int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
         s_us - (s->last_us + s->step_us) <= nw - s->last_wc + tol_us(s)) {
         t->ev_n++;
         av_log(NULL, AV_LOG_INFO, "[PTV-TL] event #%"PRId64" (stream %d): hole kept — J %+.3f s within its own silence of "
-               "%.3f s, labels as sent, no window (PTV_TIMELINE)\n", t->ev_n, si,
+               "%.3f s, labels as sent, no window\n", t->ev_n, si,
                (s_us - (s->last_us + s->step_us)) / 1e6, (nw - s->last_wc) / 1e6);
         path_take(s, s_us, nw);
         return ptv_demux_dispatch(d, pkt);

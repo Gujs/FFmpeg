@@ -47,7 +47,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.2-pre8"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.1.0-pre1"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -78,7 +78,8 @@ int     g_mv_clamp = 0;
  * catch-up. High-rate slots (59.94-in-29.97) pop multiple due frames per tick and display the
  * newest (clean 2:1 decimation instead of hold-queue overflow). A ≥75%-full hold queue
  * bypasses the gate (pressure valve vs a wrong rate estimate). PTV_NO_RESIDENCE reverts. */
-int     g_mv_residence = 1;
+int     g_mv_residence = 1;   /* 2.1: mosaic slots are frame synchronizers (mv_tl_pick); the count-paced residence,
+                               * its re-prime, birth trim and RESFOLLOW are not run (deleted after the 2.1 canary soak) */
 int     g_mv_res_follow = 0;     /* 2.0.2 T-343: a slot's audio follows each deliberate picture step at once — OPT-IN (PTV_RES_FOLLOW=1).
                                   * 2.0.2-pre1 had it on: on real multicast the servo steps each slot ±1 picture every ~10-60 s,
                                   * alternating, and each became a 42 ms silence pad / cut (live-transcoder canary 2026-10-17) */
@@ -110,7 +111,8 @@ int     g_aglue_ceil = 1;     /* 1.0.1-pre17 fix round (R3c): erase a tripwire-R
  * applied to video+audio+copy uniformly so they stay aligned and video stays smooth. On by
  * default; PTV_NO_DISCONT=1 reverts; detect threshold internalized 0.9.18.7 (was PTV_DISCONT_MS; forward DTS jump
  * beyond it = a glitch to absorb). */
-int     g_discont = 1;
+int     g_discont = 1;   /* 2.1: not run — the timeline's classifier owns every label step (deleted after the 2.1
+                          * canary soak) */
 int     g_gapdiscrim = 1;          /* gap-fix (2026-06-26): on a FORWARD audio jump, discriminate an audio-only source GAP
                                            * (video did NOT also cross + this stream was wall-absent ~the jump) from a whole-program
                                            * SPLICE. A GAP is NOT absorbed → aresample=async hard-pads silence → audio stays aligned
@@ -394,7 +396,8 @@ int     g_progoff_av = 1;
  * mis-alignment (g_progoff_av merely shares the first-crosser amount → preserves the source A/V,
  * unwrap_inj≈0 → fast channels that glue mis-muxed content accumulate the error). Supersedes
  * g_progoff_av when set. Re-aligns video if it crossed before audio within the debounce window. */
-int     g_layera = 1;   /* v0.9.10: DEFAULT ON (proven production posture); PTV_NO_LAYERA reverts */
+int     g_layera = 1;   /* v0.9.10: DEFAULT ON; 2.1: forced off — the timeline owns what the LAYERA buffer did (deleted
+                         * after the 2.1 canary soak) */
 /* 0.9.18.5 (In-Touch audio-late accumulator, analysis/ptvencoder-intouch-desync-analysis.md §4b):
  * under g_layera the demux_unwrap absorber used to be skipped for ALL super-threshold jumps, but
  * LAYERA itself only claims jumps >1s — the sub-1s band (80ms..1s backward) had NO packet-layer
@@ -479,7 +482,7 @@ int     g_audio_follow = 1;
  * unchanged (same frame shown), the transcoded audio rides the same h0+house_skew so it stays
  * locked, and the copied audio now only needs to DELAY → correctable. MULTIVIEW ONLY (n_input>1);
  * PTV_NO_H0_REANCHOR=1 reverts. */
-int     g_h0_reanchor = 1;
+int     g_h0_reanchor = 1;   /* 2.1: not run — a slot's frame sync re-locks its lag instead of moving h0 */
 int     g_reanchor2_instant = 0;   /* 1.0.1 (PTV_REANCHOR2_INSTANT=1 reverts): REANCHOR2 fires only when ≥3 of the
                                            * last 5 evaluated ticks held sk < −threshold, with the h0 shift sized from the
                                            * MEDIAN qualifying sk — a single corrupt-PTS frame (DTS intact, so it passes
@@ -525,7 +528,8 @@ int     g_af_anchor = 1;
  * a backward step (the acquire's content-drop and applied step CANCEL in want). MULTIVIEW transcoded
  * audio ONLY; single-input + copy paths untouched. Default OFF for box A/B; PTV_AVSYNC_PLL=1 enables.
  * Sign proven: d(offset)/d(applied) < 0 ⇒ to raise a negative offset (audio late), advance (drop). */
-int     g_avsync_pll = 1;             /* B3 closed-loop A/V controller DEFAULT-ON (v0.6.20, box-validated on cor-2 RAV + live-transcoder grids). PTV_NO_AVSYNC_PLL reverts to the open-loop B1 follow. Multiview transcoded audio only; single-input + copy paths byte-identical regardless. */
+int     g_avsync_pll = 1;             /* 2.1: the slot PLL below is not run — a slot's sound is placed by its frame sync
+                                       * (deleted after the 2.1 canary soak). B3 closed-loop A/V controller DEFAULT-ON (v0.6.20, box-validated on cor-2 RAV + live-transcoder grids). PTV_NO_AVSYNC_PLL reverts to the open-loop B1 follow. Multiview transcoded audio only; single-input + copy paths byte-identical regardless. */
 /* 1.0.1-pre21 #24: the mv audio-follow PLL yields (actuators frozen) while the SAME track's
  * residual corrector is STEERING — the two loops share the graph-door actuator and the PLL's
  * output-alignment objective cancels the corrector 1:1 (p24 gate-1), making mv ENGAGE→PARK

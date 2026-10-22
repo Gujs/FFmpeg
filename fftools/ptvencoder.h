@@ -2405,7 +2405,7 @@ int build_audio_filter(AudioState *a, AVCodecContext *adec, AVRational tb,
 /* ptvencoder_demux.c */
 void *demux_thread(void *arg);
 /* 2.1 T-409: the program timeline (ptvencoder_timeline.c) and the demux helpers it calls */
-extern int     g_timeline;               /* PTV_TIMELINE=1: one classifier per input owns every source timing remedy */
+extern int     g_timeline;               /* 2.1: always 1 — one classifier per input owns every source timing remedy */
 extern int64_t g_tl_open_us;             /* a dense packet this far off its path opens an event (PTV_TL_OPEN_MS, 500) */
 PtvTimeline *ptv_tl_alloc(int nb_streams);
 void ptv_tl_free(PtvTimeline **t);

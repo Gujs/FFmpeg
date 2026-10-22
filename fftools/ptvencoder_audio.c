@@ -886,11 +886,13 @@ static int audio_drain_fg(AudioState *a)
                 cont = a->af_last_out + nb;
                 err  = exact - cont;                           /* samples: + = the sound belongs later */
                 if (err <= -nb / 2) {
+                    a->rs_ma_seed = 0;                         /* the sensor's audio side takes the step with it */
                     av_frame_unref(filt);                      /* late: dropped (the next frames meet the place) */
                     continue;
                 }
                 if (err >= nb / 2) {
                     int64_t n = (err + nb / 2) / nb;
+                    a->rs_ma_seed = 0;
                     while (n-- > 0) {                          /* a hole: silence where the sound is missing */
                         AVFrame *s = av_frame_alloc();
                         if (s) {
@@ -909,7 +911,8 @@ static int audio_drain_fg(AudioState *a)
                 a->af_last_out = cont;
                 filt->pts = cont;
             } else if (a->multiview && g_audio_follow && g_avsync_pll) {
-                /* B3 (Phase B3) — CLOSED-LOOP two-regime controller on the MEASURED av_offset_us.
+                /* 2.1: not run (the branch above places a slot's sound); deleted after the 2.1 canary soak.
+                 * B3 (Phase B3) — CLOSED-LOOP two-regime controller on the MEASURED av_offset_us.
                  * Emits on this SAME content-anchored base (want = opts + applied) so ACQUIRE and TRACK
                  * share one base: the acquire's content-drop (opts jumps +Δq) and applied += Δq CANCEL
                  * in want → continuous, the monotonic guard never sees a backward step. ACQUIRE snaps the
@@ -2140,7 +2143,7 @@ static void ptv_rebuild_reanchor(AudioState *a, const AVFrame *frame)
 /* 2.0.0-pre8.1: may the real frames buffered after a filled hold go to the door now? */
 /* 2.1 T-409: under the timeline the label glue's (AGLUE) step verdicts are bypassed — the labels arrive decided. Turned
  * back on (dev-ah) its pad / trim verdicts re-made T-398's path at the burst cuts: GYF 1 h +96 ms with a -108 ms step
- * (bypassed: -1.1..+0.2 ms); it did not fix sync_storm either. PTV_TL_AGLUE=1 = the verdicts on (development). */
+ * (bypassed: -1.1..+0.2 ms); it did not fix sync_storm either. PTV_TL_AGLUE=1 = the verdicts on (A/B only). */
 static int tl_no_aglue(void)
 {
     static int v = -1;
@@ -2281,8 +2284,11 @@ static int audio_feed(AudioState *a, AVFrame *frame);
 /* 2.1 T-409 (P1, design §3.3/§5.2): the audio is placed where the VIDEO showed the same content (its record, vmap), not
  * with the house_skew of the moment the frame reaches the door — the video shows a label ~1 s after its sound arrives, and
  * around an event that skew moves in between (sync_storm: holes in quick succession inside one hold put the returning
- * sound +15 / -15 / +24 s off its fill). Real frames wait until their content is on air, at most 1.5 s; content the video
- * never showed as such (a video-only outage), or not shown in time, takes the house_skew placement as before. Single input. */
+ * sound +15 / -15 / +24 s off its fill). Single input, the record door: active within 30 s of a program event and while
+ * the source holds. Real frames wait until their content is on air (at least 3 s, and while the video still shows new
+ * pictures; fill sentinels drain the queue by time); content never shown as such (its pictures cut, or a video-only
+ * outage) continues right after the previous placed frame, or takes the house_skew placement when there is none
+ * within 1 s. The silence fill follows where the video is on air. PTV_TL_NO_VMDOOR=1 = the house_skew placement. */
 static int vm_mode(const AudioState *a)
 {
     static int on = -1;
@@ -4423,7 +4429,7 @@ static void hold_fill_quantum(AudioState *a)
      * at the delivery gate). The sentinels keep coming while a track buffers, so look again on each. */
     if (a->rj_n && !a->rj_released && rj_release_ok(a))
         rj_flush(a);
-    /* 2.1 T-409 (PTV_TL_VMDOOR): with the audio placed by the video's record, the fill follows WHERE THE VIDEO IS ON AIR
+    /* 2.1 T-409 (the record door): with the audio placed by the video's record, the fill follows WHERE THE VIDEO IS ON AIR
      * (house output + h0, the placement's own domain) 200 ms behind, instead of time / dup counts since the last real
      * frame: queued sound belongs to content not shown yet, so it lands at or after that point — the fill can never cover
      * it, and the returning frames meet the fill within the margin (aresample pads the rest) */

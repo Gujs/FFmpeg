@@ -4330,7 +4330,7 @@ static void ptv_autobank_escalate(DemuxArgs *d, int64_t worst_us, int64_t now)
  * AGLUE padding the audio by its own label step while the house took whole ticks back (ATRIM) — each leaving a sub-frame
  * remainder as a permanent content A/V step: GYF's production replay walked −4 → +39 ms in an hour of 12 s burst cuts
  * (one step at every cut, 20 ms the largest). The door knows the cut: from the end of the newest picture let through to
- * the keyframe it resumes at, whole pictures. 2.1 T-409 (PTV_TIMELINE): the cut is erased from the program offset (the
+ * the keyframe it resumes at, whole pictures. 2.1 T-409 (the timeline): the cut is erased from the program offset (the
  * timeline moves every stream alike); the audio is let through on the same boundaries, its sub-frame rest is the
  * audio's own continuity (padded / trimmed by its labels). */
 static void door_erase(DemuxArgs *d, const AVStream *vst, int64_t vb)
@@ -4349,7 +4349,7 @@ static void door_erase(DemuxArgs *d, const AVStream *vst, int64_t vb)
     d->door_erased = 1;
     d->door_vb     = vb;
     av_log(NULL, AV_LOG_INFO, "[PTV-SRC] in0 burst: the cut is erased at the door — %.3f s (%"PRId64" pictures) on every "
-           "stream, joined on the pictures' boundaries (PTV_TIMELINE)\n", cut_us / 1e6, cut / fd);
+           "stream, joined on the pictures' boundaries\n", cut_us / 1e6, cut / fd);
 }
 
 /* 2.0.0-pre20 T-364: a packet the depth door drops while the source is LIVE still ARRIVED. The wall-evidence split reads
