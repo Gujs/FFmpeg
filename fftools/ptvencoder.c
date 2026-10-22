@@ -893,6 +893,7 @@ _Atomic int64_t g_src_aread_wc;   /* 2.0.0-pre9.8 (T-076): last transcoded-audio
 int             g_src_hold_act;
 _Atomic int64_t g_src_rejoin_wall;
 _Atomic int64_t g_tl_prog_wc;
+_Atomic int     g_vm_waiting;
 _Atomic int64_t g_src_fresh_wc;          /* 2.0.0-pre6: wall us of the master's last FRESH frame */
 _Atomic int64_t g_afill_us[PTV_MAX_AUDIO];   /* 2.0.0-pre8: afill= */
 _Atomic int     g_rj_cls_seq, g_rj_cls;      /* 2.0.0-pre8.1 */
@@ -6598,6 +6599,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         as[k].v_arrive_wc = &inputs[asrc_in[k]].v_arrive_wc;  /* pre17: §3 per-input liveness — the corrector
                                                                * reads THIS input's arrival watermark */
         as[k].acomp_exp_us = AV_NOPTS_VALUE;             /* [PTV-ACOMP] no expected-pts reference yet */
+        as[k].vm_last_out  = AV_NOPTS_VALUE;             /* 2.1 T-409: no record-door frame placed yet */
         as[k].tick_dur_us = av_rescale(1000000, out_fps.den, out_fps.num);  /* 1.0.1: house tick = the PLL's vlag quantum (one house clock for all slots) */
         for (r = 0; r < n_rung; r++) {
             as[k].mux_q[r] = rung[r].mux_q;

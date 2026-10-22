@@ -3035,9 +3035,8 @@ static int vm_mode(const AudioState *a)
     static int on = -1;
     int64_t pw;
     if (on < 0)
-        on = !!getenv("PTV_TL_VMDOOR");    /* development: fixes sync_storm, but the old time-driven silence fill fights it
-                                            * (flapping / bursty: audio PID dark 3.6 / 12.6 s) — needs the exact door's fill
-                                            * (fill = the space between placed frames), design §5.2 */
+        on = !getenv("PTV_TL_NO_VMDOOR");  /* the default under the timeline (sync_storm, bursty, flapping);
+                                            * PTV_TL_NO_VMDOOR=1 = the house_skew placement */
     if (!on || !g_timeline || !g_vmap || a->multiview || !g_avlock || !a->house_skew)
         return 0;
     if (a->vm_n)
@@ -3059,9 +3058,18 @@ static int vm_drain(AudioState *a, int force)
             break;                                  /* not on air yet: wait while the video still shows new pictures (a burst
                                                      * backlog waits its whole bank delay), at least 3 s */
         a->vm_out_us = r == 1 && gap <= FFMAX(2 * tick, 50000) ? o : AV_NOPTS_VALUE;
+        /* content never shown as such (its pictures cut at the burst door, or still held when the video went stale):
+         * it continues where the previous frame was placed — the house_skew placement belongs to another domain
+         * (sync_bursty_20: 4 frames at the end of a cut stepped the door input −15 s, audio PID dark 1.6 s) */
+        if (a->vm_out_us == AV_NOPTS_VALUE && a->vm_last_out != AV_NOPTS_VALUE &&
+            lab > a->vm_last_lab && lab - a->vm_last_lab < 1000000)
+            a->vm_out_us = a->vm_last_out + (lab - a->vm_last_lab);
+        a->vm_last_lab = lab;
+        a->vm_last_out = a->vm_out_us;
         memmove(a->vm_q, a->vm_q + 1, (a->vm_n - 1) * sizeof(*a->vm_q));
         memmove(a->vm_wc, a->vm_wc + 1, (a->vm_n - 1) * sizeof(*a->vm_wc));
-        a->vm_n--;
+        if (!--a->vm_n)
+            atomic_fetch_sub_explicit(&g_vm_waiting, 1, memory_order_relaxed);
         a->vm_feeding = 1;
         ret = audio_feed(a, f);
         a->vm_feeding = 0;
@@ -3134,6 +3142,8 @@ static int audio_feed(AudioState *a, AVFrame *frame)
         if (!(c = av_frame_clone(frame)))
             return AVERROR(ENOMEM);
         a->vm_wc[a->vm_n]  = av_gettime_relative();
+        if (!a->vm_n)
+            atomic_fetch_add_explicit(&g_vm_waiting, 1, memory_order_relaxed);
         a->vm_q[a->vm_n++] = c;
         return vm_drain(a, 0);
     }

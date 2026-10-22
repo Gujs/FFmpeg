@@ -1302,6 +1302,7 @@ typedef struct AudioState {
     int64_t          vm_wc[PTV_VMQ];
     int              vm_n, vm_feeding;
     int64_t          vm_out_us;              /* this frame's placement from the video's record (output us), or NOPTS */
+    int64_t          vm_last_lab, vm_last_out;   /* the previous record-door frame: label, placement (or NOPTS) */
     int64_t          hold_drop_n;                     /* 2.0.0-pre9.4: real frames dropped while the source held */
     int              rj_n, rj_released, rj_releasing, rj_cls_seq0;
     int64_t          rj_t0;                           /* wall us the first frame was buffered */
@@ -2344,6 +2345,7 @@ extern int             g_src_hold_act;   /* 2.0.0-pre4: act on STALLED (engine f
                                           * only (PTV_HOLD_OBSERVE=1, the pre3 behaviour) */
 extern _Atomic int64_t g_src_rejoin_wall; /* 2.0.0-pre4: wall us of the last STALLED -> LIVE (0 = never) */
 extern _Atomic int64_t g_tl_prog_wc;      /* 2.1 T-409: wall us of the timeline's last program event (single input) */
+extern _Atomic int     g_vm_waiting;      /* 2.1 T-409: tracks with frames waiting at the record door (fill sentinels) */
 extern _Atomic int64_t g_src_fresh_wc;    /* 2.0.0-pre6: wall us of the master's last fresh (non-dup) frame,
                                            * stored after that tick's house_skew write */
 extern _Atomic int     g_src_icb_armed;   /* 2.0.0-pre5: the no-video read interrupt is live (single input) */

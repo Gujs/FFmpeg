@@ -1718,9 +1718,13 @@ void *output_thread(void *arg)
          * silence test), so input flowing through a frame-queue underrun fills nothing; a sentinel to such a
          * track is free. 1 s left a 0.9 s dark wire at an outage start (sync_gap_20), 200 ms + a 300 ms track
          * floor still 333 ms. pre8.1: also while a track buffers its post-rejoin frames — the input is LIVE again but
-         * the door must keep filling until they are released, or the wire pauses for the buffering (0.32 s). */
+         * the door must keep filling until they are released, or the wire pauses for the buffering (0.32 s).
+         * 2.1 T-409: also while a track's frames wait at the record door — they are released by time (their content
+         * goes on air), and a burst door that drops every arriving packet left them queued until the next arrival
+         * (sync_bursty_20: 12 s of sound fed 12.2 s after its pictures were shown, audio PID dark 12.3 s) */
         if (g_hold_fill && (v->n_hold_aq || v->hold_da) && g_src_watch && g_src_hold_act &&
             (ptv_src_holding() || atomic_load_explicit(&g_rj_buffering, memory_order_relaxed) > 0 ||
+             atomic_load_explicit(&g_vm_waiting, memory_order_relaxed) > 0 ||
              av_gettime_relative() - atomic_load_explicit(&g_src_fresh_wc, memory_order_relaxed) >= 120000)) {
             int64_t nw = av_gettime_relative();
             if (nw - v->hold_fill_wc >= 100000) {
