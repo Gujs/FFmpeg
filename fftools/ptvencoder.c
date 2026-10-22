@@ -47,7 +47,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.0.2-pre8"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.1.0-pre1"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -78,7 +78,8 @@ int     g_mv_clamp = 0;
  * catch-up. High-rate slots (59.94-in-29.97) pop multiple due frames per tick and display the
  * newest (clean 2:1 decimation instead of hold-queue overflow). A ≥75%-full hold queue
  * bypasses the gate (pressure valve vs a wrong rate estimate). PTV_NO_RESIDENCE reverts. */
-int     g_mv_residence = 1;
+int     g_mv_residence = 1;   /* 2.1: mosaic slots are frame synchronizers (mv_tl_pick); the count-paced residence,
+                               * its re-prime, birth trim and RESFOLLOW are not run (deleted after the 2.1 canary soak) */
 int     g_mv_res_follow = 0;     /* 2.0.2 T-343: a slot's audio follows each deliberate picture step at once — OPT-IN (PTV_RES_FOLLOW=1).
                                   * 2.0.2-pre1 had it on: on real multicast the servo steps each slot ±1 picture every ~10-60 s,
                                   * alternating, and each became a 42 ms silence pad / cut (live-transcoder canary 2026-10-17) */
@@ -110,7 +111,8 @@ int     g_aglue_ceil = 1;     /* 1.0.1-pre17 fix round (R3c): erase a tripwire-R
  * applied to video+audio+copy uniformly so they stay aligned and video stays smooth. On by
  * default; PTV_NO_DISCONT=1 reverts; detect threshold internalized 0.9.18.7 (was PTV_DISCONT_MS; forward DTS jump
  * beyond it = a glitch to absorb). */
-int     g_discont = 1;
+int     g_discont = 1;   /* 2.1: not run — the timeline's classifier owns every label step (deleted after the 2.1
+                          * canary soak) */
 int     g_gapdiscrim = 1;          /* gap-fix (2026-06-26): on a FORWARD audio jump, discriminate an audio-only source GAP
                                            * (video did NOT also cross + this stream was wall-absent ~the jump) from a whole-program
                                            * SPLICE. A GAP is NOT absorbed → aresample=async hard-pads silence → audio stays aligned
@@ -147,85 +149,8 @@ int     g_wallev = 1;              /* 1.0.1-pre24 #63 WALL-EVIDENCE SPLIT (the c
                                            * portion (real missing content → PAD) and J−W = flowing/relabel portion
                                            * (label lie → ERASE, as today). PTV_NO_WALLEV=1 reverts the ACTION at every
                                            * touched site (the storm-diag counterfactual); the W measurement itself
-                                           * stays on — it feeds the re-anchor corroboration provenance. See the
+                                           * stays on — it feeds the [PTV-WALLEV] conservation diag. See the
                                            * PTV_WALLEV_HARDCAP_US block in ptvencoder.h. */
-int     g_recanchor = 1;           /* 1.0.1-pre24 #63 CORROBORATED RECOVERY RE-ANCHOR (owner mandate 2026-07-24:
-                                           * "perfect lip sync once input is OK again"): one-shot, health-gated, slewed
-                                           * base re-anchor of a large stable R — ONLY when the unevidenced-deletion
-                                           * ledgers corroborate a real deletion imbalance ≈ R (aseam-class pinned-R
-                                           * false positives read 0 there and must never engage — a naive trust of
-                                           * large stable R would CREATE a desync on relabel channels).
-                                           * PTV_NO_RECANCHOR=1 disables. */
-int64_t g_recanchor_settle_us   = 300LL  * 1000000; /* PTV_RECANCHOR_SETTLE_S */
-int64_t g_recanchor_cooldown_us = 1800LL * 1000000; /* PTV_RECANCHOR_COOLDOWN_S */
-int     g_recanchor_test_abort_n = 0;  /* TEST ONLY (rr24 F2 gate): force ONE mid-walk abort after
-                                        * N applied steps, no content event injected — so the clean
-                                        * re-engage-on-remainder path can be gated. 0 = off (default,
-                                        * byte-identical). PTV_RECANCHOR_TEST_ABORT_N. */
-int     g_resync = 1;              /* 1.0.1-pre29 #69 RESYNC (default ON since pre29.1 per the project
-                                           * convention — new engines arm by default on the pre train,
-                                           * PTV_NO_RESYNC=1 disables; owner 2026-07-29): the
-                                           * hard-reset second engage path inside ptv_recanchor for the
-                                           * >PTV_RESYNC_MS dead zone. lipsync= R is owner-verified correct
-                                           * (4/4 by eye, both signs, up to 20s) — a large STABLE R is a real
-                                           * on-air desync, but today the implausibility disarm plus the
-                                           * RECANCHOR corroboration refusal leave |R|>5s unowned. A confirmed
-                                           * timer (no corroboration — the confirm span + health gates are the
-                                           * evidence) fires ONE whole backward step (audio LATE: skip seam)
-                                           * or a chunked forward walk (audio EARLY: silence-pad seams), then
-                                           * runs the RECANCHOR ledger amnesty. PTV_NO_RESYNC=1 =
-                                           * byte-identical pre28 (kill switch). */
-int64_t g_resync_ms_us          = 350000;          /* PTV_RESYNC_MS (350ms band threshold) */
-int64_t g_resync_ok_us          = 150000;          /* PTV_RESYNC_OK_MS (timer close / walk done) */
-int64_t g_resync_confirm_us     = 120LL * 1000000; /* PTV_RESYNC_CONFIRM_S */
-int64_t g_resync_confirm_big_us = 60LL  * 1000000; /* PTV_RESYNC_CONFIRM_BIG_S (|R0| > 2s) */
-/* NO routine cooldown (owner decision 2026-07-28: a seam costs <1s, a desync costs the whole
- * wait — the fresh confirm window IS the seam-spacing floor, ~1 per 60-120s max). The
- * CIRCUIT BREAKER below exists solely to surface+contain pathological loops (a resync
- * self-oscillation, an extreme source thrash-storm) at ERROR level, with an escalating
- * backoff (#49 ACQUIRE / pre27 AFMT-breaker pattern, fixed 120s base ×2 → 600s cap). */
-int     g_resync_breaker_n      = 4;               /* PTV_RESYNC_BREAKER_N: fires within the window that ARM */
-int64_t g_resync_breaker_win_us = 900LL  * 1000000;/* PTV_RESYNC_BREAKER_WIN_S */
-int64_t g_resync_quiet_us       = 1800LL * 1000000;/* PTV_RESYNC_QUIET_S: R below the band this long
-                                                    * DISARMS the breaker and clears the fire history */
-int64_t g_resync_chunk_us       = 2000000;         /* PTV_RESYNC_CHUNK_MS (audio-early chunk) */
-int64_t g_resync_chunk_gap_us   = 5LL   * 1000000; /* PTV_RESYNC_CHUNK_GAP_S */
-/* ---- 1.0.1-pre30 #69 refinements ---- */
-int64_t g_resync_seam_hold_us   = 20LL  * 1000000; /* PTV_RESYNC_SEAM_HOLD_S (item A): post-seam
-                                                    * sensor hold. Live evidence (i24/Law&Crime
-                                                    * 2026-07-29): the instant post-seam reading is
-                                                    * garbage-negative and decays ~12ms/s, so the
-                                                    * hold buys re-convergence headroom, and the
-                                                    * 2-consecutive-stable-samples rule after it
-                                                    * (5s spacing, <50ms motion) refuses a reading
-                                                    * that is still decaying. 0 disables. */
-int     g_resync_vskip          = 1;               /* item B: audio-EARLY default actuator = video
-                                                    * IDR-skip jump cut (owner mandate: "drop video,
-                                                    * not insert silence"). PTV_RESYNC_SILENCE=1
-                                                    * reverts to the pre29 silence-pad chunks; that
-                                                    * path also remains the in-walk fallback when no
-                                                    * IDR is viable inside the horizon. */
-int64_t g_resync_idr_wait_us    = 5LL   * 1000000; /* PTV_RESYNC_IDR_WAIT_S (item B): executor bound
-                                                    * waiting for a usable IDR (~2× typical GOP) */
-int64_t g_resync_vskip_tol_us   = 250000;          /* PTV_RESYNC_VSKIP_TOL_MS (item B): whole-GOP
-                                                    * overshoot tolerance (skip ≤ R + tol) */
-int64_t g_resync_walk_ceil_us   = 600LL * 1000000; /* PTV_RESYNC_WALK_CEIL_S (rr30 T1): walk
-                                                    * liveness ceiling — a never-stable sensor
-                                                    * (readings moving ≥50ms every sample) never
-                                                    * satisfies item A's corroboration, so a walk
-                                                    * would otherwise pin rsn_active FOREVER
-                                                    * (blocking the corrector via resync_owns);
-                                                    * abort + settle when no seam/complete lands
-                                                    * for this long. 10x the worst measured
-                                                    * post-seam settle (~1-2min). 0 disables. */
-/* item B cross-thread state — see ptvencoder.h for the handshake/mapping contract */
-_Atomic int64_t g_vskip_req_us;
-_Atomic int     g_vskip_state;
-_Atomic int64_t g_vskip_done_us;
-_Atomic int     g_vskip_done_gops;
-_Atomic int64_t g_vskip_off_total;
-_Atomic int64_t g_vskip_off_before;
-_Atomic int64_t g_vskip_from_us;
 _Atomic int64_t g_rj_off_total, g_rj_off_before, g_rj_from_us;   /* 2.0.0-pre6.1 rejoin map */
 _Atomic int     g_rj_epoch;
 _Atomic int64_t g_house_out_us, g_house_tick_us;
@@ -347,14 +272,10 @@ _Atomic int64_t g_dup_out_us;   /* 2.0.0-pre9.4 (T-083): output time on ticks wh
 int             g_rejoin_map = 1;
 int64_t         g_hold_clean_us = 1000000;
 int             g_vo_hold = 1;   /* 2.0.0-pre9.8 (T-076): audio keeps its own clock while only the video is gone; PTV_NO_VO_HOLD=1 off */
-_Atomic int     g_vskip_epoch;
-_Atomic int64_t g_vgop_est_us;
-_Atomic int64_t g_vgop_key_wall;
 int64_t g_rscorr_slew_fast      = 5000;            /* pre29 adaptive corrector slew above 150ms |R|
                                                     * (PTV_RSCORR_SLEW_FAST µs/s; 0 = always the base
-                                                    * clamp). Active regardless of PTV_RESYNC — 0.5%
-                                                    * rate is below the pitch JND, inaudible. */
-_Atomic int64_t g_rsn_pub[PTV_MAX_AUDIO];          /* pre29: resync fire count (stats rsn= token) */
+                                                    * clamp). 0.5% rate is below the pitch JND,
+                                                    * inaudible. */
 int     g_muxguard = 1;            /* 1.0.1-pre26 [PTV-MUXGUARD] survive-first mux backstop: drop (never
                                            * re-stamp) any packet whose DTS would EINVAL lavf's per-stream
                                            * monotonic feed check, instead of letting one leaked backward label
@@ -475,7 +396,8 @@ int     g_progoff_av = 1;
  * mis-alignment (g_progoff_av merely shares the first-crosser amount → preserves the source A/V,
  * unwrap_inj≈0 → fast channels that glue mis-muxed content accumulate the error). Supersedes
  * g_progoff_av when set. Re-aligns video if it crossed before audio within the debounce window. */
-int     g_layera = 1;   /* v0.9.10: DEFAULT ON (proven production posture); PTV_NO_LAYERA reverts */
+int     g_layera = 1;   /* v0.9.10: DEFAULT ON; 2.1: forced off — the timeline owns what the LAYERA buffer did (deleted
+                         * after the 2.1 canary soak) */
 /* 0.9.18.5 (In-Touch audio-late accumulator, analysis/ptvencoder-intouch-desync-analysis.md §4b):
  * under g_layera the demux_unwrap absorber used to be skipped for ALL super-threshold jumps, but
  * LAYERA itself only claims jumps >1s — the sub-1s band (80ms..1s backward) had NO packet-layer
@@ -560,7 +482,7 @@ int     g_audio_follow = 1;
  * unchanged (same frame shown), the transcoded audio rides the same h0+house_skew so it stays
  * locked, and the copied audio now only needs to DELAY → correctable. MULTIVIEW ONLY (n_input>1);
  * PTV_NO_H0_REANCHOR=1 reverts. */
-int     g_h0_reanchor = 1;
+int     g_h0_reanchor = 1;   /* 2.1: not run — a slot's frame sync re-locks its lag instead of moving h0 */
 int     g_reanchor2_instant = 0;   /* 1.0.1 (PTV_REANCHOR2_INSTANT=1 reverts): REANCHOR2 fires only when ≥3 of the
                                            * last 5 evaluated ticks held sk < −threshold, with the h0 shift sized from the
                                            * MEDIAN qualifying sk — a single corrupt-PTS frame (DTS intact, so it passes
@@ -606,7 +528,8 @@ int     g_af_anchor = 1;
  * a backward step (the acquire's content-drop and applied step CANCEL in want). MULTIVIEW transcoded
  * audio ONLY; single-input + copy paths untouched. Default OFF for box A/B; PTV_AVSYNC_PLL=1 enables.
  * Sign proven: d(offset)/d(applied) < 0 ⇒ to raise a negative offset (audio late), advance (drop). */
-int     g_avsync_pll = 1;             /* B3 closed-loop A/V controller DEFAULT-ON (v0.6.20, box-validated on cor-2 RAV + live-transcoder grids). PTV_NO_AVSYNC_PLL reverts to the open-loop B1 follow. Multiview transcoded audio only; single-input + copy paths byte-identical regardless. */
+int     g_avsync_pll = 1;             /* 2.1: the slot PLL below is not run — a slot's sound is placed by its frame sync
+                                       * (deleted after the 2.1 canary soak). B3 closed-loop A/V controller DEFAULT-ON (v0.6.20, box-validated on cor-2 RAV + live-transcoder grids). PTV_NO_AVSYNC_PLL reverts to the open-loop B1 follow. Multiview transcoded audio only; single-input + copy paths byte-identical regardless. */
 /* 1.0.1-pre21 #24: the mv audio-follow PLL yields (actuators frozen) while the SAME track's
  * residual corrector is STEERING — the two loops share the graph-door actuator and the PLL's
  * output-alignment objective cancels the corrector 1:1 (p24 gate-1), making mv ENGAGE→PARK
@@ -892,6 +815,8 @@ _Atomic int64_t g_src_vread_wc;
 _Atomic int64_t g_src_aread_wc;   /* 2.0.0-pre9.8 (T-076): last transcoded-audio packet read (single input) */
 int             g_src_hold_act;
 _Atomic int64_t g_src_rejoin_wall;
+_Atomic int64_t g_tl_prog_wc;
+_Atomic int     g_vm_waiting;
 _Atomic int64_t g_src_fresh_wc;          /* 2.0.0-pre6: wall us of the master's last FRESH frame */
 _Atomic int64_t g_afill_us[PTV_MAX_AUDIO];   /* 2.0.0-pre8: afill= */
 _Atomic int     g_rj_cls_seq, g_rj_cls;      /* 2.0.0-pre8.1 */
@@ -3065,7 +2990,7 @@ strip:
 
 static void rejoin_map(DecodeCtx *d, const AVFrame *frame)
 {
-    int64_t src_us, h0, pos, next, tick, lead, old, vs;
+    int64_t src_us, h0, pos, next, tick, lead, old;
     int qn;
 
     if (!g_rejoin_map || !g_src_hold_act)
@@ -3087,10 +3012,7 @@ static void rejoin_map(DecodeCtx *d, const AVFrame *frame)
     if (h0 == AV_NOPTS_VALUE || tick <= 0)
         return;
     src_us = av_rescale_q(frame->best_effort_timestamp, d->ist_tb, AV_TIME_BASE_Q);
-    vs = atomic_load_explicit(&g_vskip_off_total, memory_order_acquire);
-    if (vs && src_us < atomic_load_explicit(&g_vskip_from_us, memory_order_relaxed))
-        vs = atomic_load_explicit(&g_vskip_off_before, memory_order_relaxed);
-    pos  = src_us - h0 - vs - ptv_rj_off(src_us);                 /* where content_index() would put it now */
+    pos  = src_us - h0 - ptv_rj_off(src_us);                 /* where content_index() would put it now */
     /* 2.0.0 T-317: the house tick THIS frame will be shown on — after the frames already queued for the master. Against
      * the very next tick, a catch-up burst (decoded faster than real time) looked "ahead" once ~3 s of it were queued
      * (sync_stop_5: lead −2.88 s on the first returning frame, +0.08 s on the 74th, queued): the map shifted contiguous
@@ -3102,15 +3024,15 @@ static void rejoin_map(DecodeCtx *d, const AVFrame *frame)
     lead = pos - next;
     if (g_diag && d->rj_dbg_n < 16) {   /* 2.0.0-pre8.2: [PTV-RJTRACE] (canary B: the map cancelled — localize) */
         d->rj_dbg_n++;
-        av_log(NULL, AV_LOG_INFO, "[PTV-RJTRACE] dec src=%.3f pict=%c key=%d pos=%.3f next=%.3f lead=%+.3f qn=%d vs=%.3f "
+        av_log(NULL, AV_LOG_INFO, "[PTV-RJTRACE] dec src=%.3f pict=%c key=%d pos=%.3f next=%.3f lead=%+.3f qn=%d "
                "h0=%.3f holding=%d\n", src_us / 1e6, av_get_picture_type_char(frame->pict_type),
-               !!(frame->flags & AV_FRAME_FLAG_KEY), pos / 1e6, next / 1e6, lead / 1e6, qn, vs / 1e6, h0 / 1e6,
+               !!(frame->flags & AV_FRAME_FLAG_KEY), pos / 1e6, next / 1e6, lead / 1e6, qn, h0 / 1e6,
                ptv_src_holding());
     }
     if (lead <= tick)
         return;
     old = atomic_load_explicit(&g_rj_off_total, memory_order_relaxed);
-    atomic_store_explicit(&g_rj_off_before, old, memory_order_relaxed);      /* vskip's write order */
+    atomic_store_explicit(&g_rj_off_before, old, memory_order_relaxed);      /* the two-tier write order (ptvencoder.h) */
     /* 2.0.0-pre8.3: key the map 1 s BELOW the deciding frame. The clock sees the filter graph's output, not the
      * decoder's: on the canary (GB_News, 1080i through hwupload + bwdif_cuda) the frame after the deciding one came out
      * stamped 20 ms below it, missed the offset, landed 2.56 s ahead and the monotonic house jumped +2.32 s onto it —
@@ -3545,146 +3467,6 @@ static void *decode_thread(void *arg)
                 }
             }
         }
-        /* 1.0.1-pre30 #69 (item B) VIDEO IDR-SKIP EXECUTOR: the resync audio-EARLY actuator.
-         * The audio thread posted a target span; skip that much video content FORWARD here at
-         * the video_q pop site — upstream of decode and the rung split, so every rung skips
-         * the same content coherently — by dropping whole GOPs from the head, exactly the
-         * pre8 QSHED shape (the stop KEY decodes; the decoder input stays contiguous whole
-         * GOPs). Greedy whole-GOP rule: keep dropping while (span-to-this-key + gop_est) ≤
-         * target + tol — the largest whole-GOP total ≤ R + tol; the sub-GOP residual goes to
-         * the corrector (the same +125ms handoff as a chunked walk). Label-neutrality: the
-         * achieved span is published as a src-keyed offset that content_index() subtracts for
-         * post-boundary content, so output labels continue monotonically while content jumps
-         * (the video mirror of the audio-late reanch_mono skip seam); the m_v EMA re-seeds at
-         * the first post-boundary emit (g_vskip_epoch). If no usable IDR appears within
-         * PTV_RESYNC_IDR_WAIT_S, escape: resume decoding mid-GOP UNFLUSHED (Session-109
-         * posture — rr30 honesty: on SW h264 the frame_num-gap concealment decodes those
-         * frames against stale/dummy refs with NO corrupt flag, so expect smear, not a
-         * clean freeze, until the next key; flushing instead would permanently freeze a
-         * no-IDR source) and report the partial span so the walk falls back to silence
-         * chunks. */
-        if (!pkt && g_resync && g_resync_vskip && d->live && !d->hold) {
-            int64_t tgt = atomic_exchange_explicit(&g_vskip_req_us, 0, memory_order_relaxed);
-            if (tgt > 0) {
-                int64_t deadline = av_gettime_relative() + g_resync_idr_wait_us;
-                int64_t gop_est  = atomic_load_explicit(&g_vgop_est_us, memory_order_relaxed);
-                int64_t d0 = AV_NOPTS_VALUE, dl = AV_NOPTS_VALUE, lkey = AV_NOPTS_VALUE;
-                int64_t achieved = 0, boundary = AV_NOPTS_VALUE;
-                int     gops = 0, ndrop = 0, escape = 0;
-                if (gop_est <= 0) gop_est = 1000000;             /* fire-side gate vetted it; belt+braces */
-                for (;;) {
-                    AVPacket *sp;
-                    int rc = av_thread_message_queue_recv(d->video_q, &sp,
-                                                          AV_THREAD_MESSAGE_NONBLOCK);
-                    if (rc == AVERROR(EAGAIN)) {
-                        if (av_gettime_relative() > deadline) { escape = 1; break; }
-                        PTV_HB_VDEC(d->hb_slot, PTV_HB_VDEC_QRECV);   /* waiting = residence, not a stall */
-                        av_usleep(5000);
-                        continue;
-                    }
-                    if (rc < 0) { escape = 1; break; }           /* queue closed/EOF: stop */
-                    if ((sp->flags & AV_PKT_FLAG_KEY) && d0 != AV_NOPTS_VALUE) {
-                        int64_t kts  = sp->dts != AV_NOPTS_VALUE ? sp->dts : sp->pts;
-                        int64_t span = kts != AV_NOPTS_VALUE
-                            ? av_rescale_q(kts - d0, d->ist_tb, AV_TIME_BASE_Q) : 0;
-                        if (lkey != AV_NOPTS_VALUE && kts != AV_NOPTS_VALUE && kts > lkey) {
-                            int64_t g = av_rescale_q(kts - lkey, d->ist_tb, AV_TIME_BASE_Q);
-                            if (g > 0 && g < 30000000) gop_est = g;   /* live update while walking */
-                        }
-                        if (span + gop_est > tgt + g_resync_vskip_tol_us || span >= tgt) {
-                            pkt      = sp;                       /* STOP: this key DECODES */
-                            achieved = span;
-                            boundary = sp->pts != AV_NOPTS_VALUE
-                                ? av_rescale_q(sp->pts, d->ist_tb, AV_TIME_BASE_Q)
-                                : av_rescale_q(kts, d->ist_tb, AV_TIME_BASE_Q);
-                            break;
-                        }
-                        lkey = kts;                              /* this whole GOP goes too */
-                        gops++;
-                    } else if ((sp->flags & AV_PKT_FLAG_KEY) && d0 == AV_NOPTS_VALUE) {
-                        lkey = sp->dts != AV_NOPTS_VALUE ? sp->dts : sp->pts;
-                        gops++;                                  /* head IS a key: GOP 1 starts the skip */
-                    }
-                    if (sp->dts != AV_NOPTS_VALUE) {
-                        if (d0 == AV_NOPTS_VALUE) d0 = sp->dts;
-                        dl = sp->dts;
-                    }
-                    ndrop++;
-                    av_packet_free(&sp);
-                    /* rr30 (T4): RUNNING SPAN BOUND — the stop rule only evaluates at KEYS,
-                     * so a GOP that turns out longer than the estimate (film→ad break,
-                     * 1s→4s) would otherwise drop its WHOLE real length before the next key
-                     * (worst case: audio flips LATE by new-GOP − R, a bigger desync than
-                     * the one being fixed, then hold+abort+settle before recovery). Bound
-                     * the dropped span at target+tol at PACKET granularity: past it, escape
-                     * mid-GOP exactly like the deadline path (partial span, silence chunks
-                     * own the remainder). */
-                    if (d0 != AV_NOPTS_VALUE && dl != AV_NOPTS_VALUE && dl > d0 &&
-                        av_rescale_q(dl - d0, d->ist_tb, AV_TIME_BASE_Q) >
-                            tgt + g_resync_vskip_tol_us) {
-                        escape = 1;
-                        break;
-                    }
-                }
-                if (escape && d0 != AV_NOPTS_VALUE && dl != AV_NOPTS_VALUE && dl > d0) {
-                    achieved = av_rescale_q(dl - d0, d->ist_tb, AV_TIME_BASE_Q);
-                    boundary = av_rescale_q(dl, d->ist_tb, AV_TIME_BASE_Q) + 1000;   /* just past the last drop */
-                }
-                if (achieved > 0 && boundary != AV_NOPTS_VALUE) {
-                    int64_t nw  = av_gettime_relative();
-                    int64_t old = atomic_load_explicit(&g_vskip_off_total, memory_order_relaxed);
-                    /* rr30 (T2b): clean-IDR resume FLUSHES the decoder first — the selfheal
-                     * executor's deferred-reset recipe. Without it a non-IDR stop key
-                     * (recovery-point SEI sets AV_PKT_FLAG_KEY too) leaves pre-skip refs in
-                     * the DPB, and h264's frame_num-gap concealment then papers stale
-                     * content into the skipped range with NO corrupt flag (the CORRUPT
-                     * check never sees it) — smeared frames on air under clean labels.
-                     * Flushed, everything before the recovery point is suppressed by the
-                     * decoder itself. The deadline ESCAPE stays deliberately UNFLUSHED
-                     * (Session-109 posture: a no-IDR source's established sync is the only
-                     * one it will ever have). */
-                    if (!escape)
-                        avcodec_flush_buffers(d->vdec);
-                    /* mapping publish — WRITE ORDER is the readers' consistency contract:
-                     * off_before (old total) → from (new boundary) → off_total (new total,
-                     * RELEASE: content_index() acquire-loads off_total first, so seeing the
-                     * new total guarantees it sees the new boundary — rr30 (T2a), relaxed
-                     * stores alone let the compiler/CPU tear the pair). In-flight frames
-                     * older than the new boundary keep the old mapping; post-boundary
-                     * frames (not yet decoded) pick up the new one. */
-                    atomic_store_explicit(&g_vskip_off_before, old, memory_order_relaxed);
-                    atomic_store_explicit(&g_vskip_from_us, boundary, memory_order_relaxed);
-                    atomic_store_explicit(&g_vskip_off_total, old + achieved, memory_order_release);
-                    atomic_fetch_add_explicit(&g_vskip_epoch, 1, memory_order_relaxed);
-                    /* self-made-gap honesty + catch-up governor engagement (the QSHED stamps) */
-                    d->shed_pkts += ndrop;
-                    atomic_store_explicit(&g_shed_wall, nw, memory_order_relaxed);
-                    atomic_fetch_add_explicit(&g_shed_cnt, ndrop, memory_order_relaxed);
-                    if (d->shed_wall) atomic_store_explicit(d->shed_wall, nw, memory_order_relaxed);
-                    if (d->shed_cnt)  atomic_fetch_add_explicit(d->shed_cnt, ndrop, memory_order_relaxed);
-                    atomic_store_explicit(&g_vskip_done_us, achieved, memory_order_relaxed);
-                    atomic_store_explicit(&g_vskip_done_gops, gops, memory_order_relaxed);
-                    atomic_store_explicit(&g_vskip_state,
-                                          escape ? PTV_VSKIP_ESCAPE : PTV_VSKIP_DONE,
-                                          memory_order_release);
-                    av_log(NULL, escape ? AV_LOG_ERROR : AV_LOG_WARNING,
-                           "[PTV-VSKIP] skipped %"PRId64"ms video content (%d GOPs, %d pkts) at the "
-                           "video_q head%s — labels continue (offset %+"PRId64"ms from src %"PRId64"ms)\n",
-                           achieved / 1000, gops, ndrop,
-                           escape ? "; DEADLINE ESCAPE, resuming mid-GOP unflushed (decoder "
-                                    "conceals until the next key)" : ", resuming at the stop IDR",
-                           (old + achieved) / 1000, boundary / 1000);
-                } else {
-                    atomic_store_explicit(&g_vskip_done_us, 0, memory_order_relaxed);
-                    atomic_store_explicit(&g_vskip_done_gops, 0, memory_order_relaxed);
-                    atomic_store_explicit(&g_vskip_state, PTV_VSKIP_REFUSED, memory_order_release);
-                    av_log(NULL, AV_LOG_WARNING,
-                           "[PTV-VSKIP] no skippable GOP inside the %"PRId64"s horizon (target "
-                           "%"PRId64"ms) — refusing; the walk falls back to silence chunks\n",
-                           g_resync_idr_wait_us / 1000000, tgt / 1000);
-                }
-            }
-        }
         if (!pkt) {
             /* Timed recv (rr8 review defect 1, heal reachability): the heal executor lives in
              * THIS thread, so a pending g_selfheal_req must be servable even while video_q is
@@ -3789,26 +3571,6 @@ static void *decode_thread(void *arg)
             int64_t nws = av_gettime_relative();
             if (nws >= g_slow_dec_on_us && (!g_slow_dec_off_us || nws < g_slow_dec_off_us))
                 av_usleep(g_slow_dec);
-        }
-        /* 1.0.1-pre30 #69 (item B): GOP-span estimator — key-to-key dts spacing EMA at the pop
-         * site, published for the resync fire-side viability gate (vskip is only chosen when a
-         * whole GOP fits inside R + tol and a key passed recently). Measurement only; gated on
-         * g_resync so PTV_NO_RESYNC keeps the path inert. */
-        if (g_resync && d->live && !d->hold && (pkt->flags & AV_PKT_FLAG_KEY)) {
-            int64_t kdts = pkt->dts != AV_NOPTS_VALUE ? pkt->dts : pkt->pts;
-            if (kdts != AV_NOPTS_VALUE) {
-                if (d->vgop_key_seen && kdts > d->vgop_last_key_dts) {
-                    int64_t g = av_rescale_q(kdts - d->vgop_last_key_dts, d->ist_tb, AV_TIME_BASE_Q);
-                    if (g > 0 && g < 30000000) {                 /* splice/wrap-guarded */
-                        int64_t e = atomic_load_explicit(&g_vgop_est_us, memory_order_relaxed);
-                        atomic_store_explicit(&g_vgop_est_us, e > 0 ? e + (g - e) / 4 : g,
-                                              memory_order_relaxed);
-                    }
-                }
-                d->vgop_last_key_dts = kdts;
-                d->vgop_key_seen     = 1;
-                atomic_store_explicit(&g_vgop_key_wall, av_gettime_relative(), memory_order_relaxed);
-            }
         }
         PTV_HB_VDEC(d->hb_slot, PTV_HB_VDEC_SENDPKT);
         ret = avcodec_send_packet(d->vdec, pkt);
@@ -4129,7 +3891,7 @@ static void *mux_thread(void *arg)
         {
             int64_t wt0 = g_diag ? av_gettime_relative() : 0;
             int stream_index = pkt->stream_index;
-            /* TEST ONLY (pre26 W1/W2 gates, PTV_RECANCHOR_TEST_ABORT_N precedent):
+            /* TEST ONLY (pre26 W1/W2 gates):
              * PTV_MUXTEST_BACK_AT_S=<t> re-stamps the first AUDIO packet ≥t s after mux
              * start backward by PTV_MUXTEST_BACK_MS (default 2795 ≈ the live −2794.7ms),
              * once per rung — the live shape: one fanned-out backward audio packet hits
@@ -6581,6 +6343,12 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         as[k].h0 = &inputs[asrc_in[k]].h0; as[k].h0_lock = &inputs[asrc_in[k]].h0_lock;
         as[k].house_skew = &inputs[asrc_in[k]].house_skew;
         as[k].res_step   = n_input > 1 ? &inputs[asrc_in[k]].res_step_us : NULL;   /* 2.0.2 T-343 */
+        as[k].tl_lag     = n_input > 1 ? &inputs[asrc_in[k]].tl_lag_us : NULL;     /* 2.1 T-409 */
+        as[k].tl_nlag    = n_input > 1 ? &inputs[asrc_in[k]].tl_nlag_us : NULL;
+        as[k].tl_at      = n_input > 1 ? &inputs[asrc_in[k]].tl_at_us : NULL;
+        as[k].tl_ahead   = n_input > 1 ? &inputs[asrc_in[k]].tl_ahead_us : NULL;
+        if (n_input > 1)
+            atomic_store_explicit(&inputs[asrc_in[k]].tl_at_us, INT64_MAX, memory_order_relaxed);
         as[k].house_lag_true = (n_input > 1) ? &inputs[asrc_in[k]].house_lag_true : NULL;  /* multiview: true lag; single: NULL→house_skew */
         as[k].vring = &inputs[asrc_in[k]].vring;         /* A/V probe: pair this track's audio against its input's video ring */
         as[k].multiview = (n_input > 1);                 /* multiview-only: enable deterministic audio-follow */
@@ -6597,6 +6365,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         as[k].v_arrive_wc = &inputs[asrc_in[k]].v_arrive_wc;  /* pre17: §3 per-input liveness — the corrector
                                                                * reads THIS input's arrival watermark */
         as[k].acomp_exp_us = AV_NOPTS_VALUE;             /* [PTV-ACOMP] no expected-pts reference yet */
+        as[k].vm_last_out  = AV_NOPTS_VALUE;             /* 2.1 T-409: no record-door frame placed yet */
         as[k].tick_dur_us = av_rescale(1000000, out_fps.den, out_fps.num);  /* 1.0.1: house tick = the PLL's vlag quantum (one house clock for all slots) */
         for (r = 0; r < n_rung; r++) {
             as[k].mux_q[r] = rung[r].mux_q;
@@ -7361,6 +7130,11 @@ int main(int argc, char **argv)
     if (getenv("PTV_REPRIME")) g_reprime = 1;     /* fast buffer re-prime after a glue (default ON since v0.9.10; kept for compat) */
     if (getenv("PTV_NO_REPRIME")) g_reprime = 0;
     if (getenv("PTV_NO_LAYERA"))  g_layera  = 0;  /* v0.9.10: WUCR/LAYERA/REPRIME are default-on; NO_* revert */
+    /* 2.1 T-409: the program timeline is the only path (owner 2026-10-21: no fallback switch) */
+    g_timeline = 1;
+    g_layera   = 0;                           /* the timeline owns what the LAYERA buffer did */
+    if (getenv("PTV_TL_OPEN_MS") && atoi(getenv("PTV_TL_OPEN_MS")) > 0)
+        g_tl_open_us = atoi(getenv("PTV_TL_OPEN_MS")) * 1000LL;
     if (getenv("PTV_LAYERA_FULLSKIP")) g_layera_fullskip = 1;  /* 0.9.18.5 revert: LAYERA skips the demux absorber for ALL
                                                                 * super-threshold jumps again (restores the sub-1s no-owner
                                                                 * band = the In-Touch audio-late accumulator; A/B only) */
@@ -7413,30 +7187,6 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_WALLEV")) g_wallev = 0;     /* 1.0.1-pre24 #63 revert: erase engines back to the pre23
                                                     * whole-step remedies (butt-joint every >1s hole; the
                                                     * corrupt-storm desync counterfactual — A/B only) */
-    if (getenv("PTV_NO_RECANCHOR")) g_recanchor = 0;  /* 1.0.1-pre24 #63: no recovery re-anchor (a baked
-                                                       * post-storm offset stays until restart) */
-    { const char *s = getenv("PTV_RECANCHOR_SETTLE_S");   if (s && atoi(s) > 0) g_recanchor_settle_us   = (int64_t)atoi(s) * 1000000; }
-    { const char *s = getenv("PTV_RECANCHOR_COOLDOWN_S"); if (s && atoi(s) > 0) g_recanchor_cooldown_us = (int64_t)atoi(s) * 1000000; }
-    { const char *s = getenv("PTV_RECANCHOR_TEST_ABORT_N"); if (s && atoi(s) > 0) g_recanchor_test_abort_n = atoi(s); }  /* TEST ONLY (rr24 F2 gate) */
-    if (getenv("PTV_NO_RESYNC")) g_resync = 0;   /* 1.0.1-pre29.1 #69: >350ms hard-reset path default ON; kill switch reverts to pre28 */
-    { const char *s = getenv("PTV_RESYNC_MS");            if (s && atoi(s) > 0) g_resync_ms_us          = (int64_t)atoi(s) * 1000; }
-    { const char *s = getenv("PTV_RESYNC_OK_MS");         if (s && atoi(s) > 0) g_resync_ok_us          = (int64_t)atoi(s) * 1000; }
-    { const char *s = getenv("PTV_RESYNC_CONFIRM_S");     if (s && atoi(s) > 0) g_resync_confirm_us     = (int64_t)atoi(s) * 1000000; }
-    { const char *s = getenv("PTV_RESYNC_CONFIRM_BIG_S"); if (s && atoi(s) > 0) g_resync_confirm_big_us = (int64_t)atoi(s) * 1000000; }
-    { const char *s = getenv("PTV_RESYNC_BREAKER_N");     if (s && atoi(s) > 0) g_resync_breaker_n      = atoi(s); }
-    { const char *s = getenv("PTV_RESYNC_BREAKER_WIN_S"); if (s && atoi(s) > 0) g_resync_breaker_win_us = (int64_t)atoi(s) * 1000000; }
-    { const char *s = getenv("PTV_RESYNC_QUIET_S");       if (s && atoi(s) > 0) g_resync_quiet_us       = (int64_t)atoi(s) * 1000000; }
-    { const char *s = getenv("PTV_RESYNC_CHUNK_MS");      if (s && atoi(s) > 0) g_resync_chunk_us       = (int64_t)atoi(s) * 1000; }
-    { const char *s = getenv("PTV_RESYNC_CHUNK_GAP_S");   if (s && atoi(s) > 0) g_resync_chunk_gap_us   = (int64_t)atoi(s) * 1000000; }
-    /* 1.0.1-pre30 #69 refinements */
-    { const char *s = getenv("PTV_RESYNC_SEAM_HOLD_S");   if (s && atoi(s) >= 0) g_resync_seam_hold_us  = (int64_t)atoi(s) * 1000000; }   /* 0 explicitly disables the hold */
-    if (getenv("PTV_RESYNC_SILENCE")) g_resync_vskip = 0; /* item B kill: pre29 silence-pad actuator */
-    { const char *s = getenv("PTV_RESYNC_IDR_WAIT_S");    if (s && atoi(s) > 0) g_resync_idr_wait_us    = (int64_t)atoi(s) * 1000000; }
-    { const char *s = getenv("PTV_RESYNC_VSKIP_TOL_MS");  if (s && atoi(s) > 0) g_resync_vskip_tol_us   = (int64_t)atoi(s) * 1000; }
-    { const char *s = getenv("PTV_RESYNC_WALK_CEIL_S");   if (s && atoi(s) >= 0) g_resync_walk_ceil_us  = (int64_t)atoi(s) * 1000000; }   /* rr30 T1; 0 disables */
-    /* item C: the ring is fixed-size — clamp N into [2, PTV_RSN_RING] whatever the env says */
-    if (g_resync_breaker_n < 2)            g_resync_breaker_n = 2;
-    if (g_resync_breaker_n > PTV_RSN_RING) g_resync_breaker_n = PTV_RSN_RING;
     { const char *s = getenv("PTV_RSCORR_SLEW_FAST");     if (s) g_rscorr_slew_fast = atoi(s) > 0 ? atoi(s) : 0; }  /* 0 = disabled (always the base clamp) */
     if (getenv("PTV_NO_MUXGUARD")) g_muxguard = 0;   /* 1.0.1-pre26: disable the survive-first backward-dts mux backstop (pre24 EINVAL-exit behavior) */
     { const char *s = getenv("PTV_MUXTEST_BACK_AT_S"); if (s && atoi(s) > 0) g_muxtest_back_at_us = (int64_t)atoi(s) * 1000000; }  /* TEST ONLY (pre26 gates) */

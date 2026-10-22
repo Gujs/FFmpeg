@@ -40,7 +40,7 @@
  * absorb in both directions.) thresholds internalized 0.9.18.7 (were PTV_DISCONT_MS forward / PTV_DISCONT_BACK_MS backward). */
 static int     g_discont_ms = 1000;       /* forward jump threshold (internalized 0.9.18.7; was PTV_DISCONT_MS) */
 static int     g_discont_back_ms = 80;    /* backward jump threshold (keep small — anti-stall) (internalized 0.9.18.7; was PTV_DISCONT_BACK_MS) */
-static int64_t g_gap_min_us = 700000;     /* min wall-absence (us) to call a forward audio jump a real GAP when video did not also cross (internalized 0.9.18.7; was PTV_GAP_MIN_MS) */
+int64_t g_gap_min_us = 700000;            /* min wall-absence (us) to call a forward audio jump a real GAP when video did not also cross (internalized 0.9.18.7; was PTV_GAP_MIN_MS) */
 static int64_t g_progoff_debounce_us = 1000000;   /* coalesce a V/A straddle into one bump (internalized 0.9.18.7; was PTV_PROGOFF_DEBOUNCE_MS) */
 static int64_t g_disc_viderr_sum;    /* PTV-FLUSHAV: running total of per-flush vid_err (source A/V misalignment absorbed at glues, us) — correlate its growth vs the oracle drift to test whether flushes leak into audio-behind */
 static int64_t g_dukf_escape_us = 5000000;   /* force-resume if no IDR within this (internalized 0.9.18.7; was PTV_DUKF_ESCAPE_MS) */
@@ -313,8 +313,8 @@ static void rsync_post_edit(DemuxArgs *d, int s, int64_t delta_us)
  * containing a real gap W): pad W, erase J−W. Evidence floor g_gap_min_us (700ms — the
  * same bar the v0.8.2 gap discriminator uses); bursty/banked delivery falls back to W=0
  * (wall absence there is delivery jitter, not content evidence). ALWAYS measured — the
- * ACTION is g_wallev-gated at each site, but the measurement feeds the re-anchor
- * corroboration provenance (ptv_wallev_post_unev) in both modes. */
+ * ACTION is g_wallev-gated at each site, but the measurement feeds the provenance
+ * ledgers (ptv_wallev_post_unev) in both modes. */
 static int64_t ptv_wallev_w(DemuxArgs *d, int sidx, int64_t jump_us)
 {
     int64_t gap, cad, w;
@@ -406,7 +406,7 @@ static int64_t ptv_wallev_shared_flow(DemuxArgs *d, int sidx, int64_t jump_us, i
 /* pre24 #63 provenance: post `w_us` of UNEVIDENCED real-content deletion on stream s —
  * an erase whose event-time wall evidence said the content was genuinely missing (the #63
  * leak term, per stream). Always measured, even under PTV_NO_WALLEV; read ONLY by the
- * recovery re-anchor's corroboration (never a control input on its own). Demux thread. */
+ * [PTV-WALLEV] conservation diag (never a control input on its own). Demux thread. */
 static void ptv_wallev_post_unev(DemuxArgs *d, int s, int64_t w_us)
 {
     int j;
@@ -1391,8 +1391,8 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
                      * mism < 0 the override COLLAPSES that much of the preserved hole out of
                      * the labels (worst corner mism ≈ −W: door step ≈ 0, structurally
                      * nothing left to pad) — the collapsed portion is real content deleted
-                     * with no label representation, posted as UNEVIDENCED provenance so the
-                     * recovery re-anchor can corroborate and walk it back (Part 2). W = 0
+                     * with no label representation, posted as UNEVIDENCED provenance (the
+                     * [PTV-WALLEV] conservation diag). W = 0
                      * (flowing / fallback / PTV_NO_WALLEV) keeps all of this byte-identical
                      * to pre23. */
                     int64_t mism = b->applied_offset - ss->cumulative_ts_offset;
@@ -1407,7 +1407,7 @@ static int ptv_disc_flush(DemuxArgs *d, PtvDiscBuf *b)
                         av_log(NULL, AV_LOG_WARNING,
                                "[PTV-WALLEV] flush override collapsed %"PRId64"ms of stream %d's "
                                "wall-evidenced hole (door step %+"PRId64"ms, W=%"PRId64"ms) — "
-                               "posted as unevidenced provenance for the recovery re-anchor\n",
+                               "posted as unevidenced provenance\n",
                                coll / 1000, i, exp_step / 1000, wevr / 1000);
                     }
                     ss->pair_applied_us = b->applied_offset;
@@ -1831,6 +1831,13 @@ static void copy_emit_sil(DemuxArgs *d, PassStream *ps, int64_t ts)
  * subtitle, data/SCTE-35) straight to the muxer, rebased onto the same h0 house
  * timeline the encoded streams use so everything stays in sync. Packets that
  * precede the anchor are dropped (exactly like audio_push). */
+/* 2.1 T-409: vwait_drain() releases dense copies with pass_lock already held (its callers take it) — demux_pass_one() then
+ * must not take it again (non-recursive: the master deadlocked on the first picture). Per thread: the demux thread and
+ * the master both drain the queue. */
+static _Thread_local int t_pass_held;
+static void pass_lock_take(DemuxArgs *d) { if (!t_pass_held) pthread_mutex_lock(&d->pass_lock); }
+static void pass_lock_give(DemuxArgs *d) { if (!t_pass_held) pthread_mutex_unlock(&d->pass_lock); }
+
 static int demux_pass_one(DemuxArgs *d, AVPacket *out, int64_t vm_out_us)
 {
     int pi, i;
@@ -1883,7 +1890,7 @@ static int demux_pass_one(DemuxArgs *d, AVPacket *out, int64_t vm_out_us)
          * the same amount so pts>=dts still holds. (On-wire SCTE-35 splice timing rides
          * pts_adjustment, not container dts, so a sub-ms nudge is invisible there.) */
         if (d->pass[pi].sil)                 /* 2.0.0-pre6 D17: the master's AC-3 fill shares this state */
-            pthread_mutex_lock(&d->pass_lock);
+            pass_lock_take(d);
         if (d->pass[pi].sil && out->dts != AV_NOPTS_VALUE) {
             PassStream *ps = &d->pass[pi];
             int64_t exp = ps->real_end;              /* where this track's next frame belongs */
@@ -1903,7 +1910,7 @@ static int demux_pass_one(DemuxArgs *d, AVPacket *out, int64_t vm_out_us)
                 if (out->dts < ps->fill_end &&
                     (int64_t)ps->drop_n * ps->sil_dur < av_rescale_q(2000000, AV_TIME_BASE_Q, ps->in_tb)) {
                     ps->drop_n++;
-                    pthread_mutex_unlock(&d->pass_lock);
+                    pass_lock_give(d);
                     av_packet_free(&out);
                     return 0;
                 }
@@ -1937,7 +1944,7 @@ static int demux_pass_one(DemuxArgs *d, AVPacket *out, int64_t vm_out_us)
                 if ((gap <= -half && gap >= -av_rescale_q(1000000, AV_TIME_BASE_Q, ps->in_tb) + FFMIN(hsd, 0)) ||
                     (wire_behind > half && wire_behind <= av_rescale_q(5000000, AV_TIME_BASE_Q, ps->in_tb))) {
                     ps->ovl_n++;
-                    pthread_mutex_unlock(&d->pass_lock);
+                    pass_lock_give(d);
                     av_packet_free(&out);
                     return 0;
                 }
@@ -1968,7 +1975,7 @@ static int demux_pass_one(DemuxArgs *d, AVPacket *out, int64_t vm_out_us)
                 /* SCTE-35 is always sent (T-335: two cues released on the same frame shared its stamp) */
                 d->vm_late++;                    /* 2.0.0 T-100: stamped behind what is on the wire: its moment passed */
                 if (d->pass[pi].sil)
-                    pthread_mutex_unlock(&d->pass_lock);
+                    pass_lock_give(d);
                 av_packet_free(&out);
                 return 0;
             }
@@ -1994,7 +2001,7 @@ static int demux_pass_one(DemuxArgs *d, AVPacket *out, int64_t vm_out_us)
                 demux_send(d->mux_q[i], c, d->drop, &d->pdrop);   /* sparse subs/data/SCTE-35 bypass */
         }
         if (d->pass[pi].sil)
-            pthread_mutex_unlock(&d->pass_lock);
+            pass_lock_give(d);
         av_packet_free(&out);
         return 0;
     }
@@ -2060,6 +2067,7 @@ static int copy_shown(DemuxArgs *d, int64_t c_us, int64_t *out_us, int64_t *gap_
 static void vwait_drain(DemuxArgs *d, int force)
 {
     int pi;
+    t_pass_held = 1;                   /* every caller holds pass_lock */
     int64_t now = av_gettime_relative(), pos = atomic_load_explicit(&g_house_out_us, memory_order_relaxed);
     for (pi = 0; pi < d->n_pass; pi++) {
         PassStream *ps = &d->pass[pi];
@@ -2069,7 +2077,7 @@ static void vwait_drain(DemuxArgs *d, int force)
             AVPacket *p = ps->vwait[k];
             int64_t ts = p->dts != AV_NOPTS_VALUE ? p->dts : p->pts, o = AV_NOPTS_VALUE, gap = 0;
             int r = ts == AV_NOPTS_VALUE ? -1 : copy_shown(d, av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q), &o, &gap);
-            if (r == 0 && !force && !scte && !d->mv_vring) {
+            if (r == 0 && !force && !scte && !d->mv_vring && !ps->gated) {   /* (dense audio runs on through a video outage) */
                 /* 2.0.0 T-378: a copy stamped far past the newest video the demux has READ is a corrupt timestamp — one
                  * bit-flipped DVB sub PTS (+1491 s, rich50b bitflip) waited for content that never came, and every
                  * subtitle behind it waited too (54 subs + 17 clears lost to the end of the run). A real copy is muxed
@@ -2088,8 +2096,16 @@ static void vwait_drain(DemuxArgs *d, int force)
                     continue;
                 }
             }
-            if (r == 0 && !force)
+            if (r == 0 && !force && !(ps->gated && now - ps->vwait_wc[k] >= 1500000))
                 break;                          /* its content is not on the output yet */
+            if (ps->gated && r != 1) {
+                /* a dense copy is never dropped for timing: not shown within 1.5 s (a video-only outage, a dead video
+                 * PID) or older than the record — stamped the old way (house_skew), the track stays continuous */
+                demux_pass_one(d, p, AV_NOPTS_VALUE);
+                d->vm_fb++;
+                k++;
+                continue;
+            }
             if (r < 0 && scte && !force && ts != AV_NOPTS_VALUE) {
                 /* 2.0.0 T-316: copies now wait from before the anchor (a start-up burst); a cue whose content precedes
                  * the start was never on the output — dropped, as it was when it arrived before the anchor */
@@ -2119,7 +2135,11 @@ static void vwait_drain(DemuxArgs *d, int force)
                 if (now - ps->vwait_wc[k] < 12000000)
                     break;
             }
-            if (r == 1 && !scte && (gap > 1000000 || o < pos - 1000000)) {
+            if (r == 1 && ps->gated && gap > 1000000) {
+                demux_pass_one(d, p, AV_NOPTS_VALUE);   /* sound the video did not show as content (its own outage):
+                                                         * kept, stamped the old way */
+                d->vm_fb++;
+            } else if (r == 1 && !scte && !ps->gated && (gap > 1000000 || o < pos - 1000000)) {
                 av_packet_free(&p);
                 d->vm_late++;
             } else if (r == 1) {
@@ -2143,10 +2163,12 @@ static void vwait_drain(DemuxArgs *d, int force)
             ps->nvwait -= k;
         }
     }
+    t_pass_held = 0;
     if ((d->vm_late || d->vm_fb) && now - d->vm_log_wc >= 60000000) {
-        av_log(NULL, AV_LOG_WARNING, "[PTV-VMAP] sparse copies: %"PRId64" stamped where the video showed their content, "
+        av_log(NULL, AV_LOG_WARNING, "[PTV-VMAP] %s: %"PRId64" stamped where the video showed their content, "
                "%"PRId64" dropped (content never shown, or its moment had passed), %"PRId64" stamped the old way (queue "
-               "full) — PTV_NO_VMAP=1 disables\n", d->vm_ok, d->vm_late, d->vm_fb);
+               "full, or a dense copy not shown in time) — PTV_NO_VMAP=1 disables\n",
+               g_timeline ? "copies" : "sparse copies", d->vm_ok, d->vm_late, d->vm_fb);
         d->vm_ok = d->vm_late = d->vm_fb = 0;
         d->vm_log_wc = now;
     }
@@ -2169,7 +2191,11 @@ static int demux_pass(DemuxArgs *d, AVPacket *out)
         vwait_drain(d, 0);
         for (pi = 0; pi < d->n_pass; pi++) {
             PassStream *ps = &d->pass[pi];
-            if (ps->gated || out->stream_index != ps->in_index)
+            /* 2.1 T-409: with the timeline the dense copies (AC-3 / MP2) wait too — the labels carry every kept hole
+             * and erase, so house_skew at READ time is no longer the offset the video will show them with (a source
+             * restart: +14 s while holding, -1.6 s after the rejoin map — the AC-3 landed behind its own hold fill and
+             * was dropped for 15 s, gate sync_ac3_kill_return_20). See vwait_drain for their release rules */
+            if ((ps->gated && !(g_timeline && (ps->nvwait || ptv_tl_settling(d)))) || out->stream_index != ps->in_index)
                 continue;
             /* 2.0.0 T-316: queued from before the anchor too. A bursty source delivers its first 6-10 s at once,
              * before the first frame is decoded (h0): every subtitle / cue of that burst was dropped here while its
@@ -2380,6 +2406,75 @@ static void copy_gap_watch(DemuxArgs *d, int64_t now)
  * instead of 21600: both −120 ms on the output. The copies still waiting for their picture that were read since the
  * video packet before the previous one and lie after this PES in the mux take the step too (a section has no pos:
  * it is read at its own packet, inside that window). */
+/* 2.1 T-409: a SCTE-35 cue's effective splice time (splice_time + pts_adjustment, 90 kHz, 33 bit) — time_signal and
+ * program splice_insert with a specified time; -1 = none (immediate, component mode, cancel, malformed) */
+static int64_t scte35_splice_90k(const AVPacket *p)
+{
+    const uint8_t *b = p->data;
+    int64_t adj, t;
+    int type, o;
+    if (!b || p->size < 20 || b[0] != 0xFC || (b[4] & 0x80))   /* encrypted: unreadable */
+        return -1;
+    adj  = ((int64_t)(b[4] & 1) << 32) | ((int64_t)b[5] << 24) | (b[6] << 16) | (b[7] << 8) | b[8];
+    type = b[13];
+    if (type == 0x06)
+        o = 14;                                       /* time_signal: splice_time() */
+    else if (type == 0x05) {
+        if (p->size < 21 || (b[18] & 0x80))            /* splice_event_cancel_indicator */
+            return -1;
+        if (!(b[19] & 0x40) || (b[19] & 0x10))         /* component mode / splice_immediate */
+            return -1;
+        o = 20;
+    } else
+        return -1;
+    if (p->size < o + 5 || !(b[o] & 0x80))             /* time_specified_flag */
+        return -1;
+    t = ((int64_t)(b[o] & 1) << 32) | ((int64_t)b[o + 1] << 24) | (b[o + 2] << 16) | (b[o + 3] << 8) | b[o + 4];
+    return (t + adj) & 0x1FFFFFFFFLL;
+}
+
+/* 2.1 T-409: the timeline moved the program offset by dpo (90 kHz) at a picture boundary of source time from_us. Copies
+ * queued for the video whose SOURCE time (label minus the prog_off they were unwrapped with) lies at or after it belong
+ * to the new content — subtitles and cues are muxed ahead of their pictures, so they were read with the old offset
+ * (gate sync_bstep: SCTE-35 / DVB subs 120 ms early after a -120 ms step erase). */
+void ptv_vwait_rebase(DemuxArgs *d, int64_t from_us, int64_t old_end_us, int64_t open_wc, int64_t dpo)
+{
+    int pi, k;
+    if (!dpo)
+        return;
+    pthread_mutex_lock(&d->pass_lock);
+    for (pi = 0; pi < d->n_pass; pi++) {
+        PassStream *ps = &d->pass[pi];
+        for (k = 0; k < ps->nvwait; k++) {
+            AVPacket *p = ps->vwait[k];
+            int64_t ts = p->dts != AV_NOPTS_VALUE ? p->dts : p->pts, src;
+            if (ts == AV_NOPTS_VALUE)
+                continue;
+            src = av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q) -
+                  av_rescale_q(ps->vwait_po[k], (AVRational){ 1, 90000 }, AV_TIME_BASE_Q);
+            if (ps->is_scte) {
+                /* a cue belongs where it splices, not where its packet sits: cues lead their splice (the pre-roll),
+                 * so one read before the step can splice into the new content (sync_bstep: cues -120 ms) */
+                int64_t sp = scte35_splice_90k(p), raw90 = av_rescale_q(src, AV_TIME_BASE_Q, (AVRational){ 1, 90000 });
+                if (sp >= 0) {
+                    int64_t dlt = (sp - (raw90 & 0x1FFFFFFFFLL)) & 0x1FFFFFFFFLL;
+                    if (dlt >= (1LL << 32))
+                        dlt -= 1LL << 33;               /* nearest: the splice within +-13 h of its packet */
+                    src += av_rescale_q(dlt, (AVRational){ 1, 90000 }, AV_TIME_BASE_Q);
+                }
+            }
+            /* a step back overlaps the old content's source time [from, old_end): there the read order decides — read
+             * after the step began (the window opened) = the new content (sync_bstep: DVB subs -120 ms) */
+            if (src < from_us || (src < old_end_us && ps->vwait_wc[k] < open_wc))
+                continue;
+            if (p->pts != AV_NOPTS_VALUE) p->pts += av_rescale_q(dpo, (AVRational){ 1, 90000 }, ps->in_tb);
+            if (p->dts != AV_NOPTS_VALUE) p->dts += av_rescale_q(dpo, (AVRational){ 1, 90000 }, ps->in_tb);
+            ps->vwait_po[k] += dpo;
+        }
+    }
+    pthread_mutex_unlock(&d->pass_lock);
+}
+
 static void vwait_follow_video(DemuxArgs *d, int64_t vpos, int64_t dpo)
 {
     int pi, k;
@@ -2612,7 +2707,7 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                 d->wrap_off[pkt->stream_index] -= mask;  /* late pre-roll pkt */
                 if (ol) ol->wrap_dw = -mask;
             }
-            else if (g_discont && (ct == AVMEDIA_TYPE_VIDEO || ct == AVMEDIA_TYPE_AUDIO)) {
+            else if (g_discont && !g_timeline && (ct == AVMEDIA_TYPE_VIDEO || ct == AVMEDIA_TYPE_AUDIO)) {   /* 2.1: the timeline owns it */
                 /* Source PTS discontinuity (a DTS jump, NOT a 33-bit wrap), either direction.
                  * Frames are continuous (one per tick) but the timestamp leaps; absorb the excess
                  * so the effective timeline stays continuous (re-base to last + one nominal frame),
@@ -3059,7 +3154,7 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                     }
                     /* pre24 #63 provenance (measurement only): this absorb ERASES the step; if
                      * its wall evidence said part of it was a REAL hole, that much content was
-                     * deleted for real — post it unevidenced (re-anchor corroboration). Under
+                     * deleted for real — post it unevidenced ([PTV-WALLEV] diag). Under
                      * g_wallev the W>0 paths exited above, so this posts only in the
                      * counterfactual/fallback modes where the erase actually happens. */
                     if (delta > 0) {
@@ -3265,6 +3360,7 @@ bad:
 
 static void by_count_gap(DemuxArgs *d, int64_t gap, int64_t now);   /* 2.0.0-pre4, defined below */
 static void door_arrived(DemuxArgs *d, int si, int64_t nw);          /* 2.0.0-pre20 T-364, defined below */
+static void door_erase(DemuxArgs *d, const AVStream *vst, int64_t vb);   /* 2.0.2 T-398, defined below */
 
 /* 2.0.0 T-345: raw (a video packet after a gap) is still on the pre-gap timeline: 0..500 ms past ref (33-bit wrap) */
 static int src_tail_more(const AVStream *vst, int64_t raw, int64_t ref)
@@ -3941,6 +4037,10 @@ void *demux_thread(void *arg)
                     d->door_v0      = 0;
                     d->door_v0_arm  = 1;
                     d->door_vs_hold = vs;
+                    d->door_erased  = 0;
+                    if (g_timeline && d->door_startup && d->door_vhi_ok && out->pts != AV_NOPTS_VALUE &&
+                        vst->avg_frame_rate.num > 0 && vst->avg_frame_rate.den > 0)
+                        door_erase(d, vst, out->pts);
                     /* 2.0.0: say which way the cut goes (T-364/T-368) — only the kept case used to show (WALLEV) */
                     av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 burst: back under the max delay — resuming at a keyframe, "
                            "picture and sound together (%"PRId64" packets dropped; %s)\n", d->door_n, d->door_startup ?
@@ -3956,6 +4056,17 @@ void *demux_thread(void *arg)
                             if (dl >= m >> 1) dl -= m;
                         }
                         early = dl <= 0;      /* content up to the picture that closed the door is on air */
+                        if (g_timeline && d->door_vhi_ok && vst->avg_frame_rate.num > 0) {
+                            /* T-398: ... up to the end of the newest picture let through, where the erase joins */
+                            int64_t va = d->door_vhi + av_rescale_q(1, av_inv_q(vst->avg_frame_rate), vst->time_base);
+                            dl = raw - av_rescale_q(va, vst->time_base, st->time_base);
+                            if (st->pts_wrap_bits > 0 && st->pts_wrap_bits < 63) {
+                                int64_t m = 1LL << st->pts_wrap_bits;
+                                dl &= m - 1;
+                                if (dl >= m >> 1) dl -= m;
+                            }
+                            early = dl < 0;
+                        }
                     }
                     if (!early) {
                         /* a dropped picture still arrived (as the DUKF / corrupt drops): without the stamp the door's
@@ -3969,6 +4080,22 @@ void *demux_thread(void *arg)
                         av_packet_free(&out);
                         continue;
                     }
+                }
+            } else if (d->door == 2 && d->door_erased && raw != AV_NOPTS_VALUE &&
+                       (isv || st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)) {
+                /* T-398: an erased cut joins at the keyframe's PTS — what lies before it (the keyframe's leading pictures,
+                 * the sound before its picture) belongs to the erased span */
+                int64_t t  = out->pts != AV_NOPTS_VALUE ? out->pts : raw;
+                int64_t dl = t - av_rescale_q(d->door_vb, vst->time_base, st->time_base);
+                if (st->pts_wrap_bits > 0 && st->pts_wrap_bits < 63) {
+                    int64_t m = 1LL << st->pts_wrap_bits;
+                    dl &= m - 1;
+                    if (dl >= m >> 1) dl -= m;
+                }
+                if (dl < 0) {
+                    door_arrived(d, out->stream_index, nw);
+                    av_packet_free(&out);
+                    continue;
                 }
             } else if (d->door == 2 && !isv && raw != AV_NOPTS_VALUE) {
                 int64_t dl = raw - av_rescale_q(d->door_cut, vst->time_base, st->time_base);
@@ -3986,8 +4113,31 @@ void *demux_thread(void *arg)
             }
             if (d->door == 2 && nw - d->door_wc > 3000000)
                 d->door = 0;
+            if (isv && out->pts != AV_NOPTS_VALUE) {   /* T-398: the newest picture let through (wrap-aware) */
+                int64_t dl = out->pts - d->door_vhi;
+                if (vst->pts_wrap_bits > 0 && vst->pts_wrap_bits < 63) {
+                    int64_t m = 1LL << vst->pts_wrap_bits;
+                    dl &= m - 1;
+                    if (dl >= m >> 1) dl -= m;
+                }
+                if (!d->door_vhi_ok || dl > 0 || dl < -(int64_t)av_rescale_q(10 * AV_TIME_BASE, AV_TIME_BASE_Q, vst->time_base)) {
+                    d->door_vhi    = out->pts;
+                    d->door_vhi_ok = 1;
+                }
+            }
         }
         demux_unwrap(d, out);               /* 33-bit source wrap -> monotonic extended ts (ONCE) */
+        if (g_timeline) {                   /* 2.1 T-409: one classifier, one remedy for every stream of the input */
+            if (!d->tl && !(d->tl = ptv_tl_alloc(d->nb_streams_open))) {
+                av_packet_free(&out);
+                ret = AVERROR(ENOMEM);
+                break;
+            }
+            ret = ptv_tl_ingest(d, out);
+            if (ret < 0)
+                break;
+            continue;
+        }
 
         /* legacy-0004 TS-discontinuity buffer (g_layera only). Dense V/A get
          * detect→buffer→classify→discard-OLD→single-offset; sparse SUBTITLE/DATA
@@ -4014,17 +4164,6 @@ void *demux_thread(void *arg)
                 if (g_glueclass && !b->active && !b->flushing && sidx < b->nb_streams) {
                     ptv_glue_h_feed(&b->stream_state[sidx], raw_dts, last_dts,
                                     av_gettime_relative());
-                    /* pre24 #63: publish the audio stream's label health H for the recovery
-                     * re-anchor's gate (audio thread reads; 0 = no reading yet). */
-                    if (ct == AVMEDIA_TYPE_AUDIO && b->stream_state[sidx].h_wins > 0) {
-                        int jh;
-                        for (jh = 0; jh < d->n_audio; jh++)
-                            if (d->astream[jh] == sidx &&
-                                d->aglobal[jh] >= 0 && d->aglobal[jh] < PTV_MAX_AUDIO)
-                                atomic_store_explicit(&g_rsx.hh_q10[d->aglobal[jh]],
-                                                      b->stream_state[sidx].h_ema_q10,
-                                                      memory_order_relaxed);
-                    }
                 }
                 /* Arm buffering on a fresh jump. */
                 if (!b->active && ptv_disc_detect_jump(d, b, sidx, raw_dts, last_dts)) {
@@ -4145,6 +4284,7 @@ void *demux_thread(void *arg)
             break;
     }
 end:
+    ptv_tl_free(&d->tl);                     /* 2.1 T-409: held packets of an open window are dropped at the end */
     /* producer done → signal CONSUMERS to drain then get EOF. recv() returns
      * err_recv (set_err_send is invisible to receivers), so this MUST be
      * set_err_recv or decode/audio block forever (the offline-EOF deadlock). */
@@ -4183,6 +4323,33 @@ static void ptv_autobank_escalate(DemuxArgs *d, int64_t worst_us, int64_t now)
 {
     d->by_bank_last_q = now;
     cushion_escalate(BANK_ESCALATE, worst_us, now);
+}
+
+/* 2.0.2 T-398: the depth door erases its own cut. Left to the paths downstream, a cut was erased by whichever one its
+ * label step reached — LAYERA with the audio's offset (whole AAC frames: the pictures moved off the house grid), or
+ * AGLUE padding the audio by its own label step while the house took whole ticks back (ATRIM) — each leaving a sub-frame
+ * remainder as a permanent content A/V step: GYF's production replay walked −4 → +39 ms in an hour of 12 s burst cuts
+ * (one step at every cut, 20 ms the largest). The door knows the cut: from the end of the newest picture let through to
+ * the keyframe it resumes at, whole pictures. 2.1 T-409 (the timeline): the cut is erased from the program offset (the
+ * timeline moves every stream alike); the audio is let through on the same boundaries, its sub-frame rest is the
+ * audio's own continuity (padded / trimmed by its labels). */
+static void door_erase(DemuxArgs *d, const AVStream *vst, int64_t vb)
+{
+    int64_t fd = av_rescale_q(1, av_inv_q(vst->avg_frame_rate), vst->time_base);
+    int64_t cut = vb - (d->door_vhi + fd), cut_us;
+    if (vst->pts_wrap_bits > 0 && vst->pts_wrap_bits < 63) {
+        int64_t m = 1LL << vst->pts_wrap_bits;
+        cut &= m - 1;
+        if (cut >= m >> 1) cut -= m;
+    }
+    cut_us = av_rescale_q(cut, vst->time_base, AV_TIME_BASE_Q);
+    if (cut <= 0 || cut_us > 60 * (int64_t)AV_TIME_BASE || !d->tl)
+        return;
+    ptv_tl_cut(d, cut_us);                   /* 2.1 T-409: the program offset, every stream alike */
+    d->door_erased = 1;
+    d->door_vb     = vb;
+    av_log(NULL, AV_LOG_INFO, "[PTV-SRC] in0 burst: the cut is erased at the door — %.3f s (%"PRId64" pictures) on every "
+           "stream, joined on the pictures' boundaries\n", cut_us / 1e6, cut / fd);
 }
 
 /* 2.0.0-pre20 T-364: a packet the depth door drops while the source is LIVE still ARRIVED. The wall-evidence split reads
@@ -4360,6 +4527,16 @@ static void rate_estimator_feed(RateEstimator *e, int64_t c_now, int64_t w_now,
             e->c0 = c_now; e->w0 = w_now;                      /* slide to the next sub-window */
         }
     }
+}
+
+int ptv_demux_dispatch(DemuxArgs *d, AVPacket *pkt)   /* 2.1 T-409: the timeline releases through here */
+{
+    return demux_dispatch(d, pkt);
+}
+
+void ptv_rsync_post_edit(DemuxArgs *d, int s, int64_t delta_us)
+{
+    rsync_post_edit(d, s, delta_us);
 }
 
 static int demux_dispatch(DemuxArgs *d, AVPacket *out)

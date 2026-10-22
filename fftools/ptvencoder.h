@@ -353,7 +353,7 @@ typedef struct RsyncSense {
     _Atomic int64_t ma_wall[PTV_MAX_AUDIO]; /* wall µs of the last audio sample */
     _Atomic int64_t ea_us[PTV_MAX_AUDIO];   /* per-track audio stream ledger E_a (µs) */
     /* 1.0.1-pre24 #63 wall-evidence PROVENANCE ledgers (always measured, even under
-     * PTV_NO_WALLEV — they feed the re-anchor corroboration, never control directly):
+     * PTV_NO_WALLEV — they feed the [PTV-WALLEV] conservation diag, never control):
      * cumulative UNEVIDENCED real-content deletions (µs, ≥0) — label erases whose event-time
      * wall evidence said the content was genuinely ABSENT (a real hole erased = a real on-air
      * desync of that amount on that stream). Erases of wall-FLOWING relabels (lies — correct
@@ -362,9 +362,6 @@ typedef struct RsyncSense {
     _Atomic int64_t uev_us[PTV_MAX_INPUT];  /* per-slot VIDEO unevidenced deletions */
     _Atomic int64_t uea_us[PTV_MAX_AUDIO];  /* per-track AUDIO unevidenced deletions (demux side;
                                              * the door adds its own AudioState.u_door_us) */
-    _Atomic int64_t hh_q10[PTV_MAX_AUDIO];  /* pre24: the audio stream's demux label-health H
-                                             * (Q10 EMA — see PtvDiscStreamState) published for
-                                             * the re-anchor health gate (0 = no reading yet) */
     int             n_a;                    /* transcoded tracks wired (pre16: = n_audio ALWAYS, mv included) */
     int             a_in[PTV_MAX_AUDIO];    /* track → input slot map (stats printers; plain int,
                                              * set in transcode() before threads spawn) */
@@ -842,12 +839,6 @@ typedef struct DecodeCtx {
     _Atomic int     *gov_on;               /* -> Input.gov_on */
     _Atomic int64_t *shed_wall;            /* -> Input.shed_wall */
     _Atomic int64_t *shed_cnt;             /* -> Input.shed_cnt */
-    /* 1.0.1-pre30 #69 (item B): GOP-span estimator — key-to-key dts spacing EMA measured at
-     * the pop site (published to g_vgop_est_us / g_vgop_key_wall; the resync fire-side
-     * viability gate reads them). Measurement only; gated on g_resync so the kill switch
-     * keeps the whole path inert. */
-    int64_t          vgop_last_key_dts;    /* dts of the last KEY packet popped */
-    int              vgop_key_seen;        /* first key seen (0 until then) */
     CcTap            cc;                   /* -cc_extract: EIA-608 tap (off = byte-inert) */
     struct Input    *in;                      /* 2.0.2 T-386: its input (the late bind swaps in the real decoder) */
 } DecodeCtx;
@@ -1297,6 +1288,12 @@ typedef struct AudioState {
      * catch-up (sync_stop_10: 10 s of audio decoded in 10 ms; 256 overflowed and released early, one tick off) */
 #define PTV_RJ_BUF 1024
     AVFrame         *rj_buf[PTV_RJ_BUF];
+#define PTV_VMQ 2048                         /* a 20 s burst backlog at 21 ms AAC frames: ~940 */
+    AVFrame         *vm_q[PTV_VMQ];          /* 2.1 T-409: real frames waiting for the video to show their content */
+    int64_t          vm_wc[PTV_VMQ];
+    int              vm_n, vm_feeding;
+    int64_t          vm_out_us;              /* this frame's placement from the video's record (output us), or NOPTS */
+    int64_t          vm_last_lab, vm_last_out;   /* the previous record-door frame: label, placement (or NOPTS) */
     int64_t          hold_drop_n;                     /* 2.0.0-pre9.4: real frames dropped while the source held */
     int              rj_n, rj_released, rj_releasing, rj_cls_seq0;
     int64_t          rj_t0;                           /* wall us the first frame was buffered */
@@ -1355,12 +1352,12 @@ typedef struct AudioState {
                                                        * label divergence the folds refused; published to
                                                        * g_conv_pub for the stats conv= token */
     /* 1.0.1-pre24 #63 WALL-EVIDENCE (g_wallev; PTV_NO_WALLEV=1 reverts the ACTION — the
-     * measurement below stays on to feed the re-anchor corroboration). Door side. */
+     * measurement below stays on to feed the [PTV-WALLEV] conservation diag). Door side. */
     int64_t          u_door_us;                       /* Σ unevidenced REAL-content deletions this door made
                                                        * (µs, ≥0): folds/erases of steps whose own wall
                                                        * evidence (wall_gap ≥ step/2 + cadence) said the
                                                        * content was genuinely absent — the #63 leak term,
-                                                       * measured. Feeds the re-anchor corroboration. */
+                                                       * measured. Feeds the [PTV-WALLEV] conservation diag. */
     int64_t          wev_out_us;                      /* outstanding wall-evidenced pad backlog (µs) — the
                                                        * conv-fold-exemption OOM backstop ledger; drains at
                                                        * ~1× realtime (decayed by wall elapsed) */
@@ -1370,103 +1367,6 @@ typedef struct AudioState {
     int64_t          wev_cons_last_us;                /* conservation diag: last logged A−V unevidenced
                                                        * deletion imbalance (µs) */
     int64_t          wev_cons_log_wc;                 /* conservation diag log rate limit (10s) */
-    /* 1.0.1-pre24 #63 CORROBORATED RECOVERY RE-ANCHOR (g_recanchor; PTV_NO_RECANCHOR=1).
-     * One-shot, health-gated recovery for a channel left with a stable content↔label offset
-     * after input recovers (owner mandate 2026-07-24: "perfect lip sync once input is OK
-     * again"). Engages ONLY when R is large+stable through a quiet settle window AND the
-     * unevidenced-deletion ledgers CORROBORATE it (aseam-class pinned-R false positives have
-     * no deletion imbalance and must never engage). Actuation = the [PTV-ANCHOR] base-step
-     * algebra (glue_off += step retires +R), slewed in bounded chunks. All owned by this
-     * track's audio thread. */
-    int64_t          ra_r0;                           /* R stability reference (µs) */
-    int64_t          ra_r0_wc;                        /* wall µs R last moved beyond ±100ms of ra_r0 */
-    int64_t          ra_ev_wc;                        /* wall µs of the last observed event (own snapshots) */
-    int64_t          ra_cooldown_until;               /* wall µs before which no engage (0 = none) */
-    int              ra_active;                       /* mid-walk (chunked slew in progress) */
-    int64_t          ra_budget_us;                    /* remaining authority this engagement (|R0|×1.2) */
-    int64_t          ra_step_wc;                      /* wall µs of the last applied chunk */
-    int64_t          ra_ua_snap, ra_uv_snap;          /* unevidenced-deletion ledger snapshots (corroborate
-                                                       * only NEW deletions since the last completion) */
-    int              ra_test_steps;                   /* TEST ONLY (rr24 F2 gate): steps this engagement */
-    int              ra_test_aborted;                 /* TEST ONLY: forced abort already fired this run */
-    int64_t          ra_applied_us;                   /* rr24 F2: Σ signed steps applied since the last
-                                                       * COMPLETE — each step retired exactly +step of R,
-                                                       * so after a mid-walk ABORT the corroboration must
-                                                       * predict the REMAINDER: rp = ΔU − Δcorr − Σapplied
-                                                       * (without this, |R−rp| = Σapplied wedged re-engage
-                                                       * forever → permanently half-recovered channel) */
-    int64_t          ra_corr_snap;                    /* corr_us snapshot (trim already applied against the
-                                                       * same bake must not double-count in R_pred) */
-    int64_t          ra_log_wc;                       /* refusal-line rate limit */
-    /* own event-edge snapshots (the corrector's CorrState snapshots are CONSUMED by its own
-     * edge detector — the re-anchor must never share them) */
-    int64_t          ra_epoch_snap, ra_ev_led_snap, ra_ea_led_snap, ra_bank_snap, ra_hs_snap;
-    int              ra_glue_snap, ra_acq_snap, ra_afmt_snap, ra_reopen_snap, ra_esc_snap;
-    int              ra_seeded;                       /* snapshots initialized */
-    /* 1.0.1-pre29 #69 RESYNC (g_resync; PTV_RESYNC=1 enables, default OFF). The second
-     * engage path inside ptv_recanchor: a confirmed-timer HARD RESET for the >PTV_RESYNC_MS
-     * dead zone (owner-verified 4/4: large stable R is a real on-air desync; today it is
-     * refused by the corroboration gate and disarms the corrector as implausible). Shares
-     * the walk/actuation state above (ra_cooldown_until, ra_applied_us, the step recipe)
-     * so mutual exclusion with the corroborated path is structural. */
-    int64_t          rsn_wc;                          /* wall µs the >threshold timer opened (0 = closed) */
-    int64_t          rsn_r0;                          /* R at timer open (|r0|>2s selects the big confirm) */
-    int              rsn_active;                      /* chunked audio-early (R>0) walk in progress */
-    int64_t          rsn_budget_us;                   /* remaining chunk authority (R0 + R0/5) */
-    int64_t          rsn_step_wc;                     /* wall µs of the last applied chunk */
-    int64_t          rsn_cooldown_until;              /* wall µs before which no fire — set ONLY by a
-                                                       * mid-walk abort (settle) or the armed breaker's
-                                                       * backoff; NEVER by a routine COMPLETE (owner:
-                                                       * seams are cheaper than desync-time) */
-    int              rsn_breaker;                     /* circuit breaker armed (pathological fire rate) */
-    int64_t          rsn_backoff_us;                  /* armed-breaker backoff (120s ×2 → 600s cap) */
-    /* 1.0.1-pre30 (item C): SLIDING breaker window — ring of the last N fire wall-times.
-     * Replaces the pre29 tumbling first-fire-anchored window (N fires straddling a window
-     * boundary never armed it). Arm rule: ts[newest] − ts[newest−(N−1)] ≤ BREAKER_WIN. */
-#define PTV_RSN_RING 16
-    int64_t          rsn_fire_ring[PTV_RSN_RING];     /* fire wall µs, newest at (head−1) mod ring */
-    int              rsn_fire_head;                   /* next write slot */
-    int              rsn_fire_cnt;                    /* valid entries (≤ PTV_RSN_RING) */
-    int64_t          rsn_last_over_wc;                /* wall µs |R| last exceeded the band (quiet disarm) */
-    int64_t          rsn_count;                       /* total resync fires (stats rsn= token) */
-    /* 1.0.1-pre30 (item A): post-seam sensor hold. Live evidence (first two production
-     * fires, 2026-07-29): the reading ~2-4ms after a seam is garbage (i24: chunk +2000 on
-     * R=+2081 → expected +81, instant read −1035 → false ABORT; settled +125 ~1-2min later,
-     * decay ~12ms/s). rsn_step_wc doubles as the last-seam stamp; R-based walk decisions
-     * (COMPLETE / band-crossing / next seam) are suspended for PTV_RESYNC_SEAM_HOLD_S after
-     * it, then need 2 consecutive ≥5s-spaced SAME-SIDE samples moving <50ms (a still-decaying
-     * sensor never reads stable, so the walk waits it out instead of aborting falsely). */
-    int              rsn_rd_side;                     /* last post-hold sample's side (in-band/cross/over) */
-    int64_t          rsn_rd_R;                        /* last post-hold sample's R (stability check) */
-    int64_t          rsn_rd_wc;                       /* wall µs of that sample (≥5s spacing) */
-    int              rsn_rd_n;                        /* consecutive same-side stable samples */
-    /* 1.0.1-pre30 (item B): audio-EARLY default actuator = video IDR-skip (jump cut) via the
-     * decode-thread executor (g_vskip_* handshake); PTV_RESYNC_SILENCE=1 reverts to pre29
-     * silence-pad chunks, which also remain the in-walk fallback when no IDR is viable. */
-    int              rsn_vskip;                       /* this walk actuates via video IDR-skip */
-    int64_t          rsn_vskip_deadline;              /* wall µs: executor-unresponsive fallback */
-    /* 1.0.1-pre30.1: hs-step SELF-ATTRIBUTION for vskip walks. Live (i24/cor-3 3x
-     * 2026-07-30, reproduced): the skip consumes buffered video; the next delivery gap
-     * then starves frame_q → a dup run raises house_skew one tick per dup while the
-     * audio thread idles the same gap → its next evaluation sees ONE >1.25-tick hs jump
-     * → the walk's event-edge check aborted its own walk ("new event: hs-step") ~2s
-     * after every seam. Attribution is directional + budgeted, NOT a blanket window: a
-     * POSITIVE hs-only step is absorbed while cumulative growth since arming stays
-     * within Σ(posted skip spans)+slack — the most starvation our own skip can cause.
-     * Foreign disturbances still abort: any other edge type, any negative step, or
-     * growth beyond the budget (e.g. a genuine input stall's dup run busts it). */
-    int              rsn_hs_absorb;                   /* armed: vskip span posted this walk */
-    int64_t          rsn_hs0;                         /* house_skew at arming (growth base) */
-    int64_t          rsn_hs_budget_us;                /* max self-attributable hs growth */
-    int64_t          rsn_hs_req_us;                   /* last posted span (refund on REFUSED/recall;
-                                                       * shrink by req−achieved at DONE/ESCAPE) */
-    int64_t          rsn_walk_wc;                     /* rr30 (T1): walk ENGAGE stamp — with item A,
-                                                       * a sensor that never corroborates (2 stable
-                                                       * samples) would otherwise pin rsn_active
-                                                       * forever (and the corrector defers via
-                                                       * resync_owns): the liveness ceiling aborts
-                                                       * a walk with no seam/complete progress for
-                                                       * PTV_RESYNC_WALK_CEIL_S */
     int              slot_deferred;               /* 2.0.2 T-386: a mosaic slot not live at the start — the track
                                                   * carries silence on the house axis until the slot binds */
     int64_t          pump_next;                   /* 2.0.2 T-386: next silent sample of a deferred track (output
@@ -1475,6 +1375,8 @@ typedef struct AudioState {
     _Atomic int64_t *res_step;                    /* 2.0.2 T-343: its slot's deliberate picture steps (mosaic) */
     int64_t          res_step_seen;               /* ... the part already followed (us) */
     int              res_follow_n;                /* 2.0.2 T-343: [PTV-RESFOLLOW] lines logged */
+    _Atomic int64_t *tl_lag;                      /* 2.1 T-409: its slot's realized picture lag (mosaic frame sync), */
+    _Atomic int64_t *tl_nlag, *tl_at, *tl_ahead;  /* the lag after a boundary, the boundary, the sound's head */
 } AudioState;
 
 /* ---- demux + mux ---- */
@@ -1742,6 +1644,8 @@ typedef struct PtvDiscBuf {
     int64_t             fl_delta_us;        /* the trigger stream's jump delta at that flush (µs) */
 } PtvDiscBuf;
 
+typedef struct PtvTimeline PtvTimeline;   /* 2.1 T-409: the program timeline, source stage (ptvencoder_timeline.c) */
+
 typedef struct DemuxArgs {
     AVFormatContext      *ifmt;
     AVThreadMessageQueue *video_q;
@@ -1876,6 +1780,11 @@ typedef struct DemuxArgs {
     int                   door_startup;     /* 2.0.0-pre20 T-364: the source has stayed LIVE since this cut began (pre21:
                                              * at any time; pre20 required it before the first picture) */
     int64_t               door_raw0, door_us0, door_cut, door_wc, door_n, door_v0, door_vo, door_vo_wc, door_vs_hold;
+    /* 2.0.2 T-398: the door erases its own cut on the pictures' boundaries (see the door block) */
+    int64_t               door_vhi;         /* PTS (video tb) of the newest picture let through */
+    int                   door_vhi_ok;
+    int                   door_erased;      /* this cut was erased at the door: drop what lies before door_vb */
+    int64_t               door_vb;          /* PTS (video tb) of the keyframe the door resumed at */
     int64_t               dbg_door_wc;      /* T-316 diag: [PTV-DOORDBG] rate limit */
     int                   dbg_door_st;      /* 2.0.0: [PTV-DOORDBG] last printed state (door/active/hold/fresh) */
     int64_t               src_gap_pending;  /* 2.0.0-pre4: a hold's arrival gap awaiting its rejoin class */
@@ -1883,6 +1792,7 @@ typedef struct DemuxArgs {
     int64_t              *tail_wc_us;       /* 2.0.0 T-089: per stream, wall time that carry was taken (bounds a multi-packet tail) */
     int                   src_gap_class;    /* 2.0.0-pre4: class known before the gap was counted: 1 BURST, 2 other */
     PtvDiscBuf           *disc;           /* legacy-0004 buffer-classify-discard (g_layera only; NULL otherwise) */
+    PtvTimeline          *tl;             /* 2.1 T-409: the program timeline (g_timeline only; NULL otherwise) */
     int64_t               video_fwd_us;   /* wall-clock (us) of the last VIDEO forward-discontinuity crossing (whole-program-splice indicator) */
     int64_t               prog_off;       /* P2 (§7.1): program-level discontinuity offset (90kHz, detected on the
                                            * DENSE video reference) applied to SPARSE copied streams (sub/data/SCTE)
@@ -2031,6 +1941,10 @@ typedef struct Input {
     _Atomic int           acq_done;          /* its acquire thread returned */
     _Atomic int64_t       res_step_us;       /* 2.0.2 T-343: the compositor's deliberate picture steps for this slot (us,
                                               * + one tick per residence hold, - one per decimation skip) */
+    _Atomic int64_t       tl_lag_us;         /* 2.1 T-409: the slot's realized picture lag (output - (source - h0)), us */
+    _Atomic int64_t       tl_nlag_us;        /* ... the lag from tl_at_us on (a step scheduled at a content boundary) */
+    _Atomic int64_t       tl_at_us;          /* ... that boundary (source time, us; INT64_MAX = none pending) */
+    _Atomic int64_t       tl_ahead_us;       /* ... the newest content the slot's sound has been placed for (us) */
     int                   deferred;          /* 2.0.2 T-386: not live at the mosaic start — placeholder cell, silent
                                               * audio track, binds when its source arrives */
     int                   geom_w, geom_h, geom_fmt;   /* ... the cell geometry it takes (the first live sibling's) */
@@ -2096,65 +2010,11 @@ extern int     g_pestail;   /* 2.0.0-pre4c: PES-tail wall-gap carry for video wa
 extern int     g_rlcheck;   /* 2.0.1 T-087: content check of a backward audio erase (PTV_NO_RLCHECK=1 off) */
 extern double  g_rl_relabel_max;   /* 2.0.2 T-391 */
 extern int     g_voutlier;  /* 2.0.1 T-383: one-picture timestamp outlier restamped (PTV_NO_VOUTLIER=1 off) */
-extern int     g_recanchor;              /* 1.0.1-pre24 #63 corroborated recovery re-anchor
-                                          * (PTV_NO_RECANCHOR=1 disables) */
-extern int64_t g_recanchor_settle_us;    /* quiet+stable window before an engage (PTV_RECANCHOR_SETTLE_S, 300s) */
-extern int64_t g_recanchor_cooldown_us;  /* re-engage holdoff after a completed re-anchor
-                                          * (PTV_RECANCHOR_COOLDOWN_S, 1800s) */
-extern int     g_recanchor_test_abort_n; /* TEST ONLY (rr24 F2 gate): force one mid-walk abort
-                                          * after N steps, no event injected (0 = off, default) */
-extern int     g_resync;                 /* 1.0.1-pre29 #69 RESYNC hard-reset path for the
-                                          * >PTV_RESYNC_MS dead zone (PTV_RESYNC=1 enables, default OFF) */
-extern int64_t g_resync_ms_us;           /* resync band threshold (PTV_RESYNC_MS, 350ms) */
-extern int64_t g_resync_ok_us;           /* OK band — timer closes / walk completes (PTV_RESYNC_OK_MS, 150ms) */
-extern int64_t g_resync_confirm_us;      /* confirm timer before a fire (PTV_RESYNC_CONFIRM_S, 120s) */
-extern int64_t g_resync_confirm_big_us;  /* confirm when |R0| > 2s (PTV_RESYNC_CONFIRM_BIG_S, 60s) */
-extern int     g_resync_breaker_n;       /* circuit breaker: fires within the window that ARM
-                                          * (PTV_RESYNC_BREAKER_N, 4) — NO routine cooldown otherwise */
-extern int64_t g_resync_breaker_win_us;  /* breaker fire-count window (PTV_RESYNC_BREAKER_WIN_S, 900s) */
-extern int64_t g_resync_quiet_us;        /* below-band span that DISARMS the breaker + clears the
-                                          * history (PTV_RESYNC_QUIET_S, 1800s) */
-extern int64_t g_resync_chunk_us;        /* audio-early chunk size (PTV_RESYNC_CHUNK_MS, 2000ms) */
-extern int64_t g_resync_chunk_gap_us;    /* gap between chunks (PTV_RESYNC_CHUNK_GAP_S, 5s) */
-/* ---- 1.0.1-pre30 #69 refinements ---- */
-extern int64_t g_resync_seam_hold_us;    /* item A: post-seam sensor hold before any R-based walk
-                                          * decision (PTV_RESYNC_SEAM_HOLD_S, 20s; 0 disables).
-                                          * The effective inter-seam gap is max(chunk_gap, hold). */
-extern int     g_resync_vskip;           /* item B: audio-EARLY default actuator = video IDR-skip
-                                          * (PTV_RESYNC_SILENCE=1 reverts to pre29 silence chunks) */
-extern int64_t g_resync_idr_wait_us;     /* item B: executor bound waiting for a usable IDR
-                                          * (PTV_RESYNC_IDR_WAIT_S, 5s ≈ 2× typical GOP) */
-extern int64_t g_resync_vskip_tol_us;    /* item B: whole-GOP overshoot tolerance — skip the
-                                          * largest whole-GOP total ≤ R + tol
-                                          * (PTV_RESYNC_VSKIP_TOL_MS, 250ms) */
-extern int64_t g_resync_walk_ceil_us;    /* rr30 (T1): walk liveness ceiling — abort a walk
-                                          * whose sensor never corroborates, measured from the
-                                          * last seam (or ENGAGE) (PTV_RESYNC_WALK_CEIL_S,
-                                          * 600s; 0 disables) */
-/* item B cross-thread state (single-input only; the audio thread requests, the decode thread
- * executes at the video_q pop site — upstream of the rung split, so every rung skips the same
- * content coherently; the output threads read the label mapping in content_index()). */
-enum {                                   /* g_vskip_state */
-    PTV_VSKIP_IDLE = 0,
-    PTV_VSKIP_PENDING,                   /* request posted, executor working */
-    PTV_VSKIP_DONE,                      /* clean IDR stop — achieved span in g_vskip_done_us */
-    PTV_VSKIP_ESCAPE,                    /* deadline escape (mid-GOP resume) — partial span */
-    PTV_VSKIP_REFUSED                    /* nothing skippable inside the horizon */
-};
-extern _Atomic int64_t g_vskip_req_us;   /* requested target span µs (audio posts, decode consumes) */
-extern _Atomic int     g_vskip_state;    /* PTV_VSKIP_* (audio arms PENDING, decode completes) */
-extern _Atomic int64_t g_vskip_done_us;  /* achieved span µs (valid at DONE/ESCAPE) */
-extern _Atomic int     g_vskip_done_gops;/* whole GOPs (key packets) dropped */
-/* label mapping: the skip is label-neutral — content advances, output labels continue
- * monotonically. content_index() subtracts off_total for src ≥ from (post-skip content) and
- * off_before for src < from (frames of earlier epochs still in flight through frame_q).
- * Write order (decode thread): off_before=old_total → from=new → off_total=new_total. */
-extern _Atomic int64_t g_vskip_off_total;  /* cumulative skipped span (µs) for src ≥ from */
-extern _Atomic int64_t g_vskip_off_before; /* cumulative span before the latest skip */
-extern _Atomic int64_t g_vskip_from_us;    /* latest skip boundary on the source-time axis (µs) */
 /* 2.0.0-pre6.1 (T-077): rejoin map — content that comes back AHEAD of the house after a hold (the WUCR stretch at the
  * outage onset, measured −30 % for ~4 s = a ~1.4 s PTS debt) is mapped onto the next house tick instead of jumping
- * the output PTS forward. Same src-keyed two-tier publish as vskip, so every rung agrees; house_skew is published
+ * the output PTS forward. Src-keyed two-tier publish, so every rung agrees: ptv_rj_off() returns off_total for
+ * src >= from and off_before for src < from (frames of earlier epochs still in flight through frame_q); write order
+ * off_before=old_total -> from=new -> off_total=new_total (release). house_skew is published
  * against RAW content (it becomes −D), so audio and copies follow through the door / demux_pass. */
 extern _Atomic int64_t g_rj_off_total, g_rj_off_before, g_rj_from_us;
 extern _Atomic int     g_rj_epoch;
@@ -2181,13 +2041,9 @@ static inline int64_t ptv_rj_off(int64_t src_us)
         off = atomic_load_explicit(&g_rj_off_before, memory_order_relaxed);
     return off;
 }
-extern _Atomic int     g_vskip_epoch;      /* bumped per applied skip → master rung re-seeds m_v EMA
-                                            * at the first post-boundary emit */
-extern _Atomic int64_t g_vgop_est_us;      /* decode-measured key-to-key span EMA (0 = unknown) */
-extern _Atomic int64_t g_vgop_key_wall;    /* wall µs a KEY packet last passed the pop site */
 extern int64_t g_rscorr_slew_fast;       /* pre29 adaptive corrector slew above 150ms |R|, µs/s
-                                          * (PTV_RSCORR_SLEW_FAST, 5000; 0 = always the base clamp);
-                                          * active regardless of PTV_RESYNC (0.5%% rate < pitch JND) */
+                                          * (PTV_RSCORR_SLEW_FAST, 5000; 0 = always the base clamp;
+                                          * 0.5%% rate < pitch JND) */
 extern int     g_muxguard;               /* 1.0.1-pre26 survive-first backward-dts mux backstop
                                           * (PTV_NO_MUXGUARD=1 disables) */
 extern int64_t g_muxtest_back_at_us;     /* TEST ONLY (pre26 gates): one injected backward audio
@@ -2330,6 +2186,8 @@ extern _Atomic int64_t g_src_aread_wc;   /* 2.0.0-pre9.8 (T-076): last transcode
 extern int             g_src_hold_act;   /* 2.0.0-pre4: act on STALLED (engine freeze, accounting); 0 = observe
                                           * only (PTV_HOLD_OBSERVE=1, the pre3 behaviour) */
 extern _Atomic int64_t g_src_rejoin_wall; /* 2.0.0-pre4: wall us of the last STALLED -> LIVE (0 = never) */
+extern _Atomic int64_t g_tl_prog_wc;      /* 2.1 T-409: wall us of the timeline's last program event (single input) */
+extern _Atomic int     g_vm_waiting;      /* 2.1 T-409: tracks with frames waiting at the record door (fill sentinels) */
 extern _Atomic int64_t g_src_fresh_wc;    /* 2.0.0-pre6: wall us of the master's last fresh (non-dup) frame,
                                            * stored after that tick's house_skew write */
 extern _Atomic int     g_src_icb_armed;   /* 2.0.0-pre5: the no-video read interrupt is live (single input) */
@@ -2420,7 +2278,6 @@ extern _Atomic int64_t g_corr_pub[PTV_MAX_AUDIO];        /* cumulative corr_us p
 extern _Atomic int     g_corr_state_pub[PTV_MAX_AUDIO];  /* PTV_CORR_* per track */
 extern _Atomic int64_t g_conv_pub[PTV_MAX_AUDIO];        /* rr23: cumulative folded label motion (us) */
 extern _Atomic int64_t g_conv_park_pub[PTV_MAX_AUDIO];   /* rr23: seam_park_until wall us (0/past = unparked) */
-extern _Atomic int64_t g_rsn_pub[PTV_MAX_AUDIO];         /* pre29: total resync fires (stats rsn= token) */
 extern _Atomic int     g_corr_disarm_req[PTV_MAX_AUDIO]; /* master watchdog → audio thread (silent sync) */
 /* 1.0.1-pre17 sibling-slate condition (compositor writes, corrector reads): bit k set while
  * input slot k is black-slated. While ANY bit is set no mv track may engage — a sibling
@@ -2551,6 +2408,18 @@ int build_audio_filter(AudioState *a, AVCodecContext *adec, AVRational tb,
                        const char *af, enum AVSampleFormat out_fmt);
 /* ptvencoder_demux.c */
 void *demux_thread(void *arg);
+/* 2.1 T-409: the program timeline (ptvencoder_timeline.c) and the demux helpers it calls */
+extern int     g_timeline;               /* 2.1: always 1 — one classifier per input owns every source timing remedy */
+extern int64_t g_tl_open_us;             /* a dense packet this far off its path opens an event (PTV_TL_OPEN_MS, 500) */
+PtvTimeline *ptv_tl_alloc(int nb_streams);
+void ptv_tl_free(PtvTimeline **t);
+int  ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt);
+void ptv_tl_cut(DemuxArgs *d, int64_t cut_us);
+int  ptv_demux_dispatch(DemuxArgs *d, AVPacket *pkt);
+void ptv_rsync_post_edit(DemuxArgs *d, int s, int64_t delta_us);
+void ptv_vwait_rebase(DemuxArgs *d, int64_t from_us, int64_t old_end_us, int64_t open_wc, int64_t dpo);
+int  ptv_tl_settling(DemuxArgs *d);
+extern int64_t g_gap_min_us;
 int ptv_disc_init(PtvDiscBuf *b, int capacity, int nb_streams);
 int ptv_slot_acquire(struct Input *in, int idx);   /* 2.0.2 T-386 */
 void ptv_disc_free(PtvDiscBuf *b);
@@ -2568,7 +2437,6 @@ void ptv_stats_lipsync(char *buf, size_t size, int64_t now_us, int force_idx);
 void ptv_stats_lipsync_in(char *buf, size_t size, int64_t now_us, int in);
 void ptv_stats_corr(char *buf, size_t size, int force_idx);
 void ptv_stats_conv(char *buf, size_t size, int64_t now_us, int force_idx);
-void ptv_stats_rsn(char *buf, size_t size, int force_idx);
 /* 1.0.1-pre17: the pre14 stale-track corrector watchdog, shared by both cadence owners —
  * the single-input master rung (ptvencoder_clock.c) and the mv compositor (the passthrough
  * rung loop returns before the master block, so mv needed its own call site). Callers

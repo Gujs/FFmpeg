@@ -147,15 +147,21 @@ void show_help_default(const char *opt, const char *arg)
         "    PTV_VDELIVERY_CAP_MS  early-video hold FLOOR + audio-death escape base (default 6000).\n"
         "                        1.0.1-pre17: the live cap AUTO-SIZES to 1.5x the measured audio-chain\n"
         "                        lateness (ceiling 12s) — no per-channel tuning needed; env = floor only\n"
+        "   timing (2.1 timeline — always on): one classifier per input decides every gap, relabel, restart,\n"
+        "   burst cut and corrupt timestamp ONCE for all its streams ([PTV-TL] events); single input places the\n"
+        "   sound where its picture was shown around events (the record door); mosaic slots are frame\n"
+        "   synchronizers (picture by content time at a lag, sound placed with it; [PTV-MV] re-locked).\n"
+        "    PTV_TL_OPEN_MS=N    path tolerance that opens an event window (default 500)\n"
+        "    PTV_TL_NO_VMDOOR=1  A/B only: single-input sound by house_skew instead of the record door\n"
+        "    PTV_TL_AGLUE=1      A/B only: the 2.0 audio label-step verdicts (AGLUE) on top of the timeline\n"
         "   reverts (each disables one default-on mechanism; for A/B and rollback only):\n"
-        "    PTV_NO_WUCR         occupancy-servo house pacing      PTV_NO_LAYERA   glue/discontinuity buffer\n"
-        "    PTV_NO_REPRIME      fast post-glue buffer refill      PTV_NO_ADAPTIVE fixed (non-adaptive) cushion\n"
+        "    PTV_NO_WUCR         occupancy-servo house pacing      PTV_NO_ADAPTIVE fixed (non-adaptive) cushion\n"
+        "    PTV_NO_REPRIME      fast post-glue buffer refill\n"
         "    PTV_NO_EXACTTICK    exact-rational video stamping     PTV_NO_MV_EXACTTICK  mosaic measurement axes\n"
         "    PTV_NO_PULLDOWN     telecine-aware film emit          PTV_NO_AVLOCK   audio house-lock\n"
         "    PTV_NO_GENLOCK      source-rate estimator             PTV_NO_GAPDISCRIM audio gap-vs-splice\n"
         "    PTV_NO_DELIVERY     audio delivery-alignment gate     PTV_NO_DELIVERY_MV ungated mosaics (pre-0.9.12.1)\n"
         "    PTV_NO_VDELIVERY    symmetric EARLY-VIDEO hold (pre12; back to video-ahead wire under a buffering -af)\n"
-        "    PTV_NO_RESIDENCE    mosaic per-slot source-rate cadence (pre-0.9.13 pop-per-tick)\n"
         "    PTV_NO_AUTOBANK     runtime bursty-channel bank escalation (back to advisor-only)\n"
         "    PTV_NO_CLOCKFOLLOW  following a large verified source-clock offset (>0.5%%; e.g. a fast relay)\n"
         "    PTV_NO_QSHED        GOP-coherent video_q overflow shed (back to per-pkt tail-drop = the #32 wedge)\n"
@@ -215,10 +221,8 @@ void ptv_print_log_legend(int full)
     av_log(NULL, AV_LOG_INFO,
         "  hs         house_skew: latency debt vs baseline (ms) — a feed stall steps it up, catch-up\n"
         "             drops bleed it back; A/V stays LOCKED throughout (this is delay, not lip-sync)\n"
-        "  hsres      (0.9.18.7) LAYERA erase-residue ledger (ms): cumulative label offset the glue\n"
-        "             erases injected into the hs reading. hs growing IN STEP with hsres = erased-\n"
-        "             discontinuity bookkeeping (e.g. jump-to-live parked the stall's dups), NOT\n"
-        "             held content; hs growing while hsres is flat = real retained latency\n"
+        "  hsres      (0.9.18.7) LAYERA erase-residue ledger (ms) — 2.1: always 0 (LAYERA is not run;\n"
+        "             the timeline erases on every stream at once, so hs is real retained latency)\n"
         "  cushion    adaptive frame_q target: ~1s lean tier or ~4s raised tier ([PTV-CUSHION] logs\n"
         "             each transition: grows on 2 starvations/60min, shrinks after 6h quiet;\n"
         "             1.0.1-pre10: [PTV-CUSHREL] releases a raised tier held against a starved-\n"
@@ -317,25 +321,25 @@ void ptv_print_log_legend(int full)
         "             track N (source gone, or its packets absent 2 s with video flowing), cN = copied\n"
         "             AC-3/E-AC-3 at input stream N (silent frames of its own codec).\n");
     av_log(NULL, AV_LOG_INFO,
-        "discontinuity events (always-on since v0.9.13; were PTV_DIAG-only):\n"
-        "  [PTV-LAYERA]   jump = a >1s splice detected (buffering starts); flush = the glue applied\n"
-        "                 (vid_err = source A/V mis-mux this glue corrected)\n"
-        "  [PTV-GLUE]     running per-input mis-mux stats — the LAYERA-retirement decision line:\n"
-        "                 mean/max|err| ~0 over days => the simpler per-stream absorber suffices.\n"
-        "                 REFUSED (1.0.1-pre15 #33): a flush mismatch computed from UNHEALTHY\n"
-        "                 labels (health H far from 1.0 — label-flood source) is NOT routed to\n"
-        "                 the content path; per-stream butt-joint instead (pre-pre4 posture),\n"
-        "                 residual left to sensor/corrector\n"
-        "  [PTV-DISCONT]  per-stream PTS jump absorbed / audio GAP left to aresample padding\n"
-        "  [PTV-AGLUE]    (v0.9.16.4) sub-1s audio label step verdict, by direction: BACKWARD\n"
-        "                 => RELABEL erased (content can't be negatively missing; closes the\n"
-        "                 audio-early accumulator where aresample silently dropped content);\n"
-        "                 FORWARD => GAP, aresample pads (upstream-cut gaps arrive flowing, so\n"
-        "                 wall-clock is no evidence — the v0.9.16.3 lesson). PTV_AGLUE_MS=0 off.\n"
-        "                 1.0.1-pre15 (#33): a backward step matching a recent open GAP-pad is\n"
-        "                 the pad's RETURN leg — APPLIED (round-trip cancelled), never erased;\n"
-        "                 every non-erase verdict is realization-checked (tripwire synthesizes\n"
-        "                 at the swr boundary if hard comp did not fire). PTV_NO_GLUECLASS=1 off\n"
+        "timing events (2.1 timeline, always on — one decision per source event, for every stream of the input):\n"
+        "  [PTV-TL]       one line per event, numbered, naming the stream that opened it and the decision —\n"
+        "                 J = the step in the labels, wall = the input's silence before it, kept / erased = what\n"
+        "                 the output keeps as a hole / joins up (whole pictures), k = the input's program offset\n"
+        "                 after it. Decisions: hole kept | hole, flowing\n"
+        "                 part erased (labels jumped further than the wall time: the rest erased) | relabel erased\n"
+        "                 (a jump with no wall time) | step back erased | new domain, gap kept (a restart) |\n"
+        "                 outlier window (corrupt labels dropped) | single-stream step (one stream only, labels\n"
+        "                 as sent; RELABEL may repair it). WARNING when the program moved, INFO otherwise\n"
+        "  [PTV-SRC] in0 burst: our own depth cut — 'the cut is erased at the door' (source live: no jump)\n"
+        "                 or 'stays as a hole' (the source paused inside it)\n"
+        "  [PTV-VMAP]     copies / captions placed where the video showed their content (counts)\n"
+        "  [PTV-MV]       (re-lock) a mosaic slot's frame sync moved its lag by <step> ms (back from an\n"
+        "                 outage with the primed margin, a start-up backlog, a buffer far off its depth); the\n"
+        "                 slot's sound takes the same step at once. A repeated / skipped picture (lost, late,\n"
+        "                 rate conversion) moves nothing and is not logged\n"
+        "  (2.0 lines no longer written in 2.1: [PTV-LAYERA], [PTV-GLUE], [PTV-DISCONT], the [PTV-AGLUE] step\n"
+        "   verdicts, the mosaic [PTV-PLL] ACQUIRE / FROZEN, [PTV-RESFOLLOW], [PTV-REANCHOR2], [PTV-RESYNC],\n"
+        "   [PTV-RECANCHOR])\n"
         "  [PTV-ADISC]    (1.0.1-pre15 #33, unconditional) corrupt-flagged AUDIO discarded at the\n"
         "                 demux (rate-limited count + acor= stats) — the NBS undecodable-source\n"
         "                 phase, previously silent/restart-only; PTV_NBS_FILL=1 additionally\n"
@@ -392,11 +396,13 @@ void ptv_print_log_legend(int full)
         "               the [PTV-ADISC]/NBS log lines\n"
         "  inK:qdrop    input-K video queue overflow drops (demux side)\n"
         "  inK:corrupt  input-K corrupt packets (demux + decode)\n"
-        "  inK:pd       cadence-residence holds (v0.9.13) — a 25fps slot in a 29.97 mosaic holds\n"
-        "               every 6th tick BY DESIGN (~5/s is correct rate conversion, not a fault)\n"
-        "  inK:sv       genuine starvation dups (frame was DUE but the jitter buffer was empty)\n"
-        "  inK:sk       published per-slot audio skew (ms) the slot's audio follows\n"
-        "  inK:skres    (0.9.18.7) slot LAYERA erase-residue ledger (ms) — read like hsres= vs sk=\n");
+        "  inK:pd       cadence repeats: the cell showed its picture again because the next one was not\n"
+        "               due yet — a 25fps slot in a 29.97 mosaic repeats every 6th tick BY DESIGN (~5/s\n"
+        "               is correct rate conversion, not a fault)\n"
+        "  inK:sv       starvation repeats (no picture queued: the slot's input is late or gone)\n"
+        "  inK:sk       (2.1) the slot's realized picture lag (ms, output - source on the slot's h0 axis);\n"
+        "               its sound is placed with it. Moves only at a [PTV-MV] re-lock or a drift step\n"
+        "  inK:skres    (0.9.18.7) slot LAYERA erase-residue ledger (ms) — 2.1: always 0\n");
     if (!full)
         return;
     av_log(NULL, AV_LOG_INFO,
@@ -410,7 +416,7 @@ void ptv_print_log_legend(int full)
         "                 from logs alone. 1.0.1-pre16: per-input — the mv [PTV-DIAG] mv per-slot\n"
         "                 segment carries inK:.../gpps=M/D/gov=G (the governor ran blind on mv)\n"
         "  [PTV-AVSYNC]   per-track A/V controller telemetry: offset/avlag estimate, vlag/alag,\n"
-        "                 house_skew, and (multiview) the A/V PLL integrator state. 1.0.1-pre13:\n"
+        "                 house_skew (2.1: a mosaic slot has no PLL — its sound follows its frame sync). 1.0.1-pre13:\n"
         "                 the estimate is printed as avlag= (was lipsync= — SIGN IS OPPOSITE to\n"
         "                 the stats-line lipsync= sensor: avlag>0 = audio LATE; lipsync>0 = audio\n"
         "                 EARLY. The token now appears only on the -stats progress line)\n"
@@ -423,13 +429,12 @@ void ptv_print_log_legend(int full)
         "                 where an A/V offset enters\n"
         "  [PTV-LIPSYNC]  (single input) per-track err = async_pad − video lag (internal estimate);\n"
         "                 a mosaic slot's lip sync is its inK:lipsync on the mv stats line\n"
-        "defaults (v0.9.15): WUCR occupancy pacing + LAYERA glue handling + REPRIME fast refill +\n"
-        "  ADAPTIVE cushion + delivery gate (single & mosaic) + cadence residence + AUTO-BANK +\n"
-        "  clock-follow + cadence decimation are all ON — no env needed for the production posture.\n"
-        "  Reverts: PTV_NO_WUCR · PTV_NO_LAYERA · PTV_NO_REPRIME · PTV_NO_ADAPTIVE · PTV_NO_AVLOCK ·\n"
-        "  PTV_NO_DELIVERY_MV · PTV_NO_RESIDENCE · PTV_NO_AUTOBANK · PTV_NO_CLOCKFOLLOW ·\n"
-        "  PTV_NO_DECIMATE · PTV_LAYERA_FULLSKIP (LAYERA skips the demux absorber for sub-1s steps\n"
-        "  again — restores the In-Touch audio-late accumulator; A/B only) ·\n"
+        "defaults (2.1): the program timeline (one classifier per input, the record door, mosaic frame\n"
+        "  synchronizers) + WUCR occupancy pacing + REPRIME fast refill + ADAPTIVE cushion + delivery\n"
+        "  gate (single & mosaic) + AUTO-BANK + clock-follow + cadence decimation are all ON — no env\n"
+        "  needed for the production posture.\n"
+        "  Reverts: PTV_NO_WUCR · PTV_NO_REPRIME · PTV_NO_ADAPTIVE · PTV_NO_AVLOCK ·\n"
+        "  PTV_NO_DELIVERY_MV · PTV_NO_AUTOBANK · PTV_NO_CLOCKFOLLOW · PTV_NO_DECIMATE ·\n"
         "  PTV_NO_EXACTTICK (re-enables the integer-tick ~10ppm NTSC lip-sync drift; A/B only) ·\n"
         "  PTV_NO_PULLDOWN (revert telecine-aware emit: film segments back to dup-fill + hs sawtooth) ·\n"
         "  PTV_NO_RSYNC_CORR (residual-sync corrector off; 1.0.1-pre14, DEFAULT ON — parked and\n"
@@ -553,30 +558,6 @@ void ptv_stats_conv(char *buf, size_t size, int64_t now_us, int force_idx)
             nn += snprintf(buf + nn, size - nn, "%sa%d:", ki ? "," : "", ki);
         nn += snprintf(buf + nn, size - nn, "%+llds%s",
                        (long long)(cv / AV_TIME_BASE), (pu && now_us < pu) ? "P" : "");
-    }
-}
-
-/* rsn= builder (1.0.1-pre29 #69). Total RESYNC hard-reset fires per track — a fired reset is
- * an on-air seam a monitor should know about. Absent while every track's count is 0 (and
- * always absent with PTV_RESYNC off), so the healthy-channel stats line stays byte-identical
- * (the ptv_stats_corr absent-when-zero pattern). */
-void ptv_stats_rsn(char *buf, size_t size, int force_idx)
-{
-    int any = 0, ki, nn;
-    buf[0] = 0;
-    if (!g_resync || g_rsx.n_a <= 0)
-        return;
-    for (ki = 0; ki < g_rsx.n_a; ki++)
-        if (atomic_load_explicit(&g_rsn_pub[ki], memory_order_relaxed) > 0)
-            any = 1;
-    if (!any)
-        return;
-    nn = snprintf(buf, size, " rsn=");
-    for (ki = 0; ki < g_rsx.n_a && nn > 0 && nn < (int)size - 18; ki++) {
-        int64_t rc = atomic_load_explicit(&g_rsn_pub[ki], memory_order_relaxed);
-        if (force_idx || g_rsx.n_a > 1)
-            nn += snprintf(buf + nn, size - nn, "%sa%d:", ki ? "," : "", ki);
-        nn += snprintf(buf + nn, size - nn, "%lld", (long long)rc);
     }
 }
 

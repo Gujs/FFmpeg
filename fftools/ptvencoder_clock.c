@@ -151,26 +151,6 @@ static int64_t content_index(VideoCtx *v, int64_t src_pts)
     int64_t house_us;
     if (src_pts == AV_NOPTS_VALUE || *v->h0 == AV_NOPTS_VALUE) return -1;
     house_us = av_rescale_q(src_pts, v->out_tb, AV_TIME_BASE_Q) - *v->h0;
-    /* 1.0.1-pre30 #69 (item B) vskip label-neutrality: a resync video IDR-skip deleted
-     * content upstream (video_q head); subtract the published skip offset so the output
-     * labels CONTINUE monotonically while the content jumps — the video mirror of the
-     * audio-late skip seam. src-keyed two-tier: post-boundary content gets the new total,
-     * frames of earlier epochs still in flight through frame_q keep the previous one (skips
-     * are ≥ max(chunk_gap, seam_hold) apart, far above any frame_q residence). Every rung
-     * shares this function, so all rungs stay label-coherent. Inert until a skip fires
-     * (off_total stays 0). */
-    {
-        /* rr30 (T2a): acquire pairs with the executor's release on off_total — a reader
-         * that sees the new total is guaranteed the new from/off_before (relaxed loads
-         * below are ordered by this acquire). */
-        int64_t off = atomic_load_explicit(&g_vskip_off_total, memory_order_acquire);
-        if (off) {
-            int64_t src_us = house_us + *v->h0;   /* back on the source-time axis */
-            if (src_us < atomic_load_explicit(&g_vskip_from_us, memory_order_relaxed))
-                off = atomic_load_explicit(&g_vskip_off_before, memory_order_relaxed);
-            house_us -= off;
-        }
-    }
     house_us -= ptv_rj_off(av_rescale_q(src_pts, v->out_tb, AV_TIME_BASE_Q));   /* 2.0.0-pre6.1 rejoin map */
     if (house_us < 0) house_us = 0;
     if (g_exacttick && v->out_fps.num > 0)
@@ -1040,7 +1020,6 @@ void *output_thread(void *arg)
         /* 1.0.1-pre9 residual sensor: video-side EMA state (master rung; τ ≈ 30s of ticks) */
         int64_t rs_mv_ema = 0, rs_mv_res = 0, rs_mv_div = v->tick_dur_us > 0 ? 30000000 / v->tick_dur_us : 750;
         int     rs_mv_seed = 0;
-        int     rs_mv_vskip_ep = 0;   /* 1.0.1-pre30: last vskip epoch this EMA re-seeded for */
         if (rs_mv_div < 8) rs_mv_div = 8;
         /* v0.9.11 pulldown state: 1-frame lookahead + film-mode detector (see g_pulldown comment) */
         AVFrame *nextf = NULL;
@@ -1458,10 +1437,9 @@ void *output_thread(void *arg)
                     int64_t su = av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q);
                     rjt_n++;
                     av_log(NULL, AV_LOG_INFO, "[PTV-RJTRACE] out src=%.3f fresh=%d content=%"PRId64" last=%"PRId64
-                           " vpts=%"PRId64" rj_off=%.3f from=%.3f h0=%.3f vskip=%.3f\n", su / 1e6, fresh, content_vpts,
+                           " vpts=%"PRId64" rj_off=%.3f from=%.3f h0=%.3f\n", su / 1e6, fresh, content_vpts,
                            last_vpts, vpts, ptv_rj_off(su) / 1e6,
-                           atomic_load_explicit(&g_rj_from_us, memory_order_relaxed) / 1e6, *v->h0 / 1e6,
-                           atomic_load_explicit(&g_vskip_off_total, memory_order_relaxed) / 1e6);
+                           atomic_load_explicit(&g_rj_from_us, memory_order_relaxed) / 1e6, *v->h0 / 1e6);
                 }
             }
             held->pts = vpts; held->pkt_dts = AV_NOPTS_VALUE; held->duration = 0;
@@ -1558,19 +1536,6 @@ void *output_thread(void *arg)
                     ? av_rescale(vpts, 1000000LL * v->out_fps.den, v->out_fps.num)
                     : vpts * v->tick_dur_us;
                 int64_t m = out_us - av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q);
-                /* 1.0.1-pre30 #69 (item B): a vskip seam redefines the video content↔label
-                 * mapping (m steps by −achieved at the first post-boundary frame) — re-seed
-                 * the EMA there, the exact video mirror of the audio seam's rs_ma_seed=0,
-                 * so the walk's post-hold reading converges instead of slewing 30s. */
-                {
-                    int ep = atomic_load_explicit(&g_vskip_epoch, memory_order_relaxed);
-                    if (ep != rs_mv_vskip_ep &&
-                        av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q) >=
-                            atomic_load_explicit(&g_vskip_from_us, memory_order_relaxed)) {
-                        rs_mv_seed     = 0;
-                        rs_mv_vskip_ep = ep;
-                    }
-                }
                 {   /* 2.0.0-pre9.6 (T-075): smooth m_v − house_skew only — the same split as the audio
                      * side (house_skew steps at a hold or a rejoin map; the cadence-hold residence and
                      * everything else measured stays inside the EMA) */
@@ -1718,9 +1683,13 @@ void *output_thread(void *arg)
          * silence test), so input flowing through a frame-queue underrun fills nothing; a sentinel to such a
          * track is free. 1 s left a 0.9 s dark wire at an outage start (sync_gap_20), 200 ms + a 300 ms track
          * floor still 333 ms. pre8.1: also while a track buffers its post-rejoin frames — the input is LIVE again but
-         * the door must keep filling until they are released, or the wire pauses for the buffering (0.32 s). */
+         * the door must keep filling until they are released, or the wire pauses for the buffering (0.32 s).
+         * 2.1 T-409: also while a track's frames wait at the record door — they are released by time (their content
+         * goes on air), and a burst door that drops every arriving packet left them queued until the next arrival
+         * (sync_bursty_20: 12 s of sound fed 12.2 s after its pictures were shown, audio PID dark 12.3 s) */
         if (g_hold_fill && (v->n_hold_aq || v->hold_da) && g_src_watch && g_src_hold_act &&
             (ptv_src_holding() || atomic_load_explicit(&g_rj_buffering, memory_order_relaxed) > 0 ||
+             atomic_load_explicit(&g_vm_waiting, memory_order_relaxed) > 0 ||
              av_gettime_relative() - atomic_load_explicit(&g_src_fresh_wc, memory_order_relaxed) >= 120000)) {
             int64_t nw = av_gettime_relative();
             if (nw - v->hold_fill_wc >= 100000) {
@@ -1861,9 +1830,6 @@ void *output_thread(void *arg)
                                                                       * motion; P = seam-parked); absent
                                                                       * while zero — clean line unchanged */
                 ptv_stats_conv(cvs, sizeof cvs, nows, 0);
-                char rsn[10 + PTV_MAX_AUDIO * 16];                   /* pre29 #69: rsn= (resync fires); absent
-                                                                      * while zero — clean line unchanged */
-                ptv_stats_rsn(rsn, sizeof rsn, 0);
                 char afs[16 + (PTV_MAX_AUDIO + PTV_MAX_PASS) * 16] = "";   /* 2.0.0-pre8: afill= — current silence-fill
                                                                       * run per track (aN transcoded, cN copied AC-3,
                                                                       * N = input stream index); absent while none fills */
@@ -1934,9 +1900,9 @@ void *output_thread(void *arg)
                 av_log(NULL, AV_LOG_INFO,
                     "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f "
                     "dup=%"PRId64" pd=%"PRId64" drop=%"PRId64" corrupt=%"PRId64" "
-                    "async=%+"PRId64"ppm%s%s%s%s%s%s%s%s%s%s%s%s\n",
+                    "async=%+"PRId64"ppm%s%s%s%s%s%s%s%s%s%s%s\n",
                     v->emitted, fps, hh, mm, ss,
-                    v->dup, v->pd, v->framedrop_src ? *v->framedrop_src : v->framedrop, cr, aw, dlv, wu, bk, cfs, aco, rsl, crs, cvs, rsn, ccs, srcs, afs);
+                    v->dup, v->pd, v->framedrop_src ? *v->framedrop_src : v->framedrop, cr, aw, dlv, wu, bk, cfs, aco, rsl, crs, cvs, ccs, srcs, afs);
                 stat_last = nows; stat_prev = v->emitted;
             }
         }

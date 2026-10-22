@@ -69,6 +69,214 @@ static AVFrame *make_black_frame(AVCodecContext *vdec)
  * counter interpreted at av_inv_q(out_fps) — exact — but all output-time MEASUREMENTS used
  * T x integer tick_dur_us, +10ppm fast at NTSC rates → the slot audio followers regulated
  * audio onto the wrong axis (enforced drift). Fixed by the exact-rational axis below. */
+static int64_t mv_tick_us(CompositorCtx *c, int64_t t);
+
+/* 2.1 T-409 (mosaic, design §5.4a): a slot is a frame synchronizer. Its picture is shown by CONTENT TIME at a lag L:
+ * on each tick the newest picture whose source time (on the slot's h0 axis) is due at output - L, older due ones
+ * skipped, none due = the last one repeated. A lost picture is then a repeat and a late one a skip, and L does not move:
+ * the slot's sound, placed at its source time + L, needs no step for either (the count-paced residence let losses pull
+ * the picture forward and re-primes push it back, and the PLL chased both ~3.6 s later: cor-3 Curiosity 2026-10-22).
+ * L moves only by
+ *  - a re-lock: the first picture after the input ran dry (0.5 s), or one more than 0.5 s late, re-locks behind it with
+ *    the primed jitter-buffer depth as margin (the picture holds that long, as the re-prime did); a picture more than
+ *    1 s early with nothing shown for 1 s (content ahead of the labels' time) re-locks onto it. The sound steps exactly;
+ *  - a depth re-lock: the buffer's averaged depth (pictures x cadence) off the primed depth by more than 4 ticks (or a
+ *    quarter of it) for 5 s — 1 s in the slot's first 20 s: a start-up backlog (mv04: slots 1-3 born ~1 s deep, which the birth
+ *    trim threw away picture by picture) — re-locks by the excess at once;
+ *  - the drift servo: below that, the averaged depth held within 2 pictures of the primed depth, built up at most 1 ms/s
+ *    and taken a whole tick at a time — a source clock off the house clock. The sound follows the realized lag to the
+ *    whole audio frame. */
+typedef struct MvTlSlot {
+    int64_t lag, cad, last_src, shown_wc, pop_wc, relock_wc, exc_wc;
+    int64_t real;                                   /* the realized lag: the shown pictures' output - source, averaged */
+    int64_t shown_src;                              /* source time of the last picture shown */
+    int64_t first_wc;                               /* the slot's first picture (wall) */
+    double  acc;                                    /* the drift servo's correction not yet taken (us) */
+    int     reseed;                                 /* the lag moved: re-seed the sensor's video side at the next
+                                                     * picture shown (the move shows from then on) */
+    int     tails;                                  /* stale pictures dropped since the input ran dry */
+    double  occ_f;
+    int     stepping;                               /* a lag step is scheduled: ... */
+    int64_t nlag, nat;                              /* ... the lag from content nat (h0 axis) on */
+} MvTlSlot;
+
+/* A lag step takes effect at a CONTENT boundary, for the picture and the sound alike. The sound for the content in flight
+ * is already placed with the old lag (it waits in the delivery gate with its timestamps): a step at a moment in time
+ * moved the picture while that sound stayed, and they skipped different content (mv04 sync_flapping, a -2.4 s re-lock:
+ * pictures without their sound for 8 s). The boundary is just past the newest content the sound has been placed for:
+ * before it both keep the old lag, from it on both the new one — a step down skips the same content on both, a step up
+ * holds the picture and pads the sound at the same point. */
+static void mv_tl_step(CompositorCtx *c, int k, MvTlSlot *s, int64_t lag, int64_t h0, int64_t now_us)
+{
+    int64_t ah = atomic_load_explicit(&c->inputs[k].tl_ahead_us, memory_order_relaxed);
+    if (!s->stepping) {
+        s->nat = s->shown_src + s->cad;
+        if (ah && h0 != AV_NOPTS_VALUE)
+            s->nat = FFMAX(s->nat, ah - h0 + 200000);   /* + what the sound may place before it sees the step */
+        s->stepping = 1;
+    }
+    s->nlag      = lag;
+    s->relock_wc = now_us;
+    s->exc_wc    = 0;
+    s->occ_f     = -1;
+    atomic_store_explicit(&c->inputs[k].tl_nlag_us, s->real + (lag - s->lag), memory_order_relaxed);
+    atomic_store_explicit(&c->inputs[k].tl_at_us, h0 != AV_NOPTS_VALUE ? s->nat + h0 : INT64_MIN, memory_order_release);
+}
+
+/* the first picture at or past the boundary is shown: the step is the slot's lag from now on */
+static void mv_tl_commit(CompositorCtx *c, int k, MvTlSlot *s)
+{
+    s->real    += s->nlag - s->lag;
+    s->lag      = s->nlag;
+    s->stepping = 0;
+    s->reseed   = 1;                                /* the sensor's video side takes the step with it (it read the
+                                                     * step as lip sync, decaying over a minute: mv02 -1027 ms) */
+    atomic_store_explicit(&c->inputs[k].tl_lag_us, s->real, memory_order_relaxed);
+    atomic_store_explicit(&c->inputs[k].tl_at_us, INT64_MAX, memory_order_release);
+}
+
+static int64_t mv_tl_lag(const MvTlSlot *s, int64_t fs)
+{
+    return s->stepping && fs >= s->nat ? s->nlag : s->lag;
+}
+
+static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us, AVFrame **pending, int *done,
+                           MvTlSlot *s, int occ_tgt, int *mv_seed)
+{
+    VideoHold *h = &c->inputs[k].hold;
+    int64_t out = mv_tick_us(c, tick), half = c->tick_dur_us / 2, margin = (int64_t)occ_tgt * s->cad;   /* the primed
+                                               * depth is a picture count: 30 pictures of a 59.94 slot are 0.5 s, read
+                                               * against 1 s it re-locked +500 ms (mv01) */
+    int64_t h0, src = AV_NOPTS_VALUE, relock = AV_NOPTS_VALUE, sum = 0;
+    int dry, occ, cnt = 0;
+    AVFrame *cand = NULL, *nx;
+    pthread_mutex_lock(&c->inputs[k].h0_lock); h0 = c->inputs[k].h0; pthread_mutex_unlock(&c->inputs[k].h0_lock);
+    dry = s->pop_wc && now_us - s->pop_wc >= 500000;
+    for (;;) {
+        int64_t fs;
+        nx = *pending;
+        *pending = NULL;
+        if (!nx) {
+            int rr = av_thread_message_queue_recv(h->q, &nx, AV_THREAD_MESSAGE_NONBLOCK);
+            if (rr == AVERROR_EOF) { *done = 1; break; }
+            if (rr < 0) break;
+        }
+        if (h0 == AV_NOPTS_VALUE || nx->pts == AV_NOPTS_VALUE) {   /* the slot's first picture anchors h0 (lag 0) */
+            if (cand) { *pending = nx; break; }
+            cand = nx;
+            if (h0 == AV_NOPTS_VALUE) break;
+            continue;
+        }
+        fs = av_rescale_q(nx->pts, c->inputs[k].ist_tb, AV_TIME_BASE_Q) - h0;
+        /* the slot's cadence (every picture is popped, decimated ones too): seeded at the house tick, a 59.94 slot in a
+         * 29.97 mosaic sits on a [1/2, 2] band's edge and was never learned — its buffer read twice as deep (mv01-t397:
+         * re-locked to a +500 ms picture lag) */
+        if (s->last_src != AV_NOPTS_VALUE && fs - s->last_src > s->cad / 4 && fs - s->last_src < 3 * s->cad)
+            s->cad += (fs - s->last_src - s->cad) / 8;
+        s->last_src = fs;
+        if (fs > out - mv_tl_lag(s, fs) + half) {
+            /* content ahead of its time with nothing shown for 1 s (a return the labels put early): re-lock behind it
+             * with the primed margin — the picture keeps holding until the buffer is that deep (re-locked onto it
+             * directly, the buffer was empty and the depth re-lock moved the picture back 5 s later: mv02 -1061 then
+             * +1117 ms) */
+            if (!cand && fs - (out - mv_tl_lag(s, fs)) > margin + 1000000 && now_us - s->shown_wc > 1000000 &&
+                now_us - s->relock_wc > 1000000) {
+                av_log(NULL, AV_LOG_INFO, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (content ahead)\n",
+                       k, (out - fs + margin - s->lag) / 1000);
+                mv_tl_step(c, k, s, out - fs + margin, h0, now_us);
+            }
+            *pending = nx;                          /* not due yet */
+            break;
+        }
+        /* after a dry spell, the first picture can be the pre-gap PES tail (T-350: the cut PES completed with post-gap
+         * bytes, flushed with its OLD label) — locked onto, the slot re-locked +20 s and back (mv04 gap_20). A picture
+         * more than 1 s late whose source time is still near the last one shown is dropped, up to 3 per return; a
+         * source that really resumes where it stopped (late by the pause) re-locks after them */
+        if (dry && s->tails < 3 && s->shown_wc && out - mv_tl_lag(s, fs) - fs > 1000000 &&
+            fs - s->shown_src < (now_us - s->shown_wc) / 2) {
+            s->tails++;
+            av_frame_free(&nx);
+            continue;
+        }
+        if (cand)
+            av_frame_free(&cand);                   /* superseded within the tick (a late picture / decimation) */
+        cand = nx;
+        src = fs;
+        sum += fs;
+        cnt++;
+    }
+    occ = av_thread_message_queue_nb_elems(h->q) + (*pending != NULL);
+    if (cand) {
+        if (s->stepping && src != AV_NOPTS_VALUE && src >= s->nat)
+            mv_tl_commit(c, k, s);
+        if (src != AV_NOPTS_VALUE && !s->stepping &&
+            (dry || (out - s->lag - src > 500000 && !occ)))
+            relock = out - src + margin;            /* back from a dry spell / delayed: hold for the primed margin */
+        if (relock != AV_NOPTS_VALUE && FFABS(relock - s->lag) >= c->tick_dur_us) {
+            av_log(NULL, AV_LOG_INFO, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (%s)\n", k,
+                   (relock - s->lag) / 1000, dry ? "back from a dry spell" : "delayed");
+            mv_tl_step(c, k, s, relock, h0, now_us);
+        } else
+            relock = AV_NOPTS_VALUE;
+        if (src != AV_NOPTS_VALUE) {
+            /* pictures land on ticks: the lag they realize is L rounded by the slot's phase (a 25p slot in a 25p mosaic:
+             * L 21 ms showed every picture 40 ms late, its sound placed at L read 19 ms early); a rate-converted slot's
+             * cadence pattern averages out. The sound follows this */
+            /* ... and content in a picture skipped (decimated) shows with the next one: the sample is the mean of the
+             * pictures this one stands for (a 59.94 slot in 29.97 read 8 ms short, its sound early by that) */
+            int64_t smp = out - (cnt ? sum / cnt : src);
+            if (!s->shown_wc)
+                s->real = s->lag;
+            s->real += (smp - s->real) / 32;
+        }
+        if (src != AV_NOPTS_VALUE)
+            s->shown_src = src;
+        if (s->reseed && !s->stepping) {
+            s->reseed = 0;
+            *mv_seed  = 0;
+        }
+        if (!s->first_wc)
+            s->first_wc = now_us;
+        s->shown_wc = now_us;
+        s->pop_wc   = now_us;
+        s->tails    = 0;
+    } else if (occ)
+        s->pop_wc = now_us;                         /* pictures waiting: not dry */
+    if (cand && h0 != AV_NOPTS_VALUE && !s->stepping) {
+        double err;
+        /* in the slot's first 20 s its depth settles in one re-lock from 2 pictures off (a slot joining late with a
+         * shallow buffer was otherwise built up by the servo a tick at a time: 2 pairs at -40 ms around its steps) */
+        int64_t band = now_us - s->first_wc < 20000000 ? 2 * s->cad : FFMAX(4 * c->tick_dur_us, margin / 4);
+        if (s->occ_f < 0)
+            s->occ_f = occ;
+        s->occ_f += (occ - s->occ_f) / 64;
+        err = s->occ_f * s->cad - margin;           /* + = more buffered than primed: the source runs fast */
+        if (fabs(err) <= band)
+            s->exc_wc = 0;
+        else if (!s->exc_wc)
+            s->exc_wc = now_us;
+        else if (now_us - s->exc_wc >= (now_us - s->first_wc < 20000000 ? 1000000 : 5000000)) {
+            av_log(NULL, AV_LOG_INFO, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (buffer %.0f ms deep, primed %"PRId64
+                   " ms)\n", k, (int64_t)-err / 1000, s->occ_f * s->cad / 1000, margin / 1000);
+            mv_tl_step(c, k, s, s->lag - (int64_t)err, h0, now_us);
+        }
+        /* drift, a frame sync's way: the correction builds up and L moves by a whole tick at once (one picture repeated /
+         * skipped), its sound stepped with it at the same instant — moved continuously, every tick L crossed moved the
+         * picture at once and the sound ~1 s later with the averaged lag (late-joining slot: 5 pairs at -40 ms). A dead
+         * band of 2 pictures: a clean slot does not hunt */
+        if (now_us - s->relock_wc > 5000000 && fabs(err) > 2 * s->cad)
+            s->acc -= av_clipd((err > 0 ? err - 2 * s->cad : err + 2 * s->cad) / 1000,
+                               -c->tick_dur_us / 1000.0, c->tick_dur_us / 1000.0);
+        if (!s->stepping && fabs(s->acc) >= c->tick_dur_us) {
+            int64_t st = s->acc > 0 ? c->tick_dur_us : -c->tick_dur_us;
+            s->acc -= st;
+            mv_tl_step(c, k, s, s->lag + st, h0, now_us);
+        }
+    }
+    atomic_store_explicit(&c->inputs[k].tl_lag_us, s->real, memory_order_relaxed);
+    return cand;
+}
+
 static int64_t mv_tick_us(CompositorCtx *c, int64_t t)
 {
     if (g_mv_exacttick && c->out_fps.num > 0)
@@ -110,6 +318,7 @@ void *compositor_thread(void *arg)
     int64_t md_cnt[PTV_MAX_INPUT] = {0};      /* v0.9.13: decimation drops (multiple frames due in one tick) */
     int64_t dmg_cr[PTV_MAX_INPUT] = {0};      /* T-350: the slot's corrupt-video count (demux + decode) last seen */
     int64_t dmg_wc[PTV_MAX_INPUT] = {0};      /* T-350: wall time it last moved */
+    MvTlSlot tl_slot[PTV_MAX_INPUT];          /* 2.1 T-409: the slot as a frame synchronizer (g_timeline) */
     int     res_occ_tgt = 4;                  /* v0.9.13: occupancy-servo target (set from the primed depth) */
     /* AUDIO-FOLLOW (Option A) latch: average the per-slot lag over a startup window (past the
      * lossy join) and latch a STABLE signed offset, published to house_skew for the audio's
@@ -197,6 +406,10 @@ void *compositor_thread(void *arg)
         res_ema_us[k] = mv_tick_us(c, 1);
         res_occ_f[k] = -1;
         res_src_us[k] = AV_NOPTS_VALUE;
+        memset(&tl_slot[k], 0, sizeof(tl_slot[k]));
+        tl_slot[k].cad      = mv_tick_us(c, 1);
+        tl_slot[k].last_src = AV_NOPTS_VALUE;
+        tl_slot[k].occ_f    = -1;
     }
 
     /* preroll: prime every input's jitter buffer to ~PTV_PREROLL_MS so bursty
@@ -279,7 +492,7 @@ void *compositor_thread(void *arg)
              * open, excess over the primed target is dropped-oldest SILENTLY — the post-
              * preroll backlog must never be displayed (one-shot-trim → window; +4 margin
              * keeps normal arrival jitter out of it). */
-            if (g_mv_birthtrim && c->live && g_mv_residence && tick < bt_win_ticks) {
+            if (g_mv_birthtrim && c->live && g_mv_residence && !g_timeline && tick < bt_win_ticks) {
                 AVFrame *tf;
                 while (av_thread_message_queue_nb_elems(h->q) > res_occ_tgt + 4 &&
                        av_thread_message_queue_recv(h->q, &tf, AV_THREAD_MESSAGE_NONBLOCK) >= 0) {
@@ -307,7 +520,17 @@ void *compositor_thread(void *arg)
              *    deficit into constant slot latency). Multiple due frames in one tick (a
              *    59.94 slot in a 29.97 house) pop through and the newest displays. */
             AVFrame *cand = NULL;
-            {
+            if (g_timeline && n > 1) {
+                cand = mv_tl_pick(c, k, tick, now_us, &pending[k], &done_in[k], &tl_slot[k], res_occ_tgt,
+                                  &rs_mv_seed[k]);
+                if (!cand && last[k]) {             /* the stats line's pd= / sv=: a repeat by cadence (the next
+                                                     * picture waits for its time) or by starvation (none queued) */
+                    if (pending[k] || av_thread_message_queue_nb_elems(h->q))
+                        pd_cnt[k]++;
+                    else
+                        sv_cnt[k]++;
+                }
+            } else {                               /* 2.1: not run (deleted after the 2.1 canary soak) */
                 int   resid = g_mv_residence && c->tick_dur_us > 0;
                 int64_t hnow = mv_tick_us(c, tick);
                 int64_t half = c->tick_dur_us / 2;
@@ -673,7 +896,7 @@ void *compositor_thread(void *arg)
                      * stays locked, and copied audio now only needs to DELAY → correctable. Fires only on
                      * a real video-ahead excursion (sk < −g_h0_reanchor_ms); gradual positive drift never
                      * triggers. MULTIVIEW ONLY; g_h0_reanchor gates it. */
-                    if (n > 1 && g_h0_reanchor) {
+                    if (n > 1 && g_h0_reanchor && !g_timeline) {   /* 2.1 T-409: the frame sync re-locks L instead */
                         int cond = sk < -(int64_t)g_h0_reanchor_ms * 1000;
                         int64_t sk_used = sk;
                         int fire;
@@ -984,10 +1207,6 @@ void *compositor_thread(void *arg)
                 char cvs[10 + PTV_MAX_AUDIO * 16];   /* pre23 rr23: conv= (aK: forced, as corr=);
                                                       * absent while every track's fold total is 0 */
                 ptv_stats_conv(cvs, sizeof cvs, nows, 1);
-                char rsn[10 + PTV_MAX_AUDIO * 16];   /* pre29 #69: rsn= (resync fires; only ever
-                                                      * nonzero on a non-follow mv track — the
-                                                      * follow path never runs ptv_recanchor) */
-                ptv_stats_rsn(rsn, sizeof rsn, 1);
                 char ls[768]; int lp = 0;   /* 4 slots x ~122 chars once the counters grow: at 448
                                              * the 4th slot's whole token silently vanished — the
                                              * one the per-slot cc= exists to make visible */   /* per-slot: qdrop=input-q overflow, corrupt=demux+decode,
@@ -1013,7 +1232,9 @@ void *compositor_thread(void *arg)
                     lp += snprintf(ls + lp, sizeof ls - lp,
                                    " in%d:qdrop=%"PRId64"/corrupt=%"PRId64"/pd=%"PRId64"/sv=%"PRId64"/sk=%+dms/skres=%+dms%s%s",
                                    k, c->inputs[k].da.vdrop, c->inputs[k].da.vcorrupt + c->inputs[k].dc.vcorrupt,
-                                   pd_cnt[k], sv_cnt[k], (int)(c->inputs[k].house_skew / 1000),
+                                   pd_cnt[k], sv_cnt[k],
+                                   (int)((g_timeline ? atomic_load_explicit(&c->inputs[k].tl_lag_us, memory_order_relaxed)
+                                                     : c->inputs[k].house_skew) / 1000),
                                    (int)(c->inputs[k].da.disc_resid_us / 1000), lst, cct);
                 }
                 /* GLOBAL ccmux= — teletext packets our own mux backward-dts guard dropped.
@@ -1031,8 +1252,8 @@ void *compositor_thread(void *arg)
                         snprintf(ccg, sizeof ccg, " ccmux=%lld", (long long)cx);
                 }
                 av_log(NULL, AV_LOG_INFO,   /* v0.9.13 parity: size/bitrate/speed/genlock dropped (v0.9.10 single-input rationale) */
-                    "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f dup=%"PRId64" drop=%"PRId64"%s%s%s%s%s%s%s\n",
-                    c->emitted, fps, hh, mm, ss, c->dup, c->framedrop[0], dlv, aco, ls, ccg, crs, cvs, rsn);
+                    "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f dup=%"PRId64" drop=%"PRId64"%s%s%s%s%s%s\n",
+                    c->emitted, fps, hh, mm, ss, c->dup, c->framedrop[0], dlv, aco, ls, ccg, crs, cvs);
                 /* 1.0.1-pre17 (owner-floated): per-INPUT always-on [PTV-RSYNC] summary, ONE
                  * compact line per input — the soak forensics that used to need PTV_DIAG.
                  * R = this input's track reading(s) (same builder as the stats token), ev =
