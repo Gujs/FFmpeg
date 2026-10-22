@@ -2885,14 +2885,14 @@ static void ptv_rebuild_reanchor(AudioState *a, const AVFrame *frame)
 
 /* Feed one h0-anchored decoded audio frame into the -af graph (or swr fallback). */
 /* 2.0.0-pre8.1: may the real frames buffered after a filled hold go to the door now? */
-/* 2.1 T-409: the label glue (AGLUE) stays on under the timeline until the exact audio door replaces it (P2): its
- * hold-fill rules realign the returning labels with the fill (sync_storm 430 s without them: +24 s input step after a
- * 47.7 s fill, the sound 24 s late). PTV_TL_NO_AGLUE=1 = the bypass (development). */
+/* 2.1 T-409: under the timeline the label glue's (AGLUE) step verdicts are bypassed — the labels arrive decided. Turned
+ * back on (dev-ah) its pad / trim verdicts re-made T-398's path at the burst cuts: GYF 1 h +96 ms with a -108 ms step
+ * (bypassed: -1.1..+0.2 ms); it did not fix sync_storm either. PTV_TL_AGLUE=1 = the verdicts on (development). */
 static int tl_no_aglue(void)
 {
     static int v = -1;
     if (v < 0)
-        v = g_timeline && getenv("PTV_TL_NO_AGLUE");
+        v = g_timeline && !getenv("PTV_TL_AGLUE");
     return v;
 }
 
@@ -3606,9 +3606,8 @@ graph_in:
                     }
                 }
             }
-            /* 2.1 T-409: under the timeline the labels arrive decided (holes kept / erased, relabels repaired), so these
-             * verdicts see continuous labels except kept holes; the hold-fill rules here stay until the exact audio door
-             * (P2) takes over. PTV_TL_NO_AGLUE=1 bypasses them (see tl_no_aglue). */
+            /* 2.1 T-409: under the timeline the labels arrive decided (holes kept / erased, relabels repaired): no second
+             * classification here (tl_no_aglue; PTV_TL_AGLUE=1 = these verdicts on) */
             if (!tl_no_aglue() && a->glue_raw_last_us != AV_NOPTS_VALUE) {
                 int64_t step = raw_us - (a->glue_raw_last_us + a->glue_raw_dur_us);
                 /* 2.0.0 T-093 part 2: a multiview slot's silence fill (the compositor drives it while the slot's source is

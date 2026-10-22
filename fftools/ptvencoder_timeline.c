@@ -665,6 +665,20 @@ int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
                    "return leg, repair undone", rp / 1e6, s->rep_us / 1e6);
         }
     }
+    /* a forward jump the stream's own wall silence explains (J <= W) is a kept hole whatever its partners do: no offset
+     * moves, nothing is relabelled or erased — a window would only hold the input (heavy loss: every lost audio run held
+     * all streams up to 1 s, vt-cap-awe loss_100 audio dark 2.1 s, pre8 0.84 s). Windows stay for what can move the
+     * offset: a jump beyond its silence (relabel / flowing part), a step back; and under an armed bank (W no evidence) */
+    if (off_path(s, s_us) && s_us > s->last_us && s->last_wc &&
+        !(atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 || (int64_t)g_preroll_ms >= 4000) &&
+        s_us - (s->last_us + s->step_us) <= nw - s->last_wc + tol_us(s)) {
+        t->ev_n++;
+        av_log(NULL, AV_LOG_INFO, "[PTV-TL] event #%"PRId64" (stream %d): hole kept — J %+.3f s within its own silence of "
+               "%.3f s, labels as sent, no window (PTV_TIMELINE)\n", t->ev_n, si,
+               (s_us - (s->last_us + s->step_us)) / 1e6, (nw - s->last_wc) / 1e6);
+        path_take(s, s_us, nw);
+        return ptv_demux_dispatch(d, pkt);
+    }
     if (off_path(s, s_us)) {
         TlPkt *h = &t->held[0];
         t->active    = 1;
