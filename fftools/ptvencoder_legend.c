@@ -322,9 +322,10 @@ void ptv_print_log_legend(int full)
         "             AC-3/E-AC-3 at input stream N (silent frames of its own codec).\n");
     av_log(NULL, AV_LOG_INFO,
         "timing events (2.1 timeline, always on — one decision per source event, for every stream of the input):\n"
-        "  [PTV-TL] event #N (stream S[ opened]): <decision> — J = the step in the labels, wall = the input's\n"
-        "                 silence before it, kept / erased = what the output keeps as a hole / joins up (whole\n"
-        "                 pictures), k = the input's program offset after it. Decisions: hole kept | hole, flowing\n"
+        "  [PTV-TL]       one line per event, numbered, naming the stream that opened it and the decision —\n"
+        "                 J = the step in the labels, wall = the input's silence before it, kept / erased = what\n"
+        "                 the output keeps as a hole / joins up (whole pictures), k = the input's program offset\n"
+        "                 after it. Decisions: hole kept | hole, flowing\n"
         "                 part erased (labels jumped further than the wall time: the rest erased) | relabel erased\n"
         "                 (a jump with no wall time) | step back erased | new domain, gap kept (a restart) |\n"
         "                 outlier window (corrupt labels dropped) | single-stream step (one stream only, labels\n"
@@ -332,7 +333,7 @@ void ptv_print_log_legend(int full)
         "  [PTV-SRC] in0 burst: our own depth cut — 'the cut is erased at the door' (source live: no jump)\n"
         "                 or 'stays as a hole' (the source paused inside it)\n"
         "  [PTV-VMAP]     copies / captions placed where the video showed their content (counts)\n"
-        "  [PTV-MV] inK re-locked: picture <step> ms — a mosaic slot's frame sync moved its lag (back from an\n"
+        "  [PTV-MV]       (re-lock) a mosaic slot's frame sync moved its lag by <step> ms (back from an\n"
         "                 outage with the primed margin, a start-up backlog, a buffer far off its depth); the\n"
         "                 slot's sound takes the same step at once. A repeated / skipped picture (lost, late,\n"
         "                 rate conversion) moves nothing and is not logged\n"
