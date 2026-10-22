@@ -1646,6 +1646,8 @@ typedef struct PtvDiscBuf {
 
 typedef struct PtvTimeline PtvTimeline;   /* 2.1 T-409: the program timeline, source stage (ptvencoder_timeline.c) */
 
+#define PTV_SRC_PIDS 32   /* T-003: PIDs remembered per program for the PMT diff */
+
 typedef struct DemuxArgs {
     AVFormatContext      *ifmt;
     AVThreadMessageQueue *video_q;
@@ -1746,6 +1748,15 @@ typedef struct DemuxArgs {
     int64_t               v_last_wc;      /* 2.0.2 T-387: wall time of the last packet of the bound video stream */
     int                   vmove_n;        /* ... video packets of a late-born video stream while the bound one is silent */
     int                   vmove_force;    /* ... the video moved to a new PID: reopen now (single input: -> exit 4) */
+    /* 2.1 T-003 step 1: the source's program and mapped audio, checked once a second from the video path (ptv_src_check) */
+    int64_t               src_chk_wc;     /* last check (wall) */
+    int64_t               v_flow_wc;      /* the video flowing since (wall; a 1 s pause restarts it) */
+    int                   pmt_seen;       /* the PMT below was recorded (0 after an open / reopen: record silently) */
+    int                   pmt_prog;       /* the program carrying our video at open (its id) */
+    int                   pmt_ver;        /* the program's PMT version last seen */
+    int                   pmt_n;          /* ... its streams: count and PIDs */
+    int                   pmt_pid[PTV_SRC_PIDS];
+    unsigned              a_silent;       /* mapped audio track j (bit j) logged silent while the video flows */
     /* 2.0.0-pre17 T-348: AAC labels inside a PES. lavf labels the 2nd.. frames of a PES as the previous label
      * + 1024 / codecpar->sample_rate, the rate probed at open: after a 96 -> 48 kHz switch every frame read
      * 10.7 ms long and every PES label jumped +140 ms (aresample: drop, then pad — 4.8 s of silence in 26 s).

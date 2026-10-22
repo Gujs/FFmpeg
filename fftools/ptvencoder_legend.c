@@ -332,6 +332,8 @@ void ptv_print_log_legend(int full)
         "                 as sent; RELABEL may repair it). WARNING when the program moved, INFO otherwise\n"
         "  [PTV-SRC] in0 burst: our own depth cut — 'the cut is erased at the door' (source live: no jump)\n"
         "                 or 'stays as a hole' (the source paused inside it)\n"
+        "  [PTV-SRC] inK PMT version a \xe2\x86\x92 b: the source's program changed (PIDs added / gone); inK audio\n"
+        "                 track N ... silent for 10 s while the video flows / flowing again (2.1, T-003)\n"
         "  [PTV-VMAP]     copies / captions placed where the video showed their content (counts)\n"
         "  [PTV-MV]       (re-lock) a mosaic slot's frame sync moved its lag by <step> ms (pictures late for\n"
         "                 1 s at real-time pace, a start-up backlog, depth the buffer never used in 60 s,\n"

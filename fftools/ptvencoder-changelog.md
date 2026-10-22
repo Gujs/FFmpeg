@@ -22,6 +22,10 @@ the v2 `0001` patch (additive, travels with the source to the build box).
   (late = skip). There is no re-prime after an outage any more: the buffer refills by itself when the source comes back on
   time (it added the margin to the lag at every outage). 6 s stall test: peak 661 MB, lags back to 0 (pre1 1063 MB,
   2.0.2-pre8 665 MB).
+- **What changed in the source is logged (T-003 step 1).** `[PTV-SRC] inK PMT version a → b (program P): N streams; added: …;
+  gone: …` when the source's program changes, and `[PTV-SRC] inK audio track N (stream #S, pid …, lang) silent for 10 s while
+  the video flows` / `… flowing again` for a mapped audio stream (sync_check restarts such a channel as DEAD_AUDIO_TRACK with
+  nothing in our log to say why; a whole-source outage is not counted). Checked once a second; log only.
 - Known open: a bursty (HLS-burst) mosaic slot's content-ahead re-lock never commits (T-411; no production mosaic has one).
 
 ## 2.1.0-pre1 — one decision per source event (T-409): the program timeline, the record door, mosaic frame synchronizers; RESYNC and RECANCHOR deleted

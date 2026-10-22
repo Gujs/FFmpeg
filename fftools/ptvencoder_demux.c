@@ -7,6 +7,7 @@
 #include <time.h>
 
 #include "libavutil/avutil.h"
+#include "libavutil/avstring.h"
 #include "libavutil/log.h"
 #include "libavutil/opt.h"
 #include "libavutil/time.h"
@@ -3342,6 +3343,7 @@ static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const ReopenShape *o
     }
     d->ifmt = nf;
     if (d->ifmt_home) *d->ifmt_home = nf;      /* teardown close target follows the swap */
+    d->pmt_seen = 0;                           /* T-003: the new open's PMT is the reference */
     d->reopen_cnt++;
     if (d->rsync_slot >= 0 && d->rsync_slot < PTV_MAX_INPUT)   /* rider (a), rr191 F3: the ASTAMP
                                                                 * extrapolation carry must not span the reopen */
@@ -3473,6 +3475,67 @@ static int slot_bind(DemuxArgs *d)
     d->ifmt = f;                                     /* *d->ifmt_home == in->ifmt already (the acquire set it) */
     av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in%d WAITING → LIVE: slot %d joins the mosaic\n", d->rsync_slot, d->rsync_slot);
     return 0;
+}
+
+/* 2.1 T-003 step 1: what changed in the source, logged once — the PMT's version (with the PIDs it added and dropped) and
+ * a MAPPED audio stream that goes silent while the video flows (sync_check restarts such a channel as DEAD_AUDIO_TRACK
+ * with nothing in our log to say why). Called from the demux loop at most once a second. */
+static void ptv_src_check(DemuxArgs *d, int64_t now)
+{
+    AVFormatContext *f = d->ifmt;
+    int slot = d->rsync_slot > 0 ? d->rsync_slot : 0, i, j;
+    d->src_chk_wc = now;
+    for (i = 0; i < (int)f->nb_programs; i++) {
+        const AVProgram *p = f->programs[i];
+        int has_v = 0, n = 0, pid[PTV_SRC_PIDS];
+        for (j = 0; j < (int)p->nb_stream_indexes; j++)
+            has_v |= (int)p->stream_index[j] == d->vstream;
+        if (d->pmt_seen ? p->id != d->pmt_prog : !has_v)
+            continue;                               /* followed by id: a PMT update rebuilds its stream list */
+        for (j = 0; j < (int)p->nb_stream_indexes && n < PTV_SRC_PIDS; j++)
+            pid[n++] = f->streams[p->stream_index[j]]->id;
+        if (d->pmt_seen && p->pmt_version != d->pmt_ver) {
+            char add[160] = "", del[160] = "";
+            int a, b;
+            for (a = 0; a < n; a++) {
+                for (b = 0; b < d->pmt_n && d->pmt_pid[b] != pid[a]; b++) ;
+                if (b == d->pmt_n)
+                    av_strlcatf(add, sizeof(add), " 0x%x", pid[a]);
+            }
+            for (b = 0; b < d->pmt_n; b++) {
+                for (a = 0; a < n && pid[a] != d->pmt_pid[b]; a++) ;
+                if (a == n)
+                    av_strlcatf(del, sizeof(del), " 0x%x", d->pmt_pid[b]);
+            }
+            av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in%d PMT version %d \xe2\x86\x92 %d (program %d): %d streams; added:%s; "
+                   "gone:%s\n", slot, d->pmt_ver, p->pmt_version, p->id, n, *add ? add : " -", *del ? del : " -");
+        }
+        d->pmt_seen = 1;
+        d->pmt_prog = p->id;
+        d->pmt_ver  = p->pmt_version;
+        d->pmt_n    = n;
+        memcpy(d->pmt_pid, pid, n * sizeof(*pid));
+        break;
+    }
+    for (j = 0; j < d->n_audio && j < 32 && now - d->v_last_wc < 1000000; j++) {
+        int s = d->astream[j];
+        const AVDictionaryEntry *lang;
+        int64_t last;
+        if (s < 0 || s >= d->nb_streams_open || !d->wrap_wall_last || !(last = d->wrap_wall_last[s]))
+            continue;                               /* not mapped to this source / never flowed */
+        last = FFMAX(last, d->v_flow_wc);           /* a whole-source outage is not the audio's silence */
+        lang = av_dict_get(f->streams[s]->metadata, "language", NULL, 0);
+        if (!(d->a_silent & (1u << j)) && now - last >= 10000000) {
+            d->a_silent |= 1u << j;
+            av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in%d audio track %d (stream #%d, pid 0x%x, %s) silent for %.0f s "
+                   "while the video flows\n", slot, j, s, f->streams[s]->id, lang ? lang->value : "und",
+                   (now - last) / 1e6);
+        } else if ((d->a_silent & (1u << j)) && now - last < 1000000) {
+            d->a_silent &= ~(1u << j);
+            av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in%d audio track %d (stream #%d, pid 0x%x) flowing again\n",
+                   slot, j, s, f->streams[s]->id);
+        }
+    }
 }
 
 void *demux_thread(void *arg)
@@ -3652,8 +3715,16 @@ void *demux_thread(void *arg)
             av_packet_unref(pkt);
             continue;
         }
-        if (pkt->stream_index == d->vstream)
-            d->v_last_wc = av_gettime_relative();    /* 2.0.2 T-387 */
+        {
+            int64_t pnow = av_gettime_relative();
+            if (pkt->stream_index == d->vstream) {
+                if (pnow - d->v_last_wc > 1000000)
+                    d->v_flow_wc = pnow;             /* T-003: silence counts only while the video flows */
+                d->v_last_wc = pnow;                 /* 2.0.2 T-387 */
+            }
+            if (pnow - d->src_chk_wc >= 1000000)     /* T-003: any stream — a PMT update can move the video itself */
+                ptv_src_check(d, pnow);
+        }
         /* 2.0.0-pre17 T-348 (see aac_next): a frame without its own PES label (pos < 0: lavf split it out of the
          * PES and interpolated its label) gets the previous label + the previous frame's ADTS duration */
         if (pkt->stream_index < PTV_AAC_LBL && pkt->size >= 7 &&
