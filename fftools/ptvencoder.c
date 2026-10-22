@@ -3410,9 +3410,23 @@ static void cc_pend_add(DecodeCtx *d, const AVPacket *pkt)
     d->cc_last_dts += pkt->dts;                     /* the discarded picture holds its place in the dts sequence */
 }
 
-/* the tap, preceded by the waiting captions that come before this picture */
+/* the tap, preceded by the waiting captions that come before this picture. 2.1 T-400: a source that carries captions
+ * this run does not extract is logged once — the wrapper's start-up probe decides -cc_extract and can miss them (cor-3
+ * RAV / RAV_Espanol at a mass restart ran without teletext); the log names the channels to pin */
 static void cc_tap_ordered(DecodeCtx *d, AVFrame *frame)
 {
+    if (!d->cc.on) {
+        const AVFrameSideData *sd = d->cc_off_seen < 10 ? av_frame_get_side_data(frame, AV_FRAME_DATA_A53_CC) : NULL;
+        int k;
+        for (k = 0; sd && k + 2 < sd->size; k += 3)   /* a valid 608 pair that is not null padding (many encoders send
+                                                       * A/53 with nulls only: that is no caption carrier) */
+            if ((sd->data[k] & 4) && (sd->data[k] & 3) < 2 && ((sd->data[k + 1] | sd->data[k + 2]) & 0x7f) &&
+                ++d->cc_off_seen == 10)
+                av_log(NULL, AV_LOG_WARNING, "[PTV-CC] in%d the source carries EIA-608 captions (A/53) but -cc_extract "
+                       "is not set for it — no teletext is made from them\n", d->hb_slot);
+        if (!d->cc.strip)
+            return;
+    }
     while (d->cc_pend_n && (frame->best_effort_timestamp == AV_NOPTS_VALUE ||
                             d->cc_pend[0].pts < frame->best_effort_timestamp))
         cc_pend_tap(d, 0);
@@ -3696,7 +3710,7 @@ static void *decode_thread(void *arg)
                  * whatever control code it now spells (a spurious EDM/EOC/RCL, i.e. a wrongly
                  * cleared or re-based caption). Nothing here or in cc_dec can detect that;
                  * ccerr= counts only the pairs cc_dec rejects outright. */
-                if (d->cc.on || d->cc.strip) cc_tap_ordered(d, frame);
+                cc_tap_ordered(d, frame);
                 av_frame_unref(frame);
                 continue;
             }
@@ -3704,7 +3718,7 @@ static void *decode_thread(void *arg)
              * because cc_dec must see each frame's 608 pair exactly once in order, and this
              * is the last point upstream of the frame_q drop-oldest / dup / QSHED paths.
              * Always strips the A53 side data (so the video encoder cannot re-inject it). */
-            if (d->cc.on || d->cc.strip) cc_tap_ordered(d, frame);
+            cc_tap_ordered(d, frame);
             int64_t ts = frame->best_effort_timestamp;
             if (ts != AV_NOPTS_VALUE) {
                 int unset;
@@ -3838,11 +3852,11 @@ static void *decode_thread(void *arg)
     avcodec_send_packet(d->vdec, NULL);
     while (avcodec_receive_frame(d->vdec, frame) >= 0) {
         if (frame->flags & AV_FRAME_FLAG_CORRUPT) {
-            if (d->cc.on || d->cc.strip) cc_tap_ordered(d, frame);  /* see above */
+            cc_tap_ordered(d, frame);  /* see above */
             av_frame_unref(frame);
             continue;
         }
-        if (d->cc.on || d->cc.strip) cc_tap_ordered(d, frame);
+        cc_tap_ordered(d, frame);
         d->dec_frames++;
         PTV_HB_VDEC(d->hb_slot, d->hold ? PTV_HB_VDEC_FQSEND : PTV_HB_VDEC_HWUP);
         video_out_xo(d, frame, filt);

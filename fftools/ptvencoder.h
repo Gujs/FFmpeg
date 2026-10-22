@@ -848,6 +848,7 @@ typedef struct DecodeCtx {
     int64_t          cc_last_dts;          /* dts of the last video packet sent to the decoder (stream tb) */
     int              cc_pend_n;
     int64_t          cc_kept;              /* such captions tapped (log) */
+    int              cc_off_seen;          /* 2.1 T-400: real 608 pairs seen in a source this run does not extract (10 = logged) */
     struct { int64_t pts; int n; uint8_t d[PTV_CC_PEND_BYTES]; } cc_pend[PTV_CC_PEND];
     struct Input    *in;                      /* 2.0.2 T-386: its input (the late bind swaps in the real decoder) */
 } DecodeCtx;

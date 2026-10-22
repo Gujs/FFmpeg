@@ -39,6 +39,12 @@ the v2 `0001` patch (additive, travels with the source to the build box).
   content time (the film-cadence path, its residence cap set by the cadence): measured 2-2-2 ticks for 29.97 in 59.94 and
   the exact 2/3 mix for 25 in 59.94. Residence does not move lip sync (house_skew excludes it). A rate change held 30 s is
   logged: `[PTV-SRC] in0 source frame rate changed 59.94 → 29.97 fps (house 59.94 fps: …)`.
+- **A caption source that is not extracted says so (T-400).** Whether a channel makes teletext from CEA-608 is decided by
+  the wrapper's start-up probe (`SV_CC_EXTRACT=auto`), which can miss captions under load (cor-3 RAV / RAV_Espanol at a
+  mass restart ran without teletext). As in a professional encoder the caption output is per-channel configuration; the
+  encoder's job is the alarm: `[PTV-CC] inK the source carries EIA-608 captions (A/53) but -cc_extract is not set for it`,
+  once, after 10 real 608 pairs (A/53 with null padding only — sent by many encoders — is no carrier and stays silent).
+  The fleet's logs then name the channels to pin to `SV_CC_EXTRACT=true` in the transcoder repo.
 - Known open: a bursty (HLS-burst) mosaic slot's content-ahead re-lock never commits (T-411; no production mosaic has one).
 
 ## 2.1.0-pre1 — one decision per source event (T-409): the program timeline, the record door, mosaic frame synchronizers; RESYNC and RECANCHOR deleted
