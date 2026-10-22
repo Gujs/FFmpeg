@@ -2406,11 +2406,38 @@ static void copy_gap_watch(DemuxArgs *d, int64_t now)
  * instead of 21600: both −120 ms on the output. The copies still waiting for their picture that were read since the
  * video packet before the previous one and lie after this PES in the mux take the step too (a section has no pos:
  * it is read at its own packet, inside that window). */
+/* 2.1 T-409: a SCTE-35 cue's effective splice time (splice_time + pts_adjustment, 90 kHz, 33 bit) — time_signal and
+ * program splice_insert with a specified time; -1 = none (immediate, component mode, cancel, malformed) */
+static int64_t scte35_splice_90k(const AVPacket *p)
+{
+    const uint8_t *b = p->data;
+    int64_t adj, t;
+    int type, o;
+    if (!b || p->size < 20 || b[0] != 0xFC || (b[4] & 0x80))   /* encrypted: unreadable */
+        return -1;
+    adj  = ((int64_t)(b[4] & 1) << 32) | ((int64_t)b[5] << 24) | (b[6] << 16) | (b[7] << 8) | b[8];
+    type = b[13];
+    if (type == 0x06)
+        o = 14;                                       /* time_signal: splice_time() */
+    else if (type == 0x05) {
+        if (p->size < 21 || (b[18] & 0x80))            /* splice_event_cancel_indicator */
+            return -1;
+        if (!(b[19] & 0x40) || (b[19] & 0x10))         /* component mode / splice_immediate */
+            return -1;
+        o = 20;
+    } else
+        return -1;
+    if (p->size < o + 5 || !(b[o] & 0x80))             /* time_specified_flag */
+        return -1;
+    t = ((int64_t)(b[o] & 1) << 32) | ((int64_t)b[o + 1] << 24) | (b[o + 2] << 16) | (b[o + 3] << 8) | b[o + 4];
+    return (t + adj) & 0x1FFFFFFFFLL;
+}
+
 /* 2.1 T-409: the timeline moved the program offset by dpo (90 kHz) at a picture boundary of source time from_us. Copies
  * queued for the video whose SOURCE time (label minus the prog_off they were unwrapped with) lies at or after it belong
  * to the new content — subtitles and cues are muxed ahead of their pictures, so they were read with the old offset
  * (gate sync_bstep: SCTE-35 / DVB subs 120 ms early after a -120 ms step erase). */
-void ptv_vwait_rebase(DemuxArgs *d, int64_t from_us, int64_t dpo)
+void ptv_vwait_rebase(DemuxArgs *d, int64_t from_us, int64_t old_end_us, int64_t open_wc, int64_t dpo)
 {
     int pi, k;
     if (!dpo)
@@ -2425,7 +2452,20 @@ void ptv_vwait_rebase(DemuxArgs *d, int64_t from_us, int64_t dpo)
                 continue;
             src = av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q) -
                   av_rescale_q(ps->vwait_po[k], (AVRational){ 1, 90000 }, AV_TIME_BASE_Q);
-            if (src < from_us)
+            if (ps->is_scte) {
+                /* a cue belongs where it splices, not where its packet sits: cues lead their splice (the pre-roll),
+                 * so one read before the step can splice into the new content (sync_bstep: cues -120 ms) */
+                int64_t sp = scte35_splice_90k(p), raw90 = av_rescale_q(src, AV_TIME_BASE_Q, (AVRational){ 1, 90000 });
+                if (sp >= 0) {
+                    int64_t dlt = (sp - (raw90 & 0x1FFFFFFFFLL)) & 0x1FFFFFFFFLL;
+                    if (dlt >= (1LL << 32))
+                        dlt -= 1LL << 33;               /* nearest: the splice within +-13 h of its packet */
+                    src += av_rescale_q(dlt, (AVRational){ 1, 90000 }, AV_TIME_BASE_Q);
+                }
+            }
+            /* a step back overlaps the old content's source time [from, old_end): there the read order decides — read
+             * after the step began (the window opened) = the new content (sync_bstep: DVB subs -120 ms) */
+            if (src < from_us || (src < old_end_us && ps->vwait_wc[k] < open_wc))
                 continue;
             if (p->pts != AV_NOPTS_VALUE) p->pts += av_rescale_q(dpo, (AVRational){ 1, 90000 }, ps->in_tb);
             if (p->dts != AV_NOPTS_VALUE) p->dts += av_rescale_q(dpo, (AVRational){ 1, 90000 }, ps->in_tb);

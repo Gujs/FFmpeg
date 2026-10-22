@@ -2568,7 +2568,7 @@ int  ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt);
 void ptv_tl_cut(DemuxArgs *d, int64_t cut_us);
 int  ptv_demux_dispatch(DemuxArgs *d, AVPacket *pkt);
 void ptv_rsync_post_edit(DemuxArgs *d, int s, int64_t delta_us);
-void ptv_vwait_rebase(DemuxArgs *d, int64_t from_us, int64_t dpo);
+void ptv_vwait_rebase(DemuxArgs *d, int64_t from_us, int64_t old_end_us, int64_t open_wc, int64_t dpo);
 int  ptv_tl_settling(DemuxArgs *d);
 extern int64_t g_gap_min_us;
 int ptv_disc_init(PtvDiscBuf *b, int capacity, int nb_streams);

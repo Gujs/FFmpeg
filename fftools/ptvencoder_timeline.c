@@ -362,7 +362,8 @@ static int release(DemuxArgs *d, PtvTimeline *t, int64_t k_old, int64_t k_new, i
                 }
             }
         } else if (prog_event && h->s_us != AV_NOPTS_VALUE) {
-            k = llabs(h->s_us - vb_us) < llabs(h->s_us - va_us) ? k_new : k_old;   /* sparse: the nearer side */
+            /* sparse: the nearer side; held in a step-back window they were read after the step began: the new one */
+            k = vb_us < va_us || llabs(h->s_us - vb_us) < llabs(h->s_us - va_us) ? k_new : k_old;
         }
         relabel(d, p, h->k_at, k);
         if (ret >= 0)
@@ -402,8 +403,10 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
                                          : FFMAX(v->step_us, 1);
         va = v->old_end_us + fd;               /* the end of the last old picture */
         vb = v->new_first_us;                  /* the first new picture */
-        J  = vb - va;
-        J  = (J >= 0 ? J + fd / 2 : J - fd / 2) / fd * fd;   /* whole pictures */
+        J  = vb - va;          /* exact: an erase makes the labels continuous (the first new picture one picture after the
+                                * last old one = on the grid); only the KEPT part is whole pictures. Rounding J to pictures
+                                * over-erased a sub-picture relabel (29.97: -120 ms read -133 ms) — a skipped tick, a 0.07 s
+                                * video PTS hole per event (sync_bstep rich2997b) */
         /* W over the same span as J: J runs from the video's last old-path picture, so W counts from when that picture
          * arrived too — not only the latest silence. A content scrap between two outages, dropped as an outlier, cut W to
          * the second outage and erased 14 s of real loss as "flowing" (gate sync_storm 430 s: 15 s of pictures without
@@ -509,7 +512,7 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
         atomic_store_explicit(&t->prog_wc, nw, memory_order_relaxed);
         k_move(d, t, k_new - k_old);
         if (k_new != k_old) {
-            ptv_vwait_rebase(d, vb, av_rescale_q(k_new - k_old, AV_TIME_BASE_Q, (AVRational){ 1, 90000 }));
+            ptv_vwait_rebase(d, vb, va, t->open_wc, av_rescale_q(k_new - k_old, AV_TIME_BASE_Q, (AVRational){ 1, 90000 }));
             t->ev_va = va;
             t->ev_dk = k_new - k_old;
             t->ev_wc = nw;
