@@ -29,7 +29,6 @@
 
 #include "ptvencoder.h"
 
-static int     g_h0_reanchor_ms = 120;   /* trigger (ms); internalized 0.9.18.7 (was PTV_H0_REANCHOR_MS) */
 /* fill a planar-YUV / RGB frame with black (held cell for a not-yet-arrived or
  * stale multiview slot): luma 16, chroma 128, RGB 0. */
 static void ptv_fill_black(AVFrame *f)
@@ -330,26 +329,16 @@ void *compositor_thread(void *arg)
     int64_t lag_true_us[PTV_MAX_INPUT] = {0}; /* PTV_DIAG: TRUE uncapped signed video lag (output−content); when
                                                * this >> skew_us the 250ms cap is saturating = audio can't follow */
     int      slated[PTV_MAX_INPUT] = {0};     /* slot is/was black-slated (outage) since last fresh frame */
-    int64_t  reprime_us[PTV_MAX_INPUT] = {0}; /* 2.0.0 T-339: wall time the returning slot's first frame was queued */
     int64_t  mv_fill_us[PTV_MAX_INPUT][PTV_MAX_AUDIO] = {{0}};   /* T-093 part 2: last fill sentinel per slot track */
     int64_t  mv_pump_us[PTV_MAX_INPUT] = {0};   /* 2.0.2 T-386: last silence sentinel per deferred slot */
     struct SwsContext *norm_sws[PTV_MAX_INPUT] = {0};   /* 2.0.2 T-386: frames in another geometry than the cell's */
     int      norm_logged[PTV_MAX_INPUT] = {0};
     int64_t res_due_us[PTV_MAX_INPUT] = {0};  /* v0.9.13 residence: house-time the next pop is allowed (0 = immediate) */
     int64_t res_ema_us[PTV_MAX_INPUT];        /* v0.9.13: EMA of content deltas = the slot's smoothed cadence */
-    int64_t res_src_us[PTV_MAX_INPUT];        /* v0.9.13: content time (us) of the last popped frame */
     int64_t pd_cnt[PTV_MAX_INPUT] = {0};      /* v0.9.13: residence holds (correct cadence, not starvation) */
-    int     pd_log[PTV_MAX_INPUT] = {0};      /* 2.0.0 T-343: residence holds logged (the first 3 per slot) */
-    int     res_home[PTV_MAX_INPUT];           /* 2.0.0 T-343b: the occupancy the slot settled at (-1 = not yet) */
-    int64_t res_home_sum[PTV_MAX_INPUT] = {0}, res_home_n[PTV_MAX_INPUT] = {0};
-    int     res_hyst[PTV_MAX_INPUT] = {0};       /* 2.0.2 T-343: last residence step (+1 hold, -1 decimation) */
-    int     res_ema_n[PTV_MAX_INPUT] = {0};      /* 2.0.2 T-343: cadence deltas accepted into res_ema_us */
-    double  res_occ_f[PTV_MAX_INPUT];            /* 2.0.2 T-343: averaged occupancy the servo reads (< 0 = reseed) */
     int64_t sv_cnt[PTV_MAX_INPUT] = {0};      /* v0.9.13: genuine starvation dups (due but buffer empty) */
     int64_t md_cnt[PTV_MAX_INPUT] = {0};      /* v0.9.13: decimation drops (multiple frames due in one tick) */
-    int64_t dmg_cr[PTV_MAX_INPUT] = {0};      /* T-350: the slot's corrupt-video count (demux + decode) last seen */
-    int64_t dmg_wc[PTV_MAX_INPUT] = {0};      /* T-350: wall time it last moved */
-    MvTlSlot tl_slot[PTV_MAX_INPUT];          /* 2.1 T-409: the slot as a frame synchronizer (g_timeline) */
+    MvTlSlot tl_slot[PTV_MAX_INPUT];          /* 2.1 T-409: the slot as a frame synchronizer */
     int     res_occ_tgt = 4;                  /* v0.9.13: occupancy-servo target (set from the primed depth) */
     /* AUDIO-FOLLOW (Option A) latch: average the per-slot lag over a startup window (past the
      * lossy join) and latch a STABLE signed offset, published to house_skew for the audio's
@@ -357,13 +346,6 @@ void *compositor_thread(void *arg)
     int64_t  af_off[PTV_MAX_INPUT] = {0};     /* audio-follow: continuously-smoothed per-slot lag (EMA, us) */
     int64_t  af_t0[PTV_MAX_INPUT]  = {0};     /* tick+1 of this slot's first real frame (0 = unseeded) */
     int      h0_logged[PTV_MAX_INPUT] = {0};  /* P0 diag: one-shot PTV-H0 per slot at first display */
-    int64_t  r2_win_us[PTV_MAX_INPUT] = {0};  /* 0.9.18.7 [PTV-REANCHOR2] log rate-limit: window start (wall) */
-    int      r2_win_n[PTV_MAX_INPUT] = {0};   /*   lines printed this window */
-    int      r2_supp[PTV_MAX_INPUT] = {0};    /*   events suppressed this window */
-    int64_t  r2_supp_us[PTV_MAX_INPUT] = {0}; /*   net h0 shift suppressed this window (us) */
-    int64_t  r2_skring[PTV_MAX_INPUT][5] = {{0}};  /* 1.0.1 REANCHOR2 debounce: last 5 evaluated sk samples per slot */
-    unsigned r2_cond[PTV_MAX_INPUT] = {0};    /*   bitmask: which of the last 5 evaluated ticks held sk < -thr */
-    int      r2_pos[PTV_MAX_INPUT] = {0};     /*   ring write position */
     int      done_in[PTV_MAX_INPUT] = {0};
     int64_t rung_pts[PTV_MAX_RUNG] = {0};
     /* 1.0.1-pre16 mv sensor port: per-slot video-side EMA state (the compositor is the ONE
@@ -375,24 +357,6 @@ void *compositor_thread(void *arg)
     int64_t rs_mv_src[PTV_MAX_INPUT];         /* 2.0.1 T-362: the slot's last displayed source pts */
     int64_t rs_mv_adv[PTV_MAX_INPUT] = {0};   /* 2.0.1 T-362: the tick its displayed picture last changed */
     int64_t rs_mv_rel[PTV_MAX_INPUT] = {0};   /* 2.0.1 T-362: -1 in a hold, else the tick it ended (0 = none) */
-    /* 1.0.1-pre17 BIRTH-TRIM WINDOW (finding 1's measured root cause, Grid_2x2 box logs
-     * 2026-07-19 00:42-01:10): at a birth where one slot is DEAD, the preroll wait runs its
-     * full 3s timeout while the LIVE slots' pipelines keep banking (video_q compressed
-     * backlog decodes into hold.q right after the one-shot v0.9.13 trim — box: occ re-banked
-     * 25→110 within 10s of tick 0). The occupancy servo then drains the excess at its ±2%
-     * authority (~20ms/s content slide, md decimation) for ~3min, while the per-slot audio
-     * follow (PLL acquires throttled 12s-refractory/~400ms + TRACK ≤10ms/s) cannot track a
-     * 20ms/s slide → every live slot runs 150-240ms audio-late per restart (REANCHOR2 birth
-     * storm h0 +~1s, [PTV-AVSYNC] offset −160ms, lipsync −150..−240 decaying; the sensor
-     * read a REAL transient). Fix at the cause: for the first PTV_MV_BIRTHTRIM_S the trim is
-     * a WINDOW, not a one-shot — excess over the primed target is dropped-oldest SILENTLY
-     * (never displayed, never decimation-slid). Content skipped at birth is invisible: h0
-     * anchors at the first DISPLAYED frame, so the mosaic simply joins at the live edge.
-     * mv-only (single-input keeps its deep-prime/AUTO-BANK retention semantics untouched);
-     * PTV_NO_MV_BIRTHTRIM=1 reverts. */
-    int64_t bt_win_ticks = c->tick_dur_us > 0 ? 20000000 / c->tick_dur_us : 500;
-    int64_t bt_cnt[PTV_MAX_INPUT] = {0};
-    int     bt_logged = 0;
     int     born[PTV_MAX_INPUT] = {0};   /* pre17: slot has displayed its first fresh frame
                                           * (clears the slot's birth slate-mask bit below) */
     AVFrame *filt = av_frame_alloc();
@@ -422,7 +386,6 @@ void *compositor_thread(void *arg)
     if (rs_mv_div < 8) rs_mv_div = 8;
     if (n_prime > g_frameq_cap - 8) n_prime = g_frameq_cap - 8;
     if (n_prime < 0) n_prime = 0;
-    for (int hk = 0; hk < PTV_MAX_INPUT; hk++) res_home[hk] = -1;   /* 2.0.0 T-343b */
     res_occ_tgt = n_prime > 4 ? n_prime : 4;   /* v0.9.13 servo target = the primed jitter depth,
                                                 * clamped below the pressure valve (a deep PTV_PREROLL_MS
                                                 * would otherwise put the target INSIDE the bypass zone
@@ -435,8 +398,6 @@ void *compositor_thread(void *arg)
                                                * acceptance band and keeps the house-rate estimate — the pressure
                                                * valve then bounds it to today's overflow-decimation behavior. */
         res_ema_us[k] = mv_tick_us(c, 1);
-        res_occ_f[k] = -1;
-        res_src_us[k] = AV_NOPTS_VALUE;
         memset(&tl_slot[k], 0, sizeof(tl_slot[k]));
         tl_slot[k].cad      = mv_tick_us(c, 1);
         tl_slot[k].last_src = AV_NOPTS_VALUE;
@@ -518,244 +479,18 @@ void *compositor_thread(void *arg)
                                                       * its last frame on underrun, black when stale */
             VideoHold *h = &c->inputs[k].hold;
             AVFrame *f = NULL, *st; int stale, fresh = 0;
-            /* pre17 BIRTH-TRIM WINDOW (see the declaration comment): while the window is
-             * open, excess over the primed target is dropped-oldest SILENTLY — the post-
-             * preroll backlog must never be displayed (one-shot-trim → window; +4 margin
-             * keeps normal arrival jitter out of it). */
-            if (g_mv_birthtrim && c->live && g_mv_residence && !g_timeline && tick < bt_win_ticks) {
-                AVFrame *tf;
-                while (av_thread_message_queue_nb_elems(h->q) > res_occ_tgt + 4 &&
-                       av_thread_message_queue_recv(h->q, &tf, AV_THREAD_MESSAGE_NONBLOCK) >= 0) {
-                    av_frame_free(&tf);
-                    bt_cnt[k]++;
-                }
-            } else if (!bt_logged && tick >= bt_win_ticks) {
-                char bb[160]; int bp = 0, kk2;
-                bt_logged = 1;
-                for (kk2 = 0; kk2 < n && bp < (int)sizeof bb - 24; kk2++)
-                    bp += snprintf(bb + bp, sizeof bb - bp, " in%d:%"PRId64, kk2, bt_cnt[kk2]);
-                if (bt_cnt[0] + bt_cnt[1] + bt_cnt[2] + bt_cnt[3])
-                    av_log(NULL, AV_LOG_INFO,
-                           "[PTV-RES] birth-trim window closed (%llds): silently dropped%s backlog frames "
-                           "(never displayed — no post-birth catch-up slide; PTV_NO_MV_BIRTHTRIM reverts)\n",
-                           (long long)(bt_win_ticks * c->tick_dur_us / 1000000), bb);
-            }
-            /* Take a candidate: a frame held back last tick (pending) or a fresh pop. Two hold
-             * gates may keep it back (frame stays in pending, skew/EMA freeze via pending[k]):
-             *  - CONTENT CLAMP (opt-in, g_mv_clamp): content-age leads the house clock.
-             *  - CADENCE RESIDENCE (v0.9.13, default): the previous frame's content-projected
-             *    residence hasn't elapsed — the slot is consumed at its SOURCE rate, so a
-             *    rate-mismatched slot holds a regular cadence (5:6 for 25-in-29.97) and a
-             *    burst of late frames NEVER fast-forwards (the due re-base turns a starvation
-             *    deficit into constant slot latency). Multiple due frames in one tick (a
-             *    59.94 slot in a 29.97 house) pop through and the newest displays. */
-            AVFrame *cand = NULL;
-            if (g_timeline && n > 1) {
-                cand = mv_tl_pick(c, k, tick, now_us, &pending[k], &done_in[k], &tl_slot[k], res_occ_tgt,
-                                  &rs_mv_seed[k]);
-                if (!cand && last[k]) {             /* the stats line's pd= / sv=: a repeat by cadence (the next
-                                                     * picture waits for its time) or by starvation (none queued) */
-                    if (pending[k] || av_thread_message_queue_nb_elems(h->q))
-                        pd_cnt[k]++;
-                    else
-                        sv_cnt[k]++;
-                }
-            } else {                               /* 2.1: not run (deleted after the 2.1 canary soak) */
-                int   resid = g_mv_residence && c->tick_dur_us > 0;
-                int64_t hnow = mv_tick_us(c, tick);
-                int64_t half = c->tick_dur_us / 2;
-                int   qhot  = av_thread_message_queue_nb_elems(h->q) >= g_frameq_cap - g_frameq_cap / 4;
-                int   pops, reprime = 0;
-                /* 2.0.0 T-343b: the occupancy centre of this slot — once it has settled (the mean of 100 clean ticks from
-                 * 3 s on, within one picture of the target), the occupancy it actually runs at; the servo's deadband and
-                 * the refill after a gap / damage aim there, so the slot comes back at the lag its sound settled on */
-                int   res_ctr = res_occ_tgt;
-                if (resid && g_mv_res_deadband) {
-                    if (res_home[k] >= 0)
-                        res_ctr = res_home[k];
-                    else if (born[k] && tick > 75 && !reprime_us[k] && !slated[k] &&
-                             !(dmg_wc[k] && now_us - dmg_wc[k] < 5000000)) {
-                        res_home_sum[k] += av_thread_message_queue_nb_elems(h->q);
-                        if (++res_home_n[k] >= 100) {
-                            res_home[k] = av_clip((int)((res_home_sum[k] + 50) / 100), res_occ_tgt - 1, res_occ_tgt + 1);
-                            if (g_diag)
-                                av_log(NULL, AV_LOG_INFO, "[PTV-RES] in%d settled at occupancy %d (target %d)\n",
-                                       k, res_home[k], res_occ_tgt);
-                        }
-                    }
-                }
-                /* 2.0.0 T-339: a slot back from an outage (slated) stays on its slate until its jitter buffer holds the
-                 * primed depth again (cap 3 s). It used to show the first returning frame at once, from an empty buffer:
-                 * the occupancy servo (+-2 %) then refilled it over ~60 s, one held frame every ~2.5 s, so the slot's
-                 * picture slid ~0.9 s later while its audio chased it (MV-04 gap_20: REANCHOR2 h0 +1 s, ACQUIRE drop
-                 * 831 ms, then audio 40..200 ms early for a minute, PLL pad 170 ms). Re-primed, the picture comes back
-                 * at the lag it had before the outage. Also after a dry spell shorter than the slate (> 0.5 s without a
-                 * fresh frame: flapping ran the buffer dry on every cut and the same refill ramp moved the picture
-                 * +80 -> +680 ms while its audio chased it). */
-                /* T-350: while the slot's video is damaged (corrupt data in the last 5 s) frames are lost: each one let the
-                 * cell take a buffered frame early, the buffer drained (1 % packet loss: 23 -> 0 in 20 s, no dry spell, so no
-                 * re-prime) and the +-2 % servo refilled it over ~75 s after the loss — the picture slid +800 ms while its
-                 * audio, padded for its own lost frames at once, chased it (MV mp2 loss_10: -70 ms 30-60 s after; live
-                 * Grid_2x2 Cinestar cell C4 / C5). Damaged and 3 frames short of the primed depth = re-prime now: the
-                 * picture holds a few frames during the damage instead of sliding after it. The slot's PLL reads nothing
-                 * while damaged (g_mv_vdmg_wc, ptvencoder_audio.c). */
-                /* 2.0.2 T-393: + the slot's DECODER errors — H.264 damage inside a clean transport (a bit-flipped SPS: one
-                 * 16x640 picture, then ~2 s undecodable) emptied the buffer with no demux corrupt flag, so no re-prime:
-                 * the servo refilled it over ~30 s (14 holds, the picture +480 ms later), its audio chased it, −64…−69 ms */
-                int64_t cr = c->inputs[k].da.vcorrupt + c->inputs[k].dc.vcorrupt + c->inputs[k].dc.vdecerr;
-                if (cr != dmg_cr[k]) {
-                    dmg_cr[k] = cr; dmg_wc[k] = now_us;
-                    atomic_store_explicit(&g_mv_vdmg_wc[k], now_us, memory_order_relaxed);
-                }
-                /* 2.0.2 T-386: a slot joining late primes the same way before its first picture (measured without: it
-                 * showed from an empty buffer and the servo held a picture four times in 60 s, each a -40 ms step its
-                 * sound slewed back over ~15 s) */
-                if (resid && g_mv_reprime && (c->inputs[k].deferred ||
-                    (last_fresh_us[k] && (slated[k] || now_us - last_fresh_us[k] > 500000 ||
-                    (dmg_wc[k] && now_us - dmg_wc[k] < 5000000 &&
-                     (reprime_us[k] || av_thread_message_queue_nb_elems(h->q) < res_ctr - 2)))))) {
-                    int occ = av_thread_message_queue_nb_elems(h->q);
-                    if (occ && !reprime_us[k]) {
-                        reprime_us[k] = now_us;
-                        res_occ_f[k] = -1;               /* 2.0.2 T-343: the average restarts from the refilled buffer */
-                    }
-                    /* 2.0.0 T-343b: refill to the occupancy the slot ran at, not the static target — with the ±1
-                     * deadband a slot born one picture under the target stays there, and a refill to the target after a
-                     * gap put its picture one picture later than its sound had settled on (mv05 sync_gap_10: −30 ms
-                     * for 10 s after the return, 4 of 5 runs under gate load) */
-                    reprime = occ < res_ctr && (!reprime_us[k] || now_us - reprime_us[k] < 3000000);
-                }
-                for (pops = 0; pops < 4 && !reprime; pops++) {
-                    AVFrame *nx = pending[k];
-                    pending[k] = NULL;
-                    if (!nx) {
-                        int rr = av_thread_message_queue_recv(h->q, &nx, AV_THREAD_MESSAGE_NONBLOCK);
-                        if (rr == AVERROR_EOF) { done_in[k] = 1; break; }
-                        if (rr < 0) break;                       /* jitter buffer empty */
-                    }
-                    if (g_mv_clamp && c->tick_dur_us > 0 && nx->pts != AV_NOPTS_VALUE) {
-                        int64_t h0c; pthread_mutex_lock(&c->inputs[k].h0_lock); h0c = c->inputs[k].h0; pthread_mutex_unlock(&c->inputs[k].h0_lock);
-                        if (h0c != AV_NOPTS_VALUE &&
-                            av_rescale_q(nx->pts, c->inputs[k].ist_tb, AV_TIME_BASE_Q) - h0c > mv_tick_us(c, tick + 1)) {
-                            pending[k] = nx;                     /* content leads the clock -> hold (exact tick+1 since v0.9.12) */
-                            break;
-                        }
-                    }
-                    /* 2.0.2 T-343: hysteresis. A hold leaves the slot's phase on the opposite edge (-half), a decimation
-                     * on +half: with the phase parked on that edge (the servo had just drained or filled a picture), the
-                     * +-1 picture occupancy jitter flipped the servo's trim every frame and each flip crossed it again —
-                     * a hold/decimate pair every ~2 ticks on a clean slot (mv05 slot 2: 367/367 in 100 s, phase pinned
-                     * at +-20.0 ms), a picture shown twice then one skipped, and with the audio follow a pad/drop pair.
-                     * The step back needs the phase a quarter tick past the edge; the re-base clamp moves with it. */
-                    /* at the house rate: the cadence estimate converged (>= 64 accepted deltas — it is seeded at the
-                     * house rate, and a 59.94 slot in a 29.97 house sits on its acceptance band's edge and never moves
-                     * it) and within 2 % of the tick */
-                    int     res_matched = res_ema_n[k] >= 64 && FFABS(res_ema_us[k] - c->tick_dur_us) * 50 < c->tick_dur_us;
-                    int64_t hy_hold = g_mv_res_hyst && res_hyst[k] < 0 ? c->tick_dur_us / 4 : 0;
-                    int64_t hy_dec  = g_mv_res_hyst && res_hyst[k] > 0 ? c->tick_dur_us / 4 : 0;
-                    if (resid && !qhot && hnow + half + (cand ? -hy_dec : hy_hold) < res_due_us[k]) {
-                        pending[k] = nx;                         /* residence hold: not due yet (deliberate pacing) */
-                        if (!cand) {
-                            pd_cnt[k]++; res_hyst[k] = 1;
-                            /* 2.0.2 T-343: the cell repeats its picture = the slot's picture one tick later; its audio
-                             * follows this at once (audio PLL), not over ~10 s of TRACK slew (the -30..-40 ms dip ~20 s
-                             * after a mosaic start, after damage, after a join). Only on a slot at the house rate: on a
-                             * rate-converted slot the holds / decimations ARE its cadence (25 in 29.97 holds ~5 times a
-                             * second, 59.94 in 29.97 decimates every tick) and move nothing — followed, they padded /
-                             * dropped its sound several times a second (mv02 1x2 29.97: picture with no sound) */
-                            if (res_matched)
-                                atomic_fetch_add_explicit(&c->inputs[k].res_step_us, mv_tick_us(c, 1), memory_order_relaxed);
-                        }
-                        if (!cand && tick > 50 && pd_log[k] < 3) {   /* T-343: a matched-rate slot should never hold */
-                            pd_log[k]++;
-                            av_log(NULL, AV_LOG_WARNING, "[PTV-RES] in%d residence hold at tick %"PRId64": occupancy %d, "
-                                   "target %d, cadence %"PRId64" us (one picture shown twice)\n", k, tick,
-                                   av_thread_message_queue_nb_elems(h->q), res_occ_tgt, res_ema_us[k]);
-                        }
-                        break;
-                    }
-                    if (cand) {                                  /* superseded within one tick (decimation) */
-                        av_frame_free(&cand); md_cnt[k]++; res_hyst[k] = -1;
-                        if (res_matched)                         /* T-343 */
-                            atomic_fetch_sub_explicit(&c->inputs[k].res_step_us, mv_tick_us(c, 1), memory_order_relaxed);
-                    }
-                    cand = nx;
-                    if (resid) {
-                        int64_t src = nx->pts != AV_NOPTS_VALUE ?
-                                      av_rescale_q(nx->pts, c->inputs[k].ist_tb, AV_TIME_BASE_Q) : AV_NOPTS_VALUE;
-                        if (src != AV_NOPTS_VALUE && res_src_us[k] != AV_NOPTS_VALUE) {
-                            /* Cadence estimate: EMA over deltas ACCEPTED only inside a band around the
-                             * current estimate ([ema/2, 2*ema]) — a delta spanning skipped frames
-                             * (drop-oldest, decode drops, corrupt skips) would inflate the estimate,
-                             * which over-holds, which overflows the buffer, which drops more frames:
-                             * a runaway (v1 of this gate ratcheted sk to +23s exactly this way). */
-                            int64_t d = src - res_src_us[k];
-                            if (d > res_ema_us[k] / 2 && d < res_ema_us[k] * 2) {
-                                res_ema_us[k] += (d - res_ema_us[k]) / 16;
-                                if (res_ema_n[k] < 64) res_ema_n[k]++;
-                            }
-                            /* hard bounds: 3x house tick covers 10fps..90fps sources in a 29.97 house */
-                            res_ema_us[k] = av_clip64(res_ema_us[k], c->tick_dur_us / 3, c->tick_dur_us * 3);
-                        }
-                        if (src != AV_NOPTS_VALUE) res_src_us[k] = src;
-                        if (qhot && hnow + half < res_due_us[k]) {
-                            /* valve-FORCED pop (gate wanted to hold): not a cadence event — re-base
-                             * instead of accumulating, else a hot queue ratchets the schedule ahead
-                             * (measured +1.0-1.6s duephase in the first second of a startup-backlog
-                             * run, which the servo then needed ~90s to bleed off). */
-                            res_due_us[k] = hnow - half + res_ema_us[k];
-                        } else {
-                            /* Occupancy servo (the single-input WUCR lesson: PROPORTIONAL, small,
-                             * capped): trim the residence toward the primed jitter-buffer depth so
-                             * long-term consumption always equals arrival even if the cadence
-                             * estimate is biased. +-2% authority: enough to null estimator bias,
-                             * far too weak to disturb the 5:6 cadence pattern. */
-                            /* 2.0.2 T-343: the servo reads the AVERAGED occupancy. On real multicast a slot's buffer swings
-                             * ±8 pictures within seconds (bursty arrival; live-transcoder Grid_2x1 slot 0: occ 17..33 every
-                             * 1-2 s); read instantaneously, the ±2 % trim moved the display phase ~20 ms/s back and forth, a
-                             * hold and a decimation every ~10-60 s (162 / 156 in 85 min) — with the audio follow each one a
-                             * 42 ms silence pad / cut. The servo is for the long-term balance only (estimator bias). */
-                            int occ_now = av_thread_message_queue_nb_elems(h->q);
-                            double dev_f;
-                            if (res_occ_f[k] < 0) res_occ_f[k] = occ_now;
-                            res_occ_f[k] += (occ_now - res_occ_f[k]) / g_mv_res_occ_avg;
-                            /* 2.0.2 T-397: the averaged occupancy and the wide band are for HOUSE-RATE slots — the step storm they
-                             * stop was measured there, and there the T-343 follow moves the sound with every step. On a
-                             * rate-converted slot the sound follows only by the slow 2.0.1 slew: MV-01 slot 0 (59.94 in a 29.97
-                             * mosaic, its cadence estimate ~40 s to converge from the house-tick seed) swelled to 38-42 pictures
-                             * under the band (target 29: picture 250 ms late, the sound 130-147 ms early from ~20 to ~45 s, 5 runs
-                             * of 5) and stayed at the band's edge after (+100..150 ms). Rate-converted slots keep the pre3 servo
-                             * (instantaneous occupancy, no band): end lag 33 ms 3/3. Tried and dropped: the band once the estimate
-                             * settled (< 1 % / 64 deltas) — no transient, but the slot then sat 83 ms deep and mv01 gap_20 failed
-                             * 2/3. PTV_RES_BAND_ALL=1 = the band on every slot (pre4c1). */
-                            if (!res_matched && !g_mv_res_band_all)
-                                dev_f = occ_now - res_ctr;
-                            else
-                                dev_f = res_occ_f[k] - res_ctr;
-                            int dev = (int)lrint(dev_f);
-                            int band = res_matched || g_mv_res_band_all ? g_mv_res_deadband : 0;
-                            /* 2.0.0 T-343: a ±1 picture deadband — a slot born one picture under the target ran 0.1 %
-                             * slow until the drift reached half a tick (500 pictures = 20 s at 25 fps) and showed one
-                             * picture twice: a 40 ms audio step in a clean mosaic, which slot by birth jitter.
-                             * PTV_NO_RES_DEADBAND=1 reverts. */
-                            if (band && dev >= -band && dev <= band)
-                                dev = 0;
-                            else if (band > 1)                /* 2.0.2 T-343: a wide band acts on the excess only */
-                                dev = dev > 0 ? dev - band : dev + band;
-                            int64_t corr = band ? (int64_t)dev * 1000 : (int64_t)lrint(dev_f * 1000);
-                            corr = av_clip64(corr, -20000, 20000);
-                            res_due_us[k] = FFMAX(res_due_us[k], hnow - half - hy_dec)
-                                            + res_ema_us[k] - res_ema_us[k] * corr / 1000000;
-                        }
-                    } else break;                                /* residence off: exactly one pop per tick (legacy) */
-                }
-                if (!cand && !pending[k] && resid && !done_in[k] && last[k] &&
-                    hnow + half >= res_due_us[k])
-                    sv_cnt[k]++;                                 /* due but nothing arrived = genuine starvation dup */
+            /* 2.1 T-409: the slot is a frame synchronizer (mv_tl_pick): the picture due at its content time and
+             * lag, a lost one repeated, a late one skipped. */
+            AVFrame *cand = mv_tl_pick(c, k, tick, now_us, &pending[k], &done_in[k], &tl_slot[k], res_occ_tgt,
+                                       &rs_mv_seed[k]);
+            if (!cand && last[k]) {             /* the stats line's pd= / sv=: a repeat by cadence (the next
+                                                 * picture waits for its time) or by starvation (none queued) */
+                if (pending[k] || av_thread_message_queue_nb_elems(h->q))
+                    pd_cnt[k]++;
+                else
+                    sv_cnt[k]++;
             }
             fresh = (cand != NULL);
-            if (fresh)
-                reprime_us[k] = 0;                        /* 2.0.0 T-339: shown again — the next dry spell re-primes afresh */
             if (fresh) {
                 f = cand;                                 /* for the re-anchor diag below */
                 if (last[k]) av_frame_free(&last[k]);
@@ -789,7 +524,6 @@ void *compositor_thread(void *arg)
                                k, tick, skew_us[k]/1000, dd/1000, h0d/1000, (tick*c->tick_dur_us)/1000, g_reanchor);
                     }
                     if (g_reanchor) { skew_us[k] = 0; c->inputs[k].house_skew = 0; } slated[k] = 0;
-                    reprime_us[k] = 0;
                     /* 1.0.1-pre17: slate RECOVERY edge — clear this slot's bit; the corrector's
                      * sibling-slate freeze lifts and its 3min quiet window re-runs from here.
                      * Also re-seed the slot's m_v EMA: the outage gap + skew reset changed the
@@ -914,102 +648,6 @@ void *compositor_thread(void *arg)
                             else rs_mv_ema[k] += (m - rs_mv_ema[k]) / rs_mv_div;
                             atomic_store_explicit(&g_rsx.mv_ema[k], rs_mv_ema[k], memory_order_relaxed);
                             atomic_store_explicit(&g_rsx.mv_wall[k], now_us, memory_order_relaxed);
-                        }
-                    }
-                    /* P2 — floor the per-slot lag to ≥0 by re-anchoring h0. A cell that leaps AHEAD of
-                     * the house clock (sk very negative: −560ms on a 2x1, up to −2.5s on a 4-up, from an
-                     * anomalous first decoded frame and/or a deep startup buffer prime) is physically
-                     * wrong and is UNCORRECTABLE on a COPIED audio track (a copy can only be delayed,
-                     * not advanced — backward DTS hits the monotonic clamp). Re-anchor h0 forward so the
-                     * lag lands at +1 tick (slot reads slightly BEHIND, the normal buffered state): the
-                     * video display is unchanged, transcoded audio rides the same h0+house_skew so it
-                     * stays locked, and copied audio now only needs to DELAY → correctable. Fires only on
-                     * a real video-ahead excursion (sk < −g_h0_reanchor_ms); gradual positive drift never
-                     * triggers. MULTIVIEW ONLY; g_h0_reanchor gates it. */
-                    if (n > 1 && g_h0_reanchor && !g_timeline) {   /* 2.1 T-409: the frame sync re-locks L instead */
-                        int cond = sk < -(int64_t)g_h0_reanchor_ms * 1000;
-                        int64_t sk_used = sk;
-                        int fire;
-                        if (g_reanchor2_instant)
-                            fire = cond;                          /* pre-1.0.1 single-sample fire */
-                        else {
-                            /* 1.0.1 DEBOUNCE: shift = −sk + tick was computed from ONE instantaneous
-                             * displayed-frame label, so a single corrupt PTS (one frame, DTS intact —
-                             * passes the demux layer) inflated the shift by its full excursion and
-                             * displaced the whole slot (transient audio-early until the PLL healed).
-                             * Keep the last 5 evaluated sk samples per slot; fire only when ≥3 of
-                             * them (including the current tick) held sk < −thr, and size the shift
-                             * from the MEDIAN of the qualifying samples — a one-tick corrupt label
-                             * is 1-of-5 (ignored), a real video-ahead excursion persists across
-                             * ticks and still re-anchors within 5 ticks. PTV_REANCHOR2_INSTANT=1
-                             * reverts. */
-                            int idx = r2_pos[k];
-                            r2_skring[k][idx] = sk;
-                            r2_cond[k] = ((r2_cond[k] << 1) | (cond ? 1 : 0)) & 0x1f;
-                            r2_pos[k] = (idx + 1) % 5;
-                            fire = cond && av_popcount(r2_cond[k]) >= 3;
-                            if (fire) {
-                                int64_t v[5];
-                                int m = 0, b, x, y;
-                                for (b = 0; b < 5; b++)
-                                    if (r2_cond[k] & (1u << b))
-                                        v[m++] = r2_skring[k][(idx - b + 5) % 5];
-                                for (x = 1; x < m; x++) {          /* insertion sort, m ≤ 5 */
-                                    int64_t tv = v[x];
-                                    for (y = x; y > 0 && v[y - 1] > tv; y--) v[y] = v[y - 1];
-                                    v[y] = tv;
-                                }
-                                sk_used = v[m / 2];               /* median of the qualifying samples */
-                                r2_cond[k] = 0;                   /* re-debounce after firing */
-                            }
-                        }
-                        if (fire) {
-                            int64_t shift = -sk_used + c->tick_dur_us; /* bring sk from negative to +1 tick */
-                            pthread_mutex_lock(&c->inputs[k].h0_lock);
-                            c->inputs[k].h0 += shift; h0k = c->inputs[k].h0;
-                            pthread_mutex_unlock(&c->inputs[k].h0_lock);
-                            sk = mv_tick_us(c, tick) - (disp_src - h0k);   /* now ≈ +1 tick (median-sized) */
-                            af_off[k] = sk;                            /* snap the audio-follow EMA to the floored lag */
-                            /* 1.0.1-pre16: a REANCHOR2 h0 shift is a label-lineage disturbance for
-                             * this slot's tracks — bump the slot's disturbance epoch so the corrector
-                             * dwell resets. REUSES the existing per-input house_disturb epoch (owner
-                             * Q3, 2026-07-18): safe because house_disturb is consumed ONLY by
-                             * corrector snapshots (rscorr_event_edge/dwell_reset) — the PLL acquire
-                             * has been event-ungated since v0.6.18. Live-consumed since pre17 (the
-                             * mv corrector is armed): a REANCHOR2 resets THIS slot's tracks' dwell. */
-                            atomic_fetch_add_explicit(&c->inputs[k].house_disturb, 1, memory_order_relaxed);
-                            /* 1.0.1-pre17: a REANCHOR2 h0 shift REDEFINES this slot's mapping
-                             * baseline — the pre-shift m_v EMA samples describe a mapping that no
-                             * longer exists (mixing them in is exactly the birth −185ms sensor
-                             * spike measured on the A/B fixture). Re-seed from the next sample:
-                             * a GENUINE displacement still shows immediately (post-shift samples
-                             * measure the new mapping against the audio's unchanged one — a
-                             * cleaner reading of #24's shape, not a masking of it). */
-                            rs_mv_seed[k] = 0;
-                            /* 0.9.18.7: promoted PTV_DIAG→always-on WARNING, with the AGLUE-style log
-                             * rate limit. In LIVE mv a re-anchor is rare (a real video-ahead excursion),
-                             * but on an unpaced source (file mv, decoder outrunning the clock) it can
-                             * refire EVERY tick (~30/s measured) — the re-anchors still APPLY; only the
-                             * lines are capped: 4 per 10s window per slot, then one summary as it rolls. */
-                            {
-                                int64_t now_r2 = av_gettime_relative();
-                                if (now_r2 - r2_win_us[k] >= 10000000) {
-                                    if (r2_supp[k])
-                                        av_log(NULL, AV_LOG_WARNING,
-                                            "[PTV-REANCHOR2] in%d %d more re-anchors (net h0 +%"PRId64"ms) suppressed in last 10s — unpaced/racing source, re-anchors still applied\n",
-                                            k, r2_supp[k], r2_supp_us[k] / 1000);
-                                    r2_win_us[k] = now_r2; r2_win_n[k] = 0;
-                                    r2_supp[k] = 0; r2_supp_us[k] = 0;
-                                }
-                                if (r2_win_n[k] < 4) {
-                                    r2_win_n[k]++;
-                                    av_log(NULL, AV_LOG_WARNING,
-                                        "[PTV-REANCHOR2] in%d tick=%"PRId64" video-ahead → h0 +%"PRId64"ms, lag→%"PRId64"ms\n",
-                                        k, tick, shift / 1000, sk / 1000);
-                                } else {
-                                    r2_supp[k]++; r2_supp_us[k] += shift;
-                                }
-                            }
                         }
                     }
                     if (g_diag && !h0_logged[k]) {   /* P0: one-shot per slot at its first displayed frame */
@@ -1263,8 +901,7 @@ void *compositor_thread(void *arg)
                                    " in%d:qdrop=%"PRId64"/corrupt=%"PRId64"/pd=%"PRId64"/sv=%"PRId64"/sk=%+dms/skres=%+dms%s%s",
                                    k, c->inputs[k].da.vdrop, c->inputs[k].da.vcorrupt + c->inputs[k].dc.vcorrupt,
                                    pd_cnt[k], sv_cnt[k],
-                                   (int)((g_timeline ? atomic_load_explicit(&c->inputs[k].tl_lag_us, memory_order_relaxed)
-                                                     : c->inputs[k].house_skew) / 1000),
+                                   (int)(atomic_load_explicit(&c->inputs[k].tl_lag_us, memory_order_relaxed) / 1000),
                                    (int)(c->inputs[k].da.disc_resid_us / 1000), lst, cct);
                 }
                 /* GLOBAL ccmux= — teletext packets our own mux backward-dts guard dropped.

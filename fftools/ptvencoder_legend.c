@@ -153,7 +153,6 @@ void show_help_default(const char *opt, const char *arg)
         "   synchronizers (picture by content time at a lag, sound placed with it; [PTV-MV] re-locked).\n"
         "    PTV_TL_OPEN_MS=N    path tolerance that opens an event window (default 500)\n"
         "    PTV_TL_NO_VMDOOR=1  A/B only: single-input sound by house_skew instead of the record door\n"
-        "    PTV_TL_AGLUE=1      A/B only: the 2.0 audio label-step verdicts (AGLUE) on top of the timeline\n"
         "   reverts (each disables one default-on mechanism; for A/B and rollback only):\n"
         "    PTV_NO_WUCR         occupancy-servo house pacing      PTV_NO_ADAPTIVE fixed (non-adaptive) cushion\n"
         "    PTV_NO_REPRIME      fast post-glue buffer refill\n"

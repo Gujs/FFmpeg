@@ -470,24 +470,6 @@ int     g_drop_until_kf = 1;
  * can't advance audio for a sub-second offset. MULTIVIEW ONLY (n_input>1); PTV_NO_AUDIO_FOLLOW
  * reverts to the old floored/capped async-skew path for A/B. */
 int     g_audio_follow = 1;
-/* Multiview per-slot h0 RE-ANCHOR — floor each slot's lag to ≥0 so a cell is never displayed
- * AHEAD of the house clock. A slot's video can leap far ahead (measured: −560ms on a 2x1, up to
- * −2.5s on a 4-up) when h0 is anchored to an anomalous first decoded frame and/or the input
- * primed a deep startup backlog (the open-join barrier lets fast decoders over-fill their jitter
- * buffer while waiting for the slowest input). Video-ahead (negative lag) is (a) physically wrong
- * for a frame-synchronizer and (b) UNCORRECTABLE on a COPIED audio track — a copy can only have
- * its timestamps shifted LATER (delay); advancing it means a backward DTS, which the copy path's
- * monotonic-DTS clamp rejects. So when a slot's lag drops below −g_h0_reanchor_ms, re-anchor its
- * h0 forward (h0 += deficit) so the lag lands at a small POSITIVE value: the video display is
- * unchanged (same frame shown), the transcoded audio rides the same h0+house_skew so it stays
- * locked, and the copied audio now only needs to DELAY → correctable. MULTIVIEW ONLY (n_input>1);
- * PTV_NO_H0_REANCHOR=1 reverts. */
-int     g_h0_reanchor = 1;   /* 2.1: not run — a slot's frame sync re-locks its lag instead of moving h0 */
-int     g_reanchor2_instant = 0;   /* 1.0.1 (PTV_REANCHOR2_INSTANT=1 reverts): REANCHOR2 fires only when ≥3 of the
-                                           * last 5 evaluated ticks held sk < −threshold, with the h0 shift sized from the
-                                           * MEDIAN qualifying sk — a single corrupt-PTS frame (DTS intact, so it passes
-                                           * the demux discontinuity layer) no longer inflates the shift by its full
-                                           * excursion (transient audio-early until the PLL healed). */
 /* h0-AT-DISPLAY (multiview): anchor each slot's h0 to the first frame the COMPOSITOR actually DISPLAYS,
  * not the first frame the decoder produces. Under a deep startup prime the first-decoded frame is an
  * earlier/different content than the first-displayed one, so the old decode-thread anchor left the
@@ -927,7 +909,6 @@ int     g_nbs_fill  = 0;
 int     g_hold_fill = 1;                       /* 2.0.0-pre6: audio fill during a source hold (default-on, D24) */
 int     g_copy_gapfill = 1;                    /* 2.0.0-pre9.4 (T-083): copied AC-3 gap fill / overlap drop */
 int     g_glue_htol = 5;                       /* §2.3 |H−1| tolerance, % (fixture-tuned, G4) */
-int64_t g_pair_ttl_us = PTV_PAIR_EXPECT_TTL_US;
 int64_t g_nbs_quantum_us = 100000;             /* fill quantum: 100ms of silence per sentinel */
 _Atomic int64_t g_acorrupt;
 _Atomic int64_t g_adamage_wc[PTV_MAX_AUDIO];   /* 2.0.0-pre9.3 (T-080 A2) */
@@ -5648,10 +5629,6 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         inputs[k].da.nb_streams_open = inputs[k].ifmt->nb_streams;   /* 1.2.2 T-064: the size above */
         inputs[k].da.late_stream_max = -1;
         inputs[k].da.cc_raw_dts = AV_NOPTS_VALUE;   /* 2.1 T-326 */
-        if (g_layera) {   /* legacy-0004 buffer-classify-discard state (only when enabled) */
-            if ((ret = ptv_disc_init(&inputs[k].disc, PTV_DISC_CAPACITY,
-                                     inputs[k].ifmt->nb_streams)) < 0) goto end;
-        }
     }
     {   /* 2.0.2 T-386: the reference input = the first live slot (slot 0 may be waiting) */
         int ref = 0;
@@ -6426,10 +6403,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         as[k].af_applied_us = 0;
         as[k].dbg_k = k; as[k].dbg_in = asrc_in[k]; as[k].dbg_first_out = AV_NOPTS_VALUE;
         as[k].glue_raw_last_us = AV_NOPTS_VALUE;         /* [PTV-AGLUE] no continuity reference yet */
-        as[k].glue_exp_step = &inputs[asrc_in[k]].aglue_exp_step[k];   /* pre5 (D1): shared-flush expected-step slot */
-        as[k].glue_exp_dl   = &inputs[asrc_in[k]].aglue_exp_dl[k];
         as[k].corr_epoch    = &inputs[asrc_in[k]].house_disturb;       /* pre14: corrector event feeds (its input slot) */
-        as[k].corr_layera_active = g_layera ? &inputs[asrc_in[k]].disc.active : NULL;
         as[k].shed_wall = &inputs[asrc_in[k]].shed_wall;   /* pre16: per-input self-shed window (AGLUE notes + */
         as[k].shed_cnt  = &inputs[asrc_in[k]].shed_cnt;    /* corrector quiet) — slot B never smears slot A */
         as[k].gov_on    = &inputs[asrc_in[k]].gov_on;      /* pre16: this track's OWN input's governor flag */
@@ -6473,7 +6447,6 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         d->single    = !multiview;
         d->mv_vring  = multiview ? &inputs[kk].vring : NULL;   /* 2.0.0 T-342 */
         d->ifmt_home = &inputs[kk].ifmt;
-        d->disc = g_layera ? &inputs[kk].disc : NULL;   /* legacy-0004 buffer (NULL when off) */
         d->vq_shed_req = &inputs[kk].vq_shed_req;       /* 1.0.1-pre8 (a): overflow -> request head-GOP shed */
         d->autobank = g_autobank && !multiview && live && is_net_url(inputs[kk].url);   /* v0.9.14: single-input live only */
         for (r = 0; r < n_rung; r++) {
@@ -6485,8 +6458,6 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
             if (asrc_in[k] == kk) {
                 d->audio_q[d->n_audio] = audio_q[k]; d->astream[d->n_audio] = asrc[k];
                 av_strlcpy(d->abind[d->n_audio], as[k].bind_spec, sizeof d->abind[0]);   /* 2.0.2 T-386 */
-                d->aglue_exp_step[d->n_audio] = &inputs[kk].aglue_exp_step[k];   /* pre5 (D1): write side of the */
-                d->aglue_exp_dl[d->n_audio]   = &inputs[kk].aglue_exp_dl[k];     /* expected-step handshake      */
                 d->aglobal[d->n_audio] = k;   /* pre15: global track index — keys the per-track
                                                * published atomics (pad ledger, decode watermark, fill) */
                 d->n_audio++;
@@ -6698,7 +6669,6 @@ end:
         av_freep(&inputs[k].tail_gap_us);       /* 2.0.0-pre4c */
         av_freep(&inputs[k].tail_wc_us);        /* 2.0.0 T-089 */
         av_dict_free(&inputs[k].da.reopen_opts);   /* pre17 R1 */
-        ptv_disc_free(&inputs[k].disc);   /* legacy-0004 buffer (no-op if never inited) */
         if (inputs[k].ifmt) avformat_close_input(&inputs[k].ifmt);
         pthread_mutex_destroy(&inputs[k].h0_lock);
         pthread_mutex_destroy(&inputs[k].hold.lock);
@@ -7202,7 +7172,6 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_REPRIME")) g_reprime = 0;
     if (getenv("PTV_NO_LAYERA"))  g_layera  = 0;  /* v0.9.10: WUCR/LAYERA/REPRIME are default-on; NO_* revert */
     /* 2.1 T-409: the program timeline is the only path (owner 2026-10-21: no fallback switch) */
-    g_timeline = 1;
     g_layera   = 0;                           /* the timeline owns what the LAYERA buffer did */
     if (getenv("PTV_TL_OPEN_MS") && atoi(getenv("PTV_TL_OPEN_MS")) > 0)
         g_tl_open_us = atoi(getenv("PTV_TL_OPEN_MS")) * 1000LL;
@@ -7315,10 +7284,7 @@ int main(int argc, char **argv)
     /* 0.9.18.7: PTV_DUKF_ESCAPE_MS (5000ms) / PTV_DUKF_MIN_MS (1000ms) internalized —
      * see g_dukf_escape_us / g_dukf_min_ms */
     if (getenv("PTV_NO_AUDIO_FOLLOW")) g_audio_follow = 0;  /* A/B: multiview audio uses old floored/capped async skew */
-    if (getenv("PTV_NO_H0_REANCHOR")) g_h0_reanchor = 0;    /* A/B: don't floor per-slot lag (allow video-ahead) */
-    if (getenv("PTV_REANCHOR2_INSTANT")) g_reanchor2_instant = 1;  /* 1.0.1: revert REANCHOR2 to single-sample fire (no 3-of-5 median debounce) */
     if (getenv("PTV_NO_H0_AT_DISPLAY")) g_h0_at_display = 0; /* A/B: multiview anchors h0 at first DECODE, not first DISPLAY */
-    /* 0.9.18.7: PTV_H0_REANCHOR_MS internalized (120ms — g_h0_reanchor_ms) */
     if (getenv("PTV_AF_NO_PLL")) g_af_pll = 0;              /* A/B: pure discrete drop/pad (no smooth nudge) */
     if (getenv("PTV_AF_NO_ANCHOR")) g_af_anchor = 0;        /* A/B: revert B1 → pre-B1 free-running counter */
     /* PTV_PREROLL_MS / PTV_VIDEOQ / PTV_CUSHION_MAX_MS / PTV_BANK_DECAY_S parses moved to resolve_cushions() (0.9.18 M1) */
@@ -7415,7 +7381,6 @@ int main(int argc, char **argv)
     { const char *hc = getenv("PTV_HOLD_CLEAN_MS"); if (hc) g_hold_clean_us = (int64_t)atoi(hc) * 1000; }   /* 2.0.0 T-324 */
     if (getenv("PTV_NO_REJOIN_MAP")) g_rejoin_map = 0; /* 2.0.0-pre6.1 kill switch: PTS jumps at a rejoin again */
     { const char *s = getenv("PTV_GLUE_HTOL_PCT");     if (s && atoi(s) > 0) g_glue_htol = atoi(s); }             /* tuning knob (G4) */
-    { const char *s = getenv("PTV_PAIR_EXPECT_TTL_US");if (s && atoll(s) > 0) g_pair_ttl_us = atoll(s); }          /* TEST ONLY (G6) */
     { const char *s = getenv("PTV_NBS_QUANTUM_MS");    if (s && atoi(s) > 0) g_nbs_quantum_us = (int64_t)atoi(s) * 1000; }  /* TEST ONLY (G8) */
     /* TEST-ONLY overrides (PTV_WRAP_GUARD_S precedent): shorten the dwell/quiet windows or move
      * the band/slew so the F-gate fixtures can exercise storm/authority paths in bounded wall

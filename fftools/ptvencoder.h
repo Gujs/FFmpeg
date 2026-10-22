@@ -1161,12 +1161,6 @@ typedef struct AudioState {
     int              glue_log_win_n;                  /* verdict lines emitted this window */
     int              glue_supp_n;                     /* verdicts suppressed this window (still applied) */
     int64_t          glue_supp_net_us;                /* net label movement of the suppressed verdicts */
-    /* 1.0.1-pre5 shared-flush expected-step handshake (D1): registration slot this track reads.
-     * Demux thread writes (value first, deadline last, release); audio thread acquires the
-     * deadline then reads the value, and clears the deadline on consume/expiry. NULL = unwired.
-     * See PTV_PAIR_EXPECT_* in this header for semantics. */
-    _Atomic int_least64_t *glue_exp_step;             /* registered expected label step (us) */
-    _Atomic int_least64_t *glue_exp_dl;               /* wall-us deadline; 0 = no registration */
     /* v0.9.16.3 [PTV-ANCHOR] — birth-relationship observability (Zimbo-class startup offsets). */
     int              anchor_drop_pre;                 /* frames dropped because content preceded h0 */
     int              anchor_drop_ring;                /* pre-h0 ring overflow drops (oldest evicted) */
@@ -1251,7 +1245,6 @@ typedef struct AudioState {
      * rebuild is an event (§4.4). */
     CorrState        corr;
     _Atomic int_least64_t *corr_epoch;                /* -> Input.house_disturb (event feed) */
-    int             *corr_layera_active;              /* -> Input.disc.active (g_layera only; NULL = off) */
     int              afmt_rebuilds;                   /* [PTV-AFMT] rebuild count (corrector event feed) */
     /* 1.0.1-pre16: per-input event feeds (this track's OWN input slot; NULL → global
      * fallback). Cross-slot independence: another slot's shed/governor must not annotate
@@ -1307,7 +1300,6 @@ typedef struct AudioState {
     int64_t          hold_drop_n;                     /* 2.0.0-pre9.4: real frames dropped while the source held */
     int              rj_n, rj_released, rj_releasing, rj_cls_seq0;
     int64_t          rj_t0;                           /* wall us the first frame was buffered */
-    int64_t          hold_fill_last_wc;               /* wall us of the newest fill frame */
     int64_t          nbs_last_wall_us;                /* rr15 F9: wall of the previous quantum (elapsed base) */
     int64_t          nbs_carry_us;                    /* rr15 F9: sub-frame remainder carried between quanta */
     int64_t          glue_cad_us;                     /* rr15 R2: EMA of nonzero fed-frame wall gaps (PES-burst
@@ -1440,219 +1432,7 @@ typedef struct PassStream {
     int        nvwait;
 } PassStream;
 
-/* ---- legacy-0004 TS-discontinuity buffer (g_layera / PTV_LAYERA, default OFF) ----
- * Faithful port of patches/legacy/0004-ts-discontinuity-buffering. At a content
- * glue point the source interleaves OLD-timeline and NEW-timeline packets across
- * the straddle. The default ptvencoder path (g_layera==0) self-rebases each dense
- * stream's wrap_off at its own crossing and lets mis-glued OLD packets pass through.
- * When g_layera is on we instead: detect the jump, BUFFER the dense V/A packets while
- * both timelines are in flight, classify each held packet OLD/NEW, KEEP NEW / DISCARD
- * OLD, compute one AUDIO-derived offset, apply it to every kept packet, and release
- * in order. Sparse SUBTITLE/DATA (DVB-sub, SCTE-35) are NEVER buffered — they keep
- * the existing prog_off path in demux_unwrap. All timestamps here are AV_TIME_BASE
- * (us); the held packet already has demux_unwrap's 33-bit wrap correction applied. */
-#define PTV_DISC_CAPACITY        512   /* pre17 fix round (R3a): 256→512 — the bounded
-                                        * hold-until-drain may legally hold up to the 5s
-                                        * pairing window (Fashion ~77pkt/s ⇒ ~385 pkts;
-                                        * 256 would ENOSPC-force-flush at ~3.3s). Slots
-                                        * are pointers; RSS = held compressed packets,
-                                        * bounded by window × input bitrate. */
-#define PTV_DISC_THRESHOLD_US    (1 * AV_TIME_BASE)   /* 1s   jump threshold */
-#define PTV_DISC_TIMEOUT_US      (500 * 1000)         /* 500ms forced-flush timeout */
-#define PTV_DISC_TOL_US          (100 * 1000)         /* 100ms timeline classification tolerance */
-/* 1.0.1-pre4 shared-flush pairing window (wall us): dense flushes closer together than this
- * belong to ONE source event, and every dense stream in the event shares the event's
- * VIDEO-derived offset (see the decision tree in ptv_disc_flush). Sized for the live evidence
- * (Curiosity 2026-07-13: video and audio crossed 0.6s apart -> two partial flushes ~0.6s apart
- * after the 500ms buffer timeout) with wide margin, yet far below the spacing of independent
- * jumps (few/hour worst case). THE ACTUAL FALSE-PAIRING GUARANTEE (pre5 — the original "benign
- * by construction" claim was falsified by review: an inherited offset costs an aresample
- * convergence PROPORTIONAL to the inherited-vs-own disagreement, i.e. UNBOUNDED, and the
- * fx-dbl re-inherit destroyed ~17s of audio): each stream can inherit/apply the event's offset
- * AT MOST ONCE PER FLUSH-CYCLE CROSSING SET (pair_has is checked per flush at 3a: a flush
- * inherits if ANY crossing stream is unapplied and then applies to ALL crossing streams — an
- * already-applied stream that crosses in the SAME 500ms cycle as a late leg can re-apply;
- * review-2 F2, rare multi-audio coincidence, registered + aresample-converged when it happens)
- * and the window CLOSES as soon as every flowing dense audio stream has applied it — so an
- * independent audio wobble AFTER the event completes can never re-inherit a stale offset. What remains inherently ambiguous is a
- * video-only crossing followed by an INDEPENDENT first audio crossing inside the window: that
- * is indistinguishable from the genuine Curiosity ordering by construction, and the inherit
- * then costs an audible aresample convergence of the disagreement. The window/eps/pair_has
- * checks bound WHEN a false pairing can happen (first application per stream per window),
- * not its size. */
-#define PTV_PAIR_WINDOW_US       (5 * AV_TIME_BASE)
-/* Shared-flush equality band: a V-vs-A offset disagreement at or below this is flush BOOKKEEPING
- * (duration-estimate overhang ~1 frame, trailing-OLD discard holes ~100-400ms of interleave), NOT
- * a source A-vs-V jump difference — for those the production-proven audio-preferred butt-joint is
- * kept BYTE-IDENTICAL (the TruBLU symmetric-rewind mandate: equal deltas ⇒ per-stream-identical
- * behavior, log-line equality). The invariant holds in the band regardless — ONE offset is applied
- * to all dense streams either way; the band only decides WHICH content machinery absorbs the
- * bookkeeping residual (audio butt-joint, as today). Above the band the disagreement is a real
- * asymmetric event (live cases: 1.0s, 30.8s): VIDEO defines the timeline and the difference goes
- * to the audio content path. Half the LAYERA jump threshold, so a genuine >1s-delta pairing whose
- * streams disagree by more than this always engages. */
-#define PTV_PAIR_EPS_US          (500 * 1000)
-/* 1.0.1-pre5 demux->audio expected-step handshake (the D1 fix): when a shared flush routes an
- * A-vs-V mismatch to the audio content path, the demux thread REGISTERS the step it just put
- * into that track's label stream (value + wall deadline, atomics — demux writes, audio thread
- * reads). AGLUE consumes a matching arriving step as a REAL alignment step: it must be APPLIED
- * (aresample converges content to the new labels), never relabel-ERASED — the erase is exactly
- * what re-broke the invariant for backward mismatches in (-1000ms,-500ms) (mirror-signed
- * events: video jumping further forward than audio). Plain source backward steps carry no
- * registration and keep the 0.9.16.4 relabel-erase rule.
- *   TTL: must cover the audio pipeline's WORST-CASE demux->AGLUE residency, not the typical
- *   1-2s packet-queue latency — under a deep prime / auto-bank the audio_q legally holds the
- *   full bank ceiling (g_cushion_max_ms, 12s default, operator-raisable) plus the delivery-gate
- *   hold, and the post-outage resume carrying the discontinuity is EXACTLY the joint-event case
- *   this handshake exists for (review-2 F1: a 10s TTL expired mid-bank and fell back to the
- *   relabel-erase, re-breaking the invariant). Sized like the delivery-maxq formula
- *   (ptvencoder.c: delivery_cap + cushion_max + margin): 30s. The value-match collision window
- *   this buys is still negligible (a collision needs an unrelated backward step of near-equal
- *   >500ms magnitude on the same track inside the TTL). A stale registration expires silently.
- *   Match window is ASYMMETRIC around the registered value: flush-borne steps (same-cycle /
- *   inherit) arrive EXACT to within duration-estimate noise (measured -32..0ms), but a
- *   retro-corrected step rides the first normal-path packet after the flush and MERGES with the
- *   flush's own trailing-OLD discard hole, which is always FORWARD (measured +456ms on the
- *   ordering fixture) — hence [-LO, +HI] = [-250ms, +500ms] of the registered value. */
-#define PTV_PAIR_EXPECT_TTL_US   (30 * AV_TIME_BASE)
-#define PTV_PAIR_EXPECT_LO_US    (250 * 1000)
-#define PTV_PAIR_EXPECT_HI_US    (500 * 1000)
-/* 1.0.1-pre18 #50 (g_glueveto) — the one-remedy match keys. A gap verdict and a LAYERA
- * cycle/flush describe the SAME source event when (a) they land within the WIN of each
- * other (live: verdict 42ms after the arm, flush 520ms after — the arm-vs-verdict and
- * flush-vs-verdict gaps are both bounded by the 500ms disc-buffer timeout + interleave),
- * (b) the jump magnitudes agree within EPS (live: +2.421s jump vs +2.413s gap = 8ms), and
- * (c) the jump's from/to positions lie in the SAME timeline domain as the gap's bracketing
- * labels (DOM ≈ program interleave depth) — magnitude alone must not match a wrapped/
- * corrupt-dts jump living in a different domain (the Fashion class). Two genuinely
- * independent same-program events could still pass (a)+(c); the (b) conjunction inside a
- * 500ms window is the discriminator there (independent similar-magnitude events within
- * 500ms have no observed precedent; a wrong veto degrades to the pad-only posture, a
- * wrong non-veto is today's double remedy). */
-#define PTV_GVETO_WIN_US   (500 * 1000)
-#define PTV_GVETO_EPS_US   (150 * 1000)
-#define PTV_GVETO_DOM_US   (2 * AV_TIME_BASE)
-
-
-typedef struct PtvDiscPacket {
-    AVPacket *pkt;
-    int       stream_idx;
-    int64_t   raw_dts;     /* DTS before applied_offset (us); already 33-bit-unwrapped */
-    int       timeline;    /* 0=old, 1=new, 2=continuing (own timeline, no offset), 3=held for the next cycle (T-405),
-                            * -1=unknown */
-    int       arrival;     /* T-405: arrival index in the cycle (the flush sorts by dts) */
-    int       own_cont;    /* 1 = at arrival this packet was CONTINUOUS with its stream's own
-                            * last_dts_us (|delta| <= PTV_DISC_THRESHOLD_US) — 1.0.1-pre7: a
-                            * stream that never crossed this cycle keeps such packets on its
-                            * OWN timeline instead of borrowing the partner's bases */
-} PtvDiscPacket;
-
-typedef struct PtvDiscStreamState {
-    int64_t cumulative_ts_offset;  /* per-stream offset (us), diagnostic; persists across cycles */
-    int64_t last_sent_dts;         /* end of last packet sent for THIS stream (us); NOPTS until first */
-    int64_t last_dts_us;           /* last post-unwrap DTS seen (us) — jump-detection ref; persists */
-    int64_t old_timeline_base;     /* this stream's last DTS before jump (per-cycle) */
-    int64_t new_timeline_base;     /* this stream's first DTS in new timeline (per-cycle) */
-    int     has_old_base;
-    int     has_new_base;
-    /* 1.0.1-pre4 shared flush (semantics tightened pre5 — the D2 re-inherit fix): what offset
-     * this (audio) stream applied within the current pairing window, and HOW:
-     *   pair_has  = 1 once the stream applied the event's FINAL offset (video-defined, or
-     *               band-equal to it). Consulted at 3a: a stream that already applied can NOT
-     *               inherit again — its next crossing is a new independent event (fx-dbl: the
-     *               -2s wobble 2s after a mirror event re-inherited -14.98s and destroyed ~17s
-     *               of audio). Also drives the completion close of the window.
-     *   pair_prov = 1 while the stream holds a PROVISIONAL own offset (audio crossed before
-     *               video defined the timeline) — the only state the video-crossing flush (2d)
-     *               retro-corrects. Cleared (-> pair_has) by the retro-correct.
-     * Persist across cycles; cleared when the pairing window closes. */
-    int64_t pair_applied_us;
-    int     pair_has;
-    int     pair_prov;
-    int     aanch;                 /* 1.0.1-pre22 audio-anchor (a-anchor): this transcoded audio
-                                    * stream was seeded a PROVISIONAL zero-offset leg by a
-                                    * lone-VIDEO-jump flush (pair_prov=1, pair_applied_us=0 —
-                                    * "audio didn't jump"). NOT retro-corrected by the
-                                    * video-crossing flush's 2d (that flush is the SAME one that
-                                    * seeded it); instead FIRED at pairing-window expiry
-                                    * (ptv_aanch_fire) — the absence of the audio leg is only
-                                    * provable then. Cleared by ptv_disc_pair_reset and by any
-                                    * real audio crossing in the window (the cancel). */
-    /* 1.0.1-pre15 E4 label health H (#33 §2.1; g_glueclass): demux-side windowed EMA of
-     * Δdts/Δwall over the trailing ~30s, EXCLUDING buffered/flush windows and per-packet
-     * jumps (those are events, not rate evidence). Healthy ≈ 1.0 ±5% (Q10: 1024 = 1.0);
-     * a label-flood source (Azorse: labels stride ~6x content) reads H >> 1. Consulted by
-     * the §2.3 refuse gate before a flush routes a mismatch to the content path — evidence
-     * QUALITY, not magnitude (PATRIOT's 30.8s was real; Azorse's 31.078s was noise). */
-    int64_t h_prev_wall;           /* wall us of this stream's previous dense packet */
-    int64_t h_dts_acc, h_wall_acc; /* open sub-window accumulators (us) */
-    int64_t h_ema_q10;             /* windowed-rate EMA, Q10 (0 until first window) */
-    int     h_wins;                /* closed windows folded into the EMA */
-    int64_t h_wild_wc;             /* wall us of the last WILD window (|r-1| > 50%) — the
-                                    * flood-recency signal for the <3-packet base rule */
-    /* 1.0.1-pre24 #63 (g_wallev): the wall-absence-evidenced portion W of this stream's
-     * jump (µs, ∈ [0, J]; 0 = flowing/unmeasurable), captured at base-record time from the
-     * jump packet's pre-update delivery wall gap. The flush's butt-joint preserves this
-     * much of the label hole (erase only J−W, the flowing/relabel part) so each stream's
-     * content path pads exactly its REAL hole — the storm cross-stream conservation fix.
-     * Per-cycle: cleared with the bases. */
-    int64_t jump_wallev_us;
-} PtvDiscStreamState;
-
-typedef struct PtvDiscBuf {
-    PtvDiscPacket     **packets;
-    int                 nb_packets;
-    int                 capacity;
-    int                 active;             /* 1 while buffering across a straddle */
-    int                 flushing;           /* 1 while flushing (suppress re-detection) */
-    int64_t             buffer_start_time;  /* wall clock (us) when buffering started */
-    int                 jump_detected;      /* 1 once any stream recorded bases this cycle */
-    uint8_t            *stream_transitioned;/* per-stream: 1 once it reached the new timeline */
-    int                 nb_streams;
-    PtvDiscStreamState *stream_state;
-    int64_t             applied_offset;     /* single offset (us, audio-derived) applied to ALL kept packets */
-    /* v0.9.13 [PTV-GLUE] running stats — the LAYERA-retirement decision data: vid_err = how much
-     * source A/V mis-mux each glue carried (what LAYERA corrects and the plain absorber would
-     * leak into audio). |err| persistently ~0 => the simpler absorber suffices. */
-    int64_t             glue_cnt;           /* glues with BOTH media measured */
-    int64_t             glue_partial;       /* flushes where only one media type crossed in the window */
-    int64_t             err_abs_sum_us;     /* Σ|vid_err| */
-    int64_t             err_abs_max_us;     /* max|vid_err| */
-    int64_t             err_gt100_cnt;      /* glues with |vid_err| > 100ms */
-    /* 1.0.1-pre4 shared flush: pairing-window state (persists ACROSS flush cycles — that is the
-     * point: the live failure was two partial flushes 0.6s apart, each erasing its own stream). */
-    int64_t             pair_start_us;      /* wall us of the event's first dense flush; 0 = no open event */
-    int                 pair_vid_defined;   /* 1 once VIDEO's crossing defined this event's timeline */
-    int64_t             pair_vid_off_us;    /* the video-defined shared offset (us) */
-    int                 pair_anchored;      /* rr-d1 R3: this event's video "crossing" is a lone-audio
-                                             * ANCHOR (offset 0, no real video leg) — keep the pair
-                                             * state through the end-of-flush close until the window
-                                             * expires, so a staggered matching VIDEO leg finds the
-                                             * audio pair state (suppresses the #47-C sibling hold;
-                                             * it then flushes immediately as 2a/new event) */
-    int                 aanch_pend;         /* 1.0.1-pre22 audio-anchor (a-anchor, the rr-d1 R3 mirror):
-                                             * a lone-VIDEO forward jump seeded provisional zero-offset
-                                             * audio leg(s) (stream_state[].aanch) and now awaits the
-                                             * pairing-window verdict — the end-of-flush close must not
-                                             * pair_reset the event away while pending. Fired (audio
-                                             * re-based onto the video timeline + expected step
-                                             * registered) at window EXPIRY on the quiet path; cleared
-                                             * by ptv_disc_pair_reset or by a real audio crossing. */
-    int                 cycle_trigger;      /* 1.0.1-pre7: stream whose detect ARMED this buffer cycle
-                                             * (-1 = none); scopes the continuing-stream keep (see
-                                             * ptv_disc_flush) to transcoded-triggered cycles */
-    int                 partial_ext;        /* 1.0.1-pre16 #47-C / pre17 fix round (R3a): partial-hold
-                                             * extensions granted this cycle (was one-shot; now repeats
-                                             * while the sibling leg is missing, capped by the pairing
-                                             * window from cycle open + a capacity guard) */
-    int64_t             cycle_open_us;      /* pre17 R3a: wall µs this buffer cycle armed (extension cap base) */
-    /* 1.0.1-pre18 #50 (g_glueveto) inverse-guard evidence: the last flush that applied a
-     * nonzero offset to AUDIO labels — a gap verdict arriving just after it (matching
-     * magnitude + window) is the SAME source event already remedied, so the verdict is
-     * suppressed instead of double-applying (pad on top of the flush's relabel). */
-    int64_t             fl_wall;            /* wall µs of that flush (0 = never) */
-    int64_t             fl_delta_us;        /* the trigger stream's jump delta at that flush (µs) */
-} PtvDiscBuf;
+#define PTV_DISC_THRESHOLD_US    (1 * AV_TIME_BASE)   /* 1 s: a label step this large is a discontinuity, not jitter */
 
 typedef struct PtvTimeline PtvTimeline;   /* 2.1 T-409: the program timeline, source stage (ptvencoder_timeline.c) */
 
@@ -1668,11 +1448,6 @@ typedef struct DemuxArgs {
     int                   vstream;
     int                   astream[PTV_MAX_AUDIO]; /* input stream feeding each audio_q */
     int                   n_audio;
-    /* 1.0.1-pre5 shared-flush expected-step handshake (D1): per transcoded track, the slot the
-     * flush registers into when it routes an A-vs-V mismatch to that track's content path
-     * (storage lives in Input; AudioState holds the read side). Indexed like audio_q/astream. */
-    _Atomic int_least64_t *aglue_exp_step[PTV_MAX_AUDIO];
-    _Atomic int_least64_t *aglue_exp_dl[PTV_MAX_AUDIO];
     int                   aglobal[PTV_MAX_AUDIO];     /* 1.0.1-pre15: GLOBAL track index (dbg_k) of
                                                        * local track j — keys the per-track published
                                                        * atomics (pad ledger, decode watermark, fill) */
@@ -1813,8 +1588,7 @@ typedef struct DemuxArgs {
     int64_t              *tail_gap_us;      /* 2.0.0-pre4c: per stream, wall gap of the last packet if it was a gapped PES tail */
     int64_t              *tail_wc_us;       /* 2.0.0 T-089: per stream, wall time that carry was taken (bounds a multi-packet tail) */
     int                   src_gap_class;    /* 2.0.0-pre4: class known before the gap was counted: 1 BURST, 2 other */
-    PtvDiscBuf           *disc;           /* legacy-0004 buffer-classify-discard (g_layera only; NULL otherwise) */
-    PtvTimeline          *tl;             /* 2.1 T-409: the program timeline (g_timeline only; NULL otherwise) */
+    PtvTimeline          *tl;             /* 2.1 T-409: the program timeline */
     int64_t               video_fwd_us;   /* wall-clock (us) of the last VIDEO forward-discontinuity crossing (whole-program-splice indicator) */
     int64_t               prog_off;       /* P2 (§7.1): program-level discontinuity offset (90kHz, detected on the
                                            * DENSE video reference) applied to SPARSE copied streams (sub/data/SCTE)
@@ -1929,13 +1703,6 @@ typedef struct Input {
     int64_t              *pkt_wall_gap_us;   /* 1.0.1-pre24 #63: per-stream current-pkt wall-gap storage */
     int64_t              *tail_gap_us;       /* 2.0.0-pre4c: per-stream PES-tail wall-gap carry */
     int64_t              *tail_wc_us;        /* 2.0.0 T-089: per-stream carry wall time */
-    PtvDiscBuf            disc;              /* legacy-0004 buffer-classify-discard state (used only when g_layera) */
-    /* 1.0.1-pre5 shared-flush expected-step handshake storage (D1) — one slot per GLOBAL
-     * transcoded track index (only the tracks sourced from this input are wired). Demux thread
-     * writes, that track's audio thread reads (the house_skew/disturb_epoch publish idiom,
-     * hardened with atomics because value+deadline are a pair). Zero-init = no registration. */
-    _Atomic int_least64_t aglue_exp_step[PTV_MAX_AUDIO];
-    _Atomic int_least64_t aglue_exp_dl[PTV_MAX_AUDIO];
     _Atomic int           vq_shed_req;       /* 1.0.1-pre8 (a): per-input head-GOP shed request */
     /* 1.0.1-pre16 per-input published telemetry (the globals g_shed_wall/g_shed_cnt and
      * g_gov_* stay stamped as the any-input aggregate / input-0 single-input alias; these
@@ -2121,8 +1888,6 @@ const char *ptv_hb_name(int pos);
 #define PTV_HB_OUT(p) do { \
     atomic_store_explicit(&g_hb_out_pos, (p), memory_order_relaxed); \
     atomic_store_explicit(&g_hb_out_wall, av_gettime_relative(), memory_order_relaxed); } while (0)
-extern int     g_h0_reanchor;
-extern int     g_reanchor2_instant;
 extern int     g_h0_at_display;
 extern int     g_af_pll;
 extern int     g_af_anchor;
@@ -2324,7 +2089,6 @@ extern int     g_hold_fill;              /* 2.0.0-pre6: audio silence while inpu
 extern int     g_copy_gapfill;           /* 2.0.0-pre9.4 (T-083): copied AC-3 stays continuous while video flows
                                           * (PTV_NO_COPY_GAPFILL=1 off) */
 extern int     g_glue_htol;              /* §2.3 label-health tolerance, percent (5; PTV_GLUE_HTOL_PCT — TEST/tuning) */
-extern int64_t g_pair_ttl_us;            /* pair-expect TTL (30s; PTV_PAIR_EXPECT_TTL_US — TEST ONLY, G6) */
 extern int64_t g_nbs_quantum_us;         /* fill quantum (100ms; PTV_NBS_QUANTUM_MS — TEST ONLY, G8) */
 extern _Atomic int64_t g_acorrupt;                        /* total corrupt-discarded AUDIO pkts (acor= stats) */
 extern _Atomic int64_t g_rl_step_us[PTV_MAX_AUDIO];      /* 2.0.1 T-087: per global track, the edit the demux posted with its
@@ -2431,7 +2195,6 @@ int build_audio_filter(AudioState *a, AVCodecContext *adec, AVRational tb,
 /* ptvencoder_demux.c */
 void *demux_thread(void *arg);
 /* 2.1 T-409: the program timeline (ptvencoder_timeline.c) and the demux helpers it calls */
-extern int     g_timeline;               /* 2.1: always 1 — one classifier per input owns every source timing remedy */
 extern int64_t g_tl_open_us;             /* a dense packet this far off its path opens an event (PTV_TL_OPEN_MS, 500) */
 PtvTimeline *ptv_tl_alloc(int nb_streams);
 void ptv_tl_free(PtvTimeline **t);
@@ -2442,9 +2205,7 @@ void ptv_rsync_post_edit(DemuxArgs *d, int s, int64_t delta_us);
 void ptv_vwait_rebase(DemuxArgs *d, int64_t from_us, int64_t old_end_us, int64_t open_wc, int64_t dpo);
 int  ptv_tl_settling(DemuxArgs *d);
 extern int64_t g_gap_min_us;
-int ptv_disc_init(PtvDiscBuf *b, int capacity, int nb_streams);
 int ptv_slot_acquire(struct Input *in, int idx);   /* 2.0.2 T-386 */
-void ptv_disc_free(PtvDiscBuf *b);
 /* ptvencoder_mv.c */
 void *compositor_thread(void *arg);
 /* ptvencoder_legend.c */
