@@ -868,7 +868,7 @@ static int audio_drain_fg(AudioState *a)
              * (gapless, monotonic), DROPPING content when the audio is behind the video (advance)
              * or PADDING silence when ahead (delay). Single-input / PTV_NO_AUDIO_FOLLOW keep the
              * content-stamped opts path untouched. */
-            if (a->multiview && g_timeline && a->tl_lag) {
+            if (a->multiview && g_timeline && a->tl_lag && a->tl_at) {
                 /* 2.1 T-409 (design §5.4a): the slot is a frame synchronizer — its picture shows source time S at
                  * S - h0 + L (mv_tl_pick). The sound goes to the same place, by construction: no measurement, no
                  * PLL. Emitted gapless; the error to that place (the labels + L; the corrector's walk is in the
@@ -876,7 +876,10 @@ static int audio_drain_fg(AudioState *a)
                  * frames dropped, like a frame sync's audio); the residue stays within half a frame. L is the picture's
                  * REALIZED lag (tick rounding and decimation included), published by the compositor */
                 int     nb = filt->nb_samples;
-                int64_t L  = atomic_load_explicit(a->tl_lag, memory_order_relaxed);
+                /* a lag step applies from its content boundary on (mv_tl_step): the same content as the picture's */
+                int64_t at = atomic_load_explicit(a->tl_at, memory_order_acquire);
+                int64_t L  = src_abs_us >= at ? atomic_load_explicit(a->tl_nlag, memory_order_relaxed)
+                                              : atomic_load_explicit(a->tl_lag, memory_order_relaxed);
                 int64_t exact = opts + av_rescale(L, a->out_rate, 1000000), cont, err;
                 if (!a->af_out_set) {
                     if (exact < 0) { av_frame_unref(filt); continue; }
@@ -910,6 +913,14 @@ static int audio_drain_fg(AudioState *a)
                 }
                 a->af_last_out = cont;
                 filt->pts = cont;
+                {                                              /* the newest content placed (the next step's boundary
+                                                                * goes past it), the slot's tracks' maximum */
+                    int64_t hd = src_abs_us + (int64_t)nb * 1000000 / a->out_rate;
+                    int64_t cur = atomic_load_explicit(a->tl_ahead, memory_order_relaxed);
+                    while (hd > cur && !atomic_compare_exchange_weak_explicit(a->tl_ahead, &cur, hd,
+                                                                             memory_order_relaxed, memory_order_relaxed))
+                        ;
+                }
             } else if (a->multiview && g_audio_follow && g_avsync_pll) {
                 /* 2.1: not run (the branch above places a slot's sound); deleted after the 2.1 canary soak.
                  * B3 (Phase B3) — CLOSED-LOOP two-regime controller on the MEASURED av_offset_us.

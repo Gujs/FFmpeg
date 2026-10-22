@@ -6344,6 +6344,11 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         as[k].house_skew = &inputs[asrc_in[k]].house_skew;
         as[k].res_step   = n_input > 1 ? &inputs[asrc_in[k]].res_step_us : NULL;   /* 2.0.2 T-343 */
         as[k].tl_lag     = n_input > 1 ? &inputs[asrc_in[k]].tl_lag_us : NULL;     /* 2.1 T-409 */
+        as[k].tl_nlag    = n_input > 1 ? &inputs[asrc_in[k]].tl_nlag_us : NULL;
+        as[k].tl_at      = n_input > 1 ? &inputs[asrc_in[k]].tl_at_us : NULL;
+        as[k].tl_ahead   = n_input > 1 ? &inputs[asrc_in[k]].tl_ahead_us : NULL;
+        if (n_input > 1)
+            atomic_store_explicit(&inputs[asrc_in[k]].tl_at_us, INT64_MAX, memory_order_relaxed);
         as[k].house_lag_true = (n_input > 1) ? &inputs[asrc_in[k]].house_lag_true : NULL;  /* multiview: true lag; single: NULL→house_skew */
         as[k].vring = &inputs[asrc_in[k]].vring;         /* A/V probe: pair this track's audio against its input's video ring */
         as[k].multiview = (n_input > 1);                 /* multiview-only: enable deterministic audio-follow */
