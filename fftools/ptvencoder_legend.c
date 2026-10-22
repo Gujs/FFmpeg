@@ -158,7 +158,7 @@ void show_help_default(const char *opt, const char *arg)
         "    PTV_NO_REPRIME      fast post-glue buffer refill\n"
         "    PTV_NO_EXACTTICK    exact-rational video stamping     PTV_NO_MV_EXACTTICK  mosaic measurement axes\n"
         "    PTV_NO_PULLDOWN     telecine-aware film emit          PTV_NO_AVLOCK   audio house-lock\n"
-        "    PTV_NO_GENLOCK      source-rate estimator             PTV_NO_GAPDISCRIM audio gap-vs-splice\n"
+        "    PTV_NO_GENLOCK      source-rate estimator\n"
         "    PTV_NO_DELIVERY     audio delivery-alignment gate     PTV_NO_DELIVERY_MV ungated mosaics (pre-0.9.12.1)\n"
         "    PTV_NO_VDELIVERY    symmetric EARLY-VIDEO hold (pre12; back to video-ahead wire under a buffering -af)\n"
         "    PTV_NO_AUTOBANK     runtime bursty-channel bank escalation (back to advisor-only)\n"

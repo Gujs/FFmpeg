@@ -30,7 +30,6 @@
 
 #include "ptvencoder.h"
 
-static void    ptv_pll_bias_mark(AudioState *a, const char *why, int force);   /* rr21 A1 (defined near ptv_rebuild_reanchor) */
 /* 1.0.1-pre8 (d) SELF-MADE-GAP LOG HONESTY: when the demux/decode shed packets in the recent
  * window (video head/tail QSHED, audio drop-oldest — g_shed_wall/g_shed_cnt), the downstream
  * AGLUE/ASTEP lines must say so, so our own drops are never again misread as source
@@ -332,7 +331,6 @@ static const char *rscorr_event_edge(AudioState *a)
     v = a->corr_epoch ? atomic_load_explicit(a->corr_epoch, memory_order_relaxed) : 0;
     if (v != c->epoch_snap) { c->epoch_snap = v; return "disturb_epoch"; }
     if (a->glue_events != c->glue_snap) { c->glue_snap = a->glue_events; return "aglue"; }
-    if (a->pll_acq_count != c->acq_snap) { c->acq_snap = a->pll_acq_count; return "pll-acquire"; }
     if (a->afmt_rebuilds != c->afmt_snap) { c->afmt_snap = a->afmt_rebuilds; return "afmt-rebuild"; }
     if (a->dec_reopens != c->reopen_snap) { c->reopen_snap = a->dec_reopens; return "adecwd-reopen"; }
     v = atomic_load_explicit(&g_rsx.ev_us[a->dbg_in], memory_order_relaxed);   /* pre16: own slot's ledger */
@@ -410,7 +408,6 @@ static void rscorr_dwell_reset(AudioState *a, int64_t now, int64_t R)
     c->dwell_r0       = R;
     c->epoch_snap  = a->corr_epoch ? atomic_load_explicit(a->corr_epoch, memory_order_relaxed) : 0;
     c->glue_snap   = a->glue_events;
-    c->acq_snap    = a->pll_acq_count;
     c->afmt_snap   = a->afmt_rebuilds;
     c->reopen_snap = a->dec_reopens;
     c->ev_snap     = atomic_load_explicit(&g_rsx.ev_us[a->dbg_in], memory_order_relaxed);   /* pre16: own slot */
@@ -962,9 +959,7 @@ static int audio_drain_fg(AudioState *a)
                  * (pre3 steer); glue_off + corr are path-independent. Sign law preserved on
                  * both paths: +corr at the door delays audio content ⇒ raises m_a ⇒
                  * dR/dcorr = −1 (§2). */
-                int64_t inj    = a->glue_off_us + a->corr.corr_us + hs
-                               + ((a->multiview && g_audio_follow && g_avsync_pll)
-                                  ? a->af_steer_us : 0);
+                int64_t inj    = a->glue_off_us + a->corr.corr_us + hs;
                 int64_t slip   = 0, m, nowr;
                 if (a->fg_swr && a->fg_swr_flt &&
                     a->fg_swr_flt->nb_inputs > 0 && a->fg_swr_flt->nb_outputs > 0) {
@@ -1230,8 +1225,8 @@ static int audio_drain_fg(AudioState *a)
                  * today: glue is the label-truth judgment, not an actuator). */
                 if (!(a->multiview && g_audio_follow) && a->house_skew)
                     content -= *a->house_skew + a->corr.corr_us;
-                else if (a->multiview && g_audio_follow && g_avsync_pll)
-                    content -= a->af_steer_us + a->corr.corr_us + a->mv_hold_us;   /* T-093: a fill hold is not content */
+                else if (a->multiview && g_audio_follow)
+                    content -= a->corr.corr_us;
                 if (!(a->multiview && a->mvf_hi_us > a->mvf_lo_us &&             /* T-093: fill phase frames carry no */
                       src_abs_us >= a->mvf_lo_us && src_abs_us < a->mvf_hi_us) &&  /* content to pair */
                     vring_lookup(a->vring, content, &out_v, &msrc) == 0) {
@@ -1299,23 +1294,12 @@ static int audio_drain_fg(AudioState *a)
                     char m[24];
                     if (a->av_off_valid) snprintf(m, sizeof m, "%+"PRId64"ms", a->av_offset_us / 1000);
                     else                 snprintf(m, sizeof m, "--");
-                    if (mv && g_avsync_pll)  /* B3 closed loop: measured offset + integrator state + acquire/guard counts */
+                    if (mv)              /* multiview: lip-sync + measured offset (the slot's sound is placed by its frame sync) */
                         av_log(NULL, AV_LOG_INFO,
                             "[PTV-AVSYNC] a%d(in%d) avlag=%+"PRId64"ms | offset=%s (vlag=%+"PRId64"ms alag=%+"PRId64"ms) "
-                            "pll[ema=%+"PRId64"ms dev=%"PRId64"ms applied=%+"PRId64"ms steer=%+"PRId64"ms acq=%d guard=%"PRId64" drop=%"PRId64"ms pad=%"PRId64"ms acomp=%"PRId64"]"
-                            "  [offset<0 = audio late]\n",
+                            "acomp=%"PRId64"  [offset<0 = audio late]\n",
                             a->dbg_k, a->dbg_in, lshead / 1000, m, a->av_vlag_us / 1000, a->av_alag_us / 1000,
-                            a->pll_ema / 1000, a->pll_dev / 1000, a->af_applied_us / 1000, a->af_steer_us / 1000,
-                            a->pll_acq_count, a->pll_guard_fires,
-                            a->af_acq_drop_us / 1000, a->af_acq_pad_us / 1000, a->acomp_cnt);
-                    else if (mv)         /* multiview (open-loop B1): lip-sync + measured offset + the per-slot actuator state */
-                        av_log(NULL, AV_LOG_INFO,
-                            "[PTV-AVSYNC] a%d(in%d) avlag=%+"PRId64"ms | offset=%s (vlag=%+"PRId64"ms alag=%+"PRId64"ms) "
-                            "house_skew=%+"PRId64"ms applied=%+"PRId64"ms trk=%+"PRId64"ms nudge=%+"PRId64"ms "
-                            "acq[drop=%"PRId64"ms pad=%"PRId64"ms]  [avlag>0 / offset<0 = audio late]\n",
-                            a->dbg_k, a->dbg_in, lshead / 1000, m, a->av_vlag_us / 1000, a->av_alag_us / 1000,
-                            lag / 1000, a->af_applied_us / 1000, (lag - a->af_applied_us) / 1000,
-                            a->af_nudge_us / 1000, a->af_acq_drop_us / 1000, a->af_acq_pad_us / 1000);
+                            a->acomp_cnt);
                     else                 /* single-input: lip-sync + measured offset + house-clock lock state */
                         av_log(NULL, AV_LOG_INFO,
                             "[PTV-AVSYNC] a%d(in%d) avlag=%+"PRId64"ms | offset=%s (vlag=%+"PRId64"ms alag=%+"PRId64"ms) "
@@ -1493,40 +1477,6 @@ static int64_t ptv_anchor_next_pts(const AudioState *a, int64_t house_us)
  * Birth is untouched (this runs only with pts_set, and only from the AFMT rebuild site);
  * REANCHOR2/ACQUIRE mv re-seed paths are untouched. PTV_NO_REBUILD_REANCHOR=1 reverts all
  * three pieces. */
-/* 1.0.1-pre21 rr21 A1: the #24 bumpless bias (pll_yield_bias_us) is a CALIBRATION of the
- * PLL's label-domain pairing miscalibration, valid only against the label baseline it was
- * measured under. Any event that REDEFINES that baseline (a demux label edit — LAYERA flush
- * persist / absorber self-rebase / retro-correct, all posted to the ea ledger; an AGLUE
- * glue_off change; a rebuild re-anchor) strands it: e.g. a TruBLU splice-RETURN backward
- * jump relabel-erases and CANCELS the miscalibration an erase-class walk encoded, so
- * av_offset returns ~0 while the bias holds −walk → a phantom +walk reading the PLL would
- * ACQUIRE within seconds (physically mis-aligning real output; permanent after a
- * lifetime-cap perm_disarm). Fix: STALE-MARK — suspend the PLL's actuators (acquire+TRACK)
- * and reseed the smoothing; a settled measurement window then RE-ADOPTS (bias += ema, the
- * same idempotent arithmetic as the resume path — converges to the absolute pairing offset,
- * never blind-zeroed: zeroing a parked walk's bias re-creates the resume sawtooth).
- * `force` marks even with bias==0 (the resume path, where the calibration is CREATED);
- * un-forced marks with bias==0 no-op so the legacy PLL/glue interplay stays byte-identical
- * on tracks that never engaged. Audio thread only. */
-static void ptv_pll_bias_mark(AudioState *a, const char *why, int force)
-{
-    if (!g_pll_yield || !a->multiview)
-        return;
-    if (!force && a->pll_yield_bias_us == 0 && !a->pll_bias_stale)
-        return;
-    if (!a->pll_bias_stale)
-        av_log(NULL, AV_LOG_WARNING,
-               "[PTV-RSCORR] a%d(in%d) PLL bias STALE (%s) — actuators suspended until a "
-               "settled window re-adopts (bias %+"PRId64"ms)\n",
-               a->dbg_k, a->dbg_in, why, a->pll_yield_bias_us / 1000);
-    a->pll_bias_stale  = 1;
-    a->pll_bias_settle = 0;
-    if (!force)
-        a->pll_bias_capped = 0;   /* T-407: a label-baseline move re-calibrates the whole reading (as before) */
-    a->pll_seed        = 0;
-    a->pll_dbnc        = 0;
-    a->pll_acq_win     = 0;
-}
 
 static void ptv_rebuild_reanchor(AudioState *a, const AVFrame *frame)
 {
@@ -1593,13 +1543,6 @@ static void ptv_rebuild_reanchor(AudioState *a, const AVFrame *frame)
     a->reanch_wc      = av_gettime_relative();
     a->reanch_frames  = 0;
     a->reanch_step_us = 0;
-    /* rr21 A1 (reviewer minimum site): the re-anchor redefines the track's label baseline —
-     * the #24 pairing calibration measured under the old baseline is void. The residual
-     * steps inside the 10s window are further label edits; each re-marks via the per-frame
-     * glue/ledger watch, so adoption only completes once the window's edits settle. This
-     * also covers the mid-engagement rebuild (state forced ARMED → the PLL resume defers
-     * adoption to the same settled window instead of adopting a mid-transient sample). */
-    ptv_pll_bias_mark(a, "afmt-rebuild re-anchor", 0);
     av_log(NULL, AV_LOG_WARNING,
            "[PTV-ANCHOR] a%d(in%d) re-anchored (afmt-rebuild): base=content-h0 at %+"PRId64"ms, "
            "corr %+"PRId64"ms retired into the base ledger (door labels continuous; carried glue "
@@ -2338,56 +2281,6 @@ graph_in:
                        "%d quanta; resume step classified below\n",
                        a->dbg_k, a->dbg_in, a->nbs_fills);
             }
-            /* 1.0.1-pre18 #50 (E5 net, g_glueveto): a LAYERA-flush relabel is INVISIBLE here —
-             * the labels arrive already-shifted, so a GAP-pad's RETURN leg consumed by a flush
-             * erase left the pad's inserted silence permanently baked (pad + erase = double
-             * application; the ledger only ever saw arriving label steps). The demux publishes
-             * each flush's per-track label shift; a shift matching an open pad IS that return
-             * leg, erased at the packet layer — counter-apply it at the graph door instead:
-             * glue_off_us -= pad steps the door labels back by the pad, aresample=async
-             * hard-drops the inserted silence, and the sensor's inj accounting rides glue_off
-             * exactly as for an arriving relabel verdict. A young publish that matches no open
-             * pad stays PENDING (the pad may still be in flight through audio_q) and re-scans
-             * per frame until the pad TTL retires it. */
-            if (g_glueveto && g_glueclass && a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO) {
-                int64_t fwc = atomic_load_explicit(&g_flush_relab_wc[a->dbg_k], memory_order_acquire);
-                if (fwc && fwc != a->flush_relab_seen_wc) {
-                    if (now_wc - fwc > PTV_GLUE_PAD_TTL_US)
-                        a->flush_relab_seen_wc = fwc;          /* stale: retire unmatched */
-                    else {
-                        int64_t fstep = atomic_load_explicit(&g_flush_relab_step[a->dbg_k],
-                                                             memory_order_relaxed);
-                        int pf;
-                        for (pf = 0; pf < PTV_GLUE_PAD_LED; pf++) {
-                            int64_t pp = a->pad_led_us[pf];
-                            if (pp > 0 && now_wc - a->pad_led_wc[pf] <= PTV_GLUE_PAD_TTL_US &&
-                                llabs(fstep - pp) <= FFMAX(80000, pp / 4)) {
-                                /* 2.0.0 T-370: take back what the flush ADDED (fstep), not the whole pad: a pad
-                                 * larger than the relabel also holds content the flush itself dropped (+23600 vs
-                                 * +23301 ms: 299 ms of real audio) — erasing it left audio 299 ms early for good. The
-                                 * rest stays padded (an erase needs positive evidence) */
-                                int64_t er = FFMIN(pp, fstep);
-                                a->glue_off_us -= er;
-                                a->pad_led_us[pf] = 0;         /* consumed */
-                                ptv_pad_pub(a);
-                                a->glue_events++;
-                                a->flush_relab_seen_wc = fwc;
-                                a->pend_comp_us = -er;         /* §2.4 tripwire: the drop must realize */
-                                a->pend_comp_wc = now_wc;
-                                av_log(NULL, AV_LOG_WARNING,
-                                       "[PTV-AGLUE] a%d(in%d) LAYERA flush relabel %+"PRId64"ms matches an "
-                                       "open GAP-pad +%"PRId64"ms — the pad's return leg was erased at the "
-                                       "packet layer; counter-applied at the graph door (glue total "
-                                       "%+"PRId64"ms) so the pad's silence is dropped (PTV_NO_GLUEVETO "
-                                       "reverts)\n",
-                                       a->dbg_k, a->dbg_in, fstep / 1000, pp / 1000,
-                                       a->glue_off_us / 1000);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
             /* 2.1 T-409: the labels arrive decided (the timeline), no step verdicts here; still track the arrival
              * cadence — the silence fill's patience. At 0 every PES-burst pause after a return (150-300 ms) started a
              * fill and the rejoin buffer held the real frames ~1 s for a fresh picture (sync_flapping: 3-5 flashes
@@ -2431,17 +2324,8 @@ graph_in:
             int64_t sk = hs_door(a, frame, *a->house_skew);
             if (sk) frame->pts += av_rescale_q(sk, AV_TIME_BASE_Q, a->ist_tb);
         }
-        /* 1.0.1-pre3: multiview audio-follow PLL — inject TRACK's accumulated steer into the
-         * graph-input pts (the AVLOCK style above), so aresample=async realizes the trim as
-         * bounded content stretch/squeeze while output labels stay dense. Written by the same
-         * thread in audio_drain_fg (≤ ~213us/frame, rate-clamped), so the input pts stream
-         * stays strictly monotonic (frame spacing ~21333us dwarfs any per-frame steer delta)
-         * and never trips min_hard_comp on its own. */
-        if (a->multiview && g_audio_follow && g_avsync_pll && a->af_steer_us &&
-            frame->pts != AV_NOPTS_VALUE)
-            frame->pts += av_rescale_q(a->af_steer_us, AV_TIME_BASE_Q, a->ist_tb);
         /* 1.0.1-pre14 steer bus (§5 rule 1): the corrector's cumulative trim, injected at the
-         * SAME single graph-door site as glue_off/house_skew/af_steer_us — aresample=async
+         * SAME single graph-door site as glue_off/house_skew — aresample=async
          * realizes it as bounded SOFT compensation (rate-clamped 2ms/s upstream in
          * rscorr_update; per-frame deltas ~43µs, three orders under min_hard_comp — the
          * ACOMP proxy below monitors the summed stream and is the click tripwire for any
@@ -2452,7 +2336,7 @@ graph_in:
          * frame. The PLL's pairing skips frames of that span when they leave the graph (loudnorm holds ~3 s, so they
          * leave after the slot is back): paired against the returning picture's ring they read +19 s, the noise floor
          * rose to 4.5 s and the real −1 s offset at the return was never acquired (sync_gap_20). */
-        if (a->multiview && g_audio_follow && g_avsync_pll && frame->pts != AV_NOPTS_VALUE) {
+        if (a->multiview && g_audio_follow && frame->pts != AV_NOPTS_VALUE) {
             int64_t door_us = av_rescale_q(frame->pts, a->ist_tb, AV_TIME_BASE_Q);
             if (a->nbs_feeding) {
                 if (!a->mvf_open) { a->mvf_open = 1; a->mvf_lo_us = door_us; }
