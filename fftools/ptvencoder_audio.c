@@ -848,6 +848,14 @@ static int audio_drain_fg(AudioState *a)
                 int64_t L  = src_abs_us >= at ? atomic_load_explicit(a->tl_nlag, memory_order_relaxed)
                                               : atomic_load_explicit(a->tl_lag, memory_order_relaxed);
                 int64_t exact = opts + av_rescale(L, a->out_rate, 1000000), cont, err;
+                /* T-411/T-414: an overflow step — the picture skipped from its old due line to the boundary (those
+                 * pictures are gone); this sound, not placed yet, goes with them (placed, it played Δ late for that
+                 * long, then the sound skipped what the picture showed) */
+                if (src_abs_us < at && src_abs_us >= atomic_load_explicit(a->tl_skip, memory_order_relaxed)) {
+                    a->rs_ma_seed = 0;
+                    av_frame_unref(filt);
+                    continue;
+                }
                 if (!a->af_out_set) {
                     if (exact < 0) { av_frame_unref(filt); continue; }
                     a->af_last_out = exact - nb;
@@ -2859,6 +2867,70 @@ static void rl_feed(AudioState *a, const AVFrame *f)
     }
 }
 
+/* 2.1 T-411/T-414 (mosaic): the slot's sound is placed up to its bound — tl_alim_us, the shown picture + the primed
+ * margin + 1 s while the cell advances (the compositor publishes it; INT64_MAX = none: single input, a held or dead
+ * cell) — and the decoded frames past it PARK, released in order as the picture catches up. Placed up to the decode
+ * front, the sound put every step's boundary past the pictures waiting (a decoder catching up after the compose, a
+ * burst: the slot re-locked and never committed, T-411) and a step moved picture and sound apart by what was placed
+ * ahead. Bounded: 30 s of content or PTV_APARK frames release the oldest regardless. */
+static int apark_out(AudioState *a, AVFrame *f)     /* the frame goes to its place: anchored, then fed */
+{
+    int64_t h0;
+    if (a->pts_set) {
+        if (f->best_effort_timestamp == AV_NOPTS_VALUE) return 0;   /* 1.0.1: un-stamped = cannot be anchored */
+        a->dbg_last_src = f->best_effort_timestamp;                 /* probe: latest source audio pts */
+        return audio_feed(a, f);
+    }
+    pthread_mutex_lock(a->h0_lock); h0 = *a->h0; pthread_mutex_unlock(a->h0_lock);
+    if (h0 == AV_NOPTS_VALUE) return 0;
+    return audio_anchor_and_feed(a, f, h0);
+}
+
+static int apark_release(AudioState *a, int all)
+{
+    int ret = 0;
+    while (a->apark_n > 0) {
+        AVFrame *f = a->apark[a->apark_h];
+        if (!all) {
+            AVFrame *t   = a->apark[(a->apark_h + a->apark_n - 1) % PTV_APARK];
+            int64_t  lim = atomic_load_explicit(a->tl_alim, memory_order_relaxed);
+            int64_t  src = av_rescale_q(f->best_effort_timestamp, a->ist_tb, AV_TIME_BASE_Q);
+            int64_t  spn = av_rescale_q(t->best_effort_timestamp, a->ist_tb, AV_TIME_BASE_Q) - src;
+            if (src > lim && spn < 30000000 && a->apark_n < PTV_APARK)
+                break;
+        }
+        a->apark_h = (a->apark_h + 1) % PTV_APARK;
+        a->apark_n--;
+        if (ret >= 0) ret = apark_out(a, f);
+        av_frame_free(&f);
+    }
+    return ret;
+}
+
+static int apark_feed(AudioState *a, AVFrame *f)
+{
+    int64_t ts = f->best_effort_timestamp;
+    if (a->tl_alim && ts != AV_NOPTS_VALUE &&
+        (a->apark_n > 0 ||                           /* frames wait already: in order behind them */
+         av_rescale_q(ts, a->ist_tb, AV_TIME_BASE_Q) > atomic_load_explicit(a->tl_alim, memory_order_relaxed))) {
+        AVFrame *c = av_frame_clone(f);
+        int ret;
+        if (!c) return AVERROR(ENOMEM);
+        if (a->apark_n >= PTV_APARK) {               /* full: the oldest goes out */
+            AVFrame *o = a->apark[a->apark_h];
+            a->apark_h = (a->apark_h + 1) % PTV_APARK;
+            a->apark_n--;
+            ret = apark_out(a, o);
+            av_frame_free(&o);
+            if (ret < 0) { av_frame_free(&c); return ret; }
+        }
+        a->apark[(a->apark_h + a->apark_n) % PTV_APARK] = c;
+        a->apark_n++;
+        return apark_release(a, 0);
+    }
+    return apark_out(a, f);
+}
+
 static int audio_push(AudioState *a, AVFrame *frame)
 {
     int64_t ts = frame->best_effort_timestamp;
@@ -2917,19 +2989,17 @@ static int audio_push(AudioState *a, AVFrame *frame)
             return 0;
         }
         for (i = 0; i < a->aq_npending; i++) {        /* h0 known: replay buffered head */
-            if (ret >= 0) ret = audio_anchor_and_feed(a, a->aq_pending[i], h0);
+            if (ret >= 0) ret = apark_feed(a, a->aq_pending[i]);
             av_frame_free(&a->aq_pending[i]);
         }
         a->aq_npending = 0;
         if (ret < 0) return ret;
-        return audio_anchor_and_feed(a, frame, h0);
+        return apark_feed(a, frame);
     }
-    if (ts == AV_NOPTS_VALUE) return 0;   /* 1.0.1: un-stamped frame (e.g. a garbage-tail decode next to a
-                                           * tolerated [PTV-ADEC] error) cannot be content-anchored; encoding
-                                           * it hands the muxer a timestamp-less packet = EINVAL mux wedge.
-                                           * Drop it — same rule the pre-anchor path applies. */
-    a->dbg_last_src = ts;                 /* probe: latest source audio pts */
-    return audio_feed(a, frame);
+    /* 1.0.1: an un-stamped frame (e.g. a garbage-tail decode next to a tolerated [PTV-ADEC] error) cannot be
+     * content-anchored; encoding it hands the muxer a timestamp-less packet = EINVAL mux wedge. Dropped (apark_out) —
+     * same rule the pre-anchor path applies. */
+    return apark_feed(a, frame);
 }
 
 /* 1.0.1 [PTV-ADEC] — tolerate a hard audio decode error: count it, log a rate-limited
@@ -3366,7 +3436,7 @@ static int aq_replay_if_anchored(AudioState *a)
     if (h0 == AV_NOPTS_VALUE)
         return 0;
     for (i = 0; i < a->aq_npending; i++) {
-        if (ret >= 0) ret = audio_anchor_and_feed(a, a->aq_pending[i], h0);
+        if (ret >= 0) ret = apark_feed(a, a->aq_pending[i]);
         av_frame_free(&a->aq_pending[i]);
     }
     a->aq_npending = 0;
@@ -3383,18 +3453,25 @@ void *audio_thread(void *arg)
     if (!frame)
         goto done;
     for (;;) {
-        if (!a->pts_set && a->aq_npending) {       /* T-316: frames wait for h0 — poll, replay the moment it is known */
+        if ((!a->pts_set && a->aq_npending) ||     /* T-316: frames wait for h0 — poll, replay the moment it is known */
+            a->apark_n > 0) {                      /* T-411: frames wait for the picture — poll, release as it catches up */
             ret = av_thread_message_queue_recv(a->audio_q, &pkt, AV_THREAD_MESSAGE_NONBLOCK);
             if (ret == AVERROR(EAGAIN)) {
-                if ((ret = aq_replay_if_anchored(a)) < 0)
+                if (a->apark_n > 0 && (ret = apark_release(a, 0)) < 0)
                     break;
-                if (!a->pts_set)
+                if (!a->pts_set && a->aq_npending && (ret = aq_replay_if_anchored(a)) < 0)
+                    break;
+                if (!a->pts_set || a->apark_n > 0)
                     av_usleep(5000);
                 continue;
             }
         } else
             ret = av_thread_message_queue_recv(a->audio_q, &pkt, 0);
         if (ret < 0) break;
+        if (pkt && (pkt->flags & (PTV_PKT_FLAG_NBS_FILL | PTV_PKT_FLAG_HOLD_FILL)) && a->apark_n > 0) {
+            av_packet_free(&pkt);                /* T-411: sound waits for the picture — no hole to fill */
+            continue;
+        }
         if (pkt && (pkt->flags & PTV_PKT_FLAG_NBS_FILL)) {
             /* pre15 §3 FILL sentinel — NOT a packet: must not feed the decoder and must not
              * advance wd_pkts (ADECWD would read "packets arriving, nothing decodes" and churn
@@ -3483,6 +3560,7 @@ void *audio_thread(void *arg)
     /* flush decoder -> resampler/filtergraph -> encoder */
     avcodec_send_packet(a->dec, NULL);
     while (avcodec_receive_frame(a->dec, frame) >= 0) { audio_push(a, frame); av_frame_unref(frame); }
+    apark_release(a, 1);                                   /* T-411: the parked sound goes out */
     if (a->use_fg) {
         if (av_buffersrc_add_frame(a->afsrc, NULL) >= 0)   /* signal EOF to the graph */
             audio_drain_fg(a);
@@ -3507,6 +3585,7 @@ void *audio_thread(void *arg)
 done:
     av_frame_free(&frame);
     { int i; for (i = 0; i < a->aq_npending; i++) av_frame_free(&a->aq_pending[i]); a->aq_npending = 0; }
+    while (a->apark_n > 0) { av_frame_free(&a->apark[a->apark_h]); a->apark_h = (a->apark_h + 1) % PTV_APARK; a->apark_n--; }
     afmt_q_reset(a);
     av_thread_message_queue_set_err_send(a->audio_q, AVERROR_EOF);   /* unblock demux (a SENDER) */
     { int i; for (i = 0; i < a->n_out; i++) {        /* EOF marker to each muxer */

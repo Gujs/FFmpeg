@@ -3081,6 +3081,7 @@ static void stage_hold(VideoHold *h, int live, AVFrame *frame)
     if (nf->pts != AV_NOPTS_VALUE)
         atomic_store_explicit(&h->newest_pts, nf->pts, memory_order_relaxed);
     push_frame_q(h->q, live, &h->framedrop, nf);    /* drop-oldest in live; consumes nf */
+    atomic_store_explicit(&h->ovf, h->framedrop, memory_order_release);   /* the compositor reads the drops (mv_tl_pick) */
     pthread_mutex_lock(&h->lock);
     h->wall_us = av_gettime_relative();
     pthread_mutex_unlock(&h->lock);
@@ -5351,6 +5352,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
             av_thread_message_queue_set_free_func(inputs[k].hold.q, free_frame_msg);
             atomic_store(&inputs[k].hold.newest_pts, AV_NOPTS_VALUE);
             atomic_store(&inputs[k].hold.depth_cap, 64);   /* T-414: capped from go-live until the compose sets its own */
+            atomic_store(&inputs[k].tl_alim_us, INT64_MAX);
+            atomic_store(&inputs[k].tl_skip_us, INT64_MAX);
         }
         /* Take raw 33-bit timestamps; demux_unwrap extends them (libav's
          * correct_ts_overflow extends inconsistently across the B-frame reorder). */
@@ -6290,6 +6293,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         as[k].tl_nlag    = n_input > 1 ? &inputs[asrc_in[k]].tl_nlag_us : NULL;
         as[k].tl_at      = n_input > 1 ? &inputs[asrc_in[k]].tl_at_us : NULL;
         as[k].tl_ahead   = n_input > 1 ? &inputs[asrc_in[k]].tl_ahead_us : NULL;
+        as[k].tl_alim    = n_input > 1 ? &inputs[asrc_in[k]].tl_alim_us : NULL;
+        as[k].tl_skip    = n_input > 1 ? &inputs[asrc_in[k]].tl_skip_us : NULL;
         if (n_input > 1)
             atomic_store_explicit(&inputs[asrc_in[k]].tl_at_us, INT64_MAX, memory_order_relaxed);
         as[k].house_lag_true = (n_input > 1) ? &inputs[asrc_in[k]].house_lag_true : NULL;  /* multiview: true lag; single: NULL→house_skew */
