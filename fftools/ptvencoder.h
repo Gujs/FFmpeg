@@ -874,6 +874,8 @@ typedef struct VideoCtx {
     const int64_t   *framedrop_src;  /* 2.0.0-pre9.6: single input — the decode thread's drop-oldest count for this rung
                                       * (push_frame_q counts there; VideoCtx->framedrop was never written: drop= read 0) */
     int64_t          decim;          /* v0.9.15.2: surplus frames decimated by content mapping (>house-rate source) */
+    int64_t          src_per_us;     /* 2.1 T-413: the source's picture period (shortest step of a 2 s content window, every
+                                      * picture popped; 0 = not learned) — content_index()'s decision line for a faster source */
     /* watchdog */
     int64_t          last_emit_us;
     volatile int     output_done;
