@@ -5,7 +5,7 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
-## 2.1.0-pre2 — 2.1.0-pre1 + mosaic slots keep their lag through jitter, holes and backlogs (T-410), no start-up / stall memory peak (T-412)
+## 2.1.0-pre2 — 2.1.0-pre1 + mosaic slots keep their lag through jitter, holes and backlogs (T-410), no start-up / stall memory peak (T-412), even rate conversion (T-011, T-341), captions through corrupt pictures (T-326), source changes logged (T-003, T-400), retired paths deleted
 
 - **A mosaic slot's lag no longer follows arrival jitter (T-410).** 2.1.0-pre1 re-locked on the buffer's AVERAGE depth: a
   jittery source (cor-3 Curiosity slot 1: depth 0.7–1.3 s every minute) re-locked ±100–300 ms every few minutes, each a
@@ -54,6 +54,12 @@ the v2 `0001` patch (additive, travels with the source to the build box).
   motion. The picture nearest the tick is now shown: due half the slot's own period ahead when the slot is faster than the
   mosaic (half a tick otherwise, unchanged). MV-01 with alternating stamps: 2 pictures every tick, both neighbours 8.3 ms
   from the line (pre2 before the fix: 1 and 3 alternating for the whole run); lip sync unchanged.
+- **The retired code paths are deleted (T-409 follow-up).** What 2.1.0-pre1 still compiled but never ran is gone: LAYERA
+  (its buffer, flush, shared-flush pairing, audio anchor and wall-evidence split), the per-stream demux discontinuity
+  absorber, the AGLUE step verdicts (`PTV_TL_AGLUE`), the mosaic slot PLL / anchor / open-loop follow, the mosaic residence
+  pick, birth trim and REANCHOR2, and the `PTV_TIMELINE` switch with ~30 globals and their env switches: −4,500 lines.
+  Default log and stats line unchanged; the `PTV_DIAG` mosaic `[PTV-AVSYNC]` line prints the measured offset and acomp only.
+  Gate (251 keys, like for like with 2.1.0-pre1): 239 PASS, 0 regressions.
 - Known open: a bursty (HLS-burst) mosaic slot's content-ahead re-lock never commits (T-411; no production mosaic has one).
 
 ## 2.1.0-pre1 — one decision per source event (T-409): the program timeline, the record door, mosaic frame synchronizers; RESYNC and RECANCHOR deleted
