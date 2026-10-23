@@ -1320,6 +1320,16 @@ void *output_thread(void *arg)
                     if (ep > 0 && g_src_hold_act &&                   /* 2.0.0-pre4: a source hold is no decode deficit */
                         (atomic_load_explicit(&g_src_state, memory_order_relaxed) || (rj && nw - rj < 2000000)))
                         ep = 0;
+                    /* 2.1 T-417: frame_q empty while the source DELIVERS but the decoder discards damaged pictures is no
+                     * delivery starvation — the gap fill keeps the output linear, and a deeper buffer cannot bring lost
+                     * content back. Counted, two of them (Cinestar 10 % loss 30 s: the decoder made ~5 frames/s, frame_q
+                     * 24 -> 0 for 441 ms) raised the target 1 s -> 4 s for 6 h, and the servo ran the house 0.6 % slow to
+                     * fill it: +3 s of latency. Corrupt data within 5 s before the episode began, or during it: not counted */
+                    if (ep > 0) {
+                        int64_t dw = atomic_load_explicit(&g_vcorrupt_wc, memory_order_relaxed);
+                        if (dw && dw >= nw - ep - 5000000)
+                            ep = 0;
+                    }
                     if (ep > 0) {                                     /* a >=200ms starvation episode just ended */
                         ep_prev_us = ep_last_us; ep_last_us = nw;
                         /* 1.0.1-pre10 (e): 10min GROW suppression after a CUSHION_RELEASE —

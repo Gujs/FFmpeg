@@ -47,7 +47,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.1.0-pre3"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.1.0-pre4"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -3065,6 +3065,21 @@ static void stage_hold(VideoHold *h, int live, AVFrame *frame)
     if (!nf) { av_frame_unref(frame); return; }
     av_frame_move_ref(nf, frame);
     if (nf->best_effort_timestamp != AV_NOPTS_VALUE) nf->pts = nf->best_effort_timestamp;
+    /* 2.1 T-414: the slot keeps at most depth_cap pictures from the moment it is live — before the compose too. A queue
+     * left at its 160-picture capacity banked up to 5.3 s per slot at a mass restart (the compositor composed ~10 s
+     * after its slots went live) and the decoders' buffer pools kept that high-water for the process life (cor-3 RAV
+     * 2x2 2416 MB vs 1027 MB on a box that composed in 2 s). Drop-oldest, as at the capacity */
+    if (live) {
+        int cap = atomic_load_explicit(&h->depth_cap, memory_order_relaxed);
+        AVFrame *old;
+        while (cap > 0 && av_thread_message_queue_nb_elems(h->q) >= cap &&
+               av_thread_message_queue_recv(h->q, &old, AV_THREAD_MESSAGE_NONBLOCK) >= 0) {
+            av_frame_free(&old);
+            h->framedrop++;
+        }
+    }
+    if (nf->pts != AV_NOPTS_VALUE)
+        atomic_store_explicit(&h->newest_pts, nf->pts, memory_order_relaxed);
     push_frame_q(h->q, live, &h->framedrop, nf);    /* drop-oldest in live; consumes nf */
     pthread_mutex_lock(&h->lock);
     h->wall_us = av_gettime_relative();
@@ -3465,6 +3480,13 @@ static void *decode_thread(void *arg)
                 ret = 0;
                 break;
             }
+            /* 2.1 T-416: a picture is placed by its OWN pts. best_effort_timestamp switches for good to its DTS guess
+             * once damage has made the pts look faulty more often than the dts; every picture after that was stamped
+             * by its packet's dts — 20 ms late on Cinestar's 1080i25, one 40 ms tick after rounding, the sound
+             * unmoved: audio 40 ms early for the rest of the run (live 1 % loss, and 2 of 5 local loss patterns; the
+             * same on 2.0.2). The guess stays only for a picture without a pts */
+            if (frame->pts != AV_NOPTS_VALUE)
+                frame->best_effort_timestamp = frame->pts;
             if (frame->decode_error_flags) { /* 2.0.0-pre9.4: concealed / missing slices = damage evidence */
                 d->vdecerr++;
                 atomic_store_explicit(&g_vdmg_wc, av_gettime_relative(), memory_order_relaxed);
@@ -3642,6 +3664,8 @@ static void *decode_thread(void *arg)
     /* flush decoder */
     avcodec_send_packet(d->vdec, NULL);
     while (avcodec_receive_frame(d->vdec, frame) >= 0) {
+        if (frame->pts != AV_NOPTS_VALUE)            /* T-416: as above */
+            frame->best_effort_timestamp = frame->pts;
         if (frame->flags & AV_FRAME_FLAG_CORRUPT) {
             cc_tap_ordered(d, frame);  /* see above */
             av_frame_unref(frame);
@@ -5282,6 +5306,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         if (multiview) {                         /* per-input jitter buffer for the compositor */
             if ((ret = av_thread_message_queue_alloc(&inputs[k].hold.q, g_frameq_cap, sizeof(AVFrame *))) < 0) goto end;
             av_thread_message_queue_set_free_func(inputs[k].hold.q, free_frame_msg);
+            atomic_store(&inputs[k].hold.newest_pts, AV_NOPTS_VALUE);
+            atomic_store(&inputs[k].hold.depth_cap, 64);   /* T-414: capped from go-live until the compose sets its own */
         }
         /* Take raw 33-bit timestamps; demux_unwrap extends them (libav's
          * correct_ts_overflow extends inconsistently across the B-frame reorder). */
