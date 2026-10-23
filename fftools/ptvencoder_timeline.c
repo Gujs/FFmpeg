@@ -70,7 +70,6 @@ struct PtvTimeline {
     int       nheld;
 };
 
-int     g_timeline = 0;
 int64_t g_tl_open_us = 500000;
 
 PtvTimeline *ptv_tl_alloc(int nb_streams)
