@@ -3465,6 +3465,13 @@ static void *decode_thread(void *arg)
                 ret = 0;
                 break;
             }
+            /* 2.1 T-416: a picture is placed by its OWN pts. best_effort_timestamp switches for good to its DTS guess
+             * once damage has made the pts look faulty more often than the dts; every picture after that was stamped
+             * by its packet's dts — 20 ms late on Cinestar's 1080i25, one 40 ms tick after rounding, the sound
+             * unmoved: audio 40 ms early for the rest of the run (live 1 % loss, and 2 of 5 local loss patterns; the
+             * same on 2.0.2). The guess stays only for a picture without a pts */
+            if (frame->pts != AV_NOPTS_VALUE)
+                frame->best_effort_timestamp = frame->pts;
             if (frame->decode_error_flags) { /* 2.0.0-pre9.4: concealed / missing slices = damage evidence */
                 d->vdecerr++;
                 atomic_store_explicit(&g_vdmg_wc, av_gettime_relative(), memory_order_relaxed);
@@ -3642,6 +3649,8 @@ static void *decode_thread(void *arg)
     /* flush decoder */
     avcodec_send_packet(d->vdec, NULL);
     while (avcodec_receive_frame(d->vdec, frame) >= 0) {
+        if (frame->pts != AV_NOPTS_VALUE)            /* T-416: as above */
+            frame->best_effort_timestamp = frame->pts;
         if (frame->flags & AV_FRAME_FLAG_CORRUPT) {
             cc_tap_ordered(d, frame);  /* see above */
             av_frame_unref(frame);
