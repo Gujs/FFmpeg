@@ -5,6 +5,24 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.1.0-pre3 — 2.1.0-pre2 + a mosaic slot follows a slow source clock without starving, and keeps its picture period (T-410 / T-411 follow-up)
+
+- **A slow source clock no longer drains its mosaic slot (T-410 follow-up).** pre2's slow-clock rule added one tick of lag
+  per 60 s, about 550 ppm at most. RAV slot 0 (59.94) runs 2400–3000 ppm slow for minutes at a time (its content against
+  its arrival): the buffer emptied, the slot repeated pictures, ran late and re-locked +1 s every 7–13 min (1 s of silence
+  each), lip sync −48…−61 ms in between. The rule now acts at half the primed depth in every 10 s window of a minute and
+  adds one tick per window, two while the newest window is below a quarter: up to 6600 ppm. It keeps its history after a
+  step (a shed or a re-lock still waits 60 s), and after a dry spell it waits 60 s. Replay of the captured RAV mosaic
+  (20 min, arrival-timed, its production command): slot 0 repeats before the source's outage 0 (pre2 827), lip sync
+  −1…−17 ms (pre2 −48…−61 ms), no re-lock; after the 18 s outage +7 repeats (pre2 +716).
+- **A mosaic slot's picture period is its shortest step (T-411 follow-up).** pre2 learned the period as a 1/8 average of
+  the picture steps; long steps (lost pictures, pictures a full queue dropped) raised it, and past 4x the period it
+  ignored the real steps for good. cor-3 GB News slot 0 (40 ms) read 204 ms in its first 10 s after the mass restart:
+  its depth and primed margin read 5x ('primed 5907 ms'), it shed −17.8 s, re-locked +17.1 s and showed bars, again every
+  minute. The period is now the shortest step of each 2 s window with at least 8 steps — as the single-input period
+  (T-011), a long step lengthens one step, never the period, and nothing carries over from one window to the next. A
+  replayed 20 s backlog at 2.5x (one pop every few seconds, 4.6 s steps) keeps 40 ms, as pre2 does.
+
 ## 2.1.0-pre2 — 2.1.0-pre1 + mosaic slots keep their lag through jitter, holes and backlogs (T-410), no start-up / stall memory peak (T-412), even rate conversion (T-011, T-341), captions through corrupt pictures (T-326), source changes logged (T-003, T-400), retired paths deleted
 
 - **A mosaic slot's lag no longer follows arrival jitter (T-410).** 2.1.0-pre1 re-locked on the buffer's AVERAGE depth: a

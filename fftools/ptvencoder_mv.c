@@ -86,6 +86,8 @@ static int64_t mv_tick_us(CompositorCtx *c, int64_t t);
  * Every step takes effect at a content boundary for the picture and the sound (mv_tl_step). */
 typedef struct MvTlSlot {
     int64_t lag, cad, last_src, shown_wc, pop_wc, relock_wc;
+    int64_t cad_min, cad_wc;                        /* the period: the shortest picture step of the current 2 s window */
+    int     cad_n;                                  /* ... and how many steps it saw */
     int64_t real;                                   /* the realized lag: the shown pictures' output - source, averaged */
     int64_t shown_src;                              /* source time of the last picture shown */
     int64_t first_wc;                               /* the slot's first picture (wall) */
@@ -168,11 +170,16 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
             continue;
         }
         fs = av_rescale_q(nx->pts, c->inputs[k].ist_tb, AV_TIME_BASE_Q) - h0;
-        /* the slot's cadence (every picture is popped, decimated ones too): seeded at the house tick, a 59.94 slot in a
-         * 29.97 mosaic sits on a [1/2, 2] band's edge and was never learned — its buffer read twice as deep (mv01-t397:
-         * re-locked to a +500 ms picture lag) */
-        if (s->last_src != AV_NOPTS_VALUE && fs - s->last_src > s->cad / 4 && fs - s->last_src < 3 * s->cad)
-            s->cad += (fs - s->last_src - s->cad) / 8;
+        /* the slot's cadence (every picture is popped, decimated ones too) = the SHORTEST step of the last 2 s, as the
+         * single-input period (T-011): a lost picture lengthens a step, and so does one the full queue dropped. The 1/8
+         * average learned long steps, and past 4x the period it ignored the real ones for good: cor-3 GB News slot 0
+         * (40 ms) read 204 ms in its first 10 s after the mass restart — the depth and the primed margin read 5x
+         * ('primed 5907 ms'), shed -17.8 s, re-locked +17.1 s, bars, again every minute. Seeded at the house tick; a
+         * 59.94 slot in a 29.97 mosaic learns 16.7 ms (mv01-t397) */
+        if (s->last_src != AV_NOPTS_VALUE && fs - s->last_src >= 1000 && (!s->cad_min || fs - s->last_src < s->cad_min))
+            s->cad_min = fs - s->last_src;
+        if (s->last_src != AV_NOPTS_VALUE && fs - s->last_src >= 1000)
+            s->cad_n++;
         s->last_src = fs;
         /* the picture nearest the tick: due half a picture ahead of it — half a tick, or half the slot's own period
          * when it is faster than the house. A 59.94 slot in 29.97 put every second picture ON the half-tick line,
@@ -255,15 +262,19 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
         s->shown_wc = now_us;
         s->pop_wc   = now_us;
         s->tails    = 0;
+        if (dry)                                    /* back after a dry spell: the depth history is the outage's, not
+                                                     * the clock's — 60 s of fresh windows before any drift step */
+            s->nmin = 0;
     } else if (occ)
         s->pop_wc = now_us;                         /* pictures waiting: not dry */
     /* the buffer's MINIMUM depth over a window says what the lag must do; its average does not — bursty or jittery
      * arrival swings the depth by design (cor-3 Curiosity slot 1: 0.7..1.3 s every minute, re-locked +-300 ms each time;
      * an HLS-burst slot re-locked every few seconds). In the slot's first 20 s (5 s windows) a start-up backlog the
      * buffer never drains below is shed in one step; after that (10 s windows, the last 60 s): never below the primed
-     * depth + 2 ticks = latency nobody uses, shed in one step; below a quarter of it in EVERY window = a source clock
-     * slower than the house, one tick more (one hole drains the buffer once: content lost, not drift); after any step
-     * 60 s of fresh windows. Pictures that stay late re-lock above. */
+     * depth + 2 ticks = latency nobody uses, shed in one step; below half of it in EVERY window = a source clock
+     * slower than the house, one tick more, two while the newest window is below a quarter (one hole drains the buffer
+     * once: content lost, not drift); after a shed or a re-lock 60 s of fresh windows. Pictures that stay late re-lock
+     * above. */
     if (h0 != AV_NOPTS_VALUE && s->first_wc) {
         int64_t depth = (int64_t)occ * s->cad, wl = now_us - s->first_wc < 20000000 ? 5000000 : 10000000;
         if (!s->win_wc) {
@@ -297,11 +308,37 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
                                lo / 1000, margin / 1000);
                         mv_tl_step(c, k, s, s->lag - (lo - margin), h0, now_us);
                     }
-                    else if (hi < margin / 4)
-                        mv_tl_step(c, k, s, s->lag + c->tick_dur_us, h0, now_us);   /* about to starve */
+                    else if (hi < margin / 2 && now_us - s->shown_wc < wl) {   /* running low — a live slot only:
+                                                                                 * an outage's empty windows are no clock
+                                                                                 * evidence */
+                        int nm = s->nmin;
+                        int64_t st = (wm < margin / 4 ? 2 : 1) * c->tick_dur_us;
+                        mv_tl_step(c, k, s, s->lag + st, h0, now_us);
+                        /* the history stays, read deeper by the step from here. With 60 s of fresh windows per tick the
+                         * rule followed 550 ppm at most: a source 1100 ppm slow (RAV in0, PCR -1076 ppm against arrival)
+                         * drained its buffer, ran late and re-locked +1 s every 10 min (1 s of silence each). A tick per
+                         * 10 s window from a quarter of the depth still sat at empty: RAV in0's content runs 3000 ppm
+                         * slow for minutes (2400 ppm at its start), a step a window followed it but never refilled, and
+                         * every late burst repeated a picture (sv +60 per 10 s). From half the depth, two ticks while
+                         * the newest window is below a quarter: up to 6600 ppm, the buffer kept off the floor */
+                        s->nmin = nm;
+                        for (x = 0; x < 6; x++)
+                            s->mins[x] += st;
+                    }
                 }
             }
         }
+    }
+    /* the window's shortest step is the period — from 8 steps on: a slot of 10 pictures a second shows 20. A burst into a
+     * full queue drops the oldest while the next picture waits for its tick, and the slot pops one picture every few
+     * seconds: one step of 4.6 s read as the period gave a primed depth of 133 s, shed -577 s and re-locked +567 s
+     * (a replay of GB News slot 0 with a 20 s backlog at 2.5x). Fewer steps = unchanged */
+    if (now_us - s->cad_wc >= 2000000) {
+        if (s->cad_min && s->cad_n >= 8)
+            s->cad = s->cad_min;
+        s->cad_min = 0;
+        s->cad_n   = 0;
+        s->cad_wc  = now_us;
     }
     atomic_store_explicit(&c->inputs[k].tl_lag_us, s->real, memory_order_relaxed);
     return cand;
