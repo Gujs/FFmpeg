@@ -5,6 +5,22 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.1.0-pre5 — 2.1.0-pre4 + output frame-rate options (T-418), a decimated source shows the picture at the tick (T-413)
+
+- **Output frame-rate options (T-418).** `-r` takes `source` (the source rate, as before), `auto` (the source rate snapped to
+  the nearest standard rate within 2 %), an exact rate, `max:<rate>` (the source rate divided by the smallest integer that
+  brings it to the rate or below: `max:30` = 59.94 -> 29.97, 60 -> 30, 50 -> 25, 25 / 29.97 unchanged) and `field` (an
+  interlaced source at its field rate, 25i -> 50, with a field-rate deinterlacer in the chain — `bwdif mode=send_field`; without
+  one, or on a progressive source, the source rate). One `[PTV-RATE]` line names the decision. The rate is chosen at start; a
+  source that changes rate mid-run is converted to it. Field mode on film content (both fields from one film frame) moves a
+  cut by up to a field, as plain ffmpeg does with the same chain (Cinestar: −19 ms) — it is meant for camera-interlaced channels.
+- **A decimated source shows the picture at the tick (T-413).** A source faster than the output (59.94 -> 29.97) put every
+  second picture on the half-tick line, and the picture shown each tick was the one half a tick early: every picture 16.7 ms
+  late, the sound −15.8 ms by content. The decision line now sits half a source picture past the tick (the source period is
+  learned from every picture, seeded from the probe): +0.7 ms, every shown picture the one at its tick. Sources at or below
+  the output rate are stamped exactly as before.
+- TEST-ONLY `PTV_TEST_SRC_FPS=<rate>`: the probed source rate (a probe's odd reading).
+
 ## 2.1.0-pre4 — 2.1.0-pre3 + packet loss keeps lip sync (T-416), damage does not grow the latency (T-417), a mosaic restart under load keeps its memory and its picture (T-414)
 
 - **Packet loss no longer leaves the picture one frame late for good (T-416).** libavcodec's best_effort_timestamp switches
