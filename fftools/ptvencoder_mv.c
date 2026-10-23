@@ -146,9 +146,11 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
                            MvTlSlot *s, int occ_tgt, int *mv_seed)
 {
     VideoHold *h = &c->inputs[k].hold;
-    int64_t out = mv_tick_us(c, tick), half = c->tick_dur_us / 2, margin = (int64_t)occ_tgt * s->cad;   /* the primed
-                                               * depth is a picture count: 30 pictures of a 59.94 slot are 0.5 s, read
-                                               * against 1 s it re-locked +500 ms (mv01) */
+    /* the primed depth in CONTENT TIME (the preroll, house ticks) — and the depth below too: depth was a picture count
+     * times the learned period, so a 59.94 slot got half the margin (0.48 s), and a queue pinned at its capacity by a
+     * decoder catching up read 'full' whatever was shed (the 60 s rule shed -4.4 s three times, the slot 9.7 s ahead
+     * and starving: mass-restart replay) */
+    int64_t out = mv_tick_us(c, tick), half = c->tick_dur_us / 2, margin = (int64_t)occ_tgt * c->tick_dur_us;
     int64_t h0, src = AV_NOPTS_VALUE, relock = AV_NOPTS_VALUE, sum = 0;
     int dry, occ, cnt = 0;
     AVFrame *cand = NULL, *nx;
@@ -277,6 +279,12 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
      * above. */
     if (h0 != AV_NOPTS_VALUE && s->first_wc) {
         int64_t depth = (int64_t)occ * s->cad, wl = now_us - s->first_wc < 20000000 ? 5000000 : 10000000;
+        int64_t np = atomic_load_explicit(&h->newest_pts, memory_order_relaxed);
+        if (np != AV_NOPTS_VALUE) {   /* the depth in content time: the newest picture queued past the due line */
+            int64_t nf = av_rescale_q(np, c->inputs[k].ist_tb, AV_TIME_BASE_Q) - h0;
+            if (nf - s->shown_src >= -1000000 && nf - s->shown_src <= 60000000)   /* not across a wrap / label jump */
+                depth = FFMAX(0, nf - (out - s->lag));
+        }
         if (!s->win_wc) {
             s->win_wc = now_us;
             s->wmin   = depth;
@@ -287,7 +295,11 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
             s->mins[s->nmin++ % 6] = wm;
             s->win_wc = now_us;
             s->wmin   = depth;
-            if (!s->stepping && now_us - s->relock_wc >= 10000000) {
+            /* after a step, 10 s before the next — in the start-up phase one window (5 s): a mass restart's decoders
+             * catch up AFTER the first window (its minimum was the just-trimmed queue), the first shed was ~0.5 s of a 5 s
+             * backlog, the 10 s hold outlasted the start-up phase and the rest waited for the 60 s rule — a minute of
+             * pictures ahead of their time, the cell on bars every 5.3 s (cor-3 INSP / RAV, 2.1.0-pre3 deploy) */
+            if (!s->stepping && now_us - s->relock_wc >= (wl == 5000000 ? wl : 10000000)) {
                 if (wl == 5000000) {
                     if (wm > margin + 2 * s->cad) {
                         av_log(NULL, AV_LOG_INFO, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (start-up backlog: "
@@ -438,13 +450,24 @@ void *compositor_thread(void *arg)
         memset(&tl_slot[k], 0, sizeof(tl_slot[k]));
         tl_slot[k].cad      = mv_tick_us(c, 1);
         tl_slot[k].last_src = AV_NOPTS_VALUE;
+        /* 2.1 T-414: until the first compose, a slot keeps twice its primed depth — a mass restart composed ~10 s after
+         * the slots went live, each banked to the 160-picture capacity (5.3 s), the preroll trimmed it to the primed
+         * depth, and the decoders' buffer pools kept the high-water for the process life (cor-3 RAV 2x2 2416 MB vs
+         * 1027 MB). Lifted at the compose (a burst mid-run keeps the full capacity) */
+        atomic_store_explicit(&c->inputs[k].hold.depth_cap, FFMAX(2 * res_occ_tgt, 8), memory_order_relaxed);
     }
 
     /* preroll: prime every input's jitter buffer to ~PTV_PREROLL_MS so bursty
      * decode delivery has a cushion (no startup dup storm) and the mosaic starts
      * with every cell live. A never-arriving input is left to its black cell. */
     {
-        int64_t t0 = av_gettime_relative();
+        int64_t t0;
+        const char *ps = getenv("PTV_TEST_MV_PRESTALL_S");   /* TEST-ONLY: the compositor starts N s late while the slot
+                                                              * decoders bank (a mass restart: cor-3 composed ~10 s after
+                                                              * its slots went live) */
+        if (ps && atoi(ps) > 0)
+            av_usleep(atoi(ps) * 1000000U);
+        t0 = av_gettime_relative();
         for (;;) {
             int ready = 0, eofall = 1;
             for (k = 0; k < n; k++) {
@@ -476,6 +499,8 @@ void *compositor_thread(void *arg)
                            k, trimmed, res_occ_tgt);
             }
         }
+        for (k = 0; k < n; k++)                       /* T-414: the full capacity from the compose on */
+            atomic_store_explicit(&c->inputs[k].hold.depth_cap, 0, memory_order_relaxed);
         wall0 = av_gettime_relative();
     }
 

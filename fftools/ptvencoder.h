@@ -459,6 +459,8 @@ typedef struct VideoHold {
     pthread_mutex_t lock;      /* guards wall_us + eof */
     int64_t         wall_us;   /* when a frame was last pushed (staleness -> slate) */
     int             eof;       /* decode terminated for this input (terminal) */
+    _Atomic int64_t newest_pts;   /* 2.1 T-414: source pts of the newest picture queued (AV_NOPTS_VALUE: none yet) */
+    _Atomic int     depth_cap;    /* 2.1 T-414: pictures kept at most (0: the queue's own capacity) — set by the compositor */
 } VideoHold;
 
 /* ---- EIA-608 closed captions -> DVB-teletext subtitles (opt-in: -cc_extract) ----

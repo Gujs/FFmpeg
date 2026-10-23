@@ -5,6 +5,29 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.1.0-pre4 — 2.1.0-pre3 + packet loss keeps lip sync (T-416), damage does not grow the latency (T-417), a mosaic restart under load keeps its memory and its picture (T-414)
+
+- **Packet loss no longer leaves the picture one frame late for good (T-416).** libavcodec's best_effort_timestamp switches
+  for the rest of the stream to the packet DTS once damage made the pts look faulty more often than the dts. Every picture
+  after that was stamped 20 ms late on a 1080i25 source — one 40 ms tick after rounding, the sound unmoved: audio 40 ms
+  early until the next restart, unseen by the lip-sync sensor. Found by a live 1 % loss test on Cinestar_Premiere (content
+  A/V vs the source −3 → −43 ms), reproduced from its source capture in 2 of 5 loss patterns, the same on 2.0.2. A decoded
+  picture now keeps its own pts (the guess only without one): all patterns hold −3.4 → −3.7 ms.
+- **Damaged input no longer grows the cushion (T-417).** Pictures the decoder discards empty the frame queue while the
+  source delivers; counted as starvations, two of them raised the single-input cushion 1 s → 4 s for 6 h and the house
+  ran 0.6 % slow to fill it: +3 s of latency (live Cinestar 10 % loss). An empty queue with corrupt data within 5 s is
+  not counted; a real delivery starvation still grows it.
+- **A mosaic restart under load (T-414 + the 2.1.0-pre3 start-up bars).** At a mass restart the compositor started ~10 s
+  after its slots went live: each slot banked to its 160-picture queue (5.3 s) and the decoders' buffer pools kept that
+  high-water for the process life (cor-3 RAV 2x2 2416 MB vs 1027 MB on a box that composed in 2 s). The slot queue is
+  now capped at twice the primed depth until the first compose: the replay of that start-up 2062 → 1004 MB. A slot's
+  depth and margin are content time (the newest queued picture past the due line; the primed depth as a time): a
+  decoder catching up after the compose read 'queue full' whatever was shed, and the 60 s rule shed the same 4.4 s again
+  every minute (the slot 9.7 s ahead and starving); a 59.94 slot now gets the same ~1 s margin as the others (was 0.48 s).
+  The start-up shed may repeat every 5 s window in the first 20 s (pre3: a 0.5 s first shed blocked the rest for a minute,
+  the cell on bars every 5.3 s).
+- TEST-ONLY `PTV_TEST_MV_PRESTALL_S=N`: the compositor starts N s late while the slot decoders bank.
+
 ## 2.1.0-pre3 — 2.1.0-pre2 + a mosaic slot follows a slow source clock without starving, and keeps its picture period (T-410 / T-411 follow-up)
 
 - **A slow source clock no longer drains its mosaic slot (T-410 follow-up).** pre2's slow-clock rule added one tick of lag
