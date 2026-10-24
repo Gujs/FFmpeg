@@ -3389,14 +3389,14 @@ static void *decode_thread(void *arg)
             av_usleep((unsigned int)g_test_vdec_stall_us);
         }
         /* 2.1 T-411 (pre6, the professional pattern: an IRD that falls behind resyncs at the live edge, it never plays its
-         * backlog): a mosaic slot whose decoder banked more than 2 s in its first 60 s (a mass restart: the box decodes
-         * every channel at once) drops the backlog down to 1 s — the slot's primed cushion (kept at half a second it
+         * backlog): a mosaic slot whose decoder banked more than 2 s (whatever the cause — a mass restart, where the box
+         * decodes every channel at once, is just one) drops the backlog down to 1 s — the slot's primed cushion (kept at half a second it
          * started shallow and the slow-clock rule refilled it in tick steps: picture and sound stepped +67, +33, +33 ms in
          * its first minute) — and resumes at the next keyframe (the self-heal's deferred decoder reset). The drops count as its queue's overflow, so the compositor cuts the slot's lag ONCE to the
          * new content, picture and sound at the same point (mv_tl_pick; the sound's delay line). Decoding the backlog
          * fast-forwarded the slot past its queue instead: the head ahead of its due line, bars every 5.3 s, 2-4 overflow
-         * steps a second apart. Later than 60 s a slow decode is a held source, which the late rule handles */
-        if (d->hold && d->live && !d->heal_dropkf && d->in_pps_decl > 0 && av_gettime_relative() - hb_t0 < 60000000 &&
+         * steps a second apart */
+        if (d->hold && d->live && !d->heal_dropkf && d->in_pps_decl > 0 &&
             av_thread_message_queue_nb_elems(d->video_q) > 2 * d->in_pps_decl) {
             AVPacket *sp;
             int n = 1, q = av_thread_message_queue_nb_elems(d->video_q);
