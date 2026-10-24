@@ -201,6 +201,7 @@ typedef struct DlvGate {
 #define PTV_MAX_RUNG 8
 #define PTV_MAX_AUDIO 8    /* max transcoded audio output tracks (multi-language, multiview slots) */
 #define PTV_APARK 2048      /* per-track parked decoded frames (mosaic sound bound): ~43 s of 21 ms frames */
+#define PTV_APARK_SPAN_US 6000000   /* 2.1 T-411 pre6: the sound line's depth in content (the slot's picture queue: ~5.3 s) */
 #define PTV_AQ_PREROLL 1024 /* per-track pre-h0 audio buffer (frames, ~21s @47fps): preserve a slot's audio head
                             * while its video decodes its first frame (sets h0), instead of dropping
                             * it (which made that slot's audio start ~h0-acquire-delay late). Bounded
@@ -1054,6 +1055,13 @@ typedef struct AudioState {
     int              multiview;
     int64_t          af_last_out;                    /* last emitted output pts (samples) */
     int              af_out_set;                      /* af_last_out valid */
+    AVAudioFifo     *af_fifo;                         /* 2.1 T-420: the follow path's delay line — a correction shifts the
+                                                       * sample stream exactly (silence in / samples out), frames leave it
+                                                       * whole; empty in steady state */
+    int64_t          af_drop;                         /* ... samples still to discard (the sound was late) */
+    int64_t          af_step_at;                      /* ... the lag-step boundary last taken */
+    int              af_fade;                         /* ... samples of the fade-in still to apply after a junction */
+    int64_t          af_nfix, af_log_wc;              /* ... corrections taken, and when the last was logged */
     int64_t          avsync_stat_last;               /* [PTV-AVSYNC] status: last print time (us) */
     int64_t          async_stat_last, async_prev_bal; /* v0.9.2: aresample-work rate (g_async_ppm) state (primary track) */
     /* A/V PLL redesign Phase A probe (read-only, printed by [PTV-AVSYNC]): real per-track A/V offset. */
@@ -1316,6 +1324,7 @@ typedef struct AudioState {
     _Atomic int64_t *tl_skip;                     /* ... content the picture skipped before the boundary (dropped) */
     AVFrame         *apark[PTV_APARK];            /* ... the parked frames (FIFO ring), oldest at apark_h */
     int              apark_h, apark_n;
+    int64_t          apark_drop_us, apark_log_wc;   /* 2.1 T-411 pre6: sound dropped from the full line; last log */
 } AudioState;
 
 /* ---- demux + mux ---- */

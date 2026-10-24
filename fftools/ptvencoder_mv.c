@@ -167,8 +167,8 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
      * decoder catching up read 'full' whatever was shed (the 60 s rule shed -4.4 s three times, the slot 9.7 s ahead
      * and starving: mass-restart replay) */
     int64_t out = mv_tick_us(c, tick), half = c->tick_dur_us / 2, margin = (int64_t)occ_tgt * c->tick_dur_us;
-    int64_t h0, src = AV_NOPTS_VALUE, relock = AV_NOPTS_VALUE, sum = 0;
-    int dry, occ, cnt = 0, gap = 0;
+    int64_t h0, src = AV_NOPTS_VALUE, relock = AV_NOPTS_VALUE;
+    int dry, occ, gap = 0;
     AVFrame *cand = NULL, *nx;
     pthread_mutex_lock(&c->inputs[k].h0_lock); h0 = c->inputs[k].h0; pthread_mutex_unlock(&c->inputs[k].h0_lock);
     dry = s->pop_wc && now_us - s->pop_wc >= 500000;
@@ -269,8 +269,6 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
             av_frame_free(&cand);                   /* superseded within the tick (a late picture / decimation) */
         cand = nx;
         src = fs;
-        sum += fs;
-        cnt++;
     }
     occ = av_thread_message_queue_nb_elems(h->q) + (*pending != NULL);
     if (cand) {
@@ -306,12 +304,29 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
             /* pictures land on ticks: the lag they realize is L rounded by the slot's phase (a 25p slot in a 25p mosaic:
              * L 21 ms showed every picture 40 ms late, its sound placed at L read 19 ms early); a rate-converted slot's
              * cadence pattern averages out. The sound follows this */
-            /* ... and content in a picture skipped (decimated) shows with the next one: the sample is the mean of the
-             * pictures this one stands for (a 59.94 slot in 29.97 read 8 ms short, its sound early by that) */
-            int64_t smp = out - (cnt ? sum / cnt : src);
+            /* ... from the picture SHOWN: a decimated slot's skipped picture is not shown at all, and the sound belongs with
+             * the one that is (a frame sync leaves the audio continuous and drops whole pictures). 2.1.0-pre2 took the mean
+             * of the pictures a tick stands for — tuned against the flash ruler, which reads by the shown picture's parity:
+             * by content (avxcorr on the cell, parity-free) it put a 59.94 slot's sound 8.3 ms late (T-420) */
+            int64_t smp = out - src;
+            {   /* TEST-ONLY (PTV_TEST_MVTRACE): the slot's lags once a second */
+                static int tr = -1;
+                static int64_t twc[PTV_MAX_INPUT];
+                if (tr < 0) tr = getenv("PTV_TEST_MVTRACE") != NULL;
+                if (tr && k < PTV_MAX_INPUT && (now_us - twc[k] >= 1000000 || smp - s->lag > c->tick_dur_us)) {
+                    twc[k] = now_us;
+                    av_log(NULL, AV_LOG_INFO, "[PTV-TEST] in%d out %.3f shown %.3f lag %.1f real %.1f smp %.1f occ %d%s\n", k,
+                           out / 1e6, src / 1e6, s->lag / 1000.0, s->real / 1000.0, smp / 1000.0, occ, s->stepping ? " stepping" : "");
+                }
+            }
             if (!s->shown_wc)
                 s->real = s->lag;
-            s->real += (smp - s->real) / 32;
+            /* ... by at most a picture per sample: two source pictures labelled 29 pictures old (RAV slot 1, a 29.97i
+             * feed, at 36 s) moved it 30 ms, the sound chased it there and back in half-frame steps and kept -7.5 ms */
+            {
+                int64_t w = FFMAX(c->tick_dur_us, s->cad);
+                s->real += av_clip64(smp - s->real, -w, w) / 32;
+            }
         }
         if (src != AV_NOPTS_VALUE)
             s->shown_src = src;
