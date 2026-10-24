@@ -3042,7 +3042,6 @@ static int apark_feed(AudioState *a, AVFrame *f)
         (a->apark_n > 0 ||                           /* frames wait already: in order behind them */
          av_rescale_q(ts, a->ist_tb, AV_TIME_BASE_Q) > atomic_load_explicit(a->tl_alim, memory_order_relaxed))) {
         AVFrame *c = av_frame_clone(f);
-        int ret;
         if (!c) return AVERROR(ENOMEM);
         if (a->apark_n >= PTV_APARK) {               /* full: the oldest goes (T-411 pre6: dropped, not played late) */
             AVFrame *o = a->apark[a->apark_h];
