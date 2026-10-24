@@ -204,6 +204,13 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
             s->cad_min = fs - s->last_src;
         if (s->last_src != AV_NOPTS_VALUE && fs - s->last_src >= 1000)
             s->cad_n++;
+        /* a hole in the content (more than 0.5 s missing): the depth history is the hole's, not the clock's — 60 s of
+         * fresh windows before any drift step. The dry rule below sees only a hole the buffer did not bridge: a source
+         * flapping 2 s off / 2 s on read as a slow clock, +80 ms per minute (mv04 sync_flapping) */
+        if (s->last_src != AV_NOPTS_VALUE && fs - s->last_src > 500000) {
+            s->nmin   = 0;
+            s->win_wc = 0;
+        }
         s->last_src = fs;
         /* the picture nearest the tick: due half a picture ahead of it — half a tick, or half the slot's own period
          * when it is faster than the house. A 59.94 slot in 29.97 put every second picture ON the half-tick line,
