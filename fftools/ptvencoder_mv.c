@@ -380,11 +380,24 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
                         lo = FFMIN(lo, s->mins[x]);
                         hi = FFMAX(hi, s->mins[x]);
                     }
-                    if (lo > margin + 2 * c->tick_dur_us) {   /* unused latency: never needed in 60 s */
+                    if (lo > 2 * margin) {   /* unused latency: never needed in 60 s, more than the primed depth on
+                                              * top of it — a backlog left over, not a clock: one cut. Up to there drift
+                                              * goes a picture per window even after damage paused the evidence (a
+                                              * +1000 ppm slot on a damaged capture: 6 ticks as the limit cut -266 ms) */
                         av_log(NULL, AV_LOG_INFO, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (the buffer never "
                                "below %"PRId64" ms in 60 s, primed %"PRId64" ms)\n", k, -(lo - margin) / 1000,
                                lo / 1000, margin / 1000);
                         mv_tl_step(c, k, s, s->lag - (lo - margin), h0, now_us, AV_NOPTS_VALUE);
+                    } else if (lo > margin + c->tick_dur_us) {
+                        /* 2.1 T-422: a source clock faster than the house — one picture dropped per window, as a frame sync
+                         * does, the history kept (read shallower by the step). The backlog rule above cut it in one step
+                         * once 60 s never went below margin + 2 ticks, then waited 60 s of fresh windows: cor-3 RAV slot 0
+                         * (~140 ppm fast) cut -83..-116 ms of picture and sound every 10-15 min */
+                        int nm = s->nmin;
+                        mv_tl_step(c, k, s, s->lag - c->tick_dur_us, h0, now_us, AV_NOPTS_VALUE);
+                        s->nmin = nm;
+                        for (x = 0; x < 6; x++)
+                            s->mins[x] -= c->tick_dur_us;
                     }
                     else if (hi < margin / 2 && now_us - s->shown_wc < wl) {   /* running low — a live slot only:
                                                                                  * an outage's empty windows are no clock
