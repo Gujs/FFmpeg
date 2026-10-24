@@ -67,6 +67,35 @@ static const char *ptv_self_shed_note(AudioState *a, char *buf, size_t sz)
  * per-rung -b:a is honored), routing each rung's packets to its muxer. The frame
  * is only ref'd by avcodec_send_frame, so the one frame feeds all N encoders.
  * frame=NULL flushes every encoder. (ffmpeg's filter -> asplit -> N encoders.) */
+/* 2.1 T-420: a linear gain ramp over samples [off, off + n) of a frame-shaped buffer, gain g0 at off, + dg per sample (the
+ * few-ms fade at a delay-line junction: a cut or a pad never clicks). Formats other than these pass unramped */
+static void af_ramp(uint8_t **d, enum AVSampleFormat fmt, int ch, int off, int n, double g0, double dg)
+{
+    int planar = av_sample_fmt_is_planar(fmt), np = planar ? ch : 1, st = planar ? 1 : ch;
+    for (int p = 0; p < np; p++)
+        for (int i = 0; i < n; i++)
+            for (int c = 0; c < st; c++) {
+                int    j = (off + i) * st + c;
+                double g = g0 + dg * i;
+                switch (av_get_packed_sample_fmt(fmt)) {
+                case AV_SAMPLE_FMT_FLT: ((float   *)d[p])[j] *= (float)g;                   break;
+                case AV_SAMPLE_FMT_DBL: ((double  *)d[p])[j] *= g;                          break;
+                case AV_SAMPLE_FMT_S16: ((int16_t *)d[p])[j]  = (int16_t)(((int16_t *)d[p])[j] * g); break;
+                case AV_SAMPLE_FMT_S32: ((int32_t *)d[p])[j]  = (int32_t)(((int32_t *)d[p])[j] * g); break;
+                default: return;
+                }
+            }
+}
+
+/* the frame's data pointers advanced by off samples (for a partial write into a fifo) */
+static void af_ptrs(const AVFrame *f, int off, uint8_t **p)
+{
+    int planar = av_sample_fmt_is_planar(f->format), ch = f->ch_layout.nb_channels;
+    int bps = av_get_bytes_per_sample(f->format);
+    for (int c = 0; c < (planar ? ch : 1); c++)
+        p[c] = f->extended_data[c] + (size_t)off * bps * (planar ? 1 : ch);
+}
+
 static int audio_encode_push(AudioState *a, AVFrame *frame)
 {
     int i, j, ret;
@@ -861,30 +890,110 @@ static int audio_drain_fg(AudioState *a)
                     a->af_last_out = exact - nb;
                     a->af_out_set  = 1;
                 }
-                cont = a->af_last_out + nb;
-                err  = exact - cont;                           /* samples: + = the sound belongs later */
-                if (err <= -nb / 2) {
-                    a->rs_ma_seed = 0;                         /* the sensor's audio side takes the step with it */
-                    av_frame_unref(filt);                      /* late: dropped (the next frames meet the place) */
-                    continue;
-                }
-                if (err >= nb / 2) {
-                    int64_t n = (err + nb / 2) / nb;
-                    a->rs_ma_seed = 0;
-                    while (n-- > 0) {                          /* a hole: silence where the sound is missing */
-                        AVFrame *s = av_frame_alloc();
-                        if (s) {
-                            s->nb_samples = nb; s->format = filt->format; s->sample_rate = a->out_rate;
-                            av_channel_layout_copy(&s->ch_layout, &filt->ch_layout);
-                            if (av_frame_get_buffer(s, 0) >= 0) {
-                                av_samples_set_silence(s->data, 0, nb, s->ch_layout.nb_channels, s->format);
-                                s->pts = a->af_last_out + nb; a->af_last_out = s->pts;
-                                audio_encode_push(a, s); a->out_frames++;
-                            }
-                            av_frame_free(&s);
+                /* 2.1 T-420: a frame sync's audio delay line. The sound's place error is taken SAMPLE-accurately — at every
+                 * lag step it crosses, and whenever it reaches half a frame — by silence written into the line or samples
+                 * dropped from it, with a 5 ms fade at the junction; frames leave the line whole, contiguous. Whole-frame
+                 * pads / drops left up to half a frame (10.7 ms at AAC 1024 / 48 kHz) for good after a re-lock: a 59.94
+                 * slot's sound +21 ms after an outage (mv01 gap_20, avxcorr on the cell). Empty in steady state */
+                {
+                    int     ch = filt->ch_layout.nb_channels, r, step, fl = a->out_rate / 200;
+                    int64_t e;
+                    if (!a->af_fifo) {
+                        a->af_fifo = av_audio_fifo_alloc(filt->format, ch, 2 * nb);
+                        if (!a->af_fifo) { av_frame_unref(filt); continue; }
+                    }
+                    r    = av_audio_fifo_size(a->af_fifo);
+                    cont = a->af_last_out + nb;
+                    err  = exact - (cont + r) + a->af_drop;    /* samples: + = the sound belongs later */
+                    step = at != INT64_MAX && at != INT64_MIN && src_abs_us >= at && at != a->af_step_at;
+                    {   /* TEST-ONLY (PTV_TEST_MVTRACE): the follow error once a second per track */
+                        static int tr = -1;
+                        static int64_t twc[PTV_MAX_AUDIO];
+                        if (tr < 0) tr = getenv("PTV_TEST_MVTRACE") != NULL;
+                        if (tr && a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO && av_gettime_relative() - twc[a->dbg_k] >= 1000000) {
+                            twc[a->dbg_k] = av_gettime_relative();
+                            av_log(NULL, AV_LOG_INFO, "[PTV-TEST] a%d src %.3f L %.1f ms err %+.1f ms line %d drop %"PRId64"\n",
+                                   a->dbg_k, src_abs_us / 1e6, L / 1000.0, err * 1000.0 / a->out_rate, r, a->af_drop);
                         }
                     }
-                    cont = a->af_last_out + nb;
+                    if (step)
+                        a->af_step_at = at;
+                    if (err && (step || err >= nb / 2 || err <= -nb / 2)) {
+                        a->rs_ma_seed = 0;                     /* the sensor's audio side takes the step with it */
+                        a->af_nfix++;
+                        if (av_gettime_relative() - a->af_log_wc >= 10000000) {   /* an event; at most one line in 10 s */
+                            a->af_log_wc = av_gettime_relative();
+                            av_log(NULL, AV_LOG_INFO, "[PTV-MV] a%d sound re-placed %+.1f ms (%s; %"PRId64" so far)\n",
+                                   a->dbg_k, err * 1000.0 / a->out_rate, step ? "lag step" : "drift", a->af_nfix);
+                        }
+                        e = err;
+                        if (e > 0 && a->af_drop) {             /* a pending drop first */
+                            int64_t m = FFMIN(a->af_drop, e);
+                            a->af_drop -= m;
+                            e          -= m;
+                        }
+                        if (r > 0) {                           /* fade out the line's tail before the junction */
+                            AVFrame *t = av_frame_alloc();
+                            if (t) {
+                                t->nb_samples = r; t->format = filt->format; t->sample_rate = a->out_rate;
+                                av_channel_layout_copy(&t->ch_layout, &filt->ch_layout);
+                                if (av_frame_get_buffer(t, 0) >= 0 &&
+                                    av_audio_fifo_read(a->af_fifo, (void **)t->extended_data, r) == r) {
+                                    int n = FFMIN(r, fl);
+                                    af_ramp(t->extended_data, t->format, ch, r - n, n, 1.0, -1.0 / n);
+                                    av_audio_fifo_write(a->af_fifo, (void **)t->extended_data, r);
+                                }
+                                av_frame_free(&t);
+                            }
+                        }
+                        if (e > 0) {                           /* the sound belongs later: silence into the line */
+                            AVFrame *z = av_frame_alloc();
+                            if (z) {
+                                z->nb_samples = (int)FFMIN(e, 48 * a->out_rate); z->format = filt->format;
+                                z->sample_rate = a->out_rate;
+                                av_channel_layout_copy(&z->ch_layout, &filt->ch_layout);
+                                if (av_frame_get_buffer(z, 0) >= 0) {
+                                    av_samples_set_silence(z->extended_data, 0, z->nb_samples, ch, z->format);
+                                    av_audio_fifo_write(a->af_fifo, (void **)z->extended_data, z->nb_samples);
+                                }
+                                av_frame_free(&z);
+                            }
+                        } else if (e < 0)
+                            a->af_drop += -e;                  /* the sound was late: the next samples go */
+                        a->af_fade = fl;
+                    }
+                    if (!a->af_drop && !a->af_fade && !av_audio_fifo_size(a->af_fifo)) {
+                        cont = a->af_last_out + nb;            /* steady state: the frame as it is */
+                    } else {
+                        int      k0 = (int)FFMIN(a->af_drop, nb), got = 0;
+                        uint8_t *pp[AV_NUM_DATA_POINTERS];
+                        if (av_frame_make_writable(filt) < 0) { av_frame_unref(filt); continue; }
+                        a->af_drop -= k0;
+                        if (a->af_fade && k0 < nb) {           /* fade in what follows the junction */
+                            int n = FFMIN(a->af_fade, nb - k0), done = fl - a->af_fade;
+                            af_ramp(filt->extended_data, filt->format, ch, k0, n, (double)done / fl, 1.0 / fl);
+                            a->af_fade -= n;
+                        }
+                        af_ptrs(filt, k0, pp);
+                        if (k0 < nb)
+                            av_audio_fifo_write(a->af_fifo, (void **)pp, nb - k0);
+                        while (av_audio_fifo_size(a->af_fifo) >= 2 * nb) {   /* a long pad: whole frames out now */
+                            AVFrame *o = av_frame_alloc();
+                            if (!o) break;
+                            o->nb_samples = nb; o->format = filt->format; o->sample_rate = a->out_rate;
+                            av_channel_layout_copy(&o->ch_layout, &filt->ch_layout);
+                            if (av_frame_get_buffer(o, 0) >= 0 &&
+                                av_audio_fifo_read(a->af_fifo, (void **)o->extended_data, nb) == nb) {
+                                o->pts = a->af_last_out + nb; a->af_last_out = o->pts;
+                                audio_encode_push(a, o); a->out_frames++;
+                            }
+                            av_frame_free(&o);
+                        }
+                        if (av_audio_fifo_size(a->af_fifo) >= nb)
+                            got = av_audio_fifo_read(a->af_fifo, (void **)filt->extended_data, nb);
+                        if (got != nb) { av_frame_unref(filt); continue; }   /* the line holds less than a frame */
+                        cont = a->af_last_out + nb;
+                    }
                 }
                 a->af_last_out = cont;
                 filt->pts = cont;
@@ -2886,22 +2995,41 @@ static int apark_out(AudioState *a, AVFrame *f)     /* the frame goes to its pla
     return audio_anchor_and_feed(a, f, h0);
 }
 
+/* 2.1 T-411 (pre6): a parked frame the line drops (its picture is gone) — counted, one event line in 10 s at most */
+static void apark_drop_note(AudioState *a, const AVFrame *f)
+{
+    a->apark_drop_us += av_rescale(f->nb_samples, 1000000, f->sample_rate > 0 ? f->sample_rate : 48000);
+    if (av_gettime_relative() - a->apark_log_wc >= 10000000) {
+        a->apark_log_wc = av_gettime_relative();
+        av_log(NULL, AV_LOG_INFO, "[PTV-MV] a%d sound more than %d s ahead of its picture: dropped (%"PRId64" ms so far)\n",
+               a->dbg_k, (int)(PTV_APARK_SPAN_US / 1000000), a->apark_drop_us / 1000);
+    }
+}
+
 static int apark_release(AudioState *a, int all)
 {
     int ret = 0;
     while (a->apark_n > 0) {
         AVFrame *f = a->apark[a->apark_h];
+        int drop = 0;
         if (!all) {
             AVFrame *t   = a->apark[(a->apark_h + a->apark_n - 1) % PTV_APARK];
             int64_t  lim = atomic_load_explicit(a->tl_alim, memory_order_relaxed);
             int64_t  src = av_rescale_q(f->best_effort_timestamp, a->ist_tb, AV_TIME_BASE_Q);
             int64_t  spn = av_rescale_q(t->best_effort_timestamp, a->ist_tb, AV_TIME_BASE_Q) - src;
-            if (src > lim && spn < 30000000 && a->apark_n < PTV_APARK)
+            if (src > lim && spn < PTV_APARK_SPAN_US && a->apark_n < PTV_APARK)
                 break;
+            /* 2.1 T-411 (pre6, the professional pattern): the line is the audio side of the slot's frame sync — as deep
+             * as its picture queue (~5.3 s); full, the OLDEST sound goes (audio follows video), it is not played late
+             * (a 30 s line released the oldest regardless: its picture long gone, the sound out of its place) */
+            drop = src > lim;
         }
         a->apark_h = (a->apark_h + 1) % PTV_APARK;
         a->apark_n--;
-        if (ret >= 0) ret = apark_out(a, f);
+        if (drop)
+            apark_drop_note(a, f);
+        else if (ret >= 0)
+            ret = apark_out(a, f);
         av_frame_free(&f);
     }
     return ret;
@@ -2914,15 +3042,13 @@ static int apark_feed(AudioState *a, AVFrame *f)
         (a->apark_n > 0 ||                           /* frames wait already: in order behind them */
          av_rescale_q(ts, a->ist_tb, AV_TIME_BASE_Q) > atomic_load_explicit(a->tl_alim, memory_order_relaxed))) {
         AVFrame *c = av_frame_clone(f);
-        int ret;
         if (!c) return AVERROR(ENOMEM);
-        if (a->apark_n >= PTV_APARK) {               /* full: the oldest goes out */
+        if (a->apark_n >= PTV_APARK) {               /* full: the oldest goes (T-411 pre6: dropped, not played late) */
             AVFrame *o = a->apark[a->apark_h];
             a->apark_h = (a->apark_h + 1) % PTV_APARK;
             a->apark_n--;
-            ret = apark_out(a, o);
+            apark_drop_note(a, o);
             av_frame_free(&o);
-            if (ret < 0) { av_frame_free(&c); return ret; }
         }
         a->apark[(a->apark_h + a->apark_n) % PTV_APARK] = c;
         a->apark_n++;

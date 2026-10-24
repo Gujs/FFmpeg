@@ -5,6 +5,33 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.1.0-pre6 — 2.1.0-pre5 + the mosaic slot as a professional frame synchronizer: sound placed sample-accurately (T-420), one cut to the live edge (T-411), one rule per behaviour (T-422)
+
+All changes are mosaic-only; single input is as in 2.1.0-pre5.
+
+- **A mosaic slot's sound is placed sample-accurately (T-420).** The slot's sound goes through a short delay line: its place
+  error is taken to the sample — silence written or samples dropped, with a 5 ms fade at the junction — instead of in whole
+  codec frames, which left up to half a frame (10.7 ms at AAC 1024) for good after a re-lock: a 59.94 slot's sound +21..+25 ms
+  after an outage (mv01 gap_20, by content: +24.7 → +5.1 ms). Empty in steady state. A slot's realized lag moves by at most a
+  picture per sample: two source pictures labelled 29 pictures old (RAV slot 1) moved it 30 ms and left its sound −7.5 ms
+  (now −1.6..+0.6 ms). Log: `[PTV-MV] aK sound re-placed ±N ms (lag step|drift; N so far)`, at most once in 10 s.
+- **A decoder that falls behind cuts to the live edge (T-411).** A mosaic slot whose decoder banked more than 2 s drops the
+  backlog to 1 s and resumes at the next keyframe; the compositor cuts the slot once, picture and sound at the same point —
+  instead of decoding the backlog fast (pre5: 2–3 overflow steps in a slot's first minute after a mass restart). Sound that
+  waits for its picture is capped at 6 s (was 30 s) and dropped past it, not played late. Log: `[PTV-MV] inK catch-up: the
+  decoder had N packets banked (~ms) — dropped n, resuming at the next keyframe`, `[PTV-MV] aK sound more than 6 s ahead of
+  its picture: dropped (N ms so far)`.
+- **One rule per behaviour (T-422).** Removed the scenario-only rules: the overflow step's and the decoder catch-up's
+  "first 60 s only" windows, the "this lateness is our own backlog" exception (T-414), and the start-up 5 s depth windows
+  (one 10 s window / 60 s evidence everywhere). A mass restart is just a backlog. Restart repro: one cut per slot, 0 early
+  bars, lip sync −4.9..+0.7 ms; bursts (kit 6 s / 20 s, rav-burst replay) no worse than pre5 (rav-burst bars 11 → 4).
+- **A content hole is not clock drift (T-422).** A slot's slow-clock evidence restarted only after 0.5 s with no picture; a hole
+  the buffer bridged never restarted it, and a source flapping 2 s off / 2 s on was read as a slow clock (+80 ms per
+  minute; once a step landed on a flap, the slot ran dry and its held sound stalled the other slots' audio 130–160 ms). A jump
+  of more than 0.5 s in a slot's content now restarts the 60 s of evidence. A really slow source (RAV slot 0, ~3000 ppm)
+  is still followed (+1.0 s in 9 min, no repeats).
+- TEST-ONLY: `PTV_TEST_MVTRACE=1` traces each slot's lags and each track's place error once a second.
+
 ## 2.1.0-pre5 — 2.1.0-pre4 + output frame-rate options (T-418), a decimated source shows the picture at the tick (T-413), a mosaic restart's catch-up without bars (T-411)
 
 - **Output frame-rate options (T-418).** `-r` takes `source` (the source rate, as before), `auto` (the source rate snapped to

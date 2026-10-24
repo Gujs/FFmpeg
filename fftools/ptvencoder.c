@@ -47,7 +47,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.1.0-pre5"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.1.0-pre6"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -3388,6 +3388,35 @@ static void *decode_thread(void *arg)
             PTV_HB_VDEC(d->hb_slot, PTV_HB_VDEC_QRECV);
             av_usleep((unsigned int)g_test_vdec_stall_us);
         }
+        /* 2.1 T-411 (pre6, the professional pattern: an IRD that falls behind resyncs at the live edge, it never plays its
+         * backlog): a mosaic slot whose decoder banked more than 2 s (whatever the cause — a mass restart, where the box
+         * decodes every channel at once, is just one) drops the backlog down to 1 s — the slot's primed cushion (kept at half a second it
+         * started shallow and the slow-clock rule refilled it in tick steps: picture and sound stepped +67, +33, +33 ms in
+         * its first minute) — and resumes at the next keyframe (the self-heal's deferred decoder reset). The drops count as its queue's overflow, so the compositor cuts the slot's lag ONCE to the
+         * new content, picture and sound at the same point (mv_tl_pick; the sound's delay line). Decoding the backlog
+         * fast-forwarded the slot past its queue instead: the head ahead of its due line, bars every 5.3 s, 2-4 overflow
+         * steps a second apart */
+        if (d->hold && d->live && !d->heal_dropkf && d->in_pps_decl > 0 &&
+            av_thread_message_queue_nb_elems(d->video_q) > 2 * d->in_pps_decl) {
+            AVPacket *sp;
+            int n = 1, q = av_thread_message_queue_nb_elems(d->video_q);
+            av_packet_free(&pkt);                                /* the packet in hand goes too */
+            while (av_thread_message_queue_nb_elems(d->video_q) > d->in_pps_decl &&
+                   av_thread_message_queue_recv(d->video_q, &sp, AV_THREAD_MESSAGE_NONBLOCK) >= 0) {
+                av_packet_free(&sp);
+                n++;
+            }
+            d->heal_dropkf = 1;                                  /* resume at the next keyframe, decoder reset there */
+            d->heal_arm_us = av_gettime_relative();
+            if (d->shed_wall) atomic_store_explicit(d->shed_wall, d->heal_arm_us, memory_order_relaxed);   /* a self-shed: */
+            if (d->shed_cnt)  atomic_fetch_add_explicit(d->shed_cnt, n, memory_order_relaxed);   /* the slot's own stamp */
+            d->hold->framedrop += n;
+            atomic_store_explicit(&d->hold->ovf, d->hold->framedrop, memory_order_release);
+            av_log(NULL, AV_LOG_INFO, "[PTV-MV] in%d catch-up: the decoder had %d packets banked (~%d ms) — dropped %d, "
+                   "resuming at the next keyframe (the slot cuts to the live edge)\n", d->hb_slot, q + 1,
+                   (q + 1) * 1000 / d->in_pps_decl, n);
+            continue;
+        }
         /* 1.0.1-pre8 (c) SELF-HEAL RE-PRIME: the master output thread measured sustained
          * frame_q starvation with input flowing — the decode path is wedged on stale or
          * undecodable backlog. Do what a supervisor restart achieves, in-process: drop the
@@ -6540,6 +6569,7 @@ end:
         swr_free(&as[k].cv_swr);
         av_channel_layout_uninit(&as[k].cv_chl);
         if (as[k].fifo) av_audio_fifo_free(as[k].fifo);
+        if (as[k].af_fifo) av_audio_fifo_free(as[k].af_fifo);   /* 2.1 T-420 */
         avfilter_graph_free(&as[k].afg);
         for (r = 0; r < n_rung; r++)             /* shared encoders are aliased: free once */
             if (as[k].enc_owner[r] == r) avcodec_free_context(&as[k].enc[r]);
