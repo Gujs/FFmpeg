@@ -153,6 +153,16 @@ static int64_t content_index(VideoCtx *v, int64_t src_pts)
     house_us = av_rescale_q(src_pts, v->out_tb, AV_TIME_BASE_Q) - *v->h0;
     house_us -= ptv_rj_off(av_rescale_q(src_pts, v->out_tb, AV_TIME_BASE_Q));   /* 2.0.0-pre6.1 rejoin map */
     if (house_us < 0) house_us = 0;
+    /* 2.1 T-413: a source faster than the house — the decision line half a SOURCE picture past the tick, between two
+     * pictures, never on one. On the nearest-tick line a 2:1 pair puts every second picture ON the half tick, and the first
+     * picture popped for a tick (decimation keeps the first that advances) was the one half a tick early: 59.94 -> 29.97
+     * showed every picture 16.7 ms late, the sound -16.5 ms by content. Now the shown picture is within half a source
+     * period of its tick either way. Not learned / not faster: the nearest tick, as before */
+    if (v->src_per_us > 0 && v->src_per_us < v->tick_dur_us) {
+        if (g_exacttick && v->out_fps.num > 0)
+            return av_rescale_rnd(house_us + v->src_per_us / 2, v->out_fps.num, 1000000LL * v->out_fps.den, AV_ROUND_DOWN);
+        return (house_us + v->src_per_us / 2) / v->tick_dur_us;
+    }
     if (g_exacttick && v->out_fps.num > 0)
         return av_rescale_rnd(house_us, v->out_fps.num, 1000000LL * v->out_fps.den, AV_ROUND_NEAR_INF);
     return (house_us + v->tick_dur_us / 2) / v->tick_dur_us;
@@ -1025,6 +1035,8 @@ void *output_thread(void *arg)
         AVFrame *nextf = NULL;
         int next_have = 0, film_arm = 0, held_extra = 0;
         int slow_arm = 0;                           /* 2.1 T-011: a source slower than the house (>= 1.5 ticks a picture) */
+        int64_t pp_prev = AV_NOPTS_VALUE, pp_t0 = AV_NOPTS_VALUE, pp_min = 0;   /* 2.1 T-413: the period over every */
+        int     pp_n = 0;                           /* picture popped (the learner above sees only the pictures shown) */
         int64_t rate_ref_us = 0, rate_new_wc = 0;   /* T-011: the source cadence on record, and since when it differs */
         int64_t slow_per = 0, slow_min = 0, slow_min_prev = 0, slow_win_wc = 0;   /* T-011: the source period = the
                                                      * shortest picture step in the last 2-4 s (loss only lengthens a step) */
@@ -1092,6 +1104,27 @@ void *output_thread(void *arg)
             int pops = 0, got_eof = 0;
             for (;;) {
                 ret = av_thread_message_queue_recv(v->frame_q, &f, AV_THREAD_MESSAGE_NONBLOCK);
+                if (ret >= 0 && f->pts != AV_NOPTS_VALUE && f->opaque != &ptv_hold_tag) {
+                    /* 2.1 T-413: the source period for content_index()'s decision line = the shortest step of each 2 s
+                     * of CONTENT (every rung pops the same pictures: the same period at the same picture, the rungs
+                     * stamp alike), from 8 steps; steps under 1 ms (a doubled stamp) or over 200 ms (a gap) do not count */
+                    int64_t ps = av_rescale_q(f->pts, v->out_tb, AV_TIME_BASE_Q);
+                    if (pp_prev != AV_NOPTS_VALUE && ps - pp_prev >= 1000 && ps - pp_prev < 200000) {
+                        if (!pp_min || ps - pp_prev < pp_min)
+                            pp_min = ps - pp_prev;
+                        pp_n++;
+                    }
+                    pp_prev = ps;
+                    if (pp_t0 == AV_NOPTS_VALUE || ps < pp_t0)
+                        pp_t0 = ps;
+                    else if (ps - pp_t0 >= 2000000) {
+                        if (pp_n >= 8)
+                            v->src_per_us = pp_min;
+                        pp_min = 0;
+                        pp_n   = 0;
+                        pp_t0  = ps;
+                    }
+                }
                 if (ret >= 0 && g_vgapfill && have && f->opaque != &ptv_hold_tag) {
                     /* 2.0.0-pre9.4 (T-083): a content gap INSIDE frame_q (frames lost or corrupt-discarded at the
                      * source — the demux already re-maps relabels: DISCONT < 1 s, LAYERA > 1 s) used to be leapt:
@@ -1211,8 +1244,10 @@ void *output_thread(void *arg)
                 }
                 slow_per = slow_min && slow_min_prev ? FFMIN(slow_min, slow_min_prev) : FFMAX(slow_min, slow_min_prev);
                 damaged  = slow_dmg_wc && nw - slow_dmg_wc < 5000000;
-                if (!slow_arm && !damaged && slow_per >= v->tick_dur_us * 3 / 2)
+                if (!slow_arm && !damaged && slow_per >= v->tick_dur_us * 3 / 2) {
                     slow_arm = 1;
+                    v->src_per_us = 0;              /* T-413: a slower source — the nearest tick again */
+                }
                 else if (slow_arm && (damaged || slow_per <= v->tick_dur_us * 5 / 4))
                     slow_arm = 0;
                 if (damaged)

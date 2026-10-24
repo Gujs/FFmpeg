@@ -200,6 +200,7 @@ typedef struct DlvGate {
 
 #define PTV_MAX_RUNG 8
 #define PTV_MAX_AUDIO 8    /* max transcoded audio output tracks (multi-language, multiview slots) */
+#define PTV_APARK 2048      /* per-track parked decoded frames (mosaic sound bound): ~43 s of 21 ms frames */
 #define PTV_AQ_PREROLL 1024 /* per-track pre-h0 audio buffer (frames, ~21s @47fps): preserve a slot's audio head
                             * while its video decodes its first frame (sets h0), instead of dropping
                             * it (which made that slot's audio start ~h0-acquire-delay late). Bounded
@@ -461,6 +462,7 @@ typedef struct VideoHold {
     int             eof;       /* decode terminated for this input (terminal) */
     _Atomic int64_t newest_pts;   /* 2.1 T-414: source pts of the newest picture queued (AV_NOPTS_VALUE: none yet) */
     _Atomic int     depth_cap;    /* 2.1 T-414: pictures kept at most (0: the queue's own capacity) — set by the compositor */
+    _Atomic int64_t ovf;          /* 2.1 T-411/T-414: pictures the full queue dropped so far (framedrop, published) */
 } VideoHold;
 
 /* ---- EIA-608 closed captions -> DVB-teletext subtitles (opt-in: -cc_extract) ----
@@ -874,6 +876,8 @@ typedef struct VideoCtx {
     const int64_t   *framedrop_src;  /* 2.0.0-pre9.6: single input — the decode thread's drop-oldest count for this rung
                                       * (push_frame_q counts there; VideoCtx->framedrop was never written: drop= read 0) */
     int64_t          decim;          /* v0.9.15.2: surplus frames decimated by content mapping (>house-rate source) */
+    int64_t          src_per_us;     /* 2.1 T-413: the source's picture period (shortest step of a 2 s content window, every
+                                      * picture popped; 0 = not learned) — content_index()'s decision line for a faster source */
     /* watchdog */
     int64_t          last_emit_us;
     volatile int     output_done;
@@ -1308,6 +1312,10 @@ typedef struct AudioState {
     int              res_follow_n;                /* 2.0.2 T-343: [PTV-RESFOLLOW] lines logged */
     _Atomic int64_t *tl_lag;                      /* 2.1 T-409: its slot's realized picture lag (mosaic frame sync), */
     _Atomic int64_t *tl_nlag, *tl_at, *tl_ahead;  /* the lag after a boundary, the boundary, the sound's head */
+    _Atomic int64_t *tl_alim;                     /* ... the sound's content bound (mosaic): decoded frames past it park */
+    _Atomic int64_t *tl_skip;                     /* ... content the picture skipped before the boundary (dropped) */
+    AVFrame         *apark[PTV_APARK];            /* ... the parked frames (FIFO ring), oldest at apark_h */
+    int              apark_h, apark_n;
 } AudioState;
 
 /* ---- demux + mux ---- */
@@ -1661,6 +1669,10 @@ typedef struct Input {
     _Atomic int64_t       tl_nlag_us;        /* ... the lag from tl_at_us on (a step scheduled at a content boundary) */
     _Atomic int64_t       tl_at_us;          /* ... that boundary (source time, us; INT64_MAX = none pending) */
     _Atomic int64_t       tl_ahead_us;       /* ... the newest content the slot's sound has been placed for (us) */
+    _Atomic int64_t       tl_skip_us;        /* ... an overflow step: the content from here to the boundary is gone
+                                              * from the picture (us; INT64_MAX = none) — the sound drops it too */
+    _Atomic int64_t       tl_alim_us;        /* ... the newest content the sound MAY place (us; INT64_MAX = no bound):
+                                              * the shown picture + the primed margin + 1 s while the cell advances */
     int                   deferred;          /* 2.0.2 T-386: not live at the mosaic start — placeholder cell, silent
                                               * audio track, binds when its source arrives */
     int                   geom_w, geom_h, geom_fmt;   /* ... the cell geometry it takes (the first live sibling's) */

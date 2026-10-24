@@ -47,7 +47,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.1.0-pre4"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.1.0-pre5"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -3081,6 +3081,7 @@ static void stage_hold(VideoHold *h, int live, AVFrame *frame)
     if (nf->pts != AV_NOPTS_VALUE)
         atomic_store_explicit(&h->newest_pts, nf->pts, memory_order_relaxed);
     push_frame_q(h->q, live, &h->framedrop, nf);    /* drop-oldest in live; consumes nf */
+    atomic_store_explicit(&h->ovf, h->framedrop, memory_order_release);   /* the compositor reads the drops (mv_tl_pick) */
     pthread_mutex_lock(&h->lock);
     h->wall_us = av_gettime_relative();
     pthread_mutex_unlock(&h->lock);
@@ -5091,6 +5092,49 @@ static int pid_plan_apply(const PidPlan *p, PidEnt *ent, int n, Rung *rung, int 
                        : pid_plan_apply_v1(p, ent, n, rung, n_rung);
 }
 
+/* 2.1 T-418: the output (house) rate from -r. src = the source's FRAME rate (an interlaced source: its frame rate, 25 for
+ * 1080i25), interlaced = the source codes fields.
+ *   (unset) / source  the source rate (2.0 behaviour)
+ *   auto              the source rate snapped to the nearest standard rate within 2 % (a 25.02 stream -> 25); else the source
+ *   <rate>            exact (the frame synchronizer converts)
+ *   max:<rate>        the source rate divided by the smallest integer that brings it to <rate> or below (0.2 % slack:
+ *                     max:29.97 keeps a 30 source): max:30 = 59.94 -> 29.97, 60 -> 30, 50 -> 25, 25 / 29.97 untouched
+ *   field             with a field-rate deinterlacer in the video chain (field_deint: bwdif mode=send_field), twice the
+ *                     frame rate (25i -> 50, 29.97i -> 59.94) unless the source is known progressive — an UNKNOWN field
+ *                     order counts as interlaced: a probe that joins mid-GOP decodes no picture and leaves it unknown
+ *                     (Cinestar 1080i25: 50 deinterlaced pictures a second into a 25 house, every second one dropped,
+ *                     lip sync -44 ms). Without one, the source rate (doubling it would only show each picture twice)
+ * The rate is chosen once at start; a source that changes its rate mid-run is converted to it. */
+static int resolve_out_rate(const char *opt, AVRational src, enum AVFieldOrder fo, int field_deint, AVRational *out)
+{
+    static const AVRational std_rates[] = { { 24000, 1001 }, { 24, 1 }, { 25, 1 }, { 30000, 1001 }, { 30, 1 },
+                                            { 50, 1 }, { 60000, 1001 }, { 60, 1 } };
+    double s = av_q2d(src);
+    if (!opt || !strcmp(opt, "source")) {
+        *out = src;
+    } else if (!strcmp(opt, "auto")) {
+        double best = 0.02;
+        *out = src;
+        for (int i = 0; i < FF_ARRAY_ELEMS(std_rates); i++) {
+            double d = fabs(s / av_q2d(std_rates[i]) - 1.0);
+            if (d < best) { best = d; *out = std_rates[i]; }
+        }
+    } else if (!strncmp(opt, "max:", 4)) {
+        AVRational cap;
+        int n = 1;
+        if (av_parse_video_rate(&cap, opt + 4) < 0 || cap.num <= 0)
+            return AVERROR(EINVAL);
+        while (s / n > av_q2d(cap) * 1.002)
+            n++;
+        *out = av_div_q(src, (AVRational){ n, 1 });
+    } else if (!strcmp(opt, "field")) {
+        *out = field_deint && fo != AV_FIELD_PROGRESSIVE ? av_mul_q(src, (AVRational){ 2, 1 }) : src;
+    } else if (av_parse_video_rate(out, opt) < 0 || out->num <= 0) {
+        return AVERROR(EINVAL);
+    }
+    return 0;
+}
+
 /* transcode: ins = parsed input group list (1/2/4 inputs; >1 = multiview);
  * outs = the list of output groups (one per ABR rung); fcomplex = the shared
  * -filter_complex. The ffmpeg model — decode each input once, one filter graph
@@ -5308,6 +5352,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
             av_thread_message_queue_set_free_func(inputs[k].hold.q, free_frame_msg);
             atomic_store(&inputs[k].hold.newest_pts, AV_NOPTS_VALUE);
             atomic_store(&inputs[k].hold.depth_cap, 64);   /* T-414: capped from go-live until the compose sets its own */
+            atomic_store(&inputs[k].tl_alim_us, INT64_MAX);
+            atomic_store(&inputs[k].tl_skip_us, INT64_MAX);
         }
         /* Take raw 33-bit timestamps; demux_unwrap extends them (libav's
          * correct_ts_overflow extends inconsistently across the B-frame reorder). */
@@ -5478,17 +5524,30 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
      * r_frame_rate is the FIELD rate (e.g. 1080i25 -> 50), but the decoder/
      * deinterlacer emits one frame per coded frame (25), so a 50-fps house clock
      * would tick twice per delivered frame -> ~50% duplicates (judder). Force a
-     * specific rate (incl. field-doubling deint) with -r. */
+     * specific rate (incl. field-doubling deint) with -r. 2.1 T-418: -r also takes
+     * source / auto / max:<rate> / field (resolve_out_rate). */
     {
         const char *rate_str = og_get(&outs->groups[0], "r");
-        if (rate_str) {
-            if (av_parse_video_rate(&out_fps, rate_str) < 0 || out_fps.num <= 0) {
-                av_log(NULL, AV_LOG_ERROR, "bad -r '%s'\n", rate_str); ret = AVERROR(EINVAL); goto end;
-            }
-        } else {
-            out_fps = vist->avg_frame_rate.num ? vist->avg_frame_rate
-                    : vist->r_frame_rate.num ? vist->r_frame_rate : (AVRational){25, 1};
+        AVRational src_fps = vist->avg_frame_rate.num ? vist->avg_frame_rate
+                           : vist->r_frame_rate.num ? vist->r_frame_rate : (AVRational){25, 1};
+        enum AVFieldOrder fo = vist->codecpar->field_order;
+        const char *vchain = fcomplex ? fcomplex : sel[0].vf;
+        int fdeint = vchain && (strstr(vchain, "send_field") ||   /* bwdif / yadif (+ _cuda) in field mode */
+                                (strstr(vchain, "dif") && strstr(vchain, "mode=1")));
+        int isfield = rate_str && !strcmp(rate_str, "field");
+        const char *tsf = getenv("PTV_TEST_SRC_FPS");   /* TEST-ONLY: the probed source rate (a probe's odd reading) */
+        if (tsf && av_parse_video_rate(&src_fps, tsf) < 0)
+            src_fps = (AVRational){ 25, 1 };
+        if (resolve_out_rate(rate_str, src_fps, fo, fdeint, &out_fps) < 0) {
+            av_log(NULL, AV_LOG_ERROR, "bad -r '%s' (source|auto|<rate>|max:<rate>|field)\n", rate_str);
+            ret = AVERROR(EINVAL); goto end;
         }
+        av_log(NULL, AV_LOG_INFO, "[PTV-RATE] output %d/%d (%.3f fps): -r %s, source %d/%d (%.3f fps, %s)%s\n",
+               out_fps.num, out_fps.den, av_q2d(out_fps), rate_str ? rate_str : "(source)",
+               src_fps.num, src_fps.den, av_q2d(src_fps),
+               fo == AV_FIELD_PROGRESSIVE ? "progressive" : fo == AV_FIELD_UNKNOWN ? "field order unknown" : "interlaced",
+               isfield && !fdeint ? " — no field-rate deinterlacer in the video chain (bwdif mode=send_field): the source rate"
+                                  : "");
     }
 
     /* CUDA backend when the filter graph targets it (filter_complex or single -vf).
@@ -6173,6 +6232,10 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         vc->out_tb = filtering ? av_buffersink_get_time_base(vsink[r]) : inputs[0].ist_tb;
         vc->tick_dur_us = av_rescale(1000000, out_fps.den, out_fps.num);
         vc->out_fps = out_fps;                       /* EXACTTICK: exact rational for content-index stamping */
+        /* 2.1 T-413: a source faster than the house starts with its probed period (content_index()'s decision line;
+         * the learner replaces it after 2 s of content) — the first ticks already show the picture at the tick */
+        if (!multiview && vist->avg_frame_rate.num > 0 && av_cmp_q(vist->avg_frame_rate, out_fps) > 0)
+            vc->src_per_us = av_rescale(1000000, vist->avg_frame_rate.den, vist->avg_frame_rate.num);
         vc->live = live; vc->passthrough = multiview;
         vc->h0 = &inputs[0].h0; vc->h0_lock = &inputs[0].h0_lock;
         vc->house_skew = &inputs[0].house_skew;
@@ -6230,6 +6293,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         as[k].tl_nlag    = n_input > 1 ? &inputs[asrc_in[k]].tl_nlag_us : NULL;
         as[k].tl_at      = n_input > 1 ? &inputs[asrc_in[k]].tl_at_us : NULL;
         as[k].tl_ahead   = n_input > 1 ? &inputs[asrc_in[k]].tl_ahead_us : NULL;
+        as[k].tl_alim    = n_input > 1 ? &inputs[asrc_in[k]].tl_alim_us : NULL;
+        as[k].tl_skip    = n_input > 1 ? &inputs[asrc_in[k]].tl_skip_us : NULL;
         if (n_input > 1)
             atomic_store_explicit(&inputs[asrc_in[k]].tl_at_us, INT64_MAX, memory_order_relaxed);
         as[k].house_lag_true = (n_input > 1) ? &inputs[asrc_in[k]].house_lag_true : NULL;  /* multiview: true lag; single: NULL→house_skew */
