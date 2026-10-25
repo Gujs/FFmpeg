@@ -2648,8 +2648,14 @@ static void slot_bind_audio(AudioState *a, AVPacket *pkt)
     a->ist_tb = a->ist_pkt_tb = b->tb;
     if (a->ist_par)
         avcodec_parameters_copy(a->ist_par, b->par);
-    av_log(NULL, AV_LOG_INFO, "[PTV-BIND] a%d(in%d) decoder %s %d Hz %dch open — silence until its first frame anchors\n",
-           a->dbg_k, a->dbg_in, c->name, b->par->sample_rate, b->par->ch_layout.nb_channels);
+    if (a->pts_set) {   /* 2.2 T-427: a re-bind of a live track — same source clock, the timing carries on */
+        a->dec_ts_carry = AV_NOPTS_VALUE;
+        a->wd_pkts      = 0;
+        av_log(NULL, AV_LOG_INFO, "[PTV-BIND] a%d(in%d) decoder %s %d Hz %dch open — the track continues from it\n",
+               a->dbg_k, a->dbg_in, c->name, b->par->sample_rate, b->par->ch_layout.nb_channels);
+    } else
+        av_log(NULL, AV_LOG_INFO, "[PTV-BIND] a%d(in%d) decoder %s %d Hz %dch open — silence until its first frame anchors\n",
+               a->dbg_k, a->dbg_in, c->name, b->par->sample_rate, b->par->ch_layout.nb_channels);
     nc = NULL;
 done:
     avcodec_free_context(&nc);

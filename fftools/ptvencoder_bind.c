@@ -191,13 +191,10 @@ static const char *kind_name(int k)
     return n[k];
 }
 
-int ptv_bind_audio(const AVFormatContext *f, int fidx, const PtvBindRule *r, int mosaic,
-                   PtvBindPick *out, int max, int verbose)
+/* every audio stream of f as a candidate, relabelled (§7.1 step 1) */
+static int candidates(const AVFormatContext *f, int fidx, Cand *c, int verbose)
 {
-    Cand c[64];
-    const Cand *sel[64];
-    int i, n = 0, ns = 0, rel = 0;
-
+    int i, n = 0, rel = 0;
     for (i = 0; i < (int)f->nb_streams && n < 64; i++) {
         const AVStream *st = f->streams[i];
         const AVDictionaryEntry *lg;
@@ -217,6 +214,34 @@ int ptv_bind_audio(const AVFormatContext *f, int fidx, const PtvBindRule *r, int
         x->pref   = codec_pref(st->codecpar->codec_id);
     }
     relabel(c, n, f, fidx, verbose);
+    return n;
+}
+
+int ptv_bind_ident(const AVFormatContext *f, int fidx, int si, char *lang, int *role)
+{
+    Cand c[64];
+    int i, n = candidates(f, fidx, c, 0);
+    for (i = 0; i < n; i++)
+        if (c[i].si == si) {
+            av_strlcpy(lang, c[i].lang, 8);
+            *role = c[i].role;
+            return 0;
+        }
+    return AVERROR(EINVAL);
+}
+
+int ptv_bind_audio(const AVFormatContext *f, int fidx, const PtvBindRule *r, int mosaic,
+                   PtvBindPick *out, int max, int verbose)
+{
+    return ptv_bind_audio_in(f, fidx, r, mosaic, 0, NULL, 0, out, max, verbose);
+}
+
+int ptv_bind_audio_in(const AVFormatContext *f, int fidx, const PtvBindRule *r, int mosaic,
+                      uint64_t present, const char *id_lang, int id_role, PtvBindPick *out, int max, int verbose)
+{
+    Cand c[64];
+    const Cand *sel[64];
+    int i, n = candidates(f, fidx, c, verbose), ns = 0;
 
     if (r->kind == PTV_BIND_PID || r->kind == PTV_BIND_INDEX) {   /* static pins: no roles, no dedup */
         int v = r->kind == PTV_BIND_PID ? (int)strtol(r->arg, NULL, 0) : atoi(r->arg);
@@ -230,6 +255,8 @@ int ptv_bind_audio(const AVFormatContext *f, int fidx, const PtvBindRule *r, int
             const char *want = r->kind == PTV_BIND_LANG ? r->arg : r->lang;
             if (c[i].ad && ((st->disposition & AV_DISPOSITION_DEPENDENT) || mosaic)) continue;
             if (want && strcmp(c[i].lang, want)) continue;
+            if (present && (c[i].si >= 64 || !(present >> c[i].si & 1))) continue;   /* a re-bind: what is there now */
+            if (id_lang && (strcmp(c[i].lang, id_lang) || c[i].role != id_role)) continue;   /* ... in its group */
             c[m++] = c[i];
         }
         n = m;

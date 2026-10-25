@@ -1611,6 +1611,9 @@ typedef struct DemuxArgs {
     VOutRing             *mv_vring;         /* 2.0.0 T-342: multiview — this slot's displayed content ring (sparse copies) */
     struct Input    *in;                      /* 2.0.2 T-386: its input (a deferred slot acquires + binds here) */
     char             abind[PTV_MAX_AUDIO][128];  /* ... each track's -map specifier, resolved at the bind */
+    char             aid_lang[PTV_MAX_AUDIO][8];  /* 2.2 T-427: a rule track's identity (relabelled language + role), from */
+    int              aid_role[PTV_MAX_AUDIO];     /* ... its first bind: a re-bind stays inside it (spec D36) */
+    unsigned         aid_set, a_orphan;           /* ... identity taken (bit j); nothing in its group logged (bit j) */
     int64_t               dmg_keep_n;     /* 2.0.2 T-402: video backward steps after corrupt discards left unabsorbed */
     int64_t               dmg_keep_log_us; /* ... its log rate limit (10 s) */
 } DemuxArgs;
@@ -1950,6 +1953,12 @@ int ptv_bind_parse(const char *spec, PtvBindRule *r);
 /* the rule's source streams on input f (index fidx), at most max; mosaic = never audio description */
 int ptv_bind_audio(const AVFormatContext *f, int fidx, const PtvBindRule *r, int mosaic,
                    PtvBindPick *out, int max, int verbose);
+/* the same on the streams in present (bit = stream index; 0 = all) of one language + role group (id_lang NULL = any): a
+ * re-bind (spec D36: loose within the language + role, never across) */
+int ptv_bind_audio_in(const AVFormatContext *f, int fidx, const PtvBindRule *r, int mosaic, uint64_t present,
+                      const char *id_lang, int id_role, PtvBindPick *out, int max, int verbose);
+/* stream si's relabelled language (8 bytes) and role flags: a rule track's identity, taken at its first bind */
+int ptv_bind_ident(const AVFormatContext *f, int fidx, int si, char *lang, int *role);
 extern const char *g_audio_lang_override, *g_audio_codec_pref;
 extern int         g_audio_dedup, g_audio_dedup_chan_strict;
 /* 2.0.0-pre4: an input-0 hold is in progress and acted on (single input only) */

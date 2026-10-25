@@ -7011,7 +7011,7 @@ static int resolve_plan(Input *inputs, int n_input, OptionGroup *outg, Sel *s, i
                 if (s->n_aout >= PTV_MAX_AUDIO) break;
                 a = &s->aout[s->n_aout++];
                 a->input = fidx; a->stream = pk[j].stream; a->deferred = def;
-                if (def) av_strlcpy(a->bind_spec, spec, sizeof a->bind_spec);
+                av_strlcpy(a->bind_spec, spec, sizeof a->bind_spec);   /* the slot's bind / a re-bind (T-427) */
                 a->aenc   = codec;
                 a->abr    = br->b ? br->b : og_spec(outg, "b", 'a', -1);
                 a->filter = br->af ? br->af : og_spec(outg, "filter", 'a', -1);
