@@ -1273,6 +1273,30 @@ static int src_tail_more(const AVStream *vst, int64_t raw, int64_t ref)
  * write stays on its owner thread). A later outage of the slot takes the normal reopen. */
 static int audio_bind_send(DemuxArgs *d, int j, int si);
 
+/* the video decoder for f's stream vs, handed to the decode thread ahead of the stream's next packet (a deferred slot's
+ * first bind; 2.2 T-428 a codec change on the bound stream) */
+static int video_bind_send(DemuxArgs *d, AVFormatContext *f, int vs)
+{
+    AVPacket *bp = av_packet_alloc();
+    PtvSlotBind *b = av_mallocz(sizeof(*b));
+    if (!bp || !b || !(b->par = avcodec_parameters_alloc()) ||
+        avcodec_parameters_copy(b->par, f->streams[vs]->codecpar) < 0) {
+        if (b) avcodec_parameters_free(&b->par);
+        av_free(b); av_packet_free(&bp);
+        return AVERROR(ENOMEM);
+    }
+    b->tb  = f->streams[vs]->time_base;
+    b->avg = f->streams[vs]->avg_frame_rate;
+    bp->opaque = b;
+    bp->flags |= PTV_PKT_FLAG_SLOT_BIND;
+    if (av_thread_message_queue_send(d->video_q, &bp, 0) < 0) {
+        avcodec_parameters_free(&b->par); av_free(b); av_packet_free(&bp);
+        return AVERROR_EXIT;
+    }
+    d->vcodec = f->streams[vs]->codecpar->codec_id;
+    return 0;
+}
+
 static int slot_bind(DemuxArgs *d)
 {
     struct Input *in = d->in;
@@ -1340,22 +1364,9 @@ static int slot_bind(DemuxArgs *d)
         }
     }
     {   /* video last: the decoder opens before the first packet of the slot reaches it */
-        AVPacket *bp = av_packet_alloc();
-        PtvSlotBind *b = av_mallocz(sizeof(*b));
-        if (!bp || !b || !(b->par = avcodec_parameters_alloc()) ||
-            avcodec_parameters_copy(b->par, f->streams[vs]->codecpar) < 0) {
-            if (b) avcodec_parameters_free(&b->par);
-            av_free(b); av_packet_free(&bp);
-            return AVERROR(ENOMEM);
-        }
-        b->tb  = f->streams[vs]->time_base;
-        b->avg = f->streams[vs]->avg_frame_rate;
-        bp->opaque = b;
-        bp->flags |= PTV_PKT_FLAG_SLOT_BIND;
-        if (av_thread_message_queue_send(d->video_q, &bp, 0) < 0) {
-            avcodec_parameters_free(&b->par); av_free(b); av_packet_free(&bp);
-            return AVERROR_EXIT;
-        }
+        int r = video_bind_send(d, f, vs);
+        if (r < 0)
+            return r;
     }
     d->ifmt = f;                                     /* *d->ifmt_home == in->ifmt already (the acquire set it) */
     av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in%d WAITING → LIVE: slot %d joins the mosaic\n", d->rsync_slot, d->rsync_slot);
@@ -1780,6 +1791,21 @@ void *demux_thread(void *arg)
         {
             int64_t pnow = av_gettime_relative();
             if (pkt->stream_index == d->vstream) {
+                /* 2.2 T-428 (spec §6): a PMT update changed the video codec on the same PID (lavf rewrites the stream's
+                 * codec in place): the decoder is swapped before this packet, the picture resumes at the new codec's next
+                 * keyframe (repeated until then). Was: the old decoder fed the new codec — frozen for as long as it lasted */
+                enum AVCodecID vc = d->ifmt->streams[d->vstream]->codecpar->codec_id;
+                if (!d->vcodec)
+                    d->vcodec = vc;
+                else if (vc != d->vcodec && vc != AV_CODEC_ID_NONE) {
+                    enum AVCodecID was = d->vcodec;
+                    if (video_bind_send(d, d->ifmt, d->vstream) >= 0)
+                        av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in%d video codec %s → %s on pid 0x%x — decoder swapped, the "
+                               "picture resumes at the next keyframe\n", d->rsync_slot > 0 ? d->rsync_slot : 0,
+                               avcodec_get_name(was), avcodec_get_name(vc), d->ifmt->streams[d->vstream]->id);
+                    else
+                        d->vcodec = vc;                  /* the swap failed: do not retry on every packet */
+                }
                 if (pnow - d->v_last_wc > 1000000)
                     d->v_flow_wc = pnow;             /* T-003: silence counts only while the video flows */
                 d->v_last_wc = pnow;                 /* 2.0.2 T-387 */
