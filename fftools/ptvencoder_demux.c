@@ -1484,6 +1484,7 @@ static int audio_bind_send(DemuxArgs *d, int j, int si)
         return AVERROR(EAGAIN);
     }
     d->astream[j] = si;
+    d->acodec[j]  = f->streams[si]->codecpar->codec_id;
     return 0;
 }
 
@@ -1808,6 +1809,25 @@ void *demux_thread(void *arg)
                 }
                 if (pnow - d->v_last_wc > 1000000)
                     d->v_flow_wc = pnow;             /* T-003: silence counts only while the video flows */
+            } else {
+                int j;   /* 2.2 T-428: the same for a transcoded audio track's stream (mp2 -> aac on one PID: was silent) */
+                for (j = 0; j < d->n_audio && j < PTV_MAX_AUDIO; j++) {
+                    enum AVCodecID ac;
+                    if (d->astream[j] != pkt->stream_index)
+                        continue;
+                    ac = d->ifmt->streams[pkt->stream_index]->codecpar->codec_id;
+                    if (!d->acodec[j])
+                        d->acodec[j] = ac;
+                    else if (ac != d->acodec[j] && ac != AV_CODEC_ID_NONE) {
+                        enum AVCodecID was = d->acodec[j];
+                        if (audio_bind_send(d, j, pkt->stream_index) >= 0)
+                            av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in%d audio track %d: codec %s → %s on pid 0x%x — decoder "
+                                   "swapped, the track continues from it\n", d->rsync_slot > 0 ? d->rsync_slot : 0, j,
+                                   avcodec_get_name(was), avcodec_get_name(ac), d->ifmt->streams[pkt->stream_index]->id);
+                        else
+                            d->acodec[j] = ac;           /* the swap failed: do not retry on every packet */
+                    }
+                }
                 d->v_last_wc = pnow;                 /* 2.0.2 T-387 */
             }
             if (pnow - d->src_chk_wc >= 1000000 || pmt_moved(d))   /* T-003: any stream — a PMT update can move the video

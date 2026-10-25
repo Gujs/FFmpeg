@@ -1478,6 +1478,7 @@ typedef struct DemuxArgs {
     int                   late_stream_max; /* 1.2.2 T-064: highest late-born stream index logged */
     int64_t               short_wc;        /* 2.1 T-424: a reopen first came back with fewer streams (wall), 0 = no */
     enum AVCodecID        vcodec;          /* 2.2 T-428: the codec the video decoder runs (a PMT change swaps it) */
+    enum AVCodecID        acodec[PTV_MAX_AUDIO];   /* ... and each audio track's decoder */
     int64_t               v_last_wc;      /* 2.0.2 T-387: wall time of the last packet of the bound video stream */
     int                   vmove_n;        /* ... video packets of a late-born video stream while the bound one is silent */
     int                   vmove_force;    /* ... the video moved to a new PID: reopen now (single input: -> exit 4) */
