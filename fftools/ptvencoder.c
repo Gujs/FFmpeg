@@ -4355,9 +4355,10 @@ static int is_net_url(const char *u)
 static const char *g_start_on   = "video";
 static int         g_start_on_set;               /* 2.0.2 T-386: -start_on given (a mosaic's default is any) */
 static int64_t     g_wait_input_us;              /* 0 = wait forever */
-static int64_t     g_slot_wait_us = 10000000;    /* 2.0.2 T-386: mosaic -slot_wait (0 = inf); spec §4. 2.2 T-425: 120 s → 10 s —
+static int64_t     g_slot_wait_us = 3000000;     /* 2.0.2 T-386: mosaic -slot_wait (0 = inf); spec §4. 2.2 T-425: 120 s → 3 s —
                                                   * a dead slot kept the whole mosaic dark 2 min (cor-3 Curiosity 2x2, pre7
-                                                  * deploy: slot 2's source down); healthy slots go LIVE within ~1 s */
+                                                  * deploy: slot 2's source down). A multiview's tiles are independent: wait
+                                                  * only as long as a healthy slot takes (canaries 0.8-1.9 s, kit 1.8-2.5 s) */
 static int64_t     g_regulate_us;                /* 2.2 T-423: -regulate (0 = off) */
 static _Atomic int g_mv_acq_go;                  /* 2.0.2 T-386: the mosaic starts — live slots stop draining */
 int                g_backoff_s[8] = { 1, 2, 5, 10, 30 };   /* also the 2.0.0-pre5 reopen backoff */
@@ -6634,7 +6635,7 @@ static const OptionDef ptv_options[] = {
     { "filter_hw_device", OPT_TYPE_STRING, 0,                        { .off = 0 }, "filter hw device", "name" },
     { "filter_complex",   OPT_TYPE_STRING, 0,                        { .off = 0 }, "filtergraph", "graph" },
     { "start_on",         OPT_TYPE_STRING, 0,                        { .off = 0 }, "when outputs start: video (single input), any|all (mosaic, default any; now comes in 2.1)", "when" },
-    { "slot_wait",        OPT_TYPE_STRING, 0,                        { .off = 0 }, "mosaic: wait this long for every slot, then start with the live ones (default 10s; inf)", "dur" },
+    { "slot_wait",        OPT_TYPE_STRING, 0,                        { .off = 0 }, "mosaic: wait this long for every slot, then start with the live ones (default 3s; inf)", "dur" },
     { "regulate",         OPT_TYPE_STRING, 0,                        { .off = 0 }, "read every udp:// input at its PCR time + this delay (absorbs burst-and-gap delivery; default off)", "dur" },
     { "wait_input",       OPT_TYPE_STRING, 0,                        { .off = 0 }, "give up if the input has no video after this long (default inf)", "dur" },
     { "stall_min",        OPT_TYPE_STRING, 0,                        { .off = 0 }, "content gone + input silent this long = STALLED (default 3s)", "dur" },

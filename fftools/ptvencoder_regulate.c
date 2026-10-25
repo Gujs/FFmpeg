@@ -75,6 +75,7 @@ typedef struct Regulator {
     /* the schedule (reader thread only) */
     int             pcr_pid;
     int64_t         anchor_t, acc, last_pcr, last_due;
+    int64_t         first_wc;                       /* the first packet before any PCR (wall), 0 = said / done */
 } Regulator;
 
 static Regulator  *regs[PTV_MAX_INPUT];
@@ -181,8 +182,14 @@ static void *reg_reader(void *arg)
                     reg_schedule(r, pcr, now);
                     due = r->last_due;
                 }
-                if (due == AV_NOPTS_VALUE)
+                if (due == AV_NOPTS_VALUE) {
                     due = now + r->delay;           /* before the first PCR: held by D */
+                    r->first_wc = now;
+                } else if (r->pcr_pid < 0 && r->first_wc && now - r->first_wc > 5000000) {
+                    r->first_wc = 0;                /* no PCR to schedule by: passed through after D, said once */
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-REG] in%d no PCR in 5 s — passing the input through (delayed "
+                           "%.1f s, not regulated)\n", r->k, r->delay / 1e6);
+                }
                 memcpy(dg + dl, p, 188);
                 dl += 188;
                 if (dl == REG_DGRAM) {
