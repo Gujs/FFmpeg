@@ -5,6 +5,24 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.1.0-pre7 — 2.1.0-pre6 + a mosaic slot follows clock drift one picture at a time (T-422), a source that returns incomplete is retried, not restarted (T-424)
+
+The last 2.1 pre-release (owner 2026-10-24: 2.1 closes after pre7; binder / ladder → 2.2).
+
+- **A mosaic slot follows a source clock that differs from the house one picture at a time (T-422).** A source faster than
+  the house was followed by the unused-latency rule: once 60 s never went below the primed depth + 2 ticks it cut the whole
+  excess in one step and then waited 60 s of fresh evidence — cor-3 RAV slot 0 (~140 ppm fast) cut −83…−116 ms of picture
+  and sound every 10–15 min on pre5. Now, as a frame sync: one picture dropped per 10 s window, the history kept (the mirror
+  of the slow-clock rule, which already repeats one picture at a time); one cut only past twice the primed depth (a backlog,
+  not a clock). A slot 1000 ppm fast: pre6 7 cuts of 100–167 ms in 12 min → 16 one-picture steps (−33.4 ms), no re-lock; a
+  ~3000 ppm slow slot (RAV slot 0 replay) followed as before (+1.0 s in 9 min, no repeats).
+- **A single input that comes back incomplete is retried, not restarted (T-424).** A source that returns after a loss with
+  fewer streams than at the start, the ones there as before (type, PID, language, video codec / size), is not complete yet:
+  the reopen retries; still short after 10 s it is a real change (exit 4 for a re-probe, as before). cor-3 Fintech_247
+  (~1/day): the provider's encoder restart came back with video + audio and its SCTE-35 PID a moment later — read as
+  reshaped, the channel restarted for ~40 s dark and the re-probe found the same three streams. Log: `[PTV-SRC] in0 came
+  back incomplete (N of M streams, the ones there as before) — retrying for up to 10 s before calling it reshaped`.
+
 ## 2.1.0-pre6 — 2.1.0-pre5 + the mosaic slot as a professional frame synchronizer: sound placed sample-accurately (T-420), one cut to the live edge (T-411), one rule per behaviour (T-422)
 
 All changes are mosaic-only; single input is as in 2.1.0-pre5.
