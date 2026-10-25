@@ -1190,9 +1190,9 @@ static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const ReopenShape *o
     nb = nf->nb_streams;
     while (nb > old_nb && nf->streams[nb - 1]->codecpar->codec_id == AV_CODEC_ID_EPG)
         nb--;
-    if (nb != old_nb)
+    if (nb > old_nb || (nb < old_nb && !d->single))
         goto bad;
-    for (i = 0; i < old_nb; i++) {
+    for (i = 0; i < nb; i++) {
         ReopenShape now;
         reopen_shape_fill(&now, nf->streams[i]);
         if (now.type != old[i].type)
@@ -1204,6 +1204,22 @@ static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const ReopenShape *o
                (now.w && old[i].w && (now.w != old[i].w || now.h != old[i].h))))))
             goto bad;
     }
+    /* 2.1 T-424: fewer streams, the ones there as before = the source is not complete yet, not reshaped. A provider's
+     * encoder restart came back with video + audio and its SCTE-35 PID a moment later (cor-3 Fintech_247, ~1/day): read
+     * as RESHAPED, exit 4, the wrapper's re-probe found the same three streams — ~40 s dark for nothing. Retried as a
+     * failed attempt; still short after 10 s = a real change (exit 4 as before) */
+    if (nb < old_nb) {
+        int64_t now = av_gettime_relative();
+        if (!d->short_wc) {
+            d->short_wc = now;
+            av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 came back incomplete (%u of %u streams, the ones there as "
+                   "before) — retrying for up to 10 s before calling it reshaped\n", nb, old_nb);
+        }
+        if (now - d->short_wc < 10000000)
+            r = AVERROR(EAGAIN);
+        goto bad;
+    }
+    d->short_wc = 0;
     d->ifmt = nf;
     if (d->ifmt_home) *d->ifmt_home = nf;      /* teardown close target follows the swap */
     d->pmt_seen = 0;                           /* T-003: the new open's PMT is the reference */
