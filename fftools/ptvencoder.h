@@ -1966,6 +1966,7 @@ extern _Atomic int64_t g_shed_wall;      /* (d) wall us of the last self-inflict
                                           * stays for the catch-up governor + unwired fallback) */
 extern _Atomic int64_t g_shed_cnt;       /* (d) cumulative self-shed pkts (video head+tail, audio drop-oldest) */
 extern int     g_nvenc_serialize;        /* defined in ptvencoder_clock.c */
+extern int     g_gop_align;              /* 2.2 T-426: output GOP in ticks, IDRs forced on its multiples (ptvencoder_clock.c) */
 extern CushionRt g_curt;                 /* defined in ptvencoder_gate.c */
 /* 1.0.1-pre10 birth-armed churn fixes (defined in ptvencoder.c) */
 extern int     g_cushrel;                /* (e) cushion-tier release on starvation contradiction (PTV_NO_CUSHREL) */

@@ -5699,8 +5699,22 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         if (rung[r].ofmt->oformat->flags & AVFMT_GLOBALHEADER) rung[r].venc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
         {   /* -b:v + forwarded encoder opts (-preset/-rc/-maxrate/-g/-s12m_tc/...) */
             AVDictionary *vopts = NULL;
+            const AVDictionaryEntry *ge;
             av_dict_copy(&vopts, g->codec_opts, 0);
             if (sel[r].vbr) av_dict_set(&vopts, "b", sel[r].vbr, 0);
+            /* 2.2 T-426: the GOP (2 s, or -g) is forced on the output ticks for every rung (encode_push_inner); the encoder's
+             * own GOP is made longer than any run so it never places an IDR of its own. PTV_NO_GOP_ALIGN=1 = as before */
+            if (!getenv("PTV_NO_GOP_ALIGN")) {
+                if ((ge = av_dict_get(vopts, "g", NULL, 0)) && atoi(ge->value) > 0)
+                    rung[r].venc->gop_size = atoi(ge->value);
+                g_gop_align = rung[r].venc->gop_size;
+                av_dict_set(&vopts, "g", NULL, 0);
+                rung[r].venc->gop_size = INT_MAX / 2;
+                av_dict_set(&vopts, "forced-idr", "1", 0);   /* NVENC / x264: a forced keyframe is an IDR */
+                if (!r)
+                    av_log(NULL, AV_LOG_INFO, "[PTV-OUT] GOP %d ticks on the output timeline: every rung's IDR on the "
+                           "same pictures (PTV_NO_GOP_ALIGN=1 reverts)\n", g_gop_align);
+            }
             ret = avcodec_open2(rung[r].venc, vencoder, &vopts);
             av_dict_free(&vopts);
             if (ret < 0) { av_log(NULL, AV_LOG_ERROR, "open video encoder '%s' (output %d): %s\n", vencoder->name, r, av_err2str(ret)); goto end; }
