@@ -4356,6 +4356,7 @@ static const char *g_start_on   = "video";
 static int         g_start_on_set;               /* 2.0.2 T-386: -start_on given (a mosaic's default is any) */
 static int64_t     g_wait_input_us;              /* 0 = wait forever */
 static int64_t     g_slot_wait_us = 120000000;   /* 2.0.2 T-386: mosaic -slot_wait (0 = inf); spec §4 */
+static int64_t     g_regulate_us;                /* 2.2 T-423: -regulate (0 = off) */
 static _Atomic int g_mv_acq_go;                  /* 2.0.2 T-386: the mosaic starts — live slots stop draining */
 int                g_backoff_s[8] = { 1, 2, 5, 10, 30 };   /* also the 2.0.0-pre5 reopen backoff */
 int                g_backoff_n    = 5;
@@ -6632,6 +6633,7 @@ static const OptionDef ptv_options[] = {
     { "filter_complex",   OPT_TYPE_STRING, 0,                        { .off = 0 }, "filtergraph", "graph" },
     { "start_on",         OPT_TYPE_STRING, 0,                        { .off = 0 }, "when outputs start: video (single input), any|all (mosaic, default any; now comes in 2.1)", "when" },
     { "slot_wait",        OPT_TYPE_STRING, 0,                        { .off = 0 }, "mosaic: wait this long for every slot, then start with the live ones (default 120s; inf)", "dur" },
+    { "regulate",         OPT_TYPE_STRING, 0,                        { .off = 0 }, "read every udp:// input at its PCR time + this delay (absorbs burst-and-gap delivery; default off)", "dur" },
     { "wait_input",       OPT_TYPE_STRING, 0,                        { .off = 0 }, "give up if the input has no video after this long (default inf)", "dur" },
     { "stall_min",        OPT_TYPE_STRING, 0,                        { .off = 0 }, "content gone + input silent this long = STALLED (default 3s)", "dur" },
     { "lost_after",       OPT_TYPE_STRING, 0,                        { .off = 0 }, "no video packets this long = LOST (default 30s)", "dur" },
@@ -7355,6 +7357,12 @@ int main(int argc, char **argv)
                 uninit_parse_context(&octx); return 1;
             }
         }
+        if (!strcmp(octx.global_opts.opts[gi].key, "regulate")) {                   /* 2.2 T-423 */
+            if (av_parse_time(&g_regulate_us, octx.global_opts.opts[gi].val, 1) < 0 || g_regulate_us <= 0) {
+                av_log(NULL, AV_LOG_ERROR, "-regulate %s: expected a duration\n", octx.global_opts.opts[gi].val);
+                uninit_parse_context(&octx); return 1;
+            }
+        }
         if (!strcmp(octx.global_opts.opts[gi].key, "wait_input")) {
             const char *v = octx.global_opts.opts[gi].val;
             if (strcmp(v, "inf") && (av_parse_time(&g_wait_input_us, v, 1) < 0 || g_wait_input_us <= 0)) {
@@ -7432,7 +7440,16 @@ int main(int argc, char **argv)
     }
     ins  = &octx.groups[1];             /* all input groups (one per -i; 1/2/4 = multiview) */
     outs = &octx.groups[0];             /* all output groups (one per ABR rung) */
+    if (g_regulate_us > 0) {            /* 2.2 T-423: every udp:// input through its regulator */
+        int k;
+        for (k = 0; k < ins->nb_groups && k < PTV_MAX_INPUT; k++) {
+            char *lu = ptv_regulate_start(ins->groups[k].arg, g_regulate_us, k);
+            if (lu)
+                ins->groups[k].arg = lu;    /* lives for the process */
+        }
+    }
     ret  = transcode(ins, outs, fcomplex, hwdev, mode);
+    ptv_regulate_stop();
     uninit_parse_context(&octx);
     return ret < 0 ? 1 : 0;
 }

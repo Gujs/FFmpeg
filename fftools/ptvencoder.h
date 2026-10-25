@@ -1925,6 +1925,10 @@ static inline int ptv_url_passive(const char *u)
 {
     return u && (!strncmp(u, "udp://", 6) || !strncmp(u, "rtp://", 6));
 }
+/* 2.2 T-423: the input regulator (ptvencoder_regulate.c) — a udp:// input read at its PCR time + delay_us; returns the
+ * loopback URL the input reads instead (av_free it), NULL = keep the original */
+char *ptv_regulate_start(const char *url, int64_t delay_us, int k);
+void  ptv_regulate_stop(void);
 /* 2.0.0-pre4: an input-0 hold is in progress and acted on (single input only) */
 static inline int ptv_src_holding(void)
 {
