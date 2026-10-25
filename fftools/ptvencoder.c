@@ -5487,6 +5487,17 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         }
     }
 
+    if (ptv_ladder_on()) {   /* 2.2 (spec §16): -max_res trims the ladder at output start; ptvencoder builds the graph */
+        const AVStream *vst = !multiview && inputs[0].vstream >= 0 ? inputs[0].ifmt->streams[inputs[0].vstream] : NULL;
+        if (multiview) {
+            av_log(NULL, AV_LOG_ERROR, "-ladder: a mosaic keeps its -filter_complex in this release\n");
+            ret = AVERROR(ENOSYS); goto end;
+        }
+        if ((ret = ptv_ladder_finish(outs, vst ? vst->codecpar->height : 0, hwdev && strstr(hwdev, "cuda") != NULL,
+                                     &fcomplex)) < 0)
+            goto end;
+        n_rung = FFMIN(outs->nb_groups, PTV_MAX_RUNG);
+    }
     /* resolve each output group's -map/-c into its transcode/copy selection.
      * Every rung resolves the same input streams, so only the first one narrates. */
     for (r = 0; r < n_rung; r++)
@@ -7462,6 +7473,8 @@ int main(int argc, char **argv)
         return plan_resolve_and_print(argc, argv) < 0 ? 1 : 0;
 
     /* ffmpeg-style: split argv into the input (-i) group + output (url) group(s) */
+    if (ptv_ladder_expand(&argc, &argv) < 0)   /* 2.2: -ladder → one output block per rung (spec §16) */
+        return 1;
     if (split_commandline(&octx, argc, argv, ptv_options, ptv_groups,
                            sizeof(ptv_groups)/sizeof(ptv_groups[0])) < 0) {
         av_log(NULL, AV_LOG_ERROR, "command parse failed\n"); return 1;

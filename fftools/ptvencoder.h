@@ -1959,6 +1959,12 @@ int ptv_bind_audio_in(const AVFormatContext *f, int fidx, const PtvBindRule *r, 
                       const char *id_lang, int id_role, PtvBindPick *out, int max, int verbose);
 /* stream si's relabelled language (8 bytes) and role flags: a rule track's identity, taken at its first bind */
 int ptv_bind_ident(const AVFormatContext *f, int fidx, int si, char *lang, int *role);
+/* 2.2: -ladder (ptvencoder_ladder.c, spec §16 step 4a): the one output block written out per rung before parsing;
+ * after the input opens, -max_res trims and the video graph is built (when no -filter_complex was given) */
+struct OptionGroupList;
+int ptv_ladder_on(void);
+int ptv_ladder_expand(int *argc, char ***argv);
+int ptv_ladder_finish(struct OptionGroupList *outs, int src_h, int cuda, const char **graph);
 extern const char *g_audio_lang_override, *g_audio_codec_pref;
 extern int         g_audio_dedup, g_audio_dedup_chan_strict;
 /* 2.0.0-pre4: an input-0 hold is in progress and acted on (single input only) */
