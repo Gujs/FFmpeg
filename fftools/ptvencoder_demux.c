@@ -1169,6 +1169,7 @@ static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const ReopenShape *o
     AVDictionary *o2 = NULL;
     int r;
     unsigned i, nb;
+    int renum = 0;
     if (!(nf = avformat_alloc_context()))
         return AVERROR(ENOMEM);
     if (d->single)
@@ -1192,13 +1193,19 @@ static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const ReopenShape *o
         nb--;
     if (nb > old_nb || (nb < old_nb && !d->single))
         goto bad;
+    /* 2.2 (spec §6 / E9): a PID renumber with the layout unchanged — the same streams in the same order, the same
+     * languages, the same video codec and size — is the same source (the video moved to a new PID, a provider's mux
+     * renumbered): resumed like an outage, the -map indices still point at the same content (the output PIDs are
+     * content-keyed). A reordered or changed layout stays RESHAPED (exit 4 for a re-probe). Was: any PID change = exit 4 */
     for (i = 0; i < nb; i++) {
         ReopenShape now;
         reopen_shape_fill(&now, nf->streams[i]);
         if (now.type != old[i].type)
             goto bad;
+        if (d->single && now.id != old[i].id)
+            renum++;
         if (d->single &&
-            (now.id != old[i].id || strcmp(now.lang, old[i].lang) ||
+            (strcmp(now.lang, old[i].lang) ||
              (now.type == AVMEDIA_TYPE_VIDEO &&
               (now.codec_id != old[i].codec_id ||
                (now.w && old[i].w && (now.w != old[i].w || now.h != old[i].h))))))
@@ -1220,6 +1227,9 @@ static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const ReopenShape *o
         goto bad;
     }
     d->short_wc = 0;
+    if (renum)
+        av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 came back with %d of its %u streams on new PIDs, the layout unchanged — "
+               "resumed (the same source renumbered)\n", renum, nb);
     d->ifmt = nf;
     if (d->ifmt_home) *d->ifmt_home = nf;      /* teardown close target follows the swap */
     d->pmt_seen = 0;                           /* T-003: the new open's PMT is the reference */
