@@ -1301,12 +1301,17 @@ static int slot_bind(DemuxArgs *d)
     for (j = 0; j < d->n_audio; j++) {
         AVPacket *bp;
         PtvSlotBind *b;
+        PtvBindRule br;
+        PtvBindPick pk;
         if (d->astream[j] >= 0 || !d->abind[j][0])
             continue;
-        for (si = 0; si < nb; si++)
-            if (f->streams[si]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
-                avformat_match_stream_specifier(f, f->streams[si], d->abind[j]) > 0)
-                break;
+        if (ptv_bind_parse(d->abind[j], &br) > 0)        /* 2.2: an audio rule (spec §7) picks by content */
+            si = ptv_bind_audio(f, d->rsync_slot, &br, 1, &pk, 1, 0) == 1 ? pk.stream : nb;
+        else
+            for (si = 0; si < nb; si++)
+                if (f->streams[si]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
+                    avformat_match_stream_specifier(f, f->streams[si], d->abind[j]) > 0)
+                    break;
         if (si == nb) {
             av_log(NULL, AV_LOG_WARNING, "[PTV-BIND] %d:%s → no such audio in in%d — the track stays silent\n",
                    d->rsync_slot, d->abind[j], d->rsync_slot);

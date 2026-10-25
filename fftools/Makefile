@@ -48,6 +48,7 @@ OBJS-ptvencoder +=                    \
     fftools/ptvencoder_legend.o       \
     fftools/ptvencoder_mv.o           \
     fftools/ptvencoder_regulate.o     \
+    fftools/ptvencoder_bind.o         \
     fftools/ptvencoder_timeline.o     \
 
 OBJS-ffprobe +=                       \

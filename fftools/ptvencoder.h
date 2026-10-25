@@ -1610,7 +1610,7 @@ typedef struct DemuxArgs {
     pthread_mutex_t       pass_lock;        /* 2.0.0-pre6: copy state shared with the master's AC-3 fill */
     VOutRing             *mv_vring;         /* 2.0.0 T-342: multiview — this slot's displayed content ring (sparse copies) */
     struct Input    *in;                      /* 2.0.2 T-386: its input (a deferred slot acquires + binds here) */
-    char             abind[PTV_MAX_AUDIO][32];  /* ... each track's -map specifier, resolved at the bind */
+    char             abind[PTV_MAX_AUDIO][128];  /* ... each track's -map specifier, resolved at the bind */
     int64_t               dmg_keep_n;     /* 2.0.2 T-402: video backward steps after corrupt discards left unabsorbed */
     int64_t               dmg_keep_log_us; /* ... its log rate limit (10 s) */
 } DemuxArgs;
@@ -1929,6 +1929,29 @@ static inline int ptv_url_passive(const char *u)
  * loopback URL the input reads instead (av_free it), NULL = keep the original */
 char *ptv_regulate_start(const char *url, int64_t delay_us, int k);
 void  ptv_regulate_stop(void);
+/* 2.2: audio track rules on -map (ptvencoder_bind.c, spec §7): a:main | a:langs | a:lang=xxx | a:multich | a:pid=0x.. |
+ * a:index=N [,c=,b=,ac=,af=,lang=,label=,title=,default=1] */
+enum { PTV_BIND_MAIN, PTV_BIND_LANGS, PTV_BIND_LANG, PTV_BIND_MULTICH, PTV_BIND_PID, PTV_BIND_INDEX };
+typedef struct PtvBindRule {
+    int         kind;
+    const char *arg;                         /* lang= / pid= / index= value */
+    const char *c, *b, *ac, *af, *lang, *label, *title;   /* track options (lang = a filter on the source language) */
+    int         dflt;                        /* default=1 */
+    char        buf[128];                    /* the strings above point in here */
+} PtvBindRule;
+typedef struct PtvBindPick {
+    int  stream;                             /* input stream index */
+    char lang[8];                            /* output language: label=, else the (relabelled) source language */
+    char key_lang[8];                        /* the relabelled source language: places the PID */
+    int  disp;                               /* output disposition: default (main / first), visual_impaired (AD) */
+} PtvBindPick;
+/* 1 = an audio rule (filled), 0 = a classic stream specifier, <0 = a malformed rule */
+int ptv_bind_parse(const char *spec, PtvBindRule *r);
+/* the rule's source streams on input f (index fidx), at most max; mosaic = never audio description */
+int ptv_bind_audio(const AVFormatContext *f, int fidx, const PtvBindRule *r, int mosaic,
+                   PtvBindPick *out, int max, int verbose);
+extern const char *g_audio_lang_override, *g_audio_codec_pref;
+extern int         g_audio_dedup, g_audio_dedup_chan_strict;
 /* 2.0.0-pre4: an input-0 hold is in progress and acted on (single input only) */
 static inline int ptv_src_holding(void)
 {

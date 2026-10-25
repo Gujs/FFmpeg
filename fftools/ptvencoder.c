@@ -4021,7 +4021,12 @@ typedef struct AOutSpec {
     int            ac;                    /* -ac:a:N output channels (0 = default stereo) */
     const char    *lang;                  /* source language (override -metadata later) */
     int            deferred;              /* 2.0.2 T-386: the slot was not live at the start (stream = -1) */
-    char           bind_spec[32];         /* ... the -map stream specifier, resolved when the slot binds */
+    char           bind_spec[128];        /* ... the -map stream specifier, resolved when the slot binds */
+    int            rule;                  /* 2.2: produced by an audio rule (spec §7); its tags below, not -metadata:s:a:N */
+    char           olang[8];              /* ... output language (label=, else the relabelled source language) */
+    char           klang[8];              /* ... the relabelled source language (PID placement) */
+    int            odisp;                 /* ... output disposition */
+    const char    *title;                 /* ... title= */
 } AOutSpec;
 
 typedef struct Sel {
@@ -4035,7 +4040,11 @@ typedef struct Sel {
     int            n_aout;
     int            copy[PTV_MAX_PASS];    /* ALL copy: audio (5.1/2ch) + sub + data + scte */
     int            copy_input[PTV_MAX_PASS]; /* source input index per copy stream (multiview) */
+    char           copy_olang[PTV_MAX_PASS][8];  /* 2.2: a rule's copy — output language ("" = the source's) */
+    char           copy_klang[PTV_MAX_PASS][8];  /* ... and the language that places its PID */
     int            n_copy;
+    PtvBindRule    rules[PTV_MAX_AUDIO];  /* 2.2: the audio rules of this output (the track strings point in here) */
+    int            n_rules;
 } Sel;
 static const char *og_get(OptionGroup *g, const char *key);
 static void apply_stream_meta(OptionGroup *g, char t, int idx, AVStream *ost);
@@ -5202,6 +5211,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
     AudioState       as[PTV_MAX_AUDIO];        /* one per transcoded audio track */
     int              asrc[PTV_MAX_AUDIO];      /* input-local stream feeding each as[] */
     int              asrc_in[PTV_MAX_AUDIO];   /* source input index feeding each as[] */
+    const char      *alang[PTV_MAX_AUDIO];     /* 2.2: a rule's relabelled language (PID placement); NULL = the source's */
+    char             pass_olang[PTV_MAX_PASS][8], pass_klang[PTV_MAX_PASS][8];   /* 2.2: the same for a rule's copy */
     int              n_audio = 0;
     Rung             rung[PTV_MAX_RUNG];
     Sel              sel[PTV_MAX_RUNG];
@@ -5826,7 +5837,12 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
             aos->time_base = a->enc[r]->time_base;
             if (kist && (klang = av_dict_get(kist->metadata, "language", NULL, 0)))
                 av_dict_set(&aos->metadata, "language", klang->value, 0);
-            apply_stream_meta(&outs->groups[r], 'a', k, aos);   /* CLI -metadata:s:a:N / -disposition:a:N (G5) */
+            if (spec->rule) {                                    /* 2.2: a rule's track carries its own tags (§7.2) */
+                if (spec->olang[0]) av_dict_set(&aos->metadata, "language", spec->olang, 0);
+                if (spec->title)    av_dict_set(&aos->metadata, "title", spec->title, 0);
+                aos->disposition = spec->odisp;
+            } else
+                apply_stream_meta(&outs->groups[r], 'a', k, aos);   /* CLI -metadata:s:a:N / -disposition:a:N (G5) */
             a->ost[r] = aos;
         }
         sfmt = a->enc[0]->sample_fmt;
@@ -5893,6 +5909,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         }
         asrc[n_audio]    = spec->stream;
         asrc_in[n_audio] = spec->input;
+        alang[n_audio]   = spec->rule && spec->klang[0] ? spec->klang : NULL;
         n_audio++;
     }
     have_audio = n_audio > 0;
@@ -5934,6 +5951,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                 default:                    tlet = 'd'; tidx = copy_didx++; break;
             }
             memset(&pass[n_pass], 0, sizeof pass[n_pass]);
+            av_strlcpy(pass_olang[n_pass], sel[0].copy_olang[si], sizeof pass_olang[0]);
+            av_strlcpy(pass_klang[n_pass], sel[0].copy_klang[si], sizeof pass_klang[0]);
             pass[n_pass].input    = kk;
             pass[n_pass].in_index = sidx;
             pass[n_pass].is_scte  = ist->codecpar->codec_id == AV_CODEC_ID_SCTE_35;
@@ -5970,6 +5989,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                 os->time_base   = ist->time_base;
                 os->disposition = ist->disposition;
                 if (lang) av_dict_set(&os->metadata, "language", lang->value, 0);
+                if (pass_olang[n_pass][0]) av_dict_set(&os->metadata, "language", pass_olang[n_pass], 0);
                 apply_stream_meta(&outs->groups[r], tlet, tidx, os);  /* CLI -metadata:s:<t>:N / -disposition (G5) — copy streams (subs/data/extra-audio) */
                 pass[n_pass].ost[r] = os;
             }
@@ -6033,7 +6053,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                 e->cls = 1; e->mapped = 1; e->ord = k;
                 e->cid     = as[k].ost[0]->codecpar->codec_id;
                 e->codec   = avcodec_get_name(e->cid);
-                e->lang    = lg ? lg->value : NULL;
+                e->lang    = alang[k] ? alang[k] : lg ? lg->value : NULL;
                 e->ch      = as[k].ost[0]->codecpar->ch_layout.nb_channels;   /* OUTPUT layout */
                 e->rank    = pid_lang_rank(e->lang, e->norm);
                 e->ad      = ist && !!(ist->disposition & (AV_DISPOSITION_VISUAL_IMPAIRED |
@@ -6063,7 +6083,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                 e->cid    = ist->codecpar->codec_id;
                 e->scte   = e->cid == AV_CODEC_ID_SCTE_35;
                 e->codec  = avcodec_get_name(e->cid);
-                e->lang   = lg ? lg->value : NULL;
+                e->lang   = pass_klang[k][0] ? pass_klang[k] : lg ? lg->value : NULL;
                 e->ch     = e->cls == 1 ? ist->codecpar->ch_layout.nb_channels : 0;  /* copy: out == in */
                 e->rank   = pid_lang_rank(e->lang, e->norm);
                 /* content sub-key, ascending (see PidEnt): a plain subtitle before the
@@ -6650,6 +6670,10 @@ static const OptionDef ptv_options[] = {
     { "filter_complex",   OPT_TYPE_STRING, 0,                        { .off = 0 }, "filtergraph", "graph" },
     { "start_on",         OPT_TYPE_STRING, 0,                        { .off = 0 }, "when outputs start: video (single input), any|all (mosaic, default any; now comes in 2.1)", "when" },
     { "slot_wait",        OPT_TYPE_STRING, 0,                        { .off = 0 }, "mosaic: wait this long for every slot, then start with the live ones (default 3s; inf)", "dur" },
+    { "audio_lang_override", OPT_TYPE_STRING, 0,                     { .off = 0 }, "audio rules: relabel source languages first, KEY:LANG,… (KEY = 0xPID, audio index or language)", "list" },
+    { "audio_codec_pref", OPT_TYPE_STRING, 0,                        { .off = 0 }, "audio rules: survivor codec order among same-programme duplicates (default eac3,ac3,aac,mp2,mp3)", "list" },
+    { "audio_dedup",      OPT_TYPE_STRING, 0,                        { .off = 0 }, "audio rules: collapse same-programme duplicates (default on)", "on|off" },
+    { "audio_dedup_chan_strict", OPT_TYPE_BOOL, 0,                   { .off = 0 }, "audio rules: the channel count also splits duplicate groups" },
     { "regulate",         OPT_TYPE_STRING, 0,                        { .off = 0 }, "read every udp:// input at its PCR time + this delay (absorbs burst-and-gap delivery; default off)", "dur" },
     { "wait_input",       OPT_TYPE_STRING, 0,                        { .off = 0 }, "give up if the input has no video after this long (default inf)", "dur" },
     { "stall_min",        OPT_TYPE_STRING, 0,                        { .off = 0 }, "content gone + input silent this long = STALLED (default 3s)", "dur" },
@@ -6926,7 +6950,7 @@ static int resolve_plan(Input *inputs, int n_input, OptionGroup *outg, Sel *s, i
     }
 
     for (o = 0; o < outg->nb_opts; o++) {              /* explicit -map plan */
-        char buf[64]; int optional, fidx, targeted; const char *spec, *mv = outg->opts[o].val;
+        char buf[128]; int optional, fidx, targeted, isrule; const char *spec, *mv = outg->opts[o].val;
         AVFormatContext *kfmt;
         if (strcmp(outg->opts[o].key, "map")) continue;
         if (mv[0] == '[') {                            /* filter-output label = this rung's video */
@@ -6941,6 +6965,66 @@ static int resolve_plan(Input *inputs, int n_input, OptionGroup *outg, Sel *s, i
             return AVERROR(EINVAL);
         }
         kfmt = inputs[fidx].ifmt;
+        /* 2.2: an audio rule (spec §7.2) resolves here to source streams, each then handled like a -map K:a:N; its
+         * per-track settings come from the rule's options, else the output's -c:a / -b:a / -ac / -filter:a (never the
+         * index-addressed forms: a rule's track count is not known in advance) */
+        if (s->n_rules < PTV_MAX_AUDIO && (isrule = ptv_bind_parse(spec, &s->rules[s->n_rules])) != 0) {
+            PtvBindRule *br = &s->rules[s->n_rules++];
+            PtvBindPick  pk[PTV_MAX_AUDIO + PTV_MAX_PASS];
+            const char  *codec = br->c ? br->c : og_spec(outg, "c", 'a', -1);
+            const char  *acs   = br->ac ? br->ac : og_spec(outg, "ac", 'a', -1);
+            int          np, j, def = inputs[fidx].deferred;
+            if (isrule < 0) {
+                av_log(NULL, AV_LOG_ERROR, "-map %s: malformed audio rule (a:main | a:langs | a:lang=xxx | a:multich | "
+                       "a:pid=0x.. | a:index=N, then ,c= ,b= ,ac= ,af= ,lang= ,label= ,title= ,default=1)\n", mv);
+                return AVERROR(EINVAL);
+            }
+            if (def && br->kind != PTV_BIND_MAIN && br->kind != PTV_BIND_LANG &&
+                br->kind != PTV_BIND_PID && br->kind != PTV_BIND_INDEX) {
+                if (verbose)
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-OUT] -map %s: slot %d not live — a many-track rule needs the "
+                           "slot's audio at the start; skipped\n", mv, fidx);
+                continue;
+            }
+            if (def) {               /* 2.0.2 T-386: a placeholder, silent until the slot binds (the rule picks then) */
+                memset(&pk[0], 0, sizeof pk[0]);
+                pk[0].stream = -1;
+                if (br->label) av_strlcpy(pk[0].lang, br->label, sizeof pk[0].lang);
+                pk[0].disp = br->dflt || br->kind == PTV_BIND_MAIN ? AV_DISPOSITION_DEFAULT : 0;
+                np = 1;
+                if (verbose)
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-OUT] -map %s: slot %d not live — a:%d silent until it joins\n",
+                           mv, fidx, tcnt[1]);
+            } else
+                np = ptv_bind_audio(kfmt, fidx, br, n_input > 1, pk, FF_ARRAY_ELEMS(pk), verbose);
+            for (j = 0; j < np; j++) {
+                AOutSpec *a;
+                tcnt[1]++;
+                if (!def && codec && !strcmp(codec, "copy")) {
+                    if (s->n_copy < PTV_MAX_PASS) {
+                        av_strlcpy(s->copy_olang[s->n_copy], pk[j].lang, sizeof s->copy_olang[0]);
+                        av_strlcpy(s->copy_klang[s->n_copy], pk[j].key_lang, sizeof s->copy_klang[0]);
+                        s->copy_input[s->n_copy] = fidx; s->copy[s->n_copy++] = pk[j].stream;
+                    }
+                    continue;
+                }
+                if (s->n_aout >= PTV_MAX_AUDIO) break;
+                a = &s->aout[s->n_aout++];
+                a->input = fidx; a->stream = pk[j].stream; a->deferred = def;
+                if (def) av_strlcpy(a->bind_spec, spec, sizeof a->bind_spec);
+                a->aenc   = codec;
+                a->abr    = br->b ? br->b : og_spec(outg, "b", 'a', -1);
+                a->filter = br->af ? br->af : og_spec(outg, "filter", 'a', -1);
+                a->ac     = acs ? atoi(acs) : 0;
+                a->adec   = def ? NULL : avcodec_find_decoder(kfmt->streams[pk[j].stream]->codecpar->codec_id);
+                a->rule   = 1;
+                a->odisp  = pk[j].disp;
+                a->title  = br->title;
+                av_strlcpy(a->olang, pk[j].lang, sizeof a->olang);
+                av_strlcpy(a->klang, pk[j].key_lang, sizeof a->klang);
+            }
+            continue;
+        }
         if (inputs[fidx].deferred) {
             /* 2.0.2 T-386: a slot not live at the start has no streams yet. Its audio map becomes a placeholder track
              * (the encoder and the output stream exist from the start, silent until the slot binds; numbered like a
@@ -7373,6 +7457,20 @@ int main(int argc, char **argv)
                 av_log(NULL, AV_LOG_ERROR, "-slot_wait %s: expected a duration or inf\n", v);
                 uninit_parse_context(&octx); return 1;
             }
+        }
+        if (!strcmp(octx.global_opts.opts[gi].key, "audio_lang_override"))          /* 2.2 audio rules (spec §7.1) */
+            g_audio_lang_override = octx.global_opts.opts[gi].val;
+        if (!strcmp(octx.global_opts.opts[gi].key, "audio_codec_pref"))
+            g_audio_codec_pref = octx.global_opts.opts[gi].val;
+        if (!strcmp(octx.global_opts.opts[gi].key, "audio_dedup_chan_strict"))
+            g_audio_dedup_chan_strict = 1;
+        if (!strcmp(octx.global_opts.opts[gi].key, "audio_dedup")) {
+            const char *v = octx.global_opts.opts[gi].val;
+            if (strcmp(v, "on") && strcmp(v, "off")) {
+                av_log(NULL, AV_LOG_ERROR, "-audio_dedup %s: expected on or off\n", v);
+                uninit_parse_context(&octx); return 1;
+            }
+            g_audio_dedup = !strcmp(v, "on");
         }
         if (!strcmp(octx.global_opts.opts[gi].key, "regulate")) {                   /* 2.2 T-423 */
             if (av_parse_time(&g_regulate_us, octx.global_opts.opts[gi].val, 1) < 0 || g_regulate_us <= 0) {
