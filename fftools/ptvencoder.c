@@ -4369,6 +4369,7 @@ static int64_t     g_slot_wait_us = 3000000;     /* 2.0.2 T-386: mosaic -slot_wa
                                                   * deploy: slot 2's source down). A multiview's tiles are independent: wait
                                                   * only as long as a healthy slot takes (canaries 0.8-1.9 s, kit 1.8-2.5 s) */
 static int64_t     g_regulate_us;                /* 2.2 T-423: -regulate (0 = off) */
+static int64_t     g_bind_report_us;             /* 2.2 T-071: -bind_report (0 = off): the input wait, then report + exit */
 static _Atomic int g_mv_acq_go;                  /* 2.0.2 T-386: the mosaic starts — live slots stop draining */
 int                g_backoff_s[8] = { 1, 2, 5, 10, 30 };   /* also the 2.0.0-pre5 reopen backoff */
 int                g_backoff_n    = 5;
@@ -6101,7 +6102,41 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                 snprintf(e->srcs, sizeof e->srcs, "in#%d:%d", pass[k].input, pass[k].in_index);
             }
             if ((ret = pid_plan_apply(&pidp, ent, n, rung, n_rung, multiview)) < 0) goto end;
+            /* 2.2 T-071: -bind_report — what this command puts on the wire, one line per output stream in PID order,
+             * the same for a classic -map command and a rule-based one (the wrapper parity diff compares the two) */
+            for (k = 0; g_bind_report_us > 0 && k < n; k++) {
+                const AVStream *os = ent[k].ost[0];
+                const AVStream *is = ent[k].in_idx >= 0 && ent[k].src_idx >= 0 && inputs[ent[k].in_idx].ifmt &&
+                                     ent[k].src_idx < (int)inputs[ent[k].in_idx].ifmt->nb_streams
+                                   ? inputs[ent[k].in_idx].ifmt->streams[ent[k].src_idx] : NULL;
+                const AVDictionaryEntry *wl = av_dict_get(os->metadata, "language", NULL, 0);
+                const AVDictionaryEntry *sl = is ? av_dict_get(is->metadata, "language", NULL, 0) : NULL;
+                char disp[96] = "", src[96], ch[16] = "";
+                int bit;
+                for (bit = 0; bit < 32; bit++)
+                    if (os->disposition & (1 << bit) && av_disposition_to_string(1 << bit))
+                        av_strlcatf(disp, sizeof disp, "%s%s", *disp ? "+" : " ", av_disposition_to_string(1 << bit));
+                if (ent[k].cls == 1)
+                    snprintf(ch, sizeof ch, " %dch", os->codecpar->ch_layout.nb_channels);
+                if (is && ent[k].cls == 1)
+                    snprintf(src, sizeof src, "in%d 0x%x %s %dch %s", ent[k].in_idx, is->id,
+                             avcodec_get_name(is->codecpar->codec_id), is->codecpar->ch_layout.nb_channels,
+                             sl && sl->value[0] ? sl->value : "und");
+                else if (is)
+                    snprintf(src, sizeof src, "in%d 0x%x %s", ent[k].in_idx, is->id, avcodec_get_name(is->codecpar->codec_id));
+                else
+                    snprintf(src, sizeof src, "%s", ent[k].srcs);
+                av_log(NULL, AV_LOG_INFO, "[PTV-REPORT] pid=%d %s %s%s %s%s <- %s\n", os->id,
+                       pid_cls_name[ent[k].cls < PTV_PID_CLASSES ? ent[k].cls : 3],
+                       avcodec_get_name(os->codecpar->codec_id), ch, wl && wl->value[0] ? wl->value : "--", disp, src);
+            }
         }
+    }
+    if (g_bind_report_us > 0) {        /* 2.2 T-071: -bind_report ends here, before any output is opened */
+        av_log(NULL, AV_LOG_INFO, "[PTV-REPORT] %s — nothing encoded (-bind_report)\n",
+               pidp.on ? "end" : "the PID plan is off: no report");
+        ret = 0;
+        goto end;
     }
 
     /* per-rung: open the output, bound the interleave (sparse-sub smoothing),
@@ -6674,6 +6709,7 @@ static const OptionDef ptv_options[] = {
     { "audio_codec_pref", OPT_TYPE_STRING, 0,                        { .off = 0 }, "audio rules: survivor codec order among same-programme duplicates (default eac3,ac3,aac,mp2,mp3)", "list" },
     { "audio_dedup",      OPT_TYPE_STRING, 0,                        { .off = 0 }, "audio rules: collapse same-programme duplicates (default on)", "on|off" },
     { "audio_dedup_chan_strict", OPT_TYPE_BOOL, 0,                   { .off = 0 }, "audio rules: the channel count also splits duplicate groups" },
+    { "bind_report",      OPT_TYPE_STRING, 0,                        { .off = 0 }, "dry run: open the inputs (waiting at most this long), print every output stream with its PID and source, exit without encoding", "dur" },
     { "regulate",         OPT_TYPE_STRING, 0,                        { .off = 0 }, "read every udp:// input at its PCR time + this delay (absorbs burst-and-gap delivery; default off)", "dur" },
     { "wait_input",       OPT_TYPE_STRING, 0,                        { .off = 0 }, "give up if the input has no video after this long (default inf)", "dur" },
     { "stall_min",        OPT_TYPE_STRING, 0,                        { .off = 0 }, "content gone + input silent this long = STALLED (default 3s)", "dur" },
@@ -7472,6 +7508,12 @@ int main(int argc, char **argv)
             }
             g_audio_dedup = !strcmp(v, "on");
         }
+        if (!strcmp(octx.global_opts.opts[gi].key, "bind_report")) {                /* 2.2 T-071 */
+            if (av_parse_time(&g_bind_report_us, octx.global_opts.opts[gi].val, 1) < 0 || g_bind_report_us <= 0) {
+                av_log(NULL, AV_LOG_ERROR, "-bind_report %s: expected a duration\n", octx.global_opts.opts[gi].val);
+                uninit_parse_context(&octx); return 1;
+            }
+        }
         if (!strcmp(octx.global_opts.opts[gi].key, "regulate")) {                   /* 2.2 T-423 */
             if (av_parse_time(&g_regulate_us, octx.global_opts.opts[gi].val, 1) < 0 || g_regulate_us <= 0) {
                 av_log(NULL, AV_LOG_ERROR, "-regulate %s: expected a duration\n", octx.global_opts.opts[gi].val);
@@ -7555,6 +7597,8 @@ int main(int argc, char **argv)
     }
     ins  = &octx.groups[1];             /* all input groups (one per -i; 1/2/4 = multiview) */
     outs = &octx.groups[0];             /* all output groups (one per ABR rung) */
+    if (g_bind_report_us > 0 && !g_wait_input_us)   /* 2.2 T-071: a report never waits forever for its input */
+        g_wait_input_us = g_bind_report_us;
     if (g_regulate_us > 0) {            /* 2.2 T-423: every udp:// input through its regulator */
         int k;
         for (k = 0; k < ins->nb_groups && k < PTV_MAX_INPUT; k++) {
