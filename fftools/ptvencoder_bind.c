@@ -284,7 +284,8 @@ int ptv_bind_audio_in(const AVFormatContext *f, int fidx, const PtvBindRule *r, 
         p->stream = sel[i]->si;
         av_strlcpy(p->lang, r->label ? r->label : sel[i]->lang, sizeof p->lang);
         av_strlcpy(p->key_lang, sel[i]->lang, sizeof p->key_lang);
-        p->disp = (sel[i]->ad ? AV_DISPOSITION_VISUAL_IMPAIRED : 0) |
+        p->disp = (st->disposition & ~AV_DISPOSITION_DEFAULT) |   /* the source's flags carry through (§7.2); */
+                  (sel[i]->ad ? AV_DISPOSITION_VISUAL_IMPAIRED : 0) |   /* the rule decides default; AD says VI */
                   ((r->dflt || (i == 0 && !sel[i]->ad && (r->kind == PTV_BIND_MAIN || r->kind == PTV_BIND_LANGS)))
                    ? AV_DISPOSITION_DEFAULT : 0);
         if (verbose)
