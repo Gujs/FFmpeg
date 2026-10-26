@@ -5,6 +5,38 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.0-pre1 — 2.1.0-pre7 + input regulator, audio rules + re-binding, -bind_report, -ladder, rung IDR alignment, in-track source changes
+
+The first 2.2 pre-release (owner 2026-10-26: everything built so far; for the sandbox servers after the owner's trip).
+Every new option is opt-in; the always-on changes are listed with their measurements.
+
+**Always on:**
+- **Every rung's IDR on the same pictures (T-426, spec D40).** Each rung encoder counted its GOP from its own first frame:
+  on cor-3 NTD (2.1.0-pre7) the 480p rung's IDRs sat 2 frames after the 720p one for the whole run, so the renditions'
+  ABR segments never lined up. The GOP now belongs to the output timeline: a frame on a GOP multiple is forced to an IDR on
+  every rung (forced-idr). `[PTV-OUT] GOP N ticks on the output timeline`. PTV_NO_GOP_ALIGN=1 reverts.
+- **Mosaic -slot_wait 3 s (T-425, D39; was 120 s).** A dead slot shows bars after 3 s instead of the mosaic dark for 2 min.
+- **A video or audio codec change on the same PID swaps the decoder (T-428).** A PMT update H.264 ↔ HEVC (or mp2 → AAC)
+  fed the old decoder the new codec: the picture frozen / the track silent for as long as it lasted, nothing logged
+  (fixtures: 25 s frozen, 29 s silent). Now the decoder is swapped ahead of the new codec's first packet: `[PTV-SRC] in0
+  video codec h264 → hevc on pid 0x100 — decoder swapped`.
+- **A single input whose streams were only renumbered resumes (T-428, spec E9).** A reopen that finds the same layout
+  on new PIDs (the video moved to a new PID) resumes like an outage instead of exit 4 (kit sync_vpidmove_30: frozen 3 s,
+  then live; was exit 4).
+
+**Opt-in:**
+- **Input regulator `-regulate D` (T-423, D38).** Every udp:// input read at its PCR time + D (8 s for ~6 s segments):
+  burst-and-gap delivery (HLS over SRT) reaches the encoder as a real-time stream. Fintech bursts 0 ms / 3 repeats
+  (direct +6.8 s / 411); Unique_TV 3 h 0 silences / 0 repeats (plain 1 / 13). A PCR-less input passes through (warned).
+- **Audio rules on -map (T-427, spec §7):** `a:main`, `a:langs`, `a:lang=xxx`, `a:multich`, `a:pid=`, `a:index=` with
+  `,c= ,b= ,ac= ,af= ,lang= ,label= ,title= ,default=1`; `-audio_lang_override`, `-audio_codec_pref`, `-audio_dedup`,
+  `-audio_dedup_chan_strict`. A rule's track follows its source inside its language + role (D36): the 5.1 gone from the
+  PMT → the mp2 of the same language after 167 ms (was 20 s of silence until it returned), back when it returns.
+- **`-bind_report <dur>` (T-071):** a dry run printing every output stream with its PID and source. 9 real channels: the
+  wrapper's command and its rule command give the same wire (1 intended improvement: Euronews AC-3 over mp2).
+- **`-ladder` (spec §16, step 4a):** the ladder as data (`LABEL:autoxH:VBITRATE@IP:PORT`, `-max_res`, `-deint`,
+  `-timestamp_overlay`, `-lo_at`, `-b:a:lo`); expands to exactly the wrapper's graph and rung options (Cinestar: identical).
+
 ## 2.1.0-pre7 — 2.1.0-pre6 + a mosaic slot follows clock drift one picture at a time (T-422), a source that returns incomplete is retried, not restarted (T-424)
 
 The last 2.1 pre-release (owner 2026-10-24: 2.1 closes after pre7; binder / ladder → 2.2).
