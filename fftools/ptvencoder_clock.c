@@ -70,6 +70,7 @@ static int64_t ptv_empty_watch(const char *name, int depth, int64_t now,
  * math and the delivery gate are untouched (the gate drain runs OUTSIDE the lock so a full
  * mux_q can never stall sibling rungs behind the mutex). Default OFF until soaked. */
 int             g_nvenc_serialize = 0;
+int             g_gop_align = 0;          /* 2.2 T-426: the output GOP in ticks (0 = each encoder its own) */
 static pthread_mutex_t g_enc_serial_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Drain an encoder, pushing packets to the mux queue. frame=NULL flushes. When `gate` is set, the
@@ -85,6 +86,27 @@ static int encode_push_inner(AVThreadMessageQueue *mux_q, AVCodecContext *enc,
      * "too many B-frames in a row" and stall; NVENC's forced-IDR GOP can misalign. */
     if (frame)
         frame->pict_type = AV_PICTURE_TYPE_NONE;
+    /* 2.2 T-426 (spec D40): the GOP is the output timeline's, not each encoder's — an IDR on every frame whose tick is a
+     * multiple of the GOP, on every rung alike, so ABR segments line up. Each encoder counted from its own first frame:
+     * cor-3 NTD's 720p and 480p rungs put their IDRs 2 frames apart for the life of the process */
+    if (frame && g_gop_align > 0 && frame->pts != AV_NOPTS_VALUE && frame->pts % g_gop_align == 0)
+        frame->pict_type = AV_PICTURE_TYPE_I;
+    if (frame) {   /* TEST-ONLY (PTV_TEST_RUNG_SKIP=K:N): the K-th video encoder (0-based, in first-use order) gets its first N
+                    * frames withheld — a rung whose encoder starts late, as cor-3's rungs did (T-426) */
+        static const char *ts = (const char *)-1;
+        static AVCodecContext *seen[8];
+        static int nseen, skipped;
+        int k = -1, i;
+        if (ts == (const char *)-1) ts = getenv("PTV_TEST_RUNG_SKIP");
+        if (ts) {
+            for (i = 0; i < nseen; i++) if (seen[i] == enc) k = i;
+            if (k < 0 && nseen < 8) { seen[nseen] = enc; k = nseen++; }
+            if (k == atoi(ts) && strchr(ts, ':') && skipped < atoi(strchr(ts, ':') + 1)) {
+                skipped++;
+                return 0;
+            }
+        }
+    }
     ret = avcodec_send_frame(enc, frame);
     if (ret < 0)
         return ret;

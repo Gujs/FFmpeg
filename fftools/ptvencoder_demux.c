@@ -1169,6 +1169,7 @@ static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const ReopenShape *o
     AVDictionary *o2 = NULL;
     int r;
     unsigned i, nb;
+    int renum = 0;
     if (!(nf = avformat_alloc_context()))
         return AVERROR(ENOMEM);
     if (d->single)
@@ -1192,13 +1193,19 @@ static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const ReopenShape *o
         nb--;
     if (nb > old_nb || (nb < old_nb && !d->single))
         goto bad;
+    /* 2.2 (spec §6 / E9): a PID renumber with the layout unchanged — the same streams in the same order, the same
+     * languages, the same video codec and size — is the same source (the video moved to a new PID, a provider's mux
+     * renumbered): resumed like an outage, the -map indices still point at the same content (the output PIDs are
+     * content-keyed). A reordered or changed layout stays RESHAPED (exit 4 for a re-probe). Was: any PID change = exit 4 */
     for (i = 0; i < nb; i++) {
         ReopenShape now;
         reopen_shape_fill(&now, nf->streams[i]);
         if (now.type != old[i].type)
             goto bad;
+        if (d->single && now.id != old[i].id)
+            renum++;
         if (d->single &&
-            (now.id != old[i].id || strcmp(now.lang, old[i].lang) ||
+            (strcmp(now.lang, old[i].lang) ||
              (now.type == AVMEDIA_TYPE_VIDEO &&
               (now.codec_id != old[i].codec_id ||
                (now.w && old[i].w && (now.w != old[i].w || now.h != old[i].h))))))
@@ -1220,6 +1227,9 @@ static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const ReopenShape *o
         goto bad;
     }
     d->short_wc = 0;
+    if (renum)
+        av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 came back with %d of its %u streams on new PIDs, the layout unchanged — "
+               "resumed (the same source renumbered)\n", renum, nb);
     d->ifmt = nf;
     if (d->ifmt_home) *d->ifmt_home = nf;      /* teardown close target follows the swap */
     d->pmt_seen = 0;                           /* T-003: the new open's PMT is the reference */
@@ -1261,6 +1271,32 @@ static int src_tail_more(const AVStream *vst, int64_t raw, int64_t ref)
  * slot (per-stream state, video stream, LAYERA buffer), resolve each of its tracks' -map specifier, and hand the
  * decoders over to the decode / audio threads through their own queues (BIND sentinels: every AudioState / DecodeCtx
  * write stays on its owner thread). A later outage of the slot takes the normal reopen. */
+static int audio_bind_send(DemuxArgs *d, AVFormatContext *f, int j, int si);
+
+/* the video decoder for f's stream vs, handed to the decode thread ahead of the stream's next packet (a deferred slot's
+ * first bind; 2.2 T-428 a codec change on the bound stream) */
+static int video_bind_send(DemuxArgs *d, AVFormatContext *f, int vs)
+{
+    AVPacket *bp = av_packet_alloc();
+    PtvSlotBind *b = av_mallocz(sizeof(*b));
+    if (!bp || !b || !(b->par = avcodec_parameters_alloc()) ||
+        avcodec_parameters_copy(b->par, f->streams[vs]->codecpar) < 0) {
+        if (b) avcodec_parameters_free(&b->par);
+        av_free(b); av_packet_free(&bp);
+        return AVERROR(ENOMEM);
+    }
+    b->tb  = f->streams[vs]->time_base;
+    b->avg = f->streams[vs]->avg_frame_rate;
+    bp->opaque = b;
+    bp->flags |= PTV_PKT_FLAG_SLOT_BIND;
+    if (av_thread_message_queue_send(d->video_q, &bp, 0) < 0) {
+        avcodec_parameters_free(&b->par); av_free(b); av_packet_free(&bp);
+        return AVERROR_EXIT;
+    }
+    d->vcodec = f->streams[vs]->codecpar->codec_id;
+    return 0;
+}
+
 static int slot_bind(DemuxArgs *d)
 {
     struct Input *in = d->in;
@@ -1299,33 +1335,27 @@ static int slot_bind(DemuxArgs *d)
     /* audio: each deferred track's -map specifier against the arrived layout; a track whose source has no match keeps
      * its silence (logged) */
     for (j = 0; j < d->n_audio; j++) {
-        AVPacket *bp;
-        PtvSlotBind *b;
+        PtvBindRule br;
+        PtvBindPick pk;
+        int r;
         if (d->astream[j] >= 0 || !d->abind[j][0])
             continue;
-        for (si = 0; si < nb; si++)
-            if (f->streams[si]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
-                avformat_match_stream_specifier(f, f->streams[si], d->abind[j]) > 0)
-                break;
+        if (ptv_bind_parse(d->abind[j], &br) > 0)        /* 2.2: an audio rule (spec §7) picks by content */
+            si = ptv_bind_audio(f, d->rsync_slot, &br, 1, &pk, 1, 0) == 1 ? pk.stream : nb;
+        else
+            for (si = 0; si < nb; si++)
+                if (f->streams[si]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
+                    avformat_match_stream_specifier(f, f->streams[si], d->abind[j]) > 0)
+                    break;
         if (si == nb) {
             av_log(NULL, AV_LOG_WARNING, "[PTV-BIND] %d:%s → no such audio in in%d — the track stays silent\n",
                    d->rsync_slot, d->abind[j], d->rsync_slot);
             continue;
         }
-        if (!(bp = av_packet_alloc()) || !(b = av_mallocz(sizeof(*b))) || !(b->par = avcodec_parameters_alloc()) ||
-            avcodec_parameters_copy(b->par, f->streams[si]->codecpar) < 0) {
-            if (bp && bp->opaque) av_free(bp->opaque);
-            av_packet_free(&bp);
-            return AVERROR(ENOMEM);
-        }
-        b->tb = f->streams[si]->time_base;
-        bp->opaque = b;
-        bp->flags |= PTV_PKT_FLAG_SLOT_BIND;
-        if (av_thread_message_queue_send(d->audio_q[j], &bp, 0) < 0) {
-            avcodec_parameters_free(&b->par); av_free(b); av_packet_free(&bp);
+        if ((r = audio_bind_send(d, f, j, si)) == AVERROR(ENOMEM))
+            return r;
+        if (r < 0)
             continue;
-        }
-        d->astream[j] = si;
         {
             AVDictionaryEntry *lg = av_dict_get(f->streams[si]->metadata, "language", NULL, 0);
             av_log(NULL, AV_LOG_INFO, "[PTV-BIND] %d:%s → in%d pid 0x%x %s %dch %s (slot %d)\n", d->rsync_slot,
@@ -1334,22 +1364,9 @@ static int slot_bind(DemuxArgs *d)
         }
     }
     {   /* video last: the decoder opens before the first packet of the slot reaches it */
-        AVPacket *bp = av_packet_alloc();
-        PtvSlotBind *b = av_mallocz(sizeof(*b));
-        if (!bp || !b || !(b->par = avcodec_parameters_alloc()) ||
-            avcodec_parameters_copy(b->par, f->streams[vs]->codecpar) < 0) {
-            if (b) avcodec_parameters_free(&b->par);
-            av_free(b); av_packet_free(&bp);
-            return AVERROR(ENOMEM);
-        }
-        b->tb  = f->streams[vs]->time_base;
-        b->avg = f->streams[vs]->avg_frame_rate;
-        bp->opaque = b;
-        bp->flags |= PTV_PKT_FLAG_SLOT_BIND;
-        if (av_thread_message_queue_send(d->video_q, &bp, 0) < 0) {
-            avcodec_parameters_free(&b->par); av_free(b); av_packet_free(&bp);
-            return AVERROR_EXIT;
-        }
+        int r = video_bind_send(d, f, vs);
+        if (r < 0)
+            return r;
     }
     d->ifmt = f;                                     /* *d->ifmt_home == in->ifmt already (the acquire set it) */
     av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in%d WAITING → LIVE: slot %d joins the mosaic\n", d->rsync_slot, d->rsync_slot);
@@ -1447,6 +1464,91 @@ static void ptv_cc_salvage(DemuxArgs *d, AVPacket *pkt)
     }
 }
 
+/* the audio track j's decoder for f's stream si (the audio thread swaps it in: a deferred slot's first bind — f is the
+ * slot's new open, d->ifmt is set only after — or a re-bind) */
+static int audio_bind_send(DemuxArgs *d, AVFormatContext *f, int j, int si)
+{
+    AVPacket *bp;
+    PtvSlotBind *b;
+    if (!(bp = av_packet_alloc()) || !(b = av_mallocz(sizeof(*b))) || !(b->par = avcodec_parameters_alloc()) ||
+        avcodec_parameters_copy(b->par, f->streams[si]->codecpar) < 0) {
+        if (bp && bp->opaque) av_free(bp->opaque);
+        av_packet_free(&bp);
+        return AVERROR(ENOMEM);
+    }
+    b->tb = f->streams[si]->time_base;
+    bp->opaque = b;
+    bp->flags |= PTV_PKT_FLAG_SLOT_BIND;
+    if (av_thread_message_queue_send(d->audio_q[j], &bp, 0) < 0) {
+        avcodec_parameters_free(&b->par); av_free(b); av_packet_free(&bp);
+        return AVERROR(EAGAIN);
+    }
+    d->astream[j] = si;
+    d->acodec[j]  = f->streams[si]->codecpar->codec_id;
+    return 0;
+}
+
+/* 2.2 T-427 (spec §7.3, D36): a rule's track follows its source inside its language + role. Its stream gone from the PMT
+ * or silent past -lost_after → the rule runs again on what is there now, limited to the track's identity; the original
+ * back and ranking first again → back to it. Nothing in the group → the track stays silent (strict across languages).
+ * Another stream counts only while in the PMT with a packet in the last second; the bound one until -lost_after. Pins
+ * (a:pid / a:index) and copied tracks never move. Demux thread, once a second, while the video flows. */
+static void rule_rebind(DemuxArgs *d, int64_t now)
+{
+    AVFormatContext *f = d->ifmt;
+    int slot = d->rsync_slot > 0 ? d->rsync_slot : 0, j, si, b;
+    for (j = 0; j < d->n_audio && j < 32; j++) {
+        PtvBindRule r;
+        PtvBindPick pk;
+        uint64_t present = 0;
+        int cur = d->astream[j];
+        if (cur < 0 || !d->abind[j][0] || ptv_bind_parse(d->abind[j], &r) <= 0 ||
+            r.kind == PTV_BIND_PID || r.kind == PTV_BIND_INDEX)
+            continue;
+        if (!(d->aid_set & (1u << j))) {
+            if (ptv_bind_ident(f, slot, cur, d->aid_lang[j], &d->aid_role[j]) < 0)
+                continue;
+            d->aid_set |= 1u << j;
+        }
+        for (si = 0; si < d->nb_streams_open && si < 64; si++) {
+            int64_t last = d->wrap_wall_last ? d->wrap_wall_last[si] : 0;
+            for (b = 0; b < d->pmt_n && d->pmt_pid[b] != f->streams[si]->id; b++) ;
+            if (b < d->pmt_n && (si == cur ? !last || now - FFMAX(last, d->v_flow_wc) < g_lost_after_us
+                                           : last && now - last < 1000000))
+                present |= 1ULL << si;
+        }
+        if (ptv_bind_audio_in(f, slot, &r, !d->single, present, d->aid_lang[j], d->aid_role[j],
+                              &pk, 1, 0) != 1) {
+            if (!(present >> cur & 1) && !(d->a_orphan & (1u << j))) {
+                d->a_orphan |= 1u << j;
+                av_log(NULL, AV_LOG_WARNING, "[PTV-BIND] in%d a:%d %s: pid 0x%x gone and no other %s track — silent until "
+                       "one comes (the output track stays)\n", slot, j, d->abind[j], f->streams[cur]->id, d->aid_lang[j]);
+            }
+            continue;
+        }
+        d->a_orphan &= ~(1u << j);
+        if (pk.stream == cur || audio_bind_send(d, d->ifmt, j, pk.stream) < 0)
+            continue;
+        av_log(NULL, AV_LOG_WARNING, "[PTV-BIND] in%d a:%d %s re-bound: pid 0x%x → 0x%x %s %dch %s (%s)\n", slot, j,
+               d->abind[j], f->streams[cur]->id, f->streams[pk.stream]->id,
+               avcodec_get_name(f->streams[pk.stream]->codecpar->codec_id),
+               f->streams[pk.stream]->codecpar->ch_layout.nb_channels, d->aid_lang[j],
+               present >> cur & 1 ? "ranks first again" : "its stream is gone; same language + role");
+    }
+}
+
+/* the followed program's PMT has a new version (checked per packet: a re-bind follows it at once, T-427) */
+static int pmt_moved(const DemuxArgs *d)
+{
+    unsigned i;
+    if (!d->pmt_seen)
+        return 0;
+    for (i = 0; i < d->ifmt->nb_programs; i++)
+        if (d->ifmt->programs[i]->id == d->pmt_prog)
+            return d->ifmt->programs[i]->pmt_version != d->pmt_ver;
+    return 0;
+}
+
 /* 2.1 T-003 step 1: what changed in the source, logged once — the PMT's version (with the PIDs it added and dropped) and
  * a MAPPED audio stream that goes silent while the video flows (sync_check restarts such a channel as DEAD_AUDIO_TRACK
  * with nothing in our log to say why). Called from the demux loop at most once a second. */
@@ -1506,6 +1608,8 @@ static void ptv_src_check(DemuxArgs *d, int64_t now)
                    slot, j, s, f->streams[s]->id);
         }
     }
+    if (d->pmt_seen && now - d->v_last_wc < 1000000)   /* 2.2 T-427: not during a whole-source outage (the hold's) */
+        rule_rebind(d, now);
 }
 
 void *demux_thread(void *arg)
@@ -1688,11 +1792,46 @@ void *demux_thread(void *arg)
         {
             int64_t pnow = av_gettime_relative();
             if (pkt->stream_index == d->vstream) {
+                /* 2.2 T-428 (spec §6): a PMT update changed the video codec on the same PID (lavf rewrites the stream's
+                 * codec in place): the decoder is swapped before this packet, the picture resumes at the new codec's next
+                 * keyframe (repeated until then). Was: the old decoder fed the new codec — frozen for as long as it lasted */
+                enum AVCodecID vc = d->ifmt->streams[d->vstream]->codecpar->codec_id;
+                if (!d->vcodec)
+                    d->vcodec = vc;
+                else if (vc != d->vcodec && vc != AV_CODEC_ID_NONE) {
+                    enum AVCodecID was = d->vcodec;
+                    if (video_bind_send(d, d->ifmt, d->vstream) >= 0)
+                        av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in%d video codec %s → %s on pid 0x%x — decoder swapped, the "
+                               "picture resumes at the next keyframe\n", d->rsync_slot > 0 ? d->rsync_slot : 0,
+                               avcodec_get_name(was), avcodec_get_name(vc), d->ifmt->streams[d->vstream]->id);
+                    else
+                        d->vcodec = vc;                  /* the swap failed: do not retry on every packet */
+                }
                 if (pnow - d->v_last_wc > 1000000)
                     d->v_flow_wc = pnow;             /* T-003: silence counts only while the video flows */
                 d->v_last_wc = pnow;                 /* 2.0.2 T-387 */
+            } else {
+                int j;   /* 2.2 T-428: the same for a transcoded audio track's stream (mp2 -> aac on one PID: was silent) */
+                for (j = 0; j < d->n_audio && j < PTV_MAX_AUDIO; j++) {
+                    enum AVCodecID ac;
+                    if (d->astream[j] != pkt->stream_index)
+                        continue;
+                    ac = d->ifmt->streams[pkt->stream_index]->codecpar->codec_id;
+                    if (!d->acodec[j])
+                        d->acodec[j] = ac;
+                    else if (ac != d->acodec[j] && ac != AV_CODEC_ID_NONE) {
+                        enum AVCodecID was = d->acodec[j];
+                        if (audio_bind_send(d, d->ifmt, j, pkt->stream_index) >= 0)
+                            av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in%d audio track %d: codec %s → %s on pid 0x%x — decoder "
+                                   "swapped, the track continues from it\n", d->rsync_slot > 0 ? d->rsync_slot : 0, j,
+                                   avcodec_get_name(was), avcodec_get_name(ac), d->ifmt->streams[pkt->stream_index]->id);
+                        else
+                            d->acodec[j] = ac;           /* the swap failed: do not retry on every packet */
+                    }
+                }
             }
-            if (pnow - d->src_chk_wc >= 1000000)     /* T-003: any stream — a PMT update can move the video itself */
+            if (pnow - d->src_chk_wc >= 1000000 || pmt_moved(d))   /* T-003: any stream — a PMT update can move the video
+                                                                  * itself; 2.2 T-427: a new PMT at once (a re-bind) */
                 ptv_src_check(d, pnow);
         }
         /* 2.0.0-pre17 T-348 (see aac_next): a frame without its own PES label (pos < 0: lavf split it out of the
