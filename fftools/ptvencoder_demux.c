@@ -1271,7 +1271,7 @@ static int src_tail_more(const AVStream *vst, int64_t raw, int64_t ref)
  * slot (per-stream state, video stream, LAYERA buffer), resolve each of its tracks' -map specifier, and hand the
  * decoders over to the decode / audio threads through their own queues (BIND sentinels: every AudioState / DecodeCtx
  * write stays on its owner thread). A later outage of the slot takes the normal reopen. */
-static int audio_bind_send(DemuxArgs *d, int j, int si);
+static int audio_bind_send(DemuxArgs *d, AVFormatContext *f, int j, int si);
 
 /* the video decoder for f's stream vs, handed to the decode thread ahead of the stream's next packet (a deferred slot's
  * first bind; 2.2 T-428 a codec change on the bound stream) */
@@ -1352,7 +1352,7 @@ static int slot_bind(DemuxArgs *d)
                    d->rsync_slot, d->abind[j], d->rsync_slot);
             continue;
         }
-        if ((r = audio_bind_send(d, j, si)) == AVERROR(ENOMEM))
+        if ((r = audio_bind_send(d, f, j, si)) == AVERROR(ENOMEM))
             return r;
         if (r < 0)
             continue;
@@ -1464,10 +1464,10 @@ static void ptv_cc_salvage(DemuxArgs *d, AVPacket *pkt)
     }
 }
 
-/* the audio track j's decoder for stream si (the audio thread swaps it in: a deferred slot's first bind, or a re-bind) */
-static int audio_bind_send(DemuxArgs *d, int j, int si)
+/* the audio track j's decoder for f's stream si (the audio thread swaps it in: a deferred slot's first bind — f is the
+ * slot's new open, d->ifmt is set only after — or a re-bind) */
+static int audio_bind_send(DemuxArgs *d, AVFormatContext *f, int j, int si)
 {
-    AVFormatContext *f = d->ifmt;
     AVPacket *bp;
     PtvSlotBind *b;
     if (!(bp = av_packet_alloc()) || !(b = av_mallocz(sizeof(*b))) || !(b->par = avcodec_parameters_alloc()) ||
@@ -1527,7 +1527,7 @@ static void rule_rebind(DemuxArgs *d, int64_t now)
             continue;
         }
         d->a_orphan &= ~(1u << j);
-        if (pk.stream == cur || audio_bind_send(d, j, pk.stream) < 0)
+        if (pk.stream == cur || audio_bind_send(d, d->ifmt, j, pk.stream) < 0)
             continue;
         av_log(NULL, AV_LOG_WARNING, "[PTV-BIND] in%d a:%d %s re-bound: pid 0x%x → 0x%x %s %dch %s (%s)\n", slot, j,
                d->abind[j], f->streams[cur]->id, f->streams[pk.stream]->id,
@@ -1809,6 +1809,7 @@ void *demux_thread(void *arg)
                 }
                 if (pnow - d->v_last_wc > 1000000)
                     d->v_flow_wc = pnow;             /* T-003: silence counts only while the video flows */
+                d->v_last_wc = pnow;                 /* 2.0.2 T-387 */
             } else {
                 int j;   /* 2.2 T-428: the same for a transcoded audio track's stream (mp2 -> aac on one PID: was silent) */
                 for (j = 0; j < d->n_audio && j < PTV_MAX_AUDIO; j++) {
@@ -1820,7 +1821,7 @@ void *demux_thread(void *arg)
                         d->acodec[j] = ac;
                     else if (ac != d->acodec[j] && ac != AV_CODEC_ID_NONE) {
                         enum AVCodecID was = d->acodec[j];
-                        if (audio_bind_send(d, j, pkt->stream_index) >= 0)
+                        if (audio_bind_send(d, d->ifmt, j, pkt->stream_index) >= 0)
                             av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in%d audio track %d: codec %s → %s on pid 0x%x — decoder "
                                    "swapped, the track continues from it\n", d->rsync_slot > 0 ? d->rsync_slot : 0, j,
                                    avcodec_get_name(was), avcodec_get_name(ac), d->ifmt->streams[pkt->stream_index]->id);
@@ -1828,7 +1829,6 @@ void *demux_thread(void *arg)
                             d->acodec[j] = ac;           /* the swap failed: do not retry on every packet */
                     }
                 }
-                d->v_last_wc = pnow;                 /* 2.0.2 T-387 */
             }
             if (pnow - d->src_chk_wc >= 1000000 || pmt_moved(d))   /* T-003: any stream — a PMT update can move the video
                                                                   * itself; 2.2 T-427: a new PMT at once (a re-bind) */
