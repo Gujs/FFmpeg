@@ -1215,6 +1215,22 @@ static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const ReopenShape *o
      * encoder restart came back with video + audio and its SCTE-35 PID a moment later (cor-3 Fintech_247, ~1/day): read
      * as RESHAPED, exit 4, the wrapper's re-probe found the same three streams — ~40 s dark for nothing. Retried as a
      * failed attempt; still short after 10 s = a real change (exit 4 as before) */
+    if (nb < old_nb) {   /* 2.2 D37: only declared tracks (-map d:scte35) missing = the source as configured, not incomplete */
+        unsigned m;
+        int pi, decl = 1;
+        for (m = nb; m < old_nb && decl; m++)
+            for (pi = 0, decl = 0; pi < d->n_pass && !decl; pi++)
+                decl = d->pass[pi].declared && d->pass[pi].in_index == (int)m;
+        if (decl) {
+            for (pi = 0; pi < d->n_pass; pi++)
+                if (d->pass[pi].declared && d->pass[pi].in_index >= (int)nb)
+                    d->pass[pi].in_index = -1;       /* empty until the stream appears again (adopted as late-born) */
+            av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 came back without its declared SCTE-35 (%u of %u streams) — the "
+                   "PID stays, empty until the source sends it again\n", nb, old_nb);
+            d->nb_streams_open = nb;
+            old_nb = nb;
+        }
+    }
     if (nb < old_nb) {
         int64_t now = av_gettime_relative();
         if (!d->short_wc) {
@@ -1301,22 +1317,22 @@ static int slot_bind(DemuxArgs *d)
 {
     struct Input *in = d->in;
     AVFormatContext *f = in->ifmt;
-    int nb = f->nb_streams, si, j, vs;
+    int nb = f->nb_streams, cap = nb + PTV_STREAM_SLACK, si, j, vs;   /* 2.2: room for adopted streams */
 
-    in->wrap_off        = av_calloc(nb, sizeof(*in->wrap_off));
-    in->wrap_last       = av_malloc_array(nb, sizeof(*in->wrap_last));
-    in->wrap_wall_last  = av_calloc(nb, sizeof(*in->wrap_wall_last));
-    in->edit_us         = av_calloc(nb, sizeof(*in->edit_us));
-    in->gap_vsnap       = av_calloc(nb, sizeof(*in->gap_vsnap));
-    in->wall_cad_us     = av_calloc(nb, sizeof(*in->wall_cad_us));
-    in->pkt_wall_gap_us = av_calloc(nb, sizeof(*in->pkt_wall_gap_us));
-    in->tail_gap_us     = av_calloc(nb, sizeof(*in->tail_gap_us));
-    in->tail_wc_us      = av_calloc(nb, sizeof(*in->tail_wc_us));
-    in->ts_outl         = av_calloc(nb, sizeof(*in->ts_outl));
+    in->wrap_off        = av_calloc(cap, sizeof(*in->wrap_off));
+    in->wrap_last       = av_malloc_array(cap, sizeof(*in->wrap_last));
+    in->wrap_wall_last  = av_calloc(cap, sizeof(*in->wrap_wall_last));
+    in->edit_us         = av_calloc(cap, sizeof(*in->edit_us));
+    in->gap_vsnap       = av_calloc(cap, sizeof(*in->gap_vsnap));
+    in->wall_cad_us     = av_calloc(cap, sizeof(*in->wall_cad_us));
+    in->pkt_wall_gap_us = av_calloc(cap, sizeof(*in->pkt_wall_gap_us));
+    in->tail_gap_us     = av_calloc(cap, sizeof(*in->tail_gap_us));
+    in->tail_wc_us      = av_calloc(cap, sizeof(*in->tail_wc_us));
+    in->ts_outl         = av_calloc(cap, sizeof(*in->ts_outl));
     if (!in->wrap_off || !in->wrap_last || !in->wrap_wall_last || !in->edit_us || !in->gap_vsnap ||
         !in->wall_cad_us || !in->pkt_wall_gap_us || !in->tail_gap_us || !in->tail_wc_us || !in->ts_outl)
         return AVERROR(ENOMEM);
-    for (si = 0; si < nb; si++) {
+    for (si = 0; si < cap; si++) {
         in->wrap_last[si] = AV_NOPTS_VALUE;
         in->ts_outl[si].last2 = in->ts_outl[si].pend_last = AV_NOPTS_VALUE;
     }
@@ -1330,6 +1346,7 @@ static int slot_bind(DemuxArgs *d)
     d->wall_cad_us = in->wall_cad_us; d->pkt_wall_gap_us = in->pkt_wall_gap_us;
     d->tail_gap_us = in->tail_gap_us; d->tail_wc_us = in->tail_wc_us;
     d->nb_streams_open = nb;
+    d->nb_streams_cap  = cap;
     d->late_stream_max = -1;
     d->cc_raw_dts = AV_NOPTS_VALUE;
     /* audio: each deferred track's -map specifier against the arrived layout; a track whose source has no match keeps
@@ -1759,23 +1776,57 @@ void *demux_thread(void *arg)
          * routed nowhere (dispatch matches only the streams bound at open): drop its packets here,
          * before any bookkeeping indexes them (was a heap overflow in demux_unwrap). */
         if (pkt->stream_index >= d->nb_streams_open) {
+            const AVStream *ls = d->ifmt->streams[pkt->stream_index];
+            int adopt = 0, pi;
+            /* 2.2 (spec §8.2 / D37): a declared SCTE-35 PID still waiting for its source adopts the first SCTE-35 stream
+             * that appears (the spare per-stream slots past the open count hold its state). Was: ignored for the run —
+             * every cue lost until a restart (measured: the PID 20 s late, 0 cues on the output) */
+            if (pkt->stream_index < d->nb_streams_cap && ls->codecpar->codec_id == AV_CODEC_ID_SCTE_35)
+                for (pi = 0; pi < d->n_pass; pi++)
+                    if (d->pass[pi].declared && d->pass[pi].in_index < 0 && d->pass[pi].is_scte) {
+                        d->pass[pi].in_index = pkt->stream_index;
+                        d->pass[pi].in_tb    = ls->time_base;
+                        adopt = 1;
+                        av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in%d SCTE-35 appeared on pid 0x%x — carried on the declared "
+                               "output PID\n", d->rsync_slot > 0 ? d->rsync_slot : 0, ls->id);
+                        break;
+                    }
             /* 2.0.2 T-387: the source moved its video to a new PID (PMT update; cor-3 2026-10-08 Curiosity Now: the
              * audio flowed on, the slot's picture stayed dead until a restart 200 s later; a single input waited out
              * 2 x -lost_after, then re-probed). A late-born VIDEO stream that delivers 1 s of packets while the bound
-             * video is silent >= 2 s = the move: reopen now — a mosaic slot resumes on the new PID as after an
-             * outage (same stream count + types), a single input comes back RESHAPED and exits 4 for a re-probe. */
-            if (d->reopen && !d->vmove_force && d->vstream >= 0 &&
-                d->ifmt->streams[pkt->stream_index]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+             * video is silent >= 2 s = the move. 2.2: taken over in-process (its slot past the open count; a decoder for
+             * it ahead of its next packet; the picture resumes at its next keyframe) — no reopen, so nothing already
+             * played is read again and the cushion is not primed again (the reopen's rough resume: audio overlap trimmed,
+             * the picture ~2 s ahead of the sound). No spare slot left: the reopen, as before */
+            if (!adopt && d->reopen && !d->vmove_force && d->vstream >= 0 &&
+                ls->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
                 int64_t now = av_gettime_relative();
                 if (!d->v_last_wc || now - d->v_last_wc < 2000000)
                     d->vmove_n = 0;
                 else if (++d->vmove_n >= 25) {
-                    d->vmove_force = 1;
-                    av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] input '%s': video moved to pid 0x%x (pid 0x%x silent "
-                           "%.1f s) — reopening\n", d->url, d->ifmt->streams[pkt->stream_index]->id,
-                           d->ifmt->streams[d->vstream]->id, (now - d->v_last_wc) / 1e6);
+                    int was = d->vstream;
+                    if (pkt->stream_index < d->nb_streams_cap && video_bind_send(d, d->ifmt, pkt->stream_index) >= 0) {
+                        av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] input '%s': video moved to pid 0x%x (pid 0x%x silent %.1f s) — "
+                               "taken over in-process, the picture resumes at its next keyframe\n", d->url, ls->id,
+                               d->ifmt->streams[was]->id, (now - d->v_last_wc) / 1e6);
+                        d->vstream = pkt->stream_index;
+                        if (d->in) d->in->vstream = pkt->stream_index;
+                        d->vmove_n = 0;
+                        d->v_last_wc = now;
+                        adopt = 1;
+                    } else {
+                        d->vmove_force = 1;
+                        av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] input '%s': video moved to pid 0x%x (pid 0x%x silent "
+                               "%.1f s) — reopening\n", d->url, ls->id, d->ifmt->streams[was]->id, (now - d->v_last_wc) / 1e6);
+                    }
                 }
             }
+            if (adopt) {                             /* the stream is followed from here on, like one present at the open */
+                d->nb_streams_open = pkt->stream_index + 1;
+                ptv_tl_grow(d->tl, d->nb_streams_open);
+            }
+        }
+        if (pkt->stream_index >= d->nb_streams_open) {
             if (pkt->stream_index > d->late_stream_max) {
                 const AVStream *ls = d->ifmt->streams[pkt->stream_index];
                 d->late_stream_max = pkt->stream_index;
@@ -2297,7 +2348,7 @@ void *demux_thread(void *arg)
         }
         demux_unwrap(d, out);               /* 33-bit source wrap -> monotonic extended ts (ONCE) */
         /* 2.1 T-409: one classifier, one remedy for every stream of the input (ptv_tl_ingest dispatches) */
-        if (!d->tl && !(d->tl = ptv_tl_alloc(d->nb_streams_open))) {
+        if (!d->tl && !(d->tl = ptv_tl_alloc(d->nb_streams_open, d->nb_streams_cap))) {
             av_packet_free(&out);
             ret = AVERROR(ENOMEM);
             break;

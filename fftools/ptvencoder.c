@@ -47,7 +47,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.2.0-pre1"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.2.0-pre2"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -4042,6 +4042,7 @@ typedef struct Sel {
     int            copy_input[PTV_MAX_PASS]; /* source input index per copy stream (multiview) */
     char           copy_olang[PTV_MAX_PASS][8];  /* 2.2: a rule's copy — output language ("" = the source's) */
     char           copy_klang[PTV_MAX_PASS][8];  /* ... and the language that places its PID */
+    int            copy_decl[PTV_MAX_PASS];      /* 2.2 D37: declared by a rule (-map d:scte35): may be absent */
     int            n_copy;
     PtvBindRule    rules[PTV_MAX_AUDIO];  /* 2.2: the audio rules of this output (the track strings point in here) */
     int            n_rules;
@@ -5548,23 +5549,25 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                inputs[k].vdec->active_thread_type & FF_THREAD_FRAME ? "frame" :
                inputs[k].vdec->active_thread_type & FF_THREAD_SLICE ? "slice" : "none", "");
         vdecs[k] = inputs[k].vdec;
-        inputs[k].wrap_off  = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].wrap_off));
-        inputs[k].wrap_last = av_malloc_array(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].wrap_last));
-        inputs[k].wrap_wall_last = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].wrap_wall_last)); /* 0 = no prev packet yet */
-        inputs[k].edit_us   = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].edit_us));   /* pre9 sensor label-edit ledger */
-        inputs[k].gap_vsnap = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].gap_vsnap)); /* pre16 #47-A: vpkt snapshots */
-        inputs[k].wall_cad_us     = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].wall_cad_us));     /* pre24 #63: cadence EMA */
-        inputs[k].pkt_wall_gap_us = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].pkt_wall_gap_us)); /* pre24 #63: current-pkt gap */
-        inputs[k].tail_gap_us     = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].tail_gap_us));     /* 2.0.0-pre4c: PES-tail carry */
-        inputs[k].tail_wc_us      = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].tail_wc_us));      /* 2.0.0 T-089 */
-        inputs[k].ts_outl         = av_calloc(inputs[k].ifmt->nb_streams, sizeof(*inputs[k].ts_outl));         /* 2.0.0-pre9.2 (T-080 B) */
+        const int ncap = inputs[k].ifmt->nb_streams + PTV_STREAM_SLACK;   /* 2.2: room for a stream born later */
+        inputs[k].wrap_off  = av_calloc(ncap, sizeof(*inputs[k].wrap_off));
+        inputs[k].wrap_last = av_malloc_array(ncap, sizeof(*inputs[k].wrap_last));
+        inputs[k].wrap_wall_last = av_calloc(ncap, sizeof(*inputs[k].wrap_wall_last)); /* 0 = no prev packet yet */
+        inputs[k].edit_us   = av_calloc(ncap, sizeof(*inputs[k].edit_us));   /* pre9 sensor label-edit ledger */
+        inputs[k].gap_vsnap = av_calloc(ncap, sizeof(*inputs[k].gap_vsnap)); /* pre16 #47-A: vpkt snapshots */
+        inputs[k].wall_cad_us     = av_calloc(ncap, sizeof(*inputs[k].wall_cad_us));     /* pre24 #63: cadence EMA */
+        inputs[k].pkt_wall_gap_us = av_calloc(ncap, sizeof(*inputs[k].pkt_wall_gap_us)); /* pre24 #63: current-pkt gap */
+        inputs[k].tail_gap_us     = av_calloc(ncap, sizeof(*inputs[k].tail_gap_us));     /* 2.0.0-pre4c: PES-tail carry */
+        inputs[k].tail_wc_us      = av_calloc(ncap, sizeof(*inputs[k].tail_wc_us));      /* 2.0.0 T-089 */
+        inputs[k].ts_outl         = av_calloc(ncap, sizeof(*inputs[k].ts_outl));         /* 2.0.0-pre9.2 (T-080 B) */
         if (!inputs[k].wrap_off || !inputs[k].wrap_last || !inputs[k].wrap_wall_last || !inputs[k].edit_us || !inputs[k].gap_vsnap ||
             !inputs[k].wall_cad_us || !inputs[k].pkt_wall_gap_us || !inputs[k].tail_gap_us || !inputs[k].tail_wc_us || !inputs[k].ts_outl) { ret = AVERROR(ENOMEM); goto end; }
-        for (si = 0; si < (int)inputs[k].ifmt->nb_streams; si++) {
+        for (si = 0; si < ncap; si++) {
             inputs[k].wrap_last[si] = AV_NOPTS_VALUE;
             inputs[k].ts_outl[si].last2 = inputs[k].ts_outl[si].pend_last = AV_NOPTS_VALUE;
         }
-        inputs[k].da.nb_streams_open = inputs[k].ifmt->nb_streams;   /* 1.2.2 T-064: the size above */
+        inputs[k].da.nb_streams_open = inputs[k].ifmt->nb_streams;   /* 1.2.2 T-064: the streams at open */
+        inputs[k].da.nb_streams_cap  = ncap;                         /* 2.2: the arrays' room (adoption) */
         inputs[k].da.late_stream_max = -1;
         inputs[k].da.cc_raw_dts = AV_NOPTS_VALUE;   /* 2.1 T-326 */
     }
@@ -5952,11 +5955,22 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         for (si = 0; si < sel[0].n_copy && n_pass < PTV_MAX_PASS; si++) {
             int sidx, tidx; char tlet;
             AVStream *ist; AVDictionaryEntry *lang;
+            AVCodecParameters *phpar = NULL;         /* 2.2: the placeholder's parameters (freed below) */
+            const AVCodecParameters *ipar;
+            AVRational itb;
             if (sel[0].copy_input[si] != kk) continue;
             sidx = sel[0].copy[si];
-            ist  = inputs[kk].ifmt->streams[sidx];
-            lang = av_dict_get(ist->metadata, "language", NULL, 0);
-            switch (ist->codecpar->codec_type) {     /* type specifier + per-type output index */
+            ist  = sidx >= 0 ? inputs[kk].ifmt->streams[sidx] : NULL;
+            if (!ist) {                              /* 2.2 D37: a declared SCTE-35 PID, no source stream yet */
+                phpar = avcodec_parameters_alloc();
+                if (!phpar) { ret = AVERROR(ENOMEM); goto end; }
+                phpar->codec_type = AVMEDIA_TYPE_DATA;
+                phpar->codec_id   = AV_CODEC_ID_SCTE_35;
+            }
+            ipar = ist ? ist->codecpar : phpar;
+            itb  = ist ? ist->time_base : (AVRational){ 1, 90000 };
+            lang = ist ? av_dict_get(ist->metadata, "language", NULL, 0) : NULL;
+            switch (ipar->codec_type) {              /* type specifier + per-type output index */
                 case AVMEDIA_TYPE_AUDIO:    tlet = 'a'; tidx = copy_aidx++; break;
                 case AVMEDIA_TYPE_SUBTITLE: tlet = 's'; tidx = copy_sidx++; break;
                 case AVMEDIA_TYPE_VIDEO:    tlet = 'v'; tidx = copy_vidx++; break;
@@ -5967,18 +5981,19 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
             av_strlcpy(pass_klang[n_pass], sel[0].copy_klang[si], sizeof pass_klang[0]);
             pass[n_pass].input    = kk;
             pass[n_pass].in_index = sidx;
-            pass[n_pass].is_scte  = ist->codecpar->codec_id == AV_CODEC_ID_SCTE_35;
-            pass[n_pass].cname    = avcodec_get_name(ist->codecpar->codec_id);
-            pass[n_pass].in_tb    = ist->time_base;
+            pass[n_pass].is_scte  = ipar->codec_id == AV_CODEC_ID_SCTE_35;
+            pass[n_pass].declared = sel[0].copy_decl[si];
+            pass[n_pass].cname    = avcodec_get_name(ipar->codec_id);
+            pass[n_pass].in_tb    = itb;
             pass[n_pass].last_dts = AV_NOPTS_VALUE;
-            pass[n_pass].gated    = (ist->codecpar->codec_type == AVMEDIA_TYPE_AUDIO);  /* §7.5a: dense AC-3/MP2 ride the gate; sparse subs/data/SCTE-35 bypass */
+            pass[n_pass].gated    = (ipar->codec_type == AVMEDIA_TYPE_AUDIO);  /* §7.5a: dense AC-3/MP2 ride the gate; sparse subs/data/SCTE-35 bypass */
             pass[n_pass].fill_end = AV_NOPTS_VALUE;
             pass[n_pass].real_end = AV_NOPTS_VALUE;
             /* 2.0.0-pre9.4 (T-084): a copied broadcast audio track whose parameters the probe never saw (no clean frame
              * in the probe window — Cinestar_Premiere 2026-10-06, two senders on one group: `ac3, 4 channels, fltp`,
              * no rate) made the mpegts header fail ("sample rate not set" → exit 1 every ~27 s, zero output). Its
              * codec fixes the rate in DVB/ATSC use: 48 kHz; the frames carry their own layout. */
-            if (ist->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && ist->codecpar->sample_rate <= 0 &&
+            if (ist && ist->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && ist->codecpar->sample_rate <= 0 &&
                 (ist->codecpar->codec_id == AV_CODEC_ID_AC3 || ist->codecpar->codec_id == AV_CODEC_ID_EAC3 ||
                  ist->codecpar->codec_id == AV_CODEC_ID_MP2 || ist->codecpar->codec_id == AV_CODEC_ID_MP3 ||
                  ist->codecpar->codec_id == AV_CODEC_ID_AAC)) {
@@ -5996,15 +6011,16 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
             for (r = 0; r < n_rung; r++) {
                 AVStream *os = avformat_new_stream(rung[r].ofmt, NULL);
                 if (!os) { ret = AVERROR(ENOMEM); goto end; }
-                if ((ret = avcodec_parameters_copy(os->codecpar, ist->codecpar)) < 0) goto end;
+                if ((ret = avcodec_parameters_copy(os->codecpar, ipar)) < 0) { avcodec_parameters_free(&phpar); goto end; }
                 os->codecpar->codec_tag = 0;
-                os->time_base   = ist->time_base;
-                os->disposition = ist->disposition;
+                os->time_base   = itb;
+                os->disposition = ist ? ist->disposition : 0;
                 if (lang) av_dict_set(&os->metadata, "language", lang->value, 0);
                 if (pass_olang[n_pass][0]) av_dict_set(&os->metadata, "language", pass_olang[n_pass], 0);
                 apply_stream_meta(&outs->groups[r], tlet, tidx, os);  /* CLI -metadata:s:<t>:N / -disposition (G5) — copy streams (subs/data/extra-audio) */
                 pass[n_pass].ost[r] = os;
             }
+            avcodec_parameters_free(&phpar);
             n_pass++;
             inputs[kk].da.n_pass++;
         }
@@ -6087,10 +6103,18 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                 snprintf(e->srcs, sizeof e->srcs, "cc in#%d", cc_slot[k]);
             }
             for (k = 0; k < n_pass; k++) {           /* copies: sorted by CONTENT, not by source order */
-                AVStream *ist = inputs[pass[k].input].ifmt->streams[pass[k].in_index];
-                AVDictionaryEntry *lg = av_dict_get(ist->metadata, "language", NULL, 0);
+                AVStream *ist = pass[k].in_index >= 0 ? inputs[pass[k].input].ifmt->streams[pass[k].in_index] : NULL;
+                AVDictionaryEntry *lg = ist ? av_dict_get(ist->metadata, "language", NULL, 0) : NULL;
                 PidEnt *e = &ent[n++];
                 for (r = 0; r < n_rung; r++) e->ost[r] = pass[k].ost[r];
+                if (!ist) {                          /* 2.2 D37: the declared SCTE-35 PID, no source stream yet */
+                    e->cls = pid_cls_of(AVMEDIA_TYPE_DATA); e->cid = AV_CODEC_ID_SCTE_35; e->scte = 1;
+                    e->codec = avcodec_get_name(e->cid); e->lang = NULL; e->ch = 0;
+                    e->rank = pid_lang_rank(NULL, e->norm);
+                    e->src_pid = -1; e->in_idx = pass[k].input; e->src_idx = -1;
+                    snprintf(e->srcs, sizeof e->srcs, "in#%d:(scte35 declared)", pass[k].input);
+                    continue;
+                }
                 e->cls    = pid_cls_of(ist->codecpar->codec_type);
                 e->cid    = ist->codecpar->codec_id;
                 e->scte   = e->cid == AV_CODEC_ID_SCTE_35;
@@ -7069,6 +7093,24 @@ static int resolve_plan(Input *inputs, int n_input, OptionGroup *outg, Sel *s, i
                 a->title  = br->title;
                 av_strlcpy(a->olang, pk[j].lang, sizeof a->olang);
                 av_strlcpy(a->klang, pk[j].key_lang, sizeof a->klang);
+            }
+            continue;
+        }
+        /* 2.2 (spec §8.2 / D37, fixed track set): -map K:d:scte35 — the SCTE-35 PID is declared at the start; the source's
+         * SCTE-35 stream when it has one, else an empty placeholder that adopts the stream when it appears */
+        if (!strcmp(spec, "d:scte35") && !inputs[fidx].deferred) {
+            int found = 0;
+            for (si = 0; si < (int)kfmt->nb_streams; si++)
+                if (kfmt->streams[si]->codecpar->codec_id == AV_CODEC_ID_SCTE_35 && s->n_copy < PTV_MAX_PASS) {
+                    s->copy_decl[s->n_copy] = 1;
+                    s->copy_input[s->n_copy] = fidx; s->copy[s->n_copy++] = si; found = 1;
+                }
+            if (!found && s->n_copy < PTV_MAX_PASS) {
+                s->copy_decl[s->n_copy] = 1;
+                s->copy_input[s->n_copy] = fidx; s->copy[s->n_copy++] = -1;
+                if (verbose)
+                    av_log(NULL, AV_LOG_INFO, "[PTV-OUT] -map %s: no SCTE-35 in in%d yet — its PID is declared, empty "
+                           "until the source sends one\n", mv, fidx);
             }
             continue;
         }

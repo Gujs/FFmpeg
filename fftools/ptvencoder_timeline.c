@@ -58,7 +58,7 @@ typedef struct TlStream {
 struct PtvTimeline {
     int64_t   k_us;
     int64_t   ev_n, strag_n, drop_n;
-    int       active, trig, nst;
+    int       active, trig, nst, cap;   /* nst = streams followed; cap = st[] room (2.2: adoption) */
     int64_t   open_wc, open_s_us;
     int64_t   last_any_wc, gap_us, gap_end_wc;   /* the input's last silence >= g_gap_min_us */
     int64_t   dmg_seen_wc, dmg_start_wc;         /* the input's damage phase: corrupt packets <= 3 s apart */
@@ -72,18 +72,25 @@ struct PtvTimeline {
 
 int64_t g_tl_open_us = 500000;
 
-PtvTimeline *ptv_tl_alloc(int nb_streams)
+PtvTimeline *ptv_tl_alloc(int nb_streams, int cap)
 {
     PtvTimeline *t = av_mallocz(sizeof(*t));
     if (!t)
         return NULL;
-    t->st = av_calloc(FFMAX(nb_streams, 1), sizeof(*t->st));
+    t->cap = FFMAX(cap, nb_streams);
+    t->st = av_calloc(FFMAX(t->cap, 1), sizeof(*t->st));
     if (!t->st) {
         av_free(t);
         return NULL;
     }
     t->nst = nb_streams;
     return t;
+}
+
+void ptv_tl_grow(PtvTimeline *t, int nb_streams)
+{
+    if (t && nb_streams > t->nst && nb_streams <= t->cap)
+        t->nst = nb_streams;                   /* the new slot is zeroed: a stream that has not started */
 }
 
 void ptv_tl_free(PtvTimeline **pt)
