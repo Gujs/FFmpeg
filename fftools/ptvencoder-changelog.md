@@ -5,6 +5,23 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.0-pre2 — 2.2.0-pre1 + a stream born after the open is adopted in-process: declared SCTE-35 (T-429) and a moved video (T-428)
+
+**Opt-in:**
+- **Declared SCTE-35 `-map K:d:scte35` (T-429, spec §8.2 / D37).** The output PID exists from the start even when the
+  source's PMT has no SCTE-35 yet; the first SCTE-35 stream that appears is carried on it (`[PTV-SRC] in0 SCTE-35 appeared
+  on pid 0x… — carried on the declared output PID`). Was: a PID born after the open was ignored for the run — every cue
+  lost until a restart (fixture: SCTE-35 20 s late → 0 cues; now 15–16). A reopen that comes back without the
+  declared SCTE-35 keeps running with the PID empty until the source sends it again (Fintech_247's layout: pre1 exit 4 at
+  37 s; now runs on). Limit: only a declared stream at the END of the source's stream list may be missing after a reopen.
+
+**Always on:**
+- **A video moved to a new PID is taken over in-process (T-428).** The late-born video stream that delivers while the
+  bound one is silent ≥ 2 s gets a decoder ahead of its next packet; the picture resumes at its next keyframe — no reopen,
+  so nothing already played is read again (kit sync_vpidmove_30: 3/3 clean, was 2/3 with flashes without their beep after
+  the reopen). `[PTV-SRC] input '…': video moved to pid 0x… — taken over in-process`. No spare slot left: the reopen, as
+  before. (Each input keeps 4 spare per-stream slots for streams born later.)
+
 ## 2.2.0-pre1 — 2.1.0-pre7 + input regulator, audio rules + re-binding, -bind_report, -ladder, rung IDR alignment, in-track source changes
 
 The first 2.2 pre-release (owner 2026-10-26: everything built so far; for the sandbox servers after the owner's trip).
