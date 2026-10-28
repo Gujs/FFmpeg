@@ -5982,7 +5982,10 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
             pass[n_pass].input    = kk;
             pass[n_pass].in_index = sidx;
             pass[n_pass].is_scte  = ipar->codec_id == AV_CODEC_ID_SCTE_35;
-            pass[n_pass].declared = sel[0].copy_decl[si];
+            /* 2.2 D37: every SCTE-35 the output carries is declared, whichever map brought it (the default -map 0:d? too):
+             * a source back from an outage without it keeps the PID, empty until it returns (cor-3 Fintech_247 restarted
+             * ~1/day for a SCTE-35 PID a moment late) — no per-channel setting, and no PID for a source that never had one */
+            pass[n_pass].declared = sel[0].copy_decl[si] || pass[n_pass].is_scte;
             pass[n_pass].cname    = avcodec_get_name(ipar->codec_id);
             pass[n_pass].in_tb    = itb;
             pass[n_pass].last_dts = AV_NOPTS_VALUE;
