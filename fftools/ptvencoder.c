@@ -5248,7 +5248,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         return AVERROR(EINVAL);
     }
     multiview = n_input > 1;
-    if (multiview && !fcomplex) {
+    if (multiview && !fcomplex && !ptv_ladder_on()) {   /* -ladder builds the mosaic graph after the inputs open */
         av_log(NULL, AV_LOG_ERROR, "multiview (%d inputs) requires -filter_complex (mosaic graph)\n", n_input);
         return AVERROR(EINVAL);
     }
@@ -5489,13 +5489,14 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
     }
 
     if (ptv_ladder_on()) {   /* 2.2 (spec §16): -max_res trims the ladder at output start; ptvencoder builds the graph */
+        /* 2.2.0-pre4: a mosaic takes -ladder too (Metropolitan's SV_LADDER); a single input's explicit WxH rungs are
+         * fitted by the source's display aspect at the start (a later size change is scaled into the start size, T-406) */
         const AVStream *vst = !multiview && inputs[0].vstream >= 0 ? inputs[0].ifmt->streams[inputs[0].vstream] : NULL;
-        if (multiview) {
-            av_log(NULL, AV_LOG_ERROR, "-ladder: a mosaic keeps its -filter_complex in this release\n");
-            ret = AVERROR(ENOSYS); goto end;
-        }
-        if ((ret = ptv_ladder_finish(outs, vst ? vst->codecpar->height : 0, hwdev && strstr(hwdev, "cuda") != NULL,
-                                     &fcomplex)) < 0)
+        if ((ret = ptv_ladder_finish(outs, multiview ? n_input : 1, vst ? vst->codecpar->width : 0,
+                                     vst ? vst->codecpar->height : 0,
+                                     vst ? av_guess_sample_aspect_ratio(inputs[0].ifmt, (AVStream *)vst, NULL)
+                                         : (AVRational){ 0, 1 },
+                                     hwdev && strstr(hwdev, "cuda") != NULL, &fcomplex)) < 0)
             goto end;
         n_rung = FFMIN(outs->nb_groups, PTV_MAX_RUNG);
     }
