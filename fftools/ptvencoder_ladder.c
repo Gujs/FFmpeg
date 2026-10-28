@@ -3,7 +3,7 @@
  *
  *   -ladder 720p:autox720:2350k@227.111.4.8:6000,576p:1024x576:1650k:64k@227.111.4.8:5000,...
  *   [-max_res auto|off|<H>p] [-deint auto|on|off|film] [-timestamp_overlay off|on|<fontfile>] [-lo_at 480] [-b:a:lo 64k]
- *   [-gap <px>]
+ *   [-gap <px>] [-b:a:hi 160k]
  *   <output options given once> ladder://?<udp query of every rung>
  *
  * Before the command line is parsed, the one output block is written out once per rung, exactly as the wrapper builds
@@ -19,6 +19,8 @@
  * a 16:9 source on 16:9 rungs is a plain scale. A 2- or 4-input mosaic takes -ladder too: the wrapper's grid (each cell
  * deinterlaced, fitted and padded on the CPU, -gap px of black around every cell, composed once at the top rung's size,
  * uploaded once), then one scaler per rung. A mosaic has no single source height: -max_res auto keeps every rung.
+ * The wrapper sets each AAC track's bitrate on its own (-b:a:N): a block value "tier" is the rung's audio tier — the
+ * rung's :ABITRATE, else -b:a:lo at or below -lo_at, else -b:a:hi — and a fixed value (a 5.1 track) stays as given.
  */
 
 #include <math.h>
@@ -73,7 +75,7 @@ int ptv_ladder_expand(int *pargc, char ***pargv)
 {
     int argc = *pargc, i, j, k, n = 0, last_in = -1, url = -1, lo_at = 480;
     char **argv = *pargv, **tpl, *dst[LADDER_MAX] = { 0 };
-    const char **out, *spec = NULL, *lo_abr = NULL;
+    const char **out, *spec = NULL, *lo_abr = NULL, *hi_abr = NULL;
 
     for (i = 1; i < argc; i++)
         if (!strcmp(argv[i], "-ladder")) break;
@@ -90,6 +92,7 @@ int ptv_ladder_expand(int *pargc, char ***pargv)
         else if (!strcmp(a, "-lo_at") && v)             { lo_at = atoi(v); i++; continue; }
         else if (!strcmp(a, "-b:a:lo") && v)            { lo_abr = v; i++; continue; }
         else if (!strcmp(a, "-gap") && v)               { L.gap = atoi(v); i++; continue; }
+        else if (!strcmp(a, "-b:a:hi") && v)            { hi_abr = v; i++; continue; }
         if (!strcmp(a, "-i") && v) last_in = n + 1;
         if (!strncmp(a, "ladder://", 9)) url = n;
         tpl[n++] = argv[i];
@@ -128,12 +131,22 @@ int ptv_ladder_expand(int *pargc, char ***pargv)
     for (j = 0; j < L.n; j++) {
         int vb = L.r[j].vb, hi = vb + vb / 10, has_ba = 0;
         const char *abr = L.r[j].abr[0] ? L.r[j].abr : L.r[j].h <= lo_at && lo_abr ? lo_abr : NULL;
+        const char *tier = abr ? abr : hi_abr;
         const char *q = strchr(tpl[url], '?');
         out[k++] = "-map";
         out[k++] = av_asprintf("[v%s]", L.r[j].label);
         for (i = last_in + 1; i < url; i++) {
             out[k++] = tpl[i];
-            if (!strcmp(tpl[i], "-b:a") && i + 1 < url) {   /* the rung's audio tier replaces the block's -b:a */
+            if (!strncmp(tpl[i], "-b:a", 4) && i + 1 < url && !strcmp(tpl[i + 1], "tier")) {   /* a per-track tier */
+                if (!tier) {
+                    av_log(NULL, AV_LOG_ERROR, "-ladder: %s tier on rung %s needs -b:a:hi (or the rung's :ABITRATE)\n",
+                           tpl[i], L.r[j].label);
+                    return AVERROR(EINVAL);
+                }
+                out[k++] = tier;
+                i++;
+                has_ba = 1;
+            } else if (!strcmp(tpl[i], "-b:a") && i + 1 < url) {   /* the rung's audio tier replaces the block's -b:a */
                 i++;
                 out[k++] = abr ? abr : tpl[i];
                 has_ba = 1;
@@ -151,7 +164,7 @@ int ptv_ladder_expand(int *pargc, char ***pargv)
             if (L.r[j].w) snprintf(size, sizeof size, "%dx%d", L.r[j].w, L.r[j].h);
             else          snprintf(size, sizeof size, "%dp", L.r[j].h);
             av_log(NULL, AV_LOG_INFO, "[PTV-LADDER] %s: %s, video %dk (min %dk, max / buffer %dk), audio %s → %s\n",
-                   L.r[j].label, size, vb, vb - vb / 10, hi, abr ? abr : "as the block", dst[j]);
+                   L.r[j].label, size, vb, vb - vb / 10, hi, tier ? tier : "as the block", dst[j]);
         }
     }
     out[k] = NULL;
