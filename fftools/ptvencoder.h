@@ -1336,6 +1336,7 @@ typedef struct PassStream {
     int        is_scte;               /* 2.0.0-pre20: SCTE-35, set at bind — the master thread's vwait_drain must not read
                                        * d->ifmt (NULL while a LOST reopen closes the input: SIGSEGV, fixture 2026-10-14) */
     const char *cname;                /* 2.0.0-pre20: codec name for the master thread's fill logs (same reason) */
+    int        declared;              /* 2.2 D37: a declared track (-map d:scte35): in_index -1 = waiting for its source */
     AVStream  *ost[PTV_MAX_RUNG];     /* output stream in each muxer (fan-out) */
     AVRational in_tb;                 /* input/output time_base (copy: identical) */
     int64_t    last_dts;              /* last emitted dts (monotonic guard; NOPTS until first) */
@@ -1383,6 +1384,7 @@ typedef struct PassStream {
 typedef struct PtvTimeline PtvTimeline;   /* 2.1 T-409: the program timeline, source stage (ptvencoder_timeline.c) */
 
 #define PTV_SRC_PIDS 32   /* T-003: PIDs remembered per program for the PMT diff */
+#define PTV_STREAM_SLACK 4   /* 2.2: spare per-stream slots past the open count — a stream born later can be adopted */
 
 typedef struct DemuxArgs {
     AVFormatContext      *ifmt;
@@ -1472,6 +1474,7 @@ typedef struct DemuxArgs {
     int                   reopen;         /* live && multiview && net input */
     AVFormatContext     **ifmt_home;      /* -> Input.ifmt (teardown's close target follows the swap) */
     int64_t               reopen_cnt;     /* successful reopens (log) */
+    int                   nb_streams_cap;  /* 2.2: the per-stream arrays' room (open count + PTV_STREAM_SLACK) */
     int                   nb_streams_open; /* 1.2.2 T-064: stream count the per-stream arrays
                                             * (wrap_*, edit_us, gap_vsnap, wall_cad_us, pkt_wall_gap_us,
                                             * disc) were sized for at open */
@@ -2158,7 +2161,8 @@ int build_audio_filter(AudioState *a, AVCodecContext *adec, AVRational tb,
 void *demux_thread(void *arg);
 /* 2.1 T-409: the program timeline (ptvencoder_timeline.c) and the demux helpers it calls */
 extern int64_t g_tl_open_us;             /* a dense packet this far off its path opens an event (PTV_TL_OPEN_MS, 500) */
-PtvTimeline *ptv_tl_alloc(int nb_streams);
+PtvTimeline *ptv_tl_alloc(int nb_streams, int cap);
+void ptv_tl_grow(PtvTimeline *t, int nb_streams);   /* 2.2: an adopted stream joins (up to cap) */
 void ptv_tl_free(PtvTimeline **t);
 int  ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt);
 void ptv_tl_cut(DemuxArgs *d, int64_t cut_us);
