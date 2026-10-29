@@ -5,6 +5,31 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.0-pre4 — 2.2.0-pre3 + `-ladder` for Metropolitan: explicit rung sizes, mosaics, audio bitrate per rung
+
+Everything here is reached only through `-ladder` (the wrapper hands Metropolitan's `SV_LADDER` over as `-ladder` from this
+version, transcoder branch t066-ladder). A command without `-ladder` runs exactly as in pre3, and an `autox<H>` ladder
+expands to the same graph and options as pre3 (argv and graph diffed: identical).
+
+**Opt-in (`-ladder`):**
+- **Explicit rung sizes `LABEL:WxH:VBITRATE[:ABITRATE]@IP:PORT` (T-066).** Each rung is exactly W×H (both even). The
+  picture is fitted by its display aspect, pixel shape included: the same shape within 1 % is a plain scale (16:9 HD and
+  16:9 anamorphic SD on 16:9 rungs), any other shape is fitted whole with black bars (a 4:3 source on 854×480 → a 640×480
+  picture at x=106). CUDA: scale_cuda + pad_cuda; CPU: scale + pad. `autox<H>` keeps the source-shaped width as before.
+- **Mosaics through `-ladder`** (2 or 4 inputs): the wrapper's grid (per-cell CPU bwdif, fit, pad; side by side or 2×2) at
+  the first rung's size, then one scaler per rung; `-gap <px>` = the wrapper's SV_GAP (built with pad instead of a colour
+  source + overlays). The 1080p rung's frames are byte-identical to the wrapper's graph for 2 and 4 inputs, gap 0 / 6 / 8.
+  Like the wrapper's mosaic, a cell uses the pixel count, not the pixel shape (a 16:9 anamorphic SD slot is drawn
+  squeezed; no fleet mosaic has a non-square-pixel source, all 25 checked 2026-10-29). `-deint film` is refused for a
+  mosaic.
+- **Audio bitrate per rung and per track.** `-b:a[:N] tier` in the template takes, per rung: the rung's `:ABITRATE`, else
+  `-b:a:lo` when the rung is at or below `-lo_at`, else the new `-b:a:hi`; a missing `-b:a:hi` is an error. A track with
+  a fixed `-b:a:N` (the 5.1 track) keeps it on every rung.
+
+**Correction to the 2.2.0-pre3 notes (`-deint film`):** a longer re-sample (2026-10-29) found Racer_TV 81 % camera video and
+2 % 3:2 (the 35 s sample caught one promo), Sportsman 0 %, World_Fishing 1 %; Euronews has 3:2, but film mode was not
+visibly better on its real frames (one sharper, one blurrier). No channel is set to `-deint film`; it stays opt-in.
+
 ## 2.2.0-pre3 — 2.2.0-pre2 + every carried SCTE-35 declared by default, -deint film
 
 **Always on:**
