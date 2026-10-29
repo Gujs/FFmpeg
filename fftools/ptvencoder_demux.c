@@ -1830,6 +1830,14 @@ void *demux_thread(void *arg)
             if (pkt->stream_index > d->late_stream_max) {
                 const AVStream *ls = d->ifmt->streams[pkt->stream_index];
                 d->late_stream_max = pkt->stream_index;
+                /* 2.2: a SCTE-35 the output has no PID for (the source started without one) — its cues are lost until a
+                 * restart. Named on its own line so the fleet sweep can count how often this really happens before
+                 * anything more is built for it (-map 0:d:scte35 / SV_SCTE35=declared declares the PID at the start) */
+                if (ls->codecpar->codec_id == AV_CODEC_ID_SCTE_35)
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in%d SCTE-35 appeared on pid 0x%x after the start — NOT on the "
+                           "output (no SCTE-35 at the start; SV_SCTE35=declared carries it), cues lost until a restart\n",
+                           d->rsync_slot > 0 ? d->rsync_slot : 0, ls->id);
+                else
                 av_log(NULL, AV_LOG_WARNING,
                        "[PTV-DEMUX] input '%s': stream #%d (pid 0x%x, %s) appeared after open "
                        "(%d at open) — ignored\n", d->url, pkt->stream_index, ls->id,

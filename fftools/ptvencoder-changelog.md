@@ -5,6 +5,28 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.0-pre3 — 2.2.0-pre2 + every carried SCTE-35 declared by default, -deint film
+
+**Always on:**
+- **Every SCTE-35 the output carries is declared, whichever map brought it (T-429, D37).** With the default `-map 0:d?`
+  a source that has SCTE-35 at the start keeps its SCTE-35 PID through an outage that comes back without it — empty
+  until the source sends it again, then carried on the same PID — instead of exit 4 and a re-probe (cor-3 Fintech_247,
+  ~1/day; fixture: pre2 exit 4 at 40 s, now runs on and carries the returning cues). No per-channel setting; a source
+  without SCTE-35 at the start gets no SCTE-35 PID, as before. Limit as in pre2: only a SCTE-35 at the END of the
+  source's stream list may be missing after a reopen. An empty SCTE-35 PID does not slow the sync_check output probe
+  (A/B 5.8 s / 5.8 s).
+- **A SCTE-35 that appears only after the start is logged by name.** `[PTV-SRC] in0 SCTE-35 appeared on pid 0x… after the
+  start — NOT on the output (no SCTE-35 at the start; SV_SCTE35=declared carries it), cues lost until a restart` (was the
+  generic "stream appeared after open — ignored"). Behaviour unchanged; the fleet sweep counts it.
+
+**Opt-in:**
+- **`-deint film` on the `-ladder` graph (T-421).** Inverse telecine (`fieldmatch`) in front of bwdif: hard-telecined
+  film (3:2 on 29.97i, 2:2 on 25i) is woven back into whole pictures; whatever is still combed (camera video, a video
+  ticker) is deinterlaced by bwdif as before. No decimate — the output rate is unchanged. Fixtures: 3:2 film 34.5 → 56.6
+  dB PSNR against the film master through ptvencoder; camera 50i identical. Real sources with hard 3:2 (2026-10-28
+  survey): Euronews (cor-3), Racer_TV (cor-2); bursts on Sportsman, World_Fishing. Cost: 7.1 ms per 1080i frame on one
+  CPU core. `-deint auto` stays the default.
+
 ## 2.2.0-pre2 — 2.2.0-pre1 + a stream born after the open is adopted in-process: declared SCTE-35 (T-429) and a moved video (T-428)
 
 **Opt-in:**

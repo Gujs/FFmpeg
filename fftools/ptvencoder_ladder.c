@@ -2,7 +2,7 @@
  * ptvencoder — the resolution ladder as data (2.2, spec §16, step 4a).
  *
  *   -ladder 720p:autox720:2350k@227.111.4.8:6000,576p:autox576:1650k@227.111.4.8:5000,...
- *   [-max_res auto|off|<H>p] [-deint auto|on|off] [-timestamp_overlay off|on|<fontfile>] [-lo_at 480] [-b:a:lo 64k]
+ *   [-max_res auto|off|<H>p] [-deint auto|on|off|film] [-timestamp_overlay off|on|<fontfile>] [-lo_at 480] [-b:a:lo 64k]
  *   <output options given once> ladder://?<udp query of every rung>
  *
  * Before the command line is parsed, the one output block is written out once per rung, exactly as the wrapper builds
@@ -84,8 +84,8 @@ int ptv_ladder_expand(int *pargc, char ***pargv)
         if (!strncmp(a, "ladder://", 9)) url = n;
         tpl[n++] = argv[i];
     }
-    if (strcmp(L.deint, "auto") && strcmp(L.deint, "on") && strcmp(L.deint, "off")) {
-        av_log(NULL, AV_LOG_ERROR, "-deint %s: expected auto, on or off\n", L.deint);
+    if (strcmp(L.deint, "auto") && strcmp(L.deint, "on") && strcmp(L.deint, "off") && strcmp(L.deint, "film")) {
+        av_log(NULL, AV_LOG_ERROR, "-deint %s: expected auto, on, off or film\n", L.deint);
         return AVERROR(EINVAL);
     }
     if (last_in < 0 || url != n - 1) {
@@ -188,6 +188,13 @@ int ptv_ladder_finish(OptionGroupList *outs, int src_h, int cuda, const char **g
     if (*graph) return 0;
     av_bprint_init(&bp, 0, AV_BPRINT_SIZE_UNLIMITED);
     av_bprintf(&bp, "[0:v]format=yuv420p");
+    /* 2.2 T-421: film = inverse telecine in front of the deinterlacer (CPU, ahead of the upload and the clock overlay):
+     * fieldmatch weaves each field with its own picture's other field and leaves flagged interlaced only what is still
+     * combed (camera video, a video ticker); bwdif deint=interlaced takes exactly those. No decimate: the rate stays.
+     * Fixtures (test-results/t421): 3:2 / 2:2 film 34.6 / 33.5 -> 60.7 / 60.9 dB vs the master; camera identical;
+     * fieldmatch 7.1 ms / 1080i frame on one core */
+    if (!strcmp(L.deint, "film"))
+        av_bprintf(&bp, ",fieldmatch=order=auto:combmatch=full");
     if (strcmp(L.ts, "off"))
         av_bprintf(&bp, ",drawtext=fontfile=%s:text='%%{localtime}':fontcolor=white:fontsize=h/30:box=1:"
                    "boxcolor=black@0.6:boxborderw=5:x=w*0.02:y=h*0.14", strcmp(L.ts, "on") ? L.ts : TS_FONT);
