@@ -29,7 +29,8 @@
 #include "libavutil/time.h"
 
 #define TL_HELD_MAX   4096
-#define TL_WIN_US     1000000       /* an event window closes after 1 s of wall at the latest */
+#define TL_WIN_US     1000000       /* an event window closes 1 s after its last partner's first packet at the latest */
+#define TL_WIN_SIL_US 3000000       /* ... or 3 s while a flowing partner has delivered nothing since it opened (T-431) */
 #define TL_PASS_US    300000        /* a partner whose own timeline passed the crossing point by this did not cross */
 #define TL_STRAG_US   2000000       /* after an event, packets on a stream's old path are stragglers for this long */
 
@@ -299,6 +300,34 @@ static int has_held(const PtvTimeline *t, int si)
     return 0;
 }
 
+/* 2.2 T-431: a partner that flowed before the event but has delivered nothing since the window opened is no evidence either
+ * way — closing at 1 s took its silence as "did not cross" (live-transcoder Fashion 2026-10-30: the video came back
+ * -10312.9 s, the audio was silent 1.26 s at the return; the video went out as a single-stream step, labels as sent,
+ * house_skew +4785 s). The window's 1 s runs from the latest flowing partner's first packet in it (its own evidence: one
+ * packet at the close reads as a lone outlier), up to TL_WIN_SIL_US in all; INT64_MAX = a partner still silent */
+static int64_t evidence_from(const DemuxArgs *d, const PtvTimeline *t)
+{
+    int64_t from = win_from(t);
+    int si, i;
+    for (si = 0; si < t->nst; si++) {
+        const TlStream *s = &t->st[si];
+        if (si == t->trig || !flowing(t, s) || (si == d->vstream && s->win_passed))
+            continue;
+        for (i = 0; i < t->nheld && t->held[i].si != si; i++)
+            ;
+        if (i == t->nheld)
+            return INT64_MAX;
+        from = FFMAX(from, t->held[i].wc);
+    }
+    return from;
+}
+
+static int window_over(const DemuxArgs *d, const PtvTimeline *t, int64_t nw)
+{
+    int64_t ev = evidence_from(d, t);
+    return nw - win_from(t) >= TL_WIN_SIL_US || (ev != INT64_MAX && nw - ev >= TL_WIN_US);
+}
+
 static int window_resolved(DemuxArgs *d, PtvTimeline *t, int final)
 {
     int si, all = 1, r;
@@ -388,6 +417,9 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
     int64_t k_old = t->k_us, k_new = t->k_us, J = 0, W = 0, keep = 0, erase = 0, fd = 0, dspan = 0;
     int64_t va = AV_NOPTS_VALUE, vb = AV_NOPTS_VALUE, first_new_wc = INT64_MAX, nw = av_gettime_relative();
     const char *cls = "outlier";
+    /* T-431: a partner silent through the whole TL_WIN_SIL_US window no longer flows — no partner to wait for (a video
+     * that crossed alone is then a program event, as with no audio flowing); its next packet re-seeds its path */
+    int sil_out = nw - win_from(t) >= TL_WIN_SIL_US;
     int ret;
 
     window_resolved(d, t, 1);
@@ -395,7 +427,7 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
         TlStream *s = &t->st[si];
         if (!s->dense || si == vs)
             continue;
-        if (d->ifmt->streams[si]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && (flowing(t, s) || has_held(t, si)))
+        if (d->ifmt->streams[si]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && ((flowing(t, s) && !sil_out) || has_held(t, si)))
             n_aud_flow++;
         if (s->res == 1)
             n_aud_cross++;
@@ -549,7 +581,7 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
             }
             s->last_us = s->new_last_us;
             s->last_wc = nw;
-        } else if (prog_event && !has_held(t, si) && !flowing(t, s)) {
+        } else if (prog_event && !has_held(t, si) && (!flowing(t, s) || sil_out)) {
             s->ok = 0;                        /* not part of it: its next packet re-seeds the path, no window */
         } else if (s->ok)
             s->last_us = s->old_end_us;
@@ -610,7 +642,7 @@ int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
             llabs(s_us - (s->last_us + s->step_us)) <= tol_us(s)) {
             path_take(s, s_us, nw);
             s->win_passed = 1;
-            if (nw - win_from(t) >= TL_WIN_US || window_resolved(d, t, 0)) {
+            if (window_over(d, t, nw) || window_resolved(d, t, 0)) {
                 ret = ptv_demux_dispatch(d, pkt);
                 return ret < 0 ? ret : close_window(d, t);
             }
@@ -623,7 +655,7 @@ int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
             av_packet_free(&pkt);              /* cannot happen in a 1 s window; never block the demux */
             t->drop_n++;
         }
-        if (nw - win_from(t) >= TL_WIN_US || t->nheld >= TL_HELD_MAX || window_resolved(d, t, 0))
+        if (window_over(d, t, nw) || t->nheld >= TL_HELD_MAX || window_resolved(d, t, 0))
             return close_window(d, t);
         return 0;
     }
