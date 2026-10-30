@@ -5,6 +5,22 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.0-pre5 — 2.2.0-pre4 + a timestamp jump that comes back while the audio is silent stays one event (T-431)
+
+**Always on (single input and every mosaic slot): the timeline waits for a silent partner.** When a source's timestamps
+jump, ptvencoder holds the input for up to 1 s to see which streams jumped together and moves them as one. Until pre4 that
+second ran from the moment the window opened, so a stream that was flowing but sent nothing in it (an audio PID silent
+for a moment around a damaged return) counted as "did not jump": the video went out as a single-stream step with its labels
+as sent, the audio followed later as its own. live-transcoder Fashion 2026-10-30 (2.2.0-pre3): a corrupt +10313 s jump,
+erased correctly; 45 s later the return (−10312.9 s) with the audio silent 1.26 s → house_skew +4785 s, ~2.5 min of bad
+picture, sync_check restart. Now the second runs from the silent partner's first packet (up to 3 s in all), and a partner
+silent for all 3 s no longer counts as flowing (the video's step is then applied to every stream; the audio joins it on
+its next packet).
+
+Measured on the kit's `sync_jumpback` (Fashion's shape): pre4 → hs +146 s, audio dark 74 s; pre5 → one event, hs 0, lip
+sync +2…+16 ms. Audio silent 2.5 s: was the same failure, now passes; 4 / 8 s: one event, lip sync 0.0 ms after the gap,
++1.7 s latency kept (the 3 s wait). No silence: unchanged.
+
 ## 2.2.0-pre4 — 2.2.0-pre3 + `-ladder` for Metropolitan: explicit rung sizes, mosaics, audio bitrate per rung; mosaic cells keep the pixel shape
 
 Everything here is reached only through `-ladder` (the wrapper hands Metropolitan's `SV_LADDER` over as `-ladder` from this
