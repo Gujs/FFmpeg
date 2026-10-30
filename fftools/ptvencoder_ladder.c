@@ -299,8 +299,8 @@ int ptv_ladder_finish(OptionGroupList *outs, int n_input, int src_w, int src_h, 
             av_bprintf(&bp, "%s[%d:v]", k ? ";" : "", k);
             if (strcmp(L.deint, "off"))
                 av_bprintf(&bp, "bwdif=mode=send_frame:parity=auto:deint=%s,", strcmp(L.deint, "on") ? "interlaced" : "all");
-            av_bprintf(&bp, "scale=%d:%d:force_original_aspect_ratio=decrease:force_divisible_by=2,"
-                       "pad=%d:%d:(ow-iw)/2:(oh-ih)/2:black", cw, ch, cw, ch);
+            av_bprintf(&bp, "scale=%d:%d:force_original_aspect_ratio=decrease:force_divisible_by=2:reset_sar=1,"
+                       "pad=%d:%d:(ow-iw)/2:(oh-ih)/2:black", cw, ch, cw, ch);   /* T-430: fit by display shape */
             if (g)   /* the cell at (gap, gap) of its (cell + gap) square: the stacked cells sit gap px apart */
                 av_bprintf(&bp, ",pad=%d:%d:%d:%d:black", cw + g, ch + g, g, g);
             av_bprintf(&bp, "[cell%d]", k);
