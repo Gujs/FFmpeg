@@ -1969,7 +1969,8 @@ int ptv_bind_ident(const AVFormatContext *f, int fidx, int si, char *lang, int *
 struct OptionGroupList;
 int ptv_ladder_on(void);
 int ptv_ladder_expand(int *argc, char ***argv);
-int ptv_ladder_finish(struct OptionGroupList *outs, int src_h, int cuda, const char **graph);
+int ptv_ladder_finish(struct OptionGroupList *outs, int n_input, int src_w, int src_h, AVRational src_sar, int cuda,
+                      const char **graph);
 extern const char *g_audio_lang_override, *g_audio_codec_pref;
 extern int         g_audio_dedup, g_audio_dedup_chan_strict;
 /* 2.0.0-pre4: an input-0 hold is in progress and acted on (single input only) */

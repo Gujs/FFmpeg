@@ -52,6 +52,8 @@ static AVFrame *make_black_frame(AVCodecContext *vdec)
     f->format = vdec->pix_fmt != AV_PIX_FMT_NONE ? vdec->pix_fmt : AV_PIX_FMT_YUV420P;
     f->width  = vdec->width;
     f->height = vdec->height;
+    /* the pixel shape the slot's buffersrc was configured with (its 1:1 default included) */
+    f->sample_aspect_ratio = vdec->sample_aspect_ratio.num ? vdec->sample_aspect_ratio : (AVRational){ 1, 1 };
     if (av_frame_get_buffer(f, 0) < 0) { av_frame_free(&f); return NULL; }
     ptv_fill_black(f);
     return f;
@@ -933,6 +935,10 @@ void *compositor_thread(void *arg)
                 }
             }
             st->pts = tick; st->pkt_dts = AV_NOPTS_VALUE;
+            /* 2.2 T-430: every picture of a slot keeps the pixel shape its buffersrc was configured with — a black
+             * slate (no SAR of its own) or a source that flips 4:3 / 16:9 would otherwise make the cell scaler
+             * (reset_sar) re-fit to another size mid-run, which the pad after it cannot take */
+            if (blackf[k]) st->sample_aspect_ratio = blackf[k]->sample_aspect_ratio;
             /* v0.9.16: add_frame consumes only the REFERENCE (frame reset, struct still ours) —
              * the clone shell must be freed on success too, else 448B leak per slot per tick
              * (~193MB/h on a 2x2 grid; the cor-2 mosaic RSS leak, masked for weeks by daily
