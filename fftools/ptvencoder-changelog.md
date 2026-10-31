@@ -5,6 +5,23 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.0-pre6 — 2.2.0-pre5 + a source restart that starts with its audio is one event (T-433); a late mosaic slot keeps the other slots' caption labels (T-432)
+
+**Always on (single input and every mosaic slot): a silent video is the partner of a window its audio opens (T-433).**
+cor-3 Azorse_TV 2026-10-31 07:00 CDT (2.2.0-pre5; pre3 the same on the same pattern): the source died in a trickle — its
+video stopped ~3 s before its audio — and restarted on a clock 43210 s back with the audio 1 s first. The audio's window did
+not wait for the video (it had not flowed just before the silence) and closed at once; a stale old picture arriving in the
+window also counted as "the video goes on", and wiped the video's own wall evidence. Result: two single-stream steps with
+their labels as sent, the output audio dead until sync_check restarted the channel 6 min later. Now the video, which decides
+a program event, is waited for (up to 3 s), a stale old picture does not end that wait, and the gap is measured from the
+video's last real picture. Measured on the kit's `sync_restartlate` (Azorse's shape): pre3 / pre5 → audio PID dark 101 s,
+never live; pre6 → one event "new domain, gap kept" (8.08 s), lip sync 2.2 ms, live 0.8 s after the source is clean.
+
+**Mosaics with `-cc_slots`: a slot not live at the start no longer shifts the other slots' caption labels (T-432).** Such a
+slot gets no CC track (spec §9, until the PMT update, T-072), and every later slot's track took the previous slot's
+`-metadata:s:s:N` label (TruBlue 2×2 replay: slot 2's captions labelled `mvb`). Each slot now keeps its requested index;
+copied subtitles start after all of them. Fleet logs: latent (no late start dropped a CC track in 2 weeks).
+
 ## 2.2.0-pre5 — 2.2.0-pre4 + a timestamp jump that comes back while the audio is silent stays one event (T-431)
 
 **Always on (single input and every mosaic slot): the timeline waits for a silent partner.** When a source's timestamps
