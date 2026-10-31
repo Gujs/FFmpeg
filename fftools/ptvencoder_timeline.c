@@ -52,6 +52,8 @@ typedef struct TlStream {
     int64_t old_end_us, new_first_us, new_last_us;
     int     new_n;
     int     win_passed;                       /* the video went on on its old path during this window (dispatched) */
+    int64_t pass_wc;                          /* T-433: its last wall time before a stale old-path picture that ended a
+                                               * silence in this window (0 = none) — W keeps the silence */
     int64_t rep_us, rep_new;                  /* label repair held on this stream (us) / this window's change of it */
     int     rl_mark;                          /* flag the first repaired packet for the T-087 content check */
 } TlStream;
@@ -291,6 +293,17 @@ static int flowing(const PtvTimeline *t, const TlStream *s)
     return s->dense && s->ok && ref - s->last_wc <= 2000000;
 }
 
+/* 2.2 T-433: the video decides a program event (close_window), so a window an audio stream opens waits for a silent video
+ * too (up to TL_WIN_SIL_US, evidence_from), not only for a video that flowed just before the input fell silent — cor-3
+ * Azorse_TV 2026-10-31: the source died in a trickle, its video ~3 s before its audio, and both came back -43210 s with the
+ * audio 1 s first: the audio closed its window at once alone, two single-stream steps "labels as sent", output audio dead
+ * 6 min (sync_check restart) */
+static int partner(const DemuxArgs *d, const PtvTimeline *t, int si)
+{
+    const TlStream *s = &t->st[si];
+    return flowing(t, s) || (si == d->vstream && si != t->trig && s->dense && s->ok);
+}
+
 static int has_held(const PtvTimeline *t, int si)
 {
     int i;
@@ -311,8 +324,16 @@ static int64_t evidence_from(const DemuxArgs *d, const PtvTimeline *t)
     int si, i;
     for (si = 0; si < t->nst; si++) {
         const TlStream *s = &t->st[si];
-        if (si == t->trig || !flowing(t, s) || (si == d->vstream && s->win_passed))
+        if (si == t->trig || !partner(d, t, si))
             continue;
+        /* T-433: a video going on on its old path (dispatched) is its own evidence from its latest picture — it resolves
+         * the window once its time passes the crossing point (window_resolved). Skipped, one stale picture of the old
+         * content arriving in the window (Azorse: the dying source's last trickle) closed it at 1 s before the video's
+         * own crossing */
+        if (si == d->vstream && s->win_passed && !has_held(t, si)) {
+            from = FFMAX(from, s->last_wc);
+            continue;
+        }
         for (i = 0; i < t->nheld && t->held[i].si != si; i++)
             ;
         if (i == t->nheld)
@@ -343,10 +364,10 @@ static int window_resolved(DemuxArgs *d, PtvTimeline *t, int final)
         TlStream *s = &t->st[si];
         if (si == t->trig || !s->dense)
             continue;
-        if (!flowing(t, s) && !(final && has_held(t, si)))
+        if (!partner(d, t, si) && !(final && has_held(t, si)))
             continue;                          /* not flowing before the event: no partner to wait for */
         r = classify_stream(t, si, final, cross);
-        if (r == 0 && flowing(t, s))
+        if (r == 0 && partner(d, t, si))
             all = 0;
     }
     return all || final;
@@ -438,6 +459,7 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
     if (vs >= 0 && vs < t->nst && t->st[vs].res == 1 && (n_aud_cross || !n_aud_flow)) {
         const AVStream *vst = d->ifmt->streams[vs];
         TlStream *v = &t->st[vs];
+        int64_t vlw;
         fd = vst->avg_frame_rate.num > 0 ? av_rescale(AV_TIME_BASE, vst->avg_frame_rate.den, vst->avg_frame_rate.num)
                                          : FFMAX(v->step_us, 1);
         va = v->old_end_us + fd;               /* the end of the last old picture */
@@ -450,10 +472,10 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
          * arrived too — not only the latest silence. A content scrap between two outages, dropped as an outlier, cut W to
          * the second outage and erased 14 s of real loss as "flowing" (gate sync_storm 430 s: 15 s of pictures without
          * sound once the audio joined) */
+        vlw = v->pass_wc ? v->pass_wc : v->last_wc;
         W  = (atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 || (int64_t)g_preroll_ms >= 4000) ? 0 :
              FFMAX(input_wall_gap(t, first_new_wc),
-                   v->last_wc && first_new_wc != INT64_MAX && first_new_wc - v->last_wc >= g_gap_min_us ?
-                   first_new_wc - v->last_wc : 0);
+                   vlw && first_new_wc != INT64_MAX && first_new_wc - vlw >= g_gap_min_us ? first_new_wc - vlw : 0);
         for (si = 0; si < t->nst; si++)
             if (t->st[si].res == 1 && d->ts_outl && si < d->nb_streams_open &&
                 d->ts_outl[si].dmg_wc && nw - d->ts_outl[si].dmg_wc < W + 3000000)
@@ -640,6 +662,8 @@ int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
          * (gate loss_100 on the Cinestar media: 1.6-2.4 s) */
         if (si == d->vstream && t->trig != si && s->ok && s_us != AV_NOPTS_VALUE && !has_held(t, si) &&
             llabs(s_us - (s->last_us + s->step_us)) <= tol_us(s)) {
+            if (!s->pass_wc && s->last_wc && nw - s->last_wc >= g_gap_min_us)
+                s->pass_wc = s->last_wc;      /* T-433: a stale picture after a silence is no flow — the wall keeps it */
             path_take(s, s_us, nw);
             s->win_passed = 1;
             if (window_over(d, t, nw) || window_resolved(d, t, 0)) {
@@ -736,6 +760,7 @@ int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
         for (int i = 0; i < t->nst; i++) {     /* a stream the window never classifies keeps its path */
             t->st[i].old_end_us = t->st[i].last_us;
             t->st[i].win_passed = 0;
+            t->st[i].pass_wc    = 0;
         }
         if (d->disturb_epoch)
             atomic_fetch_add_explicit(d->disturb_epoch, 1, memory_order_relaxed);
