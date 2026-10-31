@@ -4089,11 +4089,12 @@ typedef struct Rung {
  * cc_dec/encoder/queue/thread and its own subtitle track — no slot is ever guessed.
  *
  * `slot` is the input index (0 for single-input), `sidx` the LOGICAL subtitle index this
- * track takes for -metadata:s:s:N, and `multi` marks multiview for the log lines. */
+ * track takes for -metadata:s:s:N, `first` marks the run's first extraction and `multi`
+ * marks multiview for the log lines. */
 static int cc_setup(CcCtx *cc, CcTap *tap, AVThreadMessageQueue **cc_q,
                     const AVCodec *cdec, const AVCodec *cenc,
                     AVFormatContext *vin, Rung *rung, int n_rung, OptionGroupList *outs,
-                    int slot, int sidx, int multi)
+                    int slot, int sidx, int first, int multi)
 {
     /* the cc_* options configure the extraction for the WHOLE ladder, so they are read from
      * the first output group (like -cc_extract itself). On multiview they apply to every
@@ -4141,10 +4142,11 @@ static int cc_setup(CcCtx *cc, CcTap *tap, AVThreadMessageQueue **cc_q,
         }
         tap->blk_hold_us = (int64_t)ms * 1000;
     }
-    /* ONCE per run, not once per input: `sidx` is the EXTRACTION index, which is 0 for the
-     * first participating input whatever its input index is. Gating on `slot` (the input
-     * index) printed nothing at all on a multiview whose -cc_slots excludes input 0. */
-    if (!sidx) {
+    /* ONCE per run, not once per input: `first` is the first participating input whatever
+     * its input index is. Gating on `slot` (the input index) printed nothing at all on a
+     * multiview whose -cc_slots excludes input 0; gating on `sidx` would print nothing when
+     * the first selected slot was not live at the start (T-432). */
+    if (first) {
         av_log(NULL, AV_LOG_INFO, "[PTV-CC] presentation style: %s\n",
                tap->style == PTV_CC_STYLE_BLOCK ? "block" : "faithful");
         if (tap->style == PTV_CC_STYLE_BLOCK)
@@ -5238,7 +5240,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
     int              cc_slot[PTV_MAX_INPUT];      /* input index of each extraction */
     int              started_cc[PTV_MAX_INPUT] = {0};
     int              cc_want[PTV_MAX_INPUT] = {0};/* per-input: extract from this slot? */
-    int              cc_on = 0, n_cc = 0;
+    int              cc_sidx[PTV_MAX_INPUT];      /* its -metadata:s:s:N index, fixed before late slots drop out */
+    int              cc_on = 0, n_cc = 0, n_cc_req = 0;
     /* aliases to input 0 (the shared single-input setup code works on it) */
     AVCodecContext *vdec; AVStream *vist; int vstream; const AVCodec *vdecoder;
 
@@ -5330,7 +5333,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                 }
             } else
                 for (k = 0; k < n_input; k++) cc_want[k] = 1;
-            for (k = 0; k < n_input; k++) if (cc_want[k]) n_cc++;
+            for (k = 0; k < n_input; k++) if (cc_want[k]) cc_sidx[k] = n_cc++;
+            n_cc_req = n_cc;
             if (!n_cc) {
                 av_log(NULL, AV_LOG_ERROR, "[PTV-CC] -cc_slots selected no input\n");
                 return AVERROR(EINVAL);
@@ -5456,7 +5460,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                 if (cc_want[k]) {        /* spec §9: a slot's CC track exists only if it was live at the start */
                     cc_want[k] = 0; n_cc--;
                     av_log(NULL, AV_LOG_WARNING, "[PTV-CC] slot %d not live at the start: no CC track for it this run "
-                           "(the later -cc_slots tracks move up one)\n", k);
+                           "(the other slots' tracks keep their -metadata:s:s:N labels)\n", k);
                 }
             }
             if (cc_on && !n_cc) cc_on = 0;
@@ -5948,8 +5952,9 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
      * PHYSICAL muxer order differs: the CC streams are created below, after this fan, because
      * their extradata must exist before write_header. So ffprobe lists the copied subs first
      * while -metadata:s:s:N / -c:s:N count the CC tracks first. The N used by the wrapper is
-     * the logical one. */
-    int copy_vidx = 1, copy_aidx = n_audio, copy_sidx = n_cc, copy_didx = 0;
+     * the logical one. A slot not live at the start has no CC track but keeps its index
+     * (T-432), so the wrapper's per-slot labels stay on their slots. */
+    int copy_vidx = 1, copy_aidx = n_audio, copy_sidx = n_cc_req, copy_didx = 0;
     for (kk = 0; kk < n_input; kk++) {
         inputs[kk].da.pass = &pass[n_pass];          /* this input's contiguous slice */
         inputs[kk].da.n_pass = 0;
@@ -6046,7 +6051,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
             if (!cc_want[kk]) continue;
             cc_slot[ci] = kk;
             ret = cc_setup(&cc[ci], &inputs[kk].dc.cc, &cc_q[ci], cc_dec_codec, cc_enc_codec,
-                           inputs[kk].ifmt, rung, n_rung, outs, kk, ci, multiview);
+                           inputs[kk].ifmt, rung, n_rung, outs, kk, cc_sidx[kk], !ci, multiview);
             if (ret < 0) goto end;
             ci++;
         }
