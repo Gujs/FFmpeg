@@ -1139,7 +1139,7 @@ static_assert(FF_ARRAY_ELEMS(g0_subset_info) == PTV_G0_SUBSET_MAX + 1,
 /* Map an ISO 639-2 language code to the teletext G0 national option subset (ETS 300 706
  * table 33). Returns -1 for a language with no subset of its own — the caller falls back to
  * English and says so, because a SILENT fallback is indistinguishable from a correct mapping. */
-static int lang_to_g0_subset(const char *lang)
+int lang_to_g0_subset(const char *lang)
 {
     if (!lang || !lang[0])
         return -1;
@@ -4190,7 +4190,7 @@ static int cc_setup(CcCtx *cc, CcTap *tap, AVThreadMessageQueue **cc_q,
     /* --- language: -cc_lang, else the first non-"und" audio language on the video's own
      * input, else English. Drives both the stream metadata (which mpegtsenc writes into the
      * 0x56 descriptor) and the G0 national option subset. --- */
-    if (!cclang || !cclang[0]) {
+    if ((!cclang || !cclang[0]) && vin) {        /* 2.2 T-072: a deferred slot has no input yet (its bind sets the subset) */
         for (k = 0; k < (int)vin->nb_streams; k++) {
             AVStream *ist = vin->streams[k];
             AVDictionaryEntry *le;
@@ -5386,6 +5386,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
     for (k = 0; k < n_input; k++) {
         inputs[k].url = ins->groups[k].arg;
         inputs[k].h0  = AV_NOPTS_VALUE;
+        atomic_init(&inputs[k].cc_g0_join, -1);
         /* rate estimator: the former singleton's initializers, verbatim (rest is zero) */
         inputs[k].est.c0 = AV_NOPTS_VALUE;
         inputs[k].est.ema_q20 = 1 << 20;
@@ -5457,13 +5458,10 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                 inputs[k].geom_sar = gsar;
                 av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in%d WAITING (slot %d): placeholder %dx%d cell, silent audio "
                        "track until its source arrives\n", k, k, gp->width, gp->height);
-                if (cc_want[k]) {        /* spec §9: a slot's CC track exists only if it was live at the start */
-                    cc_want[k] = 0; n_cc--;
-                    av_log(NULL, AV_LOG_WARNING, "[PTV-CC] slot %d not live at the start: no CC track for it this run "
-                           "(the other slots' tracks keep their -metadata:s:s:N labels)\n", k);
-                }
+                if (cc_want[k])          /* 2.2 T-072 (D37): its CC track is declared now, empty until the slot joins */
+                    av_log(NULL, AV_LOG_INFO, "[PTV-CC] slot %d not live at the start: its CC track is declared, "
+                           "empty until the slot joins\n", k);
             }
-            if (cc_on && !n_cc) cc_on = 0;
         }
     } else
     /* open ALL inputs in parallel: a dead/slow slot must not delay the others,
@@ -5952,8 +5950,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
      * PHYSICAL muxer order differs: the CC streams are created below, after this fan, because
      * their extradata must exist before write_header. So ffprobe lists the copied subs first
      * while -metadata:s:s:N / -c:s:N count the CC tracks first. The N used by the wrapper is
-     * the logical one. A slot not live at the start has no CC track but keeps its index
-     * (T-432), so the wrapper's per-slot labels stay on their slots. */
+     * the logical one. A slot not live at the start keeps its CC track (2.2 T-072, empty until it
+     * joins) and its index (T-432), so the wrapper's per-slot labels stay on their slots. */
     int copy_vidx = 1, copy_aidx = n_audio, copy_sidx = n_cc_req, copy_didx = 0;
     for (kk = 0; kk < n_input; kk++) {
         inputs[kk].da.pass = &pass[n_pass];          /* this input's contiguous slice */
@@ -6047,12 +6045,19 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
      * A hard failure here is fatal: the operator asked for captions. */
     if (cc_on) {
         int ci = 0;
+        const char *ccl;
         for (kk = 0; kk < n_input; kk++) {
             if (!cc_want[kk]) continue;
             cc_slot[ci] = kk;
             ret = cc_setup(&cc[ci], &inputs[kk].dc.cc, &cc_q[ci], cc_dec_codec, cc_enc_codec,
                            inputs[kk].ifmt, rung, n_rung, outs, kk, cc_sidx[kk], !ci, multiview);
             if (ret < 0) goto end;
+            ccl = og_get(&outs->groups[0], "cc_lang");
+            if (inputs[kk].deferred && (!ccl || !ccl[0])) {
+                /* 2.2 T-072: the character set follows the slot's source, which only its bind knows */
+                inputs[kk].cc_lang_join = 1;
+                cc[ci].g0_join = &inputs[kk].cc_g0_join;
+            }
             ci++;
         }
         g_cc_on = 1;
@@ -6107,7 +6112,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                 e->codec   = avcodec_get_name(e->cid);
                 e->lang    = cc[k].lang;                 /* the resolved -cc_lang, not the wire relabel */
                 e->rank    = pid_lang_rank(e->lang, e->norm);
-                e->src_pid = inputs[cc_slot[k]].vist->id;
+                e->src_pid = inputs[cc_slot[k]].vist ? inputs[cc_slot[k]].vist->id : -1;   /* T-072: a deferred slot */
                 e->in_idx  = cc_slot[k]; e->src_idx = -1;
                 snprintf(e->srcs, sizeof e->srcs, "cc in#%d", cc_slot[k]);
             }

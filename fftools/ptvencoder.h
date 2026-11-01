@@ -967,6 +967,8 @@ typedef struct CcCtx {
     const char      *lang;                    /* the resolved -cc_lang (the REAL language,
                                                * before any -metadata relabel) — the PID
                                                * plan keys the track on it (1.2.1-pre1) */
+    _Atomic int     *g0_join;                 /* 2.2 T-072: a deferred slot's Input.cc_g0_join (NULL = the subset is
+                                               * fixed at the start) */
 } CcCtx;
 
 typedef struct AudioState {
@@ -1695,6 +1697,9 @@ typedef struct Input {
                                               * audio track, binds when its source arrives */
     int                   geom_w, geom_h, geom_fmt;   /* ... the cell geometry it takes (the first live sibling's) */
     AVRational            geom_sar;
+    int                   cc_lang_join;      /* 2.2 T-072: its CC track was declared before the source arrived and no
+                                              * -cc_lang pins the language — the bind reads it from the source */
+    _Atomic int           cc_g0_join;        /* ... the G0 subset the bind found, for the emitter (-1 = none pending) */
 } Input;
 
 /* Multiview compositor = the video house clock. Samples each input's hold at
@@ -1955,6 +1960,7 @@ typedef struct PtvBindPick {
 } PtvBindPick;
 /* 1 = an audio rule (filled), 0 = a classic stream specifier, <0 = a malformed rule */
 int ptv_bind_parse(const char *spec, PtvBindRule *r);
+int lang_to_g0_subset(const char *lang);                  /* ISO 639-2 -> teletext G0 subset, -1 = none */
 /* the rule's source streams on input f (index fidx), at most max; mosaic = never audio description */
 int ptv_bind_audio(const AVFormatContext *f, int fidx, const PtvBindRule *r, int mosaic,
                    PtvBindPick *out, int max, int verbose);

@@ -1380,6 +1380,19 @@ static int slot_bind(DemuxArgs *d)
                    f->streams[si]->codecpar->ch_layout.nb_channels, lg ? lg->value : "und", d->rsync_slot);
         }
     }
+    if (in->cc_lang_join) {   /* 2.2 T-072: the CC track's character set, as cc_setup picks it for a live slot */
+        const char *lang = NULL;
+        int g0;
+        for (si = 0; si < nb && !lang; si++) {
+            AVDictionaryEntry *le = av_dict_get(f->streams[si]->metadata, "language", NULL, 0);
+            if (f->streams[si]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && le && le->value[0] && strcmp(le->value, "und"))
+                lang = le->value;
+        }
+        g0 = lang_to_g0_subset(lang ? lang : "eng");
+        atomic_store_explicit(&in->cc_g0_join, FFMAX(g0, 0), memory_order_relaxed);
+        av_log(NULL, AV_LOG_INFO, "[PTV-CC] in%d joined: source language \"%s\" -> G0 subset %d\n",
+               d->rsync_slot, lang ? lang : "eng", FFMAX(g0, 0));
+    }
     {   /* video last: the decoder opens before the first packet of the slot reaches it */
         int r = video_bind_send(d, f, vs);
         if (r < 0)
