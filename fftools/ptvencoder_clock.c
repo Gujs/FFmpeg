@@ -232,6 +232,11 @@ static void cc_emit(CcCtx *c, CcEvent *ev)
     char *use_ass;
 
     use_ass = ev->ass;
+    if (c->g0_join) {                             /* 2.2 T-072: a deferred slot joined — its source's character set */
+        int g0 = atomic_exchange_explicit(c->g0_join, -1, memory_order_relaxed);
+        if (g0 >= 0)
+            av_opt_set_int(c->enc->priv_data, "g0_subset", g0, 0);
+    }
     if (ev->src_us == AV_NOPTS_VALUE) {
         /* SYNTHETIC keepalive (see cc_thread): this input stopped delivering frames, so there
          * is no source pts to map. Stamp it as a pure MONOTONE EXTRAPOLATION of our own last

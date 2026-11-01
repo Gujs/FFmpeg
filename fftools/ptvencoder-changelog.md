@@ -5,6 +5,20 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.0-pre7 — 2.2.0-pre6 + a mosaic slot not live at the start keeps its CC track (T-072, D37)
+
+**Mosaics with `-cc_slots`: every configured slot's CC→teletext track is in the output from the start (T-072).** The output
+track set is fixed at the start (spec §19, D37): until pre6 a slot whose source was not there at the start got no CC track
+at all — when it joined later, its captions were never carried (the PMT cannot gain a track mid-run). Now its track (page
+888 + slot, PID 7000 + slot) is declared from the start, empty until the slot joins, and carries its captions from the
+join on. A slot that never joins keeps an empty, declared track. Without `cc_lang` the track's character set follows the
+slot's source, read when it joins (its first audio language; `eng` otherwise), as a live slot's does at the start.
+
+Measured on the kit (29.97 RAV mosaic, CC on all four slots, slot 2 late): joins at 40 s — pre6 no page 890, pre7 page 890
+from the join, 27 / 27 captions, offset 0; never joins — PID 0x1b5a declared, empty, no errors; a Spanish late slot —
+`[PTV-CC] in2 joined: source language "spa" -> G0 subset 5`, national subset 5 on the wire from the join (slot 1: 0).
+The wrapper keeps a down slot's CC track from this version on (`SV_CC_EXTRACT=true`; transcoder `t072-dead-slot-cc`).
+
 ## 2.2.0-pre6 — 2.2.0-pre5 + a source restart that starts with its audio is one event (T-433); a late mosaic slot keeps the other slots' caption labels (T-432)
 
 **Always on (single input and every mosaic slot): a silent video is the partner of a window its audio opens (T-433).**
