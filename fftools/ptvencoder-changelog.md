@@ -5,6 +5,19 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.0-pre8 — 2.2.0-pre7 + a regulated mosaic waits for its slots (T-434)
+
+**Mosaics with `-regulate D`: the `-slot_wait` clock starts D later (T-434).** The regulator holds every input back by D,
+so no slot can go live before D + its probe (~9 s at D = 8). Until pre7 the 3 s `-slot_wait` had always expired by then,
+and the mosaic started the moment the first slots went live. A slot that went live a moment later was starved for 4–8
+ticks at the start, then ran 160–320 ms deep; a minute in, the T-422 rule shed one tick per 10 s, so that slot's pictures
+drifted against its sound on air. Now the wait is `-slot_wait` + D (`[PTV-OUT] slot_wait 11 s expired` names the
+total when a slot is missing). Mosaics without `-regulate`, and single-input channels, are unchanged.
+
+Measured on the kit (25 fps RAV mosaic, `-regulate 8`, `sync_gap_20`, kit28 0b408b9): pre6 / pre7 — the mosaic starts with 3 of
+4 slots live, the late slot has 8 startup holds, then its offset runs to −120…−200 ms, CROSS-SLOT FAIL; the same runs
+with `-slot_wait 12` — 4 / 4 slots live at the start, 0 holds, 0 offset change, PASS.
+
 ## 2.2.0-pre7 — 2.2.0-pre6 + a mosaic slot not live at the start keeps its CC track (T-072, D37)
 
 **Mosaics with `-cc_slots`: every configured slot's CC→teletext track is in the output from the start (T-072).** The output

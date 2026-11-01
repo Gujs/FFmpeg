@@ -47,7 +47,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.2.0-pre7"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.2.0-pre8"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -4595,13 +4595,17 @@ static void *slot_acquire_thread(void *arg)
 }
 
 /* 2.0.2 T-386: the mosaic start (spec §4). -start_on any (mosaic default): every slot LIVE, or -slot_wait expired with
- * at least one LIVE; -start_on all: every slot LIVE. Returns the number of live slots; the others are aborted and
- * closed (in->ifmt NULL). Draining slots get 2 s to leave their read once the start is set; one that does not (its
+ * at least one LIVE; -start_on all: every slot LIVE. 2.2 T-434: with -regulate the wait is -slot_wait + the regulate
+ * delay — a regulated slot delivers its first packet only after the delay, so a bare 3 s always expired before the
+ * slots were live and started the mosaic on whichever went live first (a just-live slot then starved 4-8 ticks, ran
+ * 160-320 ms deep and the T-422 rule shed it on air: measured kit28 mv04-reg8, -slot_wait 12 = 4 / 4 clean).
+ * Returns the number of live slots; the others are aborted and closed (in->ifmt NULL). Draining slots get 2 s to leave their read once the start is set; one that does not (its
  * source died during the wait: the read blocks until rw_timeout) is aborted and counts as not live. */
 static int mosaic_acquire(Input *inputs, int n_input)
 {
     SlotAcq sa[PTV_MAX_INPUT];
     int64_t t0 = av_gettime_relative(), now;
+    int64_t wait = g_slot_wait_us > 0 ? g_slot_wait_us + g_regulate_us : 0;   /* 2.2 T-434 */
     int all = !strcmp(g_start_on, "all"), k, live = 0;
 
     atomic_store_explicit(&g_acq_since, t0, memory_order_relaxed);
@@ -4622,7 +4626,7 @@ static int mosaic_acquire(Input *inputs, int n_input)
         }
         if (live == n_input || done == n_input)
             break;
-        if (!all && g_slot_wait_us > 0 && live > 0 && now - t0 >= g_slot_wait_us)
+        if (!all && wait > 0 && live > 0 && now - t0 >= wait)
             break;
         ptv_acq_heartbeat();
         av_usleep(100000);
@@ -4664,7 +4668,7 @@ static int mosaic_acquire(Input *inputs, int n_input)
                    (av_gettime_relative() - t0) / 1e6);
         else
             av_log(NULL, AV_LOG_WARNING, "[PTV-OUT] slot_wait %.0f s expired: starting with %d of %d slots live — "
-                   "slot(s) %s not live\n", g_slot_wait_us / 1e6, live, n_input, not_live);
+                   "slot(s) %s not live\n", wait / 1e6, live, n_input, not_live);
     }
     return live;
 }
@@ -6753,7 +6757,7 @@ static const OptionDef ptv_options[] = {
     { "filter_hw_device", OPT_TYPE_STRING, 0,                        { .off = 0 }, "filter hw device", "name" },
     { "filter_complex",   OPT_TYPE_STRING, 0,                        { .off = 0 }, "filtergraph", "graph" },
     { "start_on",         OPT_TYPE_STRING, 0,                        { .off = 0 }, "when outputs start: video (single input), any|all (mosaic, default any; now comes in 2.1)", "when" },
-    { "slot_wait",        OPT_TYPE_STRING, 0,                        { .off = 0 }, "mosaic: wait this long for every slot, then start with the live ones (default 3s; inf)", "dur" },
+    { "slot_wait",        OPT_TYPE_STRING, 0,                        { .off = 0 }, "mosaic: wait this long for every slot, then start with the live ones (default 3s; inf; -regulate adds its delay)", "dur" },
     { "audio_lang_override", OPT_TYPE_STRING, 0,                     { .off = 0 }, "audio rules: relabel source languages first, KEY:LANG,… (KEY = 0xPID, audio index or language)", "list" },
     { "audio_codec_pref", OPT_TYPE_STRING, 0,                        { .off = 0 }, "audio rules: survivor codec order among same-programme duplicates (default eac3,ac3,aac,mp2,mp3)", "list" },
     { "audio_dedup",      OPT_TYPE_STRING, 0,                        { .off = 0 }, "audio rules: collapse same-programme duplicates (default on)", "on|off" },
