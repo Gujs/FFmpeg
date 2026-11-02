@@ -5,7 +5,7 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
-## 2.2.0-pre9 — 2.2.0-pre8 + lip-sync reading after a video gap, mosaic start-up, regulator bursts and holes (T-428, T-435, T-436, T-437)
+## 2.2.0-pre9 — 2.2.0-pre8 + lip-sync reading after a video gap, mosaic start-up, burst reports everywhere, regulator holes (T-428, T-435, T-436, T-437, T-438)
 
 **The single-input `lipsync=` reading ignores a held picture (T-428).** A short video-only gap repeats the last picture,
 and the reading's 30 s video average took every repeat in: after a 3 s gap it read +105…+144 ms, decaying over minutes,
@@ -29,6 +29,13 @@ line now reads `CUDA device N (… created in X s while the inputs opened)`.
 `[PTV-BURSTY]` went quiet on exactly the channels that burst. The regulator now measures arrivals at the socket and
 prints, per minute with a stall: `[PTV-BURSTY] inK N stalls >=1.5s in the last 60s (worst X s) at the input — regulated:
 A-B s held (D d s)`. A low end near 0 means D barely covers the gaps.
+
+**A mosaic slot reports its bursts (T-438).** Each slot's demuxer measured its arrival stalls, but the per-minute line was
+printed only for a single live input, so an unregulated mosaic gave no burst report at all. A slot now prints
+`[PTV-BURSTY] inK N stalls >=1.5s in the last 60s (worst X s) — mosaic slot`. The single-input tip to set `PTV_PREROLL_MS`,
+which a slot with 3 or more stalls in a minute used to print, is no longer printed for mosaic slots. Kit mv25 with slot 0
+delivered in 6 s bursts: one slot line (`in0 11 stalls … worst 6.0s`) instead of the single-input tip; a clean mosaic
+prints no burst line. With T-436 every input now reports its bursts: single, mosaic slot, regulated or not.
 
 **The regulator keeps a real-time hole on its schedule (T-437).** An origin that skips a segment stops sending for ~5 s
 and resumes with a PCR jump of the same length (glo-3 SOFAST). The regulator took every PCR step for a restart or a loop
