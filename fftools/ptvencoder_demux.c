@@ -2776,14 +2776,18 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                             av_log(NULL, AV_LOG_INFO,
                                    "[PTV-BURSTY] %d stall%s >=1.5s in the last 60s (worst %.1fs) — below auto-bank threshold\n",
                                    d->by_gap_cnt, d->by_gap_cnt == 1 ? "" : "s", d->by_max_gap / 1e6);
-                    }
+                    } else if (!d->single && d->by_gap_cnt > 0)  /* 2.2 T-438: a mosaic slot measured but never said */
+                        av_log(NULL, AV_LOG_INFO, "[PTV-BURSTY] in%d %d stall%s >=1.5s in the last 60s (worst %.1fs) — "
+                               "mosaic slot\n", d->rsync_slot, d->by_gap_cnt, d->by_gap_cnt == 1 ? "" : "s",
+                               d->by_max_gap / 1e6);
                     if (d->by_gap_cnt >= 3) {                   /* HLS-burst cadence */
                         if (d->autobank) {
                             if (atomic_exchange_explicit(&g_bank_lone, 0, memory_order_relaxed))   /* a cadence: a pattern */
                                 av_log(NULL, AV_LOG_INFO, "[PTV-BURSTY] stalls in a cadence — a pattern: the bank stays and "
                                        "fills, retires after %llds of quiet\n", (long long)(g_cp.bank_decay_us / 1000000));
                             ptv_autobank_escalate(d, d->by_max_gap, bw);
-                        } else if ((int64_t)g_preroll_ms < (d->by_max_gap * 12 / 10) / 1000) {
+                        } else if (d->single && (int64_t)g_preroll_ms < (d->by_max_gap * 12 / 10) / 1000) {
+                            /* the deep-prime advice is a single input's (a mosaic slot: -regulate, T-438) */
                             int64_t need_ms = (d->by_max_gap * 3 / 2) / 1000;   /* 1.5x worst gap */
                             need_ms = ((need_ms + 999) / 1000) * 1000;
                             if (need_ms > 30000) need_ms = 30000;
