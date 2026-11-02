@@ -27,6 +27,15 @@ decides it. With `-regulate 8` the earliest packet waits 8 s and a gap up to 8 s
 **The FIFO grows as it fills** (from 2048 datagrams to the D + 10 s cap): a 0.5 s hold costs ~2.7 MB per input,
 not ~26 MB.
 
+**A mosaic slot drops the pre-gap tail picture by its dry spell, not a fixed 1 s.** After a hole, the slot's last pre-gap
+PES completes with post-gap bytes and decodes as a stale picture (T-350). The tail rule dropped it only when it was more
+than 1 s late. A tail is late by the dry spell less a picture. A 2.000 s hole played on its PCR (regulated by default)
+put it at 1.000 or 1.040 s, depending on the tick phase, and at 1.000 s it was shown. That stale picture re-armed the
+slot's sound bound (T-411): the returning sound parked ~0.7 s, the slot's audio PID went dark, and the mux held the whole
+mosaic for 0.9-1.0 s (gate key `mv04/sync_flapping`, 6 of 18 runs). pre9 always put it at 1.040 s, because its input saw
+the 2.08 s wire gap: 0 of 18. A tail late by more than half the dry spell is now dropped. Same key: 18 of 18 PASS,
+worst output stall 182-229 ms (pre9 141-268 ms).
+
 **The regulator follows a PCR that moves PID.** It locked onto the first PID carrying a PCR. When a provider moves the
 PCR with its video (the gate's `sync_vpidmove_30`: 0x100 -> 0x1e1 at 30 s), no PCR came on the locked PID, the
 schedule stopped, and the input ran unregulated from the move on. The gate key failed with 3 flashes without their
