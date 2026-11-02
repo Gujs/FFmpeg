@@ -76,6 +76,9 @@ typedef struct Regulator {
     int             pcr_pid;
     int64_t         anchor_t, acc, last_pcr, last_due;
     int64_t         first_wc;                       /* the first packet before any PCR (wall), 0 = said / done */
+    /* 2.2 T-436: [PTV-BURSTY] at the socket (reader thread only) — the demuxer reads the paced loopback and sees none */
+    int64_t         by_last, by_win, by_max, held_min, held_max;
+    int             by_cnt;
 } Regulator;
 
 static Regulator  *regs[PTV_MAX_INPUT];
@@ -85,6 +88,39 @@ static int reg_interrupt(void *opaque)
 {
     (void)opaque;
     return atomic_load_explicit(&reg_stop, memory_order_relaxed);
+}
+
+/* 2.2 T-436: the arrival-stall report of an unregulated input ([PTV-BURSTY], ptvencoder_demux.c), measured where the
+ * source arrives — a regulated input's demuxer reads the paced loopback, so its own report goes quiet exactly on the
+ * channels that burst. Per 60 s window with a >= 1.5 s stall: the count, the worst, and how much the FIFO held (its
+ * lowest near 0 = D barely covers the gaps). A reopen (outage) restarts the measure, as the demuxer's excludes outages. */
+static void reg_bursty(Regulator *r, int64_t now)
+{
+    int64_t held;
+    if (r->last_due == AV_NOPTS_VALUE)              /* no schedule yet (before the first PCR) */
+        return;
+    held = r->last_due - now;
+    if (r->by_last && now - r->by_last >= 1500000) {
+        r->by_cnt++;
+        r->by_max = FFMAX(r->by_max, now - r->by_last);
+    }
+    r->by_last = now;
+    if (!r->by_win) {
+        r->by_win   = now;
+        r->held_min = r->held_max = held;
+    }
+    r->held_min = FFMIN(r->held_min, held);
+    r->held_max = FFMAX(r->held_max, held);
+    if (now - r->by_win >= 60000000) {
+        if (r->by_cnt > 0)
+            av_log(NULL, AV_LOG_INFO, "[PTV-BURSTY] in%d %d stall%s >=1.5s in the last 60s (worst %.1fs) at the input — "
+                   "regulated: %.1f-%.1f s held (D %.1f s)\n", r->k, r->by_cnt, r->by_cnt == 1 ? "" : "s",
+                   r->by_max / 1e6, r->held_min / 1e6, r->held_max / 1e6, r->delay / 1e6);
+        r->by_win = now;
+        r->by_cnt = 0;
+        r->by_max = 0;
+        r->held_min = r->held_max = held;
+    }
 }
 
 /* the packet's 33-bit PCR base when it carries one on the regulated PID, else -1 */
@@ -166,6 +202,7 @@ static void *reg_reader(void *arg)
             int64_t now = av_gettime_relative();
             if (n <= 0)
                 break;                              /* a read error / the source's timeout: reopen */
+            reg_bursty(r, now);
             have += n;
             while (have - i >= 188) {
                 const uint8_t *p = buf + i;
@@ -203,6 +240,7 @@ static void *reg_reader(void *arg)
         }
         avio_closep(&pb);
         have = 0;
+        r->by_last = 0;                             /* T-436: an outage is not a stall */
     }
     return NULL;
 }
@@ -276,6 +314,7 @@ char *ptv_regulate_start(const char *url, int64_t delay_us, int k)
     r->delay    = delay_us;
     r->pcr_pid  = -1;
     r->anchor_t = AV_NOPTS_VALUE;
+    r->last_due = AV_NOPTS_VALUE;                   /* T-436: no schedule yet */
     r->cap      = (int)((delay_us / 1000000 + 10) * 2000);   /* D + 10 s at up to ~20 Mb/s */
     r->port     = reg_port();
     r->src_url  = av_strdup(url);

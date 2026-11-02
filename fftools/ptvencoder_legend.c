@@ -369,7 +369,10 @@ void ptv_print_log_legend(int full)
     av_log(NULL, AV_LOG_INFO,
         "health events (always-on):\n"
         "  [PTV-BURSTY]   per-minute delivery-stall status (count + worst gap + bank state) while a\n"
-        "                 channel is bursty-classified; also the auto-bank escalation advisor\n"
+        "                 channel is bursty-classified; also the auto-bank escalation advisor.\n"
+        "                 A -regulate input reports it as 'inK ... at the input — regulated: A-B s\n"
+        "                 held (D d s)', measured where the source arrives (its demuxer sees a paced\n"
+        "                 stream); A near 0 = the delay barely covers the gaps\n"
         "  [PTV-CUSHION]  adaptive cushion tier moves + BANK escalations (target, sizing rationale)\n"
         "  [PTV-CUSHREL]  (1.0.1-pre10) raised cushion tier released: frame_q starved >=60s with\n"
         "                 input FLOWING while the tier held — the 6h zero-starvation release is\n"
