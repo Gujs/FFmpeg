@@ -30,7 +30,8 @@
  *   (the prototype took a fresh D at a file loop and stalled the encoder 8.5 s; the later of the two moved a bursty source
  *   later at every jump — Fintech's +2 s PCR jumps arrive early in their burst: 12 s held, 305 repeats); only when the
  *   FIFO ran dry (a real outage: the last scheduled time has passed) does it take arrival + D again, as a gateway
- *   re-buffers to its latency;
+ *   re-buffers to its latency; a forward jump that comes with an arrival stop of the same length is a hole (content
+ *   lost in real time, T-437) and keeps the PCR schedule;
  * - more than D + 10 s held (a source faster than real time for long): the oldest go, logged. */
 
 #include <stdatomic.h>
@@ -75,6 +76,7 @@ typedef struct Regulator {
     /* the schedule (reader thread only) */
     int             pcr_pid;
     int64_t         anchor_t, acc, last_pcr, last_due;
+    int64_t         last_pcr_wc;                    /* T-437: the previous PCR's arrival (wall) */
     int64_t         first_wc;                       /* the first packet before any PCR (wall), 0 = said / done */
     /* 2.2 T-436: [PTV-BURSTY] at the socket (reader thread only) — the demuxer reads the paced loopback and sees none */
     int64_t         by_last, by_win, by_max, held_min, held_max;
@@ -142,10 +144,23 @@ static void reg_schedule(Regulator *r, int64_t pcr, int64_t now)
         r->anchor_t = now + r->delay;
         r->acc      = 0;
     } else {
-        int64_t d = pcr - r->last_pcr;
+        int64_t d = pcr - r->last_pcr, gap = now - r->last_pcr_wc, dus;
         if (d < -(1LL << 32))
             d += 1LL << 33;                         /* the 33-bit wrap */
-        if (d < 0 || d > 90000) {                   /* a jump: continue the schedule (see the top) */
+        dus = av_rescale(d, 1000000, 90000);
+        if (d > 90000 && FFABS(gap - dus) <= FFMAX(500000, dus / 4)) {
+            /* 2.2 T-437: the arrivals stopped as long as the PCR jumped — content lost in real time (an origin that skips
+             * a segment: glo-3 SOFAST, a 5.1-5.6 s stop + the same PCR jump every ~30 s, 7 of 7 within 0.02 s). Kept on
+             * its schedule: the hole plays at its moment and the hold stays D. Continuing the schedule here ate the hold at
+             * every hole (a Stingray replay: held 8 -> 163 s, FIFO drops, 13 freezes vs 3 unregulated) */
+            r->acc += d;
+            if (now - r->jump_log_wc >= 10000000) {
+                r->jump_log_wc = now;
+                av_log(NULL, AV_LOG_INFO, "[PTV-REG] in%d hole %.1f s (the source stopped as long as its PCR jumped) — "
+                       "kept on its schedule (%.1f s held)\n", r->k, dus / 1e6, (r->anchor_t + av_rescale(r->acc, 1000000,
+                       90000) - now) / 1e6);
+            }
+        } else if (d < 0 || d > 90000) {            /* a jump: continue the schedule (see the top) */
             r->anchor_t = r->last_due >= now ? r->last_due : now + r->delay;
             r->acc      = 0;
             if (now - r->jump_log_wc >= 10000000) {
@@ -156,8 +171,9 @@ static void reg_schedule(Regulator *r, int64_t pcr, int64_t now)
         } else
             r->acc += d;
     }
-    r->last_pcr = pcr;
-    r->last_due = r->anchor_t + av_rescale(r->acc, 1000000, 90000);
+    r->last_pcr    = pcr;
+    r->last_pcr_wc = now;
+    r->last_due    = r->anchor_t + av_rescale(r->acc, 1000000, 90000);
 }
 
 static void reg_push(Regulator *r, const uint8_t *data, int len, int64_t due)
