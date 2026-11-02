@@ -265,9 +265,14 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
         }
         /* after a dry spell, the first picture can be the pre-gap PES tail (T-350: the cut PES completed with post-gap
          * bytes, flushed with its OLD label) — locked onto, the slot re-locked +20 s and back (mv04 gap_20). A picture
-         * more than 1 s late whose source time is still near the last one shown is dropped, up to 3 per return; a
-         * source that really resumes where it stopped (late by the pause) re-locks after them */
-        if (dry && s->tails < 3 && s->shown_wc && out - mv_tl_lag(s, fs) - fs > 1000000 &&
+         * late by more than half the dry spell whose source time is still near the last one shown is dropped, up to 3
+         * per return; a source that really resumes where it stopped (late by the pause) re-locks after them.
+         * 2.2 T-439: it was "more than 1 s late" — a tail is late by the dry spell less a picture, so a 2.000 s hole
+         * (the regulator plays it on its PCR) put it at 1.000 or 1.040 s by the tick phase: 1.000 s was shown, re-armed
+         * the slot's sound bound (T-411) from a stale picture, the returning sound parked 0.7 s and the mux held the
+         * whole mosaic 0.9-1.0 s (mv04 sync_flapping, 6 of 18 runs; the 2.08 s wire gap of an unregulated input always
+         * put it at 1.040 s). Relative to the dry spell, no hole length sits on the line */
+        if (dry && s->tails < 3 && s->shown_wc && out - mv_tl_lag(s, fs) - fs > (now_us - s->shown_wc) / 2 &&
             fs - s->shown_src < (now_us - s->shown_wc) / 2) {
             s->tails++;
             av_frame_free(&nx);
