@@ -5,6 +5,41 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.0-pre9 — 2.2.0-pre8 + lip-sync reading after a video gap, mosaic start-up, regulator bursts and holes (T-428, T-435, T-436, T-437)
+
+**The single-input `lipsync=` reading ignores a held picture (T-428).** A short video-only gap repeats the last picture,
+and the reading's 30 s video average took every repeat in: after a 3 s gap it read +105…+144 ms, decaying over minutes,
+while the content was in sync (ruler 0.0 ms). It now applies the mosaic's rule: a picture held for 0.5 s or more stops
+feeding the reading, which re-seeds 1 s after pictures move again. The same scenario reads +0 ms at every status line.
+On a live Stingray capture with 5 s holes, replayed at its recorded arrival times, pre8 read +229…+439 ms after the
+holes; pre9 reads +0…+2 ms. Full gate (kit e45fecd, media-v7): 251 runs, 241 PASS, 0 regressions against pre7.
+
+**A mosaic no longer starts its slots seconds deep after a slow set-up (T-435).** Nothing reads the slots between the
+mosaic start and the running pipeline. On cor-3 the CUDA device took 5.2 s and the six NVENC opens about 3.2 s. In those
+~8.7 s the ~5 s udp fifos of the Curiosity 2x2 overran, and each slot began on stale content followed by a 4–5 s hole.
+The hole then became the slot's depth: a freeze of its length, every later picture that much deep, and a 4.3 s re-lock
+on air at 76 s. The slots' decoded queues also held about 0.9 GB more memory (2.3 GB against 1.4 GB). The CUDA device is
+now created on its own thread before the inputs open (`-init_hw_device cuda…`). The mosaic start waits for it while live
+slots keep reading and dropping, so only the ~3.5 s output set-up stays unread. Local repro with cor-3's timing scaled to
+the fifo: overrun lines 2246 → 8, the −6.3 s start-up hole gone, slot queue 54 → 26 pictures, RSS 270 → 205 MB (the
+no-delay baseline is 193–211 MB). A single input takes the device at the old point and only gains the overlap. The log
+line now reads `CUDA device N (… created in X s while the inputs opened)`.
+
+**A regulated input reports its bursts (T-436).** With `-regulate` the demuxer reads an already-paced stream, so
+`[PTV-BURSTY]` went quiet on exactly the channels that burst. The regulator now measures arrivals at the socket and
+prints, per minute with a stall: `[PTV-BURSTY] inK N stalls >=1.5s in the last 60s (worst X s) at the input — regulated:
+A-B s held (D d s)`. A low end near 0 means D barely covers the gaps.
+
+**The regulator keeps a real-time hole on its schedule (T-437).** An origin that skips a segment stops sending for ~5 s
+and resumes with a PCR jump of the same length (glo-3 SOFAST). The regulator took every PCR step for a restart or a loop
+and continued its schedule, which ate the hold at each hole and ran it dry at every second one. A forward jump that
+comes with an arrival stop of the same length now keeps the PCR schedule, logged `[PTV-REG] inK hole X s … kept on its
+schedule`. On the live Stingray replay, the hold after each hole is now 8.1–8.2 s; before it was 3.0 / 8.0 / 2.4 / 8.0 s,
+dropping to −2.2 s.
+
+Test-only hooks: `PTV_TEST_MV_SETUP_S` (sleep after the mosaic start, nobody reading) and `PTV_TEST_HWDEV_S` (the CUDA
+device creation takes N s more).
+
 ## 2.2.0-pre8 — 2.2.0-pre7 + a regulated mosaic waits for its slots (T-434)
 
 **Mosaics with `-regulate D`: the `-slot_wait` clock starts D later (T-434).** The regulator holds every input back by D,
