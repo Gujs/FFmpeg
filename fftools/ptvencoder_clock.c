@@ -1057,6 +1057,7 @@ void *output_thread(void *arg)
         /* 1.0.1-pre9 residual sensor: video-side EMA state (master rung; τ ≈ 30s of ticks) */
         int64_t rs_mv_ema = 0, rs_mv_res = 0, rs_mv_div = v->tick_dur_us > 0 ? 30000000 / v->tick_dur_us : 750;
         int     rs_mv_seed = 0;
+        int64_t rs_mv_src = AV_NOPTS_VALUE, rs_mv_adv = 0, rs_mv_rel = 0;   /* 2.2 T-428: the mosaic's T-362 rule */
         if (rs_mv_div < 8) rs_mv_div = 8;
         /* v0.9.11 pulldown state: 1-frame lookahead + film-mode detector (see g_pulldown comment) */
         AVFrame *nextf = NULL;
@@ -1665,20 +1666,41 @@ void *output_thread(void *arg)
                 int64_t out_us = v->out_fps.num > 0
                     ? av_rescale(vpts, 1000000LL * v->out_fps.den, v->out_fps.num)
                     : vpts * v->tick_dur_us;
-                int64_t m = out_us - av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q);
-                {   /* 2.0.0-pre9.6 (T-075): smooth m_v − house_skew only — the same split as the audio
-                     * side (house_skew steps at a hold or a rejoin map; the cadence-hold residence and
-                     * everything else measured stays inside the EMA) */
-                    int64_t hs_us = v->house_skew ? *v->house_skew : 0;
-                    if (!rs_mv_seed) { rs_mv_res = m - hs_us; rs_mv_seed = 1; }
-                    else rs_mv_res += (m - hs_us - rs_mv_res) / rs_mv_div;
-                    rs_mv_ema = rs_mv_res + hs_us;
+                int64_t src_us = av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q);
+                int64_t m = out_us - src_us;
+                /* 2.2 T-428: the mosaic's T-362 rule on single input. A video-only gap (the audio flows, so no
+                 * source hold re-seeds) repeats the last picture: m grows 1 s per second, and a 3 s gap
+                 * (sync_vpidmove_30: 77 repeats, up to +2.78 s) left lipsync= +119…+139 ms decaying over
+                 * ~2 min with the ruler at 0.0 ms. A picture held 0.5 s or more is no content to measure:
+                 * the sensor stops publishing and re-seeds 1 s after the pictures move again (the first
+                 * picture after a gap can be the pre-gap tail). Short cadence holds still count. */
+                if (src_us != rs_mv_src || rs_mv_src == AV_NOPTS_VALUE) {
+                    rs_mv_src = src_us;
+                    rs_mv_adv = out_us;
                 }
-                /* pre16: slot 0 of the per-slot arrays — single input IS slot 0 (multiview
-                 * never reaches this block: passthrough rungs return above; the compositor
-                 * owns per-slot publication there). */
-                atomic_store_explicit(&g_rsx.mv_ema[0], rs_mv_ema, memory_order_relaxed);
-                atomic_store_explicit(&g_rsx.mv_wall[0], av_gettime_relative(), memory_order_relaxed);
+                if (out_us - rs_mv_adv >= 500000) {
+                    rs_mv_seed = 0;
+                    rs_mv_rel  = -1;
+                } else if (rs_mv_rel == -1)
+                    rs_mv_rel = out_us > 0 ? out_us : 1;
+                else if (rs_mv_rel > 0 && out_us - rs_mv_rel < 1000000)
+                    ;
+                else {
+                    rs_mv_rel = 0;
+                    {   /* 2.0.0-pre9.6 (T-075): smooth m_v − house_skew only — the same split as the audio
+                         * side (house_skew steps at a hold or a rejoin map; the cadence-hold residence and
+                         * everything else measured stays inside the EMA) */
+                        int64_t hs_us = v->house_skew ? *v->house_skew : 0;
+                        if (!rs_mv_seed) { rs_mv_res = m - hs_us; rs_mv_seed = 1; }
+                        else rs_mv_res += (m - hs_us - rs_mv_res) / rs_mv_div;
+                        rs_mv_ema = rs_mv_res + hs_us;
+                    }
+                    /* pre16: slot 0 of the per-slot arrays — single input IS slot 0 (multiview
+                     * never reaches this block: passthrough rungs return above; the compositor
+                     * owns per-slot publication there). */
+                    atomic_store_explicit(&g_rsx.mv_ema[0], rs_mv_ema, memory_order_relaxed);
+                    atomic_store_explicit(&g_rsx.mv_wall[0], av_gettime_relative(), memory_order_relaxed);
+                }
             }
         }
         if (v->is_master)

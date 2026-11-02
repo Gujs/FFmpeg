@@ -47,7 +47,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.2.0-pre8"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.2.0-pre9"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -4374,6 +4374,18 @@ static int64_t     g_slot_wait_us = 3000000;     /* 2.0.2 T-386: mosaic -slot_wa
 static int64_t     g_regulate_us;                /* 2.2 T-423: -regulate (0 = off) */
 static int64_t     g_bind_report_us;             /* 2.2 T-071: -bind_report (0 = off): the input wait, then report + exit */
 static _Atomic int g_mv_acq_go;                  /* 2.0.2 T-386: the mosaic starts — live slots stop draining */
+/* 2.2 T-435: the CUDA device is created on its own thread from before the inputs open (-init_hw_device cuda...). It took
+ * 5.2 s on cor-3; created after the mosaic start it left the slots unread ~8.7 s (with the NVENC opens), the ~5 s udp fifos
+ * of the Curiosity 2x2 overran and the overrun hole became the slots' depth (re-locked on air at 76 s, RSS +0.9 GB) */
+typedef struct CudaDev {
+    pthread_t     th;
+    int           started, joined, ret;
+    _Atomic int   done;
+    char          ord[64];                       /* "" = device 0 */
+    AVBufferRef  *dev;
+    int64_t       us;                            /* how long the creation took */
+} CudaDev;
+static CudaDev g_cudadev;
 int                g_backoff_s[8] = { 1, 2, 5, 10, 30 };   /* also the 2.0.0-pre5 reopen backoff */
 int                g_backoff_n    = 5;
 
@@ -4561,6 +4573,41 @@ static int input_acquire(Input *in, int idx, const AVDictionary *opts)
     return ret;
 }
 
+/* 2.2 T-435: -init_hw_device cuda=cuda:N / cuda:N[,opts] -> "N" ("" = default device 0) */
+static void cuda_ordinal(const char *hwdev, char *buf, size_t sz)
+{
+    const char *c = hwdev ? strrchr(hwdev, ':') : NULL;
+    char *comma;
+    *buf = 0;
+    if (c && c[1]) {
+        snprintf(buf, sz, "%s", c + 1);
+        if ((comma = strchr(buf, ','))) *comma = 0;   /* drop trailing ,opts */
+    }
+}
+
+static void *cuda_dev_thread(void *arg)
+{
+    CudaDev *cd = arg;
+    int64_t t0 = av_gettime_relative();
+    const char *ts = getenv("PTV_TEST_HWDEV_S");   /* TEST-ONLY (T-435): the creation takes N s more (cor-3: 5.2 s) */
+    if (ts && atoi(ts) > 0)
+        av_usleep(atoi(ts) * 1000000U);
+    cd->ret = av_hwdevice_ctx_create(&cd->dev, AV_HWDEVICE_TYPE_CUDA, *cd->ord ? cd->ord : NULL, NULL, 0);
+    cd->us  = av_gettime_relative() - t0;
+    atomic_store_explicit(&cd->done, 1, memory_order_release);
+    return NULL;
+}
+
+/* joins the device thread once; returns its result (the device stays in g_cudadev.dev for the taker) */
+static int cuda_dev_join(void)
+{
+    if (g_cudadev.started && !g_cudadev.joined) {
+        pthread_join(g_cudadev.th, NULL);
+        g_cudadev.joined = 1;
+    }
+    return g_cudadev.ret;
+}
+
 /* 2.0.2 T-386: a deferred slot's acquire, on its demux thread (blocks until the source is live; -t / EOF stop it) */
 int ptv_slot_acquire(struct Input *in, int idx)
 {
@@ -4616,7 +4663,7 @@ static int mosaic_acquire(Input *inputs, int n_input)
             atomic_store_explicit(&inputs[k].acq_done, 1, memory_order_relaxed);
     }
     for (;;) {
-        int done = 0;
+        int done = 0, dev = !g_cudadev.started || atomic_load_explicit(&g_cudadev.done, memory_order_acquire);
         now  = av_gettime_relative();
         live = 0;
         for (k = 0; k < n_input; k++) {
@@ -4624,9 +4671,11 @@ static int mosaic_acquire(Input *inputs, int n_input)
             done += atomic_load_explicit(&inputs[k].acq_done, memory_order_acquire) &&
                     !atomic_load_explicit(&inputs[k].acq_live, memory_order_acquire);
         }
-        if (live == n_input || done == n_input)
+        if (done == n_input)
             break;
-        if (!all && wait > 0 && live > 0 && now - t0 >= wait)
+        /* 2.2 T-435: a live slot reads and drops while the CUDA device is still being created (as for a late sibling),
+         * so the outputs' setup after the start is all it waits unread */
+        if (dev && (live == n_input || (!all && wait > 0 && live > 0 && now - t0 >= wait)))
             break;
         ptv_acq_heartbeat();
         av_usleep(100000);
@@ -5423,6 +5472,10 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         av_dict_set(&ins->groups[k].format_opts, "fix_teletext_pts", "0", AV_DICT_DONT_OVERWRITE);
     }
 
+    if (hwdev && strstr(hwdev, "cuda")) {             /* 2.2 T-435: the device is created while the inputs open */
+        cuda_ordinal(hwdev, g_cudadev.ord, sizeof g_cudadev.ord);
+        g_cudadev.started = !pthread_create(&g_cudadev.th, NULL, cuda_dev_thread, &g_cudadev);
+    }
     /* 2.0.0-pre2: a single live input waits for its source (input_acquire) */
     if (!multiview && strcmp(g_start_on, "video")) {                 /* 2.0.2 T-386: any / all are mosaic rules */
         av_log(NULL, AV_LOG_ERROR, "-start_on %s: a mosaic rule; a single input starts on video\n", g_start_on);
@@ -5443,6 +5496,13 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         for (k = 0; k < n_input; k++)
             av_dict_copy(&inputs[k].da.reopen_opts, ins->groups[k].format_opts, 0);
         live = mosaic_acquire(inputs, n_input);
+        {
+            const char *su = getenv("PTV_TEST_MV_SETUP_S");   /* TEST-ONLY (T-435): the output setup takes N s after the
+                                                              * start while nobody reads the slots (cor-3 mass restart:
+                                                              * CUDA + encoders ~9 s, the UDP fifos overran) */
+            if (su && atoi(su) > 0)
+                av_usleep(atoi(su) * 1000000U);
+        }
         if (!live) {
             av_log(NULL, AV_LOG_ERROR, "[PTV-OUT] no slot live\n");
             ret = AVERROR(ETIMEDOUT); goto end;
@@ -5624,23 +5684,26 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
     hw_cuda = (fcomplex && (strstr(fcomplex, "_cuda") || strstr(fcomplex, "hwupload_cuda"))) ||
               (sel[0].vf && (strstr(sel[0].vf, "_cuda") || strstr(sel[0].vf, "hwupload_cuda")));
     if (hw_cuda) {
-        const char *cuda_ord = NULL; char ordbuf[64];
-        if (hwdev) {
-            const char *c = strrchr(hwdev, ':');         /* cuda=cuda:N / cuda:N -> "N" */
-            if (c && c[1]) {
-                char *comma;
-                snprintf(ordbuf, sizeof ordbuf, "%s", c + 1);
-                if ((comma = strchr(ordbuf, ','))) *comma = 0;   /* drop trailing ,opts */
-                if (ordbuf[0]) cuda_ord = ordbuf;
-            }
+        char ordbuf[64];
+        int64_t dus = 0;
+        if (g_cudadev.started) {                         /* 2.2 T-435: created since before the inputs opened */
+            ret = cuda_dev_join();
+            hw_device = g_cudadev.dev; g_cudadev.dev = NULL;
+            snprintf(ordbuf, sizeof ordbuf, "%s", g_cudadev.ord);
+            dus = g_cudadev.us;
+        } else {
+            int64_t t0 = av_gettime_relative();
+            cuda_ordinal(hwdev, ordbuf, sizeof ordbuf);
+            ret = av_hwdevice_ctx_create(&hw_device, AV_HWDEVICE_TYPE_CUDA, *ordbuf ? ordbuf : NULL, NULL, 0);
+            dus = av_gettime_relative() - t0;
         }
-        if ((ret = av_hwdevice_ctx_create(&hw_device, AV_HWDEVICE_TYPE_CUDA, cuda_ord, NULL, 0)) < 0) {
+        if (ret < 0) {
             av_log(NULL, AV_LOG_ERROR, "cannot create CUDA device '%s': %s\n",
-                   cuda_ord ? cuda_ord : "0", av_err2str(ret)); goto end;
+                   *ordbuf ? ordbuf : "0", av_err2str(ret)); goto end;
         }
         av_log(NULL, AV_LOG_INFO,
-               "ptvencoder: CUDA device %s (hwupload + deint + scale + nvenc all share it)\n",
-               cuda_ord ? cuda_ord : "0");
+               "ptvencoder: CUDA device %s (hwupload + deint + scale + nvenc all share it; created in %.1f s%s)\n",
+               *ordbuf ? ordbuf : "0", dus / 1e6, g_cudadev.started ? " while the inputs opened" : "");
     }
 
     /* shared filter graph: -filter_complex (N video inputs -> split/mosaic ->
@@ -6730,6 +6793,8 @@ end:
         pthread_mutex_destroy(&inputs[k].vring.lock);
     }
     av_buffer_unref(&hw_device);
+    cuda_dev_join();                                     /* 2.2 T-435: made but not taken (no CUDA filter, early exit) */
+    av_buffer_unref(&g_cudadev.dev);
     return ret;
 }
 

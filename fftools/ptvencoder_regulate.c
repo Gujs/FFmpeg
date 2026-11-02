@@ -30,7 +30,8 @@
  *   (the prototype took a fresh D at a file loop and stalled the encoder 8.5 s; the later of the two moved a bursty source
  *   later at every jump — Fintech's +2 s PCR jumps arrive early in their burst: 12 s held, 305 repeats); only when the
  *   FIFO ran dry (a real outage: the last scheduled time has passed) does it take arrival + D again, as a gateway
- *   re-buffers to its latency;
+ *   re-buffers to its latency; a forward jump that comes with an arrival stop of the same length is a hole (content
+ *   lost in real time, T-437) and keeps the PCR schedule;
  * - more than D + 10 s held (a source faster than real time for long): the oldest go, logged. */
 
 #include <stdatomic.h>
@@ -75,7 +76,11 @@ typedef struct Regulator {
     /* the schedule (reader thread only) */
     int             pcr_pid;
     int64_t         anchor_t, acc, last_pcr, last_due;
+    int64_t         last_pcr_wc;                    /* T-437: the previous PCR's arrival (wall) */
     int64_t         first_wc;                       /* the first packet before any PCR (wall), 0 = said / done */
+    /* 2.2 T-436: [PTV-BURSTY] at the socket (reader thread only) — the demuxer reads the paced loopback and sees none */
+    int64_t         by_last, by_win, by_max, held_min, held_max;
+    int             by_cnt;
 } Regulator;
 
 static Regulator  *regs[PTV_MAX_INPUT];
@@ -85,6 +90,39 @@ static int reg_interrupt(void *opaque)
 {
     (void)opaque;
     return atomic_load_explicit(&reg_stop, memory_order_relaxed);
+}
+
+/* 2.2 T-436: the arrival-stall report of an unregulated input ([PTV-BURSTY], ptvencoder_demux.c), measured where the
+ * source arrives — a regulated input's demuxer reads the paced loopback, so its own report goes quiet exactly on the
+ * channels that burst. Per 60 s window with a >= 1.5 s stall: the count, the worst, and how much the FIFO held (its
+ * lowest near 0 = D barely covers the gaps). A reopen (outage) restarts the measure, as the demuxer's excludes outages. */
+static void reg_bursty(Regulator *r, int64_t now)
+{
+    int64_t held;
+    if (r->last_due == AV_NOPTS_VALUE)              /* no schedule yet (before the first PCR) */
+        return;
+    held = r->last_due - now;
+    if (r->by_last && now - r->by_last >= 1500000) {
+        r->by_cnt++;
+        r->by_max = FFMAX(r->by_max, now - r->by_last);
+    }
+    r->by_last = now;
+    if (!r->by_win) {
+        r->by_win   = now;
+        r->held_min = r->held_max = held;
+    }
+    r->held_min = FFMIN(r->held_min, held);
+    r->held_max = FFMAX(r->held_max, held);
+    if (now - r->by_win >= 60000000) {
+        if (r->by_cnt > 0)
+            av_log(NULL, AV_LOG_INFO, "[PTV-BURSTY] in%d %d stall%s >=1.5s in the last 60s (worst %.1fs) at the input — "
+                   "regulated: %.1f-%.1f s held (D %.1f s)\n", r->k, r->by_cnt, r->by_cnt == 1 ? "" : "s",
+                   r->by_max / 1e6, r->held_min / 1e6, r->held_max / 1e6, r->delay / 1e6);
+        r->by_win = now;
+        r->by_cnt = 0;
+        r->by_max = 0;
+        r->held_min = r->held_max = held;
+    }
 }
 
 /* the packet's 33-bit PCR base when it carries one on the regulated PID, else -1 */
@@ -106,10 +144,23 @@ static void reg_schedule(Regulator *r, int64_t pcr, int64_t now)
         r->anchor_t = now + r->delay;
         r->acc      = 0;
     } else {
-        int64_t d = pcr - r->last_pcr;
+        int64_t d = pcr - r->last_pcr, gap = now - r->last_pcr_wc, dus;
         if (d < -(1LL << 32))
             d += 1LL << 33;                         /* the 33-bit wrap */
-        if (d < 0 || d > 90000) {                   /* a jump: continue the schedule (see the top) */
+        dus = av_rescale(d, 1000000, 90000);
+        if (d > 90000 && FFABS(gap - dus) <= FFMAX(500000, dus / 4)) {
+            /* 2.2 T-437: the arrivals stopped as long as the PCR jumped — content lost in real time (an origin that skips
+             * a segment: glo-3 SOFAST, a 5.1-5.6 s stop + the same PCR jump every ~30 s, 7 of 7 within 0.02 s). Kept on
+             * its schedule: the hole plays at its moment and the hold stays D. Continuing the schedule here ate the hold at
+             * every hole (a Stingray replay: held 8 -> 163 s, FIFO drops, 13 freezes vs 3 unregulated) */
+            r->acc += d;
+            if (now - r->jump_log_wc >= 10000000) {
+                r->jump_log_wc = now;
+                av_log(NULL, AV_LOG_INFO, "[PTV-REG] in%d hole %.1f s (the source stopped as long as its PCR jumped) — "
+                       "kept on its schedule (%.1f s held)\n", r->k, dus / 1e6, (r->anchor_t + av_rescale(r->acc, 1000000,
+                       90000) - now) / 1e6);
+            }
+        } else if (d < 0 || d > 90000) {            /* a jump: continue the schedule (see the top) */
             r->anchor_t = r->last_due >= now ? r->last_due : now + r->delay;
             r->acc      = 0;
             if (now - r->jump_log_wc >= 10000000) {
@@ -120,8 +171,9 @@ static void reg_schedule(Regulator *r, int64_t pcr, int64_t now)
         } else
             r->acc += d;
     }
-    r->last_pcr = pcr;
-    r->last_due = r->anchor_t + av_rescale(r->acc, 1000000, 90000);
+    r->last_pcr    = pcr;
+    r->last_pcr_wc = now;
+    r->last_due    = r->anchor_t + av_rescale(r->acc, 1000000, 90000);
 }
 
 static void reg_push(Regulator *r, const uint8_t *data, int len, int64_t due)
@@ -166,6 +218,7 @@ static void *reg_reader(void *arg)
             int64_t now = av_gettime_relative();
             if (n <= 0)
                 break;                              /* a read error / the source's timeout: reopen */
+            reg_bursty(r, now);
             have += n;
             while (have - i >= 188) {
                 const uint8_t *p = buf + i;
@@ -203,6 +256,7 @@ static void *reg_reader(void *arg)
         }
         avio_closep(&pb);
         have = 0;
+        r->by_last = 0;                             /* T-436: an outage is not a stall */
     }
     return NULL;
 }
@@ -276,6 +330,7 @@ char *ptv_regulate_start(const char *url, int64_t delay_us, int k)
     r->delay    = delay_us;
     r->pcr_pid  = -1;
     r->anchor_t = AV_NOPTS_VALUE;
+    r->last_due = AV_NOPTS_VALUE;                   /* T-436: no schedule yet */
     r->cap      = (int)((delay_us / 1000000 + 10) * 2000);   /* D + 10 s at up to ~20 Mb/s */
     r->port     = reg_port();
     r->src_url  = av_strdup(url);
