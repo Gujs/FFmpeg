@@ -88,6 +88,7 @@ typedef struct Regulator {
     int             pcr_pid;
     int64_t         anchor_t, acc, last_pcr, last_due;
     int64_t         last_pcr_wc;                    /* T-437: the previous PCR's arrival (wall) */
+    int             pid_moved;                      /* T-439: the PCR just moved PID — its first step is no hole */
     int64_t         first_wc;                       /* the first packet before any PCR (wall), 0 = said / done */
     /* 2.2 T-436: [PTV-BURSTY] at the socket (reader thread only) — the demuxer reads the paced loopback and sees none */
     int64_t         by_last, by_win, by_max, held_min, held_max;
@@ -140,14 +141,22 @@ static void reg_bursty(Regulator *r, int64_t now)
     }
 }
 
-/* the packet's 33-bit PCR base when it carries one on the regulated PID, else -1 */
-static int64_t ts_pcr(Regulator *r, const uint8_t *p)
+/* the packet's 33-bit PCR base when it carries one on the regulated PID, else -1. 2.2 T-439: a PID that carries a PCR
+ * after the regulated one has carried none for 1 s takes over (the provider moved the PCR with its video:
+ * sync_vpidmove_30, 0x100 -> 0x1e1 — the schedule stopped and the input ran unregulated from the move on) */
+static int64_t ts_pcr(Regulator *r, const uint8_t *p, int64_t now)
 {
     int pid = ((p[1] & 0x1f) << 8) | p[2];
     if (!(p[3] & 0x20) || p[4] < 7 || !(p[5] & 0x10))
         return -1;
     if (r->pcr_pid < 0)
         r->pcr_pid = pid;
+    if (pid != r->pcr_pid && r->last_pcr_wc && now - r->last_pcr_wc >= 1000000) {
+        av_log(NULL, AV_LOG_INFO, "[PTV-REG] in%d PCR moved: pid 0x%x -> 0x%x (none on 0x%x for %.1f s)\n",
+               r->k, r->pcr_pid, pid, r->pcr_pid, (now - r->last_pcr_wc) / 1e6);
+        r->pcr_pid   = pid;
+        r->pid_moved = 1;
+    }
     if (pid != r->pcr_pid)
         return -1;
     return ((int64_t)p[6] << 25) | (p[7] << 17) | (p[8] << 9) | (p[9] << 1) | (p[10] >> 7);
@@ -207,7 +216,7 @@ static void reg_schedule(Regulator *r, int64_t pcr, int64_t now)
              * its schedule: the hole plays at its moment and the hold stays D. Continuing the schedule here ate the hold at
              * every hole (a Stingray replay: held 8 -> 163 s, FIFO drops, 13 freezes vs 3 unregulated) */
             r->acc += d;
-            if (now - r->jump_log_wc >= 10000000) {
+            if (!r->pid_moved && now - r->jump_log_wc >= 10000000) {
                 r->jump_log_wc = now;
                 av_log(NULL, AV_LOG_INFO, "[PTV-REG] in%d hole %.1f s (the source stopped as long as its PCR jumped) — "
                        "kept on its schedule (%.1f s held)\n", r->k, dus / 1e6, (r->anchor_t + av_rescale(r->acc, 1000000,
@@ -230,6 +239,7 @@ static void reg_schedule(Regulator *r, int64_t pcr, int64_t now)
     }
     r->last_pcr    = pcr;
     r->last_pcr_wc = now;
+    r->pid_moved   = 0;
     r->last_due    = r->anchor_t + av_rescale(r->acc, 1000000, 90000);
     reg_servo(r, r->last_due - now, now);
 }
@@ -297,7 +307,7 @@ static void *reg_reader(void *arg)
                     i++;
                     continue;
                 }
-                if ((pcr = ts_pcr(r, p)) >= 0) {
+                if ((pcr = ts_pcr(r, p, now)) >= 0) {
                     if (dl) {                       /* a PCR'd packet starts a new datagram at its own time */
                         reg_push(r, dg, dl, due);
                         dl = 0;

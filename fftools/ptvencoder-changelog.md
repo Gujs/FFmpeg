@@ -27,6 +27,13 @@ decides it. With `-regulate 8` the earliest packet waits 8 s and a gap up to 8 s
 **The FIFO grows as it fills** (from 2048 datagrams to the D + 10 s cap): a 0.5 s hold costs ~2.7 MB per input,
 not ~26 MB.
 
+**The regulator follows a PCR that moves PID.** It locked onto the first PID carrying a PCR. When a provider moves the
+PCR with its video (the gate's `sync_vpidmove_30`: 0x100 -> 0x1e1 at 30 s), no PCR came on the locked PID, the
+schedule stopped, and the input ran unregulated from the move on. The gate key failed with 3 flashes without their
+beep (38.4-40.6 s), reproducibly. Now, once the locked PID has carried no PCR for 1 s, a PID that carries one takes
+over, logged as `[PTV-REG] inK PCR moved: pid A -> B`. Its first PCR continues the schedule on the same clock.
+Measured: the schedule continues at 0.50 s across the move, and the key passes 3 of 3.
+
 ## 2.2.0-pre9 — 2.2.0-pre8 + lip-sync reading after a video gap, mosaic start-up, burst reports everywhere, regulator holes (T-428, T-435, T-436, T-437, T-438)
 
 **The single-input `lipsync=` reading ignores a held picture (T-428).** A short video-only gap repeats the last picture,
