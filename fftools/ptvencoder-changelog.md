@@ -5,6 +5,28 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.0-pre10 — 2.2.0-pre9 + every udp input regulated by default at 0.5 s, the schedule follows the source (T-439)
+
+**Regulated by default (T-439, owner 2026-11-02: "default value should be very small, as we don't want it to add too
+much delay").** No `-regulate` now means `-regulate 0.5s`; `-regulate 0` turns it off, `-regulate 8` (SV_REGULATE=8)
+stays for the bursty channels. 0.5 s covers the arrival jitter of every non-bursty production source measured over
+30 min (test-results/t439: clean sources <= 0.13 s, the glo-3 origins and WildTV 0.25-0.40 s for 99.9 % of packets,
+worst 0.50 s). A packet later than D passes as it comes, as it would unregulated, and the minute it happens in says
+so: `[PTV-REG] inK N of M PCR packets later than D in the last 60s (worst X s past due)` — a channel that prints it
+every minute (SYRIA_TV: ~1.1 s of chunky delivery) wants a larger D.
+
+**The schedule follows the source's delivery.** It was anchored at the first packet and never corrected: the glo-3
+origins' arrival wanders up to 1 s against their PCR over minutes, and the hold kept all of it as delay (TOLLY after
+a PCR glitch: 0.5 -> 4.9 s in 30 min); a source running the other way emptied it and regulation silently stopped. Now
+the earliest packet of each 10 s waits exactly D: the schedule runs -(its wait - D) / 30 s faster or slower, at most
+2 %. Measured on the built code (same binary, the servo off via the test-only `PTV_TEST_REG_NOSERVO`): a source
+0.5 % fast held 0.60 -> 2.01 s without, 0.59 -> 0.65 s with; 0.5 % slow drained to -0.94 s (every packet late)
+without, 0.35 s and none late with. It also takes the start's luck out of the hold: the first packet no longer
+decides it. With `-regulate 8` the earliest packet waits 8 s and a gap up to 8 s is covered, as before.
+
+**The FIFO grows as it fills** (from 2048 datagrams to the D + 10 s cap): a 0.5 s hold costs ~2.7 MB per input,
+not ~26 MB.
+
 ## 2.2.0-pre9 — 2.2.0-pre8 + lip-sync reading after a video gap, mosaic start-up, burst reports everywhere, regulator holes (T-428, T-435, T-436, T-437, T-438)
 
 **The single-input `lipsync=` reading ignores a held picture (T-428).** A short video-only gap repeats the last picture,
