@@ -5,6 +5,44 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.0-pre10 — 2.2.0-pre9 + every udp input regulated by default at 0.5 s, the schedule follows the source (T-439)
+
+**Regulated by default (T-439, owner 2026-11-02: "default value should be very small, as we don't want it to add too
+much delay").** No `-regulate` now means `-regulate 0.5s`; `-regulate 0` turns it off, `-regulate 8` (SV_REGULATE=8)
+stays for the bursty channels. 0.5 s covers the arrival jitter of every non-bursty production source measured over
+30 min (test-results/t439: clean sources <= 0.13 s, the glo-3 origins and WildTV 0.25-0.40 s for 99.9 % of packets,
+worst 0.50 s). A packet later than D passes as it comes, as it would unregulated, and the minute it happens in says
+so: `[PTV-REG] inK N of M PCR packets later than D in the last 60s (worst X s past due)` — a channel that prints it
+every minute (SYRIA_TV: ~1.1 s of chunky delivery) wants a larger D.
+
+**The schedule follows the source's delivery.** It was anchored at the first packet and never corrected: the glo-3
+origins' arrival wanders up to 1 s against their PCR over minutes, and the hold kept all of it as delay (TOLLY after
+a PCR glitch: 0.5 -> 4.9 s in 30 min); a source running the other way emptied it and regulation silently stopped. Now
+the earliest packet of each 10 s waits exactly D: the schedule runs -(its wait - D) / 30 s faster or slower, at most
+2 %. Measured on the built code (same binary, the servo off via the test-only `PTV_TEST_REG_NOSERVO`): a source
+0.5 % fast held 0.60 -> 2.01 s without, 0.59 -> 0.65 s with; 0.5 % slow drained to -0.94 s (every packet late)
+without, 0.35 s and none late with. It also takes the start's luck out of the hold: the first packet no longer
+decides it. With `-regulate 8` the earliest packet waits 8 s and a gap up to 8 s is covered, as before.
+
+**The FIFO grows as it fills** (from 2048 datagrams to the D + 10 s cap): a 0.5 s hold costs ~2.7 MB per input,
+not ~26 MB.
+
+**A mosaic slot drops the pre-gap tail picture by its dry spell, not a fixed 1 s.** After a hole, the slot's last pre-gap
+PES completes with post-gap bytes and decodes as a stale picture (T-350). The tail rule dropped it only when it was more
+than 1 s late. A tail is late by the dry spell less a picture. A 2.000 s hole played on its PCR (regulated by default)
+put it at 1.000 or 1.040 s, depending on the tick phase, and at 1.000 s it was shown. That stale picture re-armed the
+slot's sound bound (T-411): the returning sound parked ~0.7 s, the slot's audio PID went dark, and the mux held the whole
+mosaic for 0.9-1.0 s (gate key `mv04/sync_flapping`, 6 of 18 runs). pre9 always put it at 1.040 s, because its input saw
+the 2.08 s wire gap: 0 of 18. A tail late by more than half the dry spell is now dropped. Same key: 18 of 18 PASS,
+worst output stall 182-229 ms (pre9 141-268 ms).
+
+**The regulator follows a PCR that moves PID.** It locked onto the first PID carrying a PCR. When a provider moves the
+PCR with its video (the gate's `sync_vpidmove_30`: 0x100 -> 0x1e1 at 30 s), no PCR came on the locked PID, the
+schedule stopped, and the input ran unregulated from the move on. The gate key failed with 3 flashes without their
+beep (38.4-40.6 s), reproducibly. Now, once the locked PID has carried no PCR for 1 s, a PID that carries one takes
+over, logged as `[PTV-REG] inK PCR moved: pid A -> B`. Its first PCR continues the schedule on the same clock.
+Measured: the schedule continues at 0.50 s across the move, and the key passes 3 of 3.
+
 ## 2.2.0-pre9 — 2.2.0-pre8 + lip-sync reading after a video gap, mosaic start-up, burst reports everywhere, regulator holes (T-428, T-435, T-436, T-437, T-438)
 
 **The single-input `lipsync=` reading ignores a held picture (T-428).** A short video-only gap repeats the last picture,

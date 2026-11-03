@@ -47,7 +47,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.2.0-pre9"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.2.0-pre10"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -4371,7 +4371,7 @@ static int64_t     g_slot_wait_us = 3000000;     /* 2.0.2 T-386: mosaic -slot_wa
                                                   * a dead slot kept the whole mosaic dark 2 min (cor-3 Curiosity 2x2, pre7
                                                   * deploy: slot 2's source down). A multiview's tiles are independent: wait
                                                   * only as long as a healthy slot takes (canaries 0.8-1.9 s, kit 1.8-2.5 s) */
-static int64_t     g_regulate_us;                /* 2.2 T-423: -regulate (0 = off) */
+static int64_t     g_regulate_us = -1;           /* 2.2 T-423: -regulate (0 = off); 2.2 T-439: unset = PTV_REGULATE_DEFAULT_US */
 static int64_t     g_bind_report_us;             /* 2.2 T-071: -bind_report (0 = off): the input wait, then report + exit */
 static _Atomic int g_mv_acq_go;                  /* 2.0.2 T-386: the mosaic starts — live slots stop draining */
 /* 2.2 T-435: the CUDA device is created on its own thread from before the inputs open (-init_hw_device cuda...). It took
@@ -6828,7 +6828,7 @@ static const OptionDef ptv_options[] = {
     { "audio_dedup",      OPT_TYPE_STRING, 0,                        { .off = 0 }, "audio rules: collapse same-programme duplicates (default on)", "on|off" },
     { "audio_dedup_chan_strict", OPT_TYPE_BOOL, 0,                   { .off = 0 }, "audio rules: the channel count also splits duplicate groups" },
     { "bind_report",      OPT_TYPE_STRING, 0,                        { .off = 0 }, "dry run: open the inputs (waiting at most this long), print every output stream with its PID and source, exit without encoding", "dur" },
-    { "regulate",         OPT_TYPE_STRING, 0,                        { .off = 0 }, "read every udp:// input at its PCR time + this delay (absorbs burst-and-gap delivery; default off)", "dur" },
+    { "regulate",         OPT_TYPE_STRING, 0,                        { .off = 0 }, "read every udp:// input at its PCR time + this delay (absorbs burst-and-gap delivery; default 0.5s, 0 = off)", "dur" },
     { "wait_input",       OPT_TYPE_STRING, 0,                        { .off = 0 }, "give up if the input has no video after this long (default inf)", "dur" },
     { "stall_min",        OPT_TYPE_STRING, 0,                        { .off = 0 }, "content gone + input silent this long = STALLED (default 3s)", "dur" },
     { "lost_after",       OPT_TYPE_STRING, 0,                        { .off = 0 }, "no video packets this long = LOST (default 30s)", "dur" },
@@ -7653,7 +7653,7 @@ int main(int argc, char **argv)
             }
         }
         if (!strcmp(octx.global_opts.opts[gi].key, "regulate")) {                   /* 2.2 T-423 */
-            if (av_parse_time(&g_regulate_us, octx.global_opts.opts[gi].val, 1) < 0 || g_regulate_us <= 0) {
+            if (av_parse_time(&g_regulate_us, octx.global_opts.opts[gi].val, 1) < 0 || g_regulate_us < 0) {
                 av_log(NULL, AV_LOG_ERROR, "-regulate %s: expected a duration\n", octx.global_opts.opts[gi].val);
                 uninit_parse_context(&octx); return 1;
             }
@@ -7737,6 +7737,8 @@ int main(int argc, char **argv)
     outs = &octx.groups[0];             /* all output groups (one per ABR rung) */
     if (g_bind_report_us > 0 && !g_wait_input_us)   /* 2.2 T-071: a report never waits forever for its input */
         g_wait_input_us = g_bind_report_us;
+    if (g_regulate_us < 0)              /* 2.2 T-439: regulated by default, a short de-jitter delay */
+        g_regulate_us = PTV_REGULATE_DEFAULT_US;
     if (g_regulate_us > 0) {            /* 2.2 T-423: every udp:// input through its regulator */
         int k;
         for (k = 0; k < ins->nb_groups && k < PTV_MAX_INPUT; k++) {

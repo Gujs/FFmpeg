@@ -1940,6 +1940,7 @@ static inline int ptv_url_passive(const char *u)
 }
 /* 2.2 T-423: the input regulator (ptvencoder_regulate.c) — a udp:// input read at its PCR time + delay_us; returns the
  * loopback URL the input reads instead (av_free it), NULL = keep the original */
+#define PTV_REGULATE_DEFAULT_US 500000   /* 2.2 T-439: no -regulate = 0.5 s (the jitter of every non-bursty source measured) */
 char *ptv_regulate_start(const char *url, int64_t delay_us, int k);
 void  ptv_regulate_stop(void);
 /* 2.2: audio track rules on -map (ptvencoder_bind.c, spec §7): a:main | a:langs | a:lang=xxx | a:multich | a:pid=0x.. |
