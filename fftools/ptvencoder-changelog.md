@@ -5,6 +5,24 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.0-pre11 — 2.2.0-pre10 + the regulator paces only by a PCR that is a clock (T-441)
+
+**A PCR that is no clock is not paced by: the input passes as it arrives (as unregulated, as on pre9), said once:**
+`[PTV-REG] inK its PCR runs ahead of the arrivals … / its PCR comes only every X s … — no clock to pace by: the input
+passes as it arrives from now on (not regulated)`. What it held leaves at once.
+
+- **It runs ahead of the arrivals.** One packager's sources (Lukentv: Heartland, Retro, Revn on cor-1 / cor-3) stamp
+  each 4 s segment with 5.8 s of PCR and step back 1.8 s at the next; their PTS / DTS run exactly at real time (90 s
+  read-only capture, `fixture-media/cap-heartland-t441`). Paced by that PCR, pre10 held 1.8 s more per segment: on cor-3
+  Heartland's hold went 2.4 -> 73 s in 3 min, then the FIFO cap, 9905 of 14611 frames repeated. Rule: in three 2 s
+  windows in a row the earliest packet waits more than D + max(1 s, D / 2), each longer than the last (the drift servo
+  at its limit and losing). A hole or a jitter burst raises the wait once, then it falls. The Heartland replay switches
+  ~7 s in: 11 repeats and 0.37 s of extra delay at the start, then lip sync +0 (pre9: 0 / 0; pre10: 832 repeats and the
+  output 27.7 s behind at 89 s, growing).
+- **It comes less than once a second.** Nothing But Sportz carries one PCR per 8.3 s segment (the spec: every 0.1 s);
+  pre10 logged a false "hole 8.3 s" every 16 s. Rule: three times in 60 s the data flowed for more than 1 s with no PCR.
+  A burst's PCR jump (Fintech's +2 s) comes with PCR packets close together and does not count; nor does an outage.
+
 ## 2.2.0-pre10 — 2.2.0-pre9 + every udp input regulated by default at 0.5 s, the schedule follows the source (T-439)
 
 **Regulated by default (T-439, owner 2026-11-02: "default value should be very small, as we don't want it to add too
