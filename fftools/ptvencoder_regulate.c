@@ -39,8 +39,17 @@
  *   arrival against the PCR wanders up to 1 s over minutes (glo-3 origins; TOLLY after a PCR glitch delivered 3.7 s at
  *   1.0067x real time); anchored once, the hold took all of it as delay (0.5 -> 4.9 s), and a source drifting the other
  *   way would empty it for good. Packets later than D pass as they come (as unregulated), reported per minute;
- * - the FIFO grows as it fills (a 0.5 s hold of a 5 Mb/s source is ~250 datagrams), up to the D + 10 s cap. */
+ * - the FIFO grows as it fills (a 0.5 s hold of a 5 Mb/s source is ~250 datagrams), up to the D + 10 s cap;
+ * - 2.2 T-441: a PCR that is no clock is not paced by — the input passes as it arrives (as unregulated), said once:
+ *   - it runs ahead of the arrivals: the earliest packet waits more than D + max(1 s, D / 2), longer in three 2 s windows
+ *     in a row (the servo at its limit and losing). One packager's sources (Lukentv: Heartland, Retro, Revn) stamp each 4 s
+ *     segment with 5.8 s of PCR and step back 1.8 s at the next, their PTS / DTS exact (fixture-media/cap-heartland-t441):
+ *     paced by that PCR the hold grew 1.8 s per segment (cor-3 pre10: 73 s in 3 min, the FIFO cap, 9905 of 14611 frames
+ *     repeated). A hole or a jitter burst raises the wait once, then it falls;
+ *   - it is too sparse: three times in 60 s the data flowed for more than 1 s with no PCR (Nothing But Sportz: one per
+ *     8.3 s segment; the spec says 0.1 s). A burst's PCR jump (Fintech's +2 s) comes with PCR packets close together. */
 
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <string.h>
 #include <unistd.h>
@@ -97,6 +106,10 @@ typedef struct Regulator {
     int64_t         sv_win, sv_max, sv_rho, sv_frac;
     int64_t         lt_win, lt_worst;
     int             lt_cnt, lt_n;
+    /* 2.2 T-441: is the PCR a clock (reader thread only) */
+    int             untrusted;
+    int64_t         tr_win, tr_max, tr_prev, sp_win, rd_last, stop_max;
+    int             tr_cnt, sp_cnt;
 } Regulator;
 
 static Regulator  *regs[PTV_MAX_INPUT];
@@ -117,7 +130,7 @@ static void reg_bursty(Regulator *r, int64_t now)
     int64_t held;
     if (r->last_due == AV_NOPTS_VALUE)              /* no schedule yet (before the first PCR) */
         return;
-    held = r->last_due - now;
+    held = r->untrusted ? 0 : r->last_due - now;
     if (r->by_last && now - r->by_last >= 1500000) {
         r->by_cnt++;
         r->by_max = FFMAX(r->by_max, now - r->by_last);
@@ -130,7 +143,10 @@ static void reg_bursty(Regulator *r, int64_t now)
     r->held_min = FFMIN(r->held_min, held);
     r->held_max = FFMAX(r->held_max, held);
     if (now - r->by_win >= 60000000) {
-        if (r->by_cnt > 0)
+        if (r->by_cnt > 0 && r->untrusted)
+            av_log(NULL, AV_LOG_INFO, "[PTV-BURSTY] in%d %d stall%s >=1.5s in the last 60s (worst %.1fs) at the input — "
+                   "not regulated (its PCR is no clock)\n", r->k, r->by_cnt, r->by_cnt == 1 ? "" : "s", r->by_max / 1e6);
+        else if (r->by_cnt > 0)
             av_log(NULL, AV_LOG_INFO, "[PTV-BURSTY] in%d %d stall%s >=1.5s in the last 60s (worst %.1fs) at the input — "
                    "regulated: %.1f-%.1f s held (D %.1f s)\n", r->k, r->by_cnt, r->by_cnt == 1 ? "" : "s",
                    r->by_max / 1e6, r->held_min / 1e6, r->held_max / 1e6, r->delay / 1e6);
@@ -162,6 +178,25 @@ static int64_t ts_pcr(Regulator *r, const uint8_t *p, int64_t now)
     return ((int64_t)p[6] << 25) | (p[7] << 17) | (p[8] << 9) | (p[9] << 1) | (p[10] >> 7);
 }
 
+/* 2.2 T-441: the PCR is no clock to pace by: what is held leaves now, every later packet as it arrives */
+static av_printf_format(2, 3) void reg_untrust(Regulator *r, const char *fmt, ...)
+{
+    char msg[128];
+    va_list vl;
+    int i;
+    r->untrusted = 1;
+    va_start(vl, fmt);
+    vsnprintf(msg, sizeof msg, fmt, vl);
+    va_end(vl);
+    av_log(NULL, AV_LOG_WARNING, "[PTV-REG] in%d %s — no clock to pace by: the input passes as it arrives from now on "
+           "(not regulated)\n", r->k, msg);
+    pthread_mutex_lock(&r->lock);
+    for (i = 0; i < r->n; i++)
+        r->ring[(r->head + i) % r->cap].due = 0;
+    pthread_cond_signal(&r->cond);
+    pthread_mutex_unlock(&r->lock);
+}
+
 /* 2.2 T-439: per PCR packet, its wait (due - arrival). The earliest packet of each 10 s should wait D: the servo steers
  * the schedule's rate toward that. A packet that waits less than -100 ms arrived later than D and passes late (its
  * jitter is more than D covers): counted, said per 60 s */
@@ -181,6 +216,25 @@ static void reg_servo(Regulator *r, int64_t wait, int64_t now)
                    r->k, r->sv_max / 1e6, r->delay / 1e6, r->sv_rho, r->n);
         r->sv_win = now;
         r->sv_max = wait;
+    }
+    /* T-441: the PCR runs ahead of the arrivals faster than the servo follows — per 2 s, the longest wait; three in a row
+     * over D + max(1 s, D / 2), each longer than the last (Heartland: at ~6 s, ~3 s held; at 2 x 10 s it was 9 s held,
+     * the output 3.4 s late for good) */
+    if (!r->tr_win) {
+        r->tr_win = now;
+        r->tr_max = wait;
+    }
+    r->tr_max = FFMAX(r->tr_max, wait);
+    if (now - r->tr_win >= 2000000) {
+        if (r->tr_max - r->delay > FFMAX(1000000, r->delay / 2) && r->tr_max > r->tr_prev)
+            r->tr_cnt++;
+        else
+            r->tr_cnt = 0;
+        r->tr_prev = r->tr_max;
+        if (r->tr_cnt >= 3)
+            reg_untrust(r, "its PCR runs ahead of the arrivals (the earliest packet waits %.1f s, rising)", r->tr_max / 1e6);
+        r->tr_win = now;
+        r->tr_max = wait;
     }
     if (!r->lt_win)
         r->lt_win = now;
@@ -202,6 +256,17 @@ static void reg_servo(Regulator *r, int64_t wait, int64_t now)
 
 static void reg_schedule(Regulator *r, int64_t pcr, int64_t now)
 {
+    if (r->anchor_t != AV_NOPTS_VALUE && now - r->last_pcr_wc > 1000000 && r->stop_max < 1000000) {
+        if (now - r->sp_win >= 60000000) {          /* T-441: the data flowed > 1 s with no PCR */
+            r->sp_win = now;
+            r->sp_cnt = 0;
+        }
+        if (++r->sp_cnt >= 3) {
+            reg_untrust(r, "its PCR comes only every %.1f s (the spec: 0.1 s)", (now - r->last_pcr_wc) / 1e6);
+            return;
+        }
+    }
+    r->stop_max = 0;
     if (r->anchor_t == AV_NOPTS_VALUE) {
         r->anchor_t = now + r->delay;
         r->acc      = 0;
@@ -299,6 +364,9 @@ static void *reg_reader(void *arg)
             if (n <= 0)
                 break;                              /* a read error / the source's timeout: reopen */
             reg_bursty(r, now);
+            if (r->rd_last)                         /* T-441: the longest arrival stop since the last PCR */
+                r->stop_max = FFMAX(r->stop_max, now - r->rd_last);
+            r->rd_last = now;
             have += n;
             while (have - i >= 188) {
                 const uint8_t *p = buf + i;
@@ -307,13 +375,15 @@ static void *reg_reader(void *arg)
                     i++;
                     continue;
                 }
-                if ((pcr = ts_pcr(r, p, now)) >= 0) {
+                if (r->untrusted) {
+                    due = now;                      /* T-441: as it arrives */
+                } else if ((pcr = ts_pcr(r, p, now)) >= 0) {
                     if (dl) {                       /* a PCR'd packet starts a new datagram at its own time */
                         reg_push(r, dg, dl, due);
                         dl = 0;
                     }
                     reg_schedule(r, pcr, now);
-                    due = r->last_due;
+                    due = r->untrusted ? now : r->last_due;
                 }
                 if (due == AV_NOPTS_VALUE) {
                     due = now + r->delay;           /* before the first PCR: held by D */
@@ -337,6 +407,8 @@ static void *reg_reader(void *arg)
         avio_closep(&pb);
         have = 0;
         r->by_last = 0;                             /* T-436: an outage is not a stall */
+        r->rd_last  = 0;                            /* T-441: nor a sparse PCR */
+        r->stop_max = INT64_MAX / 2;
     }
     return NULL;
 }
