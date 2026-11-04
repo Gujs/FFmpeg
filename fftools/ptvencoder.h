@@ -1943,6 +1943,7 @@ static inline int ptv_url_passive(const char *u)
 #define PTV_REGULATE_DEFAULT_US 500000   /* 2.2 T-439: no -regulate = 0.5 s (the jitter of every non-bursty source measured) */
 char *ptv_regulate_start(const char *url, int64_t delay_us, int k);
 void  ptv_regulate_stop(void);
+int   ptv_regulate_unregulated(void);   /* 2.2 T-444: inputs passing unregulated now (no clock), for the status line */
 /* 2.2: audio track rules on -map (ptvencoder_bind.c, spec §7): a:main | a:langs | a:lang=xxx | a:multich | a:pid=0x.. |
  * a:index=N [,c=,b=,ac=,af=,lang=,label=,title=,default=1] */
 enum { PTV_BIND_MAIN, PTV_BIND_LANGS, PTV_BIND_LANG, PTV_BIND_MULTICH, PTV_BIND_PID, PTV_BIND_INDEX };
@@ -2176,7 +2177,8 @@ int  ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt);
 void ptv_tl_cut(DemuxArgs *d, int64_t cut_us);
 int  ptv_demux_dispatch(DemuxArgs *d, AVPacket *pkt);
 void ptv_rsync_post_edit(DemuxArgs *d, int s, int64_t delta_us);
-void ptv_vwait_rebase(DemuxArgs *d, int64_t from_us, int64_t old_end_us, int64_t open_wc, int64_t dpo);
+void ptv_vwait_rebase(DemuxArgs *d, int64_t from_us, int64_t old_end_us, int64_t open_wc, int64_t open_pos,
+                      int64_t open_vn, int64_t dpo);
 int  ptv_tl_settling(DemuxArgs *d);
 extern int64_t g_gap_min_us;
 int ptv_slot_acquire(struct Input *in, int idx);   /* 2.0.2 T-386 */
