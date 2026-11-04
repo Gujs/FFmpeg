@@ -2049,12 +2049,16 @@ void *output_thread(void *arg)
                             snprintf(ccs + cn, sizeof ccs - cn, " ccmux=%lld", (long long)cx);
                     }
                 }
+                char urs[24] = "";                                   /* 2.2 T-444: inputs passing unregulated (their
+                                                                      * PCR is no clock now) — shown when >0 */
+                if (ptv_regulate_unregulated() > 0)
+                    snprintf(urs, sizeof urs, " unreg=%d", ptv_regulate_unregulated());
                 av_log(NULL, AV_LOG_INFO,
                     "frame=%6"PRId64" fps=%4.1f time=%02d:%02d:%05.2f "
                     "dup=%"PRId64" pd=%"PRId64" drop=%"PRId64" corrupt=%"PRId64" "
-                    "async=%+"PRId64"ppm%s%s%s%s%s%s%s%s%s%s%s\n",
+                    "async=%+"PRId64"ppm%s%s%s%s%s%s%s%s%s%s%s%s\n",
                     v->emitted, fps, hh, mm, ss,
-                    v->dup, v->pd, v->framedrop_src ? *v->framedrop_src : v->framedrop, cr, aw, dlv, wu, bk, cfs, aco, rsl, crs, cvs, ccs, srcs, afs);
+                    v->dup, v->pd, v->framedrop_src ? *v->framedrop_src : v->framedrop, cr, aw, dlv, wu, bk, cfs, aco, rsl, crs, cvs, ccs, srcs, afs, urs);
                 stat_last = nows; stat_prev = v->emitted;
             }
         }

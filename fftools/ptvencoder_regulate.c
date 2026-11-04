@@ -49,7 +49,14 @@
  *     paced by that PCR the hold grew 1.8 s per segment (cor-3 pre10: 73 s in 3 min, the FIFO cap, 9905 of 14611 frames
  *     repeated). A hole or a jitter burst raises the wait once, then it falls;
  *   - it is too sparse: three times in 60 s the data flowed for more than 1 s with no PCR (Nothing But Sportz: one per
- *     8.3 s segment; the spec says 0.1 s). A burst's PCR jump (Fintech's +2 s) comes with PCR packets close together. */
+ *     8.3 s segment; the spec says 0.1 s). A burst's PCR jump (Fintech's +2 s) comes with PCR packets close together;
+ * - 2.2 T-444: the switch is reversible. The schedule keeps running on the PCR while the input passes; 10 min without
+ *   either sign (no 1 s PCR gap while the data flowed, no 2 s window whose earliest packet would wait more than
+ *   D + max(1 s, D / 2)) and the input is regulated again: its current packet leaves now and the servo builds the hold
+ *   up to D (at most 2 %; ~1 min for D 0.5 s) — no step. Permanent, a glitch switched for good (cor-3 pre11: Western Bound
+ *   Port. on a PCR step, T-443; TruBLU on a third PCR gap inside 5 min of source damage, 7 such gaps in 3 h otherwise,
+ *   never three in 60 s) and over months every channel would end unregulated; Heartland's and Sportz's PCR never
+ *   look like a clock for 10 min, so they stay as they arrive. */
 
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -76,6 +83,7 @@
 #define REG_SV_TAU   30                             /* T-439: its time constant (s) */
 #define REG_SV_MAX   20000                          /* T-439: its largest rate change (ppm) */
 #define REG_CAP0     2048                           /* T-439: the FIFO's first size (datagrams) */
+#define REG_RETRUST  600000000                      /* T-444: a clock again for this long (us) = regulated again */
 
 typedef struct RegItem {
     int64_t due;
@@ -111,11 +119,14 @@ typedef struct Regulator {
     /* 2.2 T-441: is the PCR a clock (reader thread only) */
     int             untrusted;
     int64_t         tr_win, tr_max, tr_prev, sp_win, rd_last, stop_max;
+    int64_t         bad_wc;                         /* T-444: while untrusted, the last sign that its PCR is no clock */
+    int64_t         retrust;                        /* T-444: REG_RETRUST (PTV_TEST_REG_RETRUST: TEST-ONLY, s) */
     int             tr_cnt, sp_cnt;
 } Regulator;
 
 static Regulator  *regs[PTV_MAX_INPUT];
 static _Atomic int reg_stop;
+static _Atomic int reg_unreg;                       /* T-444: inputs passing as they arrive now (the status line) */
 
 static int reg_interrupt(void *opaque)
 {
@@ -180,23 +191,47 @@ static int64_t ts_pcr(Regulator *r, const uint8_t *p, int64_t now)
     return ((int64_t)p[6] << 25) | (p[7] << 17) | (p[8] << 9) | (p[9] << 1) | (p[10] >> 7);
 }
 
-/* 2.2 T-441: the PCR is no clock to pace by: what is held leaves now, every later packet as it arrives */
-static av_printf_format(2, 3) void reg_untrust(Regulator *r, const char *fmt, ...)
+/* 2.2 T-441: the PCR is no clock to pace by: what is held leaves now, every later packet as it arrives (T-444: until
+ * its PCR is a clock again for REG_RETRUST) */
+static av_printf_format(3, 4) void reg_untrust(Regulator *r, int64_t now, const char *fmt, ...)
 {
     char msg[128];
     va_list vl;
     int i;
     r->untrusted = 1;
+    r->bad_wc    = now;
+    r->tr_cnt    = r->sp_cnt = 0;
+    atomic_fetch_add_explicit(&reg_unreg, 1, memory_order_relaxed);
     va_start(vl, fmt);
     vsnprintf(msg, sizeof msg, fmt, vl);
     va_end(vl);
-    av_log(NULL, AV_LOG_WARNING, "[PTV-REG] in%d %s — no clock to pace by: the input passes as it arrives from now on "
-           "(not regulated)\n", r->k, msg);
+    av_log(NULL, AV_LOG_WARNING, "[PTV-REG] in%d %s — no clock to pace by: the input passes as it arrives (not "
+           "regulated) until its PCR is a clock again for %g min\n", r->k, msg, r->retrust / 6e7);
     pthread_mutex_lock(&r->lock);
     for (i = 0; i < r->n; i++)
         r->ring[(r->head + i) % r->cap].due = 0;
     pthread_cond_signal(&r->cond);
     pthread_mutex_unlock(&r->lock);
+}
+
+/* 2.2 T-444: its PCR has been a clock for r->retrust: regulated again from the current packet on, due now; the servo
+ * (wait 0 vs D) slows the schedule and builds the hold up to D */
+static void reg_retrust(Regulator *r, int64_t now)
+{
+    r->untrusted = 0;
+    r->anchor_t  = now;
+    r->acc       = 0;
+    r->last_due  = now;
+    r->sv_win    = r->sv_rho = r->sv_frac = 0;
+    r->tr_win    = r->tr_prev = 0;
+    r->tr_cnt    = r->sp_cnt = 0;
+    r->sp_win    = now;
+    r->lt_win    = 0;
+    r->lt_cnt    = r->lt_n = 0;
+    r->lt_worst  = 0;
+    atomic_fetch_sub_explicit(&reg_unreg, 1, memory_order_relaxed);
+    av_log(NULL, AV_LOG_WARNING, "[PTV-REG] in%d its PCR has been a clock for %g min — regulated again (the hold builds "
+           "up to D %.1f s over ~1 min)\n", r->k, r->retrust / 6e7, r->delay / 1e6);
 }
 
 /* 2.2 T-439: per PCR packet, its wait (due - arrival). The earliest packet of each 10 s should wait D: the servo steers
@@ -228,16 +263,22 @@ static void reg_servo(Regulator *r, int64_t wait, int64_t now)
     }
     r->tr_max = FFMAX(r->tr_max, wait);
     if (now - r->tr_win >= 2000000) {
-        if (r->tr_max - r->delay > FFMAX(1000000, r->delay / 2) && r->tr_max > r->tr_prev)
+        int ahead = r->tr_max - r->delay > FFMAX(1000000, r->delay / 2);
+        if (r->untrusted && ahead)                  /* T-444: still no clock */
+            r->bad_wc = now;
+        else if (!r->untrusted && ahead && r->tr_max > r->tr_prev)
             r->tr_cnt++;
         else
             r->tr_cnt = 0;
         r->tr_prev = r->tr_max;
         if (r->tr_cnt >= 3)
-            reg_untrust(r, "its PCR runs ahead of the arrivals (the earliest packet waits %.1f s, rising)", r->tr_max / 1e6);
+            reg_untrust(r, now, "its PCR runs ahead of the arrivals (the earliest packet waits %.1f s, rising)",
+                        r->tr_max / 1e6);
         r->tr_win = now;
         r->tr_max = wait;
     }
+    if (r->untrusted)                               /* T-444: nothing is held: no packet is late */
+        return;
     if (!r->lt_win)
         r->lt_win = now;
     r->lt_n++;
@@ -264,10 +305,10 @@ static void reg_schedule(Regulator *r, int64_t pcr, int64_t now)
             r->sp_win = now;
             r->sp_cnt = 0;
         }
-        if (++r->sp_cnt >= 3) {
-            reg_untrust(r, "its PCR comes only every %.1f s (the spec: 0.1 s)", (now - r->last_pcr_wc) / 1e6);
-            return;
-        }
+        if (r->untrusted)                           /* T-444: still no clock */
+            r->bad_wc = now;
+        else if (++r->sp_cnt >= 3)
+            reg_untrust(r, now, "its PCR comes only every %.1f s (the spec: 0.1 s)", (now - r->last_pcr_wc) / 1e6);
     }
     stop        = r->stop_max;
     r->stop_max = 0;
@@ -285,7 +326,7 @@ static void reg_schedule(Regulator *r, int64_t pcr, int64_t now)
              * its schedule: the hole plays at its moment and the hold stays D. Continuing the schedule here ate the hold at
              * every hole (a Stingray replay: held 8 -> 163 s, FIFO drops, 13 freezes vs 3 unregulated) */
             r->acc += d;
-            if (!r->pid_moved && now - r->jump_log_wc >= 10000000) {
+            if (!r->pid_moved && !r->untrusted && now - r->jump_log_wc >= 10000000) {   /* T-444: not the shadow's */
                 r->jump_log_wc = now;
                 av_log(NULL, AV_LOG_INFO, "[PTV-REG] in%d hole %.1f s (the source stopped as long as its PCR jumped) — "
                        "kept on its schedule (%.1f s held)\n", r->k, dus / 1e6, (r->anchor_t + av_rescale(r->acc, 1000000,
@@ -299,7 +340,7 @@ static void reg_schedule(Regulator *r, int64_t pcr, int64_t now)
              * to 2.3 s, rising: a false T-441 'runs ahead', or ~1 s more delay. A jump keeps the schedule (see the top) */
             r->anchor_t = r->last_due >= now || stop < 1000000 ? r->last_due : now + r->delay;
             r->acc      = 0;
-            if (now - r->jump_log_wc >= 10000000) {
+            if (!r->untrusted && now - r->jump_log_wc >= 10000000) {
                 r->jump_log_wc = now;
                 av_log(NULL, AV_LOG_INFO, "[PTV-REG] in%d PCR jump %+.1f s — schedule continued (%.1f s held)\n",
                        r->k, d / 90000.0, (r->anchor_t - now) / 1e6);
@@ -316,6 +357,8 @@ static void reg_schedule(Regulator *r, int64_t pcr, int64_t now)
     r->pid_moved   = 0;
     r->last_due    = r->anchor_t + av_rescale(r->acc, 1000000, 90000);
     reg_servo(r, r->last_due - now, now);
+    if (r->untrusted && now - r->bad_wc >= r->retrust)
+        reg_retrust(r, now);
 }
 
 static void reg_push(Regulator *r, const uint8_t *data, int len, int64_t due)
@@ -384,16 +427,16 @@ static void *reg_reader(void *arg)
                     i++;
                     continue;
                 }
-                if (r->untrusted) {
-                    due = now;                      /* T-441: as it arrives */
-                } else if ((pcr = ts_pcr(r, p, now)) >= 0) {
+                if ((pcr = ts_pcr(r, p, now)) >= 0) {
                     if (dl) {                       /* a PCR'd packet starts a new datagram at its own time */
                         reg_push(r, dg, dl, due);
                         dl = 0;
                     }
-                    reg_schedule(r, pcr, now);
-                    due = r->untrusted ? now : r->last_due;
+                    reg_schedule(r, pcr, now);      /* T-444: also while untrusted — is it a clock again? */
+                    due = r->last_due;
                 }
+                if (r->untrusted)
+                    due = now;                      /* T-441: as it arrives */
                 if (due == AV_NOPTS_VALUE) {
                     due = now + r->delay;           /* before the first PCR: held by D */
                     r->first_wc = now;
@@ -492,6 +535,7 @@ char *ptv_regulate_start(const char *url, int64_t delay_us, int k)
     r->pcr_pid  = -1;
     r->anchor_t = AV_NOPTS_VALUE;
     r->last_due = AV_NOPTS_VALUE;                   /* T-436: no schedule yet */
+    r->retrust  = getenv("PTV_TEST_REG_RETRUST") ? atoi(getenv("PTV_TEST_REG_RETRUST")) * 1000000LL : REG_RETRUST;
     r->cap_max  = (int)((delay_us / 1000000 + 10) * 2000);   /* D + 10 s at up to ~20 Mb/s */
     r->cap      = FFMIN(REG_CAP0, r->cap_max);      /* T-439: grows as it fills */
     r->port     = reg_port();
@@ -528,6 +572,11 @@ fail:
     av_free(r->ring);
     av_free(r);
     return NULL;
+}
+
+int ptv_regulate_unregulated(void)
+{
+    return atomic_load_explicit(&reg_unreg, memory_order_relaxed);
 }
 
 void ptv_regulate_stop(void)
