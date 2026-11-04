@@ -63,6 +63,7 @@ struct PtvTimeline {
     int64_t   ev_n, strag_n, drop_n;
     int       active, trig, nst, cap;   /* nst = streams followed; cap = st[] room (2.2: adoption) */
     int64_t   open_wc, open_s_us;
+    int64_t   open_pos, open_vn;                 /* T-332: the opening packet's mux position, video packets unwrapped */
     int64_t   last_any_wc, gap_us, gap_end_wc;   /* the input's last silence >= g_gap_min_us */
     int64_t   dmg_seen_wc, dmg_start_wc;         /* the input's damage phase: corrupt packets <= 3 s apart */
     int64_t   er_lo, er_hi;                      /* source time the last program event erased (audio arriving late) */
@@ -578,7 +579,7 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
             atomic_store_explicit(&g_tl_prog_wc, nw, memory_order_relaxed);
         k_move(d, t, k_new - k_old);
         if (k_new != k_old) {
-            ptv_vwait_rebase(d, vb, va, t->open_wc, av_rescale_q(k_new - k_old, AV_TIME_BASE_Q, (AVRational){ 1, 90000 }));
+            ptv_vwait_rebase(d, vb, va, t->open_wc, t->open_pos, t->open_vn, av_rescale_q(k_new - k_old, AV_TIME_BASE_Q, (AVRational){ 1, 90000 }));
             t->ev_va = va;
             t->ev_dk = k_new - k_old;
             t->ev_wc = nw;
@@ -755,6 +756,8 @@ int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
         t->trig      = si;
         t->open_wc   = nw;
         t->open_s_us = s_us;
+        t->open_pos  = pkt->pos;
+        t->open_vn   = d->vunwrap_n;
         t->nheld     = 1;
         h->pkt = pkt; h->s_us = s_us; h->k_at = t->k_us; h->wc = nw; h->si = si; h->path = 0;
         for (int i = 0; i < t->nst; i++) {     /* a stream the window never classifies keeps its path */

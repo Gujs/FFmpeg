@@ -782,7 +782,8 @@ static int64_t scte35_splice_90k(const AVPacket *p)
  * queued for the video whose SOURCE time (label minus the prog_off they were unwrapped with) lies at or after it belong
  * to the new content — subtitles and cues are muxed ahead of their pictures, so they were read with the old offset
  * (gate sync_bstep: SCTE-35 / DVB subs 120 ms early after a -120 ms step erase). */
-void ptv_vwait_rebase(DemuxArgs *d, int64_t from_us, int64_t old_end_us, int64_t open_wc, int64_t dpo)
+void ptv_vwait_rebase(DemuxArgs *d, int64_t from_us, int64_t old_end_us, int64_t open_wc, int64_t open_pos,
+                      int64_t open_vn, int64_t dpo)
 {
     int pi, k;
     if (!dpo)
@@ -809,8 +810,12 @@ void ptv_vwait_rebase(DemuxArgs *d, int64_t from_us, int64_t old_end_us, int64_t
                 }
             }
             /* a step back overlaps the old content's source time [from, old_end): there the read order decides — read
-             * after the step began (the window opened) = the new content (sync_bstep: DVB subs -120 ms) */
-            if (src < from_us || (src < old_end_us && ps->vwait_wc[k] < open_wc))
+             * after the step began = the new content (sync_bstep: DVB subs -120 ms). The step begins at the packet that
+             * opened the window, which lavf hands out up to two video packets after its PES started: a copy read in that
+             * lag that lies after it in the mux (a section has no pos: read in the lag) is new too (T-332: rich5994b
+             * marker 60, the sub muxed after the stepped picture's PES but read 22 ms before it, cue with it: -120 ms) */
+            if (src < from_us || (src < old_end_us && ps->vwait_wc[k] < open_wc &&
+                                  !(ps->vwait_vn[k] >= open_vn - 2 && (p->pos < 0 || (open_pos >= 0 && p->pos > open_pos)))))
                 continue;
             if (p->pts != AV_NOPTS_VALUE) p->pts += av_rescale_q(dpo, (AVRational){ 1, 90000 }, ps->in_tb);
             if (p->dts != AV_NOPTS_VALUE) p->dts += av_rescale_q(dpo, (AVRational){ 1, 90000 }, ps->in_tb);
