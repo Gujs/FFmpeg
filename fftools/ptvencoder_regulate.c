@@ -26,12 +26,14 @@
  * and 411 repeats direct, 0 ms / 0 through D = 8 s.
  * - the first PCR anchors arrival + D; every packet leaves at anchor + (its PCR - the anchor's), packets without a PCR with
  *   the last PCR'd one;
- * - a PCR jump (backwards or > 1 s: a source restart, a wrap, a loop) continues the schedule from the last scheduled time
+ * - a PCR jump (backwards by 0.1 s or more, or forwards > 1 s: a source restart, a wrap, a loop) continues the schedule
+ *   from the last scheduled time
  *   (the prototype took a fresh D at a file loop and stalled the encoder 8.5 s; the later of the two moved a bursty source
- *   later at every jump — Fintech's +2 s PCR jumps arrive early in their burst: 12 s held, 305 repeats); only when the
- *   FIFO ran dry (a real outage: the last scheduled time has passed) does it take arrival + D again, as a gateway
- *   re-buffers to its latency; a forward jump that comes with an arrival stop of the same length is a hole (content
- *   lost in real time, T-437) and keeps the PCR schedule;
+ *   later at every jump — Fintech's +2 s PCR jumps arrive early in their burst: 12 s held, 305 repeats); only after a
+ *   real outage (the arrivals stopped for 1 s or more, or a reopen) does it take arrival + D again, as a gateway
+ *   re-buffers to its latency — a jump while the data flowed keeps the schedule even when its time has passed (2.2
+ *   T-443: a wandering PCR's packet + D added its wander to the hold); a forward jump that comes with an
+ *   arrival stop of the same length is a hole (content lost in real time, T-437) and keeps the PCR schedule;
  * - more than D + 10 s held (a source faster than real time for long): the oldest go, logged;
  * - 2.2 T-439 (regulated by default, D 0.5 s): the schedule follows the source's delivery. Per 10 s, the packet that came
  *   earliest against its PCR should wait exactly D; the schedule runs -(its wait - D) / 30 s faster or slower (at most
@@ -256,6 +258,7 @@ static void reg_servo(Regulator *r, int64_t wait, int64_t now)
 
 static void reg_schedule(Regulator *r, int64_t pcr, int64_t now)
 {
+    int64_t stop;
     if (r->anchor_t != AV_NOPTS_VALUE && now - r->last_pcr_wc > 1000000 && r->stop_max < 1000000) {
         if (now - r->sp_win >= 60000000) {          /* T-441: the data flowed > 1 s with no PCR */
             r->sp_win = now;
@@ -266,6 +269,7 @@ static void reg_schedule(Regulator *r, int64_t pcr, int64_t now)
             return;
         }
     }
+    stop        = r->stop_max;
     r->stop_max = 0;
     if (r->anchor_t == AV_NOPTS_VALUE) {
         r->anchor_t = now + r->delay;
@@ -287,8 +291,13 @@ static void reg_schedule(Regulator *r, int64_t pcr, int64_t now)
                        "kept on its schedule (%.1f s held)\n", r->k, dus / 1e6, (r->anchor_t + av_rescale(r->acc, 1000000,
                        90000) - now) / 1e6);
             }
-        } else if (d < 0 || d > 90000) {            /* a jump: continue the schedule (see the top) */
-            r->anchor_t = r->last_due >= now ? r->last_due : now + r->delay;
+        } else if (d < -9000 || d > 90000) {        /* a jump: continue the schedule (see the top) */
+            /* 2.2 T-443: a step back of less than 0.1 s is the PCR's jitter, not a jump. WB Int / Port (cor-3,
+             * fixture-media/cap-t443-3h) arrive at real time (arrival - PTS within 0.1 s) but their PCR wanders up to
+             * +-1 s against both, in steps of -1.4 to -9.8 ms and +1.06 / +1.17 s, on a packet 0.5-1.9 s behind its
+             * schedule. Taken as a jump there, the schedule restarted at that packet + D; the next packets then waited up
+             * to 2.3 s, rising: a false T-441 'runs ahead', or ~1 s more delay. A jump keeps the schedule (see the top) */
+            r->anchor_t = r->last_due >= now || stop < 1000000 ? r->last_due : now + r->delay;
             r->acc      = 0;
             if (now - r->jump_log_wc >= 10000000) {
                 r->jump_log_wc = now;
