@@ -5,6 +5,40 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.0-pre12 — 2.2.0-pre11 + a wandering PCR stays regulated, the no-clock switch is reversible, steps keep subtitles on their picture (T-443, T-444, T-332)
+
+**A PCR that wanders against its arrivals is still a clock (T-443).** On cor-3 Western_Bound_Portugues switched to
+pass-through ~9 min after start ("its PCR runs ahead of the arrivals"). Measured on 3 h read-only captures of WB Int /
+Port: the packets arrive at real time (arrival − video PTS within ±0.1 s), but the PCR wanders up to ±1 s against them,
+in steps of −1.4…−9.8 ms (the log's "PCR jump −0.0 s") and +1.06 / +1.17 s. pre11 took each step as a jump and, the last
+scheduled time having passed, as an outage: it re-anchored at that packet + D, the next packets waited up to 2.3 s,
+rising — the false "runs ahead" rule. Now a step back of less than 0.1 s is jitter (the schedule goes on), and a jump
+re-anchors at arrival + D only after a real outage (arrivals stopped for 1 s or more, or a reopen); otherwise the
+schedule goes on and the drift servo follows. Replays: WB Int pre11 3 / 3 switched, 12-18 repeats, +0.4-0.6 s → 0 / 3,
+0 repeats, +0; WB Port worst wait 1.46-1.51 s → 0.74-0.76 s.
+
+**The no-clock switch is reversible (T-444, owner 2026-11-04: a glitch over a long run must not leave channels switched
+for good).** pre11 switched on the first sign and stayed switched until a restart; on cor-3 a glitch did that to two
+clock sources in a day (WB Port above; TruBLU: a third 1-2 s PCR gap inside source damage). While switched, the schedule
+keeps running on the PCR in the background; either sign (a 1 s PCR gap with data flowing, a 2 s window whose earliest
+packet would wait more than D + max(1 s, D / 2)) restarts a 10 min count. 10 min without a sign = regulated again: the
+current packet is due now and the drift servo builds the hold up to D (about 40 s at D 0.5 s, no step). One line each way:
+`[PTV-REG] inK … no clock to pace by: the input passes as it arrives (not regulated) until its PCR is a clock again for
+10 min` / `[PTV-REG] inK its PCR has been a clock for 10 min — regulated again (the hold builds up to D 0.5 s over ~1 min)`;
+the status line shows `unreg=N` while N inputs are switched. Detection stays fast (~6 s): a Lukentv source (Heartland)
+keeps switching at once and never returns (its sign recurs every 4 s). Gate key `vt-regback` (a WB Port slice with 3 PCR
+gaps, a 30 s test window): pre11 FAIL, pre12 PASS.
+
+**A subtitle / cue muxed after a stepped picture takes the step (T-332).** After a backward source step the copied DVB
+subtitles and SCTE-35 cues whose source time lies in the overlap with the old content are told apart by read order. lavf
+hands the stepped picture out up to two video packets after its PES started, so a subtitle muxed right after it was read
+first and kept the old offset: gate rich5994b `sync_bstep`, the third −120 ms step, the DVB subtitle and its cue 120 ms
+early on every run. Now a copy read in that lag that lies after the stepped picture in the mux (or has no position: a
+section) belongs to the new content. Same key: −120 ms → 0 ms.
+
+**Full gate** (kit 542d30d, media-v10, 265 runs): 260 PASS, 0 regressions against pre11, the one fix above; the 5
+non-PASS rows are the 2 SCTE-35 cues keeping their lead through an outage (by design) and 3 info keys failing on pre11 too.
+
 ## 2.2.0-pre11 — 2.2.0-pre10 + the regulator paces only by a PCR that is a clock (T-441)
 
 **A PCR that is no clock is not paced by: the input passes as it arrives (as unregulated, as on pre9), said once:**
