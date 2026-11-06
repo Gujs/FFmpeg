@@ -5,6 +5,18 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.0-rc2 — 2.2.0-rc1 + a mosaic slot back from an outage longer than its input timeout keeps the hole (T-449)
+
+**A mosaic slot drops the PES tails a read timeout flushes (T-449).** cor-3 MV_2x2_Curiosity_Channels, 2026-11-06 (pre12):
+two slot sources were dark 19 h 12 m. At the slot input timeout (30 min) the failed read made mpegts hand back its pending
+PES; the slot took that tail as its last arrival, so on the return the hole was measured from the timeout and the timeline
+erased 1801 s of it as flow — the slot re-locked +1801 s, its delay ran away and its sound never came back until sync_check
+restarted the mosaic (DEAD_AUDIO_TRACK). The 2.0.0-pre5 rule that drops these tails was single-input only; it now covers
+every reopening input, and a mosaic slot logs `[PTV-REOPEN] input '…' read failed (…) — N flushed PES tails dropped`.
+Kit (new key mv04-t449/sync_gap_40: a 40 s slot outage with a 10 s slot timeout): rc1 FAIL 2/2 (9.8 s erased, slot sound
+dark 8.8 s, the other slots' sound 0.4 s gaps) → PASS 3/3, hole kept. Mosaic gate keys (kit 5d72d5b, media-v11): 39/39 PASS,
+0 regressions vs the rc baseline.
+
 ## 2.2.0-rc1 — the 2.2.0 release candidate: 2.2.0-pre12 unchanged, version only
 
 **Same code as 2.2.0-pre12** (adaptive-2.2 5fc94ca504); only `PTVENCODER_VERSION` changes. What makes it the candidate:
