@@ -5,6 +5,18 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.0-rc1 — the 2.2.0 release candidate: 2.2.0-pre12 unchanged, version only
+
+**Same code as 2.2.0-pre12** (adaptive-2.2 5fc94ca504); only `PTVENCODER_VERSION` changes. What makes it the candidate:
+- **24 h canary soak of pre12** (live-transcoder + tmtg-cor-transcoder-3, 47 channels, 2026-11-05 07:46 → 11-06 07:46):
+  0 cores, 0 restart loops; single-input lip sync within ±20 ms all day; regulation as designed (WB Port / WB Int / JLTV /
+  In Trouble regulated, Heartland / Retro / Revn / Sportz switched once and stayed, TruBLU 01:45 → 01:55 switched and
+  regulated again = T-444 live).
+- **Gate on the frozen 2.2.0-rc kit** (kit28 681e5a4, tag `kit-2.2.0-rc`, media-v11): 265 keys, 260 PASS, 0 INVALID; the
+  5 FAILs are the 2 SCTE-35 "KNOWN lead-outage only" keys + 3 keys that fail identically on every binary (pre11 too).
+- **T-071 fleet parity** (`-bind_report` vs the wrapper): 286 programs identical, 6 differences all intended / fixed /
+  owner-accepted, 39 offline (autostart=false or dead source).
+
 ## 2.2.0-pre12 — 2.2.0-pre11 + a wandering PCR stays regulated, the no-clock switch is reversible, steps keep subtitles on their picture (T-443, T-444, T-332)
 
 **A PCR that wanders against its arrivals is still a clock (T-443).** On cor-3 Western_Bound_Portugues switched to
