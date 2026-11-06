@@ -1720,6 +1720,10 @@ void *demux_thread(void *arg)
                            vr ? (lost_t0 - vr) / 1e6 : 0.0, d->tail_flushed);
                     d->tail_flushed = 0;
                     atomic_store_explicit(&g_src_icb_armed, 0, memory_order_relaxed);
+                } else if (d->tail_flushed) {
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-REOPEN] input '%s' read failed (%s) — %d flushed PES tails "
+                           "dropped\n", d->url, av_err2str(rd_ret), d->tail_flushed);
+                    d->tail_flushed = 0;
                 }
                 rd_force = 0;
                 d->vmove_force = 0; d->vmove_n = 0; d->v_last_wc = 0;
@@ -1782,8 +1786,11 @@ void *demux_thread(void *arg)
         /* 2.0.0-pre5: a failed read makes mpegts hand back its pending PES (one per call) BEFORE the
          * error; pb->error is already set. These are pre-gap tails arriving a read timeout late:
          * classified as a rejoin they armed a false BURST (BANK to 12 s) and re-stamped video arrival.
-         * The reopen follows, so drop them (a lone stale frame/audio frame under a hold). */
-        if (d->reopen && d->single && d->ifmt->pb && d->ifmt->pb->error) {
+         * The reopen follows, so drop them (a lone stale frame/audio frame under a hold).
+         * 2.2 T-449: a mosaic slot too — kept, the tail was the slot's last arrival, so the hole measured from the
+         * timeout and the timeline erased the timeout's length of it as flow (cor-3 Curiosity 2026-11-06: 1801 s of a
+         * 19 h outage; the slot re-locked +1801 s and its audio never came back) */
+        if (d->reopen && d->ifmt->pb && d->ifmt->pb->error) {
             d->tail_flushed++;
             av_packet_unref(pkt);
             continue;
