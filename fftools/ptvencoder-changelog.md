@@ -5,6 +5,24 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.0-rc3 — 2.2.0-rc2 + a source clock excursion nets to zero (T-451)
+
+**A source whose clock steps away and comes back keeps its sync (T-451).** cor-3, 2026-11-07 02:50 (rc2): the source of
+Curiosity_University and of MV_2x2_Curiosity_Channels slot 1 stepped its clock back 14768 s and returned 2 s later (the same
+source did it on 11-06 03:40 too). The audio crossed first while the video went on on its old path; 300 ms past the crossing
+point the video was taken as "did not cross", so the departure went out as two single-stream steps ("labels as sent") and the
+joint return was erased — the output ended 4 h off: the single's A/V 126 s apart, the slot re-locked +14766 s without sound,
+both restarted by sync_check. On 11-06 the return had split too and the two halves happened to cancel. Now:
+- a step bigger than the relabel bound (2 s) waits the full window (3 s) for its partners instead of judging a partner that
+  goes on on its old path as "did not cross" (the video's pictures keep flowing meanwhile);
+- the audio partner of a program event must have crossed by the video's amount (an audio's return leg arriving in the window
+  of the video's departure made one "step back erased" of two opposite steps);
+- a program event takes its damage phase with it, and the phase ends at its last corrupt packet, not at the window's close
+  (a return 2 s after a damaged departure kept 2.12 s of content that was all there as a hole; live 1.88 s).
+Kit (new scenario sync_excursion; keys vt / vt-ar01 / vt-mirror sync_excursion + mv04-t451): rc2 FAIL on every shape (audio
+dead for the rest of the run / dark 8.85 s / slot 0 dark 110 s), rc3 PASS with the excursion netting to ±0.04 s. The T-431 /
+T-433 scenarios (jumpback, restartlate) are gate keys now too.
+
 ## 2.2.0-rc2 — 2.2.0-rc1 + a mosaic slot back from an outage longer than its input timeout keeps the hole (T-449)
 
 **A mosaic slot drops the PES tails a read timeout flushes (T-449).** cor-3 MV_2x2_Curiosity_Channels, 2026-11-06 (pre12):
