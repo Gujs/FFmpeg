@@ -33,6 +33,8 @@
 #define TL_WIN_SIL_US 3000000       /* ... or 3 s while a flowing partner has delivered nothing since it opened (T-431) */
 #define TL_PASS_US    300000        /* a partner whose own timeline passed the crossing point by this did not cross */
 #define TL_STRAG_US   2000000       /* after an event, packets on a stream's old path are stragglers for this long */
+#define TL_BIG_US     2000000       /* 2.2 T-451: a step beyond this is no relabel (the repair bound): a program-wide step */
+#define TL_SAME_US    1000000       /* 2.2 T-451: the audio of a program event crossed by the video's J within this */
 
 typedef struct TlPkt {
     AVPacket *pkt;
@@ -62,6 +64,7 @@ struct PtvTimeline {
     int64_t   k_us;
     int64_t   ev_n, strag_n, drop_n;
     int       active, trig, nst, cap;   /* nst = streams followed; cap = st[] room (2.2: adoption) */
+    int       win_big;                  /* T-451: the trigger stepped more than TL_BIG_US */
     int64_t   open_wc, open_s_us;
     int64_t   open_pos, open_vn;                 /* T-332: the opening packet's mux position, video packets unwrapped */
     int64_t   last_any_wc, gap_us, gap_end_wc;   /* the input's last silence >= g_gap_min_us */
@@ -280,8 +283,12 @@ static int classify_stream(PtvTimeline *t, int si, int final, int64_t cross_s_us
     if (run_n)
         return 0;                              /* one packet off: wait for the next */
     s->old_end_us = old_last;
-    /* never left its path: resolved "did not cross" once its own time passed the crossing point */
-    if (cross_s_us != AV_NOPTS_VALUE && (seen || s->win_passed) && old_last > cross_s_us + TL_PASS_US)
+    /* never left its path: resolved "did not cross" once its own time passed the crossing point. 2.2 T-451: not on a big
+     * step — a partner going on on its old path for a while is how a source's streams cross a clock step apart (cor-3
+     * Curiosity 2026-11-07: the audio stepped -14768 s, the video 1.03 s later; decided "did not cross" at 300 ms, the
+     * step went out as two single-stream steps and the joint return 2 s later was erased: output 4 h off). It waits for
+     * the window (TL_WIN_SIL_US) — a big step on one stream alone is no relabel either way */
+    if (cross_s_us != AV_NOPTS_VALUE && (seen || s->win_passed) && old_last > cross_s_us + TL_PASS_US && !t->win_big)
         return 3;
     return 0;
 }
@@ -347,6 +354,8 @@ static int64_t evidence_from(const DemuxArgs *d, const PtvTimeline *t)
 static int window_over(const DemuxArgs *d, const PtvTimeline *t, int64_t nw)
 {
     int64_t ev = evidence_from(d, t);
+    if (t->win_big)                            /* T-451: a big step waits for its partners up to the full window */
+        return nw - win_from(t) >= TL_WIN_SIL_US;
     return nw - win_from(t) >= TL_WIN_SIL_US || (ev != INT64_MAX && nw - ev >= TL_WIN_US);
 }
 
@@ -355,8 +364,11 @@ static int window_resolved(DemuxArgs *d, PtvTimeline *t, int final)
     int si, all = 1, r;
     int64_t cross = AV_NOPTS_VALUE;
     r = classify_stream(t, t->trig, final, AV_NOPTS_VALUE);
-    if (r == 1)
-        cross = t->st[t->trig].old_end_us;
+    if (r == 1) {
+        const TlStream *ts = &t->st[t->trig];
+        cross = ts->old_end_us;
+        t->win_big = llabs(ts->new_first_us - (ts->old_end_us + (ts->step_us ? ts->step_us : 20000))) > TL_BIG_US;
+    }
     else if (r != 2)
         return final;
     if (r == 2)
@@ -451,7 +463,16 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
             continue;
         if (d->ifmt->streams[si]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && ((flowing(t, s) && !sil_out) || has_held(t, si)))
             n_aud_flow++;
-        if (s->res == 1)
+        /* 2.2 T-451: a partner of a program event crossed by the video's amount — an audio crossing the other way in the
+         * same window (its return leg while the video's step arrives) is no partner: taken as one, the video's -14768 s
+         * departure and the audio's +14768 s return made a "step back erased" (sync_excursion: audio dead after) */
+        if (s->res == 1 && vs >= 0 && vs < t->nst && t->st[vs].res == 1) {
+            const TlStream *v = &t->st[vs];
+            int64_t jv = v->new_first_us - (v->old_end_us + (v->step_us ? v->step_us : 20000));
+            int64_t ja = s->new_first_us - (s->old_end_us + (s->step_us ? s->step_us : 20000));
+            if (llabs(ja - jv) <= FFMAX(TL_SAME_US, llabs(jv) / 1000))
+                n_aud_cross++;
+        } else if (s->res == 1)
             n_aud_cross++;
     }
     for (si = 0; si < t->nheld; si++)
@@ -484,8 +505,10 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
         if (J > 0) {
             /* damage hides lost content from the wall evidence (packets keep coming, pictures do not), but no more than
              * the damage phase lasted: one corrupt PES at a splice proved a 38 s "hole" on a relabel (gate sync_burstjump:
-             * a 13 s video PTS hole) and 9094 s across a wrap (mvwrap jump_return_50) */
-            dspan = dmg && t->dmg_start_wc ? nw - t->dmg_start_wc : 0;
+             * a 13 s video PTS hole) and 9094 s across a wrap (mvwrap jump_return_50). 2.2 T-451: the phase ends at its last
+             * corrupt packet or where the event began — not at the window's close (a big step's window waits up to 3 s for
+             * its partner; counted, 1.06 s of that wait was kept as a hole: sync_excursion mirror) */
+            dspan = dmg && t->dmg_start_wc ? FFMAX(t->open_wc, t->dmg_seen_wc) - t->dmg_start_wc : 0;
             keep  = FFMIN(J, (FFMAX(W, dspan) + fd / 2) / fd * fd);
             erase = J - keep;
         } else {
@@ -613,6 +636,10 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
     if (prog_event) {                         /* a stream joining late must not bring back what the event erased */
         t->er_lo = erase > 0 ? va : 0;
         t->er_hi = erase > 0 ? vb : 0;
+        /* 2.2 T-451: the event took the damage phase it saw into account — the next corrupt packet starts a new one. Kept, a
+         * return 2 s after a damaged departure measured its "damage" from the departure: 2.12 s kept as a hole of content
+         * that was all there (sync_excursion; live cor-3 Curiosity 1.88 s) */
+        t->dmg_start_wc = 0;
     }
     t->active = 0;
     return ret;
@@ -646,7 +673,7 @@ int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
     if (d->ts_outl)
         for (int i = 0; i < t->nst && i < d->nb_streams_open; i++)
             if (d->ts_outl[i].dmg_wc > t->dmg_seen_wc) {
-                if (!t->dmg_seen_wc || d->ts_outl[i].dmg_wc - t->dmg_seen_wc > 3000000)
+                if (!t->dmg_seen_wc || !t->dmg_start_wc || d->ts_outl[i].dmg_wc - t->dmg_seen_wc > 3000000)
                     t->dmg_start_wc = d->ts_outl[i].dmg_wc;
                 t->dmg_seen_wc = d->ts_outl[i].dmg_wc;
             }
@@ -759,6 +786,7 @@ int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
         t->open_pos  = pkt->pos;
         t->open_vn   = d->vunwrap_n;
         t->nheld     = 1;
+        t->win_big   = 0;
         h->pkt = pkt; h->s_us = s_us; h->k_at = t->k_us; h->wc = nw; h->si = si; h->path = 0;
         for (int i = 0; i < t->nst; i++) {     /* a stream the window never classifies keeps its path */
             t->st[i].old_end_us = t->st[i].last_us;
