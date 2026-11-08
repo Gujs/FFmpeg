@@ -287,8 +287,12 @@ static int classify_stream(PtvTimeline *t, int si, int final, int64_t cross_s_us
      * step — a partner going on on its old path for a while is how a source's streams cross a clock step apart (cor-3
      * Curiosity 2026-11-07: the audio stepped -14768 s, the video 1.03 s later; decided "did not cross" at 300 ms, the
      * step went out as two single-stream steps and the joint return 2 s later was erased: output 4 h off). It waits for
-     * the window (TL_WIN_SIL_US) — a big step on one stream alone is no relabel either way */
-    if (cross_s_us != AV_NOPTS_VALUE && (seen || s->win_passed) && old_last > cross_s_us + TL_PASS_US && !t->win_big)
+     * the window (TL_WIN_SIL_US) — a big step on one stream alone is no relabel either way. Not past TL_BIG_US beyond the
+     * crossing point: that partner flowed through the time the step skipped (gate sync_vnull_20: the video nulled 20 s,
+     * its last PES handed over only when it resumed — its own silence read ~0, the step "big" — and the window held all
+     * streams 3 s for an audio 20 s past the crossing: content age +2 s, 3 flashes without their beep) */
+    if (cross_s_us != AV_NOPTS_VALUE && (seen || s->win_passed) && old_last > cross_s_us + TL_PASS_US &&
+        (!t->win_big || old_last > cross_s_us + TL_BIG_US))
         return 3;
     return 0;
 }
