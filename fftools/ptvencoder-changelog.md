@@ -13,15 +13,20 @@ source did it on 11-06 03:40 too). The audio crossed first while the video went 
 point the video was taken as "did not cross", so the departure went out as two single-stream steps ("labels as sent") and the
 joint return was erased — the output ended 4 h off: the single's A/V 126 s apart, the slot re-locked +14766 s without sound,
 both restarted by sync_check. On 11-06 the return had split too and the two halves happened to cancel. Now:
-- a step bigger than the relabel bound (2 s) waits the full window (3 s) for its partners instead of judging a partner that
-  goes on on its old path as "did not cross" (the video's pictures keep flowing meanwhile);
+- a step the input's silence does not explain (a step back beyond 2 s, or a forward step beyond the stream's own silence by
+  more than 2 s) waits up to the full window (3 s) for its partners instead of judging a partner that goes on on its old path
+  as "did not cross" after 300 ms (the video's pictures keep flowing meanwhile). A plain hole closes as before, and a partner
+  already more than 2 s past the crossing point did not cross (a video nulled 20 s while its audio flowed);
 - the audio partner of a program event must have crossed by the video's amount (an audio's return leg arriving in the window
   of the video's departure made one "step back erased" of two opposite steps);
 - a program event takes its damage phase with it, and the phase ends at its last corrupt packet, not at the window's close
   (a return 2 s after a damaged departure kept 2.12 s of content that was all there as a hole; live 1.88 s).
 Kit (new scenario sync_excursion; keys vt / vt-ar01 / vt-mirror sync_excursion + mv04-t451): rc2 FAIL on every shape (audio
 dead for the rest of the run / dark 8.85 s / slot 0 dark 110 s), rc3 PASS with the excursion netting to ±0.04 s. The T-431 /
-T-433 scenarios (jumpback, restartlate) are gate keys now too.
+T-433 scenarios (jumpback, restartlate) are gate keys now too. Full gate vs rc1: 0 regressions (the first two rc3 builds held a
+plain 10 s gap and a 20 s video-only null 3 s for a partner — caught by the gate, fixed before release). One deliberate change:
+a video-only forward relabel with no wall silence (gate fwd_pts_jump) now waits ~1.9 s for a partner (rc2 0.2 s) — in its
+first second it is indistinguishable from an excursion whose audio leads.
 
 ## 2.2.0-rc2 — 2.2.0-rc1 + a mosaic slot back from an outage longer than its input timeout keeps the hole (T-449)
 
