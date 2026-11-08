@@ -367,7 +367,15 @@ static int window_resolved(DemuxArgs *d, PtvTimeline *t, int final)
     if (r == 1) {
         const TlStream *ts = &t->st[t->trig];
         cross = ts->old_end_us;
-        t->win_big = llabs(ts->new_first_us - (ts->old_end_us + (ts->step_us ? ts->step_us : 20000))) > TL_BIG_US;
+        /* big = a step the input's wall silence does not explain: any step back beyond TL_BIG_US, a forward step beyond
+         * the trigger's own silence by more. A hole (J ~ W) is no relabel: its window closes on its evidence as before
+         * (rc3 verification: a 10 s gap held 3 s for a partner it never needed — 305 packets, A/V PID dark 3.1 s and
+         * flashes without their beep on sync_gap / ac3_gap). No wall evidence (armed bank / deep prime): backward only */
+        int64_t jt = ts->new_first_us - (ts->old_end_us + (ts->step_us ? ts->step_us : 20000));
+        int     nowall = atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 || (int64_t)g_preroll_ms >= 4000;
+        int64_t wt = FFMAX(ts->last_wc ? t->open_wc - ts->last_wc : 0,
+                           t->gap_end_wc && t->open_wc - t->gap_end_wc <= 1000000 ? t->gap_us : 0);
+        t->win_big = jt < -TL_BIG_US || (!nowall && jt - wt > TL_BIG_US);
     }
     else if (r != 2)
         return final;
