@@ -813,9 +813,14 @@ void ptv_vwait_rebase(DemuxArgs *d, int64_t from_us, int64_t old_end_us, int64_t
              * after the step began = the new content (sync_bstep: DVB subs -120 ms). The step begins at the packet that
              * opened the window, which lavf hands out up to two video packets after its PES started: a copy read in that
              * lag that lies after it in the mux (a section has no pos: read in the lag) is new too (T-332: rich5994b
-             * marker 60, the sub muxed after the stepped picture's PES but read 22 ms before it, cue with it: -120 ms) */
+             * marker 60, the sub muxed after the stepped picture's PES but read 22 ms before it, cue with it: -120 ms) —
+             * 2.2.0-rc4 T-453: only when its time is near the new content's start (within 10 s): across a big step back the
+             * overlap is the whole old timeline, and a cue of the OLD content read in the lag (GYF: 0.77 s before the old
+             * end, 33 ms before a -41523 s step's window) was moved by k — it then headed the queue unshown for good, every
+             * cue waited behind it and went out chained behind a label k ahead: no SCTE-35 on air until a restart */
             if (src < from_us || (src < old_end_us && ps->vwait_wc[k] < open_wc &&
-                                  !(ps->vwait_vn[k] >= open_vn - 2 && (p->pos < 0 || (open_pos >= 0 && p->pos > open_pos)))))
+                                  !(ps->vwait_vn[k] >= open_vn - 2 && (p->pos < 0 || (open_pos >= 0 && p->pos > open_pos)) &&
+                                    src - from_us <= 10000000)))
                 continue;
             if (p->pts != AV_NOPTS_VALUE) p->pts += av_rescale_q(dpo, (AVRational){ 1, 90000 }, ps->in_tb);
             if (p->dts != AV_NOPTS_VALUE) p->dts += av_rescale_q(dpo, (AVRational){ 1, 90000 }, ps->in_tb);
