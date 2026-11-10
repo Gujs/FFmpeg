@@ -5,6 +5,18 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.0-rc4 — 2.2.0-rc3 + SCTE-35 survives a large erased step back (T-453)
+
+**SCTE-35 keeps flowing after the source jumps far back in time (T-453).** cor-3, 2026-11-09 09:06 CST (rc3): the source of
+Growing_Your_Faith stepped its clock back 41523 s; the timeline erased the step correctly, but from then on the output carried
+no SCTE-35 at all (0 packets on the cue PID) and the process grew ~25-30 MB/h — every cue was held in the muxers' interleave
+buffers. One cue of the OLD content, read 33 ms before the step's window opened, was moved onto the new timeline by the
+step's offset (the rule that a section read within two video pictures of a step belongs to the new content — right for the
+-120 ms step it was made for, wrong when the overlap is the whole old timeline). It then waited for a picture that never
+came, every later cue waited behind it, and after the queue filled they went out chained behind a label 41479 s ahead. Now a
+cue read in that lag counts as new content only when its time lies within 10 s of the new content's start.
+Kit (new key vt-t453 sync_gyfstep on a GYF source capture with the step re-created): rc3 0 cues after the step, rc4 every cue.
+
 ## 2.2.0-rc3 — 2.2.0-rc2 + a source clock excursion nets to zero (T-451)
 
 **A source whose clock steps away and comes back keeps its sync (T-451).** cor-3, 2026-11-07 02:50 (rc2): the source of
