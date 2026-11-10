@@ -15,7 +15,8 @@ step's offset (the rule that a section read within two video pictures of a step 
 -120 ms step it was made for, wrong when the overlap is the whole old timeline). It then waited for a picture that never
 came, every later cue waited behind it, and after the queue filled they went out chained behind a label 41479 s ahead. Now a
 cue read in that lag counts as new content only when its time lies within 10 s of the new content's start.
-Kit (new key vt-t453 sync_gyfstep on a GYF source capture with the step re-created): rc3 0 cues after the step, rc4 every cue.
+Kit (new key vt-t453 clean on cap-gyfstep, media-v13: a GYF source capture with the step re-created): rc3 FAIL — SCTE-35
+stops at the step; rc4 PASS — 3.7 cues/s to the end.
 
 ## 2.2.0-rc3 — 2.2.0-rc2 + a source clock excursion nets to zero (T-451)
 
