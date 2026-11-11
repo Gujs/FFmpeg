@@ -5,6 +5,24 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.0-rc5 — 2.2.0-rc4 + SCTE-35 survives a large forward jump; a cue can no longer block the cue stream (T-453)
+
+**SCTE-35 keeps flowing after the source returns far ahead in time (T-453).** cor-3, 2026-11-10 19:23 / 19:34 CST (rc4):
+FaithNFreedom_TV and Biohackingville_TV came back from a ~170 s outage with their clock ~46000 s ahead; the timeline erased
+the jump correctly, but from then on the output carried no SCTE-35 (the rc3 Growing_Your_Faith failure, mirrored). A cue of
+the NEW content, 0.7 s ahead of its picture and read just before the jump's window opened, kept the old offset: its time lay
+before the new content's start, so it was taken for old content — although the old content had ended 45820 s earlier. It
+waited for a picture that never came, every later cue waited behind it, and after the queue filled they went out chained
+behind its label. Now:
+- a copy (cue, subtitle) whose time lies past the old content's end and within 10 s before the new content's start is new
+  content and moves with the jump;
+- backstop: a SCTE-35 cue labelled more than 10 s past the newest video read (a cue's time is the PCR it was read at, never
+  ahead of the video) takes the video read's time and waits on it (`[PTV-VMAP] a SCTE-35 cue labelled ... relabelled`); a cue
+  not shown within 60 s goes out with the video's offset (the T-335 path). A mislabelled cue costs at most that cue's timing,
+  never every later cue until a restart.
+Local repros (GYF source capture): forward jump +45821 / +46243 s after a 177 s outage — rc4 0 cues after the jump, rc5 all
+1305 (the backstop alone also carries all 1305); the rc3 step back -41479 s — all 1305.
+
 ## 2.2.0-rc4 — 2.2.0-rc3 + SCTE-35 survives a large erased step back (T-453)
 
 **SCTE-35 keeps flowing after the source jumps far back in time (T-453).** cor-3, 2026-11-09 09:06 CST (rc3): the source of
