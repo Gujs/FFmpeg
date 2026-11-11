@@ -441,6 +441,23 @@ static void vwait_drain(DemuxArgs *d, int force)
                     continue;
                 }
             }
+            if (r == 0 && scte && !force && d->vread_set &&
+                av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q) > d->vread_us + 10000000) {
+                /* 2.2.0-rc5 T-453: a cue labelled far past the newest video read waits for content that will never be
+                 * shown — mislabelled at a timeline event (rc3: moved by a -41523 s step; rc4: a new-content cue left on
+                 * the old offset at a +45643 s jump). It headed the queue for good, every later cue waited behind it, and
+                 * a full queue chained them all behind its label: no SCTE-35 on air until a restart. A cue's own time is
+                 * the PCR it was read at, never ahead of the video read: it takes the newest video read and waits on it */
+                int64_t lbl = av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q);
+                av_log(NULL, AV_LOG_WARNING, "[PTV-VMAP] a SCTE-35 cue labelled %.1f s past the newest video read — "
+                       "relabelled to the video read\n", (lbl - d->vread_us) / 1e6);
+                p->pts = p->dts = av_rescale_q(d->vread_us, AV_TIME_BASE_Q, ps->in_tb);
+                ps->vwait_po[k] = d->prog_off;
+                continue;                       /* evaluated again with the new label */
+            }
+            if (r == 0 && scte && !force && now - ps->vwait_wc[k] >= 60000000)
+                r = -1;                         /* 2.2.0-rc5 T-453: not shown in 60 s (a burst leads by < 30 s): placed
+                                                 * with the video's offset (T-335 below), never left heading the queue */
             if (r == 0 && !force && !(ps->gated && now - ps->vwait_wc[k] >= 1500000))
                 break;                          /* its content is not on the output yet */
             if (ps->gated && r != 1) {
@@ -818,9 +835,13 @@ void ptv_vwait_rebase(DemuxArgs *d, int64_t from_us, int64_t old_end_us, int64_t
              * overlap is the whole old timeline, and a cue of the OLD content read in the lag (GYF: 0.77 s before the old
              * end, 33 ms before a -41523 s step's window) was moved by k — it then headed the queue unshown for good, every
              * cue waited behind it and went out chained behind a label k ahead: no SCTE-35 on air until a restart */
-            if (src < from_us || (src < old_end_us && ps->vwait_wc[k] < open_wc &&
-                                  !(ps->vwait_vn[k] >= open_vn - 2 && (p->pos < 0 || (open_pos >= 0 && p->pos > open_pos)) &&
-                                    src - from_us <= 10000000)))
+            /* 2.2.0-rc5 T-453: a forward jump leaves a gap (old_end, from): a copy there lies past the old content's end —
+             * the new content's lead (GYF/FNF: a cue 0.7 s ahead of its picture, read 10 us before the window opened,
+             * kept the old offset and was labelled 45643 s ahead of the video) — it is new when near the new start */
+            if ((src < from_us && !(src >= old_end_us && from_us - src <= 10000000)) ||
+                (src < old_end_us && ps->vwait_wc[k] < open_wc &&
+                 !(ps->vwait_vn[k] >= open_vn - 2 && (p->pos < 0 || (open_pos >= 0 && p->pos > open_pos)) &&
+                   src - from_us <= 10000000)))
                 continue;
             if (p->pts != AV_NOPTS_VALUE) p->pts += av_rescale_q(dpo, (AVRational){ 1, 90000 }, ps->in_tb);
             if (p->dts != AV_NOPTS_VALUE) p->dts += av_rescale_q(dpo, (AVRational){ 1, 90000 }, ps->in_tb);
