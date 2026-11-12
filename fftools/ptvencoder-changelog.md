@@ -5,6 +5,18 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.0 — release: 2.2.0-rc5 unchanged, version only
+
+**Same code as 2.2.0-rc5** (adaptive-2.2 87cdf65cc5); only `PTVENCODER_VERSION` changes. What makes it the release:
+- **Overnight soak of rc5** (2026-11-11 20:20 → 11-12 07:33 CET) on the new soak tier live-transcoder (8) +
+  tmtg-cow-transcoder-1 (64) + tmtg-cow-transcoder-2 (29) = 101 channels, with the same channels on cor-1/2 (2.0.2-pre4) as
+  the control: 0 restarts, 0 cores, RSS max +3.4 MB/h (median 0.1), SCTE-35 in = out on every single-input channel, large
+  source time jumps handled (TruBLU step backs to −2698 s, Weather_nation +9047 s forward); mosaic lip sync flat
+  (RAV mosaic cell measured on air: rc5 +3 ms, pre4 on cor-2 wanders ±120 ms).
+- **rc5 gate** (vs rc4, kit 5d72d5b, media-v11): 267 runs, 0 regressions, 0 INVALID; T-453 forward key `vt-t453f`
+  rc4 FAIL / rc5 PASS; smoke 35/1/0 with the one mosaic cross-slot blip re-run 3/3 PASS.
+- rc4 canary (live-transcoder + cor-3, 2026-11-10/11) fixed T-453's step-back case on air (GYF SCTE-35 back).
+
 ## 2.2.0-rc5 — 2.2.0-rc4 + SCTE-35 survives a large forward jump; a cue can no longer block the cue stream (T-453)
 
 **SCTE-35 keeps flowing after the source returns far ahead in time (T-453).** cor-3, 2026-11-10 19:23 / 19:34 CST (rc4):
