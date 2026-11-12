@@ -202,6 +202,20 @@ static int occ_ticks(const VideoCtx *v, int n)
     return n;
 }
 
+/* 2.2.1 T-461: the most a setpoint (ticks) may ask of the frame queue. The base / raised tiers and the prime are clamped to
+ * frameq_cap - 8 at start-up as if a picture were a tick; a 2:1 source fills the 160-picture queue at 80 ticks, so the 4 s
+ * raised tier (119 ticks — Daystar_esp, PATRIOT-Family_Entertainment on cow after two starvations) would pin the queue full
+ * and drop the oldest picture for as long as it stood (local, 5 min: 1202 pictures). The queue swings +-16-20 pictures
+ * around its target at 59.94 (+-0.3 s), so capacity - 8 still dropped (219); a decimating source gets 3/4 of the queue
+ * (the mosaic slot rule): 120 pictures = 2.0 s at 59.94 -> 29.97, where 2.2.0's miscount left it — 0 drops measured.
+ * A source at the house rate keeps capacity - 8 */
+static int sp_cap(const VideoCtx *v, int sp)
+{
+    int cap = occ_ticks(v, g_cp.frameq_cap) != g_cp.frameq_cap ? occ_ticks(v, g_cp.frameq_cap * 3 / 4)
+                                                               : g_cp.frameq_cap - 8;
+    return sp < cap ? sp : cap;
+}
+
 /* ---- -cc_extract: EIA-608 -> DVB-teletext emitter (see the CcTap header in ptvencoder.h) ----
  * This lives in this file for ONE reason: content_index() above is the single copy of the
  * house-clock stamping arithmetic, and the captions must ride exactly it. The decode thread
@@ -1339,7 +1353,7 @@ void *output_thread(void *arg)
 
         if (!primed) {                              /* one-time jitter-buffer pre-roll */
             int64_t pt0 = av_gettime_relative();
-            while (occ_ticks(v, av_thread_message_queue_nb_elems(v->frame_q)) < n_prime &&
+            while (occ_ticks(v, av_thread_message_queue_nb_elems(v->frame_q)) < sp_cap(v, n_prime) &&
                    av_gettime_relative() - pt0 < (int64_t)preroll_ms * 3000)
                 av_usleep(2000);
             primed = 1;
@@ -1544,7 +1558,7 @@ void *output_thread(void *arg)
                     }
                     atomic_store_explicit(&v->hr->rho_corr_ppm,
                         ptv_src_holding() ? 0 :
-                        house_rate_corr_ppm(v->hr, v->est, occ, g_curt.cur_sp, base_sp, v->tick_dur_us, damaged),
+                        house_rate_corr_ppm(v->hr, v->est, occ, sp_cap(v, g_curt.cur_sp), sp_cap(v, base_sp), v->tick_dur_us, damaged),
                         memory_order_relaxed);
                 }
                 int64_t corr = atomic_load_explicit(&v->hr->rho_corr_ppm, memory_order_relaxed);
@@ -1952,7 +1966,7 @@ void *output_thread(void *arg)
                     snprintf(wu, sizeof wu, " wucr_buf=%df/%lldms wucr_rho=%+lldppm hs=%+lldms hsres=%+lldms cushion=%dms fqhw=%d",
                              occ, (long long)(occ_ticks(v, occ) * v->tick_dur_us / 1000), (long long)(-corr), (long long)(hs / 1000),
                              (long long)(hsr / 1000),
-                             (int)((int64_t)g_curt.cur_sp * v->tick_dur_us / 1000),  /* -corr = recovered source dev (+=faster); cushion = adaptive tier target */
+                             (int)((int64_t)sp_cap(v, g_curt.cur_sp) * v->tick_dur_us / 1000),  /* -corr = recovered source dev (+=faster); cushion = adaptive tier target */
                              atomic_load_explicit(&g_fq_hw, memory_order_relaxed));
                 }
                 char bk[48] = "";                                    /* v0.9.14 AUTO-BANK: actual/target — actual = TOTAL
