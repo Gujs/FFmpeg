@@ -17,6 +17,7 @@ uses) whenever the source runs more than 25 % faster than the house; every other
 Local A/B (Daystar_esp capture 720p59.94 over UDP, x264 2 rungs, 10 min each), mean content queued: 2.2.0 59.94 out 1.00 s,
 2.2.0 `-r max:30` **0.52 s** (min 0.23), 2.2.1-rc1 59.94 out 1.00 s (unchanged), 2.2.1-rc1 `-r max:30` **1.02 s** (min 0.78);
 start-up prime 0.5 s → 1.0 s; 0 dup, 0 drop in all four. Mosaics were not affected (a slot's depth is already in content).
+**Targets fit the queue at 2:1.** The base / raised cushion tiers and the prime were capped at the queue's capacity − 8 as if a picture were a tick. Counted in ticks, the 4 s raised tier (Daystar_esp, PATRIOT-Family_Entertainment on cow after two starvations) asks 119 ticks = 238 pictures of a 160-picture queue: the queue pins full and drops the oldest picture continuously (local, deep target, 5 min: 1202 pictures). A decimating source's targets are capped at 3/4 of the queue (the mosaic slot rule; capacity − 8 still dropped 219 — the queue swings ±16–20 pictures at 59.94): 120 pictures = 2.0 s at 59.94 → 29.97, 0 drops (deep target 111–132 pictures; normal target ~60 = 1 s). A source at the house rate keeps capacity − 8.
 Not in this change: a start-up backlog longer than the 160-picture queue (2.67 s of a 59.94 source, with or without `-r`) still
 sheds on non-master rungs — the cow-1 restart drops of 11-12 09:01 were that (set-up 3.3 s with seven channels restarting).
 
