@@ -5,6 +5,21 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.1-rc1 — 2.2.0 + the buffer of a rate-halved channel counts content, not pictures (T-461)
+
+**`-r max:30` on a 59.94 / 50 source keeps its full 1 s cushion (T-461).** cow-1, 2026-11-12 (first production use of
+`-r max:30`, 2.2.0): the frame queue holds SOURCE pictures — two per output tick when the house runs at half the source rate —
+but the occupancy servo, the bank margin, the start-up prime and the stats line counted one tick a picture. The servo read
+twice the cushion and ran the house fast until the queue held half of it (RAV, Rsbn, Daystar_esp, Adrenaline+, Lindel_TV:
+~0.5 s of content for the ~1 s target, servo pinned at +6000 ppm while it drained); the prime stopped at 0.5 s; `wucr_buf=`
+showed twice the real ms. Now a queued picture counts as its share of a tick (the learned source period, as content_index()
+uses) whenever the source runs more than 25 % faster than the house; every other channel counts as before.
+Local A/B (Daystar_esp capture 720p59.94 over UDP, x264 2 rungs, 10 min each), mean content queued: 2.2.0 59.94 out 1.00 s,
+2.2.0 `-r max:30` **0.52 s** (min 0.23), 2.2.1-rc1 59.94 out 1.00 s (unchanged), 2.2.1-rc1 `-r max:30` **1.02 s** (min 0.78);
+start-up prime 0.5 s → 1.0 s; 0 dup, 0 drop in all four. Mosaics were not affected (a slot's depth is already in content).
+Not in this change: a start-up backlog longer than the 160-picture queue (2.67 s of a 59.94 source, with or without `-r`) still
+sheds on non-master rungs — the cow-1 restart drops of 11-12 09:01 were that (set-up 3.3 s with seven channels restarting).
+
 ## 2.2.0 — release: 2.2.0-rc5 unchanged, version only
 
 **Same code as 2.2.0-rc5** (adaptive-2.2 87cdf65cc5); only `PTVENCODER_VERSION` changes. What makes it the release:

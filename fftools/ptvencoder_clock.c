@@ -190,6 +190,18 @@ static int64_t content_index(VideoCtx *v, int64_t src_pts)
     return (house_us + v->tick_dur_us / 2) / v->tick_dur_us;
 }
 
+/* 2.2.1 T-461: n queued SOURCE pictures as OUTPUT ticks of content. A source faster than the house (-r max:30 on 59.94:
+ * two pictures a tick) was counted one tick a picture: the occupancy servo read twice the cushion and ran the house fast
+ * until the queue held half of it (cow-1, 0.5 s of content for the 1 s target), the start-up prime stopped at half its
+ * depth and the stats line showed twice the ms. Scaled by the learned source period (content_index()'s, 2 s windows); a
+ * source within 25 % of the house rate counts a picture a tick, as before */
+static int occ_ticks(const VideoCtx *v, int n)
+{
+    if (v->src_per_us > 0 && v->src_per_us * 5 / 4 < v->tick_dur_us)
+        return (int)(((int64_t)n * v->src_per_us + v->tick_dur_us / 2) / v->tick_dur_us);
+    return n;
+}
+
 /* ---- -cc_extract: EIA-608 -> DVB-teletext emitter (see the CcTap header in ptvencoder.h) ----
  * This lives in this file for ONE reason: content_index() above is the single copy of the
  * house-clock stamping arithmetic, and the captions must ride exactly it. The decode thread
@@ -1327,7 +1339,7 @@ void *output_thread(void *arg)
 
         if (!primed) {                              /* one-time jitter-buffer pre-roll */
             int64_t pt0 = av_gettime_relative();
-            while (av_thread_message_queue_nb_elems(v->frame_q) < n_prime &&
+            while (occ_ticks(v, av_thread_message_queue_nb_elems(v->frame_q)) < n_prime &&
                    av_gettime_relative() - pt0 < (int64_t)preroll_ms * 3000)
                 av_usleep(2000);
             primed = 1;
@@ -1501,7 +1513,7 @@ void *output_thread(void *arg)
                      * g_curt.cur_sp = adaptive tier target (base preroll unless grown; M3 moved it
                      * into the escalation runtime). Master computes; all rungs apply the published
                      * hr->rho_corr_ppm identically. */
-                    int occ = av_thread_message_queue_nb_elems(v->frame_q);
+                    int occ = occ_ticks(v, av_thread_message_queue_nb_elems(v->frame_q));   /* T-461 */
                     /* 2.0.0-pre9.4 (T-083): while the source is damaged, frames lost inside frame_q make the
                      * frame COUNT read low although the content it spans is unchanged — the servo took that
                      * for starvation and re-primed (house 0.77x), adding +0.55 s latency at the onset of 10 %
@@ -1527,7 +1539,7 @@ void *output_thread(void *arg)
                         int64_t arr = atomic_load_explicit(&g_src_vread_wc, memory_order_relaxed);
                         if (arr && arr != v->hr->bk_arr_wc) {
                             v->hr->bk_arr_wc = arr;
-                            v->hr->bk_have   = av_thread_message_queue_nb_elems(v->dbg_video_q) + occ;
+                            v->hr->bk_have   = occ_ticks(v, av_thread_message_queue_nb_elems(v->dbg_video_q)) + occ;
                         }
                     }
                     atomic_store_explicit(&v->hr->rho_corr_ppm,
@@ -1938,7 +1950,7 @@ void *output_thread(void *arg)
                     int64_t hs   = v->house_skew ? *v->house_skew : 0;   /* W1 check: must stay ≈0 (ρ genlock → dups→0 → AVLOCK has nothing to inject) */
                     int64_t hsr  = v->dbg_disc_resid ? *v->dbg_disc_resid : 0;   /* 0.9.18.7: LAYERA erase-residue ledger (reporting only) */
                     snprintf(wu, sizeof wu, " wucr_buf=%df/%lldms wucr_rho=%+lldppm hs=%+lldms hsres=%+lldms cushion=%dms fqhw=%d",
-                             occ, (long long)(occ * v->tick_dur_us / 1000), (long long)(-corr), (long long)(hs / 1000),
+                             occ, (long long)(occ_ticks(v, occ) * v->tick_dur_us / 1000), (long long)(-corr), (long long)(hs / 1000),
                              (long long)(hsr / 1000),
                              (int)((int64_t)g_curt.cur_sp * v->tick_dur_us / 1000),  /* -corr = recovered source dev (+=faster); cushion = adaptive tier target */
                              atomic_load_explicit(&g_fq_hw, memory_order_relaxed));
@@ -1949,7 +1961,7 @@ void *output_thread(void *arg)
                     int64_t bt = atomic_load_explicit(&g_bank_us, memory_order_relaxed);
                     if (bt > 0)
                         snprintf(bk, sizeof bk, " bank=%lld/%lldms",
-                                 (long long)(((int64_t)atomic_load_explicit(&g_vq_elems, memory_order_relaxed)
+                                 (long long)((int64_t)occ_ticks(v, atomic_load_explicit(&g_vq_elems, memory_order_relaxed)
                                               + av_thread_message_queue_nb_elems(v->frame_q)) * v->tick_dur_us / 1000),
                                  (long long)(bt / 1000));
                 }
