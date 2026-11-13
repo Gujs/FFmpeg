@@ -70,7 +70,12 @@ typedef struct TlStream {
                                                * cadence: a lone PES tail handed over after an outage carries the outage) */
     int64_t sil_us, sil_wc;                   /* T-463: its last arrival gap >= g_gap_min_us and when it ended (a tail of
                                                * several frames arrives back to back after the outage) */
-    int64_t aw_dk;                            /* T-463: the awaiting event's offset move (its old offset = k - aw_dk) */
+    int64_t aw_dk;                            /* T-463: the awaiting events' offset move (its old offset = k - aw_dk) */
+    int64_t aw_vref;                          /* T-464: the video's path end when the awaited audio's paths were last set
+                                               * (its old and new path move on with the video's content, not the wall) */
+    int     await_more;                       /* T-464: a later program event in this window moved its awaited path */
+    int64_t open_us;                          /* T-466: its path end when the window opened (old_end_us grows with the
+                                               * old-path packets the window holds) */
 } TlStream;
 
 struct PtvTimeline {
@@ -194,8 +199,6 @@ static void path_take(TlStream *s, int64_t s_us, int64_t wc)
     s->ok      = 1;
 }
 
-/* T-463: the stream's own wall silence around its crossing in this window — the largest arrival gap from its last two
- * path packets up to its first packet on the new run (a forward step this explains is loss, not a clock of its own) */
 /* T-463: the stream stepped first, alone, and was repaired as a clock of its own — the video now steps the same: it is on
  * the new path already; undo its big repair after the release (its held packets are new content: path 3) */
 static void undo_big_repair(PtvTimeline *t, TlStream *s, int si)
@@ -213,12 +216,14 @@ static void undo_big_repair(PtvTimeline *t, TlStream *s, int si)
         }
 }
 
+/* T-463: the stream's own wall silence around its crossing in this window — the largest arrival gap from its last two
+ * path packets up to its first packet on the new run (a forward step this explains is loss, not a clock of its own) */
 static int64_t stream_silence(const PtvTimeline *t, const TlStream *s, int si)
 {
     int64_t prev = s->last_wc, w = s->gap1_wc;
+    int i;
     if (s->sil_wc && t->open_wc - s->sil_wc <= 1000000)
         w = FFMAX(w, s->sil_us);
-    int i;
     for (i = 0; i < t->nheld; i++) {
         const TlPkt *h = &t->held[i];
         if (h->si != si || h->s_us == AV_NOPTS_VALUE || h->path == 2)
@@ -537,7 +542,7 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
 {
     int si, vs = d->vstream, n_aud_cross = 0, n_aud_flow = 0, prog_event = 0, dmg = 0;
     int64_t k_old = t->k_us, k_new = t->k_us, J = 0, W = 0, keep = 0, erase = 0, fd = 0, dspan = 0;
-    int64_t va = AV_NOPTS_VALUE, vb = AV_NOPTS_VALUE, first_new_wc = INT64_MAX, nw = av_gettime_relative();
+    int64_t va = AV_NOPTS_VALUE, vb = AV_NOPTS_VALUE, first_new_wc = INT64_MAX, nw = av_gettime_relative(), vref = 0;
     const char *cls = "outlier";
     /* T-431: a partner silent through the whole TL_WIN_SIL_US window no longer flows — no partner to wait for (a video
      * that crossed alone is then a program event, as with no audio flowing); its next packet re-seeds its path */
@@ -568,7 +573,7 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
             first_new_wc = t->held[si].wc;
     /* 2.2.1 T-463: the video opened this window with a big step (win_big: back, or forward beyond its own silence) — the
      * video decides the program event alone. A flowing audio that has not crossed with it (yet) is old content after the
-     * cut: its held packets go out on the old offset (the sound after the last old picture is dropped) and it is awaited
+     * cut: its held packets go out on the old offset and it is awaited
      * on its new path (below). Waited for, a partner's own small run decided the window: PATRIOT-World_Harvest_Television
      * cow-2 2026-11-12 23:00 CST — the video -41789 s, the audio a +0.12 s hiccup, its crossing 0.5 s later: the video went
      * out "labels as sent", hs +8.6 h, ~12 dups/s. Not when an audio flowed into the span a forward step skipped: that is
@@ -590,8 +595,12 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
                 vdec = 1;
         for (si = 0; si < t->nst && vdec; si++) {
             const TlStream *s = &t->st[si];
+            /* T-466: where the audio was when the window OPENED — in the video's hole it had flowed up to the new labels
+             * already (sync_vnull); held packets of a window that waited for it advance old_end_us by the wait (a 3 s
+             * clock step forward of the video alone, the audio on its own clock, read as a hole after a 1.94 s window:
+             * labels as sent, lip sync -3 s for good — vt-ap-own) */
             if (s->dense && si != vs && d->ifmt->streams[si]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
-                jv > 0 && s->ok && s->old_end_us > v->new_first_us - TL_BIG_US)
+                jv > 0 && s->ok && s->open_us > v->new_first_us - TL_BIG_US)
                 vdec = 0;
         }
         for (si = 0; si < t->nst && vdec; si++) {
@@ -769,12 +778,27 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
     /* 2.2.1 T-463: a program event that moved the offset by a clock step: a flowing audio that did not cross with the video
      * (yet) is awaited on its new path, the video's step ahead of its old one (ingest) — taken on its old path with the new
      * offset, its later crossing went out a second time as a single-stream step */
+    /* T-464: an audio still awaited from an earlier step takes this program event too. It is not classified here (its
+     * packets go out before the window branch, the window's old_end_us is its AWAITED path): its old path stays where
+     * it is, its awaited path moves by the video's step, its old offset by this event's move (close below). Re-awaited
+     * from scratch it kept only this step and an old path = the awaited one (second restart inside the 5 s await) */
+    if (prog_event && vs >= 0 && vs < t->nst && t->st[vs].res == 1) {
+        const TlStream *v = &t->st[vs];
+        int64_t jv = v->new_first_us - (v->old_end_us + (v->step_us ? v->step_us : 20000));
+        for (si = 0; si < t->nst; si++)
+            if (si != vs && t->st[si].await_j && t->st[si].res != 1) {
+                t->st[si].await_j   += jv - keep;     /* the kept part is content both paths lost, not a clock step */
+                if (t->st[si].aw_vref)            /* the video's reference stays continuous: progress so far kept */
+                    t->st[si].aw_vref += jv - keep;
+                t->st[si].await_more = 1;
+            }
+    }
     if (prog_event && llabs(erase) > TL_BIG_US && vs >= 0 && vs < t->nst && t->st[vs].res == 1) {
         const TlStream *v = &t->st[vs];
         int64_t jv = v->new_first_us - (v->old_end_us + (v->step_us ? v->step_us : 20000));
         for (si = 0; si < t->nst; si++) {
             TlStream *s = &t->st[si];
-            if (!s->dense || si == vs || s->res == 1 || d->ifmt->streams[si]->codecpar->codec_type != AVMEDIA_TYPE_AUDIO ||
+            if (!s->dense || si == vs || s->res == 1 || s->await_more || d->ifmt->streams[si]->codecpar->codec_type != AVMEDIA_TYPE_AUDIO ||
                 !((flowing(t, s) && !sil_out) || has_held(t, si)))
                 continue;
             if (s->rep_big && llabs(s->rep_big + jv) < TL_SAME_US) {
@@ -812,7 +836,12 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
             t->ev_wc = nw;
         }
     }
+    for (si = 0; si < t->nheld; si++)         /* T-464: an awaited audio's own last arrival (the bound on e) */
+        if (t->st[t->held[si].si].await_new && t->held[si].wc > t->st[t->held[si].si].last_wc)
+            t->st[t->held[si].si].last_wc = t->held[si].wc;
     ret = release(d, t, k_old, k_new, prog_event, va, vb);
+    if (vs >= 0 && vs < t->nst)               /* T-464: the video's path end now (an awaited audio's paths follow it) */
+        vref = t->st[vs].new_last_us;
     /* the paths go on where each stream ended */
     for (si = 0; si < t->nst; si++) {
         TlStream *s = &t->st[si];
@@ -824,14 +853,26 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
             s->new_last_us += s->rep_new;
             s->rep_new = 0;
         }
-        if (s->await_new) {                   /* T-463: awaited on the video's new path, J ahead of its old one */
+        if (s->await_more) {                  /* T-464: still awaited, now J + this step ahead; its old offset moved too */
+            s->await_more = 0;
+            s->aw_dk     += k_new - k_old;
+            if (llabs(s->await_j) < 150000 && llabs(s->aw_dk) < 150000) {
+                s->await_j = s->strag_until_wc = 0;   /* this step brought the program back to its path (near exact) */
+                s->last_us = s->strag_last_us;
+                s->aw_dk   = 0;
+            } else {
+                s->last_us        = s->strag_last_us + s->await_j;
+                s->strag_until_wc = nw + TL_AWAIT_US;
+            }
+            s->ok = 1;                        /* last_wc stays its own last arrival (the bound on e, flowing()) */
+        } else if (s->await_new) {            /* T-463: awaited on the video's new path, J ahead of its old one */
             s->await_new      = 0;
-            s->aw_dk          = t->ev_dk;
+            s->aw_dk          = k_new - k_old;
             s->ok             = 1;
             s->strag_last_us  = s->old_end_us;
             s->strag_until_wc = nw + TL_AWAIT_US;
             s->last_us        = s->old_end_us + s->await_j;
-            s->last_wc        = nw;
+            s->aw_vref        = vref;         /* last_wc: its own last arrival (above), not the close */
         } else if (s->res == 1) {
             s->await_j = 0;
             if (prog_event) {
@@ -897,16 +938,31 @@ int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
     s->dense = is_dense(d, si);
 
     /* 2.2.1 T-463: an audio a clock-step program event left behind (await_j = the video's step). A packet nearer its old
-     * path than the path it is awaited on is old content: under pictures already shown (before the event's last old
-     * picture end) it goes out on the old offset, after them it is dropped; the awaited path follows it, J ahead. The first
+     * path than the path it is awaited on is old content: it goes out on the old offset (the source's audio clock lags
+     * its restart, the sound does not); the awaited path follows it, J ahead. The first
      * packet nearer the new path has crossed: taken as it comes on the new offset (its own A/V offset kept, not judged
      * against the video's step). Before the window branch: a window opened meanwhile must not hold old content as new */
     if (s->await_j && s->dense && s_us != AV_NOPTS_VALUE) {
-        int near_old = llabs(s_us - s->strag_last_us) < llabs(s_us - s->last_us);
+        /* T-464: both paths have moved on with the content since they were set — by the video's progress on its path
+         * (not the wall: a delivery stall or burst moves the wall, not the labels). Frozen path ends read an audio
+         * silent for more than half the step as being on the wrong path (3 s back + 2 s silence: its new-path return
+         * went out on the old offset and was "repaired" for good; mirror forward: an own-clock return read as crossed) */
+        const TlStream *v = d->vstream >= 0 && d->vstream < t->nst ? &t->st[d->vstream] : NULL;
+        /* a packet going on at its own cadence on the old path is old whatever the video did (a video stall, a coarse
+         * interleave or a burst moves the video's path between two of its packets — its own arrival gaps stay short);
+         * after its own silence (half the step or more: a new-path return may land on the old cadence by chance, 3 s
+         * silent on a 3 s step back) the paths have moved on by the video's progress, never more than the wall time it
+         * was silent (+0.5 s) */
+        int on_old = s->step_us && s->last_wc && nw - s->last_wc < llabs(s->await_j) / 2 &&
+                     llabs(s_us - (s->strag_last_us + s->step_us)) <= tol_us(s);
+        int64_t e = !on_old && v && v->ok && s->aw_vref && s->last_wc ?
+                    av_clip64(v->last_us - s->aw_vref, 0, nw - s->last_wc + 500000) : 0;
+        int near_old = on_old || llabs(s_us - (s->strag_last_us + e)) < llabs(s_us - (s->last_us + e));
         if (near_old && nw < s->strag_until_wc) {
             s->strag_last_us = s_us;
             s->last_us       = s_us + s->await_j;
             s->last_wc       = nw;
+            s->aw_vref       = v && v->ok ? v->last_us : 0;
             relabel(d, pkt, 0, -s->aw_dk);    /* the old offset: its sound runs on where it was */
             return ptv_demux_dispatch(d, pkt);
         }
@@ -929,7 +985,7 @@ int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
             return ptv_demux_dispatch(d, pkt);
         }
         av_log(NULL, AV_LOG_INFO, "[PTV-TL] stream %d: crossed after the video's step %+.3f s (%+.3f s off it)\n",
-               si, s->await_j / 1e6, (s_us - (s->last_us + s->step_us)) / 1e6);
+               si, s->await_j / 1e6, (s_us - (s->last_us + e + s->step_us)) / 1e6);
         s->ok = 0;                            /* crossed: re-seeded on its new path by this packet, labels as they come */
         path_take(s, s_us, nw);
         s->await_j = s->strag_until_wc = 0;
@@ -1049,7 +1105,7 @@ int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
         t->win_big   = 0;
         h->pkt = pkt; h->s_us = s_us; h->k_at = t->k_us; h->wc = nw; h->si = si; h->path = 0;
         for (int i = 0; i < t->nst; i++) {     /* a stream the window never classifies keeps its path */
-            t->st[i].old_end_us = t->st[i].last_us;
+            t->st[i].old_end_us = t->st[i].open_us = t->st[i].last_us;
             t->st[i].win_passed = 0;
             t->st[i].pass_wc    = 0;
         }
