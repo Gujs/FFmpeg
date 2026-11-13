@@ -648,9 +648,12 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
         W  = (atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 || (int64_t)g_preroll_ms >= 4000) ? 0 :
              FFMAX(input_wall_gap(t, first_new_wc),
                    vlw && first_new_wc != INT64_MAX && first_new_wc - vlw >= g_gap_min_us ? first_new_wc - vlw : 0);
+        /* T-467: damage near the EVENT (the window's open), not its close — a big step's window waits up to 3 s for its
+         * partner; counted from the close, the corrupt datagram at the step aged out and its lost picture was erased with
+         * the step (an own-clock audio 40 ms late for good: vt-ap-ownp, the audio silent inside the window) */
         for (si = 0; si < t->nst; si++)
             if (t->st[si].res == 1 && d->ts_outl && si < d->nb_streams_open &&
-                d->ts_outl[si].dmg_wc && nw - d->ts_outl[si].dmg_wc < W + 3000000)
+                d->ts_outl[si].dmg_wc && t->open_wc - d->ts_outl[si].dmg_wc < W + 3000000)
                 dmg = 1;
         if (J > 0) {
             /* damage hides lost content from the wall evidence (packets keep coming, pictures do not), but no more than
@@ -668,7 +671,8 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
                     const TlStream *s = &t->st[si];
                     if (s->dense && si != vs && s->res != 1 &&
                         d->ifmt->streams[si]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && flowing(t, s) && !sil_out &&
-                        !(d->ts_outl && si < d->nb_streams_open && d->ts_outl[si].dmg_wc && nw - d->ts_outl[si].dmg_wc < 3000000)) {
+                        !(d->ts_outl && si < d->nb_streams_open && d->ts_outl[si].dmg_wc &&
+                          t->open_wc - d->ts_outl[si].dmg_wc < 3000000)) {
                         keep = FFMIN(J, FFMAX((W + fd / 2) / fd * fd, dspan / fd * fd));
                         break;
                     }
