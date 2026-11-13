@@ -3019,18 +3019,26 @@ static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
                 /* 2.2.1 T-469: the dropped picture keeps its place on the timeline — the last picture the graph took,
                  * stamped with this one's time (a drop left a 0.12 s video PTS hole + a PCR gap at every rendition
                  * switch, vt-vsw: the first two pictures of each new size). A lone damaged picture is still never shown */
+                /* not while the source holds (bars / black after -freeze_max: a return in another rendition must not
+                 * show the pre-outage picture again); the repeat keeps the dropped picture's damage mark (the output
+                 * clock fills a gap in front of damage, leaps in front of anything else) and carries no captions (A/53
+                 * side data of the old picture would be sent twice) — Fable 5.2 review of T-469 */
                 if (d->hr_last && d->hr_last->width == in->w && d->hr_last->height == in->h &&
-                    d->hr_last->format == in->format && !d->hold) {
+                    d->hr_last->format == in->format && !ptv_src_holding()) {
                     AVFrame *rp = av_frame_clone(d->hr_last);
                     if (rp) {
                         int64_t bet = frame->best_effort_timestamp, dur = frame->duration;
+                        int dmg = av_dict_get(frame->metadata, "ptv_dmg", NULL, 0) != NULL;
                         av_frame_move_ref(frame, rp);
                         av_frame_free(&rp);
                         frame->best_effort_timestamp = bet;
+                        frame->pkt_dts = AV_NOPTS_VALUE;
                         if (dur > 0)
                             frame->duration = dur;
                         frame->flags &= ~AV_FRAME_FLAG_KEY;
                         frame->opaque = NULL;
+                        av_frame_remove_side_data(frame, AV_FRAME_DATA_A53_CC);
+                        av_dict_set(&frame->metadata, "ptv_dmg", dmg ? "1" : NULL, 0);
                         goto feed;
                     }
                 }
