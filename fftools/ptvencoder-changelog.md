@@ -5,6 +5,31 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.1-rc2 — rc1 + a source clock step taken by one stream at a time (T-463) + copied AC-3 after a clock step
+
+**A source clock step that video and audio take at different moments is one consistent offset (T-463).** The 2.2.1-rc1 soak,
+2026-11-12/13: PATRIOT-World_Harvest_Television (cow-2) — the source restarted its clock −41789 s, the video first, the audio
+0.5 s later after a +0.12 s hiccup of its own: the hiccup read as a crossing of its own closed the window on the video alone,
+the video went out "labels as sent" → hs +8.6 h and growing, ~12 dups/s, the audio packets dropped by the mux guard, RSS
++2 GB once. Fashion (live-transcoder) — the source's audio alone moved to a clock 10313 s ahead for 3 s while the pictures ran
+on: padded as a 10313 s audio loss → hs +10313 s for good, RSS +2 GB once. Now (`ptvencoder_timeline.c`):
+- the video decides a big step (back, or forward beyond its own silence) alone, whoever opened the window; an audio that has
+  not crossed with it is awaited on its new path for up to 5 s — its old-path sound goes on on the old offset (continuous
+  sound), its crossing is taken as it comes; one that never crosses keeps a clock of its own (repaired on the stream);
+- an audio stepping alone by more than 2 s while the pictures run on is a clock of its own, not loss: repaired on the stream,
+  decided as soon as its new run has gone on 0.3 s (no 1.8 s partner wait — in a mosaic the wait cost the other slots 150 ms
+  of sound); its return leg undoes it exactly; a video following by the same step undoes it with the video's program event;
+  a forward one only beyond the stream's own wall silence (+ bank / deep prime): a dead audio PID is loss, padded as before;
+- the clock-step repair is kept apart from the small-relabel repair (its bound and return leg never touch it); a video hole
+  under damage keeps whole lost pictures (floored, not rounded) when an un-stepped audio flowed through it.
+**Copied AC-3 dead after a joint clock step (pre-existing, found by the new key).** The copy gap watch measured "silence"
+from the last release; copies queued for the video (stamped where the video shows their content) read as absent after the
+event's window + keyframe wait + cushion, the fill ran ~1 s ahead of the real stamps and every real AC-3 frame was dropped
+at hand-back / as overlap, for good (measured dts − fill_end −0.97 s steady, 34–52 queued). A copy with packets queued for
+the video is no absence (`ptvencoder_demux.c`).
+Kit: 22 keys (scenarios `sync_vfirst`, `sync_aflip`, `sync_audio_gap` cut position; media-v18) — rc1 fails the PWHT,
+Fashion, audio-late, audio-first, no-wall and copied-AC-3 keys; rc2 passes all of them and the T-451/T-431/T-433 keys.
+
 ## 2.2.1-rc1 — 2.2.0 + the buffer of a rate-halved channel counts content, not pictures (T-461)
 
 **`-r max:30` on a 59.94 / 50 source keeps its full 1 s cushion (T-461).** cow-1, 2026-11-12 (first production use of
