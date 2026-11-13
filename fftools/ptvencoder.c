@@ -5704,6 +5704,15 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         av_log(NULL, AV_LOG_INFO,
                "ptvencoder: CUDA device %s (hwupload + deint + scale + nvenc all share it; created in %.1f s%s)\n",
                *ordbuf ? ordbuf : "0", dus / 1e6, g_cudadev.started ? " while the inputs opened" : "");
+    } else if (fcomplex && strstr(fcomplex, "hwupload") && hwdev && strstr(hwdev, "videotoolbox")) {
+        /* 2.2.1 T-469: -init_hw_device videotoolbox + a graph that uploads (hwupload, scale_vt) — the macOS stand-in of
+         * production's GPU path (hwupload + scale_cuda), so a test sees hwupload's real behaviour on a new picture size
+         * (a software scale re-configures by itself). Without a device hwupload cannot init at all */
+        if ((ret = av_hwdevice_ctx_create(&hw_device, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, NULL, NULL, 0)) < 0) {
+            av_log(NULL, AV_LOG_ERROR, "cannot create the VideoToolbox device: %s\n", av_err2str(ret));
+            goto end;
+        }
+        av_log(NULL, AV_LOG_INFO, "ptvencoder: VideoToolbox device for the filter graph (hwupload)\n");
     }
 
     /* shared filter graph: -filter_complex (N video inputs -> split/mosaic ->
