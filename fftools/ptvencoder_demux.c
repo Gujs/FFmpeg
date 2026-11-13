@@ -716,7 +716,13 @@ static void copy_gap_watch(DemuxArgs *d, int64_t now)
                        ps->cname);
             }
         }
-        if (!ps->sil || ps->real_end == AV_NOPTS_VALUE || now - FFMAX(ps->arr_wc, d->v_flow_since_us) < 1000000)
+        /* 2.2.1 T-463: packets queued for the video (vwait: stamped where the video shows their content, ~ the cushion
+         * after arrival) are no absence — measured from the last RELEASE, a joint clock step (window + keyframe wait +
+         * cushion > the 1 s damaged rule) started a fill ~1 s ahead of the real stamps: every real AC-3 packet then
+         * dropped at hand-back / as overlap and the fill restarted, for good (sync_ac3_vfirst: AC-3 dead 110 s; measured
+         * dts - fill_end = -0.97 s steady, nvwait 34-52) */
+        if (!ps->sil || ps->real_end == AV_NOPTS_VALUE || ps->nvwait ||
+            now - FFMAX(ps->arr_wc, d->v_flow_since_us) < 1000000)
             continue;
         /* 2.0.1 T-099: 1 s while the input is DAMAGED (corrupt video, or a corrupt-discarded packet on a transcoded
          * track, within 5 s), the T-379 rule of the transcoded track; clean sources keep 2 s. Measured (Cinestar
