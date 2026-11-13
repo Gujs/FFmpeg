@@ -2596,7 +2596,10 @@ static int slot_pump(AudioState *a)
 
     if (!a->slot_deferred || a->pts_set)
         return 0;
-    target = av_rescale(atomic_load_explicit(&g_mv_house_us, memory_order_relaxed), a->out_rate, 1000000);
+    /* 2.2.1 T-470: single input — the master's output position, 200 ms behind (the margin T-409 keeps) */
+    target = a->multiview ? av_rescale(atomic_load_explicit(&g_mv_house_us, memory_order_relaxed), a->out_rate, 1000000)
+                          : av_rescale(FFMAX(0, atomic_load_explicit(&g_house_out_us, memory_order_relaxed) - 200000),
+                                       a->out_rate, 1000000);
     lim    = a->pump_next + 2 * a->out_rate;
     while (ret >= 0 && a->pump_next + a->frame_size <= FFMIN(target, lim)) {
         AVFrame *f = av_frame_alloc();
@@ -2675,6 +2678,14 @@ static int audio_anchor_and_feed(AudioState *a, AVFrame *frame, int64_t h0)
             /* 2.0.2 T-386: a joining slot — the silence covered house 0 .. pump_next; real audio continues from there:
              * a frame before it is dropped, a gap after it is filled (from the silence's end, not from house 0) */
             int64_t pump_us = av_rescale(a->pump_next, 1000000, a->out_rate);
+            if (!a->multiview) {
+                /* 2.2.1 T-470 (born silent, single input): the audio door places a frame at content - h0 + house_skew,
+                 * not at its label — the join compares on that axis; while the door is in its vmap mode (holding /
+                 * within 30 s of a program event) the join waits, the pump keeps the silence going */
+                if (vm_mode(a)) { a->anchor_drop_pre++; return 0; }
+                if (g_avlock && a->house_skew)
+                    house_us += *a->house_skew;
+            }
             if (house_us < pump_us) { a->anchor_drop_pre++; return 0; }
             a->slot_deferred = 0;
             if (house_us > pump_us && frame->sample_rate > 0 && frame->nb_samples > 0) {
@@ -3619,6 +3630,18 @@ void *audio_thread(void *arg)
         }
         if (pkt && (pkt->flags & PTV_PKT_FLAG_SLOT_FILL)) {   /* 2.0.2 T-386: a deferred slot's silence, not a packet */
             av_packet_free(&pkt);
+            if (!a->multiview && !a->slot_deferred && !a->pts_set && !a->aq_npending && !a->apark_n) {
+                /* 2.2.1 T-470: born silent — the demux saw this planned track never decode while the video flowed */
+                int64_t h0;
+                pthread_mutex_lock(a->h0_lock); h0 = *a->h0; pthread_mutex_unlock(a->h0_lock);
+                if (h0 != AV_NOPTS_VALUE) {
+                    a->slot_deferred = 1;
+                    a->pump_next     = 0;
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-ANCHOR] a%d(in%d) born silent: no audio decoded while the video "
+                           "flowed %.0f s — silence on the house axis until real audio joins (PTV_BORN_SILENT_MS=0 off)\n",
+                           a->dbg_k, a->dbg_in, g_born_silent_us / 1e6);
+                }
+            }
             if ((ret = slot_pump(a)) < 0)
                 break;
             continue;

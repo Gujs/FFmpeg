@@ -741,6 +741,8 @@ int     g_hold_fill = 1;                       /* 2.0.0-pre6: audio fill during 
 int     g_copy_gapfill = 1;                    /* 2.0.0-pre9.4 (T-083): copied AC-3 gap fill / overlap drop */
 int     g_glue_htol = 5;                       /* §2.3 |H−1| tolerance, % (fixture-tuned, G4) */
 int64_t g_nbs_quantum_us = 100000;             /* fill quantum: 100ms of silence per sentinel */
+int64_t g_born_silent_us = 3000000;            /* 2.2.1 T-470: a planned track never decoded after this much video flow is
+                                                * born silent (PTV_BORN_SILENT_MS, 0 = off) */
 _Atomic int64_t g_acorrupt;
 _Atomic int64_t g_adamage_wc[PTV_MAX_AUDIO];   /* 2.0.0-pre9.3 (T-080 A2) */
 _Atomic int64_t g_rl_step_us[PTV_MAX_AUDIO], g_rl_wc[PTV_MAX_AUDIO], g_rl_seq[PTV_MAX_AUDIO], g_rl_undone[PTV_MAX_AUDIO];   /* 2.0.1 T-087 */
@@ -7582,6 +7584,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_REJOIN_MAP")) g_rejoin_map = 0; /* 2.0.0-pre6.1 kill switch: PTS jumps at a rejoin again */
     { const char *s = getenv("PTV_GLUE_HTOL_PCT");     if (s && atoi(s) > 0) g_glue_htol = atoi(s); }             /* tuning knob (G4) */
     { const char *s = getenv("PTV_NBS_QUANTUM_MS");    if (s && atoi(s) > 0) g_nbs_quantum_us = (int64_t)atoi(s) * 1000; }  /* TEST ONLY (G8) */
+    { const char *s = getenv("PTV_BORN_SILENT_MS");    if (s && atoi(s) >= 0) g_born_silent_us = (int64_t)atoi(s) * 1000; }  /* T-470 */
     /* TEST-ONLY overrides (PTV_WRAP_GUARD_S precedent): shorten the dwell/quiet windows or move
      * the band/slew so the F-gate fixtures can exercise storm/authority paths in bounded wall
      * time. NEVER set in production — the 5min/3min/80ms/2ms/s defaults are the owner-approved
