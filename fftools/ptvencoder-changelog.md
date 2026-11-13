@@ -5,6 +5,26 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.1-rc3 — rc2 + the await follows the content (T-464) + a small forward step of the video alone (T-466)
+
+**The awaited audio is judged against where its paths are now, not where they were (T-464).** Found by a code review of rc2,
+each case reproduced by a gate key first. rc2 compared a returning packet with the path ends frozen at its last packet:
+after a 3 s step back an audio silent 2 s returned on the new clock, read as old content, went out on the old offset and was
+repaired as a clock of its own after 5 s — lip sync −3 s for good (vt-apause); forward, an audio on its own clock that paused
+4.2 s on an 8 s step read as crossed (vt-ap-ownp, −8 s). Both paths now move on by the video's content progress since the
+audio's last old packet (never more than its own silence + 0.5 s; not the wall — a burst or stall moves the wall, not the
+labels); a packet on its own old cadence without a silence of its own is old (a video stall, a coarse interleave), after one
+it is judged by the content (vt-apause3: silent exactly the step, landing on the old cadence). A second program event inside
+the 5 s await (a second restart) re-awaited the audio with only its own step on its awaited path (vt-v2: 3 flashes without
+sound): an awaited audio now takes every later event — its awaited step and reference move by the step without its kept part,
+its old offset by the event's move; the await ends only on a near-exact return (< 150 ms).
+**A forward clock step of the video alone shorter than the window's wait + 2 s (T-466).** Rule C's veto "the audio flowed into
+the span the step skipped = the video's own hole" read the audio's old-path end after the window had waited for it (1.94 s):
+a 3 s step of the video with the audio on its own clock went out "labels as sent", lip sync −3 s for good (vt-ap-own). The
+veto now uses the audio's path end when the window opened (a real video hole: it had flowed up to the new labels already).
+Kit: 7 keys (vt-ap-ctl / vt-ap-own8 controls, vt-apause, vt-apause3, vt-ap-ownp, vt-v2, vt-ap-own; media-v23) — rc2 FAILs
+the 5 repro keys, rc3 passes all; T-465 (kit only): id3check no longer counts an item at the judged window's edge as extra.
+
 ## 2.2.1-rc2 — rc1 + a source clock step taken by one stream at a time (T-463) + copied AC-3 after a clock step
 
 **A source clock step that video and audio take at different moments is one consistent offset (T-463).** The 2.2.1-rc1 soak,
