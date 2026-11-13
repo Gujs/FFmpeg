@@ -2905,7 +2905,8 @@ static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
         if (dw && av_gettime_relative() - dw < 5000000)
             av_dict_set(&frame->metadata, "ptv_dmg", "1", 0);
     }
-    ptv_hold_note_frame(d, frame);       /* 2.0.0-pre9: the freeze picture + render timeline (T-078/T-079) */
+    if (!d->filtering)                   /* (with a graph: the FITTED picture, below — T-469) */
+        ptv_hold_note_frame(d, frame);   /* 2.0.0-pre9: the freeze picture + render timeline (T-078/T-079) */
     if (!d->filtering) {                 /* no graph: clone the decoded frame to each rung */
         if (frame->best_effort_timestamp != AV_NOPTS_VALUE)   /* source time in ist_tb (== out_tb) */
             frame->pts = frame->best_effort_timestamp;
@@ -3015,6 +3016,24 @@ static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
                     fflush(NULL);
                     _exit(4);
                 }
+                /* 2.2.1 T-469: the dropped picture keeps its place on the timeline — the last picture the graph took,
+                 * stamped with this one's time (a drop left a 0.12 s video PTS hole + a PCR gap at every rendition
+                 * switch, vt-vsw: the first two pictures of each new size). A lone damaged picture is still never shown */
+                if (d->hr_last && d->hr_last->width == in->w && d->hr_last->height == in->h &&
+                    d->hr_last->format == in->format && !d->hold) {
+                    AVFrame *rp = av_frame_clone(d->hr_last);
+                    if (rp) {
+                        int64_t bet = frame->best_effort_timestamp, dur = frame->duration;
+                        av_frame_move_ref(frame, rp);
+                        av_frame_free(&rp);
+                        frame->best_effort_timestamp = bet;
+                        if (dur > 0)
+                            frame->duration = dur;
+                        frame->flags &= ~AV_FRAME_FLAG_KEY;
+                        frame->opaque = NULL;
+                        goto feed;
+                    }
+                }
                 return;
             }
         } else
@@ -3035,6 +3054,12 @@ static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
             _exit(4);
         }
     }
+feed:
+    /* 2.2.1 T-469: the freeze picture is the one the graph takes — FITTED to its input size. Noted before the fit, a hold
+     * right after a rendition switch pushed a picture of another size into the graph: CUDA's hwupload failed ("Frame size
+     * or format changed without filter graph reinitialization"), [PTV-VGRAPH] exit 4 (glo-3 Stingray ~40 restarts/day;
+     * a VideoToolbox / software graph re-sized itself instead: vt-vsw-hole GRAPHSIZE FAIL) */
+    ptv_hold_note_frame(d, frame);
     frame->pts = frame->best_effort_timestamp;   /* carry source time through the graph */
     if (av_buffersrc_add_frame(d->fsrc, frame) < 0)   /* consumes frame */
         return;
