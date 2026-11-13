@@ -5,7 +5,7 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
-## 2.2.1-rc3 — rc2 + the await follows the content (T-464) + a small forward step of the video alone (T-466)
+## 2.2.1-rc3 — rc2 + the await follows the content (T-464) + a small forward step of the video alone (T-466) + damage at a step judged at its open (T-467)
 
 **The awaited audio is judged against where its paths are now, not where they were (T-464).** Found by a code review of rc2,
 each case reproduced by a gate key first. rc2 compared a returning packet with the path ends frozen at its last packet:
@@ -22,6 +22,11 @@ its old offset by the event's move; the await ends only on a near-exact return (
 the span the step skipped = the video's own hole" read the audio's old-path end after the window had waited for it (1.94 s):
 a 3 s step of the video with the audio on its own clock went out "labels as sent", lip sync −3 s for good (vt-ap-own). The
 veto now uses the audio's path end when the window opened (a real video hole: it had flowed up to the new labels already).
+**Damage at a big step is judged where the event began (T-467, pre-existing since 2.2).** The window of a big step waits up
+to 3 s for its partner; the damage test counted from its close, so the corrupt datagram at the step aged out in a long window
+and its lost picture was erased with the step — an audio on its own clock +40 ms late for good (vt-ap-ownp: the audio silent
+inside the window; its control with a shorter window kept the picture). The damage flag and the keep floor's "audio
+undamaged" test now count from the window's open, as the damage span already did.
 Kit: 7 keys (vt-ap-ctl / vt-ap-own8 controls, vt-apause, vt-apause3, vt-ap-ownp, vt-v2, vt-ap-own; media-v23) — rc2 FAILs
 the 5 repro keys, rc3 passes all; T-465 (kit only): id3check no longer counts an item at the judged window's edge as extra.
 
