@@ -83,6 +83,7 @@ typedef struct TlStream {
      * on the program clock, or TL_MUTE_US passed (then, once, the offset that keeps its labels where they were) */
     int     mute, mute_old;                   /* muted now / before this window's decision (its held old-path packets) */
     int64_t mute_wc, mute_rep;                /* since when; the offset its steps since would need (adopted at the bound) */
+    int64_t hk_us, hk_wc;                     /* T-481: the hole this stream kept alone (within its own silence) and when */
     int     clk_ok;                           /* clk_ref is set */
     int64_t clk_ref;                          /* the source's own A/V label offset: its labels (less a big offset) minus the
                                                * video's path at the same arrival time, while it is on the program clock */
@@ -684,7 +685,12 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
             const TlStream *v = &t->st[vs];
             int64_t jv = v->new_first_us - (v->old_end_us + (v->step_us ? v->step_us : 20000));
             int64_t ja = s->new_first_us - (s->old_end_us + (s->step_us ? s->step_us : 20000));
-            if (llabs(ja - jv) <= FFMAX(TL_SAME_US, llabs(jv) / 1000))
+            /* 2.2.1 T-481: an audio that already kept this outage's hole alone (its first packets after it, within its own
+             * silence) shows only the rest of the step here — the same outage, one program event: its kept hole counts
+             * (vt-t479v: video +6.04 s, the audio +2.84 s kept then +3.02 s — a 4.6 s video PTS hole as two events) */
+            int64_t hk = s->hk_wc && t->open_wc - s->hk_wc <= 3000000 ? s->hk_us : 0;
+            if (llabs(ja - jv) <= FFMAX(TL_SAME_US, llabs(jv) / 1000) ||
+                (hk && llabs(ja + hk - jv) <= FFMAX(TL_SAME_US, llabs(jv) / 1000)))
                 n_aud_cross++;
         } else if (s->res == 1)
             n_aud_cross++;
@@ -1291,6 +1297,8 @@ int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
         !(atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 || (int64_t)g_preroll_ms >= 4000) &&
         s_us - (s->last_us + s->step_us) <= nw - s->last_wc + tol_us(s)) {
         t->ev_n++;
+        s->hk_us = s_us - (s->last_us + s->step_us);   /* T-481: part of the outage a later program event may complete */
+        s->hk_wc = nw;
         av_log(NULL, AV_LOG_INFO, "[PTV-TL] in%d event #%"PRId64" (stream %d): hole kept — J %+.3f s within its own silence of "
                "%.3f s, labels as sent, no window\n", d->rsync_slot, t->ev_n, si,
                (s_us - (s->last_us + s->step_us)) / 1e6, (nw - s->last_wc) / 1e6);
