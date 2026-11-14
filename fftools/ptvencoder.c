@@ -552,6 +552,16 @@ int             g_reprime = 1;                /* PTV_REPRIME: when a glue drains
  * State is quantized + hysteretic (grow needs recurrence in 1h, shrink needs 6h silence) -> no
  * oscillation, no per-channel tuning; transitions log [PTV-CUSHION] and depth shows in -stats. */
 int             g_adapt_cushion = 1;
+/* 2.2.1 T-482 (owner 2026-11-14: GPU memory as lean as the ffmpeg CLI): the frame queues hold pictures AFTER the graph
+ * (hwupload + scale_cuda = GPU pictures), one copy per rung, and the CUDA pools never give a picture back. Fleet-measured
+ * (194 channels, r=0.99): VRAM = 315 MB + 12.2 MB x the deepest the queue has ever been — a stall + catch-up burst parked
+ * 160 pictures there for good (std sync_stop_10: 6.4 s; cor-1 after 600 h: median 2.2 GB a channel vs 0.9 GB after 6 h).
+ * The master publishes the setpoint + 8 ticks (in pictures) and the decoder waits while the master queue holds that
+ * many: a backlog stays COMPRESSED in video_q (what a frame synchronizer does), nothing is dropped, every timing reading
+ * that counts video_q + frame_q is unchanged. PTV_FQ_BP=0 reverts. */
+_Atomic int     g_fq_bp_lim;
+_Atomic int     g_fq_bp_wait;                 /* T-482: the decoder is waiting (video_q = backlog the servo counts) */
+int             g_fq_bp = 1;
 _Atomic int     g_frameq_depth;               /* DIAG: master video frame_q occupancy (frames), published each tick for the discontinuity logs */
 _Atomic int64_t g_vdmg_wc;                       /* 2.0.0-pre9.4 (T-083): wall time of the last corrupt video packet/frame */
 _Atomic int64_t g_vcorrupt_wc;                   /* 2.0.0 T-324: ... corrupt DATA only (no timeline step): the hold's clean rule */
@@ -2904,9 +2914,39 @@ static int hold_clean_pass(DecodeCtx *d, const AVFrame *frame)
     return 0;
 }
 
+/* 2.2.1 T-482: wait while the master queue holds the published limit (see g_fq_bp_lim). A master that takes no picture
+ * for 2 s (an output stall) releases it until the queue is below the limit again: the old drop-oldest backstop. */
+static void fq_backpressure(DecodeCtx *d)
+{
+    int64_t t0 = 0;
+    int lim;
+    if (!d->live || !d->frame_q[0])
+        return;
+    while ((lim = atomic_load_explicit(&g_fq_bp_lim, memory_order_relaxed)) > 0 &&
+           av_thread_message_queue_nb_elems(d->frame_q[0]) >= lim) {
+        int64_t nw = av_gettime_relative();
+        if (d->bp_off)
+            return;
+        atomic_store_explicit(&g_fq_bp_wait, 1, memory_order_relaxed);
+        if (!t0)
+            t0 = nw;
+        else if (nw - t0 > 2000000) {
+            d->bp_off = 1;
+            atomic_store_explicit(&g_fq_bp_wait, 0, memory_order_relaxed);
+            av_log(NULL, AV_LOG_WARNING, "[PTV-FQBP] the output took no picture for 2 s with %d queued — "
+                   "back-pressure released until the queue drains\n", lim);
+            return;
+        }
+        av_usleep(2000);
+    }
+    atomic_store_explicit(&g_fq_bp_wait, 0, memory_order_relaxed);
+    d->bp_off = 0;
+}
+
 static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
 {
     int i;
+    fq_backpressure(d);
     if (!hold_clean_pass(d, frame)) {
         av_frame_unref(frame);
         return;
@@ -7562,6 +7602,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_DECIMATE")) g_decimate = 0;         /* v0.9.15.2: keep pop-per-tick even for >house-rate sources (frame_q pins on surplus) */
     /* PTV_FRAMEQ stays HERE (not resolve_cushions()): the multiview hold.q alloc consumes
      * g_frameq_cap before resolve_cushions() runs in transcode() setup (0.9.18 M1). */
+    { const char *bp = getenv("PTV_FQ_BP"); if (bp && !atoi(bp)) g_fq_bp = 0; }   /* 2.2.1 T-482 */
     { const char *fq = getenv("PTV_FRAMEQ"); if (fq && atoi(fq) > 0) { int v = atoi(fq); if (v < PTV_FRAME_QDEPTH) v = PTV_FRAME_QDEPTH; if (v > 1024) v = 1024; g_frameq_cap = v; } }   /* frame_q (decode->output) capacity; raise + deep PTV_PREROLL_MS to absorb an ad-break decode-rate dip (AWE) */
     {   /* 0.9.16.5 postmortem guard: a frame_q deeper than the NVENC registration cache makes every
          * frame past the cache evict+re-register = 2 RM WRITE ioctls/frame/rung — at fleet scale that

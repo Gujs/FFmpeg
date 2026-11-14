@@ -788,6 +788,7 @@ typedef struct DecodeCtx {
     int              live;
     VideoHold       *hold;                    /* multiview: stage frames here (NULL = filter inline) */
     int64_t          rj_hold_id;              /* 2.0.0-pre6.1: the hold the rejoin map last armed for */
+    int              bp_off;                  /* 2.2.1 T-482: back-pressure gave up (the master stopped taking pictures) */
     int              rj_done;                 /* ... and whether it was applied */
     int64_t          hc_hold_id, hc_since, hc_flag_since, hc_last;   /* 2.0.0 T-324: the damaged hold's clean runs: frames
                                               * continuous / no corrupt data (wall us) */
@@ -1892,6 +1893,9 @@ extern int     g_reprime;
 extern int     g_adapt_cushion;
 extern CushionPlan g_cp;                 /* defined in ptvencoder_gate.c */
 extern _Atomic int     g_frameq_depth;
+extern _Atomic int     g_fq_bp_lim;
+extern _Atomic int     g_fq_bp_wait;
+extern int             g_fq_bp;
 extern _Atomic int64_t g_fq0_tail_pts;
 extern _Atomic int64_t g_vdmg_wc;
 extern _Atomic int64_t g_vcorrupt_n, g_hold_vcorrupt_n0;   /* 2.0.0 T-324: corrupt video events; the count when the hold began */

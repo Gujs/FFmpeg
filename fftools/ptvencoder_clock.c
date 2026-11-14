@@ -1427,6 +1427,12 @@ void *output_thread(void *arg)
                 int64_t nw = av_gettime_relative();
                 int64_t ep;
                 atomic_store_explicit(&g_frameq_depth, av_thread_message_queue_nb_elems(v->frame_q), memory_order_relaxed);
+                if (g_fq_bp && primed) {   /* 2.2.1 T-482: the decoder's limit = setpoint + 8 ticks, in pictures */
+                    int lim = sp_cap(v, g_curt.cur_sp + 8);
+                    if (v->src_per_us > 0 && v->src_per_us * 5 / 4 < v->tick_dur_us)
+                        lim = (int)((int64_t)lim * v->tick_dur_us / v->src_per_us);
+                    atomic_store_explicit(&g_fq_bp_lim, lim, memory_order_relaxed);
+                }
                 if (g_diag) {   /* video_q/mux_q: log only >=2s episodes — empty is their NORMAL state (consumer
                                  * drains instantly; sub-2s "refills" are sampling noise — the Cinestar lesson).
                                  * A >=2s video_q episode = a real input stall, still event-worthy. */
@@ -1614,6 +1620,12 @@ void *output_thread(void *arg)
                             v->hr->bk_have   = occ_ticks(v, av_thread_message_queue_nb_elems(v->dbg_video_q)) + occ;
                         }
                     }
+                    /* 2.2.1 T-482: while the decoder waits on the frame queue, video_q holds the backlog a free-running
+                     * decoder would have put into frame_q (2.2.1-rc4: the servo drained a burst from there and pinned on
+                     * a fast source — without it rich2997long-settle burst_once_6 kept +1.4 s, t471f 13.2 s vs 4.2 s).
+                     * The servo counts it; the bank margin above already reads video_q + frame_q. */
+                    if (v->dbg_video_q && atomic_load_explicit(&g_fq_bp_wait, memory_order_relaxed))
+                        occ += occ_ticks(v, av_thread_message_queue_nb_elems(v->dbg_video_q));
                     atomic_store_explicit(&v->hr->rho_corr_ppm,
                         ptv_src_holding() || rj_park ? 0 :   /* 2.2.1 T-472: nor is the wait for a rejoin's slot */
                         house_rate_corr_ppm(v->hr, v->est, occ, sp_cap(v, g_curt.cur_sp), sp_cap(v, base_sp), v->tick_dur_us, damaged, quiet),
