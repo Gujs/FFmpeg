@@ -443,6 +443,8 @@ typedef struct SyncChk {
     int         n;                  /* ... this many of them */
     int64_t     led, own, last;     /* the last reading: its ledger part, the exempt own-clock offset, the sum */
     int64_t     log_wc;             /* PTV_DIAG: the last "undecided" line */
+    int         rl_nov;             /* 2.2.1 T-480 step 5: an erase of this watch got NO relabel/repeat verdict */
+    int         steps;              /* ... bounded corrections taken (the stats / end tally) */
 } SyncChk;
 
 /* 0.9.18 M3 — CushionRt: the runtime COORDINATION home for cushion escalation (map §1.3).
@@ -1780,6 +1782,7 @@ extern int     g_dmgstat;   /* 2.0.2 T-402: no step / cadence statistics across 
 extern int     g_pestail;   /* 2.0.0-pre4c: PES-tail wall-gap carry for video wall evidence (PTV_NO_PESTAIL=1 off) */
 extern int     g_rlcheck;   /* 2.0.1 T-087: content check of a backward audio erase (PTV_NO_RLCHECK=1 off) */
 extern int     g_synchk;    /* 2.2.1 T-480: the post-event sync check, observe only (PTV_NO_SYNCCHK=1 off) */
+extern int     g_synchk_step; /* 2.2.1 T-480 step 5: the sync check takes its one bounded step (PTV_NO_B2STEP=1 = observe) */
 extern double  g_rl_relabel_max;   /* 2.0.2 T-391 */
 extern int     g_voutlier;  /* 2.0.1 T-383: one-picture timestamp outlier restamped (PTV_NO_VOUTLIER=1 off) */
 /* 2.0.0-pre6.1 (T-077): rejoin map — content that comes back AHEAD of the house after a hold (the WUCR stretch at the
