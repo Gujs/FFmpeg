@@ -1989,6 +1989,28 @@ static inline int ptv_src_holding(void)
 {
     return g_src_hold_act && atomic_load_explicit(&g_src_state, memory_order_relaxed);
 }
+/* 2.2.1 T-472: the cushion is primed again at a LIVE LOSS / NEW DOMAIN rejoin. The output played its frame queue out
+ * into the hole, and the rejoin map put the first returning picture on the very next house tick: an empty queue for
+ * good (sync_holes: content age 1.74 s -> 0.97 s, refilled at ~1 % by the servo; house_skew -2.24 s). Now the map leaves
+ * the base cushion's worth of the lead unmapped (g_rj_prime_us, the master's sp_cap(base_sp) in house time) and each
+ * rung's output thread keeps repeating until the returning picture's own slot comes up (g_rj_parking: the master is
+ * doing so), while the queue fills behind it. Never more than the lead, so no latency is added; a BURST rejoin and a
+ * STOP/CONT catch-up (content behind the house) are not touched. PTV_NO_RJ_PRIME=1 = off. */
+extern int             g_rj_prime;
+extern int             g_reprime_quiet_off;     /* T-472: no RE-PRIME while no video arrives (ptvencoder_clock.c) */
+extern _Atomic int     g_rj_hold_seq0;           /* master: g_rj_cls_seq when the current / last hold began */
+extern _Atomic int     g_rj_parking;
+extern _Atomic int64_t g_rj_prime_us;
+static inline int ptv_rj_prime_class(void)      /* this hold's rejoin is classified, and not as BURST */
+{
+    int cls;
+    if (!g_rj_prime || !g_src_hold_act ||
+        atomic_load_explicit(&g_rj_cls_seq, memory_order_acquire) ==
+        atomic_load_explicit(&g_rj_hold_seq0, memory_order_relaxed))
+        return 0;
+    cls = atomic_load_explicit(&g_rj_cls, memory_order_relaxed);
+    return cls == 2 || cls == 3;
+}
 /* 2.0.0-pre8.5: has house_skew taken its post-rejoin value? (cls_seq0 = g_rj_cls_seq when the fill began.) BURST at
  * once; LIVE LOSS when the master showed the content jump; NEW DOMAIN at the jump or 200 ms after the rejoin (LAYERA
  * re-bases it). Shared by the transcoded rejoin buffer and the copied-audio park, so the two cannot drift apart again
@@ -2003,7 +2025,9 @@ static inline int ptv_rj_settled(int cls_seq0, int64_t now)
     switch (atomic_load_explicit(&g_rj_cls, memory_order_relaxed)) {
     case 1:  return 1;
     case 2:  return atomic_load_explicit(&g_src_jump_wc, memory_order_relaxed) >= rj;
-    default: return atomic_load_explicit(&g_src_jump_wc, memory_order_relaxed) >= rj || now - rj > 200000;
+    default: return atomic_load_explicit(&g_src_jump_wc, memory_order_relaxed) >= rj ||
+                    (now - rj > 200000 &&                 /* 2.2.1 T-472: not while the returning picture still waits */
+                     !atomic_load_explicit(&g_rj_parking, memory_order_acquire));
     }
 }
 /* 2.0.0 T-315: has the input come back as a BURST (a sender catching up a pause) since cls_seq0? Only then are frames
@@ -2184,6 +2208,7 @@ void ptv_rsync_post_edit(DemuxArgs *d, int s, int64_t delta_us);
 void ptv_vwait_rebase(DemuxArgs *d, int64_t from_us, int64_t old_end_us, int64_t open_wc, int64_t open_pos,
                       int64_t open_vn, int64_t dpo);
 int  ptv_tl_settling(DemuxArgs *d);
+int  ptv_tl_muted(DemuxArgs *d, int si);   /* 2.2.1 T-480: the stream is off the program clock, its packets not sent */
 extern int64_t g_gap_min_us;
 int ptv_slot_acquire(struct Input *in, int idx);   /* 2.0.2 T-386 */
 /* ptvencoder_mv.c */

@@ -216,6 +216,34 @@ static int sp_cap(const VideoCtx *v, int sp)
     return sp < cap ? sp : cap;
 }
 
+/* 2.2.1 T-472: does this picture, just taken from the frame queue, wait for its slot? The first picture of a LIVE LOSS /
+ * NEW DOMAIN return whose content index lies ahead of the next tick by no more than the base cushion: where rejoin_map
+ * left it. During the hold or within 3 s of its end (a pre-gap PES tail can end the hold first; rejoin_map decides up
+ * to 2 s after it, and its picture must still find this door open). Once per classified rejoin (*seq_done). Decided
+ * from the content index and published state only, so every rung shows the picture on the same output tick. A picture
+ * further ahead (PTV_NO_REJOIN_MAP=1) is the old leap. */
+static int rj_prime_park(VideoCtx *v, const AVFrame *f, int64_t last_vpts, int base_sp, int *seq_done)
+{
+    int seq = atomic_load_explicit(&g_rj_cls_seq, memory_order_acquire);
+    int64_t nc;
+
+    if (!ptv_rj_prime_class() || seq == *seq_done || f->opaque == &ptv_hold_tag)
+        return 0;
+    if (!ptv_src_holding()) {
+        int64_t rj = atomic_load_explicit(&g_src_rejoin_wall, memory_order_relaxed);
+        if (!rj || av_gettime_relative() - rj > 3000000)
+            return 0;
+    }
+    nc = content_index(v, f->pts);
+    if (nc <= last_vpts + 1 || nc - last_vpts - 1 > sp_cap(v, base_sp) + 2)
+        return 0;
+    *seq_done = seq;
+    if (v->is_master)
+        av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 rejoin: the returning picture waits %.2f s for its slot while the "
+               "frame queue fills (PTV_NO_RJ_PRIME=1 reverts)\n", (nc - last_vpts - 1) * v->tick_dur_us / 1e6);
+    return 1;
+}
+
 /* ---- -cc_extract: EIA-608 -> DVB-teletext emitter (see the CcTap header in ptvencoder.h) ----
  * This lives in this file for ONE reason: content_index() above is the single copy of the
  * house-clock stamping arithmetic, and the captions must ride exactly it. The decode thread
@@ -787,7 +815,7 @@ void *cc_thread(void *arg)
  * state machine and clock-follow latch live in *hr, the published estimator rates in
  * *est (0.9.18 R3/R4). Master thread only — non-reentrant. */
 static int64_t house_rate_corr_ppm(HouseRateState *hr, const RateEstimator *est,
-                                   int occ, int sp, int base_sp, int64_t tick_dur_us, int damaged)
+                                   int occ, int sp, int base_sp, int64_t tick_dur_us, int damaged, int quiet)
 {
     /* PROPORTIONAL occupancy servo (v0.9.6). The earlier INTEGRAL servo (corr += K·err)
      * oscillated: the buffer is itself an integrator (ρ → consume-rate → ∫ → occupancy),
@@ -810,7 +838,13 @@ static int64_t house_rate_corr_ppm(HouseRateState *hr, const RateEstimator *est,
     /* 2.0.1 T-381 (measured, 50 % loss): no RE-PRIME while the source is damaged — an empty queue there is lost
      * content (the decoder waits for an IDR), not a buffer to refill: the house ran 0.77x for 10 s and the output
      * caught up with a 3.32 s video PTS hole when the pictures came back. A damaged phase ends an engagement. */
-    if (g_reprime && !damaged && occ <= (base_sp + 1) / 2) {       /* RE-PRIME: drained below half the BASE floor (true starvation —
+    /* 2.2.1 T-472: nor while no video arrives (quiet): the queue empties because the source stopped, not because
+     * the buffer runs low — slowing the house then only plays the last cushion out at 0.77x and leaves the content
+     * that ahead of the house when it returns (sync_holes: hs -1.2 s for good, mapped by the rejoin). The state
+     * machine is left as it is: arrivals resuming inside an engagement continue it. PTV_REPRIME_QUIET=1 reverts */
+    if (quiet) {
+        ;
+    } else if (g_reprime && !damaged && occ <= (base_sp + 1) / 2) {       /* RE-PRIME: drained below half the BASE floor (true starvation —
                                                                     * NOT the adaptive raised target). Slow the house HARD to refill fast.
                                                                     * 0.9.10.1 state machine: an engagement lasts AT MOST 10s, then a 300s
                                                                     * cooldown applies unconditionally — occupancy oscillating around the
@@ -1098,6 +1132,9 @@ void *output_thread(void *arg)
         int64_t vo_extra = 0;   /* 2.0.0-pre9.8 (T-076): video-only repeat ticks kept out of house_skew */
         int64_t vo_prev_c = -1; int vo_fresh_n = 0;   /* 2.0.0 T-345: content of the previous fresh frame; fresh frames since a vo hold */
         int vgap_park = 0;                          /* 2.0.0-pre9.4 (T-083): nextf is a frame parked behind a content gap */
+        int rj_park = 0, rj_park_n = 0, rj_park_seq = 0;   /* 2.2.1 T-472: nextf is a rejoin's first picture waiting for
+                                                     * its slot; ticks waited; the g_rj_cls_seq that had its wait */
+        int64_t blk_wc = 0;                         /* T-472: when this rung last showed its own black picture */
         int64_t vgap_filled = 0, vgap_log_wc = 0;   /* ticks filled since the last [PTV-VFILL] line */
         int64_t svo_cr = 0, svo_dmg_wc = 0;        /* T-083: corrupt count seen by the servo + when it last moved */
         unsigned rff_bits = 0;
@@ -1111,13 +1148,26 @@ void *output_thread(void *arg)
         int fresh = 0, cadence_hold = 0;
         if (v->is_master)
             PTV_HB_OUT(PTV_HB_OUT_LOOP);   /* 1.0.1-pre21 heartbeat: stats-thread loop top */
-        if (g_pulldown && (film_arm || slow_arm) && have) {   /* film cadence / a slower source: pop by content time */
+        /* 2.2.1 T-472: a rejoin's first picture waits in nextf until its slot is due (rj_prime_park). These ticks are
+         * the hold's own repeats — a dup each, the hold picture on air, house_skew and the fills' clock moving on — not
+         * cadence residence, so the audio fill runs up to the tick the picture is shown on. Bounded by the base cushion
+         * (+2 ticks: h0 or the map moving under it must not hold the picture back) */
+        if (rj_park && (!next_have || content_index(v, nextf->pts) <= last_vpts + 1 ||
+                        ++rj_park_n > sp_cap(v, base_sp) + 2))
+            rj_park = 0;
+        if (rj_park) {
+            ;                                       /* repeat; nextf is promoted below once it is due */
+        } else if (g_pulldown && (film_arm || slow_arm) && have) {   /* film cadence / a slower source: pop by content time */
             if (!next_have) {
                 ret = av_thread_message_queue_recv(v->frame_q, &f, AV_THREAD_MESSAGE_NONBLOCK);
-                if (ret >= 0) { nextf = f; next_have = 1; }
+                if (ret >= 0) {
+                    nextf = f; next_have = 1;
+                    rj_park   = rj_prime_park(v, f, last_vpts, base_sp, &rj_park_seq);   /* 2.2.1 T-472 */
+                    rj_park_n = 0;
+                }
                 else if (ret == AVERROR_EOF) break; /* pending nextf was already promoted (recv only when empty) */
             }
-            if (next_have) {
+            if (next_have && !rj_park) {
                 int64_t nc = content_index(v, nextf->pts);
                 /* residence CAP: film holds a picture 1 tick extra at most (3:2); a slower source as many as its
                  * cadence needs (29.97 in 59.94: 1, 25 in 59.94: 2) */
@@ -1178,6 +1228,11 @@ void *output_thread(void *arg)
                         pp_n   = 0;
                         pp_t0  = ps;
                     }
+                }
+                if (ret >= 0 && have && rj_prime_park(v, f, last_vpts, base_sp, &rj_park_seq)) {
+                    nextf = f; next_have = 1; rj_park = 1; rj_park_n = 0;   /* 2.2.1 T-472: before the gap fill — these
+                                                                             * ticks are repeats, not residence */
+                    break;
                 }
                 if (ret >= 0 && g_vgapfill && have && f->opaque != &ptv_hold_tag) {
                     /* 2.0.0-pre9.4 (T-083): a content gap INSIDE frame_q (frames lost or corrupt-discarded at the
@@ -1549,16 +1604,19 @@ void *output_thread(void *arg)
                     }
                     /* 2.0.0-pre4: a hold is not a rate signal — nominal pacing, no REPRIME (it would run
                      * the house at 0.77x, then 1.5 % slow, for as long as the source is gone) */
+                    int quiet = 0;
                     if (v->dbg_video_q) {   /* 2.0.1 T-361: the bank margin at the last video arrival */
                         int64_t arr = atomic_load_explicit(&g_src_vread_wc, memory_order_relaxed);
+                        quiet = g_reprime_quiet_off && arr &&   /* 2.2.1 T-472: no video read for 0.5 s (4 ticks at least) */
+                                av_gettime_relative() - arr > FFMAX(500000, 4 * v->tick_dur_us);
                         if (arr && arr != v->hr->bk_arr_wc) {
                             v->hr->bk_arr_wc = arr;
                             v->hr->bk_have   = occ_ticks(v, av_thread_message_queue_nb_elems(v->dbg_video_q)) + occ;
                         }
                     }
                     atomic_store_explicit(&v->hr->rho_corr_ppm,
-                        ptv_src_holding() ? 0 :
-                        house_rate_corr_ppm(v->hr, v->est, occ, sp_cap(v, g_curt.cur_sp), sp_cap(v, base_sp), v->tick_dur_us, damaged),
+                        ptv_src_holding() || rj_park ? 0 :   /* 2.2.1 T-472: nor is the wait for a rejoin's slot */
+                        house_rate_corr_ppm(v->hr, v->est, occ, sp_cap(v, g_curt.cur_sp), sp_cap(v, base_sp), v->tick_dur_us, damaged, quiet),
                         memory_order_relaxed);
                 }
                 int64_t corr = atomic_load_explicit(&v->hr->rho_corr_ppm, memory_order_relaxed);
@@ -1673,6 +1731,10 @@ void *output_thread(void *arg)
                                       ? av_rescale(vpts, 1000000LL * v->out_fps.den, v->out_fps.num)
                                       : vpts * v->tick_dur_us, memory_order_relaxed);
                 atomic_store_explicit(&g_house_tick_us, v->tick_dur_us, memory_order_relaxed);
+                /* 2.2.1 T-472: the base cushion in house time (what rejoin_map leaves unmapped), and whether the
+                 * master is waiting for a rejoin's slot (before the tick that ends the hold publishes the rejoin) */
+                atomic_store_explicit(&g_rj_prime_us, (int64_t)sp_cap(v, base_sp) * v->tick_dur_us, memory_order_relaxed);
+                atomic_store_explicit(&g_rj_parking, rj_park, memory_order_release);
             }
             if (src_ts != AV_NOPTS_VALUE)   /* [PTV-CHAIN] video source-content being emitted (us); any rung (same content) */
                 atomic_store_explicit(&g_ch_vout_src, av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q), memory_order_relaxed);
@@ -1735,7 +1797,8 @@ void *output_thread(void *arg)
              * frozen frame. A black DUP: same props and content pts as the held frame, so house_skew, the
              * sensors and the audio fill see an ordinary repeat. Dropped as soon as fresh content returns. */
             AVFrame *emit = held;
-            if (!fresh && ptv_src_holding()) {
+            if (!fresh && (ptv_src_holding() || rj_park)) {   /* 2.2.1 T-472: also while a rejoin's first picture
+                                                               * waits for its slot — the hold is over by then */
                 int64_t hs0 = atomic_load_explicit(&g_src_hold_start, memory_order_relaxed);
                 int64_t nw  = av_gettime_relative();
                 /* 2.0.0-pre9 (T-078/T-079): the decode thread renders the hold picture through the graph once per
@@ -1746,13 +1809,18 @@ void *output_thread(void *arg)
                     AVFrame *np = atomic_exchange_explicit(v->hold_pic, NULL, memory_order_acq_rel);
                     if (np) { av_frame_free(&hpic); hpic = np; hpic_wc = nw; }
                 }
-                if (hpic && nw - hpic_wc < 1000000) {
+                if (hpic && (nw - hpic_wc < 1000000 || rj_park)) {   /* T-472: no picture is rendered while real
+                                                                      * frames flow — the last one stays */
                     hpic->pts = held->pts; hpic->pkt_dts = AV_NOPTS_VALUE; hpic->duration = 0; hpic->opaque = NULL;
                     emit = hpic;
-                } else if (g_hold_black || (g_freeze_max_us > 0 && hs0 && nw - hs0 >= g_freeze_max_us)) {
+                } else if (g_hold_black || (g_freeze_max_us > 0 && hs0 && nw - hs0 >= g_freeze_max_us) ||
+                           (rj_park && blk_wc && nw - blk_wc < 500000)) {   /* T-472: black was on air: it stays (the
+                                                                             * hold's start time is gone, and a pre-gap
+                                                                             * tail may have been shown in between) */
                     if (black_like(&blk, held) >= 0) {
                         emit = blk;
-                        if (!blk_logged && v->is_master)
+                        blk_wc = nw;
+                        if (!blk_logged && v->is_master && !rj_park)
                             av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 held picture \xe2\x86\x92 black (%s)\n",
                                    g_hold_black ? "-hold black" : "-freeze_max reached");
                         blk_logged = 1;
@@ -1796,13 +1864,18 @@ void *output_thread(void *arg)
                     atomic_store_explicit(&g_hold_vcorrupt_n0, atomic_load_explicit(&g_vcorrupt_n, memory_order_relaxed),
                                           memory_order_relaxed);   /* 2.0.0 T-324 */
                     atomic_store_explicit(&g_src_hold_start, nw, memory_order_relaxed);
+                    atomic_store_explicit(&g_rj_hold_seq0, atomic_load_explicit(&g_rj_cls_seq, memory_order_acquire),
+                                          memory_order_relaxed);   /* 2.2.1 T-472: before the state — a class needs it */
                     atomic_store_explicit(&g_src_state, 1, memory_order_relaxed);
                     src_note = nw + 60000000; src_lost_logged = 0;
                     av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 LIVE \xe2\x86\x92 STALLED%s: frame queue and "
                            "video_q empty, no video for %.1f s (threshold %.1f s)\n", g_src_hold_act ? "" : " (observe-only)",
                            (nw - arr) / 1e6, thr / 1e6);
                 }
-            } else if (fresh) {
+            } else if (fresh || rj_park) {   /* 2.2.1 T-472: the returning picture is here — the hold ends on the tick it
+                                              * would have been shown on before, although it waits for its slot. Held
+                                              * on, the audio would drop the returning sound as fragments of the hold
+                                              * and emit_video would put the bars on every returning picture (T-474) */
                 int64_t hs0 = atomic_load_explicit(&g_src_hold_start, memory_order_relaxed);
                 atomic_store_explicit(&g_src_state, 0, memory_order_relaxed);
                 atomic_store_explicit(&g_src_hold_start, 0, memory_order_relaxed);

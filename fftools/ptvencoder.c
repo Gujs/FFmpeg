@@ -219,6 +219,10 @@ int ptv_vmap_lookup(int64_t c_us, int64_t *out_us, int64_t *gap_us)
 _Atomic int64_t g_vdisp_skew_us;   /* 2.0.0 T-095: master: (vpts - content index) of the last fresh frame, us */
 _Atomic int64_t g_dup_out_us;   /* 2.0.0-pre9.4 (T-083): output time on ticks whose content did not advance */
 int             g_rejoin_map = 1;
+int             g_rj_prime = 1;          /* 2.2.1 T-472 (ptvencoder.h) */
+int             g_reprime_quiet_off = 1; /* 2.2.1 T-472: no RE-PRIME while no video arrives; PTV_REPRIME_QUIET=1 reverts */
+_Atomic int     g_rj_hold_seq0, g_rj_parking;
+_Atomic int64_t g_rj_prime_us;
 int64_t         g_hold_clean_us = 1000000;
 int             g_vo_hold = 1;   /* 2.0.0-pre9.8 (T-076): audio keeps its own clock while only the video is gone; PTV_NO_VO_HOLD=1 off */
 int64_t g_rscorr_slew_fast      = 5000;            /* pre29 adaptive corrector slew above 150ms |R|
@@ -2814,6 +2818,14 @@ static void rejoin_map(DecodeCtx *d, const AVFrame *frame)
     qn   = d->frame_q[0] ? av_thread_message_queue_nb_elems(d->frame_q[0]) : 0;
     next = atomic_load_explicit(&g_house_out_us, memory_order_relaxed) + tick * (1 + qn);   /* a frame that misses
                                                                                               * its tick costs one dup */
+    /* 2.2.1 T-472: a LIVE LOSS / NEW DOMAIN return is shown one base cushion from now, not on the next tick — the
+     * output threads wait that long with it while the frame queue fills (rj_prime_park). Only the rest of the lead is
+     * mapped; a lead inside the cushion is not mapped at all and the picture waits for its own slot. */
+    if (ptv_rj_prime_class()) {
+        int64_t pr = atomic_load_explicit(&g_rj_prime_us, memory_order_relaxed);
+        if (pr > tick * (1 + qn))
+            next += pr - tick * (1 + qn);
+    }
     lead = pos - next;
     if (g_diag && d->rj_dbg_n < 16) {   /* 2.0.0-pre8.2: [PTV-RJTRACE] (canary B: the map cancelled — localize) */
         d->rj_dbg_n++;
@@ -7606,6 +7618,8 @@ int main(int argc, char **argv)
     if (getenv("PTV_CC_NO_REWRAP")) g_cc_rewrap = 0;   /* 2.0.0 T-023(b) */
     { const char *hc = getenv("PTV_HOLD_CLEAN_MS"); if (hc) g_hold_clean_us = (int64_t)atoi(hc) * 1000; }   /* 2.0.0 T-324 */
     if (getenv("PTV_NO_REJOIN_MAP")) g_rejoin_map = 0; /* 2.0.0-pre6.1 kill switch: PTS jumps at a rejoin again */
+    if (getenv("PTV_NO_RJ_PRIME")) g_rj_prime = 0;
+    if (getenv("PTV_REPRIME_QUIET")) g_reprime_quiet_off = 0;   /* 2.2.1 T-472 kill switch */     /* 2.2.1 T-472 kill switch: a rejoin starts on an empty frame queue */
     { const char *s = getenv("PTV_GLUE_HTOL_PCT");     if (s && atoi(s) > 0) g_glue_htol = atoi(s); }             /* tuning knob (G4) */
     { const char *s = getenv("PTV_NBS_QUANTUM_MS");    if (s && atoi(s) > 0) g_nbs_quantum_us = (int64_t)atoi(s) * 1000; }  /* TEST ONLY (G8) */
     { const char *s = getenv("PTV_BORN_SILENT_MS");    if (s && atoi(s) >= 0) g_born_silent_us = (int64_t)atoi(s) * 1000; }  /* T-470 */
