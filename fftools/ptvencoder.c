@@ -2898,6 +2898,30 @@ static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
         av_frame_unref(frame);
         return;
     }
+    /* 2.2.1 T-474: a picture that CONTINUES the last real pre-hold picture (within two picture steps) while the hold already
+     * shows bars / black is the pre-gap PES tail lavf hands out with the first post-gap packet (T-074): it ends the hold
+     * (the state machine needs it) but its PICTURE was the old frozen one flashed back on air after the bars (1 picture on
+     * a plain 12 s hole; 9 when the return came in a new rendition: the tail + its dups + the T-469 repeats of it). It
+     * keeps its time and its place; it carries the hold's picture. (Dropping it instead broke the rejoin: rc4-dev4.) */
+    /* only while still holding: after a STOP/CONT the returning content CONTINUES the pre-gap timeline (delayed, not
+     * lost) — carrying the hold picture on every continuing frame put bars on air for good (rc4-dev9: sync_stop_10 /
+     * kill_return_20 live share 0.01). Residual: a return in a new rendition keeps one stale picture (vt-vsw-bars) */
+    if (g_hold_render && d->hr_real_set && d->hr_dur > 0 && ptv_src_holding() && ptv_hold_bars_pic(d, frame)) {
+        int64_t dt = frame->best_effort_timestamp - d->hr_real_pts;
+        if (frame->best_effort_timestamp != AV_NOPTS_VALUE && dt > 0 && dt <= 2 * d->hr_dur) {
+            AVFrame *bp = ptv_hold_bars_pic(d, frame);
+            AVFrame *rp = bp ? av_frame_clone(bp) : NULL;
+            if (rp && av_frame_copy_props(rp, frame) >= 0) {
+                av_log(NULL, AV_LOG_INFO, "[PTV-SRC] in0 a pre-gap picture (+%.0f ms after the last one shown) after "
+                       "the bars carries the hold picture\n", av_q2d(d->ist_tb) * dt * 1000.0);
+                av_frame_side_data_free(&rp->side_data, &rp->nb_side_data);
+                rp->opaque = NULL;
+                av_frame_unref(frame);
+                av_frame_move_ref(frame, rp);
+            }
+            av_frame_free(&rp);
+        }
+    }
     rejoin_map(d, frame);                /* 2.0.0-pre6.1 (single input: emit_video is the non-mosaic path) */
     {   /* 2.0.0-pre9.4 (T-083): a frame decoded within 5 s of corrupt video is damage-era — the output clock fills a
          * content gap in front of it (frames lost); in front of any other frame a gap is the old leap (a backlog drain,

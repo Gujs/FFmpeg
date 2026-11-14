@@ -788,6 +788,8 @@ typedef struct DecodeCtx {
     /* 2.0.0-pre9 (T-078/T-079): hold pictures rendered through the graph while input 0 holds */
     AVFrame         *hr_last;                 /* ref of the last decoded frame (single input; shape + freeze picture) */
     int64_t          hr_pts, hr_dur;          /* next render pts / one frame, in ist_tb */
+    int64_t          hr_real_pts;             /* 2.2.1 T-474: the last REAL picture's pts (ist_tb; hr_pts runs on in a hold) */
+    int              hr_real_set;
     int64_t          hr_next;                 /* wall us of the next render */
     struct HoldPic  *hr_pic;                  /* bars / slate / black picture cache */
     /* filter graph: filtering -> N buffersinks (one per rung); else clone decode */
@@ -1897,6 +1899,7 @@ extern _Atomic(AVFrame *) g_hold_pic[PTV_MAX_RUNG];
 extern const char      ptv_hold_tag;     /* &ptv_hold_tag in AVFrame.opaque marks a rendered hold picture */
 int  ptv_hold_slate_load(const char *path);
 void ptv_hold_render(DecodeCtx *d);      /* decode thread, video_q empty: render one picture when due */
+AVFrame *ptv_hold_bars_pic(DecodeCtx *d, const AVFrame *frame);   /* 2.2.1 T-474 */
 void ptv_hold_note_frame(DecodeCtx *d, const AVFrame *frame);   /* emit_video: a real decoded frame */
 void ptv_hold_route(AVFrame *out, int rung);   /* a rendered picture leaving the graph → the rung's slot */
 AVFrame *ptv_hold_cell_pic(void **state, const AVFrame *ref, int64_t elapsed_us);   /* 2.0.0: a dead mosaic cell's
