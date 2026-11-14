@@ -87,11 +87,13 @@ typedef struct TlStream {
     int64_t clk_ref;                          /* the source's own A/V label offset: its labels (less a big offset) minus the
                                                * video's path at the same arrival time, while it is on the program clock */
     int64_t clk_cand, clk_cand_wc;            /* a new offset its labels as sent settle on (2 s steady: the new truth) */
+    int64_t big_pub;                          /* T-480: rep_big as last published to the sync check (g_rsx.eo_us) */
 } TlStream;
 
 struct PtvTimeline {
     int64_t   k_us;
     int64_t   ev_n, strag_n, drop_n, mute_n;
+    int64_t   ev_pub;                   /* T-480: ev_n as last published to the sync check (g_rsx.tl_ev) */
     int       active, trig, nst, cap;   /* nst = streams followed; cap = st[] room (2.2: adoption) */
     int       win_big;                  /* T-451: the trigger stepped more than TL_BIG_US */
     int64_t   open_wc, open_s_us;
@@ -1104,6 +1106,19 @@ int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
         return ptv_demux_dispatch(d, pkt);
     s = &t->st[si];
     s->dense = is_dense(d, si);
+    /* T-480 (the sync check, observe only): the event number and this stream's own-clock offset, as they stood after
+     * its previous packet — the ledgers they belong to were posted then, and both are events to the check */
+    if (t->ev_n != t->ev_pub && d->rsync_slot >= 0 && d->rsync_slot < PTV_MAX_INPUT) {
+        t->ev_pub = t->ev_n;
+        atomic_store_explicit(&g_rsx.tl_ev[d->rsync_slot], t->ev_n, memory_order_relaxed);
+    }
+    if (s->rep_big != s->big_pub) {
+        int j;
+        s->big_pub = s->rep_big;
+        for (j = 0; j < d->n_audio; j++)
+            if (d->astream[j] == si && d->aglobal[j] >= 0 && d->aglobal[j] < PTV_MAX_AUDIO)
+                atomic_store_explicit(&g_rsx.eo_us[d->aglobal[j]], s->rep_big, memory_order_relaxed);
+    }
 
     /* 2.2.1 T-463: an audio a clock-step program event left behind (await_j = the video's step). A packet nearer its old
      * path than the path it is awaited on is old content: it goes out on the old offset (the source's audio clock lags

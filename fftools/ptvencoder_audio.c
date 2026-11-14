@@ -222,7 +222,12 @@ static RsyncTrackR rsync_track_R(const AudioState *a, int64_t now)
     if (!r.mv_wall || !r.ma_wall || now - r.mv_wall > 3000000 || now - r.ma_wall > 3000000)
         return r;
     r.L_us = atomic_load_explicit(&g_rsx.ev_us[in], memory_order_relaxed)
-           - atomic_load_explicit(&g_rsx.ea_us[k],  memory_order_relaxed);
+           - atomic_load_explicit(&g_rsx.ea_us[k],  memory_order_relaxed)
+           + atomic_load_explicit(&g_rsx.eo_us[k],  memory_order_relaxed);   /* 2.2.1 T-480: an adopted clock of its own
+                                                                              * (rep_big) is the stream's own timing, not a
+                                                                              * desync: lipsync= read +10313001 ms through
+                                                                              * aflip60's adopted offset (in sync on air) —
+                                                                              * sync_check would have restarted it */
     r.R_us = atomic_load_explicit(&g_rsx.mv_ema[in], memory_order_relaxed) - a->rs_ma_ema + r.L_us;
     if (g_rscorr_testwalk_us_s == 0) {
         const char *tw = getenv("PTV_RSCORR_TESTWALK");
@@ -803,6 +808,200 @@ static void ptv_label_step(AudioState *a, int64_t step, int64_t now)
     a->glue_events++;                   /* corrector event edge: it re-dwells fresh */
     a->acomp_exp_us  = AV_NOPTS_VALUE;  /* deliberate step, not a click risk */
 }
+
+/* ===================== 2.2.1 T-480 step 4 — the post-event sync check (B2), OBSERVE ONLY =====================
+ * After every event on a track's input, once its source is clean again, read the track's A/V offset from the terms
+ * that are exact at once and say what ONE bounded step would do. Nothing is changed here: one [PTV-SYNCCHK] line per
+ * (track, event). R = vring + ledger  [+ = audio early, the stats line's lipsync= convention]:
+ *   vring  = out_v(C) - out_a(C) for the same label C, per emitted frame, no averaging (av_offset_us): the PLACEMENT
+ *            error (a hold's rejoin, the door, the slot's delay line). Blind to label edits by construction
+ *   ledger = (ev - ea) + own + relabels - glue_off: what was done to the LABELS of this stream and not to the video's.
+ *            ev / ea = the demux ledgers; own = the offset of an audio on a clock of its own (the timeline's rep_big:
+ *            its placement by design, part of ea); relabels = the erases the content check judged relabels (T-087,
+ *            rl_neutral_us); glue_off = this door's own label steps. Exact, step-accurate
+ * This is the sensor's R (m_v - m_a + ev - ea) without its two ~30 s averages — where the false readings after an
+ * event live (the decaying reading after a kept hole, T-446; the re-seeds) — so a step taken as glue_off += R retires
+ * exactly R ([PTV-ANCHOR] algebra, ptv_label_step). A resampler slip (rs_slip_us) is waited out, not added.
+ * Event  = any feed below moved (synchk_event). Clean = this track's own input only, no sibling (synchk_unclean).
+ * Decision = PTV_SC_CLEAN_US clean and PTV_SC_AGREE_US of paired readings within +-PTV_SC_TOL_US.
+ * PTV_NO_SYNCCHK=1 off. */
+#define PTV_SC_CLEAN_US   3000000   /* the source is clean after this long with no event, damage, hold or fill */
+#define PTV_SC_AGREE_US   2000000   /* ... and a decision needs the readings to agree for this long */
+#define PTV_SC_TOL_US       10000   /* ... within +- this */
+#define PTV_SC_MIN_N           20   /* ... over at least this many paired frames */
+#define PTV_SC_BAND_US      25000   /* in sync within this (the golden rule's bound) */
+#define PTV_SC_CAP_US     5000000   /* a step beyond this would never be taken */
+#define PTV_SC_BUDGET_US 10000000   /* decided within this of a clean source, or said so (once) */
+#define PTV_SC_HS_US      4000000   /* single input: a house_skew step is in flight through a buffering -af filter
+                                     * (loudnorm, 3 s) this long: the frames at the sink still carry the old value */
+
+/* An event on this track's input. Every feed is read and consumed, so one event with several faces fires once; the
+ * most specific name wins. NULL = none. */
+static const char *synchk_event(AudioState *a)
+{
+    SyncChk *s = &a->sc;
+    const char *why = NULL;
+    int64_t v;
+    int     b;
+
+    v = a->corr_epoch ? atomic_load_explicit(a->corr_epoch, memory_order_relaxed) : 0;
+    if (v != s->epoch_snap) { s->epoch_snap = v; why = "input event"; }             /* a timeline window opened */
+    v = atomic_load_explicit(&g_rsx.tl_ev[a->dbg_in], memory_order_relaxed);
+    if (v != s->tl_snap)    { s->tl_snap = v;    why = "timeline event"; }          /* a [PTV-TL] event line */
+    v = atomic_load_explicit(&g_rsx.ev_us[a->dbg_in], memory_order_relaxed) -
+        atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed);
+    if (v != s->led_snap)   { s->led_snap = v;   why = "label edit on one stream"; }  /* repair, undo, adopted offset */
+    if (a->glue_events != s->glue_snap)   { s->glue_snap = a->glue_events;     why = "label step at the door"; }
+    if (a->afmt_rebuilds != s->afmt_snap) { s->afmt_snap = a->afmt_rebuilds;   why = "audio format switch"; }
+    if (a->dec_reopens != s->reopen_snap) { s->reopen_snap = a->dec_reopens;   why = "decoder reopen"; }
+    b = a->nbs_fill_active;                                    /* the track's silence fill (absent, muted T-480) */
+    if (s->fill_snap && !b)
+        why = "silence fill ended";
+    s->fill_snap = b;
+    if (a->multiview) {                                        /* the slot's own bit: T-386 join, return from the slate */
+        b = (atomic_load_explicit(&g_mv_slate_mask, memory_order_relaxed) >> a->dbg_in) & 1;
+        if (s->slate_snap && !b)
+            why = "slot joined / returned";
+        s->slate_snap = b;
+    } else {
+        v = atomic_load_explicit(&g_src_rejoin_wall, memory_order_relaxed);
+        if (v != s->rejoin_snap) { s->rejoin_snap = v; why = "hold ended"; }
+    }
+    if (!s->init) {
+        s->init = 1;
+        why = "start";
+    }
+    return why;
+}
+
+/* Why this track's source is not clean right now, NULL = clean. Its own input and its own door only: no sibling slot
+ * freezes it. */
+static const char *synchk_unclean(AudioState *a, int64_t now)
+{
+    SyncChk *s = &a->sc;
+    int64_t v;
+
+    if (!a->multiview && a->house_skew) {                      /* (a slot's lag step is taken on its content boundary) */
+        int64_t hs = *a->house_skew;
+        if (llabs(hs - s->hs_last) > PTV_SC_TOL_US / 2)        /* a step, not the servo's walk */
+            s->hs_wc = now;
+        s->hs_last = hs;
+    }
+    if (a->nbs_fill_active)
+        return "the track is filled with silence";
+    if (a->multiview ? s->slate_snap : ptv_src_holding())
+        return a->multiview ? "the slot is slated" : "the source is held";
+    v = a->v_arrive_wc ? atomic_load_explicit(a->v_arrive_wc, memory_order_relaxed)
+                       : atomic_load_explicit(&g_v_arrive_wc, memory_order_relaxed);
+    if (!v || now - v > 1000000)
+        return "the input is not flowing";
+    v = atomic_load_explicit(&g_rsx.mv_wall[a->dbg_in], memory_order_relaxed);
+    if (!v || now - v > 1000000)
+        return "no pictures shown";
+    if (a->rl_pend || a->rl_undo_us)
+        return "a relabel verdict is pending";                 /* T-087 / T-395: wait for it */
+    if (a->reanch_wc || a->pend_comp_us || a->reanch_mono)
+        return "a label step is in flight at the door";
+    if (a->rs_slip_us)
+        return "the resampler has not settled";
+    if (s->hs_wc && now - s->hs_wc < PTV_SC_HS_US)
+        return "a house_skew step is in flight";
+    return NULL;
+}
+
+/* One call per emitted frame, after the vring pairing. */
+static void synchk_update(AudioState *a, int64_t now)
+{
+    SyncChk *s = &a->sc;
+    const char *ev, *bad;
+    int64_t dmg, clean;
+    int paired = s->paired;
+
+    s->paired = 0;
+    if (!g_synchk || !g_rsync_sense || a->dbg_k < 0 || a->dbg_k >= PTV_MAX_AUDIO ||
+        a->dbg_in < 0 || a->dbg_in >= PTV_MAX_INPUT)
+        return;
+    ev = synchk_event(a);
+    if (ev) {                                                  /* events before the decision merge into one watch */
+        if (!s->watch)
+            s->log_wc = now;
+        s->ev_n++;
+        s->ev_why   = ev;
+        s->ev_wc    = now;
+        s->watch    = 1;
+        s->dirty_wc = now;
+        s->n        = 0;
+    }
+    bad = synchk_unclean(a, now);
+    if (!s->watch)
+        return;
+    if (!bad && !paired)
+        bad = "no picture pairs with this sound";              /* a fill phase, the ring restarted (T-089, T-093) */
+    /* corrupt data: this track's (decode errors, discarded packets) and, single input, the video's. A mosaic has no
+     * per-slot video stamp (g_mv_vdmg_wc is never written): there a slot's corrupt video counts by its timeline events */
+    dmg = FFMAX(a->dmg_wc, atomic_load_explicit(&g_adamage_wc[a->dbg_k], memory_order_relaxed));
+    if (!a->multiview) {
+        dmg = FFMAX(dmg, atomic_load_explicit(&g_vdmg_wc, memory_order_relaxed));
+        dmg = FFMAX(dmg, atomic_load_explicit(&g_vcorrupt_wc, memory_order_relaxed));
+    }
+    if (bad || dmg > s->dirty_wc) {
+        s->dirty_wc = bad ? now : FFMIN(dmg, now);
+        s->n        = 0;
+    } else {
+        int64_t own = atomic_load_explicit(&g_rsx.eo_us[a->dbg_k], memory_order_relaxed);
+        int64_t led = atomic_load_explicit(&g_rsx.ev_us[a->dbg_in], memory_order_relaxed) -
+                      atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed) +
+                      own + a->rl_neutral_us - a->glue_off_us;
+        int64_t r   = a->av_offset_us + led;
+        if (!s->n || FFMAX(s->hi, r) - FFMIN(s->lo, r) > 2 * PTV_SC_TOL_US) {
+            s->n        = 0;                                   /* the reading moved: agreement starts again here */
+            s->agree_wc = now;
+            s->lo = s->hi = r;
+        }
+        s->lo = FFMIN(s->lo, r);
+        s->hi = FFMAX(s->hi, r);
+        s->n++;
+        s->led  = led;
+        s->own  = own;
+        s->last = r;
+    }
+    clean = now - s->dirty_wc;
+    if (!bad && s->n >= PTV_SC_MIN_N && clean >= PTV_SC_CLEAN_US && now - s->agree_wc >= PTV_SC_AGREE_US) {
+        int64_t mid = (s->lo + s->hi) / 2;
+        char slow[32] = "--";
+        if (a->rs_ma_seed)                                     /* the averaged sensor's reading now, to compare */
+            snprintf(slow, sizeof(slow), "%+"PRId64" ms",
+                     (atomic_load_explicit(&g_rsx.mv_ema[a->dbg_in], memory_order_relaxed) - a->rs_ma_ema +
+                      atomic_load_explicit(&g_rsx.ev_us[a->dbg_in], memory_order_relaxed) -
+                      atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed)) / 1000);
+        av_log(NULL, llabs(mid) <= PTV_SC_BAND_US ? AV_LOG_INFO : AV_LOG_WARNING,
+               "[PTV-SYNCCHK] a%d(in%d) after event %"PRId64" (%s, timeline #%"PRId64"): %s %+"PRId64" ms (ledger %+"PRId64
+               " vring %+"PRId64" ms, agree %.1f s, clean %.1f s, %.1f s after the event; own clock %+"PRId64" ms exempt; "
+               "lipsync %s)  [+ = audio early; observe only, PTV_NO_SYNCCHK=1 off]\n",
+               a->dbg_k, a->dbg_in, s->ev_n, s->ev_why, s->tl_snap,
+               llabs(mid) <= PTV_SC_BAND_US ? "in sync" :
+               llabs(mid) <= PTV_SC_CAP_US  ? "would step" : "beyond the 5 s cap, would not step",
+               mid / 1000, s->led / 1000, (mid - s->led) / 1000, (now - s->agree_wc) / 1e6, clean / 1e6,
+               (now - s->ev_wc) / 1e6, s->own / 1000, slow);
+        s->watch = 0;
+    } else if (!bad && clean >= PTV_SC_BUDGET_US) {
+        av_log(NULL, AV_LOG_INFO,
+               "[PTV-SYNCCHK] a%d(in%d) after event %"PRId64" (%s, timeline #%"PRId64"): no steady reading in %.0f s of "
+               "clean source (last %+"PRId64" ms, %d readings within %"PRId64" ms for %.1f s): would not step  "
+               "[+ = audio early; observe only]\n",
+               a->dbg_k, a->dbg_in, s->ev_n, s->ev_why, s->tl_snap, clean / 1e6, s->last / 1000, s->n,
+               (s->hi - s->lo) / 1000, (now - s->agree_wc) / 1e6);
+        s->watch = 0;
+    } else if (g_diag && now - s->log_wc >= 10000000) {        /* the default log gets the decision only */
+        s->log_wc = now;
+        av_log(NULL, AV_LOG_INFO,
+               "[PTV-SYNCCHK] a%d(in%d) after event %"PRId64" (%s, timeline #%"PRId64"): undecided %.0f s after it — %s "
+               "(clean %.1f s, %d readings, last %+"PRId64" ms)\n",
+               a->dbg_k, a->dbg_in, s->ev_n, s->ev_why, s->tl_snap, (now - s->ev_wc) / 1e6,
+               bad ? bad : clean < PTV_SC_CLEAN_US ? "the source is clean, waiting" : "the readings do not agree yet",
+               clean / 1e6, s->n, s->last / 1000);
+    }
+}
 /* ======================================================================================= */
 
 /* -af path: drain the filtergraph's (fixed-size) output frames straight to the
@@ -1294,7 +1493,8 @@ static int audio_drain_fg(AudioState *a)
                     if (mvw) {
                         int64_t mv = atomic_load_explicit(&g_rsx.mv_ema[a->dbg_in], memory_order_relaxed);
                         int64_t ev = atomic_load_explicit(&g_rsx.ev_us[a->dbg_in],  memory_order_relaxed);
-                        int64_t ea = atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed);
+                        int64_t ea = atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed) -
+                                     atomic_load_explicit(&g_rsx.eo_us[a->dbg_k], memory_order_relaxed);   /* T-480 */
                         int64_t dm = mv - a->rs_ma_ema;
                         a->rs_log_last = nowr;
                         av_log(NULL, AV_LOG_INFO,
@@ -1355,7 +1555,9 @@ static int audio_drain_fg(AudioState *a)
                                                                        * composition lags the audio drain in WALL time). */
                     /* Latch the latest measurement for the [PTV-AVSYNC] line (PTV_DIAG-only since v0.9.2). */
                     a->av_offset_us = offset; a->av_vlag_us = vlag; a->av_alag_us = alag; a->av_off_valid = 1;
+                    a->sc.paired = 1;                                /* T-480: this frame's reading is fresh */
                 }
+                synchk_update(a, av_gettime_relative());             /* T-480 step 4: observe only */
             }
             /* v0.9.2 — aresample WORK RATE (always-on, primary track only). The honest measure is the
              * RATE of change of the audio's realized output-vs-content span: d(outspan − content)/d(wall)

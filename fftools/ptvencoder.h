@@ -350,6 +350,11 @@ typedef struct RsyncSense {
     _Atomic int64_t uev_us[PTV_MAX_INPUT];  /* per-slot VIDEO unevidenced deletions */
     _Atomic int64_t uea_us[PTV_MAX_AUDIO];  /* per-track AUDIO unevidenced deletions (demux side;
                                              * the door adds its own AudioState.u_door_us) */
+    /* 2.2.1 T-480 (the sync check, observe only): the part of ea_us that is the offset of an audio on a clock of its
+     * own (the timeline's rep_big: placed by design, no desync), and the input's [PTV-TL] event number. The slot's
+     * demux thread writes both (ptv_tl_ingest) */
+    _Atomic int64_t eo_us[PTV_MAX_AUDIO];
+    _Atomic int64_t tl_ev[PTV_MAX_INPUT];
     int             n_a;                    /* transcoded tracks wired (pre16: = n_audio ALWAYS, mv included) */
     int             a_in[PTV_MAX_AUDIO];    /* track → input slot map (stats printers; plain int,
                                              * set in transcode() before threads spawn) */
@@ -420,6 +425,25 @@ typedef struct CorrState {          /* all owned by that track's audio thread (�
                                      * process (10s of trim failed to close R — re-arming would
                                      * walk the same doomed staircase); logged once at the cap */
 } CorrState;
+
+/* 2.2.1 T-480 step 4 — the post-event sync check (B2), OBSERVE ONLY: see synchk_update() in ptvencoder_audio.c.
+ * One per transcoded track, owned by its audio thread. */
+typedef struct SyncChk {
+    int         init;               /* the feeds are snapshotted (the first frame = event "start") */
+    int         watch;              /* an event is waiting for its decision */
+    int         paired;             /* this frame's sound found its picture in the vring (set by the pairing) */
+    int64_t     ev_n;               /* this track's events so far (the id on the line) */
+    const char *ev_why;             /* ... what the last one was */
+    int64_t     ev_wc;              /* ... and its wall time */
+    int64_t     epoch_snap, tl_snap, led_snap, rejoin_snap;     /* event feeds, consumed */
+    int         glue_snap, afmt_snap, reopen_snap, fill_snap, slate_snap;
+    int64_t     hs_last, hs_wc;     /* single input: house_skew at the last frame, wall time of its last step */
+    int64_t     dirty_wc;           /* the source is clean since here (the last event, damage, hold, fill ...) */
+    int64_t     agree_wc, lo, hi;   /* the readings agree since here, within [lo, hi] */
+    int         n;                  /* ... this many of them */
+    int64_t     led, own, last;     /* the last reading: its ledger part, the exempt own-clock offset, the sum */
+    int64_t     log_wc;             /* PTV_DIAG: the last "undecided" line */
+} SyncChk;
 
 /* 0.9.18 M3 — CushionRt: the runtime COORDINATION home for cushion escalation (map §1.3).
  * Holds the per-run wiring every escalation event needs (the per-rung delivery gates, the
@@ -1193,6 +1217,7 @@ typedef struct AudioState {
      * evaluation, never corrupts state). afmt_rebuilds counts [PTV-AFMT] path rebuilds — a
      * rebuild is an event (§4.4). */
     CorrState        corr;
+    SyncChk          sc;                              /* 2.2.1 T-480: the post-event sync check (observe only) */
     _Atomic int_least64_t *corr_epoch;                /* -> Input.house_disturb (event feed) */
     int              afmt_rebuilds;                   /* [PTV-AFMT] rebuild count (corrector event feed) */
     /* 1.0.1-pre16: per-input event feeds (this track's OWN input slot; NULL → global
@@ -1753,6 +1778,7 @@ extern int64_t g_novideo_exit_us;        /* 1.0.1-pre23 startup sanity: packets 
 extern int     g_dmgstat;   /* 2.0.2 T-402: no step / cadence statistics across corrupt-discarded packets (PTV_NO_DMGSTAT=1 off) */
 extern int     g_pestail;   /* 2.0.0-pre4c: PES-tail wall-gap carry for video wall evidence (PTV_NO_PESTAIL=1 off) */
 extern int     g_rlcheck;   /* 2.0.1 T-087: content check of a backward audio erase (PTV_NO_RLCHECK=1 off) */
+extern int     g_synchk;    /* 2.2.1 T-480: the post-event sync check, observe only (PTV_NO_SYNCCHK=1 off) */
 extern double  g_rl_relabel_max;   /* 2.0.2 T-391 */
 extern int     g_voutlier;  /* 2.0.1 T-383: one-picture timestamp outlier restamped (PTV_NO_VOUTLIER=1 off) */
 /* 2.0.0-pre6.1 (T-077): rejoin map — content that comes back AHEAD of the house after a hold (the WUCR stretch at the
