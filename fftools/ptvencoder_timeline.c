@@ -719,7 +719,10 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
              * clock step forward of the video alone, the audio on its own clock, read as a hole after a 1.94 s window:
              * labels as sent, lip sync -3 s for good — vt-ap-own) */
             if (s->dense && si != vs && d->ifmt->streams[si]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
-                jv > 0 && s->ok && s->open_us > v->new_first_us - TL_BIG_US)
+                jv > 0 && s->ok && s->open_us > v->new_first_us - TL_BIG_US &&
+                !(own_off(s) && llabs(own_off(s) + jv) < TL_SAME_US))   /* T-480: not an audio that took this very step
+                                                                         * first (muted on its raw clock: its path is on
+                                                                         * the new labels already — vt-nowall-afwd) */
                 vdec = 0;
         }
         for (si = 0; si < t->nst && vdec; si++) {
