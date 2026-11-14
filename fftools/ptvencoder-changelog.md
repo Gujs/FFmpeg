@@ -5,6 +5,32 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.1-rc5 — rc4 + audio off the program clock is muted (T-480), the sync check (observe), lipsync= after an adopted offset, a clock step right after an outage (T-481), GPU memory bounded (T-482), the rejoin park (T-472)
+
+**Golden rule (owner 2026-11-14): A/V sync perfect again as soon as possible after any interruption.**
+**An audio whose clock leaves the program clock while pictures run is muted (T-480).** Like a frame synchronizer: silence
+until it is back on the program clock; still off steadily after 10 s (or when the await ends) its offset is adopted —
+at most 10 s of silence, never a silent channel. The rule that repaired a single-stream step on the stream ("a clock of
+its own", rule B) is deleted: measured over 2-3 days on the sandbox it fired 19 times, never on a real own-clock audio
+(TruBLU joint splices, Adrenaline+ = T-475, RAV = T-479). TruBLU-type splices: no silence. PTV_TL_NO_MUTE=1 reverts.
+**lipsync= no longer reads an adopted offset as desync.** It read +10313001 ms for 50 s while in sync on air, which would
+have made sync_check restart a channel that was right.
+**Sync check after an event (observe only).** Once the source is clean after an event, [PTV-SYNCCHK] logs the offset a
+bounded correction would step out; nothing is changed yet (step 5 arms it). PTV_NO_SYNCCHK=1 off.
+**A clock step right after an outage is one program event (T-481).** Input silent ~3 s, then video + PCR +3 s and the
+audio's +3 s a moment later: the audio had kept the outage's hole alone first and the video's step went out "labels as
+sent" — a 4.6 s video PTS hole (2.2.0, rc4). The audio's own kept hole now counts as the partner: kept 3.0 s, erased 3.0 s.
+**GPU memory bounded (T-482, owner).** The frame queues hold GPU pictures (after hwupload / scale), one per rung, and the
+CUDA pools never shrink: fleet VRAM = 315 MB + 12.2 MB x the deepest the queue has been (194 channels, r = 0.99); a stall
+with a catch-up burst parked 160 pictures there for good (cor-1 after 600 h: median 2.2 GB a channel, 0.9 GB after 6 h).
+The decoder now waits while the master queue holds the setpoint + 8 ticks: a backlog stays compressed, nothing is
+dropped, latency and lip sync unchanged. PTV_FQ_BP=0 reverts.
+**Rejoin (T-472).** A LIVE LOSS / NEW DOMAIN return's first picture waits one base cushion; no RE-PRIME while no video
+arrives for 0.5 s (PTV_REPRIME_QUIET=1 reverts).
+Logs: every [PTV-TL] line names its input / slot (in%d).
+Kit: T-479 ~3 s all-source holes (single + mosaic), designed-mute judge (--mute-ok), aflip60 / tl003 / vfirst keys,
+T056_SENSOR_AFTER, T056_FQHW_MAX + T-482 keys.
+
 ## 2.2.1-rc4 — rc3 + an ABR size switch survived (T-469), a source without audio carries silence (T-470), the PES tail after bars (T-474), the rc2 regression after outages (T-475)
 
 **After an outage the T-463 rules stay out (T-475, a regression since rc2).** After an input silence of the stall class

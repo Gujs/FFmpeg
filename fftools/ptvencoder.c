@@ -47,7 +47,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.2.1-rc4"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.2.1-rc5"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -98,6 +98,7 @@ int     g_dmgstat = 1;             /* 2.0.2 T-402: see ptvencoder_demux.c (demux
 int     g_pestail = 1;             /* 2.0.0-pre4c: see ptvencoder_demux.c (PES-TAIL carry) */
 int     g_rlcheck = 1;             /* 2.0.1 T-087: content check of a backward audio erase (PTV_NO_RLCHECK=1 off) */
 int     g_rlundo = 1;              /* 2.0.2 T-395: a silent no-verdict audio erase is undone (PTV_NO_RLUNDO=1 off) */
+int     g_synchk = 1;              /* 2.2.1 T-480: the post-event sync check, observe only (PTV_NO_SYNCCHK=1 off) */
 double  g_rl_relabel_max = 0.3;    /* 2.0.2 T-391: a RELABEL verdict needs the repeat correlation below this (PTV_RL_RELABEL_MAX; 2.0.1: 0.5) */
 int     g_voutlier = 1;            /* 2.0.1 T-383: one-picture timestamp outlier restamped (PTV_NO_VOUTLIER=1 off) */
 _Atomic int64_t g_rj_off_total, g_rj_off_before, g_rj_from_us;   /* 2.0.0-pre6.1 rejoin map */
@@ -219,6 +220,10 @@ int ptv_vmap_lookup(int64_t c_us, int64_t *out_us, int64_t *gap_us)
 _Atomic int64_t g_vdisp_skew_us;   /* 2.0.0 T-095: master: (vpts - content index) of the last fresh frame, us */
 _Atomic int64_t g_dup_out_us;   /* 2.0.0-pre9.4 (T-083): output time on ticks whose content did not advance */
 int             g_rejoin_map = 1;
+int             g_rj_prime = 1;          /* 2.2.1 T-472 (ptvencoder.h) */
+int             g_reprime_quiet_off = 1; /* 2.2.1 T-472: no RE-PRIME while no video arrives; PTV_REPRIME_QUIET=1 reverts */
+_Atomic int     g_rj_hold_seq0, g_rj_parking;
+_Atomic int64_t g_rj_prime_us;
 int64_t         g_hold_clean_us = 1000000;
 int             g_vo_hold = 1;   /* 2.0.0-pre9.8 (T-076): audio keeps its own clock while only the video is gone; PTV_NO_VO_HOLD=1 off */
 int64_t g_rscorr_slew_fast      = 5000;            /* pre29 adaptive corrector slew above 150ms |R|
@@ -547,6 +552,16 @@ int             g_reprime = 1;                /* PTV_REPRIME: when a glue drains
  * State is quantized + hysteretic (grow needs recurrence in 1h, shrink needs 6h silence) -> no
  * oscillation, no per-channel tuning; transitions log [PTV-CUSHION] and depth shows in -stats. */
 int             g_adapt_cushion = 1;
+/* 2.2.1 T-482 (owner 2026-11-14: GPU memory as lean as the ffmpeg CLI): the frame queues hold pictures AFTER the graph
+ * (hwupload + scale_cuda = GPU pictures), one copy per rung, and the CUDA pools never give a picture back. Fleet-measured
+ * (194 channels, r=0.99): VRAM = 315 MB + 12.2 MB x the deepest the queue has ever been — a stall + catch-up burst parked
+ * 160 pictures there for good (std sync_stop_10: 6.4 s; cor-1 after 600 h: median 2.2 GB a channel vs 0.9 GB after 6 h).
+ * The master publishes the setpoint + 8 ticks (in pictures) and the decoder waits while the master queue holds that
+ * many: a backlog stays COMPRESSED in video_q (what a frame synchronizer does), nothing is dropped, every timing reading
+ * that counts video_q + frame_q is unchanged. PTV_FQ_BP=0 reverts. */
+_Atomic int     g_fq_bp_lim;
+_Atomic int     g_fq_bp_wait;                 /* T-482: the decoder is waiting (video_q = backlog the servo counts) */
+int             g_fq_bp = 1;
 _Atomic int     g_frameq_depth;               /* DIAG: master video frame_q occupancy (frames), published each tick for the discontinuity logs */
 _Atomic int64_t g_vdmg_wc;                       /* 2.0.0-pre9.4 (T-083): wall time of the last corrupt video packet/frame */
 _Atomic int64_t g_vcorrupt_wc;                   /* 2.0.0 T-324: ... corrupt DATA only (no timeline step): the hold's clean rule */
@@ -2814,6 +2829,14 @@ static void rejoin_map(DecodeCtx *d, const AVFrame *frame)
     qn   = d->frame_q[0] ? av_thread_message_queue_nb_elems(d->frame_q[0]) : 0;
     next = atomic_load_explicit(&g_house_out_us, memory_order_relaxed) + tick * (1 + qn);   /* a frame that misses
                                                                                               * its tick costs one dup */
+    /* 2.2.1 T-472: a LIVE LOSS / NEW DOMAIN return is shown one base cushion from now, not on the next tick — the
+     * output threads wait that long with it while the frame queue fills (rj_prime_park). Only the rest of the lead is
+     * mapped; a lead inside the cushion is not mapped at all and the picture waits for its own slot. */
+    if (ptv_rj_prime_class()) {
+        int64_t pr = atomic_load_explicit(&g_rj_prime_us, memory_order_relaxed);
+        if (pr > tick * (1 + qn))
+            next += pr - tick * (1 + qn);
+    }
     lead = pos - next;
     if (g_diag && d->rj_dbg_n < 16) {   /* 2.0.0-pre8.2: [PTV-RJTRACE] (canary B: the map cancelled — localize) */
         d->rj_dbg_n++;
@@ -2891,9 +2914,39 @@ static int hold_clean_pass(DecodeCtx *d, const AVFrame *frame)
     return 0;
 }
 
+/* 2.2.1 T-482: wait while the master queue holds the published limit (see g_fq_bp_lim). A master that takes no picture
+ * for 2 s (an output stall) releases it until the queue is below the limit again: the old drop-oldest backstop. */
+static void fq_backpressure(DecodeCtx *d)
+{
+    int64_t t0 = 0;
+    int lim;
+    if (!d->live || !d->frame_q[0])
+        return;
+    while ((lim = atomic_load_explicit(&g_fq_bp_lim, memory_order_relaxed)) > 0 &&
+           av_thread_message_queue_nb_elems(d->frame_q[0]) >= lim) {
+        int64_t nw = av_gettime_relative();
+        if (d->bp_off)
+            return;
+        atomic_store_explicit(&g_fq_bp_wait, 1, memory_order_relaxed);
+        if (!t0)
+            t0 = nw;
+        else if (nw - t0 > 2000000) {
+            d->bp_off = 1;
+            atomic_store_explicit(&g_fq_bp_wait, 0, memory_order_relaxed);
+            av_log(NULL, AV_LOG_WARNING, "[PTV-FQBP] the output took no picture for 2 s with %d queued — "
+                   "back-pressure released until the queue drains\n", lim);
+            return;
+        }
+        av_usleep(2000);
+    }
+    atomic_store_explicit(&g_fq_bp_wait, 0, memory_order_relaxed);
+    d->bp_off = 0;
+}
+
 static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
 {
     int i;
+    fq_backpressure(d);
     if (!hold_clean_pass(d, frame)) {
         av_frame_unref(frame);
         return;
@@ -7476,6 +7529,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_PESTAIL")) g_pestail = 0;   /* 2.0.0-pre4c: PES-tail carry off */
     if (getenv("PTV_NO_RLCHECK")) g_rlcheck = 0;   /* 2.0.1 T-087: relabel content check off */
     if (getenv("PTV_NO_RLUNDO")) g_rlundo = 0;     /* 2.0.2 T-395: keep a silent no-verdict audio erase (2.0.1 behaviour) */
+    if (getenv("PTV_NO_SYNCCHK")) g_synchk = 0;    /* 2.2.1 T-480: no [PTV-SYNCCHK] lines (it only observes) */
     if (getenv("PTV_RL_RELABEL_MAX")) g_rl_relabel_max = atof(getenv("PTV_RL_RELABEL_MAX"));   /* 2.0.2 T-391 */
     if (getenv("PTV_NO_VOUTLIER")) g_voutlier = 0; /* 2.0.1 T-383: video timestamp outlier restamp off */
     { const char *s = getenv("PTV_RSCORR_SLEW_FAST");     if (s) g_rscorr_slew_fast = atoi(s) > 0 ? atoi(s) : 0; }  /* 0 = disabled (always the base clamp) */
@@ -7548,6 +7602,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_DECIMATE")) g_decimate = 0;         /* v0.9.15.2: keep pop-per-tick even for >house-rate sources (frame_q pins on surplus) */
     /* PTV_FRAMEQ stays HERE (not resolve_cushions()): the multiview hold.q alloc consumes
      * g_frameq_cap before resolve_cushions() runs in transcode() setup (0.9.18 M1). */
+    { const char *bp = getenv("PTV_FQ_BP"); if (bp && !atoi(bp)) g_fq_bp = 0; }   /* 2.2.1 T-482 */
     { const char *fq = getenv("PTV_FRAMEQ"); if (fq && atoi(fq) > 0) { int v = atoi(fq); if (v < PTV_FRAME_QDEPTH) v = PTV_FRAME_QDEPTH; if (v > 1024) v = 1024; g_frameq_cap = v; } }   /* frame_q (decode->output) capacity; raise + deep PTV_PREROLL_MS to absorb an ad-break decode-rate dip (AWE) */
     {   /* 0.9.16.5 postmortem guard: a frame_q deeper than the NVENC registration cache makes every
          * frame past the cache evict+re-register = 2 RM WRITE ioctls/frame/rung — at fleet scale that
@@ -7606,6 +7661,8 @@ int main(int argc, char **argv)
     if (getenv("PTV_CC_NO_REWRAP")) g_cc_rewrap = 0;   /* 2.0.0 T-023(b) */
     { const char *hc = getenv("PTV_HOLD_CLEAN_MS"); if (hc) g_hold_clean_us = (int64_t)atoi(hc) * 1000; }   /* 2.0.0 T-324 */
     if (getenv("PTV_NO_REJOIN_MAP")) g_rejoin_map = 0; /* 2.0.0-pre6.1 kill switch: PTS jumps at a rejoin again */
+    if (getenv("PTV_NO_RJ_PRIME")) g_rj_prime = 0;
+    if (getenv("PTV_REPRIME_QUIET")) g_reprime_quiet_off = 0;   /* 2.2.1 T-472 kill switch */     /* 2.2.1 T-472 kill switch: a rejoin starts on an empty frame queue */
     { const char *s = getenv("PTV_GLUE_HTOL_PCT");     if (s && atoi(s) > 0) g_glue_htol = atoi(s); }             /* tuning knob (G4) */
     { const char *s = getenv("PTV_NBS_QUANTUM_MS");    if (s && atoi(s) > 0) g_nbs_quantum_us = (int64_t)atoi(s) * 1000; }  /* TEST ONLY (G8) */
     { const char *s = getenv("PTV_BORN_SILENT_MS");    if (s && atoi(s) >= 0) g_born_silent_us = (int64_t)atoi(s) * 1000; }  /* T-470 */

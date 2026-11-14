@@ -36,6 +36,8 @@
 #define TL_BIG_US     2000000       /* 2.2 T-451: a step beyond this is no relabel (the repair bound): a program-wide step */
 #define TL_SAME_US    1000000       /* 2.2 T-451: the audio of a program event crossed by the video's J within this */
 #define TL_AWAIT_US   5000000       /* 2.2.1 T-463: an audio the video's big step left behind is awaited on its new path */
+#define TL_CLK_US     1000000       /* 2.2.1 T-480: an audio is on the program clock within this of its own A/V label offset */
+#define TL_MUTE_US    10000000      /* 2.2.1 T-480: an audio off the program clock is silent this long at most, then adopted */
 
 typedef struct TlPkt {
     AVPacket *pkt;
@@ -76,11 +78,23 @@ typedef struct TlStream {
     int     await_more;                       /* T-464: a later program event in this window moved its awaited path */
     int64_t open_us;                          /* T-466: its path end when the window opened (old_end_us grows with the
                                                * old-path packets the window holds) */
+    /* 2.2.1 T-480: an audio whose clock left the program clock (the video's) while the pictures run is muted like a frame
+     * sync: followed and classified as before, not sent (the silence fill keeps its track continuous) until it is back
+     * on the program clock, or TL_MUTE_US passed (then, once, the offset that keeps its labels where they were) */
+    int     mute, mute_old;                   /* muted now / before this window's decision (its held old-path packets) */
+    int64_t mute_wc, mute_rep;                /* since when; the offset its steps since would need (adopted at the bound) */
+    int64_t hk_us, hk_wc;                     /* T-481: the hole this stream kept alone (within its own silence) and when */
+    int     clk_ok;                           /* clk_ref is set */
+    int64_t clk_ref;                          /* the source's own A/V label offset: its labels (less a big offset) minus the
+                                               * video's path at the same arrival time, while it is on the program clock */
+    int64_t clk_cand, clk_cand_wc;            /* a new offset its labels as sent settle on (2 s steady: the new truth) */
+    int64_t big_pub;                          /* T-480: rep_big as last published to the sync check (g_rsx.eo_us) */
 } TlStream;
 
 struct PtvTimeline {
     int64_t   k_us;
-    int64_t   ev_n, strag_n, drop_n;
+    int64_t   ev_n, strag_n, drop_n, mute_n;
+    int64_t   ev_pub;                   /* T-480: ev_n as last published to the sync check (g_rsx.tl_ev) */
     int       active, trig, nst, cap;   /* nst = streams followed; cap = st[] room (2.2: adoption) */
     int       win_big;                  /* T-451: the trigger stepped more than TL_BIG_US */
     int64_t   open_wc, open_s_us;
@@ -199,8 +213,94 @@ static void path_take(TlStream *s, int64_t s_us, int64_t wc)
     s->ok      = 1;
 }
 
+/* 2.2.1 T-480: PTV_TL_NO_MUTE=1 = rule B as in rc4 (an audio's clock step under running pictures repaired on the stream) */
+static int tl_mute_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = !getenv("PTV_TL_NO_MUTE");
+    return on;
+}
+
+/* T-480: how far the stream is off the program clock — a big offset held on it (an adopted clock of its own) plus, while
+ * muted, the steps it took since. The video stepping by minus this joins it; its own step by this is its return */
+static int64_t own_off(const TlStream *s)
+{
+    return s->rep_big + (s->mute ? s->mute_rep : 0);
+}
+
+/* T-480: the last packet of the stream's new run in this window */
+static void run_end(const PtvTimeline *t, int si, int64_t *us, int64_t *wc)
+{
+    int i;
+    for (i = t->nheld - 1; i >= 0; i--)
+        if (t->held[i].si == si && t->held[i].path == 1) {
+            *us = t->held[i].s_us;
+            *wc = t->held[i].wc;
+            return;
+        }
+}
+
+/* T-480: the audio's A/V label offset at a packet (source time s_us, arrived wc) against its own reference: its labels
+ * less a big offset, minus where the video's path is at that arrival time (the video's clock runs on with the wall
+ * between its packets and through its holes). in_close: the video's new run of the closing window is its path.
+ * Returns 0 when there is no video path to judge by; before the first reading (clk_ok) clk_ref is 0 */
+static int clk_off(const DemuxArgs *d, const PtvTimeline *t, int si, int64_t s_us, int64_t wc, int in_close, int64_t *off)
+{
+    const TlStream *s = &t->st[si], *v;
+    int64_t vu, vw;
+    if (d->vstream < 0 || d->vstream >= t->nst || d->vstream == si || !t->st[d->vstream].ok)
+        return 0;
+    v  = &t->st[d->vstream];
+    vu = v->last_us;
+    vw = v->last_wc;
+    if (in_close && v->res == 1)
+        run_end(t, d->vstream, &vu, &vw);
+    *off = (s_us - s->rep_big) - (vu + (wc - vw)) - s->clk_ref;
+    return 1;
+}
+
+/* T-480: learn the source's own A/V label offset from an audio packet on its path — only while the stream is on the
+ * program clock (not muted, no big offset). Slow, near the reference; labels as sent that settle elsewhere for 2 s are
+ * the source's new truth (a restart whose audio lands 0.8 s / 6 s off its pictures: vt-adjp, vt-vfgap); a PES tail after
+ * an outage (old labels for a few frames) teaches nothing */
+static void clk_learn(const DemuxArgs *d, PtvTimeline *t, int si, int64_t s_us, int64_t nw)
+{
+    TlStream *s = &t->st[si];
+    int64_t off;
+    if (s->mute || s->rep_big || d->ifmt->streams[si]->codecpar->codec_type != AVMEDIA_TYPE_AUDIO ||
+        !clk_off(d, t, si, s_us, nw, 0, &off))
+        return;
+    if (!s->clk_ok) {
+        s->clk_ref     = off;
+        s->clk_ok      = 1;
+        s->clk_cand_wc = 0;
+    } else if (llabs(off) <= TL_CLK_US / 4) {
+        s->clk_ref    += off / 16;
+        s->clk_cand_wc = 0;
+    } else if (!s->clk_cand_wc || llabs(s->clk_ref + off - s->clk_cand) > TL_CLK_US / 4) {
+        s->clk_cand    = s->clk_ref + off;
+        s->clk_cand_wc = nw;
+    } else if (nw - s->clk_cand_wc >= 2000000) {
+        s->clk_ref    += off;
+        s->clk_cand_wc = 0;
+    }
+}
+
+/* T-480: send a packet of the stream's own path — not while it is muted */
+static int tl_out(DemuxArgs *d, PtvTimeline *t, int si, AVPacket *pkt)
+{
+    if (t->st[si].mute) {
+        t->mute_n++;
+        av_packet_free(&pkt);
+        return 0;
+    }
+    return ptv_demux_dispatch(d, pkt);
+}
+
 /* T-463: the stream stepped first, alone, and was repaired as a clock of its own — the video now steps the same: it is on
- * the new path already; undo its big repair after the release (its held packets are new content: path 3) */
+ * the new path already; undo its big repair after the release (its held packets are new content: path 3).
+ * T-480: or it was muted for that step — on the program clock again, its held packets go out */
 static void undo_big_repair(PtvTimeline *t, TlStream *s, int si)
 {
     int i;
@@ -208,6 +308,8 @@ static void undo_big_repair(PtvTimeline *t, TlStream *s, int si)
     s->rep_new     = -s->rep_big;
     s->rep_us     -= s->rep_big;
     s->rep_big     = 0;
+    s->mute        = 0;
+    s->mute_rep    = 0;
     s->new_last_us = s->last_us;
     for (i = 0; i < t->nheld; i++)
         if (t->held[i].si == si && t->held[i].path != 2 && t->held[i].s_us != AV_NOPTS_VALUE) {
@@ -455,8 +557,8 @@ static int window_resolved(DemuxArgs *d, PtvTimeline *t, int final)
         t->win_big = jt < -TL_BIG_US || (!nowall && jt - wt > TL_BIG_US);
         /* 2.2.1 T-463: an audio coming back from a clock of its own (its big repair, about the same step) is the return
          * leg — no partner to wait for: the window held the audio 3 s, banked as a stall (Fashion 2026-11-13 01:01:38) */
-        retleg = d->ifmt->streams[t->trig]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && ts->rep_big &&
-                 llabs(jt - ts->rep_big) < TL_SAME_US;
+        retleg = d->ifmt->streams[t->trig]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && own_off(ts) &&
+                 llabs(jt - own_off(ts)) < TL_SAME_US;   /* (T-480: or back from the clock it is muted on) */
         /* 2.2.1 T-463: an audio's big step while the video shows pictures on its old path is decided at once (a clock of
          * its own, repaired on the stream): a video following by the same step later undoes the repair with its own
          * program event (close_window). Waiting up to 2 s for it held the audio 1.8 s (a mosaic's other slots then lost
@@ -480,7 +582,7 @@ static int window_resolved(DemuxArgs *d, PtvTimeline *t, int final)
             continue;                          /* not flowing before the event: no partner to wait for */
         r = classify_stream(t, si, final, cross);
         /* T-463: an audio already repaired for this very step (it stepped first, alone) has crossed — nothing to wait for */
-        if (r == 0 && s->rep_big && jt && llabs(s->rep_big + jt) < TL_SAME_US)
+        if (r == 0 && own_off(s) && jt && llabs(own_off(s) + jt) < TL_SAME_US)
             continue;
         if (r == 0 && partner(d, t, si) && !retleg)
             all = 0;
@@ -513,6 +615,14 @@ static int release(DemuxArgs *d, PtvTimeline *t, int64_t k_old, int64_t k_new, i
         h->pkt = NULL;
         if (h->path == 2) {
             t->drop_n++;
+            av_packet_free(&p);
+            continue;
+        }
+        /* T-480: a muted stream's packets were held and classified like any other; they are not sent — its new run by
+         * the state this window decided, the packets before it by the state it opened in */
+        if (h->si < t->nst && t->st[h->si].dense &&
+            (((h->path == 1 && t->st[h->si].res == 1) || h->path == 3) ? t->st[h->si].mute : t->st[h->si].mute_old)) {
+            t->mute_n++;
             av_packet_free(&p);
             continue;
         }
@@ -560,6 +670,8 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
     int ret;
 
     window_resolved(d, t, 1);
+    for (si = 0; si < t->nst; si++)
+        t->st[si].mute_old = t->st[si].mute;
     for (si = 0; si < t->nst; si++) {
         TlStream *s = &t->st[si];
         if (!s->dense || si == vs)
@@ -573,7 +685,12 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
             const TlStream *v = &t->st[vs];
             int64_t jv = v->new_first_us - (v->old_end_us + (v->step_us ? v->step_us : 20000));
             int64_t ja = s->new_first_us - (s->old_end_us + (s->step_us ? s->step_us : 20000));
-            if (llabs(ja - jv) <= FFMAX(TL_SAME_US, llabs(jv) / 1000))
+            /* 2.2.1 T-481: an audio that already kept this outage's hole alone (its first packets after it, within its own
+             * silence) shows only the rest of the step here — the same outage, one program event: its kept hole counts
+             * (vt-t479v: video +6.04 s, the audio +2.84 s kept then +3.02 s — a 4.6 s video PTS hole as two events) */
+            int64_t hk = s->hk_wc && t->open_wc - s->hk_wc <= 3000000 ? s->hk_us : 0;
+            if (llabs(ja - jv) <= FFMAX(TL_SAME_US, llabs(jv) / 1000) ||
+                (hk && llabs(ja + hk - jv) <= FFMAX(TL_SAME_US, llabs(jv) / 1000)))
                 n_aud_cross++;
         } else if (s->res == 1)
             n_aud_cross++;
@@ -600,8 +717,8 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
         int vdec = jv < -TL_BIG_US || (!nowall && jv - vsil > TL_BIG_US);
         /* an audio repaired for the same step first is evidence by itself (no wall evidence under a bank: no win_big) */
         for (si = 0; si < t->nst && !vdec; si++)
-            if (t->st[si].dense && si != vs && llabs(jv) > TL_BIG_US && t->st[si].rep_big &&
-                llabs(t->st[si].rep_big + jv) < TL_SAME_US)
+            if (t->st[si].dense && si != vs && llabs(jv) > TL_BIG_US && own_off(&t->st[si]) &&
+                llabs(own_off(&t->st[si]) + jv) < TL_SAME_US)
                 vdec = 1;
         for (si = 0; si < t->nst && vdec; si++) {
             const TlStream *s = &t->st[si];
@@ -610,7 +727,10 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
              * clock step forward of the video alone, the audio on its own clock, read as a hole after a 1.94 s window:
              * labels as sent, lip sync -3 s for good — vt-ap-own) */
             if (s->dense && si != vs && d->ifmt->streams[si]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
-                jv > 0 && s->ok && s->open_us > v->new_first_us - TL_BIG_US)
+                jv > 0 && s->ok && s->open_us > v->new_first_us - TL_BIG_US &&
+                !(own_off(s) && llabs(own_off(s) + jv) < TL_SAME_US))   /* T-480: not an audio that took this very step
+                                                                         * first (muted on its raw clock: its path is on
+                                                                         * the new labels already — vt-nowall-afwd) */
                 vdec = 0;
         }
         for (si = 0; si < t->nst && vdec; si++) {
@@ -619,7 +739,7 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
                 continue;
             /* it stepped first, alone, and was repaired as a clock of its own: the video now follows by the same step —
              * the audio is on the new path already, undo its repair (its held packets are new content: path 3) */
-            if (s->rep_big && llabs(s->rep_big + jv) < TL_SAME_US) {
+            if (own_off(s) && llabs(own_off(s) + jv) < TL_SAME_US) {
                 undo_big_repair(t, s, si);
                 continue;
             }
@@ -754,6 +874,40 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
                 big = !quiet_in && vrun && (ret_leg || js < -TL_BIG_US ||
                                (js > TL_BIG_US && js - stream_silence(t, s, si) - slack > TL_BIG_US));
             }
+            /* 2.2.1 T-480 (owner 2026-11-14: mute like a frame sync; no stream carries a big offset of its own): the
+             * question is not "did the audio step alone" but "is it on the program clock after the step" — its labels
+             * within TL_CLK_US of its own A/V label offset to the video's path. On it: labels as sent, nothing muted, a
+             * big offset it held undone exactly (RAV mosaic 2026-11-14 05:59:59, rc3: after a 2.97 s hole slot in3's audio
+             * sent its pre-hole PES tail, then stepped +2.923 s TO the live position its pictures were on already — rule
+             * B "repaired" it: lip sync +2.9 s, sync_check restart). Off it (Fashion: +10313 s for 3 s): muted — its new
+             * run is not sent, the absence watch fills the track with silence at once (ptv_tl_muted), and it is followed
+             * on its own clock until a step brings it back (here), the video steps to it (undo_big_repair), its packets
+             * read on the program clock again or TL_MUTE_US passed (ptv_tl_ingest) */
+            if ((big || s->mute) && tl_mute_on()) {
+                int64_t eu = s->new_last_us, ew = nw, off = 0;
+                run_end(t, si, &eu, &ew);
+                if (clk_off(d, t, si, eu, ew, 1, &off) && s->clk_ok && llabs(off) <= TL_CLK_US) {
+                    cls = s->mute || s->rep_big ? "audio back on the program clock, labels as sent" :
+                                                  "single-stream step onto the program clock, labels as sent";
+                    s->rep_new  = -s->rep_big;
+                    s->rep_us  -= s->rep_big;
+                    s->rep_big  = 0;
+                    s->mute     = 0;
+                    s->mute_rep = 0;
+                } else {
+                    cls = "audio off the program clock under running pictures, muted";
+                    if (!s->mute) {
+                        s->mute     = 1;
+                        s->mute_wc  = nw;
+                        s->mute_rep = 0;
+                    }
+                    s->mute_rep -= js;
+                }
+                av_log(NULL, AV_LOG_WARNING, "[PTV-TL] in%d stream %d: %s — step %+.3f s, %+.3f s off the program clock "
+                       "(band %.1f s)\n", d->rsync_slot, si, s->mute ? "MUTED" : "on the program clock", js / 1e6,
+                       off / 1e6, TL_CLK_US / 1e6);
+                continue;
+            }
             if (!big && d->ts_outl && si < d->nb_streams_open && d->ts_outl[si].dmg_wc && nw - d->ts_outl[si].dmg_wc < 3000000)
                 continue;
             /* design invariant 6, the 0.9.16.4 rule: one audio stream stepping BACK on clean audio is a relabel (its sound
@@ -823,7 +977,7 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
             if (!s->dense || si == vs || s->res == 1 || s->await_more || d->ifmt->streams[si]->codecpar->codec_type != AVMEDIA_TYPE_AUDIO ||
                 !((flowing(t, s) && !sil_out) || has_held(t, si)))
                 continue;
-            if (s->rep_big && llabs(s->rep_big + jv) < TL_SAME_US) {
+            if (own_off(s) && llabs(own_off(s) + jv) < TL_SAME_US) {
                 undo_big_repair(t, s, si);    /* it stepped first, alone: on the new path already (another audio crossed) */
                 continue;
             }
@@ -833,7 +987,7 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
     }
     t->ev_n++;
     av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO,
-           "[PTV-TL] event #%"PRId64" (stream %d opened): %s", t->ev_n, t->trig, cls);
+           "[PTV-TL] in%d event #%"PRId64" (stream %d opened): %s", d->rsync_slot, t->ev_n, t->trig, cls);
     if (prog_event)
         av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO,
                " — J %+.3f s, wall %.3f s%s, kept %.3f s, erased %.3f s (%"PRId64" pictures), k %+.3f s",
@@ -958,6 +1112,19 @@ int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
         return ptv_demux_dispatch(d, pkt);
     s = &t->st[si];
     s->dense = is_dense(d, si);
+    /* T-480 (the sync check, observe only): the event number and this stream's own-clock offset, as they stood after
+     * its previous packet — the ledgers they belong to were posted then, and both are events to the check */
+    if (t->ev_n != t->ev_pub && d->rsync_slot >= 0 && d->rsync_slot < PTV_MAX_INPUT) {
+        t->ev_pub = t->ev_n;
+        atomic_store_explicit(&g_rsx.tl_ev[d->rsync_slot], t->ev_n, memory_order_relaxed);
+    }
+    if (s->rep_big != s->big_pub) {
+        int j;
+        s->big_pub = s->rep_big;
+        for (j = 0; j < d->n_audio; j++)
+            if (d->astream[j] == si && d->aglobal[j] >= 0 && d->aglobal[j] < PTV_MAX_AUDIO)
+                atomic_store_explicit(&g_rsx.eo_us[d->aglobal[j]], s->rep_big, memory_order_relaxed);
+    }
 
     /* 2.2.1 T-463: an audio a clock-step program event left behind (await_j = the video's step). A packet nearer its old
      * path than the path it is awaited on is old content: it goes out on the old offset (the source's audio clock lags
@@ -986,7 +1153,28 @@ int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
             s->last_wc       = nw;
             s->aw_vref       = v && v->ok ? v->last_us : 0;
             relabel(d, pkt, 0, -s->aw_dk);    /* the old offset: its sound runs on where it was */
-            return ptv_demux_dispatch(d, pkt);
+            return tl_out(d, t, si, pkt);
+        }
+        if (near_old && tl_mute_on()) {
+            /* T-480: not crossed in TL_AWAIT_US — the audio is off the program clock (only the video restarted): muted, no
+             * repair. Its off-clock time counts from the await's start: still there TL_MUTE_US after it, the offset
+             * that keeps its labels where they were is adopted (below, on its path) */
+            if (!s->mute) {
+                s->mute     = 1;
+                /* the await already watched it steady on its own clock for TL_AWAIT_US with its sound in sync on the old
+                 * offset: adopted on its next packet, no silence (owner rule: never silence for nothing; bound <= 10 s) */
+                s->mute_wc  = nw - TL_MUTE_US;
+                s->mute_rep = 0;
+            }
+            s->mute_rep -= s->aw_dk;
+            t->er_lo = t->er_hi = 0;          /* the span the video erased is no sound of its to drop */
+            av_log(NULL, AV_LOG_WARNING, "[PTV-TL] in%d stream %d: did not cross the video's step %+.3f s in %.0f s — off the "
+                   "program clock, MUTED (%+.3f s)\n", d->rsync_slot, si, s->await_j / 1e6, TL_AWAIT_US / 1e6,
+                   s->mute_rep / 1e6);
+            s->await_j = s->strag_until_wc = 0;
+            s->ok = 0;
+            path_take(s, s_us, nw);
+            return tl_out(d, t, si, pkt);
         }
         if (near_old) {
             /* not crossed in TL_AWAIT_US: the audio keeps a clock of its own (only the video restarted) — repaired on the
@@ -998,16 +1186,16 @@ int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
             ptv_rsync_post_edit(d, si, rp);
             relabel(d, pkt, 0, rp);
             t->er_lo = t->er_hi = 0;          /* the span the video erased is no sound of its to drop */
-            av_log(NULL, AV_LOG_WARNING, "[PTV-TL] stream %d: did not cross the video's step %+.3f s in %.0f s — a clock of "
-                   "its own, repaired on the stream %+.3f s (repair now %+.3f s)\n", si, s->await_j / 1e6,
+            av_log(NULL, AV_LOG_WARNING, "[PTV-TL] in%d stream %d: did not cross the video's step %+.3f s in %.0f s — a clock of "
+                   "its own, repaired on the stream %+.3f s (repair now %+.3f s)\n", d->rsync_slot, si, s->await_j / 1e6,
                    TL_AWAIT_US / 1e6, rp / 1e6, s->rep_us / 1e6);
             s->await_j = s->strag_until_wc = 0;
             s->ok = 0;
             path_take(s, s_us + rp, nw);
             return ptv_demux_dispatch(d, pkt);
         }
-        av_log(NULL, AV_LOG_INFO, "[PTV-TL] stream %d: crossed after the video's step %+.3f s (%+.3f s off it)\n",
-               si, s->await_j / 1e6, (s_us - (s->last_us + e + s->step_us)) / 1e6);
+        av_log(NULL, AV_LOG_INFO, "[PTV-TL] in%d stream %d: crossed after the video's step %+.3f s (%+.3f s off it)\n",
+               d->rsync_slot, si, s->await_j / 1e6, (s_us - (s->last_us + e + s->step_us)) / 1e6);
         s->ok = 0;                            /* crossed: re-seeded on its new path by this packet, labels as they come */
         path_take(s, s_us, nw);
         s->await_j = s->strag_until_wc = 0;
@@ -1018,7 +1206,7 @@ int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
             av_packet_free(&pkt);
             return 0;
         } else
-            return ptv_demux_dispatch(d, pkt);
+            return tl_out(d, t, si, pkt);
     }
 
     if (t->active) {
@@ -1070,7 +1258,7 @@ int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
     }
     if (!s->ok) {
         path_take(s, s_us, nw);
-        return ptv_demux_dispatch(d, pkt);
+        return tl_out(d, t, si, pkt);
     }
     /* a straggler of the old path after an event: content of the erased span, never shown */
     if (s->strag_until_wc && nw < s->strag_until_wc &&
@@ -1096,8 +1284,8 @@ int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
             relabel(d, pkt, 0, rp);
             s_us += rp;
             t->ev_n++;
-            av_log(NULL, AV_LOG_INFO, "[PTV-TL] event #%"PRId64" (stream %d): single-stream %s %+.3f s on the stream "
-                   "(repair now %+.3f s)\n", t->ev_n, si, rp > 0 ? "relabel, repaired" :
+            av_log(NULL, AV_LOG_INFO, "[PTV-TL] in%d event #%"PRId64" (stream %d): single-stream %s %+.3f s on the stream "
+                   "(repair now %+.3f s)\n", d->rsync_slot, t->ev_n, si, rp > 0 ? "relabel, repaired" :
                    "return leg, repair undone", rp / 1e6, s->rep_us / 1e6);
         }
     }
@@ -1109,11 +1297,13 @@ int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
         !(atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 || (int64_t)g_preroll_ms >= 4000) &&
         s_us - (s->last_us + s->step_us) <= nw - s->last_wc + tol_us(s)) {
         t->ev_n++;
-        av_log(NULL, AV_LOG_INFO, "[PTV-TL] event #%"PRId64" (stream %d): hole kept — J %+.3f s within its own silence of "
-               "%.3f s, labels as sent, no window\n", t->ev_n, si,
+        s->hk_us = s_us - (s->last_us + s->step_us);   /* T-481: part of the outage a later program event may complete */
+        s->hk_wc = nw;
+        av_log(NULL, AV_LOG_INFO, "[PTV-TL] in%d event #%"PRId64" (stream %d): hole kept — J %+.3f s within its own silence of "
+               "%.3f s, labels as sent, no window\n", d->rsync_slot, t->ev_n, si,
                (s_us - (s->last_us + s->step_us)) / 1e6, (nw - s->last_wc) / 1e6);
         path_take(s, s_us, nw);
-        return ptv_demux_dispatch(d, pkt);
+        return tl_out(d, t, si, pkt);
     }
     if (off_path(s, s_us)) {
         TlPkt *h = &t->held[0];
@@ -1135,8 +1325,43 @@ int ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt)
             atomic_fetch_add_explicit(d->disturb_epoch, 1, memory_order_relaxed);
         return 0;
     }
+    if (s->mute) {
+        /* T-480: a muted audio going on on its own path. Its labels read on the program clock again (the program moved
+         * to it, or it came back below the window threshold): unmuted, labels as sent. Still off it TL_MUTE_US after it
+         * left: it stays there — placed by its arrival next to the pictures: the offset that keeps its labels where they
+         * were (its content ran on with the wall) is adopted, once; its step back to the program clock undoes it */
+        int64_t off = 0, rp = s->mute_rep;
+        int on = !s->rep_big && clk_off(d, t, si, s_us, nw, 0, &off) && s->clk_ok && llabs(off) <= TL_CLK_US;
+        if (on || nw - s->mute_wc >= TL_MUTE_US) {
+            s->mute = 0;
+            s->mute_rep = 0;
+            if (on)
+                rp = 0;
+            if (rp) {
+                s->rep_us  += rp;
+                s->rep_big += rp;
+                d->wrap_off[si] += av_rescale_q(rp, AV_TIME_BASE_Q, d->ifmt->streams[si]->time_base);
+                ptv_rsync_post_edit(d, si, rp);
+                relabel(d, pkt, 0, rp);
+                s_us += rp;
+            }
+            t->ev_n++;
+            av_log(NULL, AV_LOG_WARNING, "[PTV-TL] in%d event #%"PRId64" (stream %d): %s — %+.3f s off the program clock, "
+                   "silent %.1f s, offset on the stream %+.3f s\n", d->rsync_slot, t->ev_n, si,
+                   on ? "audio back on the program clock, unmuted, labels as sent" :
+                        "audio steadily off the program clock, placed by its arrival (offset adopted)",
+                   off / 1e6, (nw - s->mute_wc) / 1e6, s->rep_big / 1e6);
+        }
+    } else
+        clk_learn(d, t, si, s_us, nw);
     path_take(s, s_us, nw);
-    return ptv_demux_dispatch(d, pkt);
+    return tl_out(d, t, si, pkt);
+}
+
+/* T-480: the stream is muted (off the program clock) — the absence watch fills its tracks with silence at once */
+int ptv_tl_muted(DemuxArgs *d, int si)
+{
+    return d->tl && si >= 0 && si < d->tl->nst && d->tl->st[si].mute;
 }
 
 /* our own cut (the depth door): the span [Va, Vb) was dropped on every stream on the pictures' boundaries — erase it

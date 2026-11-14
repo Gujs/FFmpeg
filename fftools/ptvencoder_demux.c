@@ -2924,8 +2924,11 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                         }
                         continue;
                     }
-                    if (!d->a_arr_us[k] || nw - FFMAX(d->a_arr_us[k], d->v_flow_since_us) <
-                                           (dw && nw - dw < 5000000 ? 1000000 : 2000000) ||
+                    /* 2.2.1 T-480: a track the timeline muted (its audio off the program clock) is silence from the
+                     * first quantum — its packets arrive, they are not sent: no 1-2 s wait (the PID dark on the wire) */
+                    if (!d->a_arr_us[k] || (!ptv_tl_muted(d, d->astream[k]) &&
+                                            nw - FFMAX(d->a_arr_us[k], d->v_flow_since_us) <
+                                            (dw && nw - dw < 5000000 ? 1000000 : 2000000)) ||
                         nw - d->nbs_last_fill_us[k] < g_nbs_quantum_us)
                         continue;
                     d->nbs_last_fill_us[k] = nw;

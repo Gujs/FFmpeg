@@ -350,6 +350,11 @@ typedef struct RsyncSense {
     _Atomic int64_t uev_us[PTV_MAX_INPUT];  /* per-slot VIDEO unevidenced deletions */
     _Atomic int64_t uea_us[PTV_MAX_AUDIO];  /* per-track AUDIO unevidenced deletions (demux side;
                                              * the door adds its own AudioState.u_door_us) */
+    /* 2.2.1 T-480 (the sync check, observe only): the part of ea_us that is the offset of an audio on a clock of its
+     * own (the timeline's rep_big: placed by design, no desync), and the input's [PTV-TL] event number. The slot's
+     * demux thread writes both (ptv_tl_ingest) */
+    _Atomic int64_t eo_us[PTV_MAX_AUDIO];
+    _Atomic int64_t tl_ev[PTV_MAX_INPUT];
     int             n_a;                    /* transcoded tracks wired (pre16: = n_audio ALWAYS, mv included) */
     int             a_in[PTV_MAX_AUDIO];    /* track → input slot map (stats printers; plain int,
                                              * set in transcode() before threads spawn) */
@@ -420,6 +425,25 @@ typedef struct CorrState {          /* all owned by that track's audio thread (�
                                      * process (10s of trim failed to close R — re-arming would
                                      * walk the same doomed staircase); logged once at the cap */
 } CorrState;
+
+/* 2.2.1 T-480 step 4 — the post-event sync check (B2), OBSERVE ONLY: see synchk_update() in ptvencoder_audio.c.
+ * One per transcoded track, owned by its audio thread. */
+typedef struct SyncChk {
+    int         init;               /* the feeds are snapshotted (the first frame = event "start") */
+    int         watch;              /* an event is waiting for its decision */
+    int         paired;             /* this frame's sound found its picture in the vring (set by the pairing) */
+    int64_t     ev_n;               /* this track's events so far (the id on the line) */
+    const char *ev_why;             /* ... what the last one was */
+    int64_t     ev_wc;              /* ... and its wall time */
+    int64_t     epoch_snap, tl_snap, led_snap, rejoin_snap;     /* event feeds, consumed */
+    int         glue_snap, afmt_snap, reopen_snap, fill_snap, slate_snap;
+    int64_t     hs_last, hs_wc;     /* single input: house_skew at the last frame, wall time of its last step */
+    int64_t     dirty_wc;           /* the source is clean since here (the last event, damage, hold, fill ...) */
+    int64_t     agree_wc, lo, hi;   /* the readings agree since here, within [lo, hi] */
+    int         n;                  /* ... this many of them */
+    int64_t     led, own, last;     /* the last reading: its ledger part, the exempt own-clock offset, the sum */
+    int64_t     log_wc;             /* PTV_DIAG: the last "undecided" line */
+} SyncChk;
 
 /* 0.9.18 M3 — CushionRt: the runtime COORDINATION home for cushion escalation (map §1.3).
  * Holds the per-run wiring every escalation event needs (the per-rung delivery gates, the
@@ -764,6 +788,7 @@ typedef struct DecodeCtx {
     int              live;
     VideoHold       *hold;                    /* multiview: stage frames here (NULL = filter inline) */
     int64_t          rj_hold_id;              /* 2.0.0-pre6.1: the hold the rejoin map last armed for */
+    int              bp_off;                  /* 2.2.1 T-482: back-pressure gave up (the master stopped taking pictures) */
     int              rj_done;                 /* ... and whether it was applied */
     int64_t          hc_hold_id, hc_since, hc_flag_since, hc_last;   /* 2.0.0 T-324: the damaged hold's clean runs: frames
                                               * continuous / no corrupt data (wall us) */
@@ -1193,6 +1218,7 @@ typedef struct AudioState {
      * evaluation, never corrupts state). afmt_rebuilds counts [PTV-AFMT] path rebuilds — a
      * rebuild is an event (§4.4). */
     CorrState        corr;
+    SyncChk          sc;                              /* 2.2.1 T-480: the post-event sync check (observe only) */
     _Atomic int_least64_t *corr_epoch;                /* -> Input.house_disturb (event feed) */
     int              afmt_rebuilds;                   /* [PTV-AFMT] rebuild count (corrector event feed) */
     /* 1.0.1-pre16: per-input event feeds (this track's OWN input slot; NULL → global
@@ -1753,6 +1779,7 @@ extern int64_t g_novideo_exit_us;        /* 1.0.1-pre23 startup sanity: packets 
 extern int     g_dmgstat;   /* 2.0.2 T-402: no step / cadence statistics across corrupt-discarded packets (PTV_NO_DMGSTAT=1 off) */
 extern int     g_pestail;   /* 2.0.0-pre4c: PES-tail wall-gap carry for video wall evidence (PTV_NO_PESTAIL=1 off) */
 extern int     g_rlcheck;   /* 2.0.1 T-087: content check of a backward audio erase (PTV_NO_RLCHECK=1 off) */
+extern int     g_synchk;    /* 2.2.1 T-480: the post-event sync check, observe only (PTV_NO_SYNCCHK=1 off) */
 extern double  g_rl_relabel_max;   /* 2.0.2 T-391 */
 extern int     g_voutlier;  /* 2.0.1 T-383: one-picture timestamp outlier restamped (PTV_NO_VOUTLIER=1 off) */
 /* 2.0.0-pre6.1 (T-077): rejoin map — content that comes back AHEAD of the house after a hold (the WUCR stretch at the
@@ -1866,6 +1893,9 @@ extern int     g_reprime;
 extern int     g_adapt_cushion;
 extern CushionPlan g_cp;                 /* defined in ptvencoder_gate.c */
 extern _Atomic int     g_frameq_depth;
+extern _Atomic int     g_fq_bp_lim;
+extern _Atomic int     g_fq_bp_wait;
+extern int             g_fq_bp;
 extern _Atomic int64_t g_fq0_tail_pts;
 extern _Atomic int64_t g_vdmg_wc;
 extern _Atomic int64_t g_vcorrupt_n, g_hold_vcorrupt_n0;   /* 2.0.0 T-324: corrupt video events; the count when the hold began */
@@ -1989,6 +2019,28 @@ static inline int ptv_src_holding(void)
 {
     return g_src_hold_act && atomic_load_explicit(&g_src_state, memory_order_relaxed);
 }
+/* 2.2.1 T-472: the cushion is primed again at a LIVE LOSS / NEW DOMAIN rejoin. The output played its frame queue out
+ * into the hole, and the rejoin map put the first returning picture on the very next house tick: an empty queue for
+ * good (sync_holes: content age 1.74 s -> 0.97 s, refilled at ~1 % by the servo; house_skew -2.24 s). Now the map leaves
+ * the base cushion's worth of the lead unmapped (g_rj_prime_us, the master's sp_cap(base_sp) in house time) and each
+ * rung's output thread keeps repeating until the returning picture's own slot comes up (g_rj_parking: the master is
+ * doing so), while the queue fills behind it. Never more than the lead, so no latency is added; a BURST rejoin and a
+ * STOP/CONT catch-up (content behind the house) are not touched. PTV_NO_RJ_PRIME=1 = off. */
+extern int             g_rj_prime;
+extern int             g_reprime_quiet_off;     /* T-472: no RE-PRIME while no video arrives (ptvencoder_clock.c) */
+extern _Atomic int     g_rj_hold_seq0;           /* master: g_rj_cls_seq when the current / last hold began */
+extern _Atomic int     g_rj_parking;
+extern _Atomic int64_t g_rj_prime_us;
+static inline int ptv_rj_prime_class(void)      /* this hold's rejoin is classified, and not as BURST */
+{
+    int cls;
+    if (!g_rj_prime || !g_src_hold_act ||
+        atomic_load_explicit(&g_rj_cls_seq, memory_order_acquire) ==
+        atomic_load_explicit(&g_rj_hold_seq0, memory_order_relaxed))
+        return 0;
+    cls = atomic_load_explicit(&g_rj_cls, memory_order_relaxed);
+    return cls == 2 || cls == 3;
+}
 /* 2.0.0-pre8.5: has house_skew taken its post-rejoin value? (cls_seq0 = g_rj_cls_seq when the fill began.) BURST at
  * once; LIVE LOSS when the master showed the content jump; NEW DOMAIN at the jump or 200 ms after the rejoin (LAYERA
  * re-bases it). Shared by the transcoded rejoin buffer and the copied-audio park, so the two cannot drift apart again
@@ -2003,7 +2055,9 @@ static inline int ptv_rj_settled(int cls_seq0, int64_t now)
     switch (atomic_load_explicit(&g_rj_cls, memory_order_relaxed)) {
     case 1:  return 1;
     case 2:  return atomic_load_explicit(&g_src_jump_wc, memory_order_relaxed) >= rj;
-    default: return atomic_load_explicit(&g_src_jump_wc, memory_order_relaxed) >= rj || now - rj > 200000;
+    default: return atomic_load_explicit(&g_src_jump_wc, memory_order_relaxed) >= rj ||
+                    (now - rj > 200000 &&                 /* 2.2.1 T-472: not while the returning picture still waits */
+                     !atomic_load_explicit(&g_rj_parking, memory_order_acquire));
     }
 }
 /* 2.0.0 T-315: has the input come back as a BURST (a sender catching up a pause) since cls_seq0? Only then are frames
@@ -2184,6 +2238,7 @@ void ptv_rsync_post_edit(DemuxArgs *d, int s, int64_t delta_us);
 void ptv_vwait_rebase(DemuxArgs *d, int64_t from_us, int64_t old_end_us, int64_t open_wc, int64_t open_pos,
                       int64_t open_vn, int64_t dpo);
 int  ptv_tl_settling(DemuxArgs *d);
+int  ptv_tl_muted(DemuxArgs *d, int si);   /* 2.2.1 T-480: the stream is off the program clock, its packets not sent */
 extern int64_t g_gap_min_us;
 int ptv_slot_acquire(struct Input *in, int idx);   /* 2.0.2 T-386 */
 /* ptvencoder_mv.c */
