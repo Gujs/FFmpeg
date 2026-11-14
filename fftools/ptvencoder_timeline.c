@@ -360,6 +360,16 @@ static int classify_stream(PtvTimeline *t, int si, int final, int64_t cross_s_us
 
 /* a stream was flowing if it delivered within 2 s of the input's last activity before the event (before the silence
  * the window opened behind, if any) */
+/* 2.2.1 T-475: the event comes out of a real OUTAGE — an input-wide silence of the stall class (>= 3 s) that ended <= 3 s
+ * before this window, or the input still holds. The T-463 rules (the video decides alone, the await, an audio's clock of
+ * its own) assume the pictures were running: after an outage the source restarts / returns and the rules up to rc1
+ * decide (rc2/rc3: a 12 s hole's audio return repaired +11.9 s; cow-1 Adrenaline+ restart after a stall: lip sync +65 s).
+ * PWHT's restart (a 1.1 s input blip) is not an outage */
+static int after_outage(const PtvTimeline *t)
+{
+    return (t->gap_end_wc && t->gap_us >= 3000000 && t->open_wc - t->gap_end_wc <= 3000000) || ptv_src_holding();
+}
+
 static int flowing(const PtvTimeline *t, const TlStream *s)
 {
     int64_t ref = t->gap_end_wc && t->open_wc - t->gap_end_wc <= 1000000 ? t->gap_end_wc - t->gap_us : t->open_wc;
@@ -579,7 +589,7 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
      * out "labels as sent", hs +8.6 h, ~12 dups/s. Not when an audio flowed into the span a forward step skipped: that is
      * the video's own hole (sync_vnull: its PES tail reads its silence ~0, the step "big"). The awaited audio's old-path
      * sound goes on on the old offset (release, ingest): the source's audio clock lags its restart, the sound does not */
-    if (vs >= 0 && vs < t->nst && t->st[vs].res == 1 && !n_aud_cross && n_aud_flow) {
+    if (vs >= 0 && vs < t->nst && t->st[vs].res == 1 && !n_aud_cross && n_aud_flow && !after_outage(t)) {
         const TlStream *v = &t->st[vs];
         int64_t jv = v->new_first_us - (v->old_end_us + (v->step_us ? v->step_us : 20000));
         int nowall = atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 || (int64_t)g_preroll_ms >= 4000;
@@ -733,7 +743,15 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
                 int64_t slack   = 0;
                 if (atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 || (int64_t)g_preroll_ms >= 4000)
                     slack = FFMAX(atomic_load_explicit(&g_bank_us, memory_order_relaxed), (int64_t)g_preroll_ms * 1000);
-                big = vrun && (ret_leg || js < -TL_BIG_US ||
+                /* 2.2.1 T-475: no clock of its own right after the INPUT was silent (an input-wide gap ended <= 3 s before
+                 * this window) or while the input holds — the pictures were not running: a restart / return after an
+                 * outage is the other rules' business (as up to rc1). After an outage the audio's pre-gap PES tail is
+                 * taken as a crossing at the return, its last path packet looks recent and its own silence reads ~0: rc2/
+                 * rc3 repaired a 12 s hole's audio return as a clock of its own (+11.9 s, lip sync -11925 ms for good:
+                 * std sync_gap_12; 2.2.0/rc1: loss), and cow-1 Adrenaline+ (rc2, 2026-11-13 14:45) a source restart
+                 * after a stall (-18.0 / +51.4 / -5.5 s audio-only steps): lip sync +65 s until the next restart */
+                int quiet_in = after_outage(t);
+                big = !quiet_in && vrun && (ret_leg || js < -TL_BIG_US ||
                                (js > TL_BIG_US && js - stream_silence(t, s, si) - slack > TL_BIG_US));
             }
             if (!big && d->ts_outl && si < d->nb_streams_open && d->ts_outl[si].dmg_wc && nw - d->ts_outl[si].dmg_wc < 3000000)
@@ -797,7 +815,7 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
                 t->st[si].await_more = 1;
             }
     }
-    if (prog_event && llabs(erase) > TL_BIG_US && vs >= 0 && vs < t->nst && t->st[vs].res == 1) {
+    if (prog_event && llabs(erase) > TL_BIG_US && vs >= 0 && vs < t->nst && t->st[vs].res == 1 && !after_outage(t)) {
         const TlStream *v = &t->st[vs];
         int64_t jv = v->new_first_us - (v->old_end_us + (v->step_us ? v->step_us : 20000));
         for (si = 0; si < t->nst; si++) {
