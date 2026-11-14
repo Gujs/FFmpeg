@@ -5,6 +5,29 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.1-rc4 — rc3 + an ABR size switch survived (T-469), a source without audio carries silence (T-470), the PES tail after bars (T-474), the rc2 regression after outages (T-475)
+
+**After an outage the T-463 rules stay out (T-475, a regression since rc2).** After an input silence of the stall class
+(>= 3 s, ended <= 3 s before the event's window) or while the input holds, the video-decides-alone rule, the await and an
+audio's "clock of its own" no longer apply: the source returns or restarts and the rules up to rc1 decide. rc2/rc3
+repaired a 12 s hole's audio return as a clock of its own (lip sync −11.9 s for good, audio dark 11.5 s; 2.2.0 and rc1
+were right) and a source restart after a stall (cow-1 Adrenaline+ under rc2: lip sync +65 s until the next restart).
+**A picture-size switch is survived (T-469).** An adaptive-bitrate origin (glo-3 Stingray: 256x144 … 1920x1080) switching
+renditions then stalling restarted the channel (exit 4, ~40 a day): the hold repeated the last decoded picture before it
+was fitted to the graph's size, and production's CUDA hwupload rejected it. The freeze picture is now the fitted one; the
+first two pictures of a new size (dropped until three in a row confirm it) keep their place with a repeat of the last
+picture shown — no 0.12 s video gap at every switch — never while holding, keeping the damage mark, without captions.
+**A planned audio track that never decodes carries silence (T-470, owner).** A source sending no audio (glo-4
+Black_Headline_News for hours) gave a video-only output and a watchdog restart every 7.5 min. When a planned track has
+decoded nothing while the video flowed 3 s (PTV_BORN_SILENT_MS, 0 = off) it is born silent on the house axis; real audio
+joins on its content time in lip sync. Single input; mosaic slots follow.
+**After bars, no old picture flashes back (T-474).** The pre-gap PES tail lavf hands out with the first post-gap packet
+ended the hold and showed the old frozen picture between the bars and the returning content; it now keeps its time and
+carries the hold picture. Residual: a return in a new rendition keeps one such picture.
+Test parity: -init_hw_device videotoolbox gives a hwupload graph its device (macOS stand-in of the CUDA path).
+Kit: production-scan keys (cap-zenlife, cap-bhn, size switches with holes / stalls / loss / captions, holes, born-silent
+join, outage restarts), judges graphsize / stalecheck / ccdup / hscheck, --abs-baseline-ms.
+
 ## 2.2.1-rc3 — rc2 + the await follows the content (T-464) + a small forward step of the video alone (T-466) + damage at a step judged at its open (T-467)
 
 **The awaited audio is judged against where its paths are now, not where they were (T-464).** Found by a code review of rc2,
