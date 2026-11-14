@@ -2905,6 +2905,25 @@ static int demux_dispatch(DemuxArgs *d, AVPacket *out)
                                  atomic_load_explicit(&g_adamage_wc[d->aglobal[k]], memory_order_relaxed) : 0;
                     if (d->single)
                         dw = FFMAX(dw, atomic_load_explicit(&g_vcorrupt_wc, memory_order_relaxed));
+                    /* 2.2.1 T-470 (owner 2026-11-13: fill silence): a planned track that has NEVER decoded a frame while
+                     * the video flowed g_born_silent_us (3 s) — the source sends no audio (glo-4 Black_Headline_News, for
+                     * hours): the track is born silent on the house axis (the T-386 deferred-slot pump: encoder-only, no
+                     * graph) so the output carries audio from the start; real audio joins on its content time. Keyed on
+                     * "never decoded", not "no packets": a source whose audio arrives but never decodes is the same */
+                    if (d->single && g_born_silent_us > 0 && d->aglobal[k] >= 0 && d->aglobal[k] < PTV_MAX_AUDIO &&
+                        !atomic_load_explicit(&g_adec_frame_wc[d->aglobal[k]], memory_order_relaxed) &&
+                        nw - d->v_flow_since_us >= g_born_silent_us) {
+                        if (nw - d->nbs_last_fill_us[k] >= g_nbs_quantum_us) {
+                            d->nbs_last_fill_us[k] = nw;
+                            if ((fs = av_packet_alloc())) {
+                                fs->stream_index = d->astream[k];
+                                fs->flags |= PTV_PKT_FLAG_SLOT_FILL;
+                                if (av_thread_message_queue_send(d->audio_q[k], &fs, AV_THREAD_MESSAGE_NONBLOCK) < 0)
+                                    av_packet_free(&fs);
+                            }
+                        }
+                        continue;
+                    }
                     if (!d->a_arr_us[k] || nw - FFMAX(d->a_arr_us[k], d->v_flow_since_us) <
                                            (dw && nw - dw < 5000000 ? 1000000 : 2000000) ||
                         nw - d->nbs_last_fill_us[k] < g_nbs_quantum_us)

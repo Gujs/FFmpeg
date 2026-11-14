@@ -285,6 +285,22 @@ void ptv_hold_render(DecodeCtx *d)
     }
 }
 
+/* 2.2.1 T-474: the hold's bars / black / slate picture when the hold has gone past -freeze_max (or -hold black) and the
+ * picture was built in this frame's shape; NULL otherwise (still frozen, nothing built, another shape) */
+AVFrame *ptv_hold_bars_pic(DecodeCtx *d, const AVFrame *frame)
+{
+    HoldPic *hp = d->hr_pic;
+    int64_t hs0 = atomic_load_explicit(&g_src_hold_start, memory_order_relaxed);
+    int64_t el  = hs0 ? av_gettime_relative() - hs0 : 0;
+    if (!hp || !hp->pic || hp->fmt < 0 || hs0 != hp->hold_id)
+        return NULL;
+    if (!(g_hold_mode == PTV_HOLD_BLACK || (g_freeze_max_us && el >= g_freeze_max_us)))
+        return NULL;
+    if (hp->pic->width != frame->width || hp->pic->height != frame->height || hp->pic->format != frame->format)
+        return NULL;
+    return hp->pic;
+}
+
 /* emit_video: a real decoded frame (before the graph). Keeps the freeze picture and the render timeline, and closes
  * the account of a finished hold. */
 void ptv_hold_note_frame(DecodeCtx *d, const AVFrame *frame)
@@ -298,8 +314,11 @@ void ptv_hold_note_frame(DecodeCtx *d, const AVFrame *frame)
         return;
     if (frame->duration > 0)
         d->hr_dur = frame->duration;
-    if (frame->best_effort_timestamp != AV_NOPTS_VALUE)
-        d->hr_pts = frame->best_effort_timestamp + d->hr_dur;
+    if (frame->best_effort_timestamp != AV_NOPTS_VALUE) {
+        d->hr_pts      = frame->best_effort_timestamp + d->hr_dur;
+        d->hr_real_pts = frame->best_effort_timestamp;   /* T-474 */
+        d->hr_real_set = 1;
+    }
     /* No picture while real frames flow: at a rejoin the hold lasts until the master shows a fresh frame, and a
      * render pushed between real frames would carry the real frame a temporal filter (bwdif) delays by one out
      * into the hold slot — no real frame ever reached frame_q and the hold never ended (local, bwdif + two

@@ -47,7 +47,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.2.1-rc3"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.2.1-rc4"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -741,6 +741,8 @@ int     g_hold_fill = 1;                       /* 2.0.0-pre6: audio fill during 
 int     g_copy_gapfill = 1;                    /* 2.0.0-pre9.4 (T-083): copied AC-3 gap fill / overlap drop */
 int     g_glue_htol = 5;                       /* §2.3 |H−1| tolerance, % (fixture-tuned, G4) */
 int64_t g_nbs_quantum_us = 100000;             /* fill quantum: 100ms of silence per sentinel */
+int64_t g_born_silent_us = 3000000;            /* 2.2.1 T-470: a planned track never decoded after this much video flow is
+                                                * born silent (PTV_BORN_SILENT_MS, 0 = off) */
 _Atomic int64_t g_acorrupt;
 _Atomic int64_t g_adamage_wc[PTV_MAX_AUDIO];   /* 2.0.0-pre9.3 (T-080 A2) */
 _Atomic int64_t g_rl_step_us[PTV_MAX_AUDIO], g_rl_wc[PTV_MAX_AUDIO], g_rl_seq[PTV_MAX_AUDIO], g_rl_undone[PTV_MAX_AUDIO];   /* 2.0.1 T-087 */
@@ -2896,6 +2898,30 @@ static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
         av_frame_unref(frame);
         return;
     }
+    /* 2.2.1 T-474: a picture that CONTINUES the last real pre-hold picture (within two picture steps) while the hold already
+     * shows bars / black is the pre-gap PES tail lavf hands out with the first post-gap packet (T-074): it ends the hold
+     * (the state machine needs it) but its PICTURE was the old frozen one flashed back on air after the bars (1 picture on
+     * a plain 12 s hole; 9 when the return came in a new rendition: the tail + its dups + the T-469 repeats of it). It
+     * keeps its time and its place; it carries the hold's picture. (Dropping it instead broke the rejoin: rc4-dev4.) */
+    /* only while still holding: after a STOP/CONT the returning content CONTINUES the pre-gap timeline (delayed, not
+     * lost) — carrying the hold picture on every continuing frame put bars on air for good (rc4-dev9: sync_stop_10 /
+     * kill_return_20 live share 0.01). Residual: a return in a new rendition keeps one stale picture (vt-vsw-bars) */
+    if (g_hold_render && d->hr_real_set && d->hr_dur > 0 && ptv_src_holding() && ptv_hold_bars_pic(d, frame)) {
+        int64_t dt = frame->best_effort_timestamp - d->hr_real_pts;
+        if (frame->best_effort_timestamp != AV_NOPTS_VALUE && dt > 0 && dt <= 2 * d->hr_dur) {
+            AVFrame *bp = ptv_hold_bars_pic(d, frame);
+            AVFrame *rp = bp ? av_frame_clone(bp) : NULL;
+            if (rp && av_frame_copy_props(rp, frame) >= 0) {
+                av_log(NULL, AV_LOG_INFO, "[PTV-SRC] in0 a pre-gap picture (+%.0f ms after the last one shown) after "
+                       "the bars carries the hold picture\n", av_q2d(d->ist_tb) * dt * 1000.0);
+                av_frame_side_data_free(&rp->side_data, &rp->nb_side_data);
+                rp->opaque = NULL;
+                av_frame_unref(frame);
+                av_frame_move_ref(frame, rp);
+            }
+            av_frame_free(&rp);
+        }
+    }
     rejoin_map(d, frame);                /* 2.0.0-pre6.1 (single input: emit_video is the non-mosaic path) */
     {   /* 2.0.0-pre9.4 (T-083): a frame decoded within 5 s of corrupt video is damage-era — the output clock fills a
          * content gap in front of it (frames lost); in front of any other frame a gap is the old leap (a backlog drain,
@@ -2905,7 +2931,8 @@ static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
         if (dw && av_gettime_relative() - dw < 5000000)
             av_dict_set(&frame->metadata, "ptv_dmg", "1", 0);
     }
-    ptv_hold_note_frame(d, frame);       /* 2.0.0-pre9: the freeze picture + render timeline (T-078/T-079) */
+    if (!d->filtering)                   /* (with a graph: the FITTED picture, below — T-469) */
+        ptv_hold_note_frame(d, frame);   /* 2.0.0-pre9: the freeze picture + render timeline (T-078/T-079) */
     if (!d->filtering) {                 /* no graph: clone the decoded frame to each rung */
         if (frame->best_effort_timestamp != AV_NOPTS_VALUE)   /* source time in ist_tb (== out_tb) */
             frame->pts = frame->best_effort_timestamp;
@@ -3015,6 +3042,32 @@ static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
                     fflush(NULL);
                     _exit(4);
                 }
+                /* 2.2.1 T-469: the dropped picture keeps its place on the timeline — the last picture the graph took,
+                 * stamped with this one's time (a drop left a 0.12 s video PTS hole + a PCR gap at every rendition
+                 * switch, vt-vsw: the first two pictures of each new size). A lone damaged picture is still never shown */
+                /* not while the source holds (bars / black after -freeze_max: a return in another rendition must not
+                 * show the pre-outage picture again); the repeat keeps the dropped picture's damage mark (the output
+                 * clock fills a gap in front of damage, leaps in front of anything else) and carries no captions (A/53
+                 * side data of the old picture would be sent twice) — Fable 5.2 review of T-469 */
+                if (d->hr_last && d->hr_last->width == in->w && d->hr_last->height == in->h &&
+                    d->hr_last->format == in->format && !ptv_src_holding()) {
+                    AVFrame *rp = av_frame_clone(d->hr_last);
+                    if (rp) {
+                        int64_t bet = frame->best_effort_timestamp, dur = frame->duration;
+                        int dmg = av_dict_get(frame->metadata, "ptv_dmg", NULL, 0) != NULL;
+                        av_frame_move_ref(frame, rp);
+                        av_frame_free(&rp);
+                        frame->best_effort_timestamp = bet;
+                        frame->pkt_dts = AV_NOPTS_VALUE;
+                        if (dur > 0)
+                            frame->duration = dur;
+                        frame->flags &= ~AV_FRAME_FLAG_KEY;
+                        frame->opaque = NULL;
+                        av_frame_remove_side_data(frame, AV_FRAME_DATA_A53_CC);
+                        av_dict_set(&frame->metadata, "ptv_dmg", dmg ? "1" : NULL, 0);
+                        goto feed;
+                    }
+                }
                 return;
             }
         } else
@@ -3035,6 +3088,12 @@ static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
             _exit(4);
         }
     }
+feed:
+    /* 2.2.1 T-469: the freeze picture is the one the graph takes — FITTED to its input size. Noted before the fit, a hold
+     * right after a rendition switch pushed a picture of another size into the graph: CUDA's hwupload failed ("Frame size
+     * or format changed without filter graph reinitialization"), [PTV-VGRAPH] exit 4 (glo-3 Stingray ~40 restarts/day;
+     * a VideoToolbox / software graph re-sized itself instead: vt-vsw-hole GRAPHSIZE FAIL) */
+    ptv_hold_note_frame(d, frame);
     frame->pts = frame->best_effort_timestamp;   /* carry source time through the graph */
     if (av_buffersrc_add_frame(d->fsrc, frame) < 0)   /* consumes frame */
         return;
@@ -5704,6 +5763,15 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         av_log(NULL, AV_LOG_INFO,
                "ptvencoder: CUDA device %s (hwupload + deint + scale + nvenc all share it; created in %.1f s%s)\n",
                *ordbuf ? ordbuf : "0", dus / 1e6, g_cudadev.started ? " while the inputs opened" : "");
+    } else if (fcomplex && strstr(fcomplex, "hwupload") && hwdev && strstr(hwdev, "videotoolbox")) {
+        /* 2.2.1 T-469: -init_hw_device videotoolbox + a graph that uploads (hwupload, scale_vt) — the macOS stand-in of
+         * production's GPU path (hwupload + scale_cuda), so a test sees hwupload's real behaviour on a new picture size
+         * (a software scale re-configures by itself). Without a device hwupload cannot init at all */
+        if ((ret = av_hwdevice_ctx_create(&hw_device, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, NULL, NULL, 0)) < 0) {
+            av_log(NULL, AV_LOG_ERROR, "cannot create the VideoToolbox device: %s\n", av_err2str(ret));
+            goto end;
+        }
+        av_log(NULL, AV_LOG_INFO, "ptvencoder: VideoToolbox device for the filter graph (hwupload)\n");
     }
 
     /* shared filter graph: -filter_complex (N video inputs -> split/mosaic ->
@@ -7540,6 +7608,7 @@ int main(int argc, char **argv)
     if (getenv("PTV_NO_REJOIN_MAP")) g_rejoin_map = 0; /* 2.0.0-pre6.1 kill switch: PTS jumps at a rejoin again */
     { const char *s = getenv("PTV_GLUE_HTOL_PCT");     if (s && atoi(s) > 0) g_glue_htol = atoi(s); }             /* tuning knob (G4) */
     { const char *s = getenv("PTV_NBS_QUANTUM_MS");    if (s && atoi(s) > 0) g_nbs_quantum_us = (int64_t)atoi(s) * 1000; }  /* TEST ONLY (G8) */
+    { const char *s = getenv("PTV_BORN_SILENT_MS");    if (s && atoi(s) >= 0) g_born_silent_us = (int64_t)atoi(s) * 1000; }  /* T-470 */
     /* TEST-ONLY overrides (PTV_WRAP_GUARD_S precedent): shorten the dwell/quiet windows or move
      * the band/slew so the F-gate fixtures can exercise storm/authority paths in bounded wall
      * time. NEVER set in production — the 5min/3min/80ms/2ms/s defaults are the owner-approved
