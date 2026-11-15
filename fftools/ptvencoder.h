@@ -47,6 +47,7 @@ typedef struct RateEstimator {
     _Atomic int     cf_locked;      /* 20 clean chunks (~60s) before the servo may follow */
     _Atomic int64_t src_rate_q20;   /* recovered source rate (content-µs/wall-µs), Q20 */
     _Atomic int     src_rate_locked;/* 0 until the FLL trusts the estimate */
+    int     reg_k;                  /* 2.2.1 T-471: its regulator (input index; -1 = mosaic / none) */
 } RateEstimator;
 /* 0.9.18 R1+R3/R4: master-output-side house-rate actuation state (the ladder's memory).
  * One per HOUSE CLOCK — the instance is a transcode()-scope struct shared by the rung set
@@ -817,6 +818,7 @@ typedef struct DecodeCtx {
     int64_t          hr_pts, hr_dur;          /* next render pts / one frame, in ist_tb */
     int64_t          hr_real_pts;             /* 2.2.1 T-474: the last REAL picture's pts (ist_tb; hr_pts runs on in a hold) */
     int              hr_real_set;
+    int              hr_tail_said;     /* 2.2.1 T-486: the pre-gap tail line said for this hold (once per hold) */
     int64_t          hr_next;                 /* wall us of the next render */
     struct HoldPic  *hr_pic;                  /* bars / slate / black picture cache */
     /* filter graph: filtering -> N buffersinks (one per rung); else clone decode */
@@ -1127,6 +1129,11 @@ typedef struct AudioState {
     int64_t          glue_raw_last_us;              /* last RAW in-pts (us); NOPTS until first frame */
     int64_t          glue_raw_dur_us;                 /* its frame span (us) */
     int64_t          glue_wall_last_us;               /* monotonic wall time of the previous fed frame */
+    /* 2.2.1 T-478: the arrival bookkeeping before this frame — restored when the door drops the frame whole (it never
+     * reaches the output: the silence fill must go on, not stop for a frame that is not played) */
+    int64_t          gs_raw, gs_dur, gs_wall, gs_hs, gs_dup;
+    int64_t          hfe_wc;                          /* T-478: wall time the last hold fill ended */
+    int              gs_ok;
     int64_t          hf_hs_real, hf_dup_real;         /* 2.0.0-pre9.4 (T-083): house_skew + g_dup_out_us at that frame */
     int64_t          hsg_src, hsg_dur, hsg_hs, hsg_wc;  /* T-321: previous door frame's source pts / span / applied
                                                          * house_skew / wall time */
@@ -1517,6 +1524,11 @@ typedef struct DemuxArgs {
     int64_t               v_last_wc;      /* 2.0.2 T-387: wall time of the last packet of the bound video stream */
     int                   vmove_n;        /* ... video packets of a late-born video stream while the bound one is silent */
     int                   vmove_force;    /* ... the video moved to a new PID: reopen now (single input: -> exit 4) */
+    /* 2.2.1 T-484: an AUDIO stream that moved to a new PID (renumbered source) is taken over in-process: the new stream's
+     * packets are routed to the bound stream's index (amove_to[new] = bound + 1; amove_from[bound] = new + 1) */
+#define PTV_AMOVE_MAX 64
+    int8_t                amove_to[PTV_AMOVE_MAX], amove_from[PTV_AMOVE_MAX];
+    int64_t               amove_seen[PTV_AMOVE_MAX];   /* wall time the late-born audio stream's first packet came */
     /* 2.1 T-003 step 1: the source's program and mapped audio, checked once a second from the video path (ptv_src_check) */
     int64_t               src_chk_wc;     /* last check (wall) */
     int64_t               v_flow_wc;      /* the video flowing since (wall; a 1 s pause restarts it) */
@@ -1980,6 +1992,7 @@ static inline int ptv_url_passive(const char *u)
 char *ptv_regulate_start(const char *url, int64_t delay_us, int k);
 void  ptv_regulate_stop(void);
 int   ptv_regulate_unregulated(void);   /* 2.2 T-444: inputs passing unregulated now (no clock), for the status line */
+int   ptv_regulate_rate(int k, int64_t *ppm);   /* 2.2.1 T-471: input k's source clock rate measured on its PCR (1 = a measure) */
 /* 2.2: audio track rules on -map (ptvencoder_bind.c, spec §7): a:main | a:langs | a:lang=xxx | a:multich | a:pid=0x.. |
  * a:index=N [,c=,b=,ac=,af=,lang=,label=,title=,default=1] */
 enum { PTV_BIND_MAIN, PTV_BIND_LANGS, PTV_BIND_LANG, PTV_BIND_MULTICH, PTV_BIND_PID, PTV_BIND_INDEX };
@@ -2266,6 +2279,6 @@ void rscorr_stale_watchdog(int64_t now);
 /* ptvencoder.c */
 void vring_put(VOutRing *r, int64_t src_us, int64_t out_us);
 int vring_shown(VOutRing *r, int64_t c_us, int64_t *out_us, int64_t *gap_us);
-int vring_lookup(VOutRing *r, int64_t want_src, int64_t *out_v, int64_t *matched_src);
+int vring_lookup(VOutRing *r, int64_t want_src, int64_t out_hint, int64_t *out_v, int64_t *matched_src);   /* out_hint: AV_NOPTS_VALUE = none (T-486) */
 
 #endif /* FFTOOLS_PTVENCODER_H */

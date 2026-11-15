@@ -25,6 +25,7 @@
  */
 
 #include "ptvencoder.h"
+#include "libavutil/bprint.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/time.h"
 
@@ -792,7 +793,15 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
              * corrupt packet or where the event began — not at the window's close (a big step's window waits up to 3 s for
              * its partner; counted, 1.06 s of that wait was kept as a hole: sync_excursion mirror) */
             dspan = dmg && t->dmg_start_wc ? FFMAX(t->open_wc, t->dmg_seen_wc) - t->dmg_start_wc : 0;
-            keep  = FFMIN(J, (FFMAX(W, dspan) + fd / 2) / fd * fd);
+            /* 2.2.1 T-486/T-467: the damage span (first corrupt packet .. the event's window) is an UPPER bound of the
+             * pictures lost — it includes how late the step's packet came. Above one picture: the whole pictures inside
+             * it, not rounded up (vt-ap-ownp: one lost picture, a 61 ms span read as 2 — 80 ms kept, the muted audio's
+             * adopted offset 40 ms early; a few ms of regulator timing flipped it run to run). The wall evidence W keeps
+             * its rounding: real silence */
+            {
+                int64_t kd = dspan < fd ? (dspan + fd / 2) / fd * fd : dspan / fd * fd;
+                keep = FFMIN(J, FFMAX((W + fd / 2) / fd * fd, kd));
+            }
             /* 2.2.1 T-463: an audio that did not step and was not damaged flowed through the event — the damage span is
              * only an upper bound of the pictures lost: whole pictures, not rounded up (vt-vonly: one lost picture kept
              * as an 80 ms hole, the audio on its own clock 40 ms early after) */
@@ -821,9 +830,52 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
         prog_event = 1;
         cls = J > 0 && keep == J ? "hole kept" : keep && J > 0 ? "hole, flowing part erased" : J > 0 ? "relabel erased" :
               keep ? "new domain, gap kept" : "step back erased";
+        /* 2.2.1 T-476 (owner 2026-11-15: follow the content, as an encoder re-stamping each stream across a timestamp break):
+         * a pure erase of a step BACK (the input flowed: no wall gap with arrivals as evidence, no damage, nothing kept) makes the VIDEO continuous; an audio that
+         * stepped with it by a different amount keeps the difference as a lip-sync error unless its own step is erased on
+         * it too. Its own exact step = first new label - (last old label + one PES). vt-info-a85 sync_bstep: video -120 /
+         * audio -85 ms at 3 points, content continuous -> +35 ms each, +105 ms for good. Once per event, bounded (5-500 ms;
+         * below 5 ms is the PES grid), through the stream's relabel repair (rep_us, bound 2 s); an audio stepping back
+         * further than the video could repeat content -> the T-087 content check reads the seam (as a single-stream relabel) */
+        /* backward only, and only while arrivals are evidence: under a bank / deep prime W is forced to 0, so "no wall gap"
+         * proves nothing (rich2997long-t389 sync_storm_2, dev2: +3.5 s stall steps under the bank, the audio's PES grid
+         * read as its own step -81 / +49 ms — lip sync -30 ms) */
+        if (!keep && !W && !dmg && J < 0 &&
+            !(atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 || (int64_t)g_preroll_ms >= 4000)) {
+            for (si = 0; si < t->nst; si++) {
+                TlStream *s = &t->st[si];
+                int64_t ja, rn;
+                if (!s->dense || si == vs || s->res != 1 || s->mute || s->rep_big ||
+                    d->ifmt->streams[si]->codecpar->codec_type != AVMEDIA_TYPE_AUDIO || !s->step_us)
+                    continue;
+                ja = s->new_first_us - (s->old_end_us + s->step_us);
+                rn = J - ja;
+                if (llabs(rn) < 5000 || llabs(rn) > 500000 || llabs(s->rep_us + rn) > 2000000)
+                    continue;
+                s->rep_new = rn;
+                s->rep_us += rn;
+                if (rn > 0 && g_rlcheck) {
+                    int j;
+                    for (j = 0; j < d->n_audio; j++)
+                        if (d->astream[j] == si && d->aglobal[j] >= 0 && d->aglobal[j] < PTV_MAX_AUDIO) {
+                            int g = d->aglobal[j];
+                            atomic_store_explicit(&g_rl_step_us[g], rn, memory_order_relaxed);
+                            atomic_store_explicit(&g_rl_wc[g], nw, memory_order_relaxed);
+                            atomic_fetch_add_explicit(&g_rl_seq[g], 1, memory_order_relaxed);
+                            s->rl_mark = 1;
+                        }
+                }
+                av_log(NULL, AV_LOG_WARNING, "[PTV-TL] in%d stream %d: its own step %+.3f s vs the program's %+.3f s, the "
+                       "input flowing — the difference erased on the stream (%+.3f s)\n", d->rsync_slot, si, ja / 1e6,
+                       J / 1e6, rn / 1e6);
+            }
+        }
         /* the new content resumes at a keyframe only where content was lost (a hole, damage): a relabel while the input
          * flowed keeps the bitstream's references — dropping to the next keyframe left ~1 s video PTS holes (sync_bstep) */
-        if (erase && (W > 0 || dmg) && !d->drop_until_kf && g_drop_until_kf) {
+        /* 2.2.1 T-474: a KEPT hole lost content too (erase 0): the first new picture was a P-frame decoded against the
+         * last pre-outage reference — the frozen picture flashed back on air after the bars (vt-vsw-bars: one picture of
+         * content 26.92 s, then the I-frame 1 picture later). Like a receiver after a discontinuity: wait for a keyframe */
+        if ((erase || keep) && (W > 0 || dmg) && !d->drop_until_kf && g_drop_until_kf) {
             int i;
             for (i = 0; i < t->nheld; i++)
                 if (t->held[i].si == vs && t->held[i].path == 1) {
@@ -903,7 +955,7 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
                     }
                     s->mute_rep -= js;
                 }
-                av_log(NULL, AV_LOG_WARNING, "[PTV-TL] in%d stream %d: %s — step %+.3f s, %+.3f s off the program clock "
+                av_log(NULL, AV_LOG_WARNING, "[PTV-TL] in%d stream %d: %s — step %+.3f s, %+.3f s from the program clock "
                        "(band %.1f s)\n", d->rsync_slot, si, s->mute ? "MUTED" : "on the program clock", js / 1e6,
                        off / 1e6, TL_CLK_US / 1e6);
                 continue;
@@ -986,19 +1038,21 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
         }
     }
     t->ev_n++;
-    av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO,
-           "[PTV-TL] in%d event #%"PRId64" (stream %d opened): %s", d->rsync_slot, t->ev_n, t->trig, cls);
-    if (prog_event)
-        av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO,
-               " — J %+.3f s, wall %.3f s%s, kept %.3f s, erased %.3f s (%"PRId64" pictures), k %+.3f s",
-               J / 1e6, W / 1e6, dmg ? " (damaged)" : "", keep / 1e6, erase / 1e6, fd ? erase / fd : 0,
-               k_new / 1e6);
-    for (si = 0; si < t->nst; si++)
-        if (t->st[si].dense && t->st[si].res == 1)
-            av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO, " [s%d %+.3f s]", si,
-                   (t->st[si].new_first_us - t->st[si].old_end_us) / 1e6);
-    av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO, " window %.2f s, %d held\n",
-           (av_gettime_relative() - t->open_wc) / 1e6, t->nheld);
+    {   /* 2.2.1 T-486: ONE av_log — the log mutex is per call, a status line could land inside a multi-call line */
+        AVBPrint bp;
+        av_bprint_init(&bp, 0, AV_BPRINT_SIZE_AUTOMATIC);
+        av_bprintf(&bp, "[PTV-TL] in%d event #%"PRId64" (stream %d opened): %s", d->rsync_slot, t->ev_n, t->trig, cls);
+        if (prog_event)
+            av_bprintf(&bp, " — J %+.3f s, wall %.3f s%s, kept %.3f s, erased %.3f s (%"PRId64" pictures), k %+.3f s",
+                       J / 1e6, W / 1e6, dmg ? " (damaged)" : "", keep / 1e6, erase / 1e6, fd ? erase / fd : 0,
+                       k_new / 1e6);
+        for (si = 0; si < t->nst; si++)
+            if (t->st[si].dense && t->st[si].res == 1)
+                av_bprintf(&bp, " [s%d %+.3f s]", si, (t->st[si].new_first_us - t->st[si].old_end_us) / 1e6);
+        av_bprintf(&bp, " window %.2f s, %d held", (av_gettime_relative() - t->open_wc) / 1e6, t->nheld);
+        av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO, "%s\n", bp.str);
+        av_bprint_finalize(&bp, NULL);
+    }
 
     if (prog_event) {
         atomic_store_explicit(&t->prog_wc, nw, memory_order_relaxed);
