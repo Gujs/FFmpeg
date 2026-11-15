@@ -5,6 +5,19 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.1-rc9 — rc8 + the legend and help made true to the code (T-487)
+
+**Logs only, no behaviour change.** The operator-guide rewrite read every log line against the legend
+(`-log-legend`) and found lines the code prints that the legend did not explain. The legend now covers them: the
+`[PTV-SRC]` returns (renumbered / incomplete / without its declared SCTE-35), the in-process PID and codec moves (video
+and audio moved to pid, audio pid flows again, decoder swapped, SCTE-35 appeared on the declared PID or NOT on the
+output), the damaged-input hold end and every exit line (exiting 4, exiting 5 under the fallback start, PROBING, the
+`-wait_input` give-up); `[PTV-REG]` 'PCR moved' and 'no PCR in 5 s'; `[PTV-AF]` and `[PTV-CONV]`; the single input's
+`[PTV-REOPEN]` lines; the mosaic's per-slot `cc=` and which fields its line does not carry (src= except the start-up
+heartbeat, hs=, cf=, unreg=, dlvdrop=). `cf=` says when it is shown (locked or beyond 500 ppm; every line while a
+regulated input's PCR measure is valid) and that the follow arms at 5000 ppm + 2 standard errors with a measure at most
+30 s old (rc8). `-h`: `-pid_plan` describes v2 as the default (it showed the v1 packed layout), `PTV_VIDEOQ` default 512.
+
 ## 2.2.1-rc8 — rc7 + the rc7 review's fixes (Fable 5.2) and TruBlue's loop splices
 
 **Loop splices keep lip sync again (TruBlue, rc7 regression).** rc7 erased each stream of a joint backward step by its own
