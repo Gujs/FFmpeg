@@ -1415,6 +1415,9 @@ static int audio_drain_fg(AudioState *a)
                  * stays inside (the corrector's realized-trim feedback, §4). */
                 {
                     int64_t step_us = a->glue_off_us + hs;
+                    int64_t rf = a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO ?    /* rc8: per-stream relabel erases */
+                                 atomic_exchange_explicit(&g_rl_force_us[a->dbg_k], 0, memory_order_relaxed) : 0;
+                    a->rl_neutral_us += rf;
                     if (!a->rs_ma_seed) { a->rs_ma_res = m - step_us; a->rs_ma_seed = 1; }
                     else {
                         int64_t dv = a->frame_size > 0                    /* EMA ≈ 30s of audio frames */
@@ -1582,8 +1585,9 @@ static int audio_drain_fg(AudioState *a)
                     /* Latch the latest measurement for the [PTV-AVSYNC] line (PTV_DIAG-only since v0.9.2). */
                     a->av_offset_us = offset; a->av_vlag_us = vlag; a->av_alag_us = alag; a->av_off_valid = 1;
                     a->sc.paired = 1;                                /* T-480: this frame's reading is fresh */
-                }
-                synchk_update(a, av_gettime_relative());             /* T-480 step 4: observe only */
+                } else
+                    a->av_off_valid = 0;                             /* rc8: no pairing now — the DIAG lines say -- */
+                synchk_update(a, av_gettime_relative());             /* T-480 step 4: the post-event sync check */
             }
             /* v0.9.2 — aresample WORK RATE (always-on, primary track only). The honest measure is the
              * RATE of change of the audio's realized output-vs-content span: d(outspan − content)/d(wall)
@@ -2750,8 +2754,8 @@ graph_in:
              * trimmed too. Let through (the 5 s cap), an 8.3 s step back moved the door back, the fill refilled the
              * played span and nothing new reached the encoder for ~1.5 s (storm_2: the audio PID dark). Outside a fill
              * the 5 s cap stays (a restart of the audio's own clock keeps its sound; T-480 adopts within 10 s) */
-            int64_t cap = a->hold_fill_us > 0 || (a->hfe_wc && av_gettime_relative() - a->hfe_wc < 5000000) ?
-                          15000000 : 5000000;
+            int64_t cap = a->hold_fill_us > 0 || a->bk_trim_us ||         /* rc8: a trim under way keeps its cap */
+                          (a->hfe_wc && av_gettime_relative() - a->hfe_wc < 5000000) ? 15000000 : 5000000;
             if (ov > (a->bk_trim_us ? 0 : 1000) && ov <= cap) {
                 int64_t k = av_rescale(ov, frame->sample_rate, 1000000);
                 if (!a->bk_trim_us)

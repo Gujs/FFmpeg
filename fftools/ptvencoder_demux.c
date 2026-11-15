@@ -1233,6 +1233,8 @@ static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const ReopenShape *o
      * their packets) — the mapped ones carry on. Only when the ones there before keep their PIDs: a renumber AND new
      * streams together could put a new track at a mapped index (stays RESHAPED). Was: exit 4 (~25-40 s dark) */
     if (nb > old_nb) {
+        if (!d->single)                      /* rc8 (rc7 review): a mosaic slot checks type only (no PID / language) — an */
+            goto bad;                        /* inserted audio could put another language on the slot: retried, as rc6 */
         extra = nb - old_nb;
         nb = old_nb;
     }
@@ -1924,16 +1926,23 @@ void *demux_thread(void *arg)
                 const AVDictionaryEntry *nl = av_dict_get(ls->metadata, "language", NULL, 0);
                 if (!d->amove_seen[ni])
                     d->amove_seen[ni] = now;
-                if (now - d->amove_seen[ni] >= 1000000) {
-                    for (oi = 0; oi < (int)d->nb_streams_open && oi < PTV_AMOVE_MAX; oi++) {
+                /* rc8 (rc7 review, high): evidence of a MOVE, not a pause — the video flows, the new stream was born
+                 * after the bound one's last packet, the bound one feeds an output track, the language is the same when
+                 * both carry one; the FIRST such stream (two same-language tracks of one codec keep their order) */
+                if (now - d->amove_seen[ni] >= 1000000 && d->v_last_wc && now - d->v_last_wc < 1000000) {
+                    for (oi = 0; oi < (int)d->nb_streams_open && oi < PTV_AMOVE_MAX && best < 0; oi++) {
                         const AVStream *os = d->ifmt->streams[oi];
                         const AVDictionaryEntry *ol = av_dict_get(os->metadata, "language", NULL, 0);
-                        if (os->codecpar->codec_type != AVMEDIA_TYPE_AUDIO || os->codecpar->codec_id != ls->codecpar->codec_id ||
-                            d->amove_from[oi] || !d->wrap_wall_last || !d->wrap_wall_last[oi] ||
-                            now - d->wrap_wall_last[oi] < 2000000)
+                        int mapped = 0, j;
+                        for (j = 0; j < d->n_audio; j++)
+                            mapped |= d->astream[j] == oi;
+                        if (!mapped || os->codecpar->codec_type != AVMEDIA_TYPE_AUDIO ||
+                            os->codecpar->codec_id != ls->codecpar->codec_id || d->amove_from[oi] ||
+                            !d->wrap_wall_last || !d->wrap_wall_last[oi] || now - d->wrap_wall_last[oi] < 2000000 ||
+                            d->amove_seen[ni] < d->wrap_wall_last[oi] ||
+                            (nl && ol && strcmp(nl->value, ol->value)))
                             continue;
-                        if (best < 0 || (nl && ol && !strcmp(nl->value, ol->value)))
-                            best = oi;
+                        best = oi;
                     }
                     if (best >= 0) {
                         d->amove_to[ni]     = best + 1;

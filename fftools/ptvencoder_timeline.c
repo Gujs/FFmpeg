@@ -840,7 +840,11 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
         /* backward only, and only while arrivals are evidence: under a bank / deep prime W is forced to 0, so "no wall gap"
          * proves nothing (rich2997long-t389 sync_storm_2, dev2: +3.5 s stall steps under the bank, the audio's PES grid
          * read as its own step -81 / +49 ms — lip sync -30 ms) */
-        if (!keep && !W && !dmg && J < 0 &&
+        /* rc8 (rc7 review + TruBlue measurement): only a SUB-SECOND joint step is a stitched source's relabel (content
+         * continuous: a85, labels backed up 120 / 85 ms). A step of seconds is a cut or a loop splice where each stream
+         * was cut at its own point (TruBlue: -120 .. -1688 s, audio 65-165 ms off the video's step every few minutes,
+         * in sync by the program erase) — erasing each stream by its own step there put the audio 65-165 ms off */
+        if (!keep && !W && !dmg && J < 0 && J > -1000000 &&
             !(atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 || (int64_t)g_preroll_ms >= 4000)) {
             for (si = 0; si < t->nst; si++) {
                 TlStream *s = &t->st[si];
@@ -854,16 +858,13 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
                     continue;
                 s->rep_new = rn;
                 s->rep_us += rn;
-                if (rn > 0 && g_rlcheck) {
+                {   /* rc8 (rc7 review, high): the erase is the stream's own relabel — sensor-neutral, like a judged
+                     * relabel (rl_neutral_us). Posted to the ledger alone, the sync check read -rn and STEPPED it 3 s later
+                     * (rc7 gate vt-info-a85: "STEPPED +35 ms" after each of the 3 erases) */
                     int j;
                     for (j = 0; j < d->n_audio; j++)
-                        if (d->astream[j] == si && d->aglobal[j] >= 0 && d->aglobal[j] < PTV_MAX_AUDIO) {
-                            int g = d->aglobal[j];
-                            atomic_store_explicit(&g_rl_step_us[g], rn, memory_order_relaxed);
-                            atomic_store_explicit(&g_rl_wc[g], nw, memory_order_relaxed);
-                            atomic_fetch_add_explicit(&g_rl_seq[g], 1, memory_order_relaxed);
-                            s->rl_mark = 1;
-                        }
+                        if (d->astream[j] == si && d->aglobal[j] >= 0 && d->aglobal[j] < PTV_MAX_AUDIO)
+                            atomic_fetch_add_explicit(&g_rl_force_us[d->aglobal[j]], rn, memory_order_relaxed);
                 }
                 av_log(NULL, AV_LOG_WARNING, "[PTV-TL] in%d stream %d: its own step %+.3f s vs the program's %+.3f s, the "
                        "input flowing — the difference erased on the stream (%+.3f s)\n", d->rsync_slot, si, ja / 1e6,

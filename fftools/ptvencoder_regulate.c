@@ -134,6 +134,7 @@ typedef struct Regulator {
     int             fe_on, fe_bin_has, fe_n, fe_head, fe_ok;
     _Atomic int64_t fe_ppm_pub;                     /* + = the source's clock runs fast */
     _Atomic int     fe_ok_pub;
+    _Atomic int64_t fe_se_pub, fe_pub_wc;           /* rc8: the slope's standard error (ppm); when last published */
 } Regulator;
 
 static Regulator  *regs[PTV_MAX_INPUT];
@@ -239,8 +240,13 @@ static void fe_fit(Regulator *r)
     r->fe_ok  = sqrt(rss / n) <= REG_FE_RMS;
     if (r->fe_ok)
         r->fe_ppm = av_clip64(llrint(-b * 1e6), -REG_SV_MAX, REG_SV_MAX);
+    /* rc8 (rc7 review): the slope's standard error — the house arms a follow only when the rate clears its threshold
+     * by 2 SE (a 30-40 ms scatter or one late bin read > 5000 ppm on 8 bins in 3-8 % of fits) */
+    atomic_store_explicit(&r->fe_se_pub, n > 2 ? llrint(sqrt(rss / (n - 2)) / sqrt(sxx - sx * sx / n) * 1e6) : INT64_MAX / 4,
+                          memory_order_relaxed);
     atomic_store_explicit(&r->fe_ppm_pub, r->fe_ppm, memory_order_relaxed);
     atomic_store_explicit(&r->fe_ok_pub, r->fe_ok, memory_order_relaxed);
+    atomic_store_explicit(&r->fe_pub_wc, av_gettime_relative(), memory_order_relaxed);
 }
 
 /* one PCR packet on a continuous PCR (dus = its PCR step in us, 0 for the first) */
@@ -272,12 +278,15 @@ static void fe_feed(Regulator *r, int64_t dus, int64_t now)
     }
 }
 
-int ptv_regulate_rate(int k, int64_t *ppm)
+int ptv_regulate_rate(int k, int64_t *ppm, int64_t *se)
 {
     Regulator *r = k >= 0 && k < PTV_MAX_INPUT ? regs[k] : NULL;
-    if (!r || !atomic_load_explicit(&r->fe_ok_pub, memory_order_relaxed))
+    if (!r || !atomic_load_explicit(&r->fe_ok_pub, memory_order_relaxed) ||   /* rc8: a measure 30 s old is no measure */
+        av_gettime_relative() - atomic_load_explicit(&r->fe_pub_wc, memory_order_relaxed) > 30000000)
         return 0;
     *ppm = atomic_load_explicit(&r->fe_ppm_pub, memory_order_relaxed);
+    if (se)
+        *se = atomic_load_explicit(&r->fe_se_pub, memory_order_relaxed);
     return 1;
 }
 
