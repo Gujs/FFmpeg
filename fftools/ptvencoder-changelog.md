@@ -5,6 +5,18 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.1-rc6 — rc5 + the sync check corrects A/V once after an event (T-480 step 5, the golden rule)
+
+**A/V sync perfect again within seconds of a clean source (owner's golden rule).** rc5's [PTV-SYNCCHK] now acts: once the
+source has been clean for 3 s and the readings agree for 2 s, an offset outside +-25 ms and within 5 s is stepped out
+ONCE per event (the audio's door labels move by the reading; the [PTV-ANCHOR] algebra retires it exactly). A real audio
+repeat of 341 / 512 ms is corrected 4.1 s after the event instead of by the slow corrector 4-8 minutes later; the slow
+corrector keeps drift only. Not stepped: an erase whose audio could not tell a relabel from a repeat (a steady tone,
+silence — T-087: a relabel never moves the audio), offsets beyond 5 s, and mosaic slots (they log what they would do;
+no mosaic key yet). PTV_NO_B2STEP=1 = rc5 behaviour (observe only).
+Kit: T056_GOLDEN=1 judge (A/V within +-25 ms from 10 s after a clean source), keys rich2997long-t480g arepeat_300 /
+arepeat_600 / arelabel_600 + std-t480g arelabel; identify() drops an isolated chance flash match.
+
 ## 2.2.1-rc5 — rc4 + audio off the program clock is muted (T-480), the sync check (observe), lipsync= after an adopted offset, a clock step right after an outage (T-481), GPU memory bounded (T-482), the rejoin park (T-472)
 
 **Golden rule (owner 2026-11-14): A/V sync perfect again as soon as possible after any interruption.**

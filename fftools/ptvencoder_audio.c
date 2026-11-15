@@ -824,6 +824,11 @@ static void ptv_label_step(AudioState *a, int64_t step, int64_t now)
  * exactly R ([PTV-ANCHOR] algebra, ptv_label_step). A resampler slip (rs_slip_us) is waited out, not added.
  * Event  = any feed below moved (synchk_event). Clean = this track's own input only, no sibling (synchk_unclean).
  * Decision = PTV_SC_CLEAN_US clean and PTV_SC_AGREE_US of paired readings within +-PTV_SC_TOL_US.
+ * 2.2.1 T-480 STEP 5 (golden rule, owner 2026-11-14): a decision outside +-25 ms and within the 5 s cap TAKES the step
+ * (ptv_label_step(R): glue_off += R), once per event — A/V back within ~4 s of a clean source instead of the slow
+ * corrector's minutes (rich2997long arepeat_300 / _600: -341 / -512 ms for 4-8 min). Not when an erase of the event had
+ * no relabel verdict (a steady tone or silence cannot vouch: std sync_arelabel reads -300 ms in sync = T-087) and not
+ * on a mosaic slot yet (no mosaic key). The slow corrector keeps drift. PTV_NO_B2STEP=1 = observe only (rc5).
  * PTV_NO_SYNCCHK=1 off. */
 #define PTV_SC_CLEAN_US   3000000   /* the source is clean after this long with no event, damage, hold or fill */
 #define PTV_SC_AGREE_US   2000000   /* ... and a decision needs the readings to agree for this long */
@@ -923,8 +928,10 @@ static void synchk_update(AudioState *a, int64_t now)
         return;
     ev = synchk_event(a);
     if (ev) {                                                  /* events before the decision merge into one watch */
-        if (!s->watch)
+        if (!s->watch) {
             s->log_wc = now;
+            s->rl_nov = 0;
+        }
         s->ev_n++;
         s->ev_why   = ev;
         s->ev_wc    = now;
@@ -969,6 +976,21 @@ static void synchk_update(AudioState *a, int64_t now)
     if (!bad && s->n >= PTV_SC_MIN_N && clean >= PTV_SC_CLEAN_US && now - s->agree_wc >= PTV_SC_AGREE_US) {
         int64_t mid = (s->lo + s->hi) / 2;
         char slow[32] = "--";
+        const char *act = NULL;                                /* step 5: what was done (NULL = observe only) */
+        if (llabs(mid) > PTV_SC_BAND_US && llabs(mid) <= PTV_SC_CAP_US) {
+            if (!g_synchk_step)
+                act = NULL;
+            else if (a->multiview)                             /* no mosaic key yet (rc6): a slot observes */
+                act = "observe only on a mosaic slot";
+            else if (s->rl_nov)
+                act = "not stepped: an erase of this event had no verdict (a relabel cannot be ruled out, T-087) — "
+                      "left to the corrector";
+            else {
+                ptv_label_step(a, mid, now);                   /* glue_off += R retires exactly R ([PTV-ANCHOR]) */
+                s->steps++;
+                act = "STEPPED";
+            }
+        }
         if (a->rs_ma_seed)                                     /* the averaged sensor's reading now, to compare */
             snprintf(slow, sizeof(slow), "%+"PRId64" ms",
                      (atomic_load_explicit(&g_rsx.mv_ema[a->dbg_in], memory_order_relaxed) - a->rs_ma_ema +
@@ -977,12 +999,14 @@ static void synchk_update(AudioState *a, int64_t now)
         av_log(NULL, llabs(mid) <= PTV_SC_BAND_US ? AV_LOG_INFO : AV_LOG_WARNING,
                "[PTV-SYNCCHK] a%d(in%d) after event %"PRId64" (%s, timeline #%"PRId64"): %s %+"PRId64" ms (ledger %+"PRId64
                " vring %+"PRId64" ms, agree %.1f s, clean %.1f s, %.1f s after the event; own clock %+"PRId64" ms exempt; "
-               "lipsync %s)  [+ = audio early; observe only, PTV_NO_SYNCCHK=1 off]\n",
+               "lipsync %s)%s%s  [+ = audio early; PTV_NO_B2STEP=1 observe only, PTV_NO_SYNCCHK=1 off]\n",
                a->dbg_k, a->dbg_in, s->ev_n, s->ev_why, s->tl_snap,
                llabs(mid) <= PTV_SC_BAND_US ? "in sync" :
-               llabs(mid) <= PTV_SC_CAP_US  ? "would step" : "beyond the 5 s cap, would not step",
+               llabs(mid) > PTV_SC_CAP_US   ? "beyond the 5 s cap, not stepped" :
+               act && !strcmp(act, "STEPPED") ? "STEPPED" : "would step",
                mid / 1000, s->led / 1000, (mid - s->led) / 1000, (now - s->agree_wc) / 1e6, clean / 1e6,
-               (now - s->ev_wc) / 1e6, s->own / 1000, slow);
+               (now - s->ev_wc) / 1e6, s->own / 1000, slow,
+               act && strcmp(act, "STEPPED") ? " — " : "", act && strcmp(act, "STEPPED") ? act : "");
         s->watch = 0;
     } else if (!bad && clean >= PTV_SC_BUDGET_US) {
         av_log(NULL, AV_LOG_INFO,
@@ -3112,6 +3136,10 @@ static void rl_eval(AudioState *a, int64_t now)
     else
         av_log(NULL, AV_LOG_INFO, "[PTV-RELABEL] a%d(in%d) -%"PRId64"ms erase: no verdict (corr %.2f, other lags %.2f); "
                "the sensor keeps the source's A/V\n", a->dbg_k, a->dbg_in, a->rl_S_us / 1000, c_rep, c_oth);
+    /* 2.2.1 T-480 step 5: an erase without a verdict may be a relabel the audio cannot vouch for (std sync_arelabel: a
+     * steady tone, the reading -300 ms while the ruler is in sync) — the sync check must not step it (T-087) */
+    if (why || (c_rep >= g_rl_relabel_max && !(c_rep >= 0.8 && c_rep - c_oth >= 0.3)))
+        a->sc.rl_nov = 1;
     a->rl_pend = 0;
 }
 
