@@ -821,6 +821,46 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
         prog_event = 1;
         cls = J > 0 && keep == J ? "hole kept" : keep && J > 0 ? "hole, flowing part erased" : J > 0 ? "relabel erased" :
               keep ? "new domain, gap kept" : "step back erased";
+        /* 2.2.1 T-476 (owner 2026-11-15: follow the content, as an encoder re-stamping each stream across a timestamp break):
+         * a pure erase of a step BACK (the input flowed: no wall gap with arrivals as evidence, no damage, nothing kept) makes the VIDEO continuous; an audio that
+         * stepped with it by a different amount keeps the difference as a lip-sync error unless its own step is erased on
+         * it too. Its own exact step = first new label - (last old label + one PES). vt-info-a85 sync_bstep: video -120 /
+         * audio -85 ms at 3 points, content continuous -> +35 ms each, +105 ms for good. Once per event, bounded (5-500 ms;
+         * below 5 ms is the PES grid), through the stream's relabel repair (rep_us, bound 2 s); an audio stepping back
+         * further than the video could repeat content -> the T-087 content check reads the seam (as a single-stream relabel) */
+        /* backward only, and only while arrivals are evidence: under a bank / deep prime W is forced to 0, so "no wall gap"
+         * proves nothing (rich2997long-t389 sync_storm_2, dev2: +3.5 s stall steps under the bank, the audio's PES grid
+         * read as its own step -81 / +49 ms — lip sync -30 ms) */
+        if (!keep && !W && !dmg && J < 0 &&
+            !(atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 || (int64_t)g_preroll_ms >= 4000)) {
+            for (si = 0; si < t->nst; si++) {
+                TlStream *s = &t->st[si];
+                int64_t ja, rn;
+                if (!s->dense || si == vs || s->res != 1 || s->mute || s->rep_big ||
+                    d->ifmt->streams[si]->codecpar->codec_type != AVMEDIA_TYPE_AUDIO || !s->step_us)
+                    continue;
+                ja = s->new_first_us - (s->old_end_us + s->step_us);
+                rn = J - ja;
+                if (llabs(rn) < 5000 || llabs(rn) > 500000 || llabs(s->rep_us + rn) > 2000000)
+                    continue;
+                s->rep_new = rn;
+                s->rep_us += rn;
+                if (rn > 0 && g_rlcheck) {
+                    int j;
+                    for (j = 0; j < d->n_audio; j++)
+                        if (d->astream[j] == si && d->aglobal[j] >= 0 && d->aglobal[j] < PTV_MAX_AUDIO) {
+                            int g = d->aglobal[j];
+                            atomic_store_explicit(&g_rl_step_us[g], rn, memory_order_relaxed);
+                            atomic_store_explicit(&g_rl_wc[g], nw, memory_order_relaxed);
+                            atomic_fetch_add_explicit(&g_rl_seq[g], 1, memory_order_relaxed);
+                            s->rl_mark = 1;
+                        }
+                }
+                av_log(NULL, AV_LOG_WARNING, "[PTV-TL] in%d stream %d: its own step %+.3f s vs the program's %+.3f s, the "
+                       "input flowing — the difference erased on the stream (%+.3f s)\n", d->rsync_slot, si, ja / 1e6,
+                       J / 1e6, rn / 1e6);
+            }
+        }
         /* the new content resumes at a keyframe only where content was lost (a hole, damage): a relabel while the input
          * flowed keeps the bitstream's references — dropping to the next keyframe left ~1 s video PTS holes (sync_bstep) */
         if (erase && (W > 0 || dmg) && !d->drop_until_kf && g_drop_until_kf) {
