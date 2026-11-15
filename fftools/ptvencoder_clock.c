@@ -930,8 +930,8 @@ static int64_t house_rate_corr_ppm(HouseRateState *hr, const RateEstimator *est,
      * regulator's earliest-arrival fit, de-jittered) — followed at once, no 2 min pinned first: T-090's false follows
      * were the coarse estimator reading delivery jitter, which the regulator's measure does not see. Unregulated inputs
      * (and an untrusted PCR) keep the coarse estimator and T-090's rule */
-    int64_t reg_ppm = 0;
-    int     reg = est->reg_k >= 0 && ptv_regulate_rate(est->reg_k, &reg_ppm);
+    int64_t reg_ppm = 0, reg_se = 0;
+    int     reg = est->reg_k >= 0 && ptv_regulate_rate(est->reg_k, &reg_ppm, &reg_se);
     if (g_clockfollow && hr->cf_following && !reg && !atomic_load_explicit(&est->cf_locked, memory_order_relaxed)) {
         hr->cf_following = 0;              /* the measure it followed is gone (PCR untrusted / estimator unlatched) */
         av_log(NULL, AV_LOG_WARNING, "[PTV-CLOCK] source clock measure lost — released\n");
@@ -957,7 +957,7 @@ static int64_t house_rate_corr_ppm(HouseRateState *hr, const RateEstimator *est,
          * runs the house fast); the noise never does. Arm only after the servo has been pinned in the offset's
          * direction for 2 min. */
         if (!hr->cf_following && llabs(cf_ppm) > 5000 &&
-            (reg || (hr->cf_sat_dir == (cf_ppm > 0 ? -1 : 1) &&
+            ((reg && llabs(cf_ppm) - 2 * reg_se > 5000) || (!reg && hr->cf_sat_dir == (cf_ppm > 0 ? -1 : 1) &&
                      av_gettime_relative() - hr->cf_sat_since >= 120000000))) {
             hr->cf_following = 1;
             av_log(NULL, AV_LOG_WARNING,
@@ -2080,7 +2080,7 @@ void *output_thread(void *arg)
                     int64_t cp = ((cq - (1 << 20)) * 1000000) >> 20;
                     int     lk = atomic_load_explicit(&v->est->cf_locked, memory_order_relaxed);
                     int64_t rp;
-                    if (v->est->reg_k >= 0 && ptv_regulate_rate(v->est->reg_k, &rp)) {   /* T-471: what is followed */
+                    if (v->est->reg_k >= 0 && ptv_regulate_rate(v->est->reg_k, &rp, NULL)) {   /* T-471: what is followed */
                         cp = rp;
                         lk = 1;
                     }

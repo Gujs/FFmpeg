@@ -5,6 +5,21 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.1-rc8 — rc7 + the rc7 review's fixes (Fable 5.2) and TruBlue's loop splices
+
+**Loop splices keep lip sync again (TruBlue, rc7 regression).** rc7 erased each stream of a joint backward step by its own
+step (a85) — right for a stitched source's sub-second relabel, wrong at a cut or loop splice where each stream was cut at
+its own point: TruBlue's ad-insertion splices step the audio 65-165 ms off the video every few minutes (the outgoing
+audio runs 47-97 ms past its last frame, Metropolitan capture), rc7 left the sound -219 / +208 ms off (keys
+sync_loopsplice_120 / vt-loopov). The per-stream erase is now bounded to a sub-second joint step; a step of seconds takes
+the program erase as in rc6. **The per-stream erase is sensor-neutral** (a judged relabel): the sync check no longer
+steps it again (rc7: "STEPPED +35 ms" after each a85 erase). **The audio PID take-over (T-484) needs evidence of a move:**
+the video flowing, the new stream born after the bound one's last packet, a mapped bound stream, the same language when
+both carry one, the first match — a paused PID with added PIDs present is no move (key apause; rc7 took 0x102 over).
+**The PCR clock follow (T-471) arms only when the rate clears 5000 ppm by 2 standard errors of its fit**, and a measure
+older than 30 s is none. A mosaic slot that comes back with added streams is retried as in rc6 (type-only check there).
+The door trim keeps its 15 s cap while a trim is under way. DIAG [PTV-LIPSYNC] returns to -- without a pairing.
+
 ## 2.2.1-rc7 — rc6 + PCR-locked clock follow (T-471), sync_check-safe logs (T-486), reshaped / renumbered return (T-476, T-484), no frozen picture after bars (T-474), continuous audio in stall storms (T-478)
 
 **The source clock is locked on its PCR, in front (T-471, owner: the professional way).** The input regulator measures the

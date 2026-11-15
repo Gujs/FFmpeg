@@ -1992,7 +1992,7 @@ static inline int ptv_url_passive(const char *u)
 char *ptv_regulate_start(const char *url, int64_t delay_us, int k);
 void  ptv_regulate_stop(void);
 int   ptv_regulate_unregulated(void);   /* 2.2 T-444: inputs passing unregulated now (no clock), for the status line */
-int   ptv_regulate_rate(int k, int64_t *ppm);   /* 2.2.1 T-471: input k's source clock rate measured on its PCR (1 = a measure) */
+int   ptv_regulate_rate(int k, int64_t *ppm, int64_t *se);   /* 2.2.1 T-471: input k's source clock rate measured on its PCR (1 = a measure) */
 /* 2.2: audio track rules on -map (ptvencoder_bind.c, spec §7): a:main | a:langs | a:lang=xxx | a:multich | a:pid=0x.. |
  * a:index=N [,c=,b=,ac=,af=,lang=,label=,title=,default=1] */
 enum { PTV_BIND_MAIN, PTV_BIND_LANGS, PTV_BIND_LANG, PTV_BIND_MULTICH, PTV_BIND_PID, PTV_BIND_INDEX };
@@ -2149,6 +2149,7 @@ extern _Atomic int64_t g_acorrupt;                        /* total corrupt-disca
 extern _Atomic int64_t g_rl_step_us[PTV_MAX_AUDIO];      /* 2.0.1 T-087: per global track, the edit the demux posted with its
                                                            * last audio-first backward erase (+ = labels moved later) */
 extern _Atomic int64_t g_rl_wc[PTV_MAX_AUDIO], g_rl_seq[PTV_MAX_AUDIO], g_rl_undone[PTV_MAX_AUDIO];
+extern _Atomic int64_t g_rl_force_us[PTV_MAX_AUDIO];     /* 2.2.1 rc8: per-stream erases of a joint relabel — sensor-neutral by construction */
 extern _Atomic int64_t g_adamage_wc[PTV_MAX_AUDIO];      /* 2.0.0-pre9.3 (T-080 A2): per global track, wall us of the
                                                            * last corrupt-discarded packet (demux → audio thread) */
 extern _Atomic int64_t g_mv_vdmg_wc[PTV_MAX_INPUT];     /* T-350: per multiview slot, wall us of its last corrupt video (compositor) */

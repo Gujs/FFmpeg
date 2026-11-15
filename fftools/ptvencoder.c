@@ -47,7 +47,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.2.1-rc7"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.2.1-rc8"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -762,6 +762,7 @@ int64_t g_born_silent_us = 3000000;            /* 2.2.1 T-470: a planned track n
 _Atomic int64_t g_acorrupt;
 _Atomic int64_t g_adamage_wc[PTV_MAX_AUDIO];   /* 2.0.0-pre9.3 (T-080 A2) */
 _Atomic int64_t g_rl_step_us[PTV_MAX_AUDIO], g_rl_wc[PTV_MAX_AUDIO], g_rl_seq[PTV_MAX_AUDIO], g_rl_undone[PTV_MAX_AUDIO];   /* 2.0.1 T-087 */
+_Atomic int64_t g_rl_force_us[PTV_MAX_AUDIO];   /* 2.2.1 rc8: per global track, erases known to be relabels (the audio thread folds them into rl_neutral_us) */
 _Atomic int64_t g_mv_vdmg_wc[PTV_MAX_INPUT];   /* T-350 */
 _Atomic int64_t g_adec_frame_wc[PTV_MAX_AUDIO];
 _Atomic int64_t g_pad_pub_step[PTV_MAX_AUDIO];
