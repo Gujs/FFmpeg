@@ -2835,8 +2835,11 @@ static void rejoin_map(DecodeCtx *d, const AVFrame *frame)
      * mapped; a lead inside the cushion is not mapped at all and the picture waits for its own slot. */
     if (ptv_rj_prime_class()) {
         int64_t pr = atomic_load_explicit(&g_rj_prime_us, memory_order_relaxed);
-        if (pr > tick * (1 + qn))
-            next += pr - tick * (1 + qn);
+        /* 2.2.1 T-472: the first returning picture is shown one prime from now, EACH queued one a tick after it —
+         * out + pr + tick*qn. Was out + max(pr, tick*(1+qn)): the slot stood still while the catch-up decoded, the 5th
+         * picture read +80 ms "ahead" and was mapped (vt-holes: hs -80 ms per hole, -240 ms for good; the T-317 trap) */
+        if (pr > tick)
+            next += pr - tick;
     }
     lead = pos - next;
     if (g_diag && d->rj_dbg_n < 16) {   /* 2.0.0-pre8.2: [PTV-RJTRACE] (canary B: the map cancelled — localize) */
