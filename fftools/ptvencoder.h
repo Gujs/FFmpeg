@@ -1132,6 +1132,7 @@ typedef struct AudioState {
     /* 2.2.1 T-478: the arrival bookkeeping before this frame — restored when the door drops the frame whole (it never
      * reaches the output: the silence fill must go on, not stop for a frame that is not played) */
     int64_t          gs_raw, gs_dur, gs_wall, gs_hs, gs_dup;
+    int64_t          hfe_wc;                          /* T-478: wall time the last hold fill ended */
     int              gs_ok;
     int64_t          hf_hs_real, hf_dup_real;         /* 2.0.0-pre9.4 (T-083): house_skew + g_dup_out_us at that frame */
     int64_t          hsg_src, hsg_dur, hsg_hs, hsg_wc;  /* T-321: previous door frame's source pts / span / applied

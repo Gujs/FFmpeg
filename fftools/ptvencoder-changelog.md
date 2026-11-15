@@ -5,7 +5,7 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
-## 2.2.1-rc7 — rc6 + PCR-locked clock follow (T-471), sync_check-safe logs (T-486), reshaped return / per-stream erase / rejoin slot (T-476, T-472)
+## 2.2.1-rc7 — rc6 + PCR-locked clock follow (T-471), sync_check-safe logs (T-486), reshaped / renumbered return (T-476, T-484), no frozen picture after bars (T-474), continuous audio in stall storms (T-478)
 
 **The source clock is locked on its PCR, in front (T-471, owner: the professional way).** The input regulator measures the
 source clock against ours from its PCR — the earliest packet of each 2 s against its PCR (delivery only delays a packet),
@@ -23,6 +23,14 @@ longer cut under PTV_LOG_TS.
 an added track is ignored, the mapped streams keep playing; exit 4 only when a mapped stream is gone or changes
 codec / type / language. **A joint backward step is erased per stream** when one stream's own step differs (a85 +105 ms).
 **A rejoin's queued pictures get the slots after the prime (T-472):** vt-holes -240 → -80 ms.
+**A source that comes back with every PID moved keeps its sound (T-484).** The video's PID move was followed in-process,
+the audio's was not (silent for good): an audio stream that starts delivering while a bound one of the same codec has been
+silent 2 s is taken over on the same track. **No frozen picture after the bars (T-474):** after a kept hole the decoder
+input waits for a keyframe — the first returning P-frame decoded against the pre-outage reference and showed the old
+picture once. **The audio PID never goes dark in a stall storm (T-478, owner: professional behaviour):** returning audio
+behind a fill no longer moves the door back (the played span is trimmed, up to 15 s while / right after a fill) and a
+frame dropped at the door does not stop the fill: 1.5 s dark → 0.26 s. **The sync check pairs no picture shown > 5 s
+from its sound; a damage span keeps the whole pictures inside it** (an own-clock audio was adopted 40 ms early).
 
 ## 2.2.1-rc6 — rc5 + the sync check corrects A/V once after an event (T-480 step 5, the golden rule)
 

@@ -2652,6 +2652,7 @@ graph_in:
                                a->dbg_k, a->dbg_in, a->hold_fill_us / 1e6);
                     a->hold_fill_us  = 0;
                     a->hold_fresh_wc = 0;
+                    a->hfe_wc        = now_wc;   /* T-478 */
                     if (a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO)
                         atomic_store_explicit(&g_afill_us[a->dbg_k], 0, memory_order_relaxed);
                 }
@@ -2744,7 +2745,14 @@ graph_in:
              * 2.0.0 T-374: any overlap over 1 ms (label rounding stays below it), not only > 25 ms — the first real
              * frame after a hold fill landed 24 ms behind the fill's end on some runs (which tick the fill stops on is
              * a wall-clock phase), aresample carried it as an 18 ms step back and the encoder wrote one AAC overlap */
-            if (ov > (a->bk_trim_us ? 0 : 1000) && ov <= 5000000) {
+            /* 2.2.1 T-478 (owner: professional behaviour = the audio output runs on): while a fill runs or within 5 s
+             * after one, the span behind the door was already played (as silence) — a step back of up to 15 s is
+             * trimmed too. Let through (the 5 s cap), an 8.3 s step back moved the door back, the fill refilled the
+             * played span and nothing new reached the encoder for ~1.5 s (storm_2: the audio PID dark). Outside a fill
+             * the 5 s cap stays (a restart of the audio's own clock keeps its sound; T-480 adopts within 10 s) */
+            int64_t cap = a->hold_fill_us > 0 || (a->hfe_wc && av_gettime_relative() - a->hfe_wc < 5000000) ?
+                          15000000 : 5000000;
+            if (ov > (a->bk_trim_us ? 0 : 1000) && ov <= cap) {
                 int64_t k = av_rescale(ov, frame->sample_rate, 1000000);
                 if (!a->bk_trim_us)
                     av_log(NULL, AV_LOG_WARNING, "[PTV-ATRIM] a%d(in%d) input stepped back %.0f ms — the overlap is "

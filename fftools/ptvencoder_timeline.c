@@ -872,7 +872,10 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
         }
         /* the new content resumes at a keyframe only where content was lost (a hole, damage): a relabel while the input
          * flowed keeps the bitstream's references — dropping to the next keyframe left ~1 s video PTS holes (sync_bstep) */
-        if (erase && (W > 0 || dmg) && !d->drop_until_kf && g_drop_until_kf) {
+        /* 2.2.1 T-474: a KEPT hole lost content too (erase 0): the first new picture was a P-frame decoded against the
+         * last pre-outage reference — the frozen picture flashed back on air after the bars (vt-vsw-bars: one picture of
+         * content 26.92 s, then the I-frame 1 picture later). Like a receiver after a discontinuity: wait for a keyframe */
+        if ((erase || keep) && (W > 0 || dmg) && !d->drop_until_kf && g_drop_until_kf) {
             int i;
             for (i = 0; i < t->nheld; i++)
                 if (t->held[i].si == vs && t->held[i].path == 1) {
