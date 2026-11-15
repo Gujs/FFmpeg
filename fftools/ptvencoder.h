@@ -1129,6 +1129,10 @@ typedef struct AudioState {
     int64_t          glue_raw_last_us;              /* last RAW in-pts (us); NOPTS until first frame */
     int64_t          glue_raw_dur_us;                 /* its frame span (us) */
     int64_t          glue_wall_last_us;               /* monotonic wall time of the previous fed frame */
+    /* 2.2.1 T-478: the arrival bookkeeping before this frame — restored when the door drops the frame whole (it never
+     * reaches the output: the silence fill must go on, not stop for a frame that is not played) */
+    int64_t          gs_raw, gs_dur, gs_wall, gs_hs, gs_dup;
+    int              gs_ok;
     int64_t          hf_hs_real, hf_dup_real;         /* 2.0.0-pre9.4 (T-083): house_skew + g_dup_out_us at that frame */
     int64_t          hsg_src, hsg_dur, hsg_hs, hsg_wc;  /* T-321: previous door frame's source pts / span / applied
                                                          * house_skew / wall time */
@@ -1519,6 +1523,11 @@ typedef struct DemuxArgs {
     int64_t               v_last_wc;      /* 2.0.2 T-387: wall time of the last packet of the bound video stream */
     int                   vmove_n;        /* ... video packets of a late-born video stream while the bound one is silent */
     int                   vmove_force;    /* ... the video moved to a new PID: reopen now (single input: -> exit 4) */
+    /* 2.2.1 T-484: an AUDIO stream that moved to a new PID (renumbered source) is taken over in-process: the new stream's
+     * packets are routed to the bound stream's index (amove_to[new] = bound + 1; amove_from[bound] = new + 1) */
+#define PTV_AMOVE_MAX 64
+    int8_t                amove_to[PTV_AMOVE_MAX], amove_from[PTV_AMOVE_MAX];
+    int64_t               amove_seen[PTV_AMOVE_MAX];   /* wall time the late-born audio stream's first packet came */
     /* 2.1 T-003 step 1: the source's program and mapped audio, checked once a second from the video path (ptv_src_check) */
     int64_t               src_chk_wc;     /* last check (wall) */
     int64_t               v_flow_wc;      /* the video flowing since (wall; a 1 s pause restarts it) */

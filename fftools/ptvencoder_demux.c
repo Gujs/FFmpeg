@@ -1306,6 +1306,9 @@ static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const ReopenShape *o
     if (d->rsync_slot >= 0 && d->rsync_slot < PTV_MAX_INPUT)   /* rider (a), rr191 F3: the ASTAMP
                                                                 * extrapolation carry must not span the reopen */
         atomic_store_explicit(&g_reopen_wc[d->rsync_slot], av_gettime_relative(), memory_order_relaxed);
+    memset(d->amove_to, 0, sizeof(d->amove_to));     /* 2.2.1 T-484: new demuxer, new stream indices */
+    memset(d->amove_from, 0, sizeof(d->amove_from));
+    memset(d->amove_seen, 0, sizeof(d->amove_seen));
     av_log(NULL, AV_LOG_WARNING,
            "[PTV-REOPEN] input '%s' re-opened after read failure (#%"PRId64") — resuming as a "
            "fresh join (slate/recovery machinery downstream)\n", d->url, d->reopen_cnt);
@@ -1849,6 +1852,20 @@ void *demux_thread(void *arg)
          * The per-stream arrays are sized to the stream count at open, and a late-born stream is
          * routed nowhere (dispatch matches only the streams bound at open): drop its packets here,
          * before any bookkeeping indexes them (was a heap overflow in demux_unwrap). */
+        /* 2.2.1 T-484: a moved audio PID's packets go on as the bound stream's (taken over below); the bound PID itself
+         * flowing again ends it (the source moved back) */
+        if (pkt->stream_index < PTV_AMOVE_MAX) {
+            int si = pkt->stream_index;
+            if (d->amove_from[si]) {
+                int ni = d->amove_from[si] - 1;
+                d->amove_to[ni] = 0;
+                d->amove_from[si] = 0;
+                d->amove_seen[ni] = 0;
+                av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] input '%s': audio pid 0x%x flows again — the take-over of pid 0x%x "
+                       "ends\n", d->url, d->ifmt->streams[si]->id, d->ifmt->streams[ni]->id);
+            } else if (d->amove_to[si])
+                pkt->stream_index = d->amove_to[si] - 1;
+        }
         if (pkt->stream_index >= d->nb_streams_open) {
             const AVStream *ls = d->ifmt->streams[pkt->stream_index];
             int adopt = 0, pi;
@@ -1892,6 +1909,38 @@ void *demux_thread(void *arg)
                         d->vmove_force = 1;
                         av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] input '%s': video moved to pid 0x%x (pid 0x%x silent "
                                "%.1f s) — reopening\n", d->url, ls->id, d->ifmt->streams[was]->id, (now - d->v_last_wc) / 1e6);
+                    }
+                }
+            }
+            /* 2.2.1 T-484: the source renumbered its audio (renumber_return: 0x101 -> 0x201 with the video's move; the
+             * video was taken over above, the sound stayed dark for good — "audio track 0 silent for 10 s"). A late-born
+             * AUDIO stream that delivers for 1 s while a bound audio stream of the same codec is silent >= 2 s (the same
+             * language preferred) = the move: its packets go on as the bound stream's — same track, decoder, timeline and
+             * output PID; a label difference is an ordinary timeline event. Like a hardware decoder following the PMT */
+            if (!adopt && d->reopen && ls->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
+                pkt->stream_index < PTV_AMOVE_MAX) {
+                int ni = pkt->stream_index, oi, best = -1;
+                int64_t now = av_gettime_relative();
+                const AVDictionaryEntry *nl = av_dict_get(ls->metadata, "language", NULL, 0);
+                if (!d->amove_seen[ni])
+                    d->amove_seen[ni] = now;
+                if (now - d->amove_seen[ni] >= 1000000) {
+                    for (oi = 0; oi < (int)d->nb_streams_open && oi < PTV_AMOVE_MAX; oi++) {
+                        const AVStream *os = d->ifmt->streams[oi];
+                        const AVDictionaryEntry *ol = av_dict_get(os->metadata, "language", NULL, 0);
+                        if (os->codecpar->codec_type != AVMEDIA_TYPE_AUDIO || os->codecpar->codec_id != ls->codecpar->codec_id ||
+                            d->amove_from[oi] || !d->wrap_wall_last || !d->wrap_wall_last[oi] ||
+                            now - d->wrap_wall_last[oi] < 2000000)
+                            continue;
+                        if (best < 0 || (nl && ol && !strcmp(nl->value, ol->value)))
+                            best = oi;
+                    }
+                    if (best >= 0) {
+                        d->amove_to[ni]     = best + 1;
+                        d->amove_from[best] = ni + 1;
+                        av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] input '%s': audio moved to pid 0x%x (pid 0x%x silent %.1f s) — "
+                               "taken over in-process on the same track\n", d->url, ls->id, d->ifmt->streams[best]->id,
+                               (now - d->wrap_wall_last[best]) / 1e6);
                     }
                 }
             }

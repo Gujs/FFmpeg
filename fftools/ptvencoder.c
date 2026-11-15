@@ -949,6 +949,11 @@ int vring_lookup(VOutRing *r, int64_t want_src, int64_t out_hint, int64_t *out_v
      * 639 ms of real audio right after the return (audio ~150 ms early for a minute). */
     if (found && r->seg_wc && want_src < lo - 1000000 && av_gettime_relative() - r->seg_wc < 10000000)
         found = 0;
+    /* 2.2.1 T-486: right after a backward step the audio's label may not have been shown yet on the new timeline — the
+     * only match is the old timeline's picture, shown seconds away (vt-vfgap: one -11680 ms reading, then 0 ms). A
+     * picture shown more than 5 s (the sync check's cap) from the sound is not its picture: no pairing for this frame */
+    if (found && out_hint != AV_NOPTS_VALUE && (bo - out_hint > 5000000 || out_hint - bo > 5000000))
+        found = 0;
     pthread_mutex_unlock(&r->lock);
     if (found) { *out_v = bo; *matched_src = bs; }
     return found ? 0 : -1;

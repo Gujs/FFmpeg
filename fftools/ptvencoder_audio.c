@@ -2129,6 +2129,7 @@ static int audio_feed(AudioState *a, AVFrame *frame)
 {
     uint8_t **out = NULL;
     int out_max, got, ret = 0;
+    a->gs_ok = 0;                                  /* T-478: no snapshot for this frame yet */
     if (a->cv_feeding)
         goto graph_in;                             /* a converted frame: vetted by its source frame's pass */
     if (a->multiview && g_audio_follow && a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO) {   /* T-352 ledger history */
@@ -2655,6 +2656,10 @@ graph_in:
                         atomic_store_explicit(&g_afill_us[a->dbg_k], 0, memory_order_relaxed);
                 }
             }
+            if (!a->hold_feeding) {        /* T-478: a real frame — keep what it replaces until it passes the door */
+                a->gs_raw = a->glue_raw_last_us; a->gs_dur = a->glue_raw_dur_us; a->gs_wall = a->glue_wall_last_us;
+                a->gs_hs  = a->hf_hs_real;       a->gs_dup = a->hf_dup_real;     a->gs_ok   = 1;
+            }
             a->glue_raw_last_us  = raw_us;
             a->glue_raw_dur_us   = frame->sample_rate > 0 ?
                 av_rescale(frame->nb_samples, 1000000, frame->sample_rate) : 0;
@@ -2746,6 +2751,13 @@ graph_in:
                            "dropped at the graph door (labels kept)\n", a->dbg_k, a->dbg_in, ov / 1000.0);
                 if (k >= frame->nb_samples) {
                     a->bk_trim_us += av_rescale(frame->nb_samples, 1000000, frame->sample_rate);
+                    /* 2.2.1 T-478: dropped whole = not played: it must not count as the track's last arrival, or the
+                     * silence fill stops while the real sound is still behind the door (storm_2: 1.5 s of an audio
+                     * PID with nothing on it — neither the fill nor the trimmed sound — until the timeline erased) */
+                    if (a->gs_ok) {
+                        a->glue_raw_last_us = a->gs_raw; a->glue_raw_dur_us = a->gs_dur; a->glue_wall_last_us = a->gs_wall;
+                        a->hf_hs_real       = a->gs_hs;  a->hf_dup_real     = a->gs_dup;
+                    }
                     return 0;
                 }
                 if ((ret = av_frame_make_writable(frame)) < 0)

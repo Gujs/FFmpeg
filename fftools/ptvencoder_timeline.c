@@ -793,7 +793,15 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
              * corrupt packet or where the event began — not at the window's close (a big step's window waits up to 3 s for
              * its partner; counted, 1.06 s of that wait was kept as a hole: sync_excursion mirror) */
             dspan = dmg && t->dmg_start_wc ? FFMAX(t->open_wc, t->dmg_seen_wc) - t->dmg_start_wc : 0;
-            keep  = FFMIN(J, (FFMAX(W, dspan) + fd / 2) / fd * fd);
+            /* 2.2.1 T-486/T-467: the damage span (first corrupt packet .. the event's window) is an UPPER bound of the
+             * pictures lost — it includes how late the step's packet came. Above one picture: the whole pictures inside
+             * it, not rounded up (vt-ap-ownp: one lost picture, a 61 ms span read as 2 — 80 ms kept, the muted audio's
+             * adopted offset 40 ms early; a few ms of regulator timing flipped it run to run). The wall evidence W keeps
+             * its rounding: real silence */
+            {
+                int64_t kd = dspan < fd ? (dspan + fd / 2) / fd * fd : dspan / fd * fd;
+                keep = FFMIN(J, FFMAX((W + fd / 2) / fd * fd, kd));
+            }
             /* 2.2.1 T-463: an audio that did not step and was not damaged flowed through the event — the damage span is
              * only an upper bound of the pictures lost: whole pictures, not rounded up (vt-vonly: one lost picture kept
              * as an 80 ms hole, the audio on its own clock 40 ms early after) */
