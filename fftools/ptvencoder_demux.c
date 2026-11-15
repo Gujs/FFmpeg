@@ -1312,8 +1312,9 @@ static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const ReopenShape *o
     return 0;
 bad:
     if (r == PTV_REOPEN_RESHAPED)
-        av_log(NULL, AV_LOG_ERROR, "[PTV-SRC] in0 came back RESHAPED (%u streams, was %u; or a PID, language, "
-               "video codec or size changed) on %s\n", nf->nb_streams, old_nb, d->url);
+        av_log(NULL, AV_LOG_ERROR, "[PTV-SRC] in0 came back RESHAPED (%u streams, was %u): a mapped stream is gone or "
+               "changed its type, language or video codec, or the PIDs moved together with new streams — on %s\n",
+               nf->nb_streams, old_nb, d->url);   /* T-486: a PID move alone, a new size, added streams rejoin (rc7) */
     avformat_close_input(&nf);
     return r;
 }
@@ -1451,7 +1452,7 @@ static int slot_bind(DemuxArgs *d)
             return r;
     }
     d->ifmt = f;                                     /* *d->ifmt_home == in->ifmt already (the acquire set it) */
-    av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in%d WAITING → LIVE: slot %d joins the mosaic\n", d->rsync_slot, d->rsync_slot);
+    av_log(NULL, AV_LOG_INFO, "[PTV-SRC] in%d WAITING → LIVE: slot %d joins the mosaic\n", d->rsync_slot, d->rsync_slot);
     return 0;
 }
 
@@ -1815,9 +1816,10 @@ void *demux_thread(void *arg)
                                    "failed (%s), next in %.0f s\n", (av_gettime_relative() - lost_t0) / 1e6,
                                    d->url, attempt, av_err2str(rr), backoff / 1e6);
                         else
-                            av_log(NULL, AV_LOG_WARNING,
-                                   "[PTV-REOPEN] input '%s' still down — retrying (backoff %.0fs)\n",
-                                   d->url, backoff / 1e6);
+                            av_log(NULL, AV_LOG_WARNING,                 /* T-486: EINVAL = it came back, other layout */
+                                   "[PTV-REOPEN] input '%s' %s — retrying (backoff %.0fs)\n", d->url,
+                                   rr == AVERROR(EINVAL) ? "came back with another stream layout, not taken" : "still down",
+                                   backoff / 1e6);
                     }
                     if (backoff > 0)
                         av_usleep((unsigned)backoff);
@@ -2502,7 +2504,7 @@ static void door_erase(DemuxArgs *d, const AVStream *vst, int64_t vb)
     ptv_tl_cut(d, cut_us);                   /* 2.1 T-409: the program offset, every stream alike */
     d->door_erased = 1;
     d->door_vb     = vb;
-    av_log(NULL, AV_LOG_INFO, "[PTV-SRC] in0 burst: the cut is erased at the door — %.3f s (%"PRId64" pictures) on every "
+    av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 burst: the cut is erased at the door — %.3f s (%"PRId64" pictures) on every "
            "stream, joined on the pictures' boundaries\n", cut_us / 1e6, cut / fd);
 }
 

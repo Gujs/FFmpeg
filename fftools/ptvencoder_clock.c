@@ -926,8 +926,18 @@ static int64_t house_rate_corr_ppm(HouseRateState *hr, const RateEstimator *est,
             hr->cf_sat_since = av_gettime_relative();
         }
     }
-    if (g_clockfollow && atomic_load_explicit(&est->cf_locked, memory_order_relaxed)) {
-        int64_t cf_ppm = ((atomic_load_explicit(&est->cf_rate_q20, memory_order_relaxed)
+    /* 2.2.1 T-471 (owner 2026-11-15, faster lock): a regulated input's clock is measured on its PCR in front (the
+     * regulator's earliest-arrival fit, de-jittered) — followed at once, no 2 min pinned first: T-090's false follows
+     * were the coarse estimator reading delivery jitter, which the regulator's measure does not see. Unregulated inputs
+     * (and an untrusted PCR) keep the coarse estimator and T-090's rule */
+    int64_t reg_ppm = 0;
+    int     reg = est->reg_k >= 0 && ptv_regulate_rate(est->reg_k, &reg_ppm);
+    if (g_clockfollow && hr->cf_following && !reg && !atomic_load_explicit(&est->cf_locked, memory_order_relaxed)) {
+        hr->cf_following = 0;              /* the measure it followed is gone (PCR untrusted / estimator unlatched) */
+        av_log(NULL, AV_LOG_WARNING, "[PTV-CLOCK] source clock measure lost — released\n");
+    }
+    if (g_clockfollow && (reg || atomic_load_explicit(&est->cf_locked, memory_order_relaxed))) {
+        int64_t cf_ppm = reg ? reg_ppm : ((atomic_load_explicit(&est->cf_rate_q20, memory_order_relaxed)
                            - (1 << 20)) * 1000000) >> 20;
         /* v0.9.15.3: a BURSTY-classified channel (auto-bank armed) violates the coarse
          * estimator's smooth-delivery assumption — its clump windows alias into a bogus
@@ -947,13 +957,13 @@ static int64_t house_rate_corr_ppm(HouseRateState *hr, const RateEstimator *est,
          * runs the house fast); the noise never does. Arm only after the servo has been pinned in the offset's
          * direction for 2 min. */
         if (!hr->cf_following && llabs(cf_ppm) > 5000 &&
-            hr->cf_sat_dir == (cf_ppm > 0 ? -1 : 1) &&
-            av_gettime_relative() - hr->cf_sat_since >= 120000000) {
+            (reg || (hr->cf_sat_dir == (cf_ppm > 0 ? -1 : 1) &&
+                     av_gettime_relative() - hr->cf_sat_since >= 120000000))) {
             hr->cf_following = 1;
             av_log(NULL, AV_LOG_WARNING,
-                   "[PTV-CLOCK] source clock runs %+lldppm off realtime — FOLLOWING it "
+                   "[PTV-CLOCK] source clock runs %+lldppm off realtime (%s) — FOLLOWING it "
                    "(output+PCR pace at the source's true rate; PTV_NO_CLOCKFOLLOW reverts)\n",
-                   (long long)cf_ppm);
+                   (long long)cf_ppm, reg ? "measured on its PCR" : "estimated from its video");
         } else if (hr->cf_following && llabs(cf_ppm) < 2000) {
             hr->cf_following = 0;
             av_log(NULL, AV_LOG_WARNING,
@@ -1892,8 +1902,8 @@ void *output_thread(void *arg)
                 atomic_store_explicit(&g_src_state, 0, memory_order_relaxed);
                 atomic_store_explicit(&g_src_hold_start, 0, memory_order_relaxed);
                 atomic_store_explicit(&g_src_rejoin_wall, nw, memory_order_relaxed);
-                av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 STALLED \xe2\x86\x92 LIVE after %.1f s%s\n",
-                       (nw - hs0) / 1e6, g_src_hold_act ? "" : " (observe-only)");
+                av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 STALLED \xe2\x86\x92 LIVE after %.1f s held%s\n",
+                       (nw - hs0) / 1e6, g_src_hold_act ? "" : " (observe-only)");   /* T-486: the hold's length */
             } else {
                 int64_t hs0 = atomic_load_explicit(&g_src_hold_start, memory_order_relaxed);
                 if (!src_lost_logged && arr && nw - arr >= g_lost_after_us) {
@@ -2069,6 +2079,11 @@ void *output_thread(void *arg)
                     int64_t cq = atomic_load_explicit(&v->est->cf_rate_q20, memory_order_relaxed);
                     int64_t cp = ((cq - (1 << 20)) * 1000000) >> 20;
                     int     lk = atomic_load_explicit(&v->est->cf_locked, memory_order_relaxed);
+                    int64_t rp;
+                    if (v->est->reg_k >= 0 && ptv_regulate_rate(v->est->reg_k, &rp)) {   /* T-471: what is followed */
+                        cp = rp;
+                        lk = 1;
+                    }
                     int     n = 0;
                     if (lk || llabs(cp) > 500)
                         n = snprintf(cfs, sizeof cfs, " cf=%+lldppm%s", (long long)cp, lk ? "" : "?");

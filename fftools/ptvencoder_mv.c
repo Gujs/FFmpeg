@@ -237,7 +237,7 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
                     if (nf - margin > fs && nf - fs < 60000000)
                         tgt = nf - margin;
                 }
-                av_log(NULL, AV_LOG_INFO, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (the buffer overflowed: the "
+                av_log(NULL, AV_LOG_WARNING, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (the buffer overflowed: the "
                        "pictures before this one are gone, %"PRId64" dropped so far)\n", k, (out - tgt - s->lag) / 1000,
                        s->ovf_seen);
                 mv_tl_step(c, k, s, out - tgt, h0, now_us, tgt);
@@ -255,7 +255,7 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
              * normal for a bursty source and waits (re-locking on 1 s churned an HLS-burst slot every few seconds) */
             if (!cand && fs - (out - mv_tl_lag(s, fs)) > margin + 10000000 && now_us - s->shown_wc > 3000000 &&
                 now_us - s->relock_wc > 3000000) {
-                av_log(NULL, AV_LOG_INFO, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (content ahead)\n",
+                av_log(NULL, AV_LOG_WARNING, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (content ahead)\n",
                        k, (out - fs + margin - s->lag) / 1000);
                 mv_tl_step(c, k, s, out - fs + margin, h0, now_us, AV_NOPTS_VALUE);
             }
@@ -303,7 +303,7 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
                 relock = out - src + margin;        /* late for 1 s at real-time pace: hold for the primed margin */
         }
         if (relock != AV_NOPTS_VALUE && relock - s->lag >= c->tick_dur_us) {   /* grows only */
-            av_log(NULL, AV_LOG_INFO, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (late for 1 s)\n", k,
+            av_log(NULL, AV_LOG_WARNING, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (late for 1 s)\n", k,
                    (relock - s->lag) / 1000);
             s->late_wc = 0;
             mv_tl_step(c, k, s, relock, h0, now_us, AV_NOPTS_VALUE);
@@ -391,7 +391,7 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
                                               * top of it — a backlog left over, not a clock: one cut. Up to there drift
                                               * goes a picture per window even after damage paused the evidence (a
                                               * +1000 ppm slot on a damaged capture: 6 ticks as the limit cut -266 ms) */
-                        av_log(NULL, AV_LOG_INFO, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (the buffer never "
+                        av_log(NULL, AV_LOG_WARNING, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (the buffer never "
                                "below %"PRId64" ms in 60 s, primed %"PRId64" ms)\n", k, -(lo - margin) / 1000,
                                lo / 1000, margin / 1000);
                         mv_tl_step(c, k, s, s->lag - (lo - margin), h0, now_us, AV_NOPTS_VALUE);
@@ -645,7 +645,7 @@ void *compositor_thread(void *arg)
                 last[k] = cand; any_fresh = 1; last_fresh_us[k] = now_us;
                 if (c->inputs[k].deferred) {             /* 2.0.2 T-386: the slot's first picture — it joins here */
                     c->inputs[k].deferred = 0;
-                    av_log(NULL, AV_LOG_WARNING, "[PTV-MV] in%d joined: first picture at tick %"PRId64" (%.3f s)\n",
+                    av_log(NULL, AV_LOG_INFO, "[PTV-MV] in%d joined: first picture at tick %"PRId64" (%.3f s)\n",
                            k, tick, mv_tick_us(c, tick) / 1e6);
                 }
                 if (!born[k]) {                           /* pre17: first display — the slot is live;

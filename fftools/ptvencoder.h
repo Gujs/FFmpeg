@@ -47,6 +47,7 @@ typedef struct RateEstimator {
     _Atomic int     cf_locked;      /* 20 clean chunks (~60s) before the servo may follow */
     _Atomic int64_t src_rate_q20;   /* recovered source rate (content-µs/wall-µs), Q20 */
     _Atomic int     src_rate_locked;/* 0 until the FLL trusts the estimate */
+    int     reg_k;                  /* 2.2.1 T-471: its regulator (input index; -1 = mosaic / none) */
 } RateEstimator;
 /* 0.9.18 R1+R3/R4: master-output-side house-rate actuation state (the ladder's memory).
  * One per HOUSE CLOCK — the instance is a transcode()-scope struct shared by the rung set
@@ -817,6 +818,7 @@ typedef struct DecodeCtx {
     int64_t          hr_pts, hr_dur;          /* next render pts / one frame, in ist_tb */
     int64_t          hr_real_pts;             /* 2.2.1 T-474: the last REAL picture's pts (ist_tb; hr_pts runs on in a hold) */
     int              hr_real_set;
+    int              hr_tail_said;     /* 2.2.1 T-486: the pre-gap tail line said for this hold (once per hold) */
     int64_t          hr_next;                 /* wall us of the next render */
     struct HoldPic  *hr_pic;                  /* bars / slate / black picture cache */
     /* filter graph: filtering -> N buffersinks (one per rung); else clone decode */
@@ -1980,6 +1982,7 @@ static inline int ptv_url_passive(const char *u)
 char *ptv_regulate_start(const char *url, int64_t delay_us, int k);
 void  ptv_regulate_stop(void);
 int   ptv_regulate_unregulated(void);   /* 2.2 T-444: inputs passing unregulated now (no clock), for the status line */
+int   ptv_regulate_rate(int k, int64_t *ppm);   /* 2.2.1 T-471: input k's source clock rate measured on its PCR (1 = a measure) */
 /* 2.2: audio track rules on -map (ptvencoder_bind.c, spec §7): a:main | a:langs | a:lang=xxx | a:multich | a:pid=0x.. |
  * a:index=N [,c=,b=,ac=,af=,lang=,label=,title=,default=1] */
 enum { PTV_BIND_MAIN, PTV_BIND_LANGS, PTV_BIND_LANG, PTV_BIND_MULTICH, PTV_BIND_PID, PTV_BIND_INDEX };
@@ -2266,6 +2269,6 @@ void rscorr_stale_watchdog(int64_t now);
 /* ptvencoder.c */
 void vring_put(VOutRing *r, int64_t src_us, int64_t out_us);
 int vring_shown(VOutRing *r, int64_t c_us, int64_t *out_us, int64_t *gap_us);
-int vring_lookup(VOutRing *r, int64_t want_src, int64_t *out_v, int64_t *matched_src);
+int vring_lookup(VOutRing *r, int64_t want_src, int64_t out_hint, int64_t *out_v, int64_t *matched_src);   /* out_hint: AV_NOPTS_VALUE = none (T-486) */
 
 #endif /* FFTOOLS_PTVENCODER_H */

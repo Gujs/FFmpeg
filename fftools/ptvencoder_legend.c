@@ -55,7 +55,8 @@ void show_help_default(const char *opt, const char *arg)
         "                        runs once per input: each slot gets its OWN track, stamped on that\n"
         "                        slot's own clock (so captions stay on their own dialogue) and its\n"
         "                        own page, walked in BCD from the base (888, 889, 890, 891).\n"
-        "                        -cc_slots 0,2 limits it to named inputs (default: all) — use it\n"
+        "                        -cc_slots 0,2 limits it to named inputs (default: all) — use it\n");
+    av_log(NULL, AV_LOG_INFO,
         "                        when a slot already carries real DVB subtitles to copy.\n"
         "                        -cc_lang <iso639-2> sets the language + G0 national subset for\n"
         "                        every extraction (default: that input's first non-und audio\n"
@@ -75,7 +76,8 @@ void show_help_default(const char *opt, const char *arg)
         "                        It engages ONLY after a roll-up carriage return has actually been\n"
         "                        seen, so a source that never rolls up is passed through byte for\n"
         "                        byte under either style. A pop-on caption FLIPPED IN over live\n"
-        "                        roll-up content (an ad break on a news channel) is finished text\n"
+        "                        roll-up content (an ad break on a news channel) is finished text\n");
+    av_log(NULL, AV_LOG_INFO,
         "                        by definition and goes out whole, at once.\n"
         "                        Block advances are PACED: a completed line joins a queue and the\n"
         "                        window advances one line at a time, no sooner than 1500 ms after\n"
@@ -95,7 +97,8 @@ void show_help_default(const char *opt, const char *arg)
         "                        -pid_plan video=200,audio=300,subtitle=400,data=500; \"off\" =\n"
         "                        the legacy source-order PIDs). Within a class: this run's\n"
         "                        mapped/synthesised tracks first (the video; transcoded audio in\n"
-        "                        -map order; CC->teletext in slot order), then COPIED tracks by\n"
+        "                        -map order; CC->teletext in slot order), then COPIED tracks by\n");
+    av_log(NULL, AV_LOG_INFO,
         "                        SCTE-35-first (data class), SOURCE language, a content sub-key\n"
         "                        (subtitles: plain before hearing-impaired; audio: more channels\n"
         "                        first), codec name, INPUT INDEX, and finally source PID / source\n"
@@ -115,7 +118,8 @@ void show_help_default(const char *opt, const char *arg)
         "                        in PID order and PCR sits on the video PID; every ABR rung gets\n"
         "                        the same plan. Per-type option indices (-c:a:N / -metadata:s:s:N\n"
         "                        / -disposition:a:N) are UNCHANGED — they still count in\n"
-        "                        -map/resolve order — but the PHYSICAL stream order DOES change\n"
+        "                        -map/resolve order — but the PHYSICAL stream order DOES change\n");
+    av_log(NULL, AV_LOG_INFO,
         "                        (CC teletext now leads the subtitle class), so a downstream that\n"
         "                        selects by output stream POSITION rather than by PID or language\n"
         "                        sees a different track. The startup [PTV-PID] lines print the\n"
@@ -139,7 +143,8 @@ void show_help_default(const char *opt, const char *arg)
         "    PTV_CUSHION_MAX_MS  AUTO-BANK ceiling (default 12000): bursty channels self-escalate a\n"
         "                        compressed video_q bank to 1.5x their worst stall — no env needed\n"
         "    PTV_DELIVERY_CAP_MS / PTV_DELIVERY_MAXQ   audio delivery-gate sizing (auto-sized normally)\n"
-        "    PTV_RSS_CAP_MB=N    process RSS ceiling (default 8192; 0 disables): [PTV-MEMCAP] warn at\n"
+        "    PTV_RSS_CAP_MB=N    process RSS ceiling (default 8192; 0 disables): [PTV-MEMCAP] warn at\n");
+    av_log(NULL, AV_LOG_INFO,
         "                        75%%, supervised-respawn exit at cap — bounds the flap-storm memory\n"
         "                        runaway class so one channel can never ENOMEM its neighbors\n"
         "    PTV_NO_AFMT_BREAKER=1  disable the [PTV-AFMT] rebuild-storm breaker (escalating 2..60s\n"
@@ -158,7 +163,8 @@ void show_help_default(const char *opt, const char *arg)
         "    PTV_NO_REPRIME      fast post-glue buffer refill\n"
         "    PTV_NO_EXACTTICK    exact-rational video stamping     PTV_NO_MV_EXACTTICK  mosaic measurement axes\n"
         "    PTV_NO_PULLDOWN     telecine-aware film emit          PTV_NO_AVLOCK   audio house-lock\n"
-        "    PTV_NO_GENLOCK      source-rate estimator\n"
+        "    PTV_NO_GENLOCK      source-rate estimator\n");
+    av_log(NULL, AV_LOG_INFO,
         "    PTV_NO_DELIVERY     audio delivery-alignment gate     PTV_NO_DELIVERY_MV ungated mosaics (pre-0.9.12.1)\n"
         "    PTV_NO_VDELIVERY    symmetric EARLY-VIDEO hold (pre12; back to video-ahead wire under a buffering -af)\n"
         "    PTV_NO_AUTOBANK     runtime bursty-channel bank escalation (back to advisor-only)\n"
@@ -176,7 +182,8 @@ void show_help_default(const char *opt, const char *arg)
 /* v0.9.2 self-documenting log legend. full=0 (compact) describes the always-on `-stats` progress
  * line and is printed once at startup below the banner, so every channel log explains itself;
  * full=1 (via `-log-legend`, exits after) also documents the PTV_DIAG debug lines + env switches.
- * Split into <1KiB av_log calls (the default log callback truncates a single line at 1024). */
+ * Every av_log call stays under 2 KiB: the PTV_LOG_TS callback formats one call into a 2048-byte buffer
+ * (ptvencoder.c) — a longer chunk lost its tail AND its newline, gluing the next log line onto the legend. */
 void ptv_print_log_legend(int full)
 {
     av_log(NULL, AV_LOG_INFO,
@@ -191,10 +198,11 @@ void ptv_print_log_legend(int full)
         "  pd         intentional cadence holds (v0.9.11 telecine-aware emit): during 23.976-film-in-\n"
         "             29.97 segments a repeat_pict frame occupies its 2:3 residence — ~6/s during a\n"
         "             movie is CORRECT pulldown, not a fault (PTV_DIAG: [PTV-PULLDOWN] brackets film segments)\n"
-        "  drop       frames SKIPPED at frame_q overflow — the latency-drain meter: after a stall,\n"
-        "             drop= ticks up while hs= bleeds down (the debt repaid in skipped content)\n"
+        "  drop       frames SKIPPED at frame_q overflow ([PTV-FRAMEQ]) — 0 in normal running (2.1+:\n"
+        "             an outage's hold is kept or erased by the timeline, not drained by drops)\n"
         "  corrupt    corrupt packets discarded (demux + decode)\n"
-        "  async      aresample compensation RATE (ppm); ~0 = idle/healthy, large = resampler fighting\n");
+        "  async      aresample compensation RATE (ppm, EMA); ~0 = idle/healthy, a sustained large value =\n"
+        "             resampler fighting (2.2.1: a step — hold, fill, label step — is not averaged in)\n");
     av_log(NULL, AV_LOG_INFO,
         "  dlvhold    (delivery gate) ms of audio HELD waiting for matching video (≈ encoder latency +\n"
         "             cushion); normal ~1-2s, scales with the cushion\n"
@@ -215,13 +223,14 @@ void ptv_print_log_legend(int full)
         "  wucr_buf   frame_q occupancy (frames/ms) — the jitter cushion fill vs cushion= target\n"
         "  fqhw       deepest any frame queue has ever been (frames) — the CUDA pool high-water;\n"
         "             this, not the cushion tier, sets the per-process VRAM footprint\n"
-        "  wucr_rho   applied house-rate offset (ppm) = recovered source-clock deviation (+ = source\n"
+        "  wucr_rho   applied house-rate offset (ppm) = recovered source-clock deviation (+ = source\n");
+    av_log(NULL, AV_LOG_INFO,
         "             faster); pegged ±6000 = gentle-zone fill/drain in progress\n");
     av_log(NULL, AV_LOG_INFO,
-        "  hs         house_skew: latency debt vs baseline (ms) — a feed stall steps it up, catch-up\n"
-        "             drops bleed it back; A/V stays LOCKED throughout (this is delay, not lip-sync)\n"
-        "  hsres      (0.9.18.7) LAYERA erase-residue ledger (ms) — 2.1: always 0 (LAYERA is not run;\n"
-        "             the timeline erases on every stream at once, so hs is real retained latency)\n"
+        "  hs         house_skew (ms): output time minus source label time since the start. Grows by every\n"
+        "             kept hole, hold, erased relabel and skipped catch-up and does not come back — it is\n"
+        "             NOT latency (latency = wucr_buf + bank + dlvhold) and not lip sync (that is lipsync=)\n"
+        "  hsres      always 0 since 2.1 (the LAYERA erase-residue ledger is not run); kept for parsers\n"
         "  cushion    adaptive frame_q target: ~1s lean tier or ~4s raised tier ([PTV-CUSHION] logs\n"
         "             each transition: grows on 2 starvations/60min, shrinks after 6h quiet;\n"
         "             1.0.1-pre10: [PTV-CUSHREL] releases a raised tier held against a starved-\n"
@@ -237,10 +246,11 @@ void ptv_print_log_legend(int full)
         "             from the stalls' own retained latency, retires after 1 h quiet; a lone\n"
         "             >=3 s stall's bank (pre20) holds only what came and retires after 10 min\n");
     av_log(NULL, AV_LOG_INFO,
-        "  cf         (v0.9.15, shown when notable) coarse source-CLOCK estimate (ppm vs realtime,\n"
-        "             `?` = not yet locked ~60s). |cf|>5000 locked => output+PCR FOLLOW the source's\n"
-        "             true rate ([PTV-CLOCK] logs arm/release); frozen while BURSTY/bank is armed\n"
-        "             (clump delivery is not a clock measurement)\n"
+        "  cf         (v0.9.15, shown when notable) the source CLOCK's rate (ppm vs realtime, + = fast).\n"
+        "             2.2.1: a regulated input = measured on its PCR by the regulator (earliest arrival per\n"
+        "             2 s, 16-60 s fit) and followed at once beyond 5000 ppm; otherwise the coarse video\n"
+        "             estimate (`?` = not locked, ~60 s; followed after the servo was pinned 2 min).\n"
+        "             [PTV-CLOCK] logs follow/release; never followed while BURSTY/bank is armed\n"
         "  decim      (v0.9.15.2, shown when >0) SURPLUS frames decimated: source delivers more real\n"
         "             frames than its declared rate (e.g. ~25.4 fps declaring 25) — each skip is a\n"
         "             content position already displayed, so perceived speed is always EXACTLY 1x;\n"
@@ -249,12 +259,13 @@ void ptv_print_log_legend(int full)
         "             (ms, + = audio EARLY): per-stream source→output content mapping difference\n"
         "             (video EMA(out−src) + demux edit ledger vs audio ledger m_a) — sees\n"
         "             relabel-erases, wrong glues and parked resampler slip; shared latency (hs)\n"
-        "             cancels. `--` = a side not flowing, the track filled with silence (afill=)\n"
+        "             cancels; an ADOPTED clock of its own ([PTV-TL] offset adopted) is excluded. `--` = a side not flowing, the track filled with silence (afill=)\n"
         "             or (2.0.2, single input) the source STALLED — no content to compare.\n"
         "             On mv each track pairs against ITS OWN\n"
         "             slot's video (aK: prefix always; track→slot map = the startup [PTV-RSYNC]\n"
         "             tracks: line). 1.0.1-pre11: the slip probe is scoped to the async-aresample\n"
-        "             boundary — a buffering -af's hold (loudnorm ~3s) is label-preserving latency,\n"
+        "             boundary — a buffering -af's hold (loudnorm ~3s) is label-preserving latency,\n");
+    av_log(NULL, AV_LOG_INFO,
         "             EXCLUDED from R (the pre9 whole-graph probe read it as false audio-early).\n"
         "             Soak-CERTIFIED vs the external oracle 2026-07-16 (Δ12-21ms on real excursions,\n"
         "             both signs human-verified, NTSC 24h flat) — the corrector's gate condition.\n"
@@ -262,7 +273,7 @@ void ptv_print_log_legend(int full)
         "             (both modes). Components: [PTV-RSYNC] under PTV_DIAG.\n"
         "  corr       (1.0.1-pre14, only when nonzero/engaged) residual-sync\n"
         "             CORRECTOR cumulative resampler trim (ms; `*` = actively integrating). The\n"
-        "             actuation half of the supervisor: when the sensor's R dwells outside ±80ms\n"
+        "             actuation half of the supervisor: when the sensor's R dwells outside ±40ms\n"
         "             for 5min stable + 3min event-free with ALL rungs' wire provably moving, it\n"
         "             steers R→0 through aresample (≤2ms/s; park |R|≤20ms; authority 5s/engagement,\n"
         "             10s lifetime → hard disarm). [PTV-RSCORR] logs every state change\n"
@@ -288,7 +299,8 @@ void ptv_print_log_legend(int full)
         "             The difference is clears superseded by a new caption before they were due,\n"
         "             plus clears the encoder had nothing to do (page already blank).\n"
         "             ccheld climbing with cclate flat => clears are being LOST, not delayed, and\n"
-        "             pages will outlive the source's (that was the pre-fix behaviour)\n"
+        "             pages will outlive the source's (that was the pre-fix behaviour)\n");
+    av_log(NULL, AV_LOG_INFO,
         "  ccmux      (shown when >0) teletext packets OUR OWN mux backward-dts guard dropped\n"
         "             ([PTV-MUXGUARD], stream = the teletext PID). Every other counter here is\n"
         "             taken where the page was produced, so this is the only one that speaks for\n"
@@ -308,7 +320,8 @@ void ptv_print_log_legend(int full)
         "             not a fault. One [PTV-CC] INFO line names it the first time it happens.\n"
         "             (2.1 T-326) [PTV-CC] inK captions of a corrupt-discarded picture kept: the picture is\n"
         "             dropped before decode, its EIA-608 pair still reaches the tap in display order;\n"
-        "             [PTV-CC] inK the source carries EIA-608 captions but -cc_extract is not set for it\n"
+        "             [PTV-CC] inK the source carries EIA-608 captions but -cc_extract is not set for it\n");
+    av_log(NULL, AV_LOG_INFO,
         "             (2.1 T-400, once, after 10 real pairs): pin SV_CC_EXTRACT=true for this channel\n"
         "  unreg      (shown when >0, 2.2.0-pre12) inputs the regulator passes as they arrive now\n"
         "             (their PCR is no clock: [PTV-REG] 'no clock to pace by' / 'regulated again')\n"
@@ -334,11 +347,35 @@ void ptv_print_log_legend(int full)
         "                 part erased (labels jumped further than the wall time: the rest erased) | relabel erased\n"
         "                 (a jump with no wall time) | step back erased | new domain, gap kept (a restart) |\n"
         "                 outlier window (corrupt labels dropped) | single-stream step (one stream only, labels\n"
-        "                 as sent; RELABEL may repair it). WARNING when the program moved, INFO otherwise\n"
+        "                 as sent; RELABEL may repair it). WARNING when the program moved, INFO otherwise.\n"
+        "                 2.2.1: an audio whose clock leaves the program clock while pictures run is MUTED\n"
+        "                 (silence, like a frame synchronizer) until it is back on the program clock; still\n"
+        "                 off after 10 s its offset is ADOPTED (its own timing: lipsync= excludes it). Also:\n"
+        "                 'did not cross / crossed after the video's step', 'its own step ... erased on the\n"
+        "                 stream' (a joint backward step erased per stream by its own step, rc7)\n"
+        "  [PTV-SYNCCHK]  (2.2.1) once per track and event, after 3 s of clean source and 2 s of agreeing\n"
+        "                 readings: the A/V offset (ledger + vring, + = audio early) — in sync (within 25 ms)\n"
+        "                 | STEPPED (25 ms .. 5 s stepped out of the audio labels once) | would step ... not\n"
+        "                 stepped (an erase without a verdict, a mosaic slot, PTV_NO_B2STEP=1) | beyond the 5 s\n");
+    av_log(NULL, AV_LOG_INFO,
+        "                 cap | no steady reading. Prints the lipsync= sensor's value to compare\n"
+        "  [PTV-SRC]      (2.0, single input) the source state machine, one line per change: in0 LIVE (start),\n"
+        "                 LIVE \xe2\x86\x92 STALLED (no picture for -stall_min: the last picture is held, then bars / black\n"
+        "                 after -freeze_max; the sound is filled with silence: 'hold fill' / 'hold fill ended'),\n"
+        "                 STALLED \xe2\x86\x92 LOST (no packets: the input is reopened, 'reopen attempt #N failed' every 30 s),\n"
+        "                 LOST \xe2\x86\x92 reopened, STALLED \xe2\x86\x92 LIVE after N s (N = the hold's length), 'still STALLED'\n"
+        "                 (1/min, after 10 min every 10 min). 'rejoin class BURST | LIVE LOSS | NEW DOMAIN' = how the\n"
+        "                 source came back (its backlog / the live content / a restarted clock); 'skipped the\n"
+        "                 catch-up' = more than the max delay would be kept, the output resumes at the live content.\n"
+        "                 'came back reshaped ... rejoined in-process' (2.2.1: more streams, a new picture size);\n"
+        "                 'came back RESHAPED' + 'exiting 4' = a mapped stream is gone or changed: the wrapper\n"
+        "                 re-probes and restarts (normal after a source change, a fault when it repeats).\n"
+        "                 inK WAITING / PROBING (start, with the frame=0 heartbeat line), inK WAITING \xe2\x86\x92 LIVE (mosaic slot)\n"
         "  [PTV-SRC] in0 burst: our own depth cut — 'the cut is erased at the door' (source live: no jump)\n"
         "                 or 'stays as a hole' (the source paused inside it)\n"
         "  [PTV-SRC] inK PMT version a \xe2\x86\x92 b: the source's program changed (PIDs added / gone); inK audio\n"
-        "                 track N ... silent for 10 s while the video flows / flowing again (2.1, T-003);\n"
+        "                 track N ... silent for 10 s while the video flows / flowing again (2.1, T-003);\n");
+    av_log(NULL, AV_LOG_INFO,
         "                 in0 source frame rate changed a \xe2\x86\x92 b fps (held 30 s; the output rate stays, the\n"
         "                 pictures of a slower source are shown on their due ticks — 2.1, T-011)\n"
         "  [PTV-VMAP]     copies / captions placed where the video showed their content (counts)\n"
@@ -347,9 +384,21 @@ void ptv_print_log_legend(int full)
         "                 content far ahead); the slot's sound takes the same step at the same content. A\n"
         "                 repeated / skipped picture (lost, late, a backlog catching up, rate conversion)\n"
         "                 moves nothing and is not logged\n"
-        "  (2.0 lines no longer written in 2.1: [PTV-LAYERA], [PTV-GLUE], [PTV-DISCONT], the [PTV-AGLUE] step\n"
-        "   verdicts, the mosaic [PTV-PLL] ACQUIRE / FROZEN, [PTV-RESFOLLOW], [PTV-REANCHOR2], [PTV-RESYNC],\n"
-        "   [PTV-RECANCHOR])\n"
+        "                 Reasons as printed: late for 1 s | content ahead | the buffer overflowed (the\n"
+        "                 pictures before it are gone) | the buffer never below N ms in 60 s. Other lines:\n"
+        "                 inK joined: first picture (a late slot starts) | inK catch-up: the decoder had N\n"
+        "                 packets banked ... the slot cuts to the live edge (after a return) | aK sound\n"
+        "                 re-placed (lag step / drift: the sound follows its picture) | aK sound more than N s\n"
+        "                 ahead of its picture: dropped | inK pictures are WxH ... scaled to the cell (the\n"
+        "                 source changed size) | inK no signal \xe2\x86\x92 bars / slate / black in its cell\n"
+        "  [PTV-RES]      inK startup backlog trimmed N frames (keep M): a slot's start-up burst cut to its buffer\n"
+        "                 depth — normal at every mosaic start (PTV_DIAG adds the per-second [PTV-RES] t= depths)\n"
+        "  [PTV-DISCONT]  one picture's corrupt timestamp restamped between its neighbours / a wrap step\n");
+    av_log(NULL, AV_LOG_INFO,
+        "                 reverted (a single bad label, not a timeline event)\n"
+        "  [PTV-LAYERA]   a video PTS far from its DTS (a corrupt label): the PTS dropped, the frame keeps its DTS\n"
+        "  (2.0 lines no longer written in 2.1: [PTV-GLUE], the [PTV-AGLUE] step verdicts, the mosaic\n"
+        "   [PTV-PLL] ACQUIRE / FROZEN, [PTV-RESFOLLOW], [PTV-REANCHOR2], [PTV-RESYNC], [PTV-RECANCHOR])\n"
         "  [PTV-ADISC]    (1.0.1-pre15 #33, unconditional) corrupt-flagged AUDIO discarded at the\n"
         "                 demux (rate-limited count + acor= stats) — the NBS undecodable-source\n"
         "                 phase, previously silent/restart-only; PTV_NBS_FILL=1 additionally\n"
@@ -360,14 +409,65 @@ void ptv_print_log_legend(int full)
         "                 startup-structural lip-sync offset is visible HERE, not in drift\n"
         "  [PTV-ACOMP]    (1.0.1-pre3) graph-input audio pts step >25ms — aresample will hard-\n"
         "                 compensate (instantaneous sample insert/drop, click risk); rate-limited\n"
-        "                 ~1/10s per track, cumulative count on the PLL diag line (acomp=)\n"
+        "                 ~1/10s per track, total in the line; acomp= on the mosaic [PTV-AVSYNC] DIAG line\n"
         "  [PTV-PID]      (1.2.0-pre8, startup) the deterministic output PID plan and where it came\n"
         "                 from (default / -pid_plan / env PTV_PID_PLAN), then one line per output\n"
         "                 stream: pid=<n> <class>/<codec>/<source language> <- <source>. When a\n"
         "                 -metadata override puts a DIFFERENT tag on the wire the column reads\n"
-        "                 src(wire:tag) — the sort used the source tag, never the override. The same\n"
+        "                 src(wire:tag) — the sort used the source tag, never the override. The same\n");
+    av_log(NULL, AV_LOG_INFO,
         "                 plan is written to every rung, so the lines are printed once. Absent when\n"
         "                 -pid_plan off restores the legacy source-order PIDs\n");
+    av_log(NULL, AV_LOG_INFO,
+        "audio path events (always-on, aK(inN) = output track K from input N):\n"
+        "  [PTV-BIND]     which source stream each output track / the video is bound to (start: '-map rule \xe2\x86\x92\n"
+        "                 inN 0xPID codec ch lang'), decoder open lines, and mid-run: 'pid gone ... silent until\n"
+        "                 one comes' / 're-bound: pid A \xe2\x86\x92 B' (same language + role) / 'no source track qualifies'.\n"
+        "                 'the track stays silent' (no decoder / open failed) is a fault to look at\n"
+        "  [PTV-AFMT]     the audio INPUT format changed (rate / layout / sample format, confirmed over several\n"
+        "                 frames): a converter is put in front of the unchanged path, or the path is rebuilt; the\n"
+        "                 output format never changes. 'rebuild BREAKER' = the source flaps its format, rebuilds\n"
+        "                 are spaced 2..60 s (frames dropped meanwhile). 'splice overlap trimmed' / 'source gap ...\n"
+        "                 filled with silence' = what the switch itself cost. Normal at ad splices; a storm is not\n"
+        "  [PTV-ATRIM]    'input stepped back N ms — the overlap is dropped at the graph door (labels kept)': the\n"
+        "                 sound's labels went back up to 5 s (after a rejoin map or a hold fill); what was already\n"
+        "                 sent is not sent twice. Followed by 'N ms dropped in all'. Normal after an event\n"
+        "  [PTV-ADEC]     'decode error ... dropped, track continues' (first one, then a 10 s count) = damaged\n"
+        "                 audio packets; 'impossible samples ... muted as damage' = a decoder output far over full\n"
+        "                 scale replaced by silence. A few at a loss are normal, a steady stream is a bad source\n"
+        "  [PTV-ADECWD]   no decoded audio for 45 s although its packets arrive: the decoder is reopened (the\n");
+    av_log(NULL, AV_LOG_INFO,
+        "                 anchor is kept). Rare; repeated = the source's audio is undecodable\n"
+        "  [PTV-ACHOP]    the audio stayed chopped (errors above the floor) for minutes: the whole audio path of\n"
+        "                 the track is rebuilt once ([PTV-AFMT] follows). PTV_NO_ACHOP_REBUILD=1 disables\n"
+        "  [PTV-ASTAMP]   decoded audio frames without a timestamp (a probe-failed source phase): stamped by\n"
+        "                 counting samples from the last label\n"
+        "  [PTV-AVLOCK]   (single input) 'short gap (+N ms, no hold)': the sound returned after a gap too short\n"
+        "                 for a hold; it keeps the pre-gap house_skew until the video shows the same content\n"
+        "                 ('house_skew ... again after N s'). First 3 gaps per track only. Informational\n"
+        "  [PTV-RELABEL]  the content check after an audio-only step back that the timeline repaired: 'was a\n"
+        "                 RELABEL' (the sound did not repeat: the repair stands) | 'the audio REPEATS' (a real step\n"
+        "                 back: left to the sync check / corrector) | 'no verdict' (tone, silence, a splice) |\n"
+        "                 'erase UNDONE' (silent on both sides, no evidence). Decides what the lipsync sensor reads after it\n"
+        "  [PTV-WALLEV]   measurement only: more real audio than video (or the reverse) was deleted without wall-\n"
+        "                 time evidence, by more than 0.5 s — pressure towards a lasting offset; watch the lipsync sensor\n");
+    av_log(NULL, AV_LOG_INFO,
+        "start-up lines (once per start):\n"
+        "  [PTV-START]    'first picture on air N s after start' with the split (source live / set-up done / first\n"
+        "                 picture decoded) and the content queued behind it; 'start-up window closed after 30 s'\n"
+        "                 (longer when a start-up backlog was kept); 'start-up backlog drained'. PTV_DIAG adds the\n"
+        "                 mosaic per-tick trace [PTV-START] t=\n"
+        "  [PTV-RATE]     the output frame rate and why (-r source | auto | <rate> | max:<rate> | field; the source's\n"
+        "                 rate and scan). A wrong output rate is read here first\n"
+        "  [PTV-OUT]      'GOP N ticks on the output timeline' (every rung's keyframes on the same pictures);\n"
+        "                 mosaic: 'all N slots live after X s' or 'slot_wait expired: starting with K of N slots\n"
+        "                 live'; '-map ...: slot K not live — silent until it joins / skipped'; 'no slot live' (ERROR)\n"
+        "  [PTV-LADDER]   (-ladder) one line per rung (size, video / audio bitrate, destination), the -max_res\n"
+        "                 cap when it trimmed rungs, and the generated filter graph\n"
+        "  [PTV-REPORT]   (-bind_report) the planned PIDs and bindings, nothing encoded\n"
+        "  [PTV-MEMCAP]   'RSS cap watchdog armed: N MB' at start; WARNING at 75%% of the cap (memory growth:\n"
+        "                 capture the [PTV-AFMT] / [PTV-CUSHION] lines), FATAL exit for a supervised respawn after\n"
+        "                 two 10 s samples at the cap. PTV_RSS_CAP_MB tunes it, 0 disables\n");
     av_log(NULL, AV_LOG_INFO,
         "health events (always-on):\n"
         "  [PTV-BURSTY]   per-minute delivery-stall status (count + worst gap + bank state) while a\n"
@@ -388,14 +488,17 @@ void ptv_print_log_legend(int full)
         "                 'no clock to pace by' (2.2.0-pre11) = the input's PCR runs ahead of its\n"
         "                 arrivals or comes less than once a second: the input passes as it arrives\n"
         "                 (not regulated); 'regulated again' (2.2.0-pre12) = its PCR was a clock for\n"
-        "                 10 min, the hold builds back up to D over ~1 min\n"
+        "                 10 min, the hold builds back up to D over ~1 min\n");
+    av_log(NULL, AV_LOG_INFO,
         "  [PTV-CUSHION]  adaptive cushion tier moves + BANK escalations (target, sizing rationale)\n"
         "  [PTV-CUSHREL]  (1.0.1-pre10) raised cushion tier released: frame_q starved >=60s with\n"
         "                 input FLOWING while the tier held — the 6h zero-starvation release is\n"
         "                 unreachable under churn; tier back to base, gate caps restored\n"
         "                 (PTV_NO_CUSHREL disables; an input outage never triggers this)\n"
-        "  [PTV-CLOCK]    clock-follow arm/release (source clock offset FOLLOWED/back-in-range) +\n"
-        "                 estimator frozen on BURSTY (PTV_DIAG adds re-acquire + lock progress)\n"
+        "  [PTV-CLOCK]    clock-follow arm/release (source clock offset FOLLOWED — '(measured on its PCR)' for a\n"
+        "                 regulated input, '(estimated from its video)' otherwise — back in range / measure lost) +\n"
+        "                 estimator frozen on BURSTY (PTV_DIAG adds re-acquire + lock progress; [PTV-REGDIAG]\n"
+        "                 carries the regulator's clock measure)\n"
         "  [PTV-DEGRADED] (1.0.1-pre10, opt-in PTV_DEGRADED=1, SINGLE-INPUT ONLY — hard-disabled\n"
         "                 with a startup WARNING on multiview) sustained-deficit demand admission\n"
         "                 enter/status/release; entry needs a >=3min train of QSHED full-cycles\n"
@@ -403,6 +506,48 @@ void ptv_print_log_legend(int full)
         "  [PTV-EMPTY]    frame_q starvation episodes >=2s (refill time; PTV_DIAG: sub-2s aggregate\n"
         "                 per 60s + a 5s still-empty heartbeat)\n"
         "  [PTV-WATCHDOG] (WARNING) the encoder stalled and stopped advancing\n");
+    av_log(NULL, AV_LOG_INFO,
+        "  [PTV-STALL]    (ERROR, at most 1/min) which thread stopped and where: 'vdec thread (inK) stalled N s at\n"
+        "                 <position>' (packets arrive, nothing decoded for 5 s) or 'output/stats thread stalled'.\n"
+        "                 With [PTV-WATCHDOG] (no picture emitted for 2 s) the line to send with a wedge report\n"
+        "  [PTV-NOVIDEO]  (FATAL) packets flow but no picture decoded since the start (PTV_NOVIDEO_EXIT_S, default\n"
+        "                 300 s): undecodable video, the process exits for a supervised respawn\n"
+        "  [PTV-VFILL]    N pictures repeated into content gaps (source pictures lost or corrupt), at most one\n"
+        "                 line per 10 s; the output timestamps stay continuous. Counts as dup= too\n"
+        "  [PTV-DUKF]     after a jump of 1 s or more in the video the decoder input waits for the next keyframe:\n"
+        "                 'resume at keyframe — dropped N video frames' (normal, at most one GOP) | 'escape — no IDR\n"
+        "                 within 5000ms' (resumed without one: a few damaged pictures may show)\n"
+        "  [PTV-VDEC]     'the source changed to WxH ... scaled to fit' (a mid-stream size switch, taken in-process,\n"
+        "                 each new size once) | 'N damaged picture(s) in another size dropped' | 'decoder error on\n"
+        "                 output ... frame lost' | 'scaling ... failed' (ERROR). The first is normal on ABR sources\n"
+        "  [PTV-VGRAPH]   (ERROR) the video filter graph took pictures and returned none: a filter failed, the\n"
+        "                 process exits 4 for a re-probe\n"
+        "  [PTV-QSHED]    the decoder cannot keep up: 'video_q full — shedding whole GOPs' / 'overflow: dropped GOP\n"
+        "                 N pkts ... from the head' / 'tail-dropped ... to the IDR boundary' / 'tail escape ... without\n");
+    av_log(NULL, AV_LOG_INFO,
+        "                 IDR'. Pictures are lost each time: look at the GPU / CPU load of the box\n"
+        "  [PTV-SELFHEAL] the frame queue stayed empty for tens of seconds although input flows: video_q and the decoder are\n"
+        "                 flushed and decoding resumes at the next keyframe ('no IDR within 5s' = resumed mid-GOP).\n"
+        "                 A decoder that lost its references; repeated = report it. PTV_NO_SELFHEAL disables\n");
+    av_log(NULL, AV_LOG_INFO,
+        "  [PTV-FRAMEQ]   'frame queue full (N pictures): dropping the oldest decoded pictures — a timestamp hole\n"
+        "                 on the wire' then 'stopped dropping: N pictures dropped over X s'. The output did not\n"
+        "                 take pictures (encoder / egress slow)\n"
+        "  [PTV-FQBP]     the output took no picture for 2 s with pictures queued: the decoder's back-pressure\n"
+        "                 is released until the queue drains (a guard against a decoder / output deadlock)\n"
+        "  [PTV-DLV]      'delivery gate full (N packets): copied packet dropped' = a copied (passthrough)\n"
+        "                 packet waited for its video longer than the gate holds (dlvdrop= on the stats line) —\n"
+        "                 must stay 0; the line says how far the video is behind\n"
+        "  [PTV-MUX]      WARNING 'dropped a packet stamped before the start' (start-up only, harmless). FATAL,\n"
+        "                 each exits for a supervised respawn: 'MUXGUARD drop span 60s with no accepted pkt' (a\n"
+        "                 stream's labels are dead) | 'egress dead 60s' | 'write failed' (the output is gone)\n"
+        "  [PTV-MUXGUARD] a packet with a backward dts dropped before the muxer ('remedy leak, channel survives')\n"
+        "                 + a total per rung at exit. Any line is a label bug to report with the lines before it\n"
+        "  [PTV-MUXTOL]   a mux write returned ENOMEM / EAGAIN (egress pressure): the packet is dropped, the\n"
+        "                 channel survives; 60 s of it ends in the [PTV-MUX] egress-dead exit. PTV_NO_MUXTOL reverts\n"
+        "  [PTV-DEMUX]    'stream #N (pid, type) appeared after open — ignored' (a PID born mid-run that is not\n"
+        "                 mapped; normal) | 'AAC now N Hz ... labels inside a PES re-derived from the ADTS header'\n"
+        "                 (the source switched its AAC sample rate)\n");
     av_log(NULL, AV_LOG_INFO,
         "multiview stats line — same head (frame/fps/time/dup/drop/dlvhold/dlvforced) + per slot:\n"
         "  inK:lipsync  (1.0.1-pre16.1, ALWAYS-ON, inside each inK: group) that slot's sensor R\n"
@@ -414,15 +559,19 @@ void ptv_print_log_legend(int full)
         "               absent while quiet. While ANY slot is black-slated no track may engage\n"
         "               ([PTV-RSCORR] HOLD 'sibling slate') — finding-1 defense-in-depth\n"
         "  [PTV-RSYNC] inK  (pre17; PTV_DIAG since 2.0.0, one round per 30s) per-slot soak summary:\n"
-        "               R (as inK:lipsync), ev= slot edit ledger, sk= follow skew, occ=\n"
+        "               R (as inK:lipsync), ev= slot edit ledger, sk= the sound's follow offset (not the\n"
+        "               stats line's inK:sk picture lag), occ=\n"
         "               jitter depth, SLATED while black\n"
         "  [PTV-REOPEN] (pre17 fix round) live mv net input re-opened after a read error\n"
         "               (rw_timeout expiry included) — the slot auto-resumes as a fresh join;\n"
-        "               retries forever with 1..5s backoff while the source is down\n"
+        "               retries forever with 1..5s backoff while the source is down ('still down' /\n"
+        "               'came back with another stream layout, not taken'). A single input logs its\n"
+        "               reopen as [PTV-SRC] in0 LOST ... (-reopen_backoff, default 1,2,5,10,30 s)\n"
         "  acor         (when >0) corrupt-discarded audio pkts, GLOBAL sum — per-track detail on\n"
         "               the [PTV-ADISC]/NBS log lines\n"
         "  inK:qdrop    input-K video queue overflow drops (demux side)\n"
-        "  inK:corrupt  input-K corrupt packets (demux + decode)\n"
+        "  inK:corrupt  input-K corrupt packets (demux + decode)\n");
+    av_log(NULL, AV_LOG_INFO,
         "  inK:pd       cadence repeats: the cell showed its picture again because the next one was not\n"
         "               due yet — a 25fps slot in a 29.97 mosaic repeats every 6th tick BY DESIGN (~5/s\n"
         "               is correct rate conversion, not a fault)\n"
@@ -454,7 +603,7 @@ void ptv_print_log_legend(int full)
     av_log(NULL, AV_LOG_INFO,
         "  [PTV-CHAIN]    A/V trace demux→output (rawA-V / srcA-V / unwrap_inj / outA-V) to localize\n"
         "                 where an A/V offset enters\n"
-        "  [PTV-LIPSYNC]  (single input) per-track err = async_pad − video lag (internal estimate);\n"
+        "  [PTV-LIPSYNC]  (single input) per-track err = the ring-paired offset (picture vs sound, + = audio late);\n"
         "                 a mosaic slot's lip sync is its inK:lipsync on the mv stats line\n"
         "defaults (2.1): the program timeline (one classifier per input, the record door, mosaic frame\n"
         "  synchronizers) + WUCR occupancy pacing + REPRIME fast refill + ADAPTIVE cushion + delivery\n"
@@ -513,7 +662,11 @@ void ptv_stats_lipsync(char *buf, size_t size, int64_t now_us, int force_idx)
             int64_t mv = atomic_load_explicit(&g_rsx.mv_ema[in], memory_order_relaxed)
                        + atomic_load_explicit(&g_rsx.ev_us[in],  memory_order_relaxed);
             int64_t ma = atomic_load_explicit(&g_rsx.ma_ema[ki], memory_order_relaxed)
-                       + atomic_load_explicit(&g_rsx.ea_us[ki],  memory_order_relaxed);
+                       + atomic_load_explicit(&g_rsx.ea_us[ki],  memory_order_relaxed)
+                       - atomic_load_explicit(&g_rsx.eo_us[ki],  memory_order_relaxed);   /* T-480/T-486: an adopted
+                                                                    * clock of its own is the stream's timing, not desync
+                                                                    * (the corrector's R_us; rc5/rc6 read +10313001 ms
+                                                                    * in sync on aflip60 — sync_check's PIN would restart) */
             nn += snprintf(buf + nn, size - nn, "%+lldms", (long long)((mv - ma) / 1000));
         } else
             nn += snprintf(buf + nn, size - nn, "--");
@@ -548,7 +701,11 @@ void ptv_stats_lipsync_in(char *buf, size_t size, int64_t now_us, int in)
             int64_t mv = atomic_load_explicit(&g_rsx.mv_ema[in], memory_order_relaxed)
                        + atomic_load_explicit(&g_rsx.ev_us[in],  memory_order_relaxed);
             int64_t ma = atomic_load_explicit(&g_rsx.ma_ema[ki], memory_order_relaxed)
-                       + atomic_load_explicit(&g_rsx.ea_us[ki],  memory_order_relaxed);
+                       + atomic_load_explicit(&g_rsx.ea_us[ki],  memory_order_relaxed)
+                       - atomic_load_explicit(&g_rsx.eo_us[ki],  memory_order_relaxed);   /* T-480/T-486: an adopted
+                                                                    * clock of its own is the stream's timing, not desync
+                                                                    * (the corrector's R_us; rc5/rc6 read +10313001 ms
+                                                                    * in sync on aflip60 — sync_check's PIN would restart) */
             nn += snprintf(buf + nn, size - nn, "%+lldms", (long long)((mv - ma) / 1000));
         } else
             nn += snprintf(buf + nn, size - nn, "--");

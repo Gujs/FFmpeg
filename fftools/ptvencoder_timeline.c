@@ -25,6 +25,7 @@
  */
 
 #include "ptvencoder.h"
+#include "libavutil/bprint.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/time.h"
 
@@ -943,7 +944,7 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
                     }
                     s->mute_rep -= js;
                 }
-                av_log(NULL, AV_LOG_WARNING, "[PTV-TL] in%d stream %d: %s — step %+.3f s, %+.3f s off the program clock "
+                av_log(NULL, AV_LOG_WARNING, "[PTV-TL] in%d stream %d: %s — step %+.3f s, %+.3f s from the program clock "
                        "(band %.1f s)\n", d->rsync_slot, si, s->mute ? "MUTED" : "on the program clock", js / 1e6,
                        off / 1e6, TL_CLK_US / 1e6);
                 continue;
@@ -1026,19 +1027,21 @@ static int close_window(DemuxArgs *d, PtvTimeline *t)
         }
     }
     t->ev_n++;
-    av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO,
-           "[PTV-TL] in%d event #%"PRId64" (stream %d opened): %s", d->rsync_slot, t->ev_n, t->trig, cls);
-    if (prog_event)
-        av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO,
-               " — J %+.3f s, wall %.3f s%s, kept %.3f s, erased %.3f s (%"PRId64" pictures), k %+.3f s",
-               J / 1e6, W / 1e6, dmg ? " (damaged)" : "", keep / 1e6, erase / 1e6, fd ? erase / fd : 0,
-               k_new / 1e6);
-    for (si = 0; si < t->nst; si++)
-        if (t->st[si].dense && t->st[si].res == 1)
-            av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO, " [s%d %+.3f s]", si,
-                   (t->st[si].new_first_us - t->st[si].old_end_us) / 1e6);
-    av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO, " window %.2f s, %d held\n",
-           (av_gettime_relative() - t->open_wc) / 1e6, t->nheld);
+    {   /* 2.2.1 T-486: ONE av_log — the log mutex is per call, a status line could land inside a multi-call line */
+        AVBPrint bp;
+        av_bprint_init(&bp, 0, AV_BPRINT_SIZE_AUTOMATIC);
+        av_bprintf(&bp, "[PTV-TL] in%d event #%"PRId64" (stream %d opened): %s", d->rsync_slot, t->ev_n, t->trig, cls);
+        if (prog_event)
+            av_bprintf(&bp, " — J %+.3f s, wall %.3f s%s, kept %.3f s, erased %.3f s (%"PRId64" pictures), k %+.3f s",
+                       J / 1e6, W / 1e6, dmg ? " (damaged)" : "", keep / 1e6, erase / 1e6, fd ? erase / fd : 0,
+                       k_new / 1e6);
+        for (si = 0; si < t->nst; si++)
+            if (t->st[si].dense && t->st[si].res == 1)
+                av_bprintf(&bp, " [s%d %+.3f s]", si, (t->st[si].new_first_us - t->st[si].old_end_us) / 1e6);
+        av_bprintf(&bp, " window %.2f s, %d held", (av_gettime_relative() - t->open_wc) / 1e6, t->nheld);
+        av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO, "%s\n", bp.str);
+        av_bprint_finalize(&bp, NULL);
+    }
 
     if (prog_event) {
         atomic_store_explicit(&t->prog_wc, nw, memory_order_relaxed);

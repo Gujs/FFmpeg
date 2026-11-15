@@ -809,9 +809,10 @@ static void ptv_label_step(AudioState *a, int64_t step, int64_t now)
     a->acomp_exp_us  = AV_NOPTS_VALUE;  /* deliberate step, not a click risk */
 }
 
-/* ===================== 2.2.1 T-480 step 4 — the post-event sync check (B2), OBSERVE ONLY =====================
+/* ===================== 2.2.1 T-480 steps 4-5 — the post-event sync check (B2) =====================
  * After every event on a track's input, once its source is clean again, read the track's A/V offset from the terms
- * that are exact at once and say what ONE bounded step would do. Nothing is changed here: one [PTV-SYNCCHK] line per
+ * that are exact at once; since rc6 (step 5) an offset of 25 ms .. 5 s is stepped out ONCE (ptv_label_step), unless an
+ * erase of the event had no verdict, on a mosaic slot, or with PTV_NO_B2STEP=1: one [PTV-SYNCCHK] line per
  * (track, event). R = vring + ledger  [+ = audio early, the stats line's lipsync= convention]:
  *   vring  = out_v(C) - out_a(C) for the same label C, per emitted frame, no averaging (av_offset_us): the PLACEMENT
  *            error (a hold's rejoin, the door, the slot's delay line). Blind to label edits by construction
@@ -977,6 +978,12 @@ static void synchk_update(AudioState *a, int64_t now)
         int64_t mid = (s->lo + s->hi) / 2;
         char slow[32] = "--";
         const char *act = NULL;                                /* step 5: what was done (NULL = observe only) */
+        if (a->rs_ma_seed)                                     /* the averaged sensor's reading now, to compare — read */
+            snprintf(slow, sizeof(slow), "%+"PRId64" ms",      /* BEFORE a step re-seeds it (T-486: every STEPPED line */
+                     (atomic_load_explicit(&g_rsx.mv_ema[a->dbg_in], memory_order_relaxed) - a->rs_ma_ema +   /* printed -- ) */
+                      atomic_load_explicit(&g_rsx.ev_us[a->dbg_in], memory_order_relaxed) -
+                      atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed) +
+                      atomic_load_explicit(&g_rsx.eo_us[a->dbg_k], memory_order_relaxed)) / 1000);   /* T-486 */
         if (llabs(mid) > PTV_SC_BAND_US && llabs(mid) <= PTV_SC_CAP_US) {
             if (!g_synchk_step)
                 act = NULL;
@@ -991,11 +998,6 @@ static void synchk_update(AudioState *a, int64_t now)
                 act = "STEPPED";
             }
         }
-        if (a->rs_ma_seed)                                     /* the averaged sensor's reading now, to compare */
-            snprintf(slow, sizeof(slow), "%+"PRId64" ms",
-                     (atomic_load_explicit(&g_rsx.mv_ema[a->dbg_in], memory_order_relaxed) - a->rs_ma_ema +
-                      atomic_load_explicit(&g_rsx.ev_us[a->dbg_in], memory_order_relaxed) -
-                      atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed)) / 1000);
         av_log(NULL, llabs(mid) <= PTV_SC_BAND_US ? AV_LOG_INFO : AV_LOG_WARNING,
                "[PTV-SYNCCHK] a%d(in%d) after event %"PRId64" (%s, timeline #%"PRId64"): %s %+"PRId64" ms (ledger %+"PRId64
                " vring %+"PRId64" ms, agree %.1f s, clean %.1f s, %.1f s after the event; own clock %+"PRId64" ms exempt; "
@@ -1011,8 +1013,8 @@ static void synchk_update(AudioState *a, int64_t now)
     } else if (!bad && clean >= PTV_SC_BUDGET_US) {
         av_log(NULL, AV_LOG_INFO,
                "[PTV-SYNCCHK] a%d(in%d) after event %"PRId64" (%s, timeline #%"PRId64"): no steady reading in %.0f s of "
-               "clean source (last %+"PRId64" ms, %d readings within %"PRId64" ms for %.1f s): would not step  "
-               "[+ = audio early; observe only]\n",
+               "clean source (last %+"PRId64" ms, %d readings within %"PRId64" ms for %.1f s): not stepped  "
+               "[+ = audio early]\n",
                a->dbg_k, a->dbg_in, s->ev_n, s->ev_why, s->tl_snap, clean / 1e6, s->last / 1000, s->n,
                (s->hi - s->lo) / 1000, (now - s->agree_wc) / 1e6);
         s->watch = 0;
@@ -1022,7 +1024,7 @@ static void synchk_update(AudioState *a, int64_t now)
                "[PTV-SYNCCHK] a%d(in%d) after event %"PRId64" (%s, timeline #%"PRId64"): undecided %.0f s after it — %s "
                "(clean %.1f s, %d readings, last %+"PRId64" ms)\n",
                a->dbg_k, a->dbg_in, s->ev_n, s->ev_why, s->tl_snap, (now - s->ev_wc) / 1e6,
-               bad ? bad : clean < PTV_SC_CLEAN_US ? "the source is clean, waiting" : "the readings do not agree yet",
+               bad ? bad : clean < PTV_SC_CLEAN_US ? "waiting for 3 s of clean source" : "the readings do not agree yet",
                clean / 1e6, s->n, s->last / 1000);
     }
 }
@@ -1570,7 +1572,7 @@ static int audio_drain_fg(AudioState *a)
                     content -= a->corr.corr_us;
                 if (!(a->multiview && a->mvf_hi_us > a->mvf_lo_us &&             /* T-093: fill phase frames carry no */
                       src_abs_us >= a->mvf_lo_us && src_abs_us < a->mvf_hi_us) &&  /* content to pair */
-                    vring_lookup(a->vring, content, &out_v, &msrc) == 0) {
+                    vring_lookup(a->vring, content, out_a_us, &out_v, &msrc) == 0) {
                     int64_t vlag   = out_v    - (msrc    - h0_us);   /* video realized output − content (at msrc) */
                     int64_t alag   = out_a_us - (content - h0_us);   /* audio realized output − content (at content) */
                     int64_t offset = vlag - alag;                    /* the content-referenced (via shared h0) lip-sync the
@@ -1598,8 +1600,12 @@ static int audio_drain_fg(AudioState *a)
                     int64_t r  = dw > 0 ? (bal - a->async_prev_bal) * 1000000 / dw : 0;
                     int64_t cur = atomic_load_explicit(&g_async_ppm, memory_order_relaxed);
                     /* EMA (÷8): the per-interval balance is quantized to ~one audio frame (~21ms ⇒
-                     * ~1000ppm noise @10s), so smooth to the NET rate — idle ≈ 0, a sustained sign = real work. */
-                    atomic_store_explicit(&g_async_ppm, cur + ((r - cur) >> 3), memory_order_relaxed);
+                     * ~1000ppm noise @10s), so smooth to the NET rate — idle ≈ 0, a sustained sign = real work.
+                     * 2.2.1 T-486: a balance that moved faster than the resampler can work (async=1000 = 20.8 ms/s;
+                     * > 2.5 %) is a step — a hold, a fill, a label step — not work: re-baselined, not averaged in
+                     * (it read +332143 ppm decaying for minutes after one, vt-vfgap, lipsync=+1 ms throughout) */
+                    if (llabs(r) <= 25000)
+                        atomic_store_explicit(&g_async_ppm, cur + ((r - cur) >> 3), memory_order_relaxed);
                     a->async_stat_last = nowa; a->async_prev_bal = bal;
                 }
             }
@@ -1697,20 +1703,21 @@ static int audio_drain_fg(AudioState *a)
                 int64_t now = av_gettime_relative();
                 if (a->dbg_first_out == AV_NOPTS_VALUE) a->dbg_first_out = opts;
                 if (now - a->dbg_diag_last >= FFMAX(1000000, g_stats_period_us)) {
-                    int64_t content_us   = av_rescale_q(a->dbg_last_src - a->dbg_first_src, a->ist_tb, AV_TIME_BASE_Q);
-                    int64_t outspan_us   = a->out_frames * (int64_t)a->frame_size * 1000000 / a->out_rate;
-                    int64_t async_pad_us = outspan_us - content_us;                  /* audio realized output−content */
                     int64_t hs_us        = a->house_skew ? *a->house_skew : 0;       /* commanded skew (capped/floored) */
                     int64_t lag_us       = a->house_lag_true ? *a->house_lag_true    /* TRUE video lag (multiview) … */
                                                              : hs_us;               /* … or house_skew (single-input, uncapped) */
+                    char errs[24] = "--";
                     a->dbg_diag_last = now;
-                    /* err = audio's realized lag − video's TRUE lag. Using the TRUE (uncapped) video lag, not the
-                     * commanded house_skew, so a slot pinned at the 250ms cap or floored at 0 (video racing/dragging
-                     * beyond the correctable range) still surfaces. lag≠house_skew ⇒ the actuator is saturated. */
+                    /* 2.2.1 T-486: err = the ring-paired offset (the picture shown with this audio label: the sync
+                     * check's vring term, [PTV-AVSYNC]'s headline), + = audio late. It was async_pad − lag, async_pad =
+                     * the frames the encoder took minus the span of source frames FED into the filter graph: whatever
+                     * the graph holds (one AAC frame, a buffering -af) read as audio early — Cinestar −21 ms with the
+                     * content −0.9 ms. -- until the ring pairs. */
+                    if (a->av_off_valid)
+                        snprintf(errs, sizeof(errs), "%+"PRId64"ms", -a->av_offset_us / 1000);
                     av_log(NULL, AV_LOG_INFO,
-                        "[PTV-LIPSYNC] a%d(in%d) err=%+"PRId64"ms  (lag_true=%+"PRId64"ms house_skew=%+"PRId64"ms async_pad=%+"PRId64"ms first_out=%"PRId64"ms)  [+ = audio late]\n",
-                        a->dbg_k, a->dbg_in, (async_pad_us - lag_us) / 1000,
-                        lag_us / 1000, hs_us / 1000, async_pad_us / 1000, a->dbg_first_out * 1000 / a->out_rate);
+                        "[PTV-LIPSYNC] a%d(in%d) err=%s  (paired picture vs sound; lag_true=%+"PRId64"ms house_skew=%+"PRId64"ms first_out=%"PRId64"ms)  [+ = audio late]\n",
+                        a->dbg_k, a->dbg_in, errs, lag_us / 1000, hs_us / 1000, a->dbg_first_out * 1000 / a->out_rate);
                 }
             }
             /* 1.0.1-pre26 D3 instrumentation (PTV_MUXDIAG=1, temporary/gated): the emission-point
@@ -2973,7 +2980,7 @@ static int audio_anchor_and_feed(AudioState *a, AVFrame *frame, int64_t h0)
          * Zimbo-class startup-structural offset — visible at birth, invisible to every drift
          * sensor. ring_dropped>0 means the pre-h0 buffer overflowed (audio led video by more
          * than the ring; the kept head is NOT the true source head). */
-        av_log(NULL, AV_LOG_WARNING,
+        av_log(NULL, AV_LOG_INFO,                  /* T-486: normal start-up = INFO */
                "[PTV-ANCHOR] a%d(in%d) anchored: first_audio-h0=%+"PRId64"ms (h0=%"PRId64"ms) "
                "dropped_pre_h0=%d ring_dropped=%d\n",
                a->dbg_k, a->dbg_in, house_us / 1000, h0 / 1000,
@@ -3248,7 +3255,7 @@ static void apark_drop_note(AudioState *a, const AVFrame *f)
     a->apark_drop_us += av_rescale(f->nb_samples, 1000000, f->sample_rate > 0 ? f->sample_rate : 48000);
     if (av_gettime_relative() - a->apark_log_wc >= 10000000) {
         a->apark_log_wc = av_gettime_relative();
-        av_log(NULL, AV_LOG_INFO, "[PTV-MV] a%d sound more than %d s ahead of its picture: dropped (%"PRId64" ms so far)\n",
+        av_log(NULL, AV_LOG_WARNING, "[PTV-MV] a%d sound more than %d s ahead of its picture: dropped (%"PRId64" ms so far)\n",
                a->dbg_k, (int)(PTV_APARK_SPAN_US / 1000000), a->apark_drop_us / 1000);
     }
 }
@@ -3784,7 +3791,7 @@ fill:
                 av_rescale_q(door + i * dur_us, AV_TIME_BASE_Q, a->ist_tb);
             ret = audio_feed(a, s);
             if (a->hold_fill_us < 3000000 && a->hold_fill_us + dur_us >= 3000000)   /* short repeat runs stay quiet */
-                av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] a%d(in%d) hold fill: silence aligned to the held video "
+                av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] a%d(in%d) silence fill: no audio for 3 s while the pictures run "
                        "(PTV_NO_SRC_FILL=1 disables)\n", a->dbg_k, a->dbg_in);
             a->hold_fill_us += dur_us;
         }

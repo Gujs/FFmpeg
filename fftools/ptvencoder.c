@@ -836,8 +836,9 @@ static void ptv_log_ts_stamp(void)
 static void ptv_log_ts_callback(void *avcl, int level, const char *fmt, va_list vl)
 {
     static int print_prefix = 1, at_line_start = 1, repeats;
-    static char prev[2048];
-    char buf[2048];
+    static char prev[8192];
+    char buf[8192];                 /* 2.2.1 T-486: was 2048 — a longer call (the legend chunks, 4.9 KB) lost its tail and
+                                     * its newline, gluing the next line on without its stamp */
     int n, start;
 
     if (level > av_log_get_level())
@@ -923,16 +924,23 @@ int vring_shown(VOutRing *r, int64_t c_us, int64_t *out_us, int64_t *gap_us)
 /* nearest-by-content lookup: of all kept entries, return the out_v and matched src of the one
  * whose src is closest to want_src. 0 = found (ring non-empty), -1 = empty (or, 2.0.0 T-089, no
  * pairing: see below). */
-int vring_lookup(VOutRing *r, int64_t want_src, int64_t *out_v, int64_t *matched_src)
+int vring_lookup(VOutRing *r, int64_t want_src, int64_t out_hint, int64_t *out_v, int64_t *matched_src)
 {
-    int64_t best = INT64_MAX, bo = 0, bs = 0, lo = INT64_MAX;
-    int found = 0, cnt, i;
+    int64_t best = INT64_MAX, bo = 0, bs = 0, lo = INT64_MAX, bt = INT64_MAX;
+    int found = 0, cnt, i, near = 0;
     pthread_mutex_lock(&r->lock);
     cnt = r->n < PTV_VRING ? (int)r->n : PTV_VRING;
     for (i = 0; i < cnt; i++) {
         int idx = (int)((r->n - 1 - i) % PTV_VRING);
         int64_t d = r->src[idx] - want_src; if (d < 0) d = -d;
-        if (d < best) { best = d; bo = r->out[idx]; bs = r->src[idx]; found = 1; }
+        /* 2.2.1 T-486: after a backward clock step the ring holds the same labels twice (the old timeline's pictures
+         * and the new ones). Of the entries whose label matches (within 60 ms), the one shown nearest the audio's own
+         * output time is its picture — nearest-by-label alone paired an old-domain picture 11.7 s back (vt-vfgap: the
+         * sync check read -11680 ms with lipsync=+1 ms and the content in sync; under 5 s it would have STEPPED) */
+        if (out_hint != AV_NOPTS_VALUE && d <= 60000) {
+            int64_t t = r->out[idx] - out_hint; if (t < 0) t = -t;
+            if (!near || t < bt) { bt = t; bo = r->out[idx]; bs = r->src[idx]; found = near = 1; }
+        } else if (!near && d < best) { best = d; bo = r->out[idx]; bs = r->src[idx]; found = 1; }
         if (r->src[idx] < lo) lo = r->src[idx];
     }
     /* 2.0.0 T-089: for 10 s after a multiview slot's ring restarted on a new content segment, audio
@@ -2963,14 +2971,17 @@ static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
     /* only while still holding: after a STOP/CONT the returning content CONTINUES the pre-gap timeline (delayed, not
      * lost) — carrying the hold picture on every continuing frame put bars on air for good (rc4-dev9: sync_stop_10 /
      * kill_return_20 live share 0.01). Residual: a return in a new rendition keeps one stale picture (vt-vsw-bars) */
+    if (!ptv_src_holding())
+        d->hr_tail_said = 0;
     if (g_hold_render && d->hr_real_set && d->hr_dur > 0 && ptv_src_holding() && ptv_hold_bars_pic(d, frame)) {
         int64_t dt = frame->best_effort_timestamp - d->hr_real_pts;
         if (frame->best_effort_timestamp != AV_NOPTS_VALUE && dt > 0 && dt <= 2 * d->hr_dur) {
             AVFrame *bp = ptv_hold_bars_pic(d, frame);
             AVFrame *rp = bp ? av_frame_clone(bp) : NULL;
             if (rp && av_frame_copy_props(rp, frame) >= 0) {
-                av_log(NULL, AV_LOG_INFO, "[PTV-SRC] in0 a pre-gap picture (+%.0f ms after the last one shown) after "
-                       "the bars carries the hold picture\n", av_q2d(d->ist_tb) * dt * 1000.0);
+                if (!d->hr_tail_said++)        /* T-486: once per hold (it was one line per picture) */
+                    av_log(NULL, AV_LOG_INFO, "[PTV-SRC] in0 pre-gap pictures after the bars (the first +%.0f ms after "
+                           "the last one shown) carry the hold picture\n", av_q2d(d->ist_tb) * dt * 1000.0);
                 av_frame_side_data_free(&rp->side_data, &rp->nb_side_data);
                 rp->opaque = NULL;
                 av_frame_unref(frame);
@@ -3691,7 +3702,7 @@ static void *decode_thread(void *arg)
                         *d->h0 = av_rescale_q(ts, d->ist_tb, AV_TIME_BASE_Q);
                         /* [PTV-ANCHOR] (v0.9.16.3, always-on): the video half of the birth pair —
                          * each audio track logs its first_audio-h0 offset against this. */
-                        av_log(NULL, AV_LOG_WARNING,
+                        av_log(NULL, AV_LOG_INFO,      /* T-486: normal start-up = INFO */
                                "[PTV-ANCHOR] h0 anchored at %"PRId64"ms (first decoded video frame)\n",
                                *d->h0 / 1000);
                         atomic_store_explicit(&g_t_dec_us, av_gettime_relative(), memory_order_relaxed);
@@ -5563,6 +5574,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         inputs[k].est.cf_ema_q20 = 1 << 20;
         inputs[k].est.src_rate_q20 = 1 << 20;
         inputs[k].est.cf_rate_q20 = 1 << 20;
+        inputs[k].est.reg_k = multiview ? -1 : k;   /* 2.2.1 T-471: single input follows its regulator's PCR measure */
         pthread_mutex_init(&inputs[k].h0_lock, NULL);
         pthread_mutex_init(&inputs[k].da.pass_lock, NULL);   /* 2.0.0-pre6 */
         pthread_mutex_init(&inputs[k].hold.lock, NULL);
@@ -6946,7 +6958,7 @@ static const OptionDef ptv_options[] = {
     { "init_hw_device",   OPT_TYPE_STRING, 0,                        { .off = 0 }, "init hw device", "args" },
     { "filter_hw_device", OPT_TYPE_STRING, 0,                        { .off = 0 }, "filter hw device", "name" },
     { "filter_complex",   OPT_TYPE_STRING, 0,                        { .off = 0 }, "filtergraph", "graph" },
-    { "start_on",         OPT_TYPE_STRING, 0,                        { .off = 0 }, "when outputs start: video (single input), any|all (mosaic, default any; now comes in 2.1)", "when" },
+    { "start_on",         OPT_TYPE_STRING, 0,                        { .off = 0 }, "when outputs start: video (single input), any|all (mosaic, default any)", "when" },
     { "slot_wait",        OPT_TYPE_STRING, 0,                        { .off = 0 }, "mosaic: wait this long for every slot, then start with the live ones (default 3s; inf; -regulate adds its delay)", "dur" },
     { "audio_lang_override", OPT_TYPE_STRING, 0,                     { .off = 0 }, "audio rules: relabel source languages first, KEY:LANG,… (KEY = 0xPID, audio index or language)", "list" },
     { "audio_codec_pref", OPT_TYPE_STRING, 0,                        { .off = 0 }, "audio rules: survivor codec order among same-programme duplicates (default eac3,ac3,aac,mp2,mp3)", "list" },
@@ -7750,7 +7762,7 @@ int main(int argc, char **argv)
             g_start_on_set = 1;
             if (strcmp(g_start_on, "video") && strcmp(g_start_on, "any") && strcmp(g_start_on, "all")) {
                 av_log(NULL, AV_LOG_ERROR, "-start_on %s: %s\n", g_start_on,
-                       !strcmp(g_start_on, "now") ? "comes in 2.1; supported: video (single input), any|all (mosaic)"
+                       !strcmp(g_start_on, "now") ? "not supported; supported: video (single input), any|all (mosaic)"
                                                   : "unknown value (video|any|all)");
                 uninit_parse_context(&octx); return 1;
             }
