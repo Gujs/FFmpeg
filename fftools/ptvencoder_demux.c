@@ -1205,8 +1205,8 @@ static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const ReopenShape *o
     AVFormatContext *nf = NULL;
     AVDictionary *o2 = NULL;
     int r;
-    unsigned i, nb;
-    int renum = 0;
+    unsigned i, nb, extra = 0;
+    int renum = 0, resized = 0;
     if (!(nf = avformat_alloc_context()))
         return AVERROR(ENOMEM);
     if (d->single)
@@ -1228,7 +1228,15 @@ static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const ReopenShape *o
     nb = nf->nb_streams;
     while (nb > old_nb && nf->streams[nb - 1]->codecpar->codec_id == AV_CODEC_ID_EPG)
         nb--;
-    if (nb > old_nb || (nb < old_nb && !d->single))
+    /* 2.2.1 T-476 (owner 2026-11-15: a reshaped return rejoins in-process, like a professional encoder keeping its
+     * configured outputs): streams beyond the open layout are ignored like any stream born after the open (T-064 drops
+     * their packets) — the mapped ones carry on. Only when the ones there before keep their PIDs: a renumber AND new
+     * streams together could put a new track at a mapped index (stays RESHAPED). Was: exit 4 (~25-40 s dark) */
+    if (nb > old_nb) {
+        extra = nb - old_nb;
+        nb = old_nb;
+    }
+    if (nb < old_nb && !d->single)
         goto bad;
     /* 2.2 (spec §6 / E9): a PID renumber with the layout unchanged — the same streams in the same order, the same
      * languages, the same video codec and size — is the same source (the video moved to a new PID, a provider's mux
@@ -1243,11 +1251,14 @@ static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const ReopenShape *o
             renum++;
         if (d->single &&
             (strcmp(now.lang, old[i].lang) ||
-             (now.type == AVMEDIA_TYPE_VIDEO &&
-              (now.codec_id != old[i].codec_id ||
-               (now.w && old[i].w && (now.w != old[i].w || now.h != old[i].h))))))
+             (now.type == AVMEDIA_TYPE_VIDEO && now.codec_id != old[i].codec_id)))
             goto bad;
+        /* 2.2.1 T-476: a new video size is fitted in-process like a mid-stream size switch (T-406), not a re-probe */
+        if (d->single && now.type == AVMEDIA_TYPE_VIDEO && now.w && old[i].w && (now.w != old[i].w || now.h != old[i].h))
+            resized = 1;
     }
+    if (extra && renum)
+        goto bad;
     /* 2.1 T-424: fewer streams, the ones there as before = the source is not complete yet, not reshaped. A provider's
      * encoder restart came back with video + audio and its SCTE-35 PID a moment later (cor-3 Fintech_247, ~1/day): read
      * as RESHAPED, exit 4, the wrapper's re-probe found the same three streams — ~40 s dark for nothing. Retried as a
@@ -1283,6 +1294,10 @@ static int demux_reopen_once(DemuxArgs *d, unsigned old_nb, const ReopenShape *o
     if (renum)
         av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 came back with %d of its %u streams on new PIDs, the layout unchanged — "
                "resumed (the same source renumbered)\n", renum, nb);
+    if (extra || resized)
+        av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in%d came back reshaped%s%s — rejoined in-process: the mapped streams carry "
+               "on%s\n", d->rsync_slot > 0 ? d->rsync_slot : 0, extra ? " (more streams than at the start)" : "",
+               resized ? " (a new video size)" : "", extra ? ", the new ones are ignored" : "");
     d->ifmt = nf;
     if (d->ifmt_home) *d->ifmt_home = nf;      /* teardown close target follows the swap */
     d->pmt_seen = 0;                           /* T-003: the new open's PMT is the reference */
