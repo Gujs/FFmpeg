@@ -228,7 +228,8 @@ static RsyncTrackR rsync_track_R(const AudioState *a, int64_t now)
                                                                               * desync: lipsync= read +10313001 ms through
                                                                               * aflip60's adopted offset (in sync on air) —
                                                                               * sync_check would have restarted it */
-    r.R_us = atomic_load_explicit(&g_rsx.mv_ema[in], memory_order_relaxed) - a->rs_ma_ema + r.L_us;
+    r.R_us = atomic_load_explicit(&g_rsx.mv_ema[in], memory_order_relaxed) - a->rs_ma_ema + r.L_us
+           - atomic_load_explicit(&g_rsx.cal_us[k], memory_order_relaxed);   /* T-488 */
     if (g_rscorr_testwalk_us_s == 0) {
         const char *tw = getenv("PTV_RSCORR_TESTWALK");
         const char *ta = getenv("PTV_RSCORR_TESTWALK_AT_S");
@@ -809,6 +810,23 @@ static void ptv_label_step(AudioState *a, int64_t step, int64_t now)
     a->acomp_exp_us  = AV_NOPTS_VALUE;  /* deliberate step, not a click risk */
 }
 
+/* 2.2.1 T-488: the post-event sync check's step — a door ACTUATOR term (sstep_us, beside corr), not a glue_off label edit:
+ * the record door's placement replaced glue_off (booked, never on air). Both sensors read it as they read corr
+ * (dR/dsstep = -1: the vring content and the averaged sensor's inj subtract it), so +R retires exactly R */
+static void ptv_sync_step(AudioState *a, int64_t step, int64_t now)
+{
+    a->sstep_us     += step;
+    a->rs_ma_seed    = 0;               /* base redefined — sensor re-seeds */
+    a->pend_comp_us += step;            /* §2.4 tripwire composes with any pending verdict */
+    a->pend_comp_wc  = now;
+    if (step < 0) {                     /* backward door labels — arm the mux monotonic guard */
+        a->reanch_mono = 1;
+        a->reanch_mono_dropped = 0;
+    }
+    a->glue_events++;                   /* corrector event edge: it re-dwells fresh */
+    a->acomp_exp_us  = AV_NOPTS_VALUE;  /* deliberate step, not a click risk */
+}
+
 /* ===================== 2.2.1 T-480 steps 4-5 — the post-event sync check (B2) =====================
  * After every event on a track's input, once its source is clean again, read the track's A/V offset from the terms
  * that are exact at once; since rc6 (step 5) an offset of 25 ms .. 5 s is stepped out ONCE (ptv_label_step), unless an
@@ -983,7 +1001,24 @@ static void synchk_update(AudioState *a, int64_t now)
                      (atomic_load_explicit(&g_rsx.mv_ema[a->dbg_in], memory_order_relaxed) - a->rs_ma_ema +   /* printed -- ) */
                       atomic_load_explicit(&g_rsx.ev_us[a->dbg_in], memory_order_relaxed) -
                       atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed) +
-                      atomic_load_explicit(&g_rsx.eo_us[a->dbg_k], memory_order_relaxed)) / 1000);   /* T-486 */
+                      atomic_load_explicit(&g_rsx.eo_us[a->dbg_k], memory_order_relaxed) -
+                      atomic_load_explicit(&g_rsx.cal_us[a->dbg_k], memory_order_relaxed)) / 1000);   /* T-486, T-488 */
+        /* 2.2.1 T-488: the averaged sensor agrees with the verdict from here on (single input, steps armed): its reading
+         * now (before any step re-seeds it) minus the verdict's. After a step both move by the step (the [PTV-ANCHOR]
+         * algebra), so the corrector reads 0 where the check left the track in sync, +R where it read R in the band */
+        if (g_synchk_step && g_rs_cal && !a->multiview && a->rs_ma_seed && llabs(mid) <= PTV_SC_CAP_US) {
+            int64_t raw = atomic_load_explicit(&g_rsx.mv_ema[a->dbg_in], memory_order_relaxed) - a->rs_ma_ema +
+                          atomic_load_explicit(&g_rsx.ev_us[a->dbg_in], memory_order_relaxed) -
+                          atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed) +
+                          atomic_load_explicit(&g_rsx.eo_us[a->dbg_k], memory_order_relaxed);
+            int64_t was = atomic_load_explicit(&g_rsx.cal_us[a->dbg_k], memory_order_relaxed);
+            if (llabs(raw - mid - was) > PTV_SC_TOL_US) {
+                atomic_store_explicit(&g_rsx.cal_us[a->dbg_k], raw - mid, memory_order_relaxed);
+                av_log(NULL, AV_LOG_INFO, "[PTV-SYNCCHK] a%d(in%d) the averaged sensor (lipsync=, the corrector) read %+"PRId64
+                       " ms where the check reads %+"PRId64" ms: calibrated %+"PRId64" -> %+"PRId64" ms (PTV_NO_RSCAL=1 off)\n",
+                       a->dbg_k, a->dbg_in, (raw - was) / 1000, mid / 1000, was / 1000, (raw - mid) / 1000);
+            }
+        }
         if (llabs(mid) > PTV_SC_BAND_US && llabs(mid) <= PTV_SC_CAP_US) {
             if (!g_synchk_step)
                 act = NULL;
@@ -993,7 +1028,7 @@ static void synchk_update(AudioState *a, int64_t now)
                 act = "not stepped: an erase of this event had no verdict (a relabel cannot be ruled out, T-087) — "
                       "left to the corrector";
             else {
-                ptv_label_step(a, mid, now);                   /* glue_off += R retires exactly R ([PTV-ANCHOR]) */
+                ptv_sync_step(a, mid, now);                    /* T-488: on air at the door (sstep), retires R */
                 s->steps++;
                 act = "STEPPED";
             }
@@ -1301,7 +1336,7 @@ static int audio_drain_fg(AudioState *a)
                  * (pre3 steer); glue_off + corr are path-independent. Sign law preserved on
                  * both paths: +corr at the door delays audio content ⇒ raises m_a ⇒
                  * dR/dcorr = −1 (§2). */
-                int64_t inj    = a->glue_off_us + a->corr.corr_us + hs;
+                int64_t inj    = a->glue_off_us + a->corr.corr_us + a->sstep_us + hs;   /* T-488: + sstep */
                 int64_t slip   = 0, m, nowr;
                 if (a->fg_swr && a->fg_swr_flt &&
                     a->fg_swr_flt->nb_inputs > 0 && a->fg_swr_flt->nb_outputs > 0) {
@@ -1525,14 +1560,15 @@ static int audio_drain_fg(AudioState *a)
                         int64_t ea = atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed) -
                                      atomic_load_explicit(&g_rsx.eo_us[a->dbg_k], memory_order_relaxed);   /* T-480 */
                         int64_t dm = mv - a->rs_ma_ema;
+                        int64_t cal = atomic_load_explicit(&g_rsx.cal_us[a->dbg_k], memory_order_relaxed);   /* T-488 */
                         a->rs_log_last = nowr;
                         av_log(NULL, AV_LOG_INFO,
                             "[PTV-RSYNC] a%d(in%d) R=%+"PRId64"ms%s dm=%+"PRId64"ms ev=%+"PRId64"ms ea=%+"PRId64"ms "
-                            "glue=%+"PRId64"ms hs=%+"PRId64"ms slip=%+"PRId64"ms  [+ = audio early; passive]\n",
-                            a->dbg_k, a->dbg_in, (dm + ev - ea) / 1000,
+                            "glue=%+"PRId64"ms hs=%+"PRId64"ms slip=%+"PRId64"ms cal=%+"PRId64"ms  [+ = audio early; passive]\n",
+                            a->dbg_k, a->dbg_in, (dm + ev - ea - cal) / 1000,
                             (nowr - mvw < 3000000) ? "" : "(video-stale)",
                             dm / 1000, ev / 1000, ea / 1000,
-                            a->glue_off_us / 1000, hs / 1000, slip / 1000);
+                            a->glue_off_us / 1000, hs / 1000, slip / 1000, cal / 1000);
                     }
                 }
             }
@@ -1570,7 +1606,7 @@ static int audio_drain_fg(AudioState *a)
                  * measurement loop that reads sink labels (glue_off stays un-subtracted, as
                  * today: glue is the label-truth judgment, not an actuator). */
                 if (!(a->multiview && g_audio_follow) && a->house_skew)
-                    content -= *a->house_skew + a->corr.corr_us;
+                    content -= *a->house_skew + a->corr.corr_us + a->sstep_us;   /* T-488: an actuator, as corr */
                 else if (a->multiview && g_audio_follow)
                     content -= a->corr.corr_us;
                 if (!(a->multiview && a->mvf_hi_us > a->mvf_lo_us &&             /* T-093: fill phase frames carry no */
@@ -1860,7 +1896,8 @@ static void ptv_rebuild_reanchor(AudioState *a, const AVFrame *frame)
      * reality shows up as R, which the (c) residual step(s) below retire with an explicit,
      * forward-or-guarded label edit. The corrector's own trim is still retired (corr = 0,
      * state → ARMED) — it never double-applies. */
-    a->glue_off_us      = old_glue + old_corr;
+    a->glue_off_us      = old_glue + old_corr + a->sstep_us;   /* T-488: the sync-check steps fold in like corr */
+    a->sstep_us         = 0;
     {   /* F1: the swr-fallback free counter must never step backward either (same mux
          * invariant); a backward re-derivation is clamped to the current counter — the
          * fallback path realizes forward re-anchors only, the residual stays with the
@@ -2146,6 +2183,11 @@ static int audio_feed(AudioState *a, AVFrame *frame)
     }
     if (frame->best_effort_timestamp != AV_NOPTS_VALUE)
         a->dbg_last_src = frame->best_effort_timestamp;   /* probe: latest fed source pts */
+    if (g_diag && !a->vm_feeding && !a->hold_feeding && !a->rj_releasing && vm_mode(a) != a->vm_on) {
+        a->vm_on = !a->vm_on;                       /* T-488 DIAG: when the record door places this track */
+        av_log(NULL, AV_LOG_INFO, "[PTV-VMDOOR] a%d(in%d) record door %s (%d frames waiting, sync-check steps %+"PRId64" ms)\n",
+               a->dbg_k, a->dbg_in, a->vm_on ? "ON" : "OFF", a->vm_n, a->sstep_us / 1000);
+    }
     if (!a->vm_feeding && !a->hold_feeding && !a->rj_releasing && frame->best_effort_timestamp != AV_NOPTS_VALUE &&
         vm_mode(a)) {
         AVFrame *c;
@@ -2692,6 +2734,12 @@ graph_in:
          * mis-sized bus term). corr_us==0 (default-off / parked-at-zero) skips = byte-inert. */
         if (a->corr.corr_us && frame->pts != AV_NOPTS_VALUE && !a->hold_feeding)
             frame->pts += av_rescale_q(a->corr.corr_us, AV_TIME_BASE_Q, a->ist_tb);
+        /* 2.2.1 T-488: the post-event sync check's steps, at the same door site as corr — on air on every path. As a
+         * glue_off label edit they were replaced by the record door's placement (T-409, on for good once frames wait in
+         * it): booked by both sensors, never on air — the slow corrector then steered each booked step back out with
+         * corr (on air) and the audio walked ~0.5 s an hour away from the source (TruBLU sandbox rc6-rc9: -4 s in 8 h) */
+        if (a->sstep_us && frame->pts != AV_NOPTS_VALUE && !a->hold_feeding)
+            frame->pts += av_rescale_q(a->sstep_us, AV_TIME_BASE_Q, a->ist_tb);
         /* 2.0.0 T-093 part 2: the door span of a multiview fill phase — its silence plus the pad up to the first real
          * frame. The PLL's pairing skips frames of that span when they leave the graph (loudnorm holds ~3 s, so they
          * leave after the slot is back): paired against the returning picture's ring they read +19 s, the noise floor
@@ -3763,7 +3811,7 @@ static void hold_fill_quantum(AudioState *a)
         if (h0 == AV_NOPTS_VALUE || pos <= 0)
             return;
         dur_us = av_rescale(1024, 1000000, a->fg_in_rate);
-        target = pos + h0 + a->corr.corr_us - 200000;
+        target = pos + h0 + a->corr.corr_us + a->sstep_us - 200000;   /* T-488: + the sync-check steps */
         door   = a->acomp_exp_us;
         if (target - door > 2000000)
             target = door + 2000000;
@@ -3783,7 +3831,7 @@ static void hold_fill_quantum(AudioState *a)
      * corrupt-discarded) — the target fell 67 s behind the door and the track was absent from the wire for 75 s. The
      * clock never steps back. (Not the whole output position: that also counts fresh ticks, and every routine
      * 120 ms video stall then filled the time since the last real frame over the real frames about to arrive.) */
-    target = a->glue_raw_last_us + a->glue_raw_dur_us + a->glue_off_us + a->corr.corr_us + a->hf_hs_real +
+    target = a->glue_raw_last_us + a->glue_raw_dur_us + a->glue_off_us + a->corr.corr_us + a->sstep_us + a->hf_hs_real +
              (atomic_load_explicit(&g_dup_out_us, memory_order_relaxed) - a->hf_dup_real);
     door   = a->acomp_exp_us;
     if (target - door > 2000000)

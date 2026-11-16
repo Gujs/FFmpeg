@@ -5,6 +5,22 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.1-rc10 — rc9 + the post-event sync check's step reaches the air; the slow corrector acts on drift only (T-488)
+
+**The audio no longer walks away from the picture at every source event (T-488, 2.2.1 blocker).** Sandbox rc8, TruBLU and
+WildTV: the sound ~4 s early on air after 8 h (measured on content against the source), growing ~0.5 s an hour, while
+lipsync= read ~0 between events. Cause, measured on a replay of the real capture: the record door (2.1 T-409 — the sound
+placed where the video showed the same content) replaces glue_off and stays on for good once frames wait in it, so the
+sync check's step (rc6) was booked by both sensors and never on air; lipsync= then read the booked step as an error and
+the slow corrector, whose corr IS on air, steered it out — one more step's worth at every event. Now:
+- the step is a door actuator beside corr (on air on every path; both sensors read it as they read corr);
+- at every sync-check verdict (single input) lipsync= and the corrector are calibrated to agree with the verdict, so the
+  corrector keeps drift only (rc6's design). PTV_NO_RSCAL=1 disables the calibration.
+Replay of the real TruBLU splices: a corrector offset present at the splice stays on air on rc8 (+194 ms), the step
+removes it with rc10 (+1.7 ms). Logs: the calibration line under [PTV-SYNCCHK], cal= on [PTV-RSYNC], [PTV-VMDOOR] (DIAG).
+Kit: contentsync.py (lip sync on content against the source itself, any capture), sensorcheck --fight, gate28
+vt-tbsplice (40 min of the real splices) + vt-tbseed, media-v37 (cap-trublusplice).
+
 ## 2.2.1-rc9 — rc8 + the legend and help made true to the code (T-487)
 
 **Logs only, no behaviour change.** The operator-guide rewrite read every log line against the legend

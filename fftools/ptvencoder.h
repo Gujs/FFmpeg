@@ -356,6 +356,11 @@ typedef struct RsyncSense {
      * demux thread writes both (ptv_tl_ingest) */
     _Atomic int64_t eo_us[PTV_MAX_AUDIO];
     _Atomic int64_t tl_ev[PTV_MAX_INPUT];
+    /* 2.2.1 T-488: the averaged sensor's calibration — set at every post-event sync check verdict (single input) to the
+     * difference between it and the verdict, so the corrector and lipsync= start each event where the verdict left the
+     * track and act on drift only (rc6's "the slow corrector keeps drift only"). Before: lipsync= read every step as an
+     * error of its own size and the corrector steered it back out at the next dwell (TruBLU: −4 s in 8 h on air) */
+    _Atomic int64_t cal_us[PTV_MAX_AUDIO];
     int             n_a;                    /* transcoded tracks wired (pre16: = n_audio ALWAYS, mv included) */
     int             a_in[PTV_MAX_AUDIO];    /* track → input slot map (stats printers; plain int,
                                              * set in transcode() before threads spawn) */
@@ -1280,6 +1285,8 @@ typedef struct AudioState {
     int64_t          vm_wc[PTV_VMQ];
     int              vm_n, vm_feeding;
     int64_t          vm_out_us;              /* this frame's placement from the video's record (output us), or NOPTS */
+    int64_t          sstep_us;               /* 2.2.1 T-488: the post-event sync check's steps, a door actuator beside corr */
+    int              vm_on;                  /* T-488: the record door is placing (for its on/off DIAG line) */
     int64_t          vm_last_lab, vm_last_out;   /* the previous record-door frame: label, placement (or NOPTS) */
     int64_t          hold_drop_n;                     /* 2.0.0-pre9.4: real frames dropped while the source held */
     int              rj_n, rj_released, rj_releasing, rj_cls_seq0;
@@ -1794,6 +1801,7 @@ extern int     g_dmgstat;   /* 2.0.2 T-402: no step / cadence statistics across 
 extern int     g_pestail;   /* 2.0.0-pre4c: PES-tail wall-gap carry for video wall evidence (PTV_NO_PESTAIL=1 off) */
 extern int     g_rlcheck;   /* 2.0.1 T-087: content check of a backward audio erase (PTV_NO_RLCHECK=1 off) */
 extern int     g_synchk;    /* 2.2.1 T-480: the post-event sync check, observe only (PTV_NO_SYNCCHK=1 off) */
+extern int     g_rs_cal;      /* 2.2.1 T-488: the averaged sensor calibrated at the sync check's verdicts */
 extern int     g_synchk_step; /* 2.2.1 T-480 step 5: the sync check takes its one bounded step (PTV_NO_B2STEP=1 = observe) */
 extern double  g_rl_relabel_max;   /* 2.0.2 T-391 */
 extern int     g_voutlier;  /* 2.0.1 T-383: one-picture timestamp outlier restamped (PTV_NO_VOUTLIER=1 off) */

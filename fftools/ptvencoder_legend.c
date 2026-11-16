@@ -342,7 +342,11 @@ void ptv_print_log_legend(int full)
         "                 | STEPPED (25 ms .. 5 s stepped out of the audio labels once) | would step ... not\n"
         "                 stepped (an erase without a verdict, a mosaic slot, PTV_NO_B2STEP=1) | beyond the 5 s\n");
     av_log(NULL, AV_LOG_INFO,
-        "                 cap | no steady reading. Prints the lipsync= sensor's value to compare\n"
+        "                 cap | no steady reading. Prints the lipsync= sensor's value to compare.\n"
+        "                 STEPPED moves the sound on air at the graph door (2.2.1-rc10, T-488). Single input,\n"
+        "                 also 'the averaged sensor (lipsync=, the corrector) read X ms where the check reads\n"
+        "                 Y ms: calibrated A -> B ms' — lipsync= and the slow corrector are set to agree with the\n"
+        "                 verdict, the corrector acts on drift only (PTV_NO_RSCAL=1 off)\n"
         "  [PTV-SRC]      (2.0, single input) the source state machine, one line per change: in0 LIVE (start),\n"
         "                 LIVE \xe2\x86\x92 STALLED (no picture for -stall_min: the last picture is held, then bars / black\n"
         "                 after -freeze_max; the sound is filled with silence: 'hold fill' / 'hold fill ended'),\n"
@@ -608,7 +612,10 @@ void ptv_print_log_legend(int full)
         "  [PTV-SWRDELAY] aresample internal buffer occupancy (a latency LEVEL; `async` is the RATE)\n"
         "  [PTV-RSYNC]    (1.0.1-pre9) residual-sensor components per track: R + dm(m_v−m_a) +\n"
         "                 ev/ea (demux label-edit ledgers) + glue/hs (audio-injected offsets) +\n"
-        "                 slip (un-realized resampler correction). PASSIVE — nothing consumes R\n");
+        "                 slip (un-realized resampler correction) − cal (the calibration set at the\n"
+        "                 last sync check verdict, rc10). PASSIVE — nothing consumes R\n"
+        "  [PTV-VMDOOR]   (PTV_DIAG, rc10) the record door places this track's sound where the video\n"
+        "                 showed its content: ON / OFF, frames waiting, the sync check's steps so far\n");
     av_log(NULL, AV_LOG_INFO,
         "  [PTV-CHAIN]    A/V trace demux→output (rawA-V / srcA-V / unwrap_inj / outA-V) to localize\n"
         "                 where an A/V offset enters\n"
@@ -676,6 +683,7 @@ void ptv_stats_lipsync(char *buf, size_t size, int64_t now_us, int force_idx)
                                                                     * clock of its own is the stream's timing, not desync
                                                                     * (the corrector's R_us; rc5/rc6 read +10313001 ms
                                                                     * in sync on aflip60 — sync_check's PIN would restart) */
+            ma += atomic_load_explicit(&g_rsx.cal_us[ki], memory_order_relaxed);   /* T-488: as the corrector reads it */
             nn += snprintf(buf + nn, size - nn, "%+lldms", (long long)((mv - ma) / 1000));
         } else
             nn += snprintf(buf + nn, size - nn, "--");
