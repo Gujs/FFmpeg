@@ -5,6 +5,21 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.1-rc11 — rc10 + the sync check's picture times on the exact clock (T-491)
+
+**The post-event sync check no longer steps the sound late on 29.97 / 59.94 channels (T-491, 2.2.1 blocker).** Sandbox
+rc10, live TruBLU measured on content against its source: the sound +67 ms late, then +107 ms after one more step — the
+sum of the check's STEPPED values; cow-1 TruBLU / WildTV the same, while lipsync= read ~0 (the rc10 calibration had set
+it to the check's reading). Cause: the check pairs each sound frame with the picture of the same label and kept each
+picture's output time on the integer tick (33367 us for a 29.97 frame of 33366.67 us), the one output-time map left off
+the exact axis: its reading crept +10 ppm (+1 ms per 100 s) while air stayed put, and at the next splice beyond 25 ms it
+was stepped onto air. Now the exact axis, like every other map (and the mosaic). Replay of the live capture: the reading
+stays at 0 (rc10: 0 -> +20 ms in 20 min), the splices read +0 ms, air within 3 ms. Logs: no new or changed lines.
+Kit: gate28 vt-tbsplice judges VDRIFT (sensorcheck --vdrift: the check's picture lag does not creep between events,
+<= 3 ms per segment; rc10 +4 ms, rc11 +0) and SCREAD (sensorcheck --screads: its post-event readings within 20 ms);
+the gate's lanes share one key queue. Known, not a blocker (T-492): after a splice that is not a whole
+number of frames the check reads the pictures' sub-frame tick phase (up to one frame, constant).
+
 ## 2.2.1-rc10 — rc9 + the post-event sync check's step reaches the air; the slow corrector acts on drift only (T-488)
 
 **The audio no longer walks away from the picture at every source event (T-488, 2.2.1 blocker).** Sandbox rc8, TruBLU and

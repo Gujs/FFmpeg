@@ -1762,8 +1762,13 @@ void *output_thread(void *arg)
                 atomic_store_explicit(&g_ch_vout_src, av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q), memory_order_relaxed);
             /* A/V probe (read-only): record this distinct content's first-display output time so the
              * audio drain can pair against it (single-input master rung only; multiview → compositor). */
+            /* 2.2.1 T-491: on the exact-rational axis (the mux pts axis, as ptv_vmap_push and the mosaic's mv_tick_us).
+             * The integer tick (33367 us for 29.97) put the picture +10 ppm late in this ring only: the sync check's
+             * vring crept +1 ms / 100 s while air stayed put, and its post-event step put that on air (TruBLU +107 ms) */
             if (v->vring && fresh && content_vpts >= 0)
-                vring_put(v->vring, av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q), vpts * v->tick_dur_us);
+                vring_put(v->vring, av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q),
+                          v->out_fps.num > 0 ? av_rescale(vpts, 1000000LL * v->out_fps.den, v->out_fps.num)
+                                             : vpts * v->tick_dur_us);
             /* 1.0.1-pre9 residual sensor (PASSIVE), video side: m_v = out − src per EMITTED
              * frame — dups included (a dup presents old content later: that lateness is REAL
              * and must be measured, not read back from house_skew, a control variable). out on
