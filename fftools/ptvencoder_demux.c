@@ -1677,6 +1677,38 @@ static void ptv_src_check(DemuxArgs *d, int64_t now)
         memcpy(d->pmt_pid, pid, n * sizeof(*pid));
         break;
     }
+    /* 2.2.1 T-493: a copied subtitle track follows what the source's PMT now says about it — ffmpeg updates the input
+     * stream at a new PMT version (language, page ids / type, hearing impaired); the mux threads put it on the outputs.
+     * Compared every check, not only at a version change: the version the bind saw may already be the new one */
+    for (i = 0; i < d->n_pass && d->pass; i++) {
+        PassStream *ps = &d->pass[i];
+        const AVStream *is;
+        const AVDictionaryEntry *nl;
+        int nx, hi;
+        if (!ps->lang_follow || ps->in_index < 0 || ps->in_index >= (int)f->nb_streams)
+            continue;
+        is = f->streams[ps->in_index];
+        nl = av_dict_get(is->metadata, "language", NULL, 0);
+        if (!nl || !nl->value[0])
+            continue;                               /* a PMT without the language keeps the last one */
+        nx = is->codecpar->extradata_size > 0 && is->codecpar->extradata_size <= (int)sizeof ps->lang_xd ?
+             is->codecpar->extradata_size : 0;
+        hi = !!(is->disposition & AV_DISPOSITION_HEARING_IMPAIRED);
+        if (!strcmp(nl->value, ps->lang_now) && hi == ps->lang_hi && nx == ps->lang_xd_n &&
+            (!nx || !memcmp(is->codecpar->extradata, ps->lang_xd, nx)))
+            continue;
+        av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in%d pid 0x%x (%s): the source's PMT says %s%s (was %s) — the output "
+               "follows\n", slot, is->id, avcodec_get_name(is->codecpar->codec_id), nl->value,
+               hi ? ", hearing impaired" : "", ps->lang_now[0] ? ps->lang_now : "und");
+        pthread_mutex_lock(&g_lang_lock);
+        av_strlcpy(ps->lang_now, nl->value, sizeof ps->lang_now);
+        if (nx)
+            memcpy(ps->lang_xd, is->codecpar->extradata, nx);
+        ps->lang_xd_n = nx;
+        ps->lang_hi   = hi;
+        pthread_mutex_unlock(&g_lang_lock);
+        atomic_fetch_add_explicit(&g_lang_gen, 1, memory_order_release);
+    }
     for (j = 0; j < d->n_audio && j < 32 && now - d->v_last_wc < 1000000; j++) {
         int s = d->astream[j];
         const AVDictionaryEntry *lang;
