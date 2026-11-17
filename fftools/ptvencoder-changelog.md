@@ -5,6 +5,22 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.1-rc12 — rc11 + copied subtitle tracks follow the source's PMT (T-493)
+
+**A copied subtitle track takes its language and page data from the source's current PMT, not only from the PMT seen at
+start (T-493, 2.2.1).** glo-2 2.2.0, NOCTOCODE GB_News / Euronews AI subs: the encoder started while the source came back
+from an outage; the source's first PMT gave a language for one of twelve DVB subtitle tracks, the full PMT came 62 ms
+after the bind — eleven tracks went out as "und" (and with the muxer's default page ids) until a restart. Now: when the
+source's PMT says something new about a copied subtitle track (language, subtitling type / composition and ancillary page
+ids, teletext pages, hearing impaired), the outputs carry it and the output PMT version goes up so receivers read it
+again. The PIDs stay as planned at start. Not when `-metadata` or a selection rule set the track's language. A track that
+first appears in a later PMT is still not added (unchanged). New log lines: `[PTV-SRC] inK pid 0xP (codec): the source's
+PMT says LANG (was OLD) — the output follows` and `[PTV-MUX] output PMT version a → b: N copied track(s) take the source's
+language / page data`. Kit: gate28 `vt-cin/pmtlate_15` (media-v39: cap-cinestar with three subtitle PIDs listed language-
+less until content 15 s; judge LANGS = langcheck.py, the output's last PMT carries the source's languages and page data):
+rc11 FAIL (hrv + und und und), rc12 PASS; an output PMT version change with the same PIDs is accepted only as the
+encoder's own `[PTV-MUX]` line.
+
 ## 2.2.1-rc11 — rc10 + the sync check's picture times on the exact clock (T-491)
 
 **The post-event sync check no longer steps the sound late on 29.97 / 59.94 channels (T-491, 2.2.1 blocker).** Sandbox

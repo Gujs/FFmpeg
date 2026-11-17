@@ -47,7 +47,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.2.1-rc11"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.2.1-rc12"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -106,6 +106,8 @@ int     g_voutlier = 1;            /* 2.0.1 T-383: one-picture timestamp outlier
 _Atomic int64_t g_rj_off_total, g_rj_off_before, g_rj_from_us;   /* 2.0.0-pre6.1 rejoin map */
 _Atomic int     g_rj_epoch;
 _Atomic int64_t g_house_out_us, g_house_tick_us;
+_Atomic int     g_lang_gen;                            /* 2.2.1 T-493 */
+pthread_mutex_t g_lang_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* 2.0.0 T-100: where the video actually put its content. The master records every fresh frame it puts on the
  * output (source content time -> output time, both us); sparse copies (DVB subs, SCTE-35) and CC captions are
@@ -3883,7 +3885,57 @@ typedef struct MuxArgs {
     int                   err;
     int                   is_master;                  /* Φ1′: rung 0 — compute the wire-DTS sensor here only */
     int                   rung;                       /* pre14: index into g_mux_sent_wc (wire-send watermark) */
+    PassStream           *pass;                       /* 2.2.1 T-493: the copied tracks (lang_*) ... */
+    int                   n_pass;
+    int                   lang_gen;                   /* ... and the g_lang_gen this rung has applied */
 } MuxArgs;
+
+/* 2.2.1 T-493: put what the source's PMT now says about the copied tracks onto this rung's output streams (the mpegts muxer
+ * writes language, page ids / type and the hearing-impaired flag from them on every PMT) and raise the PMT version, so a
+ * receiver that keeps the PMT by its version reads it again. Mux thread only: the muxer reads these here, nowhere else */
+static void mux_follow_langs(MuxArgs *m)
+{
+    int i, changed = 0, gen = atomic_load_explicit(&g_lang_gen, memory_order_acquire);
+    if (gen == m->lang_gen)
+        return;
+    m->lang_gen = gen;
+    pthread_mutex_lock(&g_lang_lock);
+    for (i = 0; i < m->n_pass; i++) {
+        PassStream *ps = &m->pass[i];
+        AVStream *os = ps->ost[m->rung];
+        const AVDictionaryEntry *ol;
+        int hi;
+        if (!ps->lang_follow || !os || !ps->lang_now[0])
+            continue;
+        ol = av_dict_get(os->metadata, "language", NULL, 0);
+        hi = !!(os->disposition & AV_DISPOSITION_HEARING_IMPAIRED);
+        if (ol && !strcmp(ol->value, ps->lang_now) && hi == ps->lang_hi &&
+            os->codecpar->extradata_size == ps->lang_xd_n &&
+            (!ps->lang_xd_n || !memcmp(os->codecpar->extradata, ps->lang_xd, ps->lang_xd_n)))
+            continue;
+        av_dict_set(&os->metadata, "language", ps->lang_now, 0);
+        os->disposition = (os->disposition & ~AV_DISPOSITION_HEARING_IMPAIRED) |
+                          (ps->lang_hi ? AV_DISPOSITION_HEARING_IMPAIRED : 0);
+        if (ps->lang_xd_n > 0) {
+            uint8_t *xd = av_mallocz(ps->lang_xd_n + AV_INPUT_BUFFER_PADDING_SIZE);
+            if (xd) {
+                memcpy(xd, ps->lang_xd, ps->lang_xd_n);
+                av_freep(&os->codecpar->extradata);
+                os->codecpar->extradata      = xd;
+                os->codecpar->extradata_size = ps->lang_xd_n;
+            }
+        }
+        changed++;
+    }
+    pthread_mutex_unlock(&g_lang_lock);
+    if (changed && m->ofmt->priv_data) {
+        int64_t v = 0;
+        if (av_opt_get_int(m->ofmt->priv_data, "tables_version", 0, &v) >= 0 &&
+            av_opt_set_int(m->ofmt->priv_data, "tables_version", (v + 1) & 31, 0) >= 0 && m->is_master)
+            av_log(NULL, AV_LOG_WARNING, "[PTV-MUX] output PMT version %"PRId64" \xe2\x86\x92 %"PRId64": %d copied track(s) "
+                   "take the source's language / page data\n", v, (v + 1) & 31, changed);
+    }
+}
 
 static void *mux_thread(void *arg)
 {
@@ -3937,6 +3989,7 @@ static void *mux_thread(void *arg)
                 break;
             continue;
         }
+        mux_follow_langs(m);                         /* 2.2.1 T-493 */
         {
             int64_t wt0 = g_diag ? av_gettime_relative() : 0;
             int stream_index = pkt->stream_index;
@@ -6238,6 +6291,21 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
                 apply_stream_meta(&outs->groups[r], tlet, tidx, os);  /* CLI -metadata:s:<t>:N / -disposition (G5) — copy streams (subs/data/extra-audio) */
                 pass[n_pass].ost[r] = os;
             }
+            /* 2.2.1 T-493: a copied subtitle track whose language came from the source follows the source's PMT (glo-2
+             * NOCTOCODE AI subs: the full PMT with eleven languages came 62 ms after the bind — "und" until a restart).
+             * Not when -metadata or a rule set the language (the output then says what the operator asked for) */
+            if (ist && ipar->codec_type == AVMEDIA_TYPE_SUBTITLE && !pass_olang[n_pass][0]) {
+                const AVDictionaryEntry *ol = av_dict_get(pass[n_pass].ost[0]->metadata, "language", NULL, 0);
+                if (lang ? ol && !strcmp(ol->value, lang->value) : !ol) {
+                    pass[n_pass].lang_follow = 1;
+                    av_strlcpy(pass[n_pass].lang_now, lang ? lang->value : "", sizeof pass[n_pass].lang_now);
+                    if (ipar->extradata_size > 0 && ipar->extradata_size <= (int)sizeof pass[n_pass].lang_xd) {
+                        memcpy(pass[n_pass].lang_xd, ipar->extradata, ipar->extradata_size);
+                        pass[n_pass].lang_xd_n = ipar->extradata_size;
+                    }
+                    pass[n_pass].lang_hi = !!(ist->disposition & AV_DISPOSITION_HEARING_IMPAIRED);
+                }
+            }
             avcodec_parameters_free(&phpar);
             n_pass++;
             inputs[kk].da.n_pass++;
@@ -6618,6 +6686,7 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         rung[r].ma.ofmt = rung[r].ofmt; rung[r].ma.mux_q = rung[r].mux_q;
         rung[r].ma.is_master = (r == 0);                        /* Φ1′: wire-DTS sensor on rung 0 only */
         rung[r].ma.rung = r;                                    /* pre14: g_mux_sent_wc slot (wire watermark) */
+        rung[r].ma.pass = pass; rung[r].ma.n_pass = n_pass;     /* 2.2.1 T-493: copied tracks follow the source's PMT */
         rung[r].ma.n_producers = 1 + n_audio + n_copy_inputs + n_cc;   /* video out + N audio + per-input copy fan + one CC emitter per extraction */
     }
     for (k = 0; k < n_cc; k++) {                 /* one emitter per extraction */

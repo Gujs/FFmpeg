@@ -1423,6 +1423,14 @@ typedef struct PassStream {
     int64_t    vwait_po[PTV_VWAIT_MAX];   /* DemuxArgs.prog_off when it arrived (the SCTE-35 rebase term) */
     int64_t    vwait_vn[PTV_VWAIT_MAX];   /* 2.0.1 T-332: DemuxArgs.vunwrap_n when it arrived */
     int        nvwait;
+    /* 2.2.1 T-493: the output carries what the source's PMT says about this track (language, DVB subtitle page ids and
+     * type / teletext pages, hearing impaired) — lang_follow when no -metadata / rule language replaced it at bind.
+     * lang_now / lang_xd / lang_hi are written by this input's demux thread under g_lang_lock, read by the mux threads */
+    int        lang_follow;
+    char       lang_now[64];
+    uint8_t    lang_xd[64];
+    int        lang_xd_n;
+    int        lang_hi;
 } PassStream;
 
 #define PTV_DISC_THRESHOLD_US    (1 * AV_TIME_BASE)   /* 1 s: a label step this large is a discontinuity, not jitter */
@@ -1814,6 +1822,11 @@ extern int     g_voutlier;  /* 2.0.1 T-383: one-picture timestamp outlier restam
 extern _Atomic int64_t g_rj_off_total, g_rj_off_before, g_rj_from_us;
 extern _Atomic int     g_rj_epoch;
 extern _Atomic int64_t g_house_out_us, g_house_tick_us;   /* master: last emitted vpts on the output axis, tick */
+/* 2.2.1 T-493: a copied track's language / descriptor data follows the source's PMT. The demux thread of the track's input
+ * writes PassStream.lang_* under g_lang_lock and bumps g_lang_gen; each rung's mux thread applies them to its own output
+ * stream (the muxer reads them when it writes the PMT) and raises the PMT version */
+extern _Atomic int      g_lang_gen;
+extern pthread_mutex_t  g_lang_lock;
 /* 2.0.0 T-100: the video's content -> output record (ptvencoder.c) */
 #define PTV_VMAP_N 4096
 extern int g_vmap;

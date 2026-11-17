@@ -370,7 +370,9 @@ void ptv_print_log_legend(int full)
         "  [PTV-SRC] in0 burst: our own depth cut — 'the cut is erased at the door' (source live: no jump)\n"
         "                 or 'stays as a hole' (the source paused inside it)\n"
         "  [PTV-SRC] inK PMT version a \xe2\x86\x92 b: the source's program changed (PIDs added / gone); inK audio\n"
-        "                 track N ... silent for 10 s while the video flows / flowing again (2.1, T-003);\n");
+        "                 track N ... silent for 10 s while the video flows / flowing again (2.1, T-003);\n"
+        "                 inK pid 0xP (codec): 'the source's PMT says LANG (was OLD) — the output follows' (a copied\n"
+        "                 subtitle track takes its language / page data from the source's current PMT; 2.2.1, T-493);\n");
     av_log(NULL, AV_LOG_INFO,
         "                 in0 source frame rate changed a \xe2\x86\x92 b fps (held 30 s; the output rate stays, the\n"
         "                 pictures of a slower source are shown on their due ticks — 2.1, T-011)\n"
@@ -550,7 +552,9 @@ void ptv_print_log_legend(int full)
         "                 must stay 0; the line says how far the video is behind\n"
         "  [PTV-MUX]      WARNING 'dropped a packet stamped before the start' (start-up only, harmless). FATAL,\n"
         "                 each exits for a supervised respawn: 'MUXGUARD drop span 60s with no accepted pkt' (a\n"
-        "                 stream's labels are dead) | 'egress dead 60s' | 'write failed' (the output is gone)\n"
+        "                 stream's labels are dead) | 'egress dead 60s' | 'write failed' (the output is gone).\n"
+        "                 WARNING 'output PMT version a \xe2\x86\x92 b: N copied track(s) take the source's language / page\n"
+        "                 data' (after a [PTV-SRC] '... the output follows'; receivers re-read the PMT; 2.2.1, T-493)\n"
         "  [PTV-MUXGUARD] a packet with a backward dts dropped before the muxer ('remedy leak, channel survives')\n"
         "                 + a total per rung at exit. Any line is a label bug to report with the lines before it\n"
         "  [PTV-MUXTOL]   a mux write returned ENOMEM / EAGAIN (egress pressure): the packet is dropped, the\n"
