@@ -5,6 +5,20 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.1-rc13 — rc12 + the post-rejoin audio buffer armed for every hold (T-489)
+
+**A source return that is too short to end the audio's hold fill no longer leaves the next hold's return counting the
+hole twice (T-489, 2.2.1).** cow-1 TVP_World, rc11 sandbox 2026-11-17: after a 320 s loss the source came back for ~1 s,
+then went away for 25.6 s more; at the second return the audio entered the resampler +26 s ahead (the hole counted twice:
+the label jump plus the house_skew the hold had grown), ~30 s without sound and ~19 s of extra latency kept until a
+restart; an earlier 315 s loss gave +317 s and 295 s of silence. Cause: the buffer that holds the returning audio until
+the rejoin's house_skew is shown was armed only when a fill started from zero; a real frame fed while the fill ran but no
+hold was declared (a short return, or the seconds between the fill's start and STALLED) released it, and the fill went on
+into the next hold. Now it is armed again at the start of every hold; frames still buffered from the short return are
+pre-hold content the fill covers and are dropped (the existing `real frames during the hold are dropped` line). No new
+log line. Kit: `sync_blip_20` (a hold, the source back for T056_BLIP_MS, a second hold of 20 s): with a 2.5 s return rc11
+FAILs (ACOMP +20978 ms, 20 flashes without their beep), 1 s and 5 s PASS.
+
 ## 2.2.1-rc12 — rc11 + copied subtitle tracks follow the source's PMT (T-493)
 
 **A copied subtitle track takes its language and page data from the source's current PMT, not only from the PMT seen at
