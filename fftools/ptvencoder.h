@@ -1291,6 +1291,7 @@ typedef struct AudioState {
     int64_t          hold_drop_n;                     /* 2.0.0-pre9.4: real frames dropped while the source held */
     int              rj_n, rj_released, rj_releasing, rj_cls_seq0;
     int64_t          rj_t0;                           /* wall us the first frame was buffered */
+    int64_t          rj_hold_wc;                      /* T-489: the hold (g_src_hold_start) the buffer was armed for */
     int64_t          nbs_last_wall_us;                /* rr15 F9: wall of the previous quantum (elapsed base) */
     int64_t          nbs_carry_us;                    /* rr15 F9: sub-frame remainder carried between quanta */
     int64_t          glue_cad_us;                     /* rr15 R2: EMA of nonzero fed-frame wall gaps (PES-burst

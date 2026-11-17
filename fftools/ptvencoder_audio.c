@@ -1960,6 +1960,7 @@ static int rj_release_ok(AudioState *a)
 }
 
 static void rj_flush(AudioState *a);
+static void rj_arm_hold(AudioState *a);
 
 /* 2.0.0 T-321: the house_skew a real frame meets at the graph door. A short source gap (no hold) ends at the door
  * before it ends on air: the returning audio arrives while the video still repeats frames through the gap, so
@@ -2211,6 +2212,8 @@ static int audio_feed(AudioState *a, AVFrame *frame)
      * showed is not enough: the fill can start while the frame queue still drains (B), and the first fresh frame
      * after a hold can be the pre-gap PES tail while the post-gap frames are dropped until the next IDR (A). Now the
      * frames are BUFFERED (the audio thread keeps serving fill sentinels) until rj_release_ok(). */
+    if (!a->hold_feeding && !a->rj_releasing && !a->vm_feeding)
+        rj_arm_hold(a);                            /* 2.2.1 T-489: armed for every hold */
     if (!a->hold_feeding && !a->rj_releasing && !a->vm_feeding && a->hold_fill_us && !a->rj_released) {
         /* 2.0.0-pre9.4 (T-083): while the source still HOLDS, a real frame is a fragment that survived the damage (the
          * video is dead, bars are on air). Fed — at once or from this buffer after its 4 s cap — it met the hold-grown
@@ -3788,6 +3791,32 @@ static void rj_flush(AudioState *a)
     a->rj_releasing = 0;
 }
 
+/* 2.2.1 T-489: the post-rejoin buffer is armed for every HOLD, not only when a fill starts from zero. A real frame fed
+ * while the fill runs but no hold is declared (the ~3 s between the fill's start and STALLED, or a return too short to
+ * end the fill) released it, and the fill went on into the hold: the return then met the hold-grown house_skew, the
+ * hole counted twice (cow-1 TVP_World rc11 2026-11-17: +317 s at the resampler, 295 s of silence after a 315 s loss;
+ * back for ~1 s then 25.6 s more: +26 s, ~30 s without sound) and house_skew kept ~20 s of latency until a restart.
+ * Frames still buffered from that short return are pre-hold content: the fill covers their time, they are dropped. */
+static void rj_arm_hold(AudioState *a)
+{
+    int64_t h = atomic_load_explicit(&g_src_hold_start, memory_order_relaxed);
+    if (!h || h == a->rj_hold_wc || !ptv_src_holding())
+        return;
+    a->rj_hold_wc = h;
+    if (a->rj_n) {
+        if (!a->hold_drop_n++)
+            av_log(NULL, AV_LOG_INFO, "[PTV-SRC] a%d(in%d) real frames during the hold are dropped — the fill "
+                   "covers the track until the rejoin\n", a->dbg_k, a->dbg_in);
+        for (int i = 0; i < a->rj_n; i++)
+            av_frame_free(&a->rj_buf[i]);
+        a->rj_n = 0;
+        atomic_fetch_sub_explicit(&g_rj_buffering, 1, memory_order_relaxed);
+    }
+    a->rj_released = 0;
+    a->rj_t0       = 0;
+    a->rj_cls_seq0 = atomic_load_explicit(&g_rj_hold_seq0, memory_order_relaxed);   /* this hold's rejoin is the next class */
+}
+
 static void hold_fill_quantum(AudioState *a)
 {
     int64_t dur_us, door, target, now = av_gettime_relative();
@@ -3795,6 +3824,7 @@ static void hold_fill_quantum(AudioState *a)
 
     if (a->vm_n)
         vm_drain(a, 0);                             /* 2.1 T-409: frames whose content went on air since */
+    rj_arm_hold(a);                                 /* 2.2.1 T-489 */
 
     /* 2.0.0-pre8.1: the wait can end between real frames — a post-gap burst is often all buffered before the video
      * shows the jump, and the next frame came 265 ms later (sync_gap_20: a 0.32 s dark wire, video waiting for audio
