@@ -5,6 +5,19 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.1 — release: 2.2.1-rc13 unchanged, version only
+
+**Same code as 2.2.1-rc13** (adaptive-2.2 25be11cc9d); only `PTVENCODER_VERSION` changes. What makes it the release:
+- **Soak of rc13** (2026-11-17 ~21:00 → 11-18 15:35 CET, 18.6 h) on the soak tier live-transcoder (8) +
+  tmtg-cow-transcoder-1 (64) + tmtg-cow-transcoder-2 (29) = 101 channels: 0 cores, 0 program exits, 0 sync_check
+  restarts or desync verdicts (the one standing error = TMTG_Earning_Calls, source gone); RSS max +7.1 MB/h and falling
+  (a mosaic, 1024 -> 1155 MB), threads and fds flat on every channel. 24 source returns, all clean (the hold fill ends
+  2-5 s after the picture returns, the post-event sync check in sync within +-25 ms); T-489's case confirmed on air.
+- **rc13 gate** (12 lanes, kit 41b036c, media-v39): 382 keys, 380 PASS, the 2 accepted SCTE-35 KNOWN lead-outage keys;
+  0 regressions vs rc12; T-489 key `sync_blip_20` rc11 FAIL / rc13 PASS.
+- Known, not blocking (2.3): T-496 a mosaic slot takes 30-60 s to re-sync after a small source step (pre-existing, also
+  2.2.0); T-497 one-frame audio lag on PATRIOT-Outdoor that the sensor does not see (+31 ms, steady, no drift).
+
 ## 2.2.1-rc13 — rc12 + the post-rejoin audio buffer armed for every hold (T-489)
 
 **A source return that is too short to end the audio's hold fill no longer leaves the next hold's return counting the
