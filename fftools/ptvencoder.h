@@ -824,6 +824,7 @@ typedef struct DecodeCtx {
     int64_t          hr_real_pts;             /* 2.2.1 T-474: the last REAL picture's pts (ist_tb; hr_pts runs on in a hold) */
     int              hr_real_set;
     int              hr_tail_said;     /* 2.2.1 T-486: the pre-gap tail line said for this hold (once per hold) */
+    int64_t          rf_seq;           /* 2.2.2 T-498: serial of the last picture handed to the rungs (ptv_seq) */
     int64_t          hr_next;                 /* wall us of the next render */
     struct HoldPic  *hr_pic;                  /* bars / slate / black picture cache */
     /* filter graph: filtering -> N buffersinks (one per rung); else clone decode */
@@ -876,6 +877,39 @@ typedef struct DecodeCtx {
     struct Input    *in;                      /* 2.0.2 T-386: its input (the late bind swaps in the real decoder) */
 } DecodeCtx;
 
+/* 2.2.2 T-498: one timing decision for the whole ladder. Each rung used to run the house clock's emit logic on its own
+ * frame_q (own tick phase, own non-blocking pop, own monotonic guard): at a delivery starvation every rung decided its
+ * own repeats, and a lower rung could show the same picture one or more ticks away from rung 0 until a later
+ * starvation moved it again — while house_skew, the sensors and the shared audio all follow rung 0 (lip sync off by a
+ * tick on that rung, every sensor reading 0). Now the master rung alone decides: per tick it records which picture it
+ * shows (the decode thread's picture serial + the source time), on which output tick, and in which form (the picture,
+ * the rendered hold picture, black). The other rungs (followers) emit from that record: the same picture on the same
+ * tick, their own scaled copy of it. A follower never shows a picture the master did not show on that tick; a picture
+ * it does not have (its queue dropped it) is a repeat of its last one. The master never waits for a follower.
+ * PTV_NO_RUNG_FOLLOW=1 reverts (every rung its own clock). Single input, live, 2+ rungs; the mosaic composes once. */
+#define PTV_RF_N 1024                /* records kept: a follower this many ticks behind skips forward */
+typedef struct RungRec {
+    int64_t vpts;                    /* the output tick */
+    int64_t seq;                     /* the picture's serial (frame metadata ptv_seq; -1 = none) */
+    int64_t src_us;                  /* its source time, us (AV_NOPTS_VALUE = none) */
+    int     fo;                      /* decode fan-outs begun when this was recorded (see g_rf_fo_done) */
+    uint8_t kind;                    /* 0 the picture, 1 the rendered hold picture, 2 black */
+    uint8_t fresh;                   /* the master took a new picture on this tick */
+    uint8_t pd;                      /* a repeat that is cadence residence (pd=), not a dup */
+} RungRec;
+typedef struct RungFollow {
+    pthread_mutex_t lock;
+    pthread_cond_t  cond;
+    RungRec         rec[PTV_RF_N];
+    int64_t         head;            /* records written */
+    int             eof;             /* the master's loop ended */
+} RungFollow;
+extern int         g_rung_follow;    /* PTV_NO_RUNG_FOLLOW=1 -> 0 */
+extern RungFollow  g_rf;
+/* the decode thread hands one decoded picture to every rung's frame_q in one pass (a fan-out). Begun / done counts tell
+ * a follower whether a picture the master already shows can still arrive in its own queue */
+extern _Atomic int g_rf_fo_begun, g_rf_fo_done;
+
 /* Per-rung output side: pop this rung's frame_q on the house clock, stamp the
  * content-anchored PTS, encode, hand to this rung's mux_q. One per output. */
 struct DemuxArgs;
@@ -903,6 +937,8 @@ typedef struct VideoCtx {
     int              live;
     int              passthrough;    /* multiview: compositor already paced+stamped; encode 1:1 */
     int              is_master;      /* only the master rung prints stats/diag */
+    RungFollow      *rf;             /* 2.2.2 T-498: the ladder's emit record (master writes, the others follow); NULL = off */
+    int              rung;           /* this rung's index (log lines) */
     /* shared decode counters + queue, for the master's diag line */
     AVThreadMessageQueue *dbg_video_q;
     int64_t         *dbg_dec_frames, *dbg_vcorrupt;

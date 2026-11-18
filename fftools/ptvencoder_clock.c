@@ -1017,6 +1017,190 @@ static int black_like(AVFrame **pb, const AVFrame *ref)
     return 0;
 }
 
+/* 2.2.2 T-498 (ptvencoder.h, RungFollow): the picture identity both sides of the record use — the decode thread's serial
+ * and the source time in us. */
+static int64_t rf_frame_seq(const AVFrame *f)
+{
+    const AVDictionaryEntry *e = av_dict_get(f->metadata, "ptv_seq", NULL, 0);
+    return e ? strtoll(e->value, NULL, 10) : -1;
+}
+
+/* the master's side: one record per emitted tick, never blocking on a follower */
+static void rf_publish(RungFollow *rf, const RungRec *r, int eof)
+{
+    pthread_mutex_lock(&rf->lock);
+    if (r)
+        rf->rec[rf->head++ % PTV_RF_N] = *r;
+    if (eof)
+        rf->eof = 1;
+    pthread_cond_broadcast(&rf->cond);
+    pthread_mutex_unlock(&rf->lock);
+}
+
+/* a queued picture against the record's: < 0 older (the master is past it), 0 the one, > 0 newer (not shown yet).
+ * By serial; two pictures of one serial (a field-rate deinterlacer makes two from one) by source time, as do pictures
+ * without a serial. 1 ms of tolerance: the rungs' sinks may count time in different units */
+static int rf_cmp(int64_t seq, int64_t us, const RungRec *r)
+{
+    if (seq >= 0 && r->seq >= 0 && seq != r->seq)
+        return seq < r->seq ? -1 : 1;
+    if (us == AV_NOPTS_VALUE || r->src_us == AV_NOPTS_VALUE)
+        return seq >= 0 && r->seq >= 0 ? 0 : r->fresh ? 0 : 1;   /* no time on one side: the serial alone decides;
+                                                                  * neither: the next picture goes with a fresh tick */
+    if (llabs(us - r->src_us) <= 1000)
+        return 0;
+    return us < r->src_us ? -1 : 1;
+}
+
+/* A follower rung's output loop: emit what the master's record says, tick by tick. Runs behind the master by its own
+ * encode time only; behind by more than its frame queue holds (a starved encoder) it skips the ticks whose pictures
+ * are gone, as the per-rung clock did by content time. */
+static void rung_follow_loop(VideoCtx *v)
+{
+    RungFollow *rf = v->rf;
+    AVFrame *held = av_frame_alloc(), *nextf = NULL, *blk = NULL, *hpic = NULL, *f;
+    int64_t tail = -1, cur_seq = -1, cur_us = AV_NOPTS_VALUE, next_seq = -1, next_us = AV_NOPTS_VALUE;
+    int64_t miss = 0, miss_run = 0, skip_n = 0, log_wc = 0, diag_wc = av_gettime_relative(), diag_miss = 0;
+    int have = 0, ret = 0;
+    int lag_max = FFMIN(g_cp.frameq_cap, PTV_RF_N - 16);
+
+    if (!held)
+        goto end;
+    for (;;) {
+        RungRec r;
+        int got = 0, eof = 0;
+        AVFrame *emit;
+
+        pthread_mutex_lock(&rf->lock);
+        if (tail < 0)                               /* start with the master's next tick */
+            tail = rf->head;
+        while (tail >= rf->head && !rf->eof)
+            pthread_cond_wait(&rf->cond, &rf->lock);
+        if (tail >= rf->head)
+            eof = 1;
+        else {
+            /* further behind than the frame queue holds: those pictures were dropped at the queue — skip the ticks */
+            if (rf->head - tail > lag_max) {
+                skip_n += rf->head - tail - lag_max / 2;
+                tail    = rf->head - lag_max / 2;
+            }
+            r = rf->rec[tail++ % PTV_RF_N];
+        }
+        pthread_mutex_unlock(&rf->lock);
+        if (eof)
+            break;
+        if (skip_n && av_gettime_relative() - log_wc >= 10000000) {
+            av_log(NULL, AV_LOG_WARNING, "[PTV-RUNG] rung %d fell behind rung 0 by more than its frame queue — %"PRId64
+                   " tick(s) skipped (its encoder is too slow; PTV_NO_RUNG_FOLLOW=1 reverts to a clock per rung)\n",
+                   v->rung, skip_n);
+            skip_n = 0;
+            log_wc = av_gettime_relative();
+        }
+
+        /* the picture of this tick: already held, or taken from the queue. Older pictures are ones the master passed
+         * over (surplus of a faster source, or shown on ticks this rung skipped); a newer one waits for its tick */
+        if (!have || rf_cmp(cur_seq, cur_us, &r)) {
+            int64_t w0 = 0;
+            for (;;) {
+                int c;
+                if (!nextf) {
+                    int done = atomic_load_explicit(&g_rf_fo_done, memory_order_acquire);   /* before the queue read */
+                    ret = av_thread_message_queue_recv(v->frame_q, &f, AV_THREAD_MESSAGE_NONBLOCK);
+                    if (ret < 0) {
+                        /* queue empty. The fan-out that gave the master this picture is still under way: this rung's
+                         * copy is about to arrive — wait for it (bounded: the decode thread never blocks on a
+                         * follower's queue). Done: the copy was dropped, or never made — repeat */
+                        int64_t nw = av_gettime_relative();
+                        if (ret == AVERROR_EOF || done - r.fo >= 0)
+                            break;
+                        if (!w0)
+                            w0 = nw;
+                        else if (nw - w0 > 100000)
+                            break;
+                        av_usleep(500);
+                        continue;
+                    }
+                    nextf    = f;
+                    next_seq = rf_frame_seq(f);
+                    next_us  = f->pts != AV_NOPTS_VALUE ? av_rescale_q(f->pts, v->out_tb, AV_TIME_BASE_Q) : AV_NOPTS_VALUE;
+                }
+                c = rf_cmp(next_seq, next_us, &r);
+                if (c > 0)
+                    break;
+                if (c < 0) {
+                    av_frame_free(&nextf);
+                    continue;
+                }
+                av_frame_unref(held); av_frame_move_ref(held, nextf); av_frame_free(&nextf);
+                cur_seq = next_seq; cur_us = next_us;
+                have = 1; got = 1;
+                break;
+            }
+            if (!got && have) {
+                miss++;
+                /* a rung that holds a newer picture yet matches none of the master's for 2 s of fresh ticks cannot
+                 * identify pictures (its filters changed the labels): start over from the queue's newest */
+                if (nextf && r.fresh && ++miss_run * v->tick_dur_us > 2000000) {
+                    int n = 1;
+                    av_frame_free(&nextf);
+                    while (av_thread_message_queue_recv(v->frame_q, &f, AV_THREAD_MESSAGE_NONBLOCK) >= 0) {
+                        av_frame_free(&f);
+                        n++;
+                    }
+                    if (av_gettime_relative() - log_wc >= 10000000) {
+                        av_log(NULL, AV_LOG_WARNING, "[PTV-RUNG] rung %d found none of rung 0's pictures in its queue "
+                               "for 2 s — %d queued picture(s) dropped, following again from the next one\n", v->rung, n);
+                        log_wc = av_gettime_relative();
+                    }
+                    miss_run = 0;
+                }
+            } else if (got)
+                miss_run = 0;
+        }
+        if (!have)
+            continue;                               /* no picture yet (as at start-up: no dups before the first one) */
+
+        /* the form the master chose: the picture, this rung's rendered hold picture, or black */
+        emit = held;
+        if (r.kind == 1) {
+            AVFrame *np = v->hold_pic ? atomic_exchange_explicit(v->hold_pic, NULL, memory_order_acq_rel) : NULL;
+            if (np) { av_frame_free(&hpic); hpic = np; }
+            if (hpic) {
+                hpic->opaque = NULL;
+                emit = hpic;
+            }
+        } else if (r.kind == 2) {
+            if (black_like(&blk, held) >= 0)
+                emit = blk;
+        } else if (r.fresh && (blk || hpic || (v->hold_pic && atomic_load_explicit(v->hold_pic, memory_order_relaxed)))) {
+            AVFrame *np = v->hold_pic ? atomic_exchange_explicit(v->hold_pic, NULL, memory_order_acq_rel) : NULL;
+            av_frame_free(&np);
+            av_frame_free(&blk);
+            av_frame_free(&hpic);
+        }
+        emit->pts = r.vpts; emit->pkt_dts = AV_NOPTS_VALUE; emit->duration = 0;
+        ret = encode_push(v->mux_q, v->venc, v->ost, emit, v->gate);
+        v->last_emit_us = av_gettime_relative();
+        v->emitted++;
+        if (!got) { if (r.pd) v->pd++; else v->dup++; }
+        if (g_diag && v->last_emit_us - diag_wc >= 60000000) {   /* DIAG: pictures of rung 0 this rung did not have */
+            if (miss != diag_miss)
+                av_log(NULL, AV_LOG_INFO, "[PTV-RUNG] rung %d: %"PRId64" tick(s) in 60 s without rung 0's picture "
+                       "(its own last one repeated)\n", v->rung, miss - diag_miss);
+            diag_miss = miss;
+            diag_wc   = v->last_emit_us;
+        }
+        if (ret < 0)
+            break;
+    }
+end:
+    encode_push(v->mux_q, v->venc, v->ost, NULL, v->gate);
+    av_frame_free(&held);
+    av_frame_free(&nextf);
+    av_frame_free(&blk);
+    av_frame_free(&hpic);
+}
+
 void *output_thread(void *arg)
 {
     VideoCtx *v = arg;
@@ -1043,6 +1227,8 @@ void *output_thread(void *arg)
     int64_t diag_t0 = av_gettime_relative(), diag_last = diag_t0;
     int64_t stat_last = diag_t0, stat_prev = 0;
     int64_t src_fresh_wall = 0, src_note = 0;   /* 2.0.0-pre3 source-state watch (master only) */
+    int64_t rf_seq = -1;                    /* 2.2.2 T-498: the held picture's serial (master) */
+    int     rf_seq_have = 0;
     int     src_lost_logged = 0;
 
     if (!held)
@@ -1079,6 +1265,11 @@ void *output_thread(void *arg)
             if (ret < 0) break;
         }
         encode_push(v->mux_q, v->venc, v->ost, NULL, v->gate);
+        goto done;
+    }
+
+    if (v->rf && !v->is_master) {                   /* 2.2.2 T-498: this rung emits from the master's record */
+        rung_follow_loop(v);
         goto done;
     }
 
@@ -1860,6 +2051,22 @@ void *output_thread(void *arg)
                 av_frame_free(&hpic);
                 blk_logged = 0;
             }
+            if (v->rf && v->is_master) {            /* 2.2.2 T-498: this tick's decision, for every other rung */
+                RungRec rr;
+                if (fresh || !rf_seq_have) {
+                    rf_seq      = rf_frame_seq(held);
+                    rf_seq_have = 1;
+                }
+                rr.vpts   = held->pts;
+                rr.seq    = rf_seq;
+                rr.src_us = held_src_pts != AV_NOPTS_VALUE ? av_rescale_q(held_src_pts, v->out_tb, AV_TIME_BASE_Q)
+                                                           : AV_NOPTS_VALUE;
+                rr.fo     = atomic_load_explicit(&g_rf_fo_begun, memory_order_acquire);
+                rr.kind   = emit == held ? 0 : emit == hpic ? 1 : 2;
+                rr.fresh  = fresh;
+                rr.pd     = cadence_hold;
+                rf_publish(v->rf, &rr, 0);
+            }
             ret = encode_push(v->mux_q, v->venc, v->ost, emit, v->gate);   /* §7.5a: publish video front + release caught-up audio/copy */
         }
         v->last_emit_us = av_gettime_relative();
@@ -2198,6 +2405,8 @@ void *output_thread(void *arg)
     av_frame_free(&nextf);   /* v0.9.11: pending pulldown lookahead (normally promoted before EOF) */
     }
 done:
+    if (v->rf && v->is_master)
+        rf_publish(v->rf, NULL, 1);         /* 2.2.2 T-498: the followers flush and end */
     av_frame_free(&held);
     av_frame_free(&blk);
     av_frame_free(&hpic);
