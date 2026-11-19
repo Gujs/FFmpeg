@@ -5,6 +5,20 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.2-pre2 — pre1 + no output PTS hole at a small source timing gap (T-501)
+
+**A forward step in the source's video timestamps of up to 4 ticks no longer leaves a hole in the output video PTS
+(T-501, GOALS #1 / #6).** Sandbox 2026-11-18 (2.2.1): PATRIOT-LVTV_Portugal's output had 8 one-tick + 1 two-tick holes in 2
+min where its video label walk crossed the rounding line; Biohackingville a 3-tick hole at a splice's +118.67 ms label
+step. A clean frame whose content index jumped past the next tick was stamped on its index (the monotonic guard only catches
+backward), so the output skipped ticks; the T-083 gap fill (repeat the held picture up to the frame's slot, residence —
+house_skew and the audio do not move) acted on damage-era frames only, because T-084 showed that filling a gap our own
+queue made (drop-oldest in a backlog) holds the cursor against the cushion servo. Now a gap of <= 4 ticks in front of a
+clean frame is filled too when this rung's queue dropped nothing since the previous pop (the gap is the source's timing);
+a gap our queue made, or a larger one (the start-up step), keeps the leap. The T-498 followers copy the repeats.
+`PTV_NO_VGAP_SRC=1` reverts. No new log line. Key: an injected +20 ms video label step (bio_clean1852) and the real
+Biohackingville splice capture: 2.2.2-pre1 a 1-tick / 3-tick hole, pre2 every output PTS delta one tick.
+
 ## 2.2.2-pre1 — 2.2.1 + one emit decision for the whole ladder (T-498)
 
 **Every rung of an ABR ladder shows the same source picture on the same output tick, always (T-498, 2.2.2).** Each rung

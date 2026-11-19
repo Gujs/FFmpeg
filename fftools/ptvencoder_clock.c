@@ -1333,6 +1333,7 @@ void *output_thread(void *arg)
         int64_t vo_extra = 0;   /* 2.0.0-pre9.8 (T-076): video-only repeat ticks kept out of house_skew */
         int64_t vo_prev_c = -1; int vo_fresh_n = 0;   /* 2.0.0 T-345: content of the previous fresh frame; fresh frames since a vo hold */
         int vgap_park = 0;                          /* 2.0.0-pre9.4 (T-083): nextf is a frame parked behind a content gap */
+        int64_t vg_fd_last = -1;                    /* 2.2.2 T-501: this rung's queue-drop count at the previous pop */
         int rj_park = 0, rj_park_n = 0, rj_park_seq = 0;   /* 2.2.1 T-472: nextf is a rejoin's first picture waiting for
                                                      * its slot; ticks waited; the g_rj_cls_seq that had its wait */
         int64_t blk_wc = 0;                         /* T-472: when this rung last showed its own black picture */
@@ -1449,9 +1450,19 @@ void *output_thread(void *arg)
                     /* 2.0.0 T-377: up to the stall threshold (3 s), not 2 s — a gap between the two was handled by
                      * neither path: at 50 fps a 2 s flap is 101 lost frames = 2020 ms, leapt = a 2.04 s video PTS hole
                      * (rich50b flapping; 25 fps: 50 frames = 2000 ms, filled). Below the threshold no hold ever starts */
+                    /* 2.2.2 T-501: a SMALL gap (<= PTV_VGAP_SRC_TICKS) in front of a clean frame is the source's own
+                     * timing — a sub-frame label re-phase at a splice (Biohackingville +118.67 ms = a 3-tick hole) or a
+                     * label walk crossing the rounding line (LVTV: 8 one-tick holes in 2 min) — and is filled like the
+                     * damage-era gap: whole-picture repeats up to the frame's slot, residence, the output PTS stays one
+                     * tick per picture (GOALS #1 / #6: never a timestamp hole). A gap our own queue made (a drop-oldest
+                     * since the previous pop: a backlog) or a larger one (the start-up step) keeps the leap — T-084's
+                     * reason for marking damage only. PTV_NO_VGAP_SRC=1 reverts */
                     int64_t hc = content_index(v, f->pts);
+                    int64_t fd_now = v->framedrop_src ? *v->framedrop_src : v->framedrop;
+                    int src_gap = g_vgap_src && vg_fd_last >= 0 && fd_now == vg_fd_last &&
+                                  hc - last_vpts - 1 <= PTV_VGAP_SRC_TICKS;
                     if (hc > last_vpts + 1 && (hc - last_vpts - 1) * v->tick_dur_us <= FFMAX(2000000, g_stall_min_us) &&
-                        av_dict_get(f->metadata, "ptv_dmg", NULL, 0)) {   /* damage-era frame (emit_video) */
+                        (src_gap || av_dict_get(f->metadata, "ptv_dmg", NULL, 0))) {   /* damage-era frame (emit_video) */
                         nextf = f; next_have = 1; vgap_park = 1;
                         if (!fresh) {
                             cadence_hold = 1;
@@ -1460,6 +1471,8 @@ void *output_thread(void *arg)
                         break;
                     }
                 }
+                if (ret >= 0)                       /* 2.2.2 T-501: drops after this pop are what the next gap is judged by */
+                    vg_fd_last = v->framedrop_src ? *v->framedrop_src : v->framedrop;
                 if (ret >= 0) {
                     av_frame_unref(held); av_frame_move_ref(held, f); av_frame_free(&f);
                     have = 1; fresh = 1; held_src_pts = held->pts;   /* capture before emit overwrites it */

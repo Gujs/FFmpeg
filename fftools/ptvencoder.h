@@ -1949,6 +1949,8 @@ extern int     g_exacttick;
 extern int     g_mv_exacttick;
 extern int     g_decimate;
 extern int     g_vgapfill;               /* 2.0.0-pre9.4 (T-083): fill a content gap at the tick rate (PTV_NO_VGAPFILL=1 off) */
+extern int     g_vgap_src;               /* 2.2.2 T-501: fill a small source-timing gap in front of a clean frame too (PTV_NO_VGAP_SRC=1 off) */
+#define PTV_VGAP_SRC_TICKS 4             /* 2.2.2 T-501: largest source-timing gap filled (ticks); measured holes were 1-3 */
 extern int     g_pulldown;
 extern int     g_cad_disarm;
 extern int     g_frameq_cap;
