@@ -5,6 +5,24 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.2-pre5 — pre4 + every hold's return is classified (T-502) + a dropped silence-fill frame moves the fill on (T-505)
+
+**T-502 — the rejoin classifier is armed for every hold.** The classifier was re-armed only by a video packet read while
+the source state was LIVE. A return that ends as its hold ends (the source back for ~1 s: the last picture is read as the
+master shows the first) left no such packet, so the next hold's return was never classified; the audio waited for the class
+with its real frames buffered while the hold fill had already stopped, and the 4 s cap released them (blip1000/sync_blip_20:
+189 frames held 4.1 s, the audio PID dark 4.1 s; 12 of 24 runs under 8-at-once load). A class now belongs to one hold: the
+classifier is armed again when the next hold begins (g_src_hold_start, as the audio's rejoin buffer is since T-489).
+Same load: 0 of 40.
+
+**T-505 — a dropped silence-fill frame moves the fill on.** The T-478 snapshot ("keep what a frame dropped whole at the
+door replaces") was also taken for the track's own silence fill. When house_skew stepped back under a running fill (the
+video back on its content after a run of repeats: +240 ms -> 0) each fill frame fell behind the door, was dropped whole and
+"restored": the fill's label never advanced and every later quantum was dropped too, until house_skew moved again or a real
+frame came (Cinestar 10 % loss: 1.4 s on every run plus 0.5-2.1 s by chance; the audio PID dark up to 2.3 s, 6 of 24 runs
+over the 1.5 s bar). The snapshot is now taken for real frames only, so a dropped fill frame loses exactly the step and is
+back at the door: std-cin/loss_100 audio dark 1.2-2.3 s -> 0.46-0.51 s, largest ATRIM 1386-2290 ms -> 240 ms, 0 of 40.
+
 ## 2.2.2-pre4 — pre3 + a gap-fill repeat never moves the sound (T-507) + a lost picture after a hold is a repeat (T-508)
 
 **T-507 — a residence tick does not move house_skew.** Since pre2 the T-501 gap fill (a repeat into a small source timing
