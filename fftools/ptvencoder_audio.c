@@ -930,6 +930,8 @@ static const char *synchk_unclean(AudioState *a, int64_t now)
         return "the resampler has not settled";
     if (s->hs_wc && now - s->hs_wc < PTV_SC_HS_US)
         return "a house_skew step is in flight";
+    if (a->vph_mv_wc && now - a->vph_mv_wc < PTV_SC_HS_US)     /* 2.2.2 T-499: the frames at the sink carry an older value */
+        return "the sound is following a picture phase move";
     return NULL;
 }
 
@@ -1336,7 +1338,8 @@ static int audio_drain_fg(AudioState *a)
                  * (pre3 steer); glue_off + corr are path-independent. Sign law preserved on
                  * both paths: +corr at the door delays audio content ⇒ raises m_a ⇒
                  * dR/dcorr = −1 (§2). */
-                int64_t inj    = a->glue_off_us + a->corr.corr_us + a->sstep_us + hs;   /* T-488: + sstep */
+                int64_t inj    = a->glue_off_us + a->corr.corr_us + a->sstep_us + hs +   /* T-488: + sstep */
+                                 a->vph_us;          /* 2.2.2 T-499: + the picture-phase term (0 on a mosaic track) */
                 int64_t slip   = 0, m, nowr;
                 if (a->fg_swr && a->fg_swr_flt &&
                     a->fg_swr_flt->nb_inputs > 0 && a->fg_swr_flt->nb_outputs > 0) {
@@ -1606,7 +1609,8 @@ static int audio_drain_fg(AudioState *a)
                  * measurement loop that reads sink labels (glue_off stays un-subtracted, as
                  * today: glue is the label-truth judgment, not an actuator). */
                 if (!(a->multiview && g_audio_follow) && a->house_skew)
-                    content -= *a->house_skew + a->corr.corr_us + a->sstep_us;   /* T-488: an actuator, as corr */
+                    content -= *a->house_skew + a->corr.corr_us + a->sstep_us +  /* T-488: an actuator, as corr */
+                               a->vph_us;            /* 2.2.2 T-499: and the picture-phase term */
                 else if (a->multiview && g_audio_follow)
                     content -= a->corr.corr_us;
                 if (!(a->multiview && a->mvf_hi_us > a->mvf_lo_us &&             /* T-093: fill phase frames carry no */
@@ -1961,6 +1965,56 @@ static int rj_release_ok(AudioState *a)
 
 static void rj_flush(AudioState *a);
 static void rj_arm_hold(AudioState *a);
+
+/* 2.2.2 T-499: this track's picture-phase term for a real frame at the house_skew door (sk = the house_skew the door
+ * applies to it, hs_door()'s value). The term moves toward the master's target by at most 2 ms per second of audio (4
+ * while more than 20 ms away) — a soft resample, the output labels stay sample-counted. Not moved while the slow
+ * corrector steers on any track. A house_skew step the master counted as "no change of where the picture is"
+ * (g_vph_jcum_us) is taken out of the term in the frame whose applied house_skew makes exactly that step — so a value
+ * hs_door() keeps is waited for — and dropped when no such frame comes within 4 s. After a second without a door frame
+ * (start, a hold, the record door) there is no continuity to keep: the term is the target. */
+static int64_t vph_door(AudioState *a, const AVFrame *frame, int64_t sk)
+{
+    int64_t now = av_gettime_relative();
+    int64_t g   = atomic_load_explicit(&g_vph_tgt_us, memory_order_relaxed);
+    int64_t jc  = atomic_load(&g_vph_jcum_us);
+    int64_t dur = frame->sample_rate > 0 ? av_rescale(frame->nb_samples, 1000000, frame->sample_rate) : 0;
+    int k, eng = 0;
+    if (!a->vph_wc || now - a->vph_wc > 1000000) {
+        a->vph_us    = g;
+        a->vph_jseen = jc;
+        a->vph_jwc   = 0;
+    } else {
+        int64_t d, lim;
+        if (jc != a->vph_jseen) {
+            if (!a->vph_jwc)
+                a->vph_jwc = now;
+            if (sk - a->vph_sk_last == jc - a->vph_jseen) {
+                if (g_diag)
+                    av_log(NULL, AV_LOG_INFO, "[PTV-VPHASE] a%d(in%d) house_skew %+"PRId64" ms with the opposite picture "
+                           "slip: no step in the sound, the phase term takes it and moves back\n", a->dbg_k, a->dbg_in,
+                           (jc - a->vph_jseen) / 1000);
+                a->vph_us   -= jc - a->vph_jseen;
+                a->vph_jseen = jc;
+                a->vph_jwc   = 0;
+            } else if (now - a->vph_jwc > 4000000) {
+                a->vph_jseen = jc;
+                a->vph_jwc   = 0;
+            }
+        }
+        for (k = 0; k < g_rsx.n_a && k < PTV_MAX_AUDIO; k++)
+            eng |= atomic_load_explicit(&g_corr_state_pub[k], memory_order_relaxed) == PTV_CORR_ENGAGED;
+        d   = g - a->vph_us;
+        lim = dur * (llabs(d) > PTV_VPH_FAR_US ? PTV_VPH_SLEW_FAR : PTV_VPH_SLEW) / 1000;
+        if (!eng)
+            a->vph_us += av_clip64(d, -lim, lim);
+    }
+    if (llabs(g - a->vph_us) > 1000)
+        a->vph_mv_wc = now;
+    a->vph_wc      = now;
+    a->vph_sk_last = sk;
+    return a->vph_us;
+}
 
 /* 2.0.0 T-321: the house_skew a real frame meets at the graph door. A short source gap (no hold) ends at the door
  * before it ends on air: the returning audio arrives while the video still repeats frames through the gap, so
@@ -2723,10 +2777,15 @@ graph_in:
             int64_t h0;
             pthread_mutex_lock(a->h0_lock); h0 = *a->h0; pthread_mutex_unlock(a->h0_lock);
             if (h0 != AV_NOPTS_VALUE)               /* output = door - h0: exactly where the video put this content */
-                frame->pts = av_rescale_q(a->vm_out_us + h0, AV_TIME_BASE_Q, a->ist_tb);
+                frame->pts = av_rescale_q(a->vm_out_us + h0 + g_vph_bias_us, AV_TIME_BASE_Q, a->ist_tb);
+            a->vph_wc = 0;                          /* 2.2.2 T-499: the record holds the picture's phase already; the
+                                                     * first house_skew-door frame after it starts on the target */
+            a->vph_us = atomic_load_explicit(&g_vph_tgt_us, memory_order_relaxed);
         } else if (g_avlock && a->house_skew && !(a->multiview && g_audio_follow) && frame->pts != AV_NOPTS_VALUE &&
             !a->hold_feeding) {
             int64_t sk = hs_door(a, frame, *a->house_skew);
+            if (g_vphase && !a->multiview)          /* 2.2.2 T-499: + the shown picture's sub-frame phase */
+                sk += vph_door(a, frame, sk);
             if (sk) frame->pts += av_rescale_q(sk, AV_TIME_BASE_Q, a->ist_tb);
         }
         /* 1.0.1-pre14 steer bus (§5 rule 1): the corrector's cumulative trim, injected at the

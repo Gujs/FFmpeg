@@ -5,6 +5,33 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.2-pre3 — pre2 + the sound follows the shown picture inside the frame (T-499)
+
+**A sub-frame step or a slow walk of the source's picture timestamps no longer moves the lip sync (T-499, GOALS #2 / #6).**
+The house shows a picture on the nearest tick, so it is on air r = tick − label away from its label (up to half a rounding
+period P: ±16.7 ms at 29.97, ±20 ms at 25); the sound was placed on its label exactly. A splice that re-phased the picture
+labels (Biohackingville +18.6 ms; the −14 ms injection) or a 12 ppm label walk (PATRIOT-LVTV_Portugal: +12 → −20 ms in an
+hour) therefore moved A/V by up to P/2 with no event line, dup=0, hs=0. Now:
+- the master measures r of every fresh picture (label arithmetic only — feed-forward, no loop) in half-second windows on
+  the circle of P; a window whose pictures agree (resultant ≥ 0.9) is coherent; after two in a row the target is
+  **F(phase)**: the phase itself, falling linearly to 0 in a 2 ms band next to ±P/2. +P/2 and −P/2 are the same point (the
+  picture moves one tick there), so the target is continuous when a walk crosses it: the sound never makes a step, and the
+  error stays within ±P/2 (it is 0 outside the band);
+- each transcoded track adds its own copy of the target at the house_skew door, moved by at most 2 ms per second of audio
+  (4 while more than 20 ms away): a soft resample, output labels stay sample-counted. Not on the record door (its
+  placement holds the phase already), fills, copies, the mosaic;
+- not followed (target 0 = the 2.2.1 placement): film cadence and rate conversions (no coherent phase for 5 s), and a
+  source that slips whole pictures more than once in 45 s (a different frame rate, 30.00 → 29.97 is one per 33 s: decimation leaves the sound
+  continuous). The estimator restarts when the rounding period changes (T-413 learned / cleared, slow / film path);
+- a house_skew step that comes with the opposite whole-tick move of r (a slip or sub-frame step shown as a repeat because
+  the queue was empty) is taken out of the track's term in the frame whose door applies that step, then slewed back;
+- both sensors and [PTV-AVSYNC] count the term as an actuator (lipsync= and offset read the true rest); the post-event sync
+  check waits while a track is still moving ("the sound is following a picture phase move").
+Stats: `vph=` (the target, ms) after `fqhw=`. Log: `[PTV-VPHASE]` one line per move of 5 ms or more (at most 1 / 60 s),
+the rest under PTV_DIAG. `PTV_NO_VPHASE=1` reverts; `PTV_TEST_VPH_BIAS=<us>` (test hook) adds a bias to the target.
+The video axis (content_index, house_skew, decimation / repeat, T-498, T-501), copied audio, captions and SCTE-35 are
+unchanged.
+
 ## 2.2.2-pre2 — pre1 + no output PTS hole at a small source timing gap (T-501)
 
 **A forward step in the source's video timestamps of less than 200 ms no longer leaves a hole in the output video PTS
