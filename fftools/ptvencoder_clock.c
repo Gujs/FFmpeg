@@ -196,20 +196,21 @@ static int64_t content_index(VideoCtx *v, int64_t src_pts)
  * are label arithmetic only (the tick a fresh picture's label rounded to, minus the label), so the sound's own move is not
  * in them — no loop. Half-second windows on the circle of one rounding period P; a window is coherent when its pictures
  * agree (resultant length >= 0.9: a constant phase, a splice step, a slow walk; not a pulldown or a rate conversion by
- * repeat / skip, whose pictures land all over the period). The target is F(phase) of the latest coherent window after two
- * in a row; under 8 pictures in a window nothing changes; 5 s without a coherent window, or a source that slips whole
- * pictures against the grid more often than once in 45 s (a different frame rate), puts the target at 0 = the label
- * placement of 2.2.1. */
+ * repeat / skip, whose pictures land all over the period; a window of under 8 pictures is not coherent either, unless damaged input left them out). The target
+ * is F(phase) of the latest coherent window after two in a row; 5 s without a coherent window, or a source that slips
+ * whole pictures against the grid faster than the sound can follow inside P/2 (vphase_window()), puts the target at 0 =
+ * the label placement of 2.2.1. */
 typedef struct VPhase {
     int64_t P;                  /* the rounding period the open window is collected on (us) */
     int     mode;               /* slow_arm | film_arm << 1 of the open window */
     double  s, c;               /* sums of sin / cos of 2 pi r / P */
-    int     n;
+    int     n, dmg;             /* samples; pictures left out for damaged input in this window */
     int64_t t0;                 /* the output tick the window opened on; -1 = none */
     int     coh, inc;           /* coherent / incoherent windows in a row */
     int     have_phi;
     int64_t phi;                /* the previous coherent window's phase (us, +-P/2) */
-    int     wsign, fast;        /* the last whole-picture slip's direction; slips come faster than one in 45 s */
+    int64_t phi_g;              /* the phase the target was last taken from; INT64_MIN = none (not followed) */
+    int     wsign, fast;        /* the last whole-picture slip's direction; slips come faster than the sound can follow */
     int64_t wrap_wc, fast_wc;
     int64_t r_prev;             /* the previous fresh picture's r (us); INT64_MIN = none */
     int64_t g;                  /* the target without the test bias (us) */
@@ -232,63 +233,94 @@ static int64_t vph_F(int64_t phi, int64_t P)
 static void vphase_reset(VPhase *p, int64_t P, int mode)
 {
     p->P = P; p->mode = mode;
-    p->s = p->c = 0; p->n = 0; p->t0 = -1;
+    p->s = p->c = 0; p->n = 0; p->dmg = 0; p->t0 = -1;
     p->coh = 0; p->have_phi = 0; p->wsign = 0; p->fast = 0;
+    p->phi_g = INT64_MIN;
     p->r_prev = INT64_MIN;
+}
+
+/* How long the sound takes to move d us: 2 ms/s, 4 ms/s for the part beyond 20 ms (vph_door()). */
+static double vph_move_s(int64_t d)
+{
+    d = llabs(d);
+    return (d > PTV_VPH_FAR_US ? (d - PTV_VPH_FAR_US) / 1e3 / PTV_VPH_SLEW_FAR + PTV_VPH_FAR_US / 1e3 / PTV_VPH_SLEW
+                               : d / 1e3 / PTV_VPH_SLEW);
 }
 
 static void vphase_window(VPhase *p, int64_t now)
 {
-    int64_t g = p->g;
+    int64_t g = p->g, h = p->P / 2, w = FFMIN(PTV_VPH_BAND_US, p->P / 4);
+    /* The fastest slip the sound can follow inside P/2: in the band the target moves (h - w) / w times as fast as the
+     * phase, and the door moves the sound at most PTV_VPH_SLEW_FAR us per ms there (g_vph_seam). Two slips the same way
+     * closer than P / that phase rate are a frame-rate conversion (30 fps: 61 s = 545 ppm; 25 fps: 90 s = 444 ppm) */
+    int64_t slip_us = w > 0 ? p->P * (h - w) / w * 1000 / PTV_VPH_SLEW_FAR : 0;
     double  R = 0;
+    int     coherent = 0, seam = 0, step = 0;
+    const char *why = NULL;             /* why the target left the phase; NULL = it is the phase */
     if (p->n >= 8) {
         R = hypot(p->s, p->c) / p->n;
-        if (R >= 0.9) {
-            int64_t phi = llrint(atan2(p->s, p->c) / (2 * M_PI) * p->P);
-            int w = !p->have_phi ? 0 : p->phi > p->P / 4 && phi < -p->P / 4 ? 1 :
-                                       p->phi < -p->P / 4 && phi > p->P / 4 ? -1 : 0;
-            if (w) {                    /* a whole picture slipped; back and forth at the line (label wobble) cancels */
-                int recent = p->wsign && now - p->wrap_wc < PTV_VPH_SLIP_US;
-                if (recent && w == p->wsign) {
-                    if (!p->fast && g_diag)
-                        av_log(NULL, AV_LOG_INFO, "[PTV-VPHASE] the source's pictures slip against the house grid more "
-                               "than once in 45 s (a different frame rate, converted by repeat / skip): not followed\n");
-                    p->fast = 1; p->fast_wc = now; p->wrap_wc = now;
-                } else if (recent)
-                    p->wsign = 0;
-                else {
-                    p->wsign = w; p->wrap_wc = now;
-                }
-            }
-            if (p->fast && now - p->fast_wc >= 300000000) {
-                p->fast = 0;
-                if (g_diag)
-                    av_log(NULL, AV_LOG_INFO, "[PTV-VPHASE] no such pair of slips for 5 min: followed again\n");
-            }
-            p->phi = phi; p->have_phi = 1; p->inc = 0;
-            if (++p->coh >= 2)
-                g = p->fast ? 0 : vph_F(phi, p->P);
-        } else {
-            p->coh = 0;
-            if (++p->inc >= 10) {       /* 5 s: a stale target never stays */
-                g = 0;
-                p->have_phi = 0;
+        coherent = R >= 0.9;
+    }
+    if (coherent) {
+        int64_t phi = llrint(atan2(p->s, p->c) / (2 * M_PI) * p->P);
+        /* a whole picture slipped = the SHORT way from the previous phase to this one goes through +-P/2 (the picture
+         * moved a tick); a splice from +9 to -9 ms goes the long way round the circle's seam and is no slip */
+        int sl = !p->have_phi || p->P - llabs(phi - p->phi) >= p->P / 4 ? 0 : phi < p->phi ? 1 : -1;
+        if (sl) {                       /* back and forth at the line (label wobble) cancels */
+            int recent = p->wsign && now - p->wrap_wc < slip_us;
+            if (recent && sl == p->wsign) {
+                p->fast = 1; p->fast_wc = now; p->wrap_wc = now;
+            } else if (recent)
+                p->wsign = 0;
+            else {
+                p->wsign = sl; p->wrap_wc = now;
             }
         }
+        if (p->fast && now - p->fast_wc >= 300000000)
+            p->fast = 0;
+        p->phi = phi; p->have_phi = 1; p->inc = 0;
+        if (++p->coh >= 2) {
+            g    = p->fast ? 0 : vph_F(phi, p->P);
+            seam = !p->fast && llabs(phi) > h - w;
+            /* an event for the default log = the PHASE stepped 5 ms or more the long way (a splice), or following
+             * starts away from 0; not the target's own run in the band, not a slip */
+            step = !p->fast && (p->phi_g == INT64_MIN ||
+                                (llabs(phi - p->phi_g) >= 5000 && p->P - llabs(phi - p->phi_g) >= p->P / 4));
+            p->phi_g = p->fast ? INT64_MIN : phi;
+            if (p->fast)
+                why = "the source slips whole pictures too often to follow (a frame-rate conversion by repeat / skip)";
+        }
+    } else if (p->n < 8 && p->dmg) {
+        ;                               /* pictures were there but damaged input left them out: nothing changes (the
+                                         * phase does not move with a corrupt packet; a source bad for long is held) */
+    } else {
+        p->coh = 0;
+        if (++p->inc >= 10) {           /* 5 s without a coherent window, picture-less windows included: a stale target
+                                         * never stays (a hold, film cadence, a rate conversion) */
+            g = 0;
+            p->have_phi = 0;
+            p->phi_g    = INT64_MIN;
+            why = "no steady picture phase for 5 s (film cadence, a rate conversion or no pictures)";
+        }
     }
-    p->s = p->c = 0; p->n = 0;
+    p->s = p->c = 0; p->n = 0; p->dmg = 0;
+    atomic_store_explicit(&g_vph_seam, seam, memory_order_relaxed);
     if (g != p->g) {
         int64_t d = g - p->g;
-        if (llabs(d) >= 5000 && now - p->ev_wc >= 60000000) {
+        if (llabs(d) >= 5000 && (why || step) && now - p->ev_wc >= 60000000) {
             p->ev_wc = p->dg_wc = now;
-            av_log(NULL, AV_LOG_INFO, "[PTV-VPHASE] the pictures' place on the house grid moved %+.1f ms (now %+.1f ms %s "
-                   "their labels): the sound follows over %.1f s\n", d / 1e3, g / 1e3, g < 0 ? "before" : "after",
-                   llabs(d) / 1e3 / PTV_VPH_SLEW);
+            if (why)
+                av_log(NULL, AV_LOG_INFO, "[PTV-VPHASE] the picture phase is not followed: %s — the sound returns to its "
+                       "label time (%+.1f ms) over %.1f s\n", why, d / 1e3, vph_move_s(d));
+            else
+                av_log(NULL, AV_LOG_INFO, "[PTV-VPHASE] the pictures' place on the house grid moved %+.1f ms (now %+.1f "
+                       "ms %s their labels): the sound follows over %.1f s\n", d / 1e3, g / 1e3,
+                       g < 0 ? "before" : "after", vph_move_s(d));
         } else if (g_diag && (llabs(d) >= 5000 || now - p->dg_wc >= 10000000)) {
             p->dg_wc = now;
             av_log(NULL, AV_LOG_INFO, "[PTV-VPHASE] target %+.2f -> %+.2f ms (phase %+.2f ms of %.2f, R %.2f, %s)\n",
                    p->g / 1e3, g / 1e3, p->phi / 1e3, p->P / 1e3, R,
-                   p->fast ? "not followed: frame rate" : p->coh >= 2 ? "followed" : "no coherent phase");
+                   p->fast ? "not followed: frame rate" : p->coh >= 2 ? "followed" : "no steady phase");
         }
         p->g = g;
         atomic_store_explicit(&g_vph_tgt_us, g + g_vph_bias_us, memory_order_relaxed);
@@ -1438,7 +1470,7 @@ void *output_thread(void *arg)
         int64_t vo_extra = 0;   /* 2.0.0-pre9.8 (T-076): video-only repeat ticks kept out of house_skew */
         int64_t vo_prev_c = -1; int vo_fresh_n = 0;   /* 2.0.0 T-345: content of the previous fresh frame; fresh frames since a vo hold */
         int vgap_park = 0;                          /* 2.0.0-pre9.4 (T-083): nextf is a frame parked behind a content gap */
-        VPhase vp = { .t0 = -1, .r_prev = INT64_MIN };   /* 2.2.2 T-499 */
+        VPhase vp = { .t0 = -1, .r_prev = INT64_MIN, .phi_g = INT64_MIN };   /* 2.2.2 T-499 */
         int64_t vg_fd_last = -1;                    /* 2.2.2 T-501: this rung's queue-drop count at the previous pop */
         int     vgap_src = 0;                       /* T-501: the parked gap is source timing (not damage) */
         int64_t vgap_src_n = 0, vgap_src_wc = 0;    /* T-501: its repeats since the last DIAG line */
@@ -2068,8 +2100,10 @@ void *output_thread(void *arg)
                     if (ok) {
                         int64_t su = av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q);
                         int64_t hu = su - *v->h0 - ptv_rj_off(su);
-                        int64_t r  = (v->out_fps.num > 0 ? av_rescale(content_vpts, 1000000LL * v->out_fps.den, v->out_fps.num)
-                                                         : content_vpts * v->tick_dur_us) - hu;
+                        /* the tick's time on content_index()'s own axis (PTV_NO_EXACTTICK: the integer tick) */
+                        int64_t r  = (g_exacttick && v->out_fps.num > 0
+                                      ? av_rescale(content_vpts, 1000000LL * v->out_fps.den, v->out_fps.num)
+                                      : content_vpts * v->tick_dur_us) - hu;
                         /* A whole-tick house_skew step that comes with the opposite whole-tick move of r is no change
                          * of where the picture is on air (a label slip or a sub-frame step shown as a repeat because the
                          * queue was empty, or taken back by a skip): counted, so each track's door takes the step out of
@@ -2081,7 +2115,9 @@ void *output_thread(void *arg)
                             atomic_fetch_add(&g_vph_jcum_us, d);
                         if (hu >= 0 && llabs(r) <= v->tick_dur_us) {
                             vp.r_prev = r;
-                            if (!dup_tick && !(slow_dmg_wc && nwp - slow_dmg_wc < 5000000)) {
+                            if (slow_dmg_wc && nwp - slow_dmg_wc < 5000000)
+                                vp.dmg = 1;
+                            else if (!dup_tick) {
                                 double an = 2 * M_PI * (double)r / (double)P;
                                 vp.s += sin(an); vp.c += cos(an); vp.n++;
                             }

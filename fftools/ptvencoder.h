@@ -1325,6 +1325,7 @@ typedef struct AudioState {
     int64_t          vph_us;                 /* 2.2.2 T-499: this track's realised picture-phase term at the door (us) */
     int64_t          vph_wc, vph_mv_wc;      /* T-499: wall time of the last door frame / of the last frame still moving */
     int64_t          vph_jseen, vph_jwc;     /* T-499: netted house_skew steps taken / when an untaken one was first seen */
+    int              vph_afmt, vph_reop;     /* T-499: afmt_rebuilds / dec_reopens at the last door frame */
     int64_t          vph_sk_last;            /* T-499: the house_skew the door applied to the previous frame */
     int              vm_on;                  /* T-488: the record door is placing (for its on/off DIAG line) */
     int64_t          vm_last_lab, vm_last_out;   /* the previous record-door frame: label, placement (or NOPTS) */
@@ -1963,12 +1964,13 @@ extern int     g_vgap_src;               /* 2.2.2 T-501: fill a small source-tim
 extern int     g_vphase;
 extern int64_t g_vph_bias_us;            /* test hook PTV_TEST_VPH_BIAS (us): added to the target after the estimator */
 extern _Atomic int64_t g_vph_tgt_us;     /* the target g = F(phase) (+ bias), us; 0 = not followed */
+extern _Atomic int     g_vph_seam;       /* the followed phase is in the band next to +-P/2: the door may move at the far rate */
 extern _Atomic int64_t g_vph_jcum_us;    /* cumulative house_skew steps that came with an equal and opposite phase wrap */
 #define PTV_VPH_BAND_US   2000           /* F falls linearly to 0 in this band next to +-P/2 (wider than label wobble) */
 #define PTV_VPH_SLEW      2              /* us per ms of audio (2 ms/s = 0.2 %) ... */
-#define PTV_VPH_SLEW_FAR  4              /* ... 4 ms/s while more than PTV_VPH_FAR_US away */
+#define PTV_VPH_SLEW_FAR  4              /* ... 4 ms/s while more than PTV_VPH_FAR_US away, or in the band (g_vph_seam) */
 #define PTV_VPH_FAR_US    20000
-#define PTV_VPH_SLIP_US   45000000       /* two whole-picture slips the same way within this = a frame-rate conversion */
+#define PTV_VPH_MOVE_US   3000           /* the sync check waits while a track is further than this from the target */
 #define PTV_VGAP_SRC_US 200000           /* 2.2.2 T-501: largest source-timing gap filled (the 200 ms "a gap" line of T-413) */
 extern int     g_pulldown;
 extern int     g_cad_disarm;

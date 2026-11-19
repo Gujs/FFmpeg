@@ -18,17 +18,21 @@ hour) therefore moved A/V by up to P/2 with no event line, dup=0, hs=0. Now:
   picture moves one tick there), so the target is continuous when a walk crosses it: the sound never makes a step, and the
   error stays within ±P/2 (it is 0 outside the band);
 - each transcoded track adds its own copy of the target at the house_skew door, moved by at most 2 ms per second of audio
-  (4 while more than 20 ms away): a soft resample, output labels stay sample-counted. Not on the record door (its
+  (4 for the part beyond 20 ms, and while the phase is in the band next to ±P/2): a soft resample, output labels stay
+  sample-counted. A pause in the arrival never makes it jump; only a real restart of the track's sound (first frame, the
+  end of a hold, a rebuilt audio path or decoder, the record door) starts on the target. Not on the record door (its
   placement holds the phase already), fills, copies, the mosaic;
-- not followed (target 0 = the 2.2.1 placement): film cadence and rate conversions (no coherent phase for 5 s), and a
-  source that slips whole pictures more than once in 45 s (a different frame rate, 30.00 → 29.97 is one per 33 s: decimation leaves the sound
-  continuous). The estimator restarts when the rounding period changes (T-413 learned / cleared, slow / film path);
+- not followed (target 0 = the 2.2.1 placement): no coherent window for 5 s (film cadence, rate conversions, no pictures:
+  a hold), and a source that slips whole pictures faster than the sound can follow inside P/2 — two slips the same way
+  within P·(P/2 − w)/(w · 4 ms/s) (61 s at 30 fps = 545 ppm, 90 s at 25 fps = 444 ppm; 30.00 → 29.97 is one per 33 s):
+  decimation leaves the sound continuous. A slip is a phase move whose short way round goes through ±P/2; a splice
+  across 0 is none. The estimator restarts when the rounding period changes (T-413 learned / cleared, slow / film path);
 - a house_skew step that comes with the opposite whole-tick move of r (a slip or sub-frame step shown as a repeat because
   the queue was empty) is taken out of the track's term in the frame whose door applies that step, then slewed back;
 - both sensors and [PTV-AVSYNC] count the term as an actuator (lipsync= and offset read the true rest); the post-event sync
-  check waits while a track is still moving ("the sound is following a picture phase move").
-Stats: `vph=` (the target, ms) after `fqhw=`. Log: `[PTV-VPHASE]` one line per move of 5 ms or more (at most 1 / 60 s),
-the rest under PTV_DIAG. `PTV_NO_VPHASE=1` reverts; `PTV_TEST_VPH_BIAS=<us>` (test hook) adds a bias to the target.
+  check waits while a track is more than 3 ms from its target ("the sound is following a picture phase move").
+Stats: `vph=` (the target, ms) after `fqhw=`. Log: `[PTV-VPHASE]` one line per move of 5 ms or more (at most 1 / 60 s):
+'the pictures' place on the house grid moved …' or 'the picture phase is not followed: <why> …'; the rest under PTV_DIAG. `PTV_NO_VPHASE=1` reverts; `PTV_TEST_VPH_BIAS=<us>` (test hook) adds a bias to the target.
 The video axis (content_index, house_skew, decimation / repeat, T-498, T-501), copied audio, captions and SCTE-35 are
 unchanged.
 

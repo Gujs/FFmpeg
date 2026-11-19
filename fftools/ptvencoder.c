@@ -444,6 +444,7 @@ int     g_vphase = 1;         /* 2.2.2 T-499: the sound follows the shown pictur
 int64_t g_vph_bias_us;
 _Atomic int64_t g_vph_tgt_us;
 _Atomic int64_t g_vph_jcum_us;
+_Atomic int     g_vph_seam;
 int     g_vgap_src = 1;       /* 2.2.2 T-501: a small source-timing gap in front of a clean frame is filled too */
 int     g_decimate = 1;       /* v0.9.15.2 cadence decimation (PTV_NO_DECIMATE reverts): a frame whose
                                       * content index does not advance past the last emitted tick is surplus

@@ -1971,8 +1971,9 @@ static void rj_arm_hold(AudioState *a);
  * while more than 20 ms away) — a soft resample, the output labels stay sample-counted. Not moved while the slow
  * corrector steers on any track. A house_skew step the master counted as "no change of where the picture is"
  * (g_vph_jcum_us) is taken out of the term in the frame whose applied house_skew makes exactly that step — so a value
- * hs_door() keeps is waited for — and dropped when no such frame comes within 4 s. After a second without a door frame
- * (start, a hold, the record door) there is no continuity to keep: the term is the target. */
+ * hs_door() keeps is waited for — and dropped when no such frame comes within 4 s. Only a real restart of the track's
+ * sound (its first frame, the end of a hold, a rebuilt audio path or decoder, the record door) starts on the target; a
+ * pause in the arrival does not — bursty audio keeps slewing (a jump of up to P would be a hard compensation click). */
 static int64_t vph_door(AudioState *a, const AVFrame *frame, int64_t sk)
 {
     int64_t now = av_gettime_relative();
@@ -1980,7 +1981,8 @@ static int64_t vph_door(AudioState *a, const AVFrame *frame, int64_t sk)
     int64_t jc  = atomic_load(&g_vph_jcum_us);
     int64_t dur = frame->sample_rate > 0 ? av_rescale(frame->nb_samples, 1000000, frame->sample_rate) : 0;
     int k, eng = 0;
-    if (!a->vph_wc || now - a->vph_wc > 1000000) {
+    if (!a->vph_wc || atomic_load_explicit(&g_src_rejoin_wall, memory_order_relaxed) > a->vph_wc ||
+        a->afmt_rebuilds != a->vph_afmt || a->dec_reopens != a->vph_reop) {
         a->vph_us    = g;
         a->vph_jseen = jc;
         a->vph_jwc   = 0;
@@ -2005,12 +2007,17 @@ static int64_t vph_door(AudioState *a, const AVFrame *frame, int64_t sk)
         for (k = 0; k < g_rsx.n_a && k < PTV_MAX_AUDIO; k++)
             eng |= atomic_load_explicit(&g_corr_state_pub[k], memory_order_relaxed) == PTV_CORR_ENGAGED;
         d   = g - a->vph_us;
-        lim = dur * (llabs(d) > PTV_VPH_FAR_US ? PTV_VPH_SLEW_FAR : PTV_VPH_SLEW) / 1000;
+        /* 4 ms/s in the band too: there the target runs (P/2 - w) / w times the phase, and the sound must be near 0
+         * when the picture slips or it is a whole period off (the estimator's slip limit is derived from this rate) */
+        lim = dur * (llabs(d) > PTV_VPH_FAR_US || atomic_load_explicit(&g_vph_seam, memory_order_relaxed)
+                     ? PTV_VPH_SLEW_FAR : PTV_VPH_SLEW) / 1000;
         if (!eng)
             a->vph_us += av_clip64(d, -lim, lim);
     }
-    if (llabs(g - a->vph_us) > 1000)
+    if (llabs(g - a->vph_us) > PTV_VPH_MOVE_US)                /* not the in-band target jitter of a phase parked at the line */
         a->vph_mv_wc = now;
+    a->vph_afmt    = a->afmt_rebuilds;
+    a->vph_reop    = a->dec_reopens;
     a->vph_wc      = now;
     a->vph_sk_last = sk;
     return a->vph_us;
