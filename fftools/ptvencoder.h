@@ -1611,6 +1611,7 @@ typedef struct DemuxArgs {
     int64_t               src_last_vdts_raw; /* 2.0.0-pre3: last video DTS, raw 33-bit (stream tb) */
     int64_t               src_last_vwall;   /* 2.0.0-pre3: wall us of that packet */
     int                   src_classified;   /* 2.0.0-pre3: rejoin of the current hold already classified */
+    int64_t               src_cls_hold;     /* 2.2.2 T-502: the hold (g_src_hold_start) the classifier was armed for */
     int                   src_pend;         /* 2.0.0-pre3: first post-gap packet (the PES tail) seen */
     int64_t               src_pend_w, src_pend_raw; /* 2.0.0-pre3: its wall gap; the last pre-gap DTS */
     /* 2.0.0 T-103 (owner 2026-10-10: the output delay is pinned): a pause the burst bank cannot absorb is not kept as

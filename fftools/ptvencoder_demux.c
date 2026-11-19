@@ -2196,6 +2196,18 @@ void *demux_thread(void *arg)
                  * packets (copied AC-3 + mid-GOP cut: the state flipped back to LIVE after the tail, the class was
                  * never set, the audio waiting for it ran into its 4 s cap and video waited at the gate: 1.9 s dark) */
                 if (atomic_load_explicit(&g_src_state, memory_order_relaxed) || d->src_pend) {
+                    /* 2.2.2 T-502: a class belongs to ONE hold — the classifier is armed again when the next hold
+                     * begins (g_src_hold_start, as the audio's rejoin buffer is: T-489), not only by a video packet read
+                     * while LIVE. A return that ends as its hold ends (back for 1 s: the last picture is read as the
+                     * master shows the first) left no such packet: the second hold's return was never classified, the
+                     * audio waited for the class with its real frames buffered and the fill stopped — the 4 s cap
+                     * released them (blip1000/sync_blip_20: 189 frames held 4.1 s, the audio PID dark 4.1 s) */
+                    int64_t hid = atomic_load_explicit(&g_src_hold_start, memory_order_relaxed);
+                    if (hid && hid != d->src_cls_hold) {
+                        d->src_cls_hold   = hid;
+                        d->src_classified = 0;
+                        d->src_pend       = 0;
+                    }
                     if (!d->src_classified && d->src_last_vwall) {
                         if (!d->src_pend) {                 /* first packet after the gap: the held tail */
                             d->src_pend     = 1;

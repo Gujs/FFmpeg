@@ -2767,7 +2767,13 @@ graph_in:
                         atomic_store_explicit(&g_afill_us[a->dbg_k], 0, memory_order_relaxed);
                 }
             }
-            if (!a->hold_feeding) {        /* T-478: a real frame — keep what it replaces until it passes the door */
+            /* 2.2.2 T-505: a REAL frame only. The track's own silence fill (nbs) took the snapshot too: when house_skew
+             * stepped back under it (the video back on its content after a run of repeats: +240 ms -> 0) its frames fell
+             * behind the door, each was dropped whole and "restored" — the fill's next label never advanced, so every
+             * later quantum was dropped as well, until house_skew moved again or a real frame came (Cinestar 10 % loss:
+             * 1.4 s on every run, 0.5-2.1 s more by chance — the audio PID dark 2.3 s). A dropped fill frame moves the
+             * fill on: it loses the step (240 ms) and is back at the door */
+            if (!a->nbs_feeding) {         /* T-478: a real frame — keep what it replaces until it passes the door */
                 a->gs_raw = a->glue_raw_last_us; a->gs_dur = a->glue_raw_dur_us; a->gs_wall = a->glue_wall_last_us;
                 a->gs_hs  = a->hf_hs_real;       a->gs_dup = a->hf_dup_real;     a->gs_ok   = 1;
             }
