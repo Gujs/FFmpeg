@@ -2130,7 +2130,16 @@ void *output_thread(void *arg)
                         vp.t0 = vpts;
                     }
                 }
-                *v->house_skew = hsn;
+                /* 2.2.2 T-507: a residence tick (film / slower-source cadence, a gap fill's repeat) is the held picture
+                 * on air one tick longer — house_skew stays what the tick that showed it published. Derived again here,
+                 * it moved when the held picture's label rounded to another tick in between: the learned source period
+                 * crossing the tick length (LVTV: 39.5 <-> 40.0 ms) moves content_index()'s decision line 0.24 ms, a
+                 * label next to the line (where a T-501 fill happens) then counts as content one tick on, the picture
+                 * popped behind it looks like a gap and is filled, and vpts - content (0) less the residence (1) read
+                 * -1 tick for that one tick: an audio frame at the door in it stepped back 40 ms and forward again
+                 * ([PTV-ATRIM] + [PTV-ACOMP], LVTV_Portugal 16 times in 2.2.2-pre2). The next shown picture publishes */
+                if (!cadence_hold)
+                    *v->house_skew = hsn;
             }
             /* 2.0.0 T-095: how far the master shows content past its content index (dups / a BURST rejoin keep this;
              * 0 in steady state). Captions are stamped from the content index, so they need the same offset or they
