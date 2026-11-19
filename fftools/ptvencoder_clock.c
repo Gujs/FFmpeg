@@ -1333,6 +1333,9 @@ void *output_thread(void *arg)
         int64_t vo_extra = 0;   /* 2.0.0-pre9.8 (T-076): video-only repeat ticks kept out of house_skew */
         int64_t vo_prev_c = -1; int vo_fresh_n = 0;   /* 2.0.0 T-345: content of the previous fresh frame; fresh frames since a vo hold */
         int vgap_park = 0;                          /* 2.0.0-pre9.4 (T-083): nextf is a frame parked behind a content gap */
+        int64_t vg_fd_last = -1;                    /* 2.2.2 T-501: this rung's queue-drop count at the previous pop */
+        int     vgap_src = 0;                       /* T-501: the parked gap is source timing (not damage) */
+        int64_t vgap_src_n = 0, vgap_src_wc = 0;    /* T-501: its repeats since the last DIAG line */
         int rj_park = 0, rj_park_n = 0, rj_park_seq = 0;   /* 2.2.1 T-472: nextf is a rejoin's first picture waiting for
                                                      * its slot; ticks waited; the g_rj_cls_seq that had its wait */
         int64_t blk_wc = 0;                         /* T-472: when this rung last showed its own black picture */
@@ -1361,6 +1364,8 @@ void *output_thread(void *arg)
         } else if (g_pulldown && (film_arm || slow_arm) && have) {   /* film cadence / a slower source: pop by content time */
             if (!next_have) {
                 ret = av_thread_message_queue_recv(v->frame_q, &f, AV_THREAD_MESSAGE_NONBLOCK);
+                if (ret >= 0)                       /* 2.2.2 T-501: the drop count at this pop */
+                    vg_fd_last = v->framedrop_src ? *v->framedrop_src : v->framedrop;
                 if (ret >= 0) {
                     nextf = f; next_have = 1;
                     rj_park   = rj_prime_park(v, f, last_vpts, base_sp, &rj_park_seq);   /* 2.2.1 T-472 */
@@ -1382,7 +1387,7 @@ void *output_thread(void *arg)
             /* queue empty + no lookahead: fall through = dup-on-empty exactly as today */
         } else if (next_have && vgap_park && content_index(v, nextf->pts) > last_vpts + 1) {
             cadence_hold = 1;                       /* 2.0.0-pre9.4 (T-083): still inside the content gap — repeat */
-            vgap_filled++;
+            if (vgap_src) vgap_src_n++; else vgap_filled++;   /* T-501: source timing is not "frames lost" */
         } else if (next_have) {
             /* v0.9.16.2 (defensive): drain a PARKED pulldown lookahead first. If cadence ever
              * disarms with a frame still in nextf, that frame would sit orphaned until the next
@@ -1431,6 +1436,7 @@ void *output_thread(void *arg)
                     }
                 }
                 if (ret >= 0 && have && rj_prime_park(v, f, last_vpts, base_sp, &rj_park_seq)) {
+                    vg_fd_last = v->framedrop_src ? *v->framedrop_src : v->framedrop;   /* 2.2.2 T-501 */
                     nextf = f; next_have = 1; rj_park = 1; rj_park_n = 0;   /* 2.2.1 T-472: before the gap fill — these
                                                                              * ticks are repeats, not residence */
                     break;
@@ -1449,17 +1455,36 @@ void *output_thread(void *arg)
                     /* 2.0.0 T-377: up to the stall threshold (3 s), not 2 s — a gap between the two was handled by
                      * neither path: at 50 fps a 2 s flap is 101 lost frames = 2020 ms, leapt = a 2.04 s video PTS hole
                      * (rich50b flapping; 25 fps: 50 frames = 2000 ms, filled). Below the threshold no hold ever starts */
+                    /* 2.2.2 T-501: a SMALL gap (< PTV_VGAP_SRC_US = 200 ms) in front of a clean frame is the source's own
+                     * timing — a sub-frame label re-phase at a splice (Biohackingville +118.67 ms = a 3-tick hole) or a
+                     * label walk crossing the rounding line (LVTV: 8 one-tick holes in 2 min) — and is filled like the
+                     * damage-era gap: whole-picture repeats up to the frame's slot, residence, the output PTS stays one
+                     * tick per picture (GOALS #1 / #6: never a timestamp hole). A gap our own queue made (a drop-oldest
+                     * since the previous pop: a backlog, counted before the drop takes effect) or one of 200 ms or more
+                     * keeps the leap — T-084's reason for marking damage only. The start-up's first pop never reaches
+                     * this test (have = 0); after it only the drop check guards (a <= 200 ms fill is harmless residence).
+                     * PTV_NO_VGAP_SRC=1 reverts */
                     int64_t hc = content_index(v, f->pts);
+                    int64_t fd_now = v->framedrop_src ? *v->framedrop_src : v->framedrop;
+                    int dmg = av_dict_get(f->metadata, "ptv_dmg", NULL, 0) != NULL;   /* damage-era frame (emit_video) */
+                    int src_gap = g_vgap_src && vg_fd_last >= 0 && fd_now == vg_fd_last &&
+                                  (hc - last_vpts - 1) * v->tick_dur_us < PTV_VGAP_SRC_US;
                     if (hc > last_vpts + 1 && (hc - last_vpts - 1) * v->tick_dur_us <= FFMAX(2000000, g_stall_min_us) &&
-                        av_dict_get(f->metadata, "ptv_dmg", NULL, 0)) {   /* damage-era frame (emit_video) */
-                        nextf = f; next_have = 1; vgap_park = 1;
-                        if (!fresh) {
+                        (src_gap || dmg)) {
+                        nextf = f; next_have = 1; vgap_park = 1; vgap_src = !dmg;
+                        vg_fd_last = fd_now;
+                        /* T-501: on a 2:1 source this tick's fresh picture is the SURPLUS one the decimation was skipping
+                         * (content already shown): on air it is a repeat, so residence too — else house_skew (and the
+                         * audio) would step one tick for one tick on a clean channel */
+                        if (!fresh || (!dmg && have && content_index(v, held_src_pts) <= last_content_vpts)) {
                             cadence_hold = 1;
-                            vgap_filled++;
+                            if (vgap_src) vgap_src_n++; else vgap_filled++;
                         }
                         break;
                     }
                 }
+                if (ret >= 0)                       /* 2.2.2 T-501: drops after this pop are what the next gap is judged by */
+                    vg_fd_last = v->framedrop_src ? *v->framedrop_src : v->framedrop;
                 if (ret >= 0) {
                     av_frame_unref(held); av_frame_move_ref(held, f); av_frame_free(&f);
                     have = 1; fresh = 1; held_src_pts = held->pts;   /* capture before emit overwrites it */
@@ -2077,6 +2102,13 @@ void *output_thread(void *arg)
                                                                           * media time reached — every
                                                                           * demux stops pulling */
         if (!fresh) { if (cadence_hold) v->pd++; else v->dup++; }   /* pd = intentional cadence residence; dup stays the health alarm */
+        if (g_diag && vgap_src_n && v->is_master && av_gettime_relative() - vgap_src_wc >= 60000000) {   /* T-501 */
+            av_log(NULL, AV_LOG_INFO, "[PTV-VFILL] %"PRId64" picture repeat(s) into source timing gaps in 60 s (a forward "
+                   "label step < 200 ms, no frame lost) — output PTS stays continuous (PTV_NO_VGAP_SRC=1 disables)\n",
+                   vgap_src_n);
+            vgap_src_n  = 0;
+            vgap_src_wc = av_gettime_relative();
+        }
         if (vgap_filled && v->is_master && av_gettime_relative() - vgap_log_wc >= 10000000) {
             av_log(NULL, AV_LOG_WARNING, "[PTV-VFILL] %"PRId64" frame(s) repeated into content gaps (source frames "
                    "lost/corrupt) — output PTS stays continuous (PTV_NO_VGAPFILL=1 disables)\n", vgap_filled);

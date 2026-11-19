@@ -47,7 +47,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.2.2-pre1"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.2.2-pre2"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -440,6 +440,7 @@ int     g_mv_exacttick = 1;   /* v0.9.12 MV-EXACTTICK (PTV_NO_MV_EXACTTICK rever
                                       * ~36ms/h audio-late onto the wire while every internal offset read bounded.
                                       * See analysis/ptvencoder-0911-multiview-tick-audit.md. */
 int     g_vgapfill = 1;       /* 2.0.0-pre9.4 (T-083): a content gap inside frame_q is filled, not leapt */
+int     g_vgap_src = 1;       /* 2.2.2 T-501: a small source-timing gap in front of a clean frame is filled too */
 int     g_decimate = 1;       /* v0.9.15.2 cadence decimation (PTV_NO_DECIMATE reverts): a frame whose
                                       * content index does not advance past the last emitted tick is surplus
                                       * (source delivers MORE real frames than its declared rate — NewsNation
@@ -7708,6 +7709,7 @@ int main(int argc, char **argv)
     }   /* v0.9.14: revert to advisor-only (manual PTV_PREROLL_MS recipe) */
     if (getenv("PTV_NO_CLOCKFOLLOW")) g_clockfollow = 0;   /* v0.9.15: never follow a large source-clock offset (buffers pin + resampler churns on such sources) */
     if (getenv("PTV_NO_VGAPFILL")) g_vgapfill = 0;          /* 2.0.0-pre9.4 (T-083) kill switch */
+    if (getenv("PTV_NO_VGAP_SRC")) g_vgap_src = 0;          /* 2.2.2 T-501 kill switch: the source-timing gap is leapt again */
     if (getenv("PTV_NO_DECIMATE")) g_decimate = 0;         /* v0.9.15.2: keep pop-per-tick even for >house-rate sources (frame_q pins on surplus) */
     /* PTV_FRAMEQ stays HERE (not resolve_cushions()): the multiview hold.q alloc consumes
      * g_frameq_cap before resolve_cushions() runs in transcode() setup (0.9.18 M1). */
