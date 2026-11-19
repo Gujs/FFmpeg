@@ -1474,6 +1474,10 @@ void *output_thread(void *arg)
         int64_t vg_fd_last = -1;                    /* 2.2.2 T-501: this rung's queue-drop count at the previous pop */
         int     vgap_src = 0;                       /* T-501: the parked gap is source timing (not damage) */
         int64_t vgap_src_n = 0, vgap_src_wc = 0;    /* T-501: its repeats since the last DIAG line */
+        int64_t vg_lag = 0;                         /* 2.2.2 T-508: ticks the pictures are on air past their content index
+                                                     * (the delay kept after a hold, or a dup) while one follows the other;
+                                                     * 0 after a tick that had no picture of its own to show */
+        int64_t vgap_lag = 0;                       /* T-508: ... as it was when nextf was parked behind its gap */
         int rj_park = 0, rj_park_n = 0, rj_park_seq = 0;   /* 2.2.1 T-472: nextf is a rejoin's first picture waiting for
                                                      * its slot; ticks waited; the g_rj_cls_seq that had its wait */
         int64_t blk_wc = 0;                         /* T-472: when this rung last showed its own black picture */
@@ -1523,7 +1527,7 @@ void *output_thread(void *arg)
                     cadence_hold = 1;               /* held frame legitimately occupies this tick (3-field residence) */
             }
             /* queue empty + no lookahead: fall through = dup-on-empty exactly as today */
-        } else if (next_have && vgap_park && content_index(v, nextf->pts) > last_vpts + 1) {
+        } else if (next_have && vgap_park && content_index(v, nextf->pts) + vgap_lag > last_vpts + 1) {
             cadence_hold = 1;                       /* 2.0.0-pre9.4 (T-083): still inside the content gap — repeat */
             if (vgap_src) vgap_src_n++; else vgap_filled++;   /* T-501: source timing is not "frames lost" */
         } else if (next_have) {
@@ -1602,14 +1606,25 @@ void *output_thread(void *arg)
                      * keeps the leap — T-084's reason for marking damage only. The start-up's first pop never reaches
                      * this test (have = 0); after it only the drop check guards (a <= 200 ms fill is harmless residence).
                      * PTV_NO_VGAP_SRC=1 reverts */
+                    /* 2.2.2 T-508: the small gap is measured where the pictures are on air, not at the content index. While
+                     * the output keeps a delay (the bank after a BURST hold: house_skew +4.4 s; one dup: +1 tick) every
+                     * content index lies behind the output cursor, so no gap was ever seen: a single lost picture was
+                     * leapt — the pictures one tick earlier for good, house_skew stepped by a tick and the sound was cut
+                     * by it ("[PTV-ATRIM] input stepped back 33 ms", m1key hand-over: one corrupt packet 28 s after a 6 s
+                     * pause; the same loss before the pause was a repeat). The slot of a picture that follows its
+                     * predecessor on air is its content index plus the predecessor's delay (vg_lag); after a tick with no
+                     * picture to show (a dup, a hold) it is the content index again, and the larger damage-era gap keeps
+                     * the content index too — the kept delay takes those up, as before (an outage, a cut at the door) */
                     int64_t hc = content_index(v, f->pts);
                     int64_t fd_now = v->framedrop_src ? *v->framedrop_src : v->framedrop;
                     int dmg = av_dict_get(f->metadata, "ptv_dmg", NULL, 0) != NULL;   /* damage-era frame (emit_video) */
-                    int src_gap = g_vgap_src && vg_fd_last >= 0 && fd_now == vg_fd_last &&
-                                  (hc - last_vpts - 1) * v->tick_dur_us < PTV_VGAP_SRC_US;
-                    if (hc > last_vpts + 1 && (hc - last_vpts - 1) * v->tick_dur_us <= FFMAX(2000000, g_stall_min_us) &&
-                        (src_gap || dmg)) {
+                    int64_t gs = hc - last_vpts - 1 + vg_lag;                         /* T-508 */
+                    int src_gap = g_vgap_src && vg_fd_last >= 0 && fd_now == vg_fd_last && gs > 0 &&
+                                  gs * v->tick_dur_us < PTV_VGAP_SRC_US;
+                    if (src_gap || (dmg && hc > last_vpts + 1 &&
+                                    (hc - last_vpts - 1) * v->tick_dur_us <= FFMAX(2000000, g_stall_min_us))) {
                         nextf = f; next_have = 1; vgap_park = 1; vgap_src = !dmg;
+                        vgap_lag = src_gap ? vg_lag : 0;
                         vg_fd_last = fd_now;
                         /* T-501: on a 2:1 source this tick's fresh picture is the SURPLUS one the decimation was skipping
                          * (content already shown): on air it is a repeat, so residence too — else house_skew (and the
@@ -2041,6 +2056,10 @@ void *output_thread(void *arg)
             if (v->is_master && !cadence_hold && (content_vpts < 0 || content_vpts <= last_content_vpts))
                 atomic_fetch_add_explicit(&g_dup_out_us, v->tick_dur_us, memory_order_relaxed);
             int dup_tick = content_vpts < 0 || content_vpts <= last_content_vpts;   /* T-076 */
+            if (fresh && !dup_tick)                 /* 2.2.2 T-508: where this picture is on air against its content index */
+                vg_lag = vpts - content_vpts;
+            else if (!cadence_hold)                 /* a tick with nothing of its own to show: the content index decides */
+                vg_lag = 0;
             int64_t vp_prev_c = last_content_vpts;  /* T-499 */
             if (content_vpts >= 0)
                 last_content_vpts = content_vpts;   /* v0.9.15.3 decimation cursor: real content played
@@ -2130,7 +2149,16 @@ void *output_thread(void *arg)
                         vp.t0 = vpts;
                     }
                 }
-                *v->house_skew = hsn;
+                /* 2.2.2 T-507: a residence tick (film / slower-source cadence, a gap fill's repeat) is the held picture
+                 * on air one tick longer — house_skew stays what the tick that showed it published. Derived again here,
+                 * it moved when the held picture's label rounded to another tick in between: the learned source period
+                 * crossing the tick length (LVTV: 39.5 <-> 40.0 ms) moves content_index()'s decision line 0.24 ms, a
+                 * label next to the line (where a T-501 fill happens) then counts as content one tick on, the picture
+                 * popped behind it looks like a gap and is filled, and vpts - content (0) less the residence (1) read
+                 * -1 tick for that one tick: an audio frame at the door in it stepped back 40 ms and forward again
+                 * ([PTV-ATRIM] + [PTV-ACOMP], LVTV_Portugal 16 times in 2.2.2-pre2). The next shown picture publishes */
+                if (!cadence_hold)
+                    *v->house_skew = hsn;
             }
             /* 2.0.0 T-095: how far the master shows content past its content index (dups / a BURST rejoin keep this;
              * 0 in steady state). Captions are stamped from the content index, so they need the same offset or they
