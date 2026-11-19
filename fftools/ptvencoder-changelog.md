@@ -5,6 +5,28 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.2-pre1 — 2.2.1 + one emit decision for the whole ladder (T-498)
+
+**Every rung of an ABR ladder shows the same source picture on the same output tick, always (T-498, 2.2.2).** Each rung
+ran the house clock's emit logic on its own frame queue (own tick phase, own non-blocking pop, own monotonic guard). At
+a delivery starvation every rung decided its own repeats, and a lower rung could end up showing the same picture one or
+more ticks away from rung 0 until a later starvation moved it again. house_skew, the picture record, the sensors and the
+shared audio all follow rung 0, so on that rung lip sync was off by whole ticks while every sensor read 0 (cow
+Nothing_But_Sportz lowest rung +30 / +36 ms; local replay of a 300 s capture with 8 feed pauses of 2.0-2.7 s: 2.2.1
+diverged in every run on at least one rung, by -30, -60 or -90 ms for 30-135 s). Now the decision is made once, before
+the ladder (the HLS authoring / CMAF alignment rule): the master rung alone runs the clock (cadence hold, decimation,
+gap fill, rejoin park, hold pictures, all unchanged) and records per tick which picture it shows (the decode thread's
+picture serial, frame metadata `ptv_seq`, + its source time), on which tick, and in which form (the picture, the
+rendered hold picture, black). The other rungs emit from that record: their own scaled copy of that picture, stamped
+with the master's tick. Pictures the master passed over are dropped; a picture not yet shown waits; a picture a rung
+does not have (its queue dropped it) is a repeat of its last one for those ticks only. The master never waits for a
+follower; a follower runs behind by its own encode time, waits for a picture only while the decode thread is still
+handing it out, and a rung further behind than its frame queue holds skips those ticks (as its own clock did by content
+time). The mosaic composes once and is unchanged. `PTV_NO_RUNG_FOLLOW=1` reverts to a clock per rung.
+Log: `[PTV-RUNG]` (legend) — WARNING `rung N fell behind rung 0 by more than its frame queue — K tick(s) skipped` and
+`rung N found none of rung 0's pictures in its queue for 2 s`, each at most once per 10 s; PTV_DIAG: `rung N: K tick(s)
+in 60 s without rung 0's picture`. The default log of a healthy ladder has no new line.
+
 ## 2.2.1 — release: 2.2.1-rc13 unchanged, version only
 
 **Same code as 2.2.1-rc13** (adaptive-2.2 25be11cc9d); only `PTVENCODER_VERSION` changes. What makes it the release:

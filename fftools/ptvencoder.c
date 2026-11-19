@@ -47,7 +47,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.2.1"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.2.2-pre1"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -225,6 +225,9 @@ _Atomic int64_t g_vdisp_skew_us;   /* 2.0.0 T-095: master: (vpts - content index
 _Atomic int64_t g_dup_out_us;   /* 2.0.0-pre9.4 (T-083): output time on ticks whose content did not advance */
 int             g_rejoin_map = 1;
 int             g_rj_prime = 1;          /* 2.2.1 T-472 (ptvencoder.h) */
+int             g_rung_follow = 1;       /* 2.2.2 T-498 (ptvencoder.h): the rungs emit from the master's record */
+RungFollow      g_rf = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER };
+_Atomic int     g_rf_fo_begun, g_rf_fo_done;
 int             g_reprime_quiet_off = 1; /* 2.2.1 T-472: no RE-PRIME while no video arrives; PTV_REPRIME_QUIET=1 reverts */
 _Atomic int     g_rj_hold_seq0, g_rj_parking;
 _Atomic int64_t g_rj_prime_us;
@@ -3008,11 +3011,16 @@ static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
         if (dw && av_gettime_relative() - dw < 5000000)
             av_dict_set(&frame->metadata, "ptv_dmg", "1", 0);
     }
+    /* 2.2.2 T-498: the picture's serial — every rung's copy of this picture carries it (as ptv_dmg above), so a follower
+     * rung finds in its own queue the picture the master shows */
+    if (g_rung_follow && d->n_rung > 1)
+        av_dict_set_int(&frame->metadata, "ptv_seq", ++d->rf_seq, 0);
     if (!d->filtering)                   /* (with a graph: the FITTED picture, below — T-469) */
         ptv_hold_note_frame(d, frame);   /* 2.0.0-pre9: the freeze picture + render timeline (T-078/T-079) */
     if (!d->filtering) {                 /* no graph: clone the decoded frame to each rung */
         if (frame->best_effort_timestamp != AV_NOPTS_VALUE)   /* source time in ist_tb (== out_tb) */
             frame->pts = frame->best_effort_timestamp;
+        atomic_fetch_add_explicit(&g_rf_fo_begun, 1, memory_order_release);   /* T-498 */
         for (i = 0; i < d->n_rung; i++) {
             AVFrame *out;
             if (i == d->n_rung - 1) { out = av_frame_alloc(); if (out) av_frame_move_ref(out, frame); }
@@ -3021,6 +3029,7 @@ static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
             if (out) push_frame_q(d->frame_q[i], ((d->deep_prime_packets > 0 || atomic_load_explicit(&g_bank_pkts, memory_order_relaxed) > 0 || ptv_fq_startup_lossless()) && i == 0) ? 0 : d->live, &d->framedrop[i], out);
             else if (i == d->n_rung - 1) av_frame_unref(frame);
         }
+        atomic_store_explicit(&g_rf_fo_done, atomic_load_explicit(&g_rf_fo_begun, memory_order_relaxed), memory_order_release);
         return;
     }
     {   /* 2.0.0 T-373: a picture in another size / format than the graph was built for is damage (a bit-flipped SPS
@@ -3175,6 +3184,7 @@ feed:
     if (av_buffersrc_add_frame(d->fsrc, frame) < 0)   /* consumes frame */
         return;
     d->vg_in_since_out++;
+    atomic_fetch_add_explicit(&g_rf_fo_begun, 1, memory_order_release);   /* T-498: a fan-out to every rung begins */
     for (i = 0; i < d->n_rung; i++) {                 /* split branch -> each rung's frame_q */
         while (av_buffersink_get_frame(d->fsink[i], filt) >= 0) {
             AVFrame *out;
@@ -3190,6 +3200,7 @@ feed:
             else     { av_frame_unref(filt); }
         }
     }
+    atomic_store_explicit(&g_rf_fo_done, atomic_load_explicit(&g_rf_fo_begun, memory_order_relaxed), memory_order_release);
 }
 
 /* Multiview: push a decoded frame onto this input's jitter buffer for the
@@ -3851,12 +3862,14 @@ static void *decode_thread(void *arg)
     /* flush filter graph: push EOF into the src, drain every rung's sink */
     if (d->filtering) {
         int fr = av_buffersrc_add_frame(d->fsrc, NULL); (void)fr;
+        atomic_fetch_add_explicit(&g_rf_fo_begun, 1, memory_order_release);   /* T-498 */
         for (i = 0; i < d->n_rung; i++)
             while (av_buffersink_get_frame(d->fsink[i], filt) >= 0) {
                 AVFrame *out = filt->opaque == &ptv_hold_tag ? NULL : av_frame_alloc();   /* pre9: no hold picture */
                 if (out) { av_frame_move_ref(out, filt); push_frame_q(d->frame_q[i], ((d->deep_prime_packets > 0 || atomic_load_explicit(&g_bank_pkts, memory_order_relaxed) > 0 || ptv_fq_startup_lossless()) && i == 0) ? 0 : d->live, &d->framedrop[i], out); }
                 else     { av_frame_unref(filt); }
             }
+        atomic_store_explicit(&g_rf_fo_done, atomic_load_explicit(&g_rf_fo_begun, memory_order_relaxed), memory_order_release);
     }
 done:
     av_frame_free(&filt);
@@ -6673,6 +6686,8 @@ static int transcode(OptionGroupList *ins, OptionGroupList *outs, const char *fc
         vc->hr  = &house_rate;                   /* R4: house-rate actuation state, shared by the rung set */
         vc->vring = (!multiview && r == 0) ? &inputs[0].vring : NULL;  /* single-input: master rung feeds the A/V probe ring (multiview: compositor does) */
         vc->is_master = (r == 0);
+        vc->rung = r;
+        vc->rf = (g_rung_follow && live && !multiview && n_rung > 1) ? &g_rf : NULL;   /* 2.2.2 T-498 */
         vc->hold_pic = multiview ? NULL : &g_hold_pic[r];   /* 2.0.0-pre9: rendered hold pictures (T-078/T-079) */
         if (!multiview && r == 0) {              /* 2.0.0-pre6: the master fills these while input 0 holds */
             int t;
@@ -7756,6 +7771,7 @@ int main(int argc, char **argv)
     { const char *hc = getenv("PTV_HOLD_CLEAN_MS"); if (hc) g_hold_clean_us = (int64_t)atoi(hc) * 1000; }   /* 2.0.0 T-324 */
     if (getenv("PTV_NO_REJOIN_MAP")) g_rejoin_map = 0; /* 2.0.0-pre6.1 kill switch: PTS jumps at a rejoin again */
     if (getenv("PTV_NO_RJ_PRIME")) g_rj_prime = 0;
+    if (getenv("PTV_NO_RUNG_FOLLOW")) g_rung_follow = 0;   /* 2.2.2 T-498 kill switch: every rung its own clock again */
     if (getenv("PTV_REPRIME_QUIET")) g_reprime_quiet_off = 0;   /* 2.2.1 T-472 kill switch */     /* 2.2.1 T-472 kill switch: a rejoin starts on an empty frame queue */
     { const char *s = getenv("PTV_GLUE_HTOL_PCT");     if (s && atoi(s) > 0) g_glue_htol = atoi(s); }             /* tuning knob (G4) */
     { const char *s = getenv("PTV_NBS_QUANTUM_MS");    if (s && atoi(s) > 0) g_nbs_quantum_us = (int64_t)atoi(s) * 1000; }  /* TEST ONLY (G8) */
