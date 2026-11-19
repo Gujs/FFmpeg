@@ -5,6 +5,26 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.2-pre4 — pre3 + a gap-fill repeat never moves the sound (T-507) + a lost picture after a hold is a repeat (T-508)
+
+**T-507 — a residence tick does not move house_skew.** Since pre2 the T-501 gap fill (a repeat into a small source timing
+gap) occasionally made the sound step back one frame and forward again ~2-3 s later (`[PTV-ATRIM] input stepped back 40 ms`
++ `[PTV-ACOMP] ... click risk`; sandbox PATRIOT-LVTV_Portugal 16 times in pre2's log, twice at a seam crossing in pre3).
+house_skew was derived again on every tick; on a residence tick (cadence hold, a gap fill's repeat) that assumed the held
+picture's label still rounds to the tick it was shown on. When the learned source period (T-413) crosses the tick length
+(LVTV 1080p25: 39.5 <-> 40.0 ms) content_index()'s decision line moves 0.24 ms; a label next to it then counted as content
+one tick on, and that one fill tick published -1 tick of house_skew. Now a residence tick keeps the value the tick that
+showed the picture published. Media-v44 LVTV 400 ppm walk: sound steps 2 -> 0, lip sync unchanged.
+
+**T-508 — a small picture gap is filled at the pictures' place on air, also while the output keeps a delay.** After a
+BURST hold the output keeps the bank (house_skew +4.4 s); a corrupt picture ~28 s later left a one-picture content gap that
+the gap fill never saw (it compared the content index with the output cursor), so the picture was leapt: house_skew -33 ms
+and the sound cut 33 ms (`[PTV-ATRIM]`), in pre2 and pre3 alike. The fill now measures a small gap (< 200 ms, no queue drop)
+against where the pictures are on air (`vg_lag`: ticks on air past the content index, kept on residence ticks, cleared after
+a tick with no picture of its own), so the lost picture is a repeat at any kept delay: house_skew, the record and the sound
+do not move. Larger damage-era gaps keep the content-index rule (the kept delay absorbs an outage). Hand-over key (6 s
+hold after a +18 ms step): 4 of 4 PASS (pre3 1 of 6).
+
 ## 2.2.2-pre3 — pre2 + the sound follows the shown picture inside the frame (T-499)
 
 **A sub-frame step or a slow walk of the source's picture timestamps no longer moves the lip sync (T-499, GOALS #2 / #6).**
