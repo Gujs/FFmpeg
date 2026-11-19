@@ -834,12 +834,15 @@ void push_frame_q(AVThreadMessageQueue *q, int live, int64_t *framedrop, AVFrame
         int ret = av_thread_message_queue_send(q, &out, AV_THREAD_MESSAGE_NONBLOCK);
         if (ret == AVERROR(EAGAIN)) {                /* full -> drop oldest, keep newest */
             AVFrame *old;
-            if (av_thread_message_queue_recv(q, &old, AV_THREAD_MESSAGE_NONBLOCK) >= 0) {
+            /* v0.9.10: count drop-oldest — this is real skipped content (catch-up overflow = the latency-drain meter).
+             * 2.2.2 T-501: counted BEFORE the drop takes effect (the queue mutex orders it before the output thread's
+             * next pop), so the output never sees the gap our drop made with the old count (it would fill it as
+             * source timing — T-084's backlog). Taken back if nothing was dropped */
+            (*framedrop)++;
+            if (av_thread_message_queue_recv(q, &old, AV_THREAD_MESSAGE_NONBLOCK) >= 0)
                 av_frame_free(&old);
-                (*framedrop)++;                      /* v0.9.10: count drop-oldest — this is real skipped content
-                                                      * (catch-up overflow = the latency-drain meter); it was
-                                                      * silent before, leaving stats drop= misleadingly at 0 */
-            }
+            else
+                (*framedrop)--;
             if (av_thread_message_queue_send(q, &out, AV_THREAD_MESSAGE_NONBLOCK) < 0) {
                 av_frame_free(&out);
                 (*framedrop)++;

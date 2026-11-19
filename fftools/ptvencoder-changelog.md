@@ -7,17 +7,25 @@ the v2 `0001` patch (additive, travels with the source to the build box).
 
 ## 2.2.2-pre2 — pre1 + no output PTS hole at a small source timing gap (T-501)
 
-**A forward step in the source's video timestamps of up to 4 ticks no longer leaves a hole in the output video PTS
+**A forward step in the source's video timestamps of less than 200 ms no longer leaves a hole in the output video PTS
 (T-501, GOALS #1 / #6).** Sandbox 2026-11-18 (2.2.1): PATRIOT-LVTV_Portugal's output had 8 one-tick + 1 two-tick holes in 2
 min where its video label walk crossed the rounding line; Biohackingville a 3-tick hole at a splice's +118.67 ms label
 step. A clean frame whose content index jumped past the next tick was stamped on its index (the monotonic guard only catches
 backward), so the output skipped ticks; the T-083 gap fill (repeat the held picture up to the frame's slot, residence —
 house_skew and the audio do not move) acted on damage-era frames only, because T-084 showed that filling a gap our own
-queue made (drop-oldest in a backlog) holds the cursor against the cushion servo. Now a gap of <= 4 ticks in front of a
-clean frame is filled too when this rung's queue dropped nothing since the previous pop (the gap is the source's timing);
-a gap our queue made, or a larger one (the start-up step), keeps the leap. The T-498 followers copy the repeats.
-`PTV_NO_VGAP_SRC=1` reverts. No new log line. Key: an injected +20 ms video label step (bio_clean1852) and the real
-Biohackingville splice capture: 2.2.2-pre1 a 1-tick / 3-tick hole, pre2 every output PTS delta one tick.
+queue made (drop-oldest in a backlog) holds the cursor against the cushion servo. Now a gap under 200 ms (the T-413 "a gap"
+line) in front of a clean frame is filled too when this rung's queue dropped nothing since the previous pop (the gap is the
+source's timing); a gap our queue made, or a larger one, keeps the leap. Details from the review (independent agent):
+- the drop-oldest is counted BEFORE the drop takes effect (push_frame_q), so a gap our own drop made can never be read
+  with the old count;
+- on a 2:1 source the surplus picture shown while the next one is parked is a repeat on air: residence too, so
+  house_skew (and the audio) cannot step one tick for one tick;
+- these repeats count as pd= (residence), not dup=, and do NOT feed the [PTV-VFILL] "source frames lost/corrupt" warning;
+  under PTV_DIAG one line per 60 s counts them ('N picture repeat(s) into source timing gaps').
+The T-498 followers copy the repeats (the master's record carries fresh=0 / pd=1 with the same picture serial).
+`PTV_NO_VGAP_SRC=1` reverts. Not covered (follow-up): the film / slow-arm pop path (pulldown, >= 1.5-tick sources).
+Key: an injected +20 ms video label step (bio_clean1852) and the real Biohackingville splice capture: 2.2.2-pre1 a 1-tick /
+3-tick hole, pre2 every output PTS delta one tick.
 
 ## 2.2.2-pre1 — 2.2.1 + one emit decision for the whole ladder (T-498)
 
