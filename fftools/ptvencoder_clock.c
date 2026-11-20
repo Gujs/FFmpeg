@@ -192,6 +192,8 @@ static int64_t content_index(VideoCtx *v, int64_t src_pts)
     return (house_us + v->tick_dur_us / 2) / v->tick_dur_us;
 }
 
+#define PTV_PP_STEPS 256    /* 2.2.2 T-512: picture steps kept per 2 s learner window (T-413; 120 fps = 240) */
+
 /* 2.2.2 T-499: the picture-phase estimator (master rung, output thread; ptvencoder.h g_vphase). Feed-forward: the samples
  * are label arithmetic only (the tick a fresh picture's label rounded to, minus the label), so the sound's own move is not
  * in them — no loop. Half-second windows on the circle of one rounding period P; a window is coherent when its pictures
@@ -1463,6 +1465,7 @@ void *output_thread(void *arg)
         int slow_arm = 0;                           /* 2.1 T-011: a source slower than the house (>= 1.5 ticks a picture) */
         int64_t pp_prev = AV_NOPTS_VALUE, pp_t0 = AV_NOPTS_VALUE, pp_min = 0;   /* 2.1 T-413: the period over every */
         int     pp_n = 0;                           /* picture popped (the learner above sees only the pictures shown) */
+        int64_t pp_step[PTV_PP_STEPS];              /* 2.2.2 T-512: the window's steps, for their median */
         int64_t rate_ref_us = 0, rate_new_wc = 0;   /* T-011: the source cadence on record, and since when it differs */
         int64_t slow_per = 0, slow_min = 0, slow_min_prev = 0, slow_win_wc = 0;   /* T-011: the source period = the
                                                      * shortest picture step in the last 2-4 s (loss only lengthens a step) */
@@ -1557,21 +1560,48 @@ void *output_thread(void *arg)
             for (;;) {
                 ret = av_thread_message_queue_recv(v->frame_q, &f, AV_THREAD_MESSAGE_NONBLOCK);
                 if (ret >= 0 && f->pts != AV_NOPTS_VALUE && f->opaque != &ptv_hold_tag) {
-                    /* 2.1 T-413: the source period for content_index()'s decision line = the shortest step of each 2 s
-                     * of CONTENT (every rung pops the same pictures: the same period at the same picture, the rungs
-                     * stamp alike), from 8 steps; steps under 1 ms (a doubled stamp) or over 200 ms (a gap) do not count */
+                    /* 2.1 T-413: the source period for content_index()'s decision line, learned over each 2 s of
+                     * CONTENT (every rung pops the same pictures: the same period at the same picture, the rungs
+                     * stamp alike), from 8 steps; steps under 1 ms (a doubled stamp) or over 200 ms (a gap) do not count.
+                     * 2.2.2 T-512: the MEDIAN step of the window, not the shortest. One short step is a label step, not
+                     * the picture rate: an HLS-origin source re-stamps sound and pictures together at every segment
+                     * join (WildTV: -8 / -8 / +15.3 ms every 6 s), the shortest step of a window holding a -8 ms join
+                     * read 25.4 ms for a 33.37 ms source, and for those 2 s content_index() put the decision line
+                     * 4 ms nearer the tick (pictures 12.7 .. 16.7 ms before a tick moved one tick: a repeat and a skip
+                     * with no label gap) and T-499 measured the picture phase on a 25.4 ms circle — the sound then
+                     * stood a whole wrong period (25.4 ms) from the picture, which the post-event sync check stepped
+                     * out and back ("STEPPED -25 / +25 ms", each on air for minutes). The median ignores lost
+                     * pictures (longer steps) as the minimum did, as long as most steps are whole.
+                     * PTV_SRCPER_MIN=1 = the shortest step, as before */
                     int64_t ps = av_rescale_q(f->pts, v->out_tb, AV_TIME_BASE_Q);
                     if (pp_prev != AV_NOPTS_VALUE && ps - pp_prev >= 1000 && ps - pp_prev < 200000) {
                         if (!pp_min || ps - pp_prev < pp_min)
                             pp_min = ps - pp_prev;
+                        if (pp_n < PTV_PP_STEPS)
+                            pp_step[pp_n] = ps - pp_prev;
                         pp_n++;
                     }
                     pp_prev = ps;
                     if (pp_t0 == AV_NOPTS_VALUE || ps < pp_t0)
                         pp_t0 = ps;
                     else if (ps - pp_t0 >= 2000000) {
-                        if (pp_n >= 8)
-                            v->src_per_us = pp_min;
+                        if (pp_n >= 8) {
+                            int     pn  = FFMIN(pp_n, PTV_PP_STEPS), pi, pj;
+                            int64_t med, was = v->src_per_us;
+                            for (pi = 1; pi < pn; pi++) {        /* at most 256 steps every 2 s: an insertion sort */
+                                int64_t x = pp_step[pi];
+                                for (pj = pi; pj > 0 && pp_step[pj - 1] > x; pj--)
+                                    pp_step[pj] = pp_step[pj - 1];
+                                pp_step[pj] = x;
+                            }
+                            med = pp_step[pn / 2];
+                            v->src_per_us = g_srcper_min ? pp_min : med;
+                            if (v->is_master && g_diag && (llabs(v->src_per_us - was) * 100 > v->tick_dur_us ||
+                                                           llabs(med - pp_min) * 100 > v->tick_dur_us))
+                                av_log(NULL, AV_LOG_INFO, "[PTV-SRCPER] source picture period %.2f -> %.2f ms (%d steps "
+                                       "in 2 s: median %.2f, shortest %.2f ms; tick %.2f ms)\n", was / 1e3,
+                                       v->src_per_us / 1e3, pp_n, med / 1e3, pp_min / 1e3, v->tick_dur_us / 1e3);
+                        }
                         pp_min = 0;
                         pp_n   = 0;
                         pp_t0  = ps;
