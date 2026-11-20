@@ -5,6 +5,21 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.2-pre6 — pre5 + the source picture period is the median step, not the shortest (T-512)
+
+**T-512 — one short label step is not the picture rate.** An HLS-origin source re-stamps sound and pictures together at
+every segment join (WildTV, provider HLS -> SRT: -8 / -8 / +15.3 ms every 6 s, content contiguous). The T-413 learner took the
+shortest picture step of each 2 s window, so after every -8 ms join it read 25.4 ms for a 33.37 ms source: for those 2 s
+content_index() moved its rounding line and T-499 measured the picture phase on a 25.4 ms circle. When the join also carried
+the picture across the half tick, the wrong circle read the new phase as the old one, the target did not move, and the sound
+stood a whole 25.4 ms from the picture with its phase term on target — clean for the post-event sync check, which stepped it
+after 2 s of agreement (cow-1 WildTV on pre3/pre4: `[PTV-SYNCCHK] STEPPED` -25 / +25 ms). The period is now the median step
+of the window (lost pictures, the longer steps, are ignored as before). On the kit's source classes the median equals the
+shortest everywhere except LVTV 25p (shortest 39.3-39.5 ms in 16 of 17 windows, median 40.00: the T-510 flip goes too). WildTV
+capture replay: picture-phase lines on the wrong circle 44 of 169 -> 0 of 18, sync-check sensor beyond 21 ms 12 -> 2 (both at
+source damage); with sync-check watches forced every 7 s: STEPPED 4 -> 0 (77 decisions). New `[PTV-SRCPER]` DIAG line;
+`PTV_SRCPER_MIN=1` = the shortest step, as before.
+
 ## 2.2.2-pre5 — pre4 + every hold's return is classified (T-502) + a dropped silence-fill frame moves the fill on (T-505)
 
 **T-502 — the rejoin classifier is armed for every hold.** The classifier was re-armed only by a video packet read while
