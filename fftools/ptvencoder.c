@@ -440,6 +440,7 @@ int     g_mv_exacttick = 1;   /* v0.9.12 MV-EXACTTICK (PTV_NO_MV_EXACTTICK rever
                                       * ~36ms/h audio-late onto the wire while every internal offset read bounded.
                                       * See analysis/ptvencoder-0911-multiview-tick-audit.md. */
 int     g_vgapfill = 1;       /* 2.0.0-pre9.4 (T-083): a content gap inside frame_q is filled, not leapt */
+int     g_srcper_min;         /* 2.2.2 T-512: PTV_SRCPER_MIN=1 — T-413's source period = the shortest step of a window (as before), not the median */
 int     g_vphase = 1;         /* 2.2.2 T-499: the sound follows the shown picture's sub-frame phase (ptvencoder.h) */
 int64_t g_vph_bias_us;
 _Atomic int64_t g_vph_tgt_us;
@@ -7714,6 +7715,7 @@ int main(int argc, char **argv)
     }   /* v0.9.14: revert to advisor-only (manual PTV_PREROLL_MS recipe) */
     if (getenv("PTV_NO_CLOCKFOLLOW")) g_clockfollow = 0;   /* v0.9.15: never follow a large source-clock offset (buffers pin + resampler churns on such sources) */
     if (getenv("PTV_NO_VGAPFILL")) g_vgapfill = 0;          /* 2.0.0-pre9.4 (T-083) kill switch */
+    if (getenv("PTV_SRCPER_MIN")) g_srcper_min = 1;         /* 2.2.2 T-512: the T-413 learner as before (the shortest step) */
     if (getenv("PTV_NO_VPHASE")) g_vphase = 0;              /* 2.2.2 T-499 kill switch: the sound stays on the label, as 2.2.1 */
     if (getenv("PTV_TEST_VPH_BIAS")) {                      /* T-499 test hook: every placement by the picture moves by B us */
         g_vph_bias_us = atoll(getenv("PTV_TEST_VPH_BIAS"));

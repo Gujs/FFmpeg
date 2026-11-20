@@ -949,8 +949,9 @@ typedef struct VideoCtx {
     const int64_t   *framedrop_src;  /* 2.0.0-pre9.6: single input — the decode thread's drop-oldest count for this rung
                                       * (push_frame_q counts there; VideoCtx->framedrop was never written: drop= read 0) */
     int64_t          decim;          /* v0.9.15.2: surplus frames decimated by content mapping (>house-rate source) */
-    int64_t          src_per_us;     /* 2.1 T-413: the source's picture period (shortest step of a 2 s content window, every
-                                      * picture popped; 0 = not learned) — content_index()'s decision line for a faster source */
+    int64_t          src_per_us;     /* 2.1 T-413: the source's picture period (median step of a 2 s content window, every
+                                      * picture popped — 2.2.2 T-512, the shortest before; 0 = not learned) —
+                                      * content_index()'s decision line for a faster source */
     /* watchdog */
     int64_t          last_emit_us;
     volatile int     output_done;
@@ -1962,6 +1963,7 @@ extern int     g_vgap_src;               /* 2.2.2 T-501: fill a small source-tim
  * against the house grid moved the lip sync by up to P/2 with no event. The master measures r per shown picture
  * (clock) and publishes a target; each transcoded track adds its own slewed copy at the house_skew door (audio).
  * Audio only: the video axis, house_skew, copies and the mosaic are not touched. PTV_NO_VPHASE=1 = off. */
+extern int     g_srcper_min;     /* 2.2.2 T-512: PTV_SRCPER_MIN=1 — T-413 learns the shortest step, as before */
 extern int     g_vphase;
 extern int64_t g_vph_bias_us;            /* test hook PTV_TEST_VPH_BIAS (us): added to the target after the estimator */
 extern _Atomic int64_t g_vph_tgt_us;     /* the target g = F(phase) (+ bias), us; 0 = not followed */
