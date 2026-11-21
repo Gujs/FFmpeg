@@ -1523,7 +1523,13 @@ void *output_thread(void *arg)
                 /* residence CAP: film holds a picture 1 tick extra at most (3:2); a slower source as many as its
                  * cadence needs (29.97 in 59.94: 1, 25 in 59.94: 2) */
                 int cap = film_arm ? 1 : (int)((slow_per + v->tick_dur_us - 1) / v->tick_dur_us) - 1;
-                if (nc < 0 || nc <= last_vpts + 1 || held_extra >= cap) {   /* due, unstampable, or residence CAP hit */
+                /* T-516: due where the pictures are on air (T-508's vg_lag), not at the content index. While the output
+                 * keeps a delay (house_skew > 0 after a hold) every content index lies behind the output cursor: each
+                 * picture was "due" at once, the residence never happened, film was shown a picture a tick — 30 of the
+                 * source's 24 a second — until the queue was empty, and from then on the output ran on the empty queue:
+                 * -1 tick of house_skew at every 1.5-tick label step, +1 at every repeat on empty, the sound cut and
+                 * padded 33 ms each time (PATRIOT-OAN 2026-11-20: 3654 "[PTV-ATRIM] input stepped back 33 ms") */
+                if (nc < 0 || nc + vg_lag <= last_vpts + 1 || held_extra >= cap) {   /* due, unstampable, or residence CAP hit */
                     av_frame_unref(held); av_frame_move_ref(held, nextf); av_frame_free(&nextf);
                     next_have = 0; fresh = 1; held_src_pts = held->pts; held_extra = 0; vgap_park = 0;
                 } else
@@ -2157,9 +2163,16 @@ void *output_thread(void *arg)
                          * of where the picture is on air (a label slip or a sub-frame step shown as a repeat because the
                          * queue was empty, or taken back by a skip): counted, so each track's door takes the step out of
                          * its phase term in the same frame and slews it back, instead of a one-tick step in the sound.
-                         * Written before house_skew: a door that reads the new house_skew reads this too */
+                         * Written before house_skew: a door that reads the new house_skew reads this too.
+                         * T-516: only while the phase is followed (two coherent windows, no rate conversion). The step
+                         * taken out of the sound is the wrap of a phase the target tracks; with no steady phase the
+                         * target is 0 and house_skew alone places the sound, as in 2.2.1. Film cadence under a kept
+                         * delay is the case that showed it: no residence there (every label is due), the 50 ms label
+                         * steps are 1.5 ticks = on this test's line, so each second picture's -1 tick was counted and
+                         * the repeat on the empty queue that gave the tick back (not a fresh picture) never was: the
+                         * sound walked 33 ms late per pair, seconds within a minute (OAN_Plus 2026-11-20, +4.6 s) */
                         int64_t d = hsn - *v->house_skew, dc = content_vpts - vp_prev_c - 1;
-                        if (d && vp_prev_c >= 0 && vp.r_prev != INT64_MIN && (dc == 1 || dc == -1) &&
+                        if (d && vp.coh >= 2 && !vp.fast && vp_prev_c >= 0 && vp.r_prev != INT64_MIN && (dc == 1 || dc == -1) &&
                             d == -dc * v->tick_dur_us && llabs(r - vp.r_prev + d) < P / 2)
                             atomic_fetch_add(&g_vph_jcum_us, d);
                         if (hu >= 0 && llabs(r) <= v->tick_dur_us) {

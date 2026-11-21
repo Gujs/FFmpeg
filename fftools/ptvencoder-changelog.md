@@ -5,6 +5,21 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.2-pre7 — pre6 + a delay kept after a stall no longer breaks film cadence or walks the sound (T-516)
+
+**T-516 — film cadence while the output keeps a delay.** After a stall of the encoder (the input still arriving, the
+backlog kept as a delay: house_skew > 0) two defects stacked on film content (3:2 soft telecine). (1) Pre-existing (2.2.1
+too): the cadence path judged a picture due at its content index, which under a kept delay lies behind the output cursor
+for every picture — the residence never happened, film went out a picture a tick until the queue was empty, and from
+then on house_skew see-sawed one tick (-1 at each 50 ms label step, +1 at each repeat on the empty queue): the sound was
+cut and padded 33 ms at every film pair (AWE_Plus 1056 / PATRIOT-OAN 3654 `[PTV-ATRIM] input stepped back 33 ms` while
+a delay was kept). Residence is now judged where the pictures are on air (T-508's lag), as the gap fill already is.
+(2) Since T-499 (pre3): those -1 ticks sit exactly on the opposite-slip test's line (a 1.5-tick label step) and were
+counted as slips while the +1 that gave them back never was, so the sound walked 33 ms late per pair — seconds within a
+minute (OAN_Plus: +4.6 s and a sync_check restart). A step is now counted only while a picture phase is followed, and the
+phase term holds at most one slip on its way back; a step beyond that goes into the sound. Local replay (film + a 20 s
+encoder stall): pre6 sensor worst +5.1 s and 540 sound steps, 2.2.1 682 steps, pre7 worst +16 ms and 0 steps.
+
 ## 2.2.2-pre6 — pre5 + the source picture period is the median step, not the shortest (T-512)
 
 **T-512 — one short label step is not the picture rate.** An HLS-origin source re-stamps sound and pictures together at
