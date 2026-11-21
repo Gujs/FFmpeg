@@ -2174,13 +2174,14 @@ static int vm_drain(AudioState *a, int force)
     int ret = 0;
     while (a->vm_n && ret >= 0) {
         AVFrame *f = a->vm_q[0];
-        int64_t o = AV_NOPTS_VALUE, gap = 0, lab = av_rescale_q(f->best_effort_timestamp, a->ist_tb, AV_TIME_BASE_Q);
-        int r = ptv_vmap_lookup(lab, &o, &gap);
+        int64_t o = AV_NOPTS_VALUE, gap = 0, res = 0, lab = av_rescale_q(f->best_effort_timestamp, a->ist_tb, AV_TIME_BASE_Q);
+        int r = ptv_vmap_lookup_res(lab, &o, &gap, &res);
         if (r == 0 && !force && (now - a->vm_wc[0] < 3000000 ||
             now - atomic_load_explicit(&g_src_fresh_wc, memory_order_relaxed) < 500000))
             break;                                  /* not on air yet: wait while the video still shows new pictures (a burst
                                                      * backlog waits its whole bank delay), at least 3 s */
-        a->vm_out_us = r == 1 && gap <= FFMAX(2 * tick, 50000) ? o : AV_NOPTS_VALUE;
+        /* 2.2.3 T-517: without the frame's own sub-tick rounding — the phase term adds the picture phase (audio_feed) */
+        a->vm_out_us = r == 1 && gap <= FFMAX(2 * tick, 50000) ? o - res : AV_NOPTS_VALUE;
         /* content never shown as such (its pictures cut at the burst door, or still held when the video went stale):
          * it continues where the previous frame was placed — the house_skew placement belongs to another domain
          * (sync_bursty_20: 4 frames at the end of a cut stepped the door input −15 s, audio PID dark 1.6 s) */
@@ -2851,11 +2852,16 @@ graph_in:
         if (a->vm_feeding && a->vm_out_us != AV_NOPTS_VALUE && frame->pts != AV_NOPTS_VALUE) {
             int64_t h0;
             pthread_mutex_lock(a->h0_lock); h0 = *a->h0; pthread_mutex_unlock(a->h0_lock);
-            if (h0 != AV_NOPTS_VALUE)               /* output = door - h0: exactly where the video put this content */
-                frame->pts = av_rescale_q(a->vm_out_us + h0 + g_vph_bias_us, AV_TIME_BASE_Q, a->ist_tb);
-            a->vph_wc = 0;                          /* 2.2.2 T-499: the record holds the picture's phase already; the
-                                                     * first house_skew-door frame after it starts on the target */
-            a->vph_us = atomic_load_explicit(&g_vph_tgt_us, memory_order_relaxed);
+            /* output = door - h0: where the video put this content, with the house_skew its picture was shown with.
+             * 2.2.3 T-517: the sub-tick part is the house_skew door's phase term (T-499), not the picture's own rounding
+             * (the record dropped it): film pictures round to the grid up to a tick apart, and each one placed its
+             * sound — '[PTV-ATRIM] input stepped back 17 ms' ~6 times a second after every hold (the door stays on).
+             * The phase term follows a steady picture phase (and nets its wraps) as on the house_skew door; film = 0 */
+            if (h0 != AV_NOPTS_VALUE) {
+                int64_t sk = a->vm_out_us + h0 - av_rescale_q(frame->pts, a->ist_tb, AV_TIME_BASE_Q);
+                frame->pts = av_rescale_q(a->vm_out_us + h0 + (g_vphase ? vph_door(a, frame, sk) : g_vph_bias_us),
+                                          AV_TIME_BASE_Q, a->ist_tb);
+            }
         } else if (g_avlock && a->house_skew && !(a->multiview && g_audio_follow) && frame->pts != AV_NOPTS_VALUE &&
             !a->hold_feeding) {
             int64_t sk = hs_door(a, frame, *a->house_skew);

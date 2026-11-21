@@ -1883,8 +1883,9 @@ extern int g_mv_ccvmap;        /* 2.0.2 T-396: mosaic captions wait for their sl
 extern int     g_cc_rewrap;       /* 2.0.0 T-023(b): re-wrap pop-on captions to the teletext row (PTV_CC_NO_REWRAP=1 off) */
 extern int64_t g_hold_clean_us;   /* 2.0.0 T-324: a hold that saw video damage ends after this much clean video */
 extern int64_t g_max_delay_us;   /* 2.0.0 T-103: pinned output delay (us; 0 = off) */
-void ptv_vmap_push(int64_t src_us, int64_t out_us);
+void ptv_vmap_push(int64_t src_us, int64_t out_us, int64_t res_us);
 int  ptv_vmap_lookup(int64_t c_us, int64_t *out_us, int64_t *gap_us);
+int  ptv_vmap_lookup_res(int64_t c_us, int64_t *out_us, int64_t *gap_us, int64_t *res_us);   /* 2.2.3 T-517 */
 int  ptv_vmap_newest(int64_t since_wc, int64_t *src_us, int64_t *out_us);
 void ptv_copy_vwait(struct DemuxArgs *d);   /* master output thread: release the copies the video has shown */
 extern _Atomic int64_t g_vdisp_skew_us;  /* 2.0.0 T-095: where the master put the last fresh frame vs its content index */
