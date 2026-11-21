@@ -332,7 +332,11 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
                 s->real = s->lag;
             /* ... by at most a picture per sample: two source pictures labelled 29 pictures old (RAV slot 1, a 29.97i
              * feed, at 36 s) moved it 30 ms, the sound chased it there and back in half-frame steps and kept -7.5 ms */
-            {
+            /* 2.2.3 T-518: ... and only from a picture on its place. A backlog's pictures are shown late while the slot
+             * catches up (above) and realize no lag: 3.8 s of them walked this +126 ms (a picture per sample, / 32), the
+             * sound was re-placed after it ("+81.2 ms (drift)") and played up to 116 ms late for 6 s after the return
+             * (sync_catchup_8, flash against beep) */
+            if (smp - s->lag <= 500000) {
                 int64_t w = FFMAX(c->tick_dur_us, s->cad);
                 s->real += av_clip64(smp - s->real, -w, w) / 32;
             }
@@ -783,7 +787,18 @@ void *compositor_thread(void *arg)
                             rs_mv_src[k] = disp_src;
                             rs_mv_adv[k] = tick;
                         }
-                        if (mv_tick_us(c, tick) - mv_tick_us(c, rs_mv_adv[k]) >= 500000) {
+                        /* 2.2.3 T-518 (measured, cow-2 MV_1x2_AmericanStories_AWE + sync_catchup_8): a source back from
+                         * an 8 s stall with its backlog at 2.6x real time — the slot shows the backlog's pictures late
+                         * while it catches up (mv_tl_pick: 6.6 s late at the return, each less late than the one before,
+                         * on its place 3.8 s later). They move, so the hold rule above released after 1 s and the EMA
+                         * seeded on a picture still 4.7 s late: lipsync= +4762 ms decaying over 3 min on a slot in sync
+                         * ([PTV-SYNCCHK] "in sync +0 ms ... lipsync +3864 ms"). A picture more than 0.5 s late is the
+                         * frame sync catching up or about to re-lock (it re-locks behind pictures that stay late: the
+                         * lag step reseeds) — no content to measure either: `--`, the EMA reseeds 1 s after the
+                         * pictures are back within 0.5 s of their place. One burst (sync_stop_8) is over inside that
+                         * second and never showed it */
+                        if (mv_tick_us(c, tick) - mv_tick_us(c, rs_mv_adv[k]) >= 500000 ||
+                            mv_tick_us(c, tick) - mv_tl_lag(&tl_slot[k], disp_src - h0k) - (disp_src - h0k) > 500000) {
                             rs_mv_seed[k] = 0;
                             rs_mv_rel[k]  = -1;
                         } else if (rs_mv_rel[k] == -1)
