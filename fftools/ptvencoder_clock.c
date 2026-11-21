@@ -1523,7 +1523,13 @@ void *output_thread(void *arg)
                 /* residence CAP: film holds a picture 1 tick extra at most (3:2); a slower source as many as its
                  * cadence needs (29.97 in 59.94: 1, 25 in 59.94: 2) */
                 int cap = film_arm ? 1 : (int)((slow_per + v->tick_dur_us - 1) / v->tick_dur_us) - 1;
-                if (nc < 0 || nc <= last_vpts + 1 || held_extra >= cap) {   /* due, unstampable, or residence CAP hit */
+                /* T-516: due where the pictures are on air (T-508's vg_lag), not at the content index. While the output
+                 * keeps a delay (house_skew > 0 after a hold) every content index lies behind the output cursor: each
+                 * picture was "due" at once, the residence never happened, film was shown a picture a tick — 30 of the
+                 * source's 24 a second — until the queue was empty, and from then on the output ran on the empty queue:
+                 * -1 tick of house_skew at every 1.5-tick label step, +1 at every repeat on empty, the sound cut and
+                 * padded 33 ms each time (PATRIOT-OAN 2026-11-20: 3654 "[PTV-ATRIM] input stepped back 33 ms") */
+                if (nc < 0 || nc + vg_lag <= last_vpts + 1 || held_extra >= cap) {   /* due, unstampable, or residence CAP hit */
                     av_frame_unref(held); av_frame_move_ref(held, nextf); av_frame_free(&nextf);
                     next_have = 0; fresh = 1; held_src_pts = held->pts; held_extra = 0; vgap_park = 0;
                 } else
