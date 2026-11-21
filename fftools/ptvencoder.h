@@ -1336,6 +1336,11 @@ typedef struct AudioState {
     int64_t          rj_hold_wc;                      /* T-489: the hold (g_src_hold_start) the buffer was armed for */
     int64_t          nbs_last_wall_us;                /* rr15 F9: wall of the previous quantum (elapsed base) */
     int64_t          nbs_carry_us;                    /* rr15 F9: sub-frame remainder carried between quanta */
+    /* 2.2.3 T-519: a mosaic slot's returning sound still inside the span its fill has played (a backlog catching up) */
+    int64_t          nbs_lo_us;                       /* raw label the fill began at */
+    int64_t          nbs_cu_ref, nbs_cu_wc;           /* the smallest distance to the fill's front so far (us), since when */
+    int              nbs_cu_n;                        /* real frames dropped behind the front in this return */
+    int64_t          nbs_cu_at, nbs_cu_wc0;           /* the last lag step taken (af_step_at) / the wall time at its first one */
     int64_t          glue_cad_us;                     /* rr15 R2: EMA of nonzero fed-frame wall gaps (PES-burst
                                                        * period) — the E3 cadence baseline for the pad-ledger gate */
     /* 1.0.1-pre20 REBUILD RE-ANCHOR (g_rebuild_reanchor; PTV_NO_REBUILD_REANCHOR=1 reverts).

@@ -2143,6 +2143,7 @@ int ptv_cv_setup(AudioState *a, int rate, enum AVSampleFormat fmt, const AVChann
 }
 
 static int audio_feed(AudioState *a, AVFrame *frame);
+static void nbs_fill_quantum(AudioState *a);
 
 /* 2.1 T-409 (P1, design §3.3/§5.2): the audio is placed where the VIDEO showed the same content (its record, vmap), not
  * with the house_skew of the moment the frame reaches the door — the video shows a label ~1 s after its sound arrives, and
@@ -2740,6 +2741,52 @@ graph_in:
                 av_log(NULL, AV_LOG_WARNING,
                        "[PTV-CONV] a%d(in%d) seam-park expired — converging re-enabled\n",
                        a->dbg_k, a->dbg_in);
+            }
+            /* 2.2.3 T-519 (measured, sync_catchup_8 on a mosaic: an 8 s stall, the backlog at 2.6x): the fill has played
+             * silence up to the wall clock, the returning sound starts 6.7 s behind its front. Released at the first real
+             * frame, the fill stopped and aresample dropped the late sound until it reached the front 2.6 s later
+             * ([PTV-ACOMP] input pts step -6805 ms): nothing on this track meanwhile and the mux waited for it — the
+             * slot's audio PID dark 2.6-2.7 s, the mosaic's video PID 1.6-1.7 s on the wire. A real frame wholly behind
+             * the front is the sound of a time already played as silence: it is dropped here (as aresample did) and the
+             * fill goes on at wall pace until the sound reaches the front — the track never pauses. Bounded: only while
+             * the sound closes in (80 ms nearer within every second: a backlog), and only sound from the span the fill
+             * covers (a label more than 1 s before the fill's start is a step back: taken at once, as before). A source
+             * that stays late (resumed where it stopped, at real-time pace) never closes in: the slot re-locks behind
+             * its pictures (late for 1 s) and the sound takes that lag step when a frame crosses its boundary — a fill
+             * frame, so the fill goes on until it has (the step's silence is in the line: the track stays alive while
+             * aresample drops the overlap), 4 s at most (no re-lock: the sound is taken as it comes, as before; a
+             * picture that returns mid-GOP is up to a GOP behind its sound). The mosaic's follow path only: single
+             * input returns through the hold's rejoin buffer (the same scenario runs clean there) */
+            if (g_glueclass && a->nbs_fill_active && !a->nbs_feeding && a->multiview && g_audio_follow) {
+                int64_t fd  = frame->sample_rate > 0 ? av_rescale(frame->nb_samples, 1000000, frame->sample_rate) : 0;
+                int64_t gap = a->glue_raw_last_us + a->glue_raw_dur_us - (raw_us + fd);
+                if (gap >= 0 && raw_us >= a->nbs_lo_us - 1000000) {
+                    if (!a->nbs_cu_wc || gap < a->nbs_cu_ref - 80000) {
+                        if (!a->nbs_cu_wc)
+                            av_log(NULL, AV_LOG_WARNING, "[PTV-ADISC] a%d(in%d) real frames resumed %"PRId64" ms behind "
+                                   "the silence already played — the fill goes on until they reach it\n",
+                                   a->dbg_k, a->dbg_in, (gap + fd) / 1000);
+                        if (!a->nbs_cu_wc) {
+                            a->nbs_cu_at  = a->af_step_at;
+                            a->nbs_cu_wc0 = now_wc;
+                        }
+                        a->nbs_cu_ref = gap;
+                        a->nbs_cu_wc  = now_wc;
+                    }
+                    if (now_wc - a->nbs_cu_wc < 1000000 ||
+                        (a->af_step_at == a->nbs_cu_at && now_wc - a->nbs_cu_wc0 < 4000000)) {
+                        a->nbs_cu_n++;
+                        nbs_fill_quantum(a);
+                        return 0;
+                    }
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-ADISC] a%d(in%d) the returning sound stays %"PRId64" ms behind "
+                           "the fill (no nearer in 1 s) — taken as it comes\n", a->dbg_k, a->dbg_in, (gap + fd) / 1000);
+                } else if (a->nbs_cu_n)
+                    av_log(NULL, AV_LOG_INFO, "[PTV-ADISC] a%d(in%d) the returning sound reached the fill: %d frames "
+                           "(%.1f s) behind it dropped\n", a->dbg_k, a->dbg_in, a->nbs_cu_n,
+                           a->nbs_cu_n * fd / 1e6);
+                a->nbs_cu_wc = 0;
+                a->nbs_cu_n  = 0;
             }
             if (g_glueclass && a->nbs_fill_active && !a->nbs_feeding) {
                 a->nbs_fill_active = 0;
@@ -3790,6 +3837,9 @@ static void nbs_fill_quantum(AudioState *a)
         a->nbs_last_wall_us = 0;
         a->nbs_carry_us     = 0;
         a->nbs_engage_wc    = av_gettime_relative();
+        a->nbs_lo_us        = a->glue_raw_last_us + a->glue_raw_dur_us;
+        a->nbs_cu_wc        = 0;
+        a->nbs_cu_n         = 0;
         av_log(NULL, AV_LOG_WARNING,
                "[PTV-ADISC] a%d(in%d) silence-fill ENGAGED — nothing decoding on this track while "
                "video flows (packets corrupt-discarded, or none arriving for 2 s); synthesizing "
