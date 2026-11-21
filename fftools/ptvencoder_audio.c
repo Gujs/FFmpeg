@@ -1992,11 +1992,21 @@ static int64_t vph_door(AudioState *a, const AVFrame *frame, int64_t sk)
             if (!a->vph_jwc)
                 a->vph_jwc = now;
             if (sk - a->vph_sk_last == jc - a->vph_jseen) {
-                if (g_diag)
-                    av_log(NULL, AV_LOG_INFO, "[PTV-VPHASE] a%d(in%d) house_skew %+"PRId64" ms with the opposite picture "
-                           "slip: no step in the sound, the phase term takes it and moves back\n", a->dbg_k, a->dbg_in,
-                           (jc - a->vph_jseen) / 1000);
-                a->vph_us   -= jc - a->vph_jseen;
+                /* T-516: the term is the target (within +-P/2) plus at most ONE slip on its way back. A step that
+                 * would put it further than a tick and a half from the target is not a slip of a followed phase but
+                 * house_skew moving for real (a delay draining, a lag change): the sound takes it, as before T-499 */
+                int64_t jd  = jc - a->vph_jseen;
+                int64_t far = a->tick_dur_us > 0 ? a->tick_dur_us + a->tick_dur_us / 2 : 50000;
+                if (llabs(a->vph_us - jd - g) <= far) {
+                    if (g_diag)
+                        av_log(NULL, AV_LOG_INFO, "[PTV-VPHASE] a%d(in%d) house_skew %+"PRId64" ms with the opposite picture "
+                               "slip: no step in the sound, the phase term takes it and moves back\n", a->dbg_k, a->dbg_in,
+                               jd / 1000);
+                    a->vph_us -= jd;
+                } else if (g_diag)
+                    av_log(NULL, AV_LOG_INFO, "[PTV-VPHASE] a%d(in%d) house_skew %+"PRId64" ms: the phase term is %+.1f ms "
+                           "from its target already, the sound takes the step\n", a->dbg_k, a->dbg_in, jd / 1000,
+                           (a->vph_us - g) / 1e3);
                 a->vph_jseen = jc;
                 a->vph_jwc   = 0;
             } else if (now - a->vph_jwc > 4000000) {

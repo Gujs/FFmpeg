@@ -2157,9 +2157,16 @@ void *output_thread(void *arg)
                          * of where the picture is on air (a label slip or a sub-frame step shown as a repeat because the
                          * queue was empty, or taken back by a skip): counted, so each track's door takes the step out of
                          * its phase term in the same frame and slews it back, instead of a one-tick step in the sound.
-                         * Written before house_skew: a door that reads the new house_skew reads this too */
+                         * Written before house_skew: a door that reads the new house_skew reads this too.
+                         * T-516: only while the phase is followed (two coherent windows, no rate conversion). The step
+                         * taken out of the sound is the wrap of a phase the target tracks; with no steady phase the
+                         * target is 0 and house_skew alone places the sound, as in 2.2.1. Film cadence under a kept
+                         * delay is the case that showed it: no residence there (every label is due), the 50 ms label
+                         * steps are 1.5 ticks = on this test's line, so each second picture's -1 tick was counted and
+                         * the repeat on the empty queue that gave the tick back (not a fresh picture) never was: the
+                         * sound walked 33 ms late per pair, seconds within a minute (OAN_Plus 2026-11-20, +4.6 s) */
                         int64_t d = hsn - *v->house_skew, dc = content_vpts - vp_prev_c - 1;
-                        if (d && vp_prev_c >= 0 && vp.r_prev != INT64_MIN && (dc == 1 || dc == -1) &&
+                        if (d && vp.coh >= 2 && !vp.fast && vp_prev_c >= 0 && vp.r_prev != INT64_MIN && (dc == 1 || dc == -1) &&
                             d == -dc * v->tick_dur_us && llabs(r - vp.r_prev + d) < P / 2)
                             atomic_fetch_add(&g_vph_jcum_us, d);
                         if (hu >= 0 && llabs(r) <= v->tick_dur_us) {
