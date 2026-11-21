@@ -2754,12 +2754,16 @@ graph_in:
              * that stays late (resumed where it stopped, at real-time pace) never closes in: the slot re-locks behind
              * its pictures (late for 1 s) and the sound takes that lag step when a frame crosses its boundary — a fill
              * frame, so the fill goes on until it has (the step's silence is in the line: the track stays alive while
-             * aresample drops the overlap), 4 s at most (no re-lock: the sound is taken as it comes, as before; a
-             * picture that returns mid-GOP is up to a GOP behind its sound). The mosaic's follow path only: single
-             * input returns through the hold's rejoin buffer (the same scenario runs clean there) */
+             * aresample drops the overlap) — while the slot's picture is not on its place (no sensor reading for
+             * 0.5 s: held, late, or not back yet — a picture that returns mid-GOP is up to a GOP behind its sound),
+             * 4 s at most. With the picture on its place no re-lock is coming (the sound alone relabelled behind
+             * its fill: sync_aback): taken as it comes after that one second, as before. The mosaic's follow path
+             * only: single input returns through the hold's rejoin buffer (the same scenario runs clean there) */
             if (g_glueclass && a->nbs_fill_active && !a->nbs_feeding && a->multiview && g_audio_follow) {
                 int64_t fd  = frame->sample_rate > 0 ? av_rescale(frame->nb_samples, 1000000, frame->sample_rate) : 0;
                 int64_t gap = a->glue_raw_last_us + a->glue_raw_dur_us - (raw_us + fd);
+                int64_t mvw = a->dbg_in >= 0 && a->dbg_in < PTV_MAX_INPUT ?
+                              atomic_load_explicit(&g_rsx.mv_wall[a->dbg_in], memory_order_relaxed) : 0;
                 if (gap >= 0 && raw_us >= a->nbs_lo_us - 1000000) {
                     if (!a->nbs_cu_wc || gap < a->nbs_cu_ref - 80000) {
                         if (!a->nbs_cu_wc)
@@ -2774,7 +2778,8 @@ graph_in:
                         a->nbs_cu_wc  = now_wc;
                     }
                     if (now_wc - a->nbs_cu_wc < 1000000 ||
-                        (a->af_step_at == a->nbs_cu_at && now_wc - a->nbs_cu_wc0 < 4000000)) {
+                        (a->af_step_at == a->nbs_cu_at && now_wc - a->nbs_cu_wc0 < 4000000 &&
+                         (!mvw || now_wc - mvw > 500000))) {
                         a->nbs_cu_n++;
                         nbs_fill_quantum(a);
                         return 0;
