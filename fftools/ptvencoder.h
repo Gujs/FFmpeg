@@ -1803,7 +1803,7 @@ typedef struct Input {
     _Atomic int64_t       tl_nlag_us;        /* ... the lag from tl_at_us on (a step scheduled at a content boundary) */
     _Atomic int64_t       tl_at_us;          /* ... that boundary (source time, us; INT64_MAX = none pending) */
     _Atomic int64_t       tl_ahead_us;       /* ... the newest content the slot's sound has been placed for (us) */
-    _Atomic int64_t       tl_skip_us;        /* ... an overflow step: the content from here to the boundary is gone
+    _Atomic int64_t       tl_skip_us;        /* ... a step down (2.2.3 T-523; an overflow step before): the content from here to the boundary is gone
                                               * from the picture (us; INT64_MAX = none) — the sound drops it too */
     _Atomic int64_t       tl_alim_us;        /* ... the newest content the sound MAY place (us; INT64_MAX = no bound):
                                               * the shown picture + the primed margin + 1 s while the cell advances */

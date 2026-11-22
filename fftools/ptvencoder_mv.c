@@ -5,6 +5,7 @@
 #include <stdatomic.h>
 #include <time.h>
 
+#include "libavutil/avstring.h"
 #include "libavutil/avutil.h"
 #include "libavutil/log.h"
 #include "libavutil/opt.h"
@@ -108,6 +109,49 @@ typedef struct MvTlSlot {
     int     pend_gap;                               /* the pending picture: the full queue dropped pictures before it */
 } MvTlSlot;
 
+/* TEST-ONLY (PTV_TEST_MVSTEP_AT=K:FILE[:MS], 2.2.3 T-523): slot K's lag steps take their boundary at the first flash of the
+ * kit's ruler schedule (FILE = a SRC.markers.json: its first list, source seconds) + MS at or past the boundary they chose — a
+ * step whose boundary lands on a flash (or MS into it), the race of the sound's boundary with the picture's made
+ * deterministic. Never set in production */
+static int64_t mv_test_step_at(int k, int64_t nat, int64_t h0)
+{
+    static int init, tk = -1, nt;
+    static int64_t tt[4096], off;
+    int i;
+    if (!init) {
+        const char *e = getenv("PTV_TEST_MVSTEP_AT");
+        char path[1024];
+        FILE *f = NULL;
+        init = 1;
+        if (e && strchr(e, ':')) {
+            char *c;
+            av_strlcpy(path, strchr(e, ':') + 1, sizeof(path));
+            if ((c = strrchr(path, ':'))) {
+                *c  = 0;
+                off = (int64_t)(atof(c + 1) * 1000);
+            }
+            f = fopen(path, "r");
+        }
+        if (f) {
+            int ch, depth = 0;
+            double v;
+            tk = atoi(e);
+            while ((ch = fgetc(f)) != EOF && depth < 2)       /* into the first inner list */
+                depth += ch == '[';
+            while (nt < 4096 && fscanf(f, " %lf ,", &v) == 1)  /* up to its ']' */
+                tt[nt++] = (int64_t)(v * 1e6 + 0.5) + off;
+            fclose(f);
+            av_log(NULL, AV_LOG_WARNING, "[PTV-TEST] in%d lag steps on the flashes of %s %+"PRId64" ms (%d)\n", tk, path, off / 1000, nt);
+        }
+    }
+    if (k != tk || h0 == AV_NOPTS_VALUE)
+        return nat;
+    for (i = 0; i < nt; i++)
+        if (tt[i] - h0 >= nat)
+            return tt[i] - h0;
+    return nat;
+}
+
 /* A lag step takes effect at a CONTENT boundary, for the picture and the sound alike. The sound for the content in flight
  * is already placed with the old lag (it waits in the delivery gate with its timestamps): a step at a moment in time
  * moved the picture while that sound stayed, and they skipped different content (mv04 sync_flapping, a -2.4 s re-lock:
@@ -127,16 +171,26 @@ static void mv_tl_step(CompositorCtx *c, int k, MvTlSlot *s, int64_t lag, int64_
         s->nat = s->shown_src + s->cad;
         if (ah && h0 != AV_NOPTS_VALUE)
             s->nat = FFMAX(s->nat, ah - h0 + 200000);   /* + what the sound may place before it sees the step */
+        s->nat = mv_test_step_at(k, s->nat, h0);
         s->stepping = 1;
     }
+    /* 2.2.3 T-523: a step down skips the content from the old due line to the boundary, pictures and sound alike, as an
+     * overflow's does, when the sound has not placed it yet (a drift step: a tick inside the 200 ms above): those pictures
+     * are due no earlier than the boundary's own and were superseded — or one waiting there held the boundary's picture a
+     * tick — while the sound dropped the content after the boundary: a flash just past it shown a tick before its beep
+     * (+33 ms). A larger step down keeps both skipping after the boundary (the pictures before it shown on the old lag, then
+     * the newest due; the sound's drop from the boundary on) */
+    if (!s->gapstep)
+        s->skip_from = lag < s->lag && h0 != AV_NOPTS_VALUE && s->nat - (s->lag - lag) >= ah - h0
+                     ? s->nat - (s->lag - lag) : s->nat;
     s->nlag      = lag;
     s->relock_wc = now_us;
     s->nmin      = 0;                               /* the depth history read the old lag: 60 s of fresh evidence
                                                      * before the next drift step (one 0.7 s source hole stepped
                                                      * +40 ms every 10 s to +240 ms: Curiosity replay) */
     atomic_store_explicit(&c->inputs[k].tl_nlag_us, s->real + (lag - s->lag), memory_order_relaxed);
-    /* an overflow step: the picture skipped from the old due line (the boundary less the step) to the boundary */
-    atomic_store_explicit(&c->inputs[k].tl_skip_us, s->gapstep && h0 != AV_NOPTS_VALUE ? s->skip_from + h0 : INT64_MAX,
+    /* a step down: the picture skips from the old due line (the boundary less the step) to the boundary, the sound too */
+    atomic_store_explicit(&c->inputs[k].tl_skip_us, s->skip_from < s->nat && h0 != AV_NOPTS_VALUE ? s->skip_from + h0 : INT64_MAX,
                           memory_order_relaxed);
     atomic_store_explicit(&c->inputs[k].tl_at_us, h0 != AV_NOPTS_VALUE ? s->nat + h0 : INT64_MIN, memory_order_release);
 }
@@ -175,7 +229,7 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
     pthread_mutex_lock(&c->inputs[k].h0_lock); h0 = c->inputs[k].h0; pthread_mutex_unlock(&c->inputs[k].h0_lock);
     dry = s->pop_wc && now_us - s->pop_wc >= 500000;
     for (;;) {
-        int64_t fs;
+        int64_t fs, fd;
         nx = *pending;
         *pending = NULL;
         gap = s->pend_gap;
@@ -217,11 +271,17 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
         /* the picture nearest the tick: due half a picture ahead of it — half a tick, or half the slot's own period
          * when it is faster than the house. A 59.94 slot in 29.97 put every second picture ON the half-tick line,
          * and a 1/90000 s stamp difference moved it across: 1-3-1-3 pictures a tick instead of 2 (T-341) */
-        if (s->stepping && s->gapstep && fs >= s->skip_from && fs < s->nat) {   /* inside an overflow step's skip */
-            av_frame_free(&nx);
-            continue;
+        fd = fs;
+        if (s->stepping && fs >= s->skip_from && fs < s->nat) {   /* inside a step's skip (T-523: a step down's too) */
+            if (fs + s->cad <= s->nat) {
+                av_frame_free(&nx);
+                continue;
+            }
+            fd = s->nat;                            /* 2.2.3 T-523: across the boundary it shows the content at the
+                                                     * boundary — due at the boundary's place (dropped, a flash there
+                                                     * showed from its next picture, its beep from the boundary: -23 ms) */
         }
-        if (fs > out - mv_tl_lag(s, fs) + FFMIN(half, s->cad / 2)) {
+        if (fd > out - mv_tl_lag(s, fd) + FFMIN(half, s->cad / 2)) {
             /* 2.1 T-411/T-414: the full queue dropped the pictures before this one (a decoder catching up after the
              * compose, a burst past the queue's capacity): waiting for its time shows nothing meanwhile (up to the
              * queue's 5.3 s: bars every 5.3 s on a mass restart's slots, a bursty slot's re-lock never due). An
@@ -249,7 +309,7 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
                 }
             }
         }
-        if (fs > out - mv_tl_lag(s, fs) + FFMIN(half, s->cad / 2)) {
+        if (fd > out - mv_tl_lag(s, fd) + FFMIN(half, s->cad / 2)) {
             /* content far ahead of its time (10 s past the margin) with nothing shown for 3 s — labels the timeline
              * left ahead: re-lock behind it with the primed margin. Content a burst brings ahead of its time is
              * normal for a bursty source and waits (re-locking on 1 s churned an HLS-burst slot every few seconds) */
