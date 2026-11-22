@@ -619,7 +619,7 @@ static void *reg_writer(void *arg)
 }
 
 /* a free loopback UDP port (bound and released: the input binds it next) */
-static int reg_port(void)
+static int reg_port_once(void)
 {
     struct sockaddr_in a = { 0 };
     socklen_t al = sizeof a;
@@ -632,6 +632,25 @@ static int reg_port(void)
         port = ntohs(a.sin_port);
     close(fd);
     return port;
+}
+
+/* 2.2.3 T-526: the mosaic starts every slot's regulator before any input binds its port, so the system may hand the
+ * port just released for one slot to the next (gate 2026-11-22: in0 and in1 both on 58697 — in1 'Address already in
+ * use' and never fed, in0 fed both sources). A port another regulator of this process holds is refused. */
+static int reg_port(int k)
+{
+    int tries, j, port = -1;
+    for (tries = 0; tries < 32; tries++) {
+        int taken = 0;
+        if ((port = reg_port_once()) < 0)
+            return -1;
+        for (j = 0; j < PTV_MAX_INPUT; j++)
+            if (j != k && regs[j] && regs[j]->port == port)
+                taken = 1;
+        if (!taken)
+            return port;
+    }
+    return -1;
 }
 
 char *ptv_regulate_start(const char *url, int64_t delay_us, int k)
@@ -652,7 +671,7 @@ char *ptv_regulate_start(const char *url, int64_t delay_us, int k)
     r->retrust  = getenv("PTV_TEST_REG_RETRUST") ? atoi(getenv("PTV_TEST_REG_RETRUST")) * 1000000LL : REG_RETRUST;
     r->cap_max  = (int)((delay_us / 1000000 + 10) * 2000);   /* D + 10 s at up to ~20 Mb/s */
     r->cap      = FFMIN(REG_CAP0, r->cap_max);      /* T-439: grows as it fills */
-    r->port     = reg_port();
+    r->port     = reg_port(k);
     r->src_url  = av_strdup(url);
     r->ring     = av_malloc_array(r->cap, sizeof *r->ring);
     if (r->port < 0 || !r->src_url || !r->ring)
