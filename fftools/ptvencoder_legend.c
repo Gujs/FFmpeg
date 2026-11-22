@@ -628,7 +628,11 @@ void ptv_print_log_legend(int full)
         "               is correct rate conversion, not a fault)\n"
         "  inK:sv       starvation repeats (no picture queued: the slot's input is late or gone)\n"
         "  inK:sk       (2.1) the slot's realized picture lag (ms, output - source on the slot's h0 axis);\n"
-        "               its sound is placed with it. Moves only at a [PTV-MV] re-lock or a drift step\n"
+        "               its sound is placed with it. Moves only at a [PTV-MV] re-lock or a drift step.\n"
+        "               NOT the slot's delay: it sums the content dropped (or repeated) so far, so a source\n"
+        "               running fast or slow against the box clock walks it one picture per drift step\n"
+        "               (+130 ppm = -0.47 s/h, by design). The delay is the slot's queue depth: PTV_DIAG\n"
+        "               [PTV-RES] inK:occ= counts PICTURES, its tgt= house TICKS (a 59.94 slot reads ~2x tgt)\n"
         "  inK:skres    (0.9.18.7) slot LAYERA erase-residue ledger (ms) — 2.1: always 0; kept for parsers\n"
         "  inK:cc       (only on slots with -cc_extract) that slot's captions/a53 (as the single-input cc=)\n"
         "  not on the mosaic line: src= (except the start-up waiting heartbeat), hs=, cf=, unreg=, dlvdrop=\n");
