@@ -5,6 +5,30 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.2 — release: 2.2.2-pre7 unchanged, version only
+
+**Same code as 2.2.2-pre7** (adaptive-2.2 e65b37c043); only `PTVENCODER_VERSION` changes. Released by the written criteria
+(owner 2026-11-20: "release needs to keep channels stable and in a/v sync"), not by sign-off. What makes it the release:
+- **Soak of pre7** (2026-11-21 ~17:13 CET -> 2026-11-22 17:17 CET, 24 h incl. the US night) on the soak tier live-transcoder (8) +
+  tmtg-cow-transcoder-1 (64) + tmtg-cow-transcoder-2 (29) = 101 channels: 0 unexpected exits, 0 fatal, 0 rung divergence,
+  0 SELFHEAL, 0 unclean, 0 `[PTV-SYNCCHK] STEPPED`, every channel on its first start; held-4 s only inside a source outage
+  (FaithNFreedom_TV). Every lip-sync reading beyond +-25 ms for more than 10 s is explained: a corrupt source burst
+  (TVP_World, the same corruption logged by the 2.0.2 control on cor-1) and the mosaic sensor's own reading error (T-514 / T-515: its sound
+  position leaves out the follow delay line, so a slot reads up to ~21 ms early; the content ruler measures no real bias on
+  2.2.1, pre7 or later builds), states that occur on 2.2.1 on the same channels (mosaic placement code unchanged since 2.2.1).
+- **pre7 gate** (12 lanes, kit dee59fc, media-v46): 401 keys, 399 PASS, the 2 accepted SCTE-35 KNOWN lead-outage keys;
+  0 regressions vs pre6.
+- **What 2.2.2 brings over 2.2.1:** one emit decision for the whole ladder (T-498); no output PTS hole at a small source
+  timing gap (T-501); the sound follows the shown picture inside the frame (T-499); every hold's return is classified
+  (T-502); a dropped silence-fill frame moves the fill on (T-505); a gap-fill repeat never moves the sound (T-507); a lost
+  picture after a hold is a repeat (T-508); the source picture period is the median step (T-512); a delay kept after a
+  stall no longer breaks film cadence or walks the sound (T-516).
+- Known, not blocking (pre-existing, same on 2.2.1): T-514 / T-515 the mosaic sensor reads up to ~21 ms early, T-517
+  film through a hold (17 ms step-backs), T-518 / T-519 mosaic catch-up, T-523 a
+  mosaic lag step can put one marker's sound a tick behind its picture for under a second -> 2.2.3 / 2.3. (T-522, a 60p
+  mosaic slot's delay growing, was measured afterwards: not a defect — the walking number is the content the frame sync
+  dropped from a fast source; the real delay stays bounded.)
+
 ## 2.2.2-pre7 — pre6 + a delay kept after a stall no longer breaks film cadence or walks the sound (T-516)
 
 **T-516 — film cadence while the output keeps a delay.** After a stall of the encoder (the input still arriving, the
