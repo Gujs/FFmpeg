@@ -5,6 +5,49 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.3-pre1 — 2.2.2 + mosaic catch-up (T-518, T-519), film through a hold (T-517), mosaic sensor (T-515), mosaic lag step (T-523)
+
+All five are pre-existing (the same on 2.2.1); four are in the mosaic, T-517 is single input.
+
+**T-518 — a mosaic slot catching up is no lip-sync reading.** A slot that returns from an outage with its backlog at
+~2.5x real time shows the backlog's pictures late while it catches up. The sensor seeded its 30 s average from a picture
+still ~5 s late (`lipsync=` +5540 ms decaying over ~3 min, AmericanStories on the soak) and the same late pictures fed the
+realized lag (`[PTV-MV] a0 sound re-placed +81 ms (drift)`, the sound up to 116 ms late for ~6 s on air). A picture more
+than 0.5 s late is now neither measured nor a sample of the realized lag; the slot reads `--` and reseeds 1 s after its
+pictures are back on their place.
+
+**T-519 — a slot's catch-up no longer leaves its sound dark.** The returning sound starts behind the silence fill already
+played; the fill ended at the first real frame and the late sound was dropped until it reached the fill's end: the slot's
+audio PID dark 2.3-2.7 s and the whole mosaic's video PID 1.6-1.7 s on the wire. A real frame wholly behind the fill's
+front is now dropped at the door while the fill goes on at wall pace until the sound reaches it (`[PTV-ADISC] ... resumed
+N ms behind the silence already played` / `... reached the fill`); the fill waits for a re-lock only while the slot's
+picture is off its place.
+
+**T-517 — film through a hold.** After a hold's rejoin the record door placed the sound on each film picture's own
+half-tick residue, which alternates by 16.7 ms on 3:2 content: `[PTV-ATRIM] input stepped back 17 ms` about six times a
+second to the end of the run. The door now places the sound with the house_skew its picture was shown with plus the phase
+term.
+
+**T-515 — the mosaic sensor reads the sound's real place.** `lipsync=`, `[PTV-AVSYNC]` and the mosaic sync check read a
+slot 5-15 ms early (up to ~21 ms; Curiosity +20 ms for 9 h on the 2.2.2 soak) while the content ruler measured +-2 ms:
+the sound side left out the 0-1 AAC frame in the follow delay line, the video side counted a repeated picture twice and
+restarted from one picture after every lag step. Both sides now measure the real place (delay line counted, each picture
+once where first shown, the realized lag the sound was placed at). Reading only: nothing steers differently (the mosaic
+corrector's 40 ms band was never reached, the mosaic sync check observes; arming it = T-524, 2.3). The mosaic sync check
+now reaches a decision on rate-converted slots (gate: 287 "in sync", 0 "no steady reading").
+
+**T-523 — a mosaic lag step: picture and sound skip the same content.** On a drift step down the picture skipped the
+content just before the step's boundary and the sound the content just after it: a flash right after the boundary lost
+the head of its beep (+33 ms for one marker, under a second). A step down now publishes its skip to both sides, the
+picture across the boundary is shown at the boundary's place, and the delay line takes a frame in parts (a step up pads
+exactly at the boundary). Test-only `PTV_TEST_MVSTEP_AT=K:FILE[:MS]` puts slot K's step boundaries on given flashes
+(off unless set).
+
+**Verification:** full gate on the stacked build (kit 3725e2b, media-v46, 8 lanes, `tests/results/t515/full-t523cand`):
+412 keys, 0 regressions against the T-517 build's gate, 5 new keys PASS (mv02-t515, mv02-t520, mv25-t514, mv25-t523,
+mv25-t523b), the 2 accepted SCTE-35 KNOWN lead-outage keys. New keys fail on the old code: prod-t518 / mv02-t518 on 2.2.1
+and pre7, mv02-t515 / mv25-t514 on 2.2.1, pre7 and the T-517 build, mv25-t523 on the old code with the test hook (4 of 4).
+
 ## 2.2.2 — release: 2.2.2-pre7 unchanged, version only
 
 **Same code as 2.2.2-pre7** (adaptive-2.2 e65b37c043); only `PTVENCODER_VERSION` changes. Released by the written criteria
