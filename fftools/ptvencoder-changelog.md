@@ -5,6 +5,28 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.3-pre2 — 2.2.3-pre1 + two mosaic slots never share a regulator port (T-526), the legend explains a slot's sk (T-522)
+
+**T-526 — two mosaic slots' regulators never share a loopback port.** Each input regulator hands its paced packets to the
+input through a loopback UDP port it picks as "any free port" (bound, read, released; the input binds it a moment later).
+A mosaic starts all its slots' regulators before any input binds, and the system may hand the port just released for one
+slot to the next: in the 2.2.3-pre2 gate (mv01-t479) in0 and in1 both got 58697 — in1's input failed 'Address already in
+use' and stayed WAITING for the whole run, in0's input received both sources mixed (6813 corrupt packets). Seen once in
+2526 regulated mosaic runs, never in the fleet's logs; every build since 2.2.0-pre10 (every udp input regulated by
+default) has it. A regulator now refuses a port another regulator of this process holds. Key mv01-t526 forces the
+system's reuse with a test-only shim (the first two "any port" loopback binds get the same port): FAIL on 2.2.3-pre1,
+PASS with the fix; every mosaic key now FAILs if two regulators report the same port. Not covered: another process taking
+the port between the release and the input's bind (T-527: an in-memory hand-off instead of the port, 2.3).
+
+**T-522 — closed as not a defect; the legend now says what `inK:sk` is.** On the 2.2.2 soak MV_2x2_RAV slot 0 (a 59.94
+source in a 29.97 mosaic) showed `in0:sk` walking -0.47 s/h, read as a growing delay. Measured: the source runs ~130 ppm
+fast against the box clock (pictures 59.9478/s, audio 48006 samples/s), the frame sync drops one tick per 33.4 ms of
+surplus, and sk sums those drops; the slot's real delay (queue depth `[PTV-RES] in0:occ`, 56-72 pictures = 0.93-1.2 s)
+stayed flat for 37 h. The legend (`-h` / start-up) now says sk is the content dropped or repeated so far, not the delay,
+and that `[PTV-RES]` occ counts pictures while tgt counts house ticks (a 59.94 slot reads about twice tgt). Text only, no
+behaviour change. Guard key `mv01-t522` (media-v47, every source +2000 ppm for 720 s: the true delay stays flat) PASSes on
+2.2.1, 2.2.2-pre7 and 2.2.3-pre1.
+
 ## 2.2.3-pre1 — 2.2.2 + mosaic catch-up (T-518, T-519), film through a hold (T-517), mosaic sensor (T-515), mosaic lag step (T-523)
 
 All five are pre-existing (the same on 2.2.1); four are in the mosaic, T-517 is single input.
