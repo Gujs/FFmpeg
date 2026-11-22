@@ -489,13 +489,13 @@ void *compositor_thread(void *arg)
     int64_t rung_pts[PTV_MAX_RUNG] = {0};
     /* 1.0.1-pre16 mv sensor port: per-slot video-side EMA state (the compositor is the ONE
      * writer of g_rsx.mv_ema/mv_wall[*] on mv — the single-input master-rung mirror). τ ≈ 30s
-     * of ticks, divisor verbatim from the single-input sensor (ptvencoder_clock.c). */
+     * (2.2.3 T-515: of pictures shown, each weighing the time since the last one). */
     int64_t rs_mv_ema[PTV_MAX_INPUT] = {0};
     int     rs_mv_seed[PTV_MAX_INPUT] = {0};
-    int64_t rs_mv_div;
     int64_t rs_mv_src[PTV_MAX_INPUT];         /* 2.0.1 T-362: the slot's last displayed source pts */
     int64_t rs_mv_adv[PTV_MAX_INPUT] = {0};   /* 2.0.1 T-362: the tick its displayed picture last changed */
     int64_t rs_mv_rel[PTV_MAX_INPUT] = {0};   /* 2.0.1 T-362: -1 in a hold, else the tick it ended (0 = none) */
+    int64_t rs_mv_ftk[PTV_MAX_INPUT] = {0};   /* 2.2.3 T-515: the output time of the last picture measured */
     int     born[PTV_MAX_INPUT] = {0};   /* pre17: slot has displayed its first fresh frame
                                           * (clears the slot's birth slate-mask bit below) */
     AVFrame *filt = av_frame_alloc();
@@ -521,8 +521,6 @@ void *compositor_thread(void *arg)
         if (!c->inputs[k].deferred)   /* 2.0.2 T-386: a slot not live at the start must not freeze the live slots'
                                        * correction until it joins (GAFamily: 3 days without correction) */
             atomic_fetch_or_explicit(&g_mv_slate_mask, 1 << k, memory_order_relaxed);
-    rs_mv_div = c->tick_dur_us > 0 ? 30000000 / c->tick_dur_us : 750;
-    if (rs_mv_div < 8) rs_mv_div = 8;
     if (n_prime > g_frameq_cap - 8) n_prime = g_frameq_cap - 8;
     if (n_prime < 0) n_prime = 0;
     res_occ_tgt = n_prime > 4 ? n_prime : 4;   /* v0.9.13 servo target = the primed jitter depth,
@@ -806,10 +804,25 @@ void *compositor_thread(void *arg)
                         else if (rs_mv_rel[k] > 0 && mv_tick_us(c, tick) - mv_tick_us(c, rs_mv_rel[k]) < 1000000)
                             ;
                         else {
+                            /* 2.2.3 T-515: a picture is measured once, where it is first shown, and weighs the time
+                             * since the last one (tau stays 30 s). Per tick, a rate-converted slot's repeats weighed
+                             * twice — and the pictures held two ticks are the ones shown late (nearest-tick placement):
+                             * lipsync= read the sound early by that much on a 25p slot in 29.97, beside the delay
+                             * line below the sound (T-514: the ruler read +0.2..+1.6 ms, the sensor +4.8..+13.6) */
                             rs_mv_rel[k] = 0;
-                            if (!rs_mv_seed[k]) { rs_mv_ema[k] = m; rs_mv_seed[k] = 1; }
-                            else rs_mv_ema[k] += (m - rs_mv_ema[k]) / rs_mv_div;
-                            atomic_store_explicit(&g_rsx.mv_ema[k], rs_mv_ema[k], memory_order_relaxed);
+                            if (fresh && !rs_mv_seed[k]) {
+                                rs_mv_ema[k] = tl_slot[k].real - h0k;   /* T-515: the realized lag, not one picture's
+                                                                         * rounding (+-17 ms on a 25p slot in 29.97,
+                                                                         * decaying over 30 s after every lag step) */
+                                rs_mv_seed[k] = 1;
+                                rs_mv_ftk[k] = mv_tick_us(c, tick);
+                            } else if (fresh) {
+                                int64_t dt = av_clip64(mv_tick_us(c, tick) - rs_mv_ftk[k], 0, 500000);
+                                rs_mv_ema[k] += (m - rs_mv_ema[k]) * dt / 30000000;
+                                rs_mv_ftk[k] = mv_tick_us(c, tick);
+                            }
+                            if (rs_mv_seed[k])
+                                atomic_store_explicit(&g_rsx.mv_ema[k], rs_mv_ema[k], memory_order_relaxed);
                             atomic_store_explicit(&g_rsx.mv_wall[k], now_us, memory_order_relaxed);
                         }
                     }

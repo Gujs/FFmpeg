@@ -1182,6 +1182,10 @@ static int audio_drain_fg(AudioState *a)
                         a->af_step_at = at;
                     if (err && (step || err >= nb / 2 || err <= -nb / 2)) {
                         a->rs_ma_seed = 0;                     /* the sensor's audio side takes the step with it */
+                        if (step) {                            /* T-515: ... once the picture has (below) */
+                            a->rs_pend_at = at;
+                            a->rs_pend_us = L - atomic_load_explicit(a->tl_lag, memory_order_relaxed);
+                        }
                         a->af_nfix++;
                         if (av_gettime_relative() - a->af_log_wc >= 10000000) {   /* an event; at most one line in 10 s */
                             a->af_log_wc = av_gettime_relative();
@@ -1258,6 +1262,8 @@ static int audio_drain_fg(AudioState *a)
                     }
                 }
                 a->af_last_out = cont;
+                a->af_line     = av_audio_fifo_size(a->af_fifo);
+                a->af_lag      = L;
                 filt->pts = cont;
                 {                                              /* the newest content placed (the next step's boundary
                                                                 * goes past it), the slot's tracks' maximum */
@@ -1324,7 +1330,7 @@ static int audio_drain_fg(AudioState *a)
              * ==================================================================================== */
             if (g_rsync_sense && a->use_fg &&
                 a->dbg_k < PTV_MAX_AUDIO && a->out_rate > 0) {
-                int64_t out_us = av_rescale(filt->pts, 1000000, a->out_rate);
+                int64_t out_us = av_rescale(filt->pts + a->af_line, 1000000, a->out_rate);   /* T-515: + the delay line */
                 int64_t hs     = (!(a->multiview && g_audio_follow) && g_avlock && a->house_skew)
                                ? *a->house_skew : 0;
                 /* pre14 (§5 bus rule 3): corr_us joins inj — the sensor recovers the RAW
@@ -1444,6 +1450,18 @@ static int audio_drain_fg(AudioState *a)
                     }
                 }
                 m = out_us - (src_abs_us - inj) - slip;
+                /* 2.2.3 T-515: the sound takes a mosaic lag step at its content boundary up to the delivery gate's depth
+                 * (~1.2 s) before the picture does — R compares the newest sound with the newest picture, so it read the
+                 * step (+33 ms) until the picture's commit re-seeded the video side. The sound's side keeps the old lag
+                 * until the slot's boundary is gone (the commit), then re-seeds */
+                if (a->rs_pend_at) {
+                    if (a->tl_at && atomic_load_explicit(a->tl_at, memory_order_acquire) == a->rs_pend_at)
+                        m -= a->rs_pend_us;
+                    else {
+                        a->rs_pend_at = 0;
+                        a->rs_ma_seed = 0;
+                    }
+                }
                 /* 2.0.0-pre9.6 (T-075): the EMA smooths only the MEASURED part of m_a (slip, rounding);
                  * the label edits this thread made (glue_off relabels/folds, the door's house_skew) are
                  * steps by nature and join outside it, as the demux ledger E does. Smoothed, a hold's
@@ -1590,7 +1608,11 @@ static int audio_drain_fg(AudioState *a)
              *   at the mux reads ≈0 regardless = the av_off trap).
              * ==================================================================================== */
             if (a->vring) {
-                int64_t out_a_us = av_rescale(filt->pts, 1000000, a->out_rate);   /* emitted output time (us) */
+                /* 2.2.3 T-515: a mosaic slot's sound waits in its delay line (0..1 frame) after the frame that left it:
+                 * this frame's content is placed that much after its pts. Not counted, every alag was a whole number of
+                 * AAC frames and the sound read up to 21.3 ms early (cow-2 Curiosity slot 1: +20 ms mean for 9 h, the
+                 * flash+beep ruler +0.2..+1.6 ms on the same class) */
+                int64_t out_a_us = av_rescale(filt->pts + a->af_line, 1000000, a->out_rate);   /* the sound's place (us) */
                 int64_t h0_us    = (h0 == AV_NOPTS_VALUE) ? 0 : h0;
                 int64_t content  = src_abs_us;                                    /* abs source content of this audio frame */
                 int64_t out_v, msrc;
@@ -1616,7 +1638,15 @@ static int audio_drain_fg(AudioState *a)
                 if (!(a->multiview && a->mvf_hi_us > a->mvf_lo_us &&             /* T-093: fill phase frames carry no */
                       src_abs_us >= a->mvf_lo_us && src_abs_us < a->mvf_hi_us) &&  /* content to pair */
                     vring_lookup(a->vring, content, out_a_us, &out_v, &msrc) == 0) {
-                    int64_t vlag   = out_v    - (msrc    - h0_us);   /* video realized output − content (at msrc) */
+                    int64_t plag   = out_v    - (msrc    - h0_us);   /* video realized output − content (at msrc) */
+                    /* 2.2.3 T-515: a mosaic slot's pictures land on house ticks — each one up to a tick off the slot's
+                     * realized lag (nearest-tick placement, a rate-converted slot's cadence); the lag they realize is
+                     * that average (mv_tl_pick), the place the sound is put at. One paired picture read its own residue
+                     * (vlag sawing -246..-218 ms on a 25p slot in 29.97, +-17 ms around the ruler's mean): the realized
+                     * lag is the video side, the picture's own lag only when it is off it by more than tick rounding
+                     * (a catch-up's late pictures, a held cell) */
+                    int64_t vlag   = a->multiview && a->af_out_set && llabs(plag - a->af_lag) <= PTV_MV_VLAG_ROUND_US
+                                   ? a->af_lag : plag;
                     int64_t alag   = out_a_us - (content - h0_us);   /* audio realized output − content (at content) */
                     int64_t offset = vlag - alag;                    /* the content-referenced (via shared h0) lip-sync the
                                                                        * PLAYER sees — not the raw out_v−out_a, which carries

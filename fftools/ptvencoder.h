@@ -209,6 +209,8 @@ typedef struct DlvGate {
                             * ring (drop-oldest) so a never-arriving video can't grow it unboundedly. */
 #define PTV_MAX_INPUT 4    /* max composited inputs (multiview): 1 / 2 / 4 */
 #define PTV_MV_SKEW_CAP_US 250000   /* multiview per-slot audio skew cap (async budget) */
+#define PTV_MV_VLAG_ROUND_US 100000 /* 2.2.3 T-515: a mosaic slot's picture within this of its realized lag is tick
+                                     * rounding (up to a tick at 20 fps and above), farther = off its place */
 
 /* ===================== 1.0.1-pre15 — glue classification (#33) =====================
  * NORMATIVE DESIGN = analysis/ptvencoder-33-glue-classification.md (§refs below are its
@@ -1134,6 +1136,10 @@ typedef struct AudioState {
                                                        * sample stream exactly (silence in / samples out), frames leave it
                                                        * whole; empty in steady state */
     int64_t          af_drop;                         /* ... samples still to discard (the sound was late) */
+    int64_t          af_line;                         /* 2.2.3 T-515: ... samples it holds after the last frame left: that
+                                                       * frame's content is placed this much after its pts (the sensor) */
+    int64_t          af_lag;                          /* 2.2.3 T-515: ... the slot's realized picture lag that frame was
+                                                       * placed at (the sensor's video side) */
     int64_t          af_step_at;                      /* ... the lag-step boundary last taken */
     int              af_fade;                         /* ... samples of the fade-in still to apply after a junction */
     int64_t          af_nfix, af_log_wc;              /* ... corrections taken, and when the last was logged */
@@ -1245,6 +1251,8 @@ typedef struct AudioState {
     int64_t          afmt_drop_us;                     /* its withheld partial tail (µs) */
     int64_t          afmt_drain_end_us;                /* door-domain content end the drain is cut at (µs) */
     int64_t          rs_ma_res;                       /* 2.0.0-pre9.6: EMA of m_a − (glue_off + house_skew) (µs) */
+    int64_t          rs_pend_at, rs_pend_us;          /* 2.2.3 T-515: a mosaic lag step the sound has taken and the picture not
+                                                       * yet (its boundary, the step): m_a reads the old lag until then */
     /* 2.0.1 T-087 relabel check: 10 ms RMS envelope of the decoded audio (channel 0) and one pending seam */
 #define PTV_RL_ENV 512
     float            rl_env[PTV_RL_ENV];              /* ring of 10 ms RMS bins */
