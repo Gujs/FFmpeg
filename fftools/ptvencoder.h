@@ -209,6 +209,8 @@ typedef struct DlvGate {
                             * ring (drop-oldest) so a never-arriving video can't grow it unboundedly. */
 #define PTV_MAX_INPUT 4    /* max composited inputs (multiview): 1 / 2 / 4 */
 #define PTV_MV_SKEW_CAP_US 250000   /* multiview per-slot audio skew cap (async budget) */
+#define PTV_MV_VLAG_ROUND_US 100000 /* 2.2.3 T-515: a mosaic slot's picture within this of its realized lag is tick
+                                     * rounding (up to a tick at 20 fps and above), farther = off its place */
 
 /* ===================== 1.0.1-pre15 — glue classification (#33) =====================
  * NORMATIVE DESIGN = analysis/ptvencoder-33-glue-classification.md (§refs below are its
@@ -1134,6 +1136,10 @@ typedef struct AudioState {
                                                        * sample stream exactly (silence in / samples out), frames leave it
                                                        * whole; empty in steady state */
     int64_t          af_drop;                         /* ... samples still to discard (the sound was late) */
+    int64_t          af_line;                         /* 2.2.3 T-515: ... samples it holds after the last frame left: that
+                                                       * frame's content is placed this much after its pts (the sensor) */
+    int64_t          af_lag;                          /* 2.2.3 T-515: ... the slot's realized picture lag that frame was
+                                                       * placed at (the sensor's video side) */
     int64_t          af_step_at;                      /* ... the lag-step boundary last taken */
     int              af_fade;                         /* ... samples of the fade-in still to apply after a junction */
     int64_t          af_nfix, af_log_wc;              /* ... corrections taken, and when the last was logged */
@@ -1245,6 +1251,8 @@ typedef struct AudioState {
     int64_t          afmt_drop_us;                     /* its withheld partial tail (µs) */
     int64_t          afmt_drain_end_us;                /* door-domain content end the drain is cut at (µs) */
     int64_t          rs_ma_res;                       /* 2.0.0-pre9.6: EMA of m_a − (glue_off + house_skew) (µs) */
+    int64_t          rs_pend_at, rs_pend_us;          /* 2.2.3 T-515: a mosaic lag step the sound has taken and the picture not
+                                                       * yet (its boundary, the step): m_a reads the old lag until then */
     /* 2.0.1 T-087 relabel check: 10 ms RMS envelope of the decoded audio (channel 0) and one pending seam */
 #define PTV_RL_ENV 512
     float            rl_env[PTV_RL_ENV];              /* ring of 10 ms RMS bins */
@@ -1336,6 +1344,11 @@ typedef struct AudioState {
     int64_t          rj_hold_wc;                      /* T-489: the hold (g_src_hold_start) the buffer was armed for */
     int64_t          nbs_last_wall_us;                /* rr15 F9: wall of the previous quantum (elapsed base) */
     int64_t          nbs_carry_us;                    /* rr15 F9: sub-frame remainder carried between quanta */
+    /* 2.2.3 T-519: a mosaic slot's returning sound still inside the span its fill has played (a backlog catching up) */
+    int64_t          nbs_lo_us;                       /* raw label the fill began at */
+    int64_t          nbs_cu_ref, nbs_cu_wc;           /* the smallest distance to the fill's front so far (us), since when */
+    int              nbs_cu_n;                        /* real frames dropped behind the front in this return */
+    int64_t          nbs_cu_at, nbs_cu_wc0;           /* the last lag step taken (af_step_at) / the wall time at its first one */
     int64_t          glue_cad_us;                     /* rr15 R2: EMA of nonzero fed-frame wall gaps (PES-burst
                                                        * period) — the E3 cadence baseline for the pad-ledger gate */
     /* 1.0.1-pre20 REBUILD RE-ANCHOR (g_rebuild_reanchor; PTV_NO_REBUILD_REANCHOR=1 reverts).
@@ -1790,7 +1803,7 @@ typedef struct Input {
     _Atomic int64_t       tl_nlag_us;        /* ... the lag from tl_at_us on (a step scheduled at a content boundary) */
     _Atomic int64_t       tl_at_us;          /* ... that boundary (source time, us; INT64_MAX = none pending) */
     _Atomic int64_t       tl_ahead_us;       /* ... the newest content the slot's sound has been placed for (us) */
-    _Atomic int64_t       tl_skip_us;        /* ... an overflow step: the content from here to the boundary is gone
+    _Atomic int64_t       tl_skip_us;        /* ... a step down (2.2.3 T-523; an overflow step before): the content from here to the boundary is gone
                                               * from the picture (us; INT64_MAX = none) — the sound drops it too */
     _Atomic int64_t       tl_alim_us;        /* ... the newest content the sound MAY place (us; INT64_MAX = no bound):
                                               * the shown picture + the primed margin + 1 s while the cell advances */
@@ -1878,8 +1891,9 @@ extern int g_mv_ccvmap;        /* 2.0.2 T-396: mosaic captions wait for their sl
 extern int     g_cc_rewrap;       /* 2.0.0 T-023(b): re-wrap pop-on captions to the teletext row (PTV_CC_NO_REWRAP=1 off) */
 extern int64_t g_hold_clean_us;   /* 2.0.0 T-324: a hold that saw video damage ends after this much clean video */
 extern int64_t g_max_delay_us;   /* 2.0.0 T-103: pinned output delay (us; 0 = off) */
-void ptv_vmap_push(int64_t src_us, int64_t out_us);
+void ptv_vmap_push(int64_t src_us, int64_t out_us, int64_t res_us);
 int  ptv_vmap_lookup(int64_t c_us, int64_t *out_us, int64_t *gap_us);
+int  ptv_vmap_lookup_res(int64_t c_us, int64_t *out_us, int64_t *gap_us, int64_t *res_us);   /* 2.2.3 T-517 */
 int  ptv_vmap_newest(int64_t since_wc, int64_t *src_us, int64_t *out_us);
 void ptv_copy_vwait(struct DemuxArgs *d);   /* master output thread: release the copies the video has shown */
 extern _Atomic int64_t g_vdisp_skew_us;  /* 2.0.0 T-095: where the master put the last fresh frame vs its content index */

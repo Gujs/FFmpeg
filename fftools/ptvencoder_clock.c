@@ -2213,9 +2213,21 @@ void *output_thread(void *arg)
                     ptv_startup_on_air(av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q), v->tick_dur_us);
                 /* 2.0.0 T-100: record where this content went on air (copies + captions are stamped through it) */
                 if (g_vmap && !v->passthrough && src_ts != AV_NOPTS_VALUE) {
-                    ptv_vmap_push(av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q),
-                                  v->out_fps.num > 0 ? av_rescale(vpts, 1000000LL * v->out_fps.den, v->out_fps.num)
-                                                     : vpts * v->tick_dur_us);
+                    /* 2.2.3 T-517: with its sub-tick rounding = where it went on air - its label's house time - the
+                     * house_skew it published - its residence / video-only repeats (T-499's r, exact to the us so the
+                     * door's phase term nets a wrap as on the house_skew door). The record door places the sound with
+                     * the house_skew this frame was shown with plus that phase term, not on each frame's own rounding:
+                     * film pictures round to the grid up to a tick apart, and after a hold (the door on for good) the
+                     * sound stepped 17 ms back and forth with them, ~6 times a second */
+                    int64_t su = av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q), res = 0;
+                    int64_t ou = v->out_fps.num > 0 ? av_rescale(vpts, 1000000LL * v->out_fps.den, v->out_fps.num)
+                                                    : vpts * v->tick_dur_us;
+                    if (*v->h0 != AV_NOPTS_VALUE && v->house_skew) {
+                        res = ou - (su - *v->h0) - (*v->house_skew + (held_extra + vo_extra) * v->tick_dur_us);
+                        if (llabs(res) > v->tick_dur_us)
+                            res = 0;            /* not a rounding: placed on the frame itself, as before */
+                    }
+                    ptv_vmap_push(su, ou, res);
                     if (v->hold_da)              /* release the copies this frame has caught up to */
                         ptv_copy_vwait(v->hold_da);
                 }

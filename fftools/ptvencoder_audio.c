@@ -96,6 +96,23 @@ static void af_ptrs(const AVFrame *f, int off, uint8_t **p)
         p[c] = f->extended_data[c] + (size_t)off * bps * (planar ? 1 : ch);
 }
 
+/* 2.1 T-420: samples [from, to) of a mosaic slot's frame into its delay line — a pending drop takes the first ones, a pending
+ * fade-in ramps what follows the junction (2.2.3 T-523: a frame is put in parts when a lag-step boundary is inside it) */
+static void af_line_put(AudioState *a, AVFrame *f, int from, int to, int fl)
+{
+    int      k0 = from + (int)FFMIN(a->af_drop, to - from);
+    uint8_t *pp[AV_NUM_DATA_POINTERS];
+    a->af_drop -= k0 - from;
+    if (a->af_fade && k0 < to) {
+        int n = FFMIN(a->af_fade, to - k0), done = fl - a->af_fade;
+        af_ramp(f->extended_data, f->format, f->ch_layout.nb_channels, k0, n, (double)done / fl, 1.0 / fl);
+        a->af_fade -= n;
+    }
+    af_ptrs(f, k0, pp);
+    if (k0 < to)
+        av_audio_fifo_write(a->af_fifo, (void **)pp, to - k0);
+}
+
 static int audio_encode_push(AudioState *a, AVFrame *frame)
 {
     int i, j, ret;
@@ -1134,19 +1151,33 @@ static int audio_drain_fg(AudioState *a)
                  * frames dropped, like a frame sync's audio); the residue stays within half a frame. L is the picture's
                  * REALIZED lag (tick rounding and decimation included), published by the compositor */
                 int     nb = filt->nb_samples;
-                /* a lag step applies from its content boundary on (mv_tl_step): the same content as the picture's */
-                int64_t at = atomic_load_explicit(a->tl_at, memory_order_acquire);
-                int64_t L  = src_abs_us >= at ? atomic_load_explicit(a->tl_nlag, memory_order_relaxed)
-                                              : atomic_load_explicit(a->tl_lag, memory_order_relaxed);
-                int64_t exact = opts + av_rescale(L, a->out_rate, 1000000), cont, err;
+                /* a lag step applies from its content boundary on (mv_tl_step): the same content as the picture's.
+                 * 2.2.3 T-523: to the sample — the frame is cut there: [0, ia) keeps the old lag, [ia, nb) takes the new
+                 * one; a step down skips the content [is, ia) before the boundary, as the picture does (its old due line
+                 * to the boundary: the pictures there are due no earlier than the boundary's and are never shown). The
+                 * whole step was taken at the first frame starting past the boundary: a drop of the content from there, a
+                 * flash just past the boundary shown a tick before its beep (+33 ms; mv25-t514 2 runs in 12, every
+                 * build; every flash on a boundary with PTV_TEST_MVSTEP_AT) */
+                int64_t at  = atomic_load_explicit(a->tl_at, memory_order_acquire);
+                int64_t sk  = atomic_load_explicit(a->tl_skip, memory_order_relaxed);
+                int64_t Lo  = atomic_load_explicit(a->tl_lag, memory_order_relaxed);
+                int64_t Ln  = atomic_load_explicit(a->tl_nlag, memory_order_relaxed), L;
+                int     bnd = at != INT64_MAX && at != INT64_MIN;
+                int     ia  = !bnd || at >= src_abs_us + av_rescale(nb, 1000000, a->out_rate) ? nb :
+                              at <= src_abs_us ? 0 : (int)av_rescale(at - src_abs_us, a->out_rate, 1000000);
+                int     is  = bnd && sk < at && sk > src_abs_us ? (int)FFMIN(av_rescale(sk - src_abs_us, a->out_rate, 1000000), ia)
+                            : bnd && sk < at ? 0 : ia;
+                int64_t exact, cont, err, pos = 0;
                 /* T-411/T-414: an overflow step — the picture skipped from its old due line to the boundary (those
                  * pictures are gone); this sound, not placed yet, goes with them (placed, it played Δ late for that
                  * long, then the sound skipped what the picture showed) */
-                if (src_abs_us < at && src_abs_us >= atomic_load_explicit(a->tl_skip, memory_order_relaxed)) {
+                if (!is && ia == nb) {
                     a->rs_ma_seed = 0;
                     av_frame_unref(filt);
                     continue;
                 }
+                L     = is ? Lo : Ln;                         /* the lag of the frame's first sample placed */
+                exact = opts + (is ? 0 : ia) + av_rescale(L, a->out_rate, 1000000);
                 if (!a->af_out_set) {
                     if (exact < 0) { av_frame_unref(filt); continue; }
                     a->af_last_out = exact - nb;
@@ -1156,89 +1187,106 @@ static int audio_drain_fg(AudioState *a)
                  * lag step it crosses, and whenever it reaches half a frame — by silence written into the line or samples
                  * dropped from it, with a 5 ms fade at the junction; frames leave the line whole, contiguous. Whole-frame
                  * pads / drops left up to half a frame (10.7 ms at AAC 1024 / 48 kHz) for good after a re-lock: a 59.94
-                 * slot's sound +21 ms after an outage (mv01 gap_20, avxcorr on the cell). Empty in steady state */
+                 * slot's sound +21 ms after an outage (mv01 gap_20, avxcorr on the cell). Empty in steady state.
+                 * T-523: the frame's parts in turn — before the skip (old lag), from the boundary (new lag, the step) */
                 {
-                    int     ch = filt->ch_layout.nb_channels, r, step, fl = a->out_rate / 200;
+                    int     ch = filt->ch_layout.nb_channels, r = 0, step, fl = a->out_rate / 200, sg, put = 0, steady = 0;
                     int64_t e;
                     if (!a->af_fifo) {
                         a->af_fifo = av_audio_fifo_alloc(filt->format, ch, 2 * nb);
                         if (!a->af_fifo) { av_frame_unref(filt); continue; }
                     }
-                    r    = av_audio_fifo_size(a->af_fifo);
                     cont = a->af_last_out + nb;
-                    err  = exact - (cont + r) + a->af_drop;    /* samples: + = the sound belongs later */
-                    step = at != INT64_MAX && at != INT64_MIN && src_abs_us >= at && at != a->af_step_at;
-                    {   /* TEST-ONLY (PTV_TEST_MVTRACE): the follow error once a second per track */
-                        static int tr = -1;
-                        static int64_t twc[PTV_MAX_AUDIO];
-                        if (tr < 0) tr = getenv("PTV_TEST_MVTRACE") != NULL;
-                        if (tr && a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO && av_gettime_relative() - twc[a->dbg_k] >= 1000000) {
-                            twc[a->dbg_k] = av_gettime_relative();
-                            av_log(NULL, AV_LOG_INFO, "[PTV-TEST] a%d src %.3f L %.1f ms err %+.1f ms line %d drop %"PRId64"\n",
-                                   a->dbg_k, src_abs_us / 1e6, L / 1000.0, err * 1000.0 / a->out_rate, r, a->af_drop);
-                        }
-                    }
-                    if (step)
-                        a->af_step_at = at;
-                    if (err && (step || err >= nb / 2 || err <= -nb / 2)) {
-                        a->rs_ma_seed = 0;                     /* the sensor's audio side takes the step with it */
-                        a->af_nfix++;
-                        if (av_gettime_relative() - a->af_log_wc >= 10000000) {   /* an event; at most one line in 10 s */
-                            a->af_log_wc = av_gettime_relative();
-                            av_log(NULL, AV_LOG_INFO, "[PTV-MV] a%d sound re-placed %+.1f ms (%s; %"PRId64" so far)\n",
-                                   a->dbg_k, err * 1000.0 / a->out_rate, step ? "lag step" : "drift", a->af_nfix);
-                        }
-                        e = err;
-                        if (e > 0 && a->af_drop) {             /* a pending drop first */
-                            int64_t m = FFMIN(a->af_drop, e);
-                            a->af_drop -= m;
-                            e          -= m;
-                        }
-                        if (r > 0) {                           /* fade out the line's tail before the junction */
-                            AVFrame *t = av_frame_alloc();
-                            if (t) {
-                                t->nb_samples = r; t->format = filt->format; t->sample_rate = a->out_rate;
-                                av_channel_layout_copy(&t->ch_layout, &filt->ch_layout);
-                                if (av_frame_get_buffer(t, 0) >= 0 &&
-                                    av_audio_fifo_read(a->af_fifo, (void **)t->extended_data, r) == r) {
-                                    int n = FFMIN(r, fl);
-                                    af_ramp(t->extended_data, t->format, ch, r - n, n, 1.0, -1.0 / n);
-                                    av_audio_fifo_write(a->af_fifo, (void **)t->extended_data, r);
-                                }
-                                av_frame_free(&t);
+                    for (sg = 0; sg < 2; sg++) {
+                        int from = sg ? ia : 0, to = sg ? nb : is;
+                        if (from >= to)
+                            continue;
+                        L     = sg ? Ln : Lo;
+                        exact = opts + from + av_rescale(L, a->out_rate, 1000000);
+                        r     = av_audio_fifo_size(a->af_fifo);
+                        err   = exact - (cont + r) + a->af_drop;      /* samples: + = the sound belongs later */
+                        step  = sg && bnd && at != a->af_step_at;
+                        {   /* TEST-ONLY (PTV_TEST_MVTRACE): the follow error once a second per track */
+                            static int tr = -1;
+                            static int64_t twc[PTV_MAX_AUDIO];
+                            if (tr < 0) tr = getenv("PTV_TEST_MVTRACE") != NULL;
+                            if (tr && a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO && av_gettime_relative() - twc[a->dbg_k] >= 1000000) {
+                                twc[a->dbg_k] = av_gettime_relative();
+                                av_log(NULL, AV_LOG_INFO, "[PTV-TEST] a%d src %.3f L %.1f ms err %+.1f ms line %d drop %"PRId64"\n",
+                                       a->dbg_k, src_abs_us / 1e6, L / 1000.0, err * 1000.0 / a->out_rate, r, a->af_drop);
                             }
                         }
-                        if (e > 0) {                           /* the sound belongs later: silence into the line */
-                            AVFrame *z = av_frame_alloc();
-                            if (z) {
-                                z->nb_samples = (int)FFMIN(e, 48 * a->out_rate); z->format = filt->format;
-                                z->sample_rate = a->out_rate;
-                                av_channel_layout_copy(&z->ch_layout, &filt->ch_layout);
-                                if (av_frame_get_buffer(z, 0) >= 0) {
-                                    av_samples_set_silence(z->extended_data, 0, z->nb_samples, ch, z->format);
-                                    av_audio_fifo_write(a->af_fifo, (void **)z->extended_data, z->nb_samples);
-                                }
-                                av_frame_free(&z);
-                            }
-                        } else if (e < 0)
-                            a->af_drop += -e;                  /* the sound was late: the next samples go */
-                        a->af_fade = fl;
-                    }
-                    if (!a->af_drop && !a->af_fade && !av_audio_fifo_size(a->af_fifo)) {
-                        cont = a->af_last_out + nb;            /* steady state: the frame as it is */
-                    } else {
-                        int      k0 = (int)FFMIN(a->af_drop, nb), got = 0;
-                        uint8_t *pp[AV_NUM_DATA_POINTERS];
-                        if (av_frame_make_writable(filt) < 0) { av_frame_unref(filt); continue; }
-                        a->af_drop -= k0;
-                        if (a->af_fade && k0 < nb) {           /* fade in what follows the junction */
-                            int n = FFMIN(a->af_fade, nb - k0), done = fl - a->af_fade;
-                            af_ramp(filt->extended_data, filt->format, ch, k0, n, (double)done / fl, 1.0 / fl);
-                            a->af_fade -= n;
+                        if (step) {
+                            a->af_step_at = at;
+                            a->rs_ma_seed = 0;                     /* the sensor's audio side takes the step with it, */
+                            a->rs_pend_at = at;                    /* T-515: ... once the picture has (below) */
+                            a->rs_pend_us = Ln - Lo;
+                            if (sk < at && !a->af_fade)            /* after a skip: fade in what follows it */
+                                a->af_fade = fl;
                         }
-                        af_ptrs(filt, k0, pp);
-                        if (k0 < nb)
-                            av_audio_fifo_write(a->af_fifo, (void **)pp, nb - k0);
+                        if (err && (step || err >= nb / 2 || err <= -nb / 2)) {
+                            a->rs_ma_seed = 0;
+                            a->af_nfix++;
+                            if (av_gettime_relative() - a->af_log_wc >= 10000000) {   /* an event; at most one line in 10 s */
+                                a->af_log_wc = av_gettime_relative();
+                                av_log(NULL, AV_LOG_INFO, "[PTV-MV] a%d sound re-placed %+.1f ms (%s; %"PRId64" so far)\n",
+                                       a->dbg_k, err * 1000.0 / a->out_rate, step ? "lag step" : "drift", a->af_nfix);
+                            }
+                            e = err;
+                            if (e > 0 && a->af_drop) {             /* a pending drop first */
+                                int64_t m = FFMIN(a->af_drop, e);
+                                a->af_drop -= m;
+                                e          -= m;
+                            }
+                            if (r > 0) {                           /* fade out the line's tail before the junction */
+                                AVFrame *t = av_frame_alloc();
+                                if (t) {
+                                    t->nb_samples = r; t->format = filt->format; t->sample_rate = a->out_rate;
+                                    av_channel_layout_copy(&t->ch_layout, &filt->ch_layout);
+                                    if (av_frame_get_buffer(t, 0) >= 0 &&
+                                        av_audio_fifo_read(a->af_fifo, (void **)t->extended_data, r) == r) {
+                                        int n = FFMIN(r, fl);
+                                        af_ramp(t->extended_data, t->format, ch, r - n, n, 1.0, -1.0 / n);
+                                        av_audio_fifo_write(a->af_fifo, (void **)t->extended_data, r);
+                                    }
+                                    av_frame_free(&t);
+                                }
+                            }
+                            if (e > 0) {                           /* the sound belongs later: silence into the line */
+                                AVFrame *z = av_frame_alloc();
+                                if (z) {
+                                    z->nb_samples = (int)FFMIN(e, 48 * a->out_rate); z->format = filt->format;
+                                    z->sample_rate = a->out_rate;
+                                    av_channel_layout_copy(&z->ch_layout, &filt->ch_layout);
+                                    if (av_frame_get_buffer(z, 0) >= 0) {
+                                        av_samples_set_silence(z->extended_data, 0, z->nb_samples, ch, z->format);
+                                        av_audio_fifo_write(a->af_fifo, (void **)z->extended_data, z->nb_samples);
+                                    }
+                                    av_frame_free(&z);
+                                }
+                            } else if (e < 0)
+                                a->af_drop += -e;                  /* the sound was late: the next samples go */
+                            a->af_fade = fl;
+                            r = av_audio_fifo_size(a->af_fifo);
+                        }
+                        /* T-515: where the frame's content goes on this part's lag (a pending drop takes its first samples) */
+                        pos = cont + r - a->af_drop - from;
+                        if (!put && from == 0 && to == nb && !a->af_drop && !a->af_fade && !r) {
+                            steady = 1;                            /* steady state: the frame as it is */
+                            break;
+                        }
+                        if (!put && av_frame_make_writable(filt) < 0)
+                            break;
+                        if (!sg && to < nb) {                      /* a skip follows: fade out before it */
+                            int n = FFMIN(fl, to);
+                            af_ramp(filt->extended_data, filt->format, ch, to - n, n, 1.0, -1.0 / n);
+                        }
+                        af_line_put(a, filt, from, to, fl);
+                        put = 1;
+                    }
+                    if (!steady) {
+                        int got = 0;
+                        if (!put) { av_frame_unref(filt); continue; }   /* (not writable) */
                         while (av_audio_fifo_size(a->af_fifo) >= 2 * nb) {   /* a long pad: whole frames out now */
                             AVFrame *o = av_frame_alloc();
                             if (!o) break;
@@ -1254,10 +1302,12 @@ static int audio_drain_fg(AudioState *a)
                         if (av_audio_fifo_size(a->af_fifo) >= nb)
                             got = av_audio_fifo_read(a->af_fifo, (void **)filt->extended_data, nb);
                         if (got != nb) { av_frame_unref(filt); continue; }   /* the line holds less than a frame */
-                        cont = a->af_last_out + nb;
                     }
+                    cont = a->af_last_out + nb;
                 }
                 a->af_last_out = cont;
+                a->af_line     = pos - cont;                  /* T-515: the frame's content is placed this far after its pts */
+                a->af_lag      = L;
                 filt->pts = cont;
                 {                                              /* the newest content placed (the next step's boundary
                                                                 * goes past it), the slot's tracks' maximum */
@@ -1324,7 +1374,7 @@ static int audio_drain_fg(AudioState *a)
              * ==================================================================================== */
             if (g_rsync_sense && a->use_fg &&
                 a->dbg_k < PTV_MAX_AUDIO && a->out_rate > 0) {
-                int64_t out_us = av_rescale(filt->pts, 1000000, a->out_rate);
+                int64_t out_us = av_rescale(filt->pts + a->af_line, 1000000, a->out_rate);   /* T-515: + the delay line */
                 int64_t hs     = (!(a->multiview && g_audio_follow) && g_avlock && a->house_skew)
                                ? *a->house_skew : 0;
                 /* pre14 (§5 bus rule 3): corr_us joins inj — the sensor recovers the RAW
@@ -1444,6 +1494,18 @@ static int audio_drain_fg(AudioState *a)
                     }
                 }
                 m = out_us - (src_abs_us - inj) - slip;
+                /* 2.2.3 T-515: the sound takes a mosaic lag step at its content boundary up to the delivery gate's depth
+                 * (~1.2 s) before the picture does — R compares the newest sound with the newest picture, so it read the
+                 * step (+33 ms) until the picture's commit re-seeded the video side. The sound's side keeps the old lag
+                 * until the slot's boundary is gone (the commit), then re-seeds */
+                if (a->rs_pend_at) {
+                    if (a->tl_at && atomic_load_explicit(a->tl_at, memory_order_acquire) == a->rs_pend_at)
+                        m -= a->rs_pend_us;
+                    else {
+                        a->rs_pend_at = 0;
+                        a->rs_ma_seed = 0;
+                    }
+                }
                 /* 2.0.0-pre9.6 (T-075): the EMA smooths only the MEASURED part of m_a (slip, rounding);
                  * the label edits this thread made (glue_off relabels/folds, the door's house_skew) are
                  * steps by nature and join outside it, as the demux ledger E does. Smoothed, a hold's
@@ -1590,7 +1652,11 @@ static int audio_drain_fg(AudioState *a)
              *   at the mux reads ≈0 regardless = the av_off trap).
              * ==================================================================================== */
             if (a->vring) {
-                int64_t out_a_us = av_rescale(filt->pts, 1000000, a->out_rate);   /* emitted output time (us) */
+                /* 2.2.3 T-515: a mosaic slot's sound waits in its delay line (0..1 frame) after the frame that left it:
+                 * this frame's content is placed that much after its pts. Not counted, every alag was a whole number of
+                 * AAC frames and the sound read up to 21.3 ms early (cow-2 Curiosity slot 1: +20 ms mean for 9 h, the
+                 * flash+beep ruler +0.2..+1.6 ms on the same class) */
+                int64_t out_a_us = av_rescale(filt->pts + a->af_line, 1000000, a->out_rate);   /* the sound's place (us) */
                 int64_t h0_us    = (h0 == AV_NOPTS_VALUE) ? 0 : h0;
                 int64_t content  = src_abs_us;                                    /* abs source content of this audio frame */
                 int64_t out_v, msrc;
@@ -1616,7 +1682,15 @@ static int audio_drain_fg(AudioState *a)
                 if (!(a->multiview && a->mvf_hi_us > a->mvf_lo_us &&             /* T-093: fill phase frames carry no */
                       src_abs_us >= a->mvf_lo_us && src_abs_us < a->mvf_hi_us) &&  /* content to pair */
                     vring_lookup(a->vring, content, out_a_us, &out_v, &msrc) == 0) {
-                    int64_t vlag   = out_v    - (msrc    - h0_us);   /* video realized output − content (at msrc) */
+                    int64_t plag   = out_v    - (msrc    - h0_us);   /* video realized output − content (at msrc) */
+                    /* 2.2.3 T-515: a mosaic slot's pictures land on house ticks — each one up to a tick off the slot's
+                     * realized lag (nearest-tick placement, a rate-converted slot's cadence); the lag they realize is
+                     * that average (mv_tl_pick), the place the sound is put at. One paired picture read its own residue
+                     * (vlag sawing -246..-218 ms on a 25p slot in 29.97, +-17 ms around the ruler's mean): the realized
+                     * lag is the video side, the picture's own lag only when it is off it by more than tick rounding
+                     * (a catch-up's late pictures, a held cell) */
+                    int64_t vlag   = a->multiview && a->af_out_set && llabs(plag - a->af_lag) <= PTV_MV_VLAG_ROUND_US
+                                   ? a->af_lag : plag;
                     int64_t alag   = out_a_us - (content - h0_us);   /* audio realized output − content (at content) */
                     int64_t offset = vlag - alag;                    /* the content-referenced (via shared h0) lip-sync the
                                                                        * PLAYER sees — not the raw out_v−out_a, which carries
@@ -2143,6 +2217,7 @@ int ptv_cv_setup(AudioState *a, int rate, enum AVSampleFormat fmt, const AVChann
 }
 
 static int audio_feed(AudioState *a, AVFrame *frame);
+static void nbs_fill_quantum(AudioState *a);
 
 /* 2.1 T-409 (P1, design §3.3/§5.2): the audio is placed where the VIDEO showed the same content (its record, vmap), not
  * with the house_skew of the moment the frame reaches the door — the video shows a label ~1 s after its sound arrives, and
@@ -2173,13 +2248,14 @@ static int vm_drain(AudioState *a, int force)
     int ret = 0;
     while (a->vm_n && ret >= 0) {
         AVFrame *f = a->vm_q[0];
-        int64_t o = AV_NOPTS_VALUE, gap = 0, lab = av_rescale_q(f->best_effort_timestamp, a->ist_tb, AV_TIME_BASE_Q);
-        int r = ptv_vmap_lookup(lab, &o, &gap);
+        int64_t o = AV_NOPTS_VALUE, gap = 0, res = 0, lab = av_rescale_q(f->best_effort_timestamp, a->ist_tb, AV_TIME_BASE_Q);
+        int r = ptv_vmap_lookup_res(lab, &o, &gap, &res);
         if (r == 0 && !force && (now - a->vm_wc[0] < 3000000 ||
             now - atomic_load_explicit(&g_src_fresh_wc, memory_order_relaxed) < 500000))
             break;                                  /* not on air yet: wait while the video still shows new pictures (a burst
                                                      * backlog waits its whole bank delay), at least 3 s */
-        a->vm_out_us = r == 1 && gap <= FFMAX(2 * tick, 50000) ? o : AV_NOPTS_VALUE;
+        /* 2.2.3 T-517: without the frame's own sub-tick rounding — the phase term adds the picture phase (audio_feed) */
+        a->vm_out_us = r == 1 && gap <= FFMAX(2 * tick, 50000) ? o - res : AV_NOPTS_VALUE;
         /* content never shown as such (its pictures cut at the burst door, or still held when the video went stale):
          * it continues where the previous frame was placed — the house_skew placement belongs to another domain
          * (sync_bursty_20: 4 frames at the end of a cut stepped the door input −15 s, audio PID dark 1.6 s) */
@@ -2741,6 +2817,57 @@ graph_in:
                        "[PTV-CONV] a%d(in%d) seam-park expired — converging re-enabled\n",
                        a->dbg_k, a->dbg_in);
             }
+            /* 2.2.3 T-519 (measured, sync_catchup_8 on a mosaic: an 8 s stall, the backlog at 2.6x): the fill has played
+             * silence up to the wall clock, the returning sound starts 6.7 s behind its front. Released at the first real
+             * frame, the fill stopped and aresample dropped the late sound until it reached the front 2.6 s later
+             * ([PTV-ACOMP] input pts step -6805 ms): nothing on this track meanwhile and the mux waited for it — the
+             * slot's audio PID dark 2.6-2.7 s, the mosaic's video PID 1.6-1.7 s on the wire. A real frame wholly behind
+             * the front is the sound of a time already played as silence: it is dropped here (as aresample did) and the
+             * fill goes on at wall pace until the sound reaches the front — the track never pauses. Bounded: only while
+             * the sound closes in (80 ms nearer within every second: a backlog), and only sound from the span the fill
+             * covers (a label more than 1 s before the fill's start is a step back: taken at once, as before). A source
+             * that stays late (resumed where it stopped, at real-time pace) never closes in: the slot re-locks behind
+             * its pictures (late for 1 s) and the sound takes that lag step when a frame crosses its boundary — a fill
+             * frame, so the fill goes on until it has (the step's silence is in the line: the track stays alive while
+             * aresample drops the overlap) — while the slot's picture is not on its place (no sensor reading for
+             * 0.5 s: held, late, or not back yet — a picture that returns mid-GOP is up to a GOP behind its sound),
+             * 4 s at most. With the picture on its place no re-lock is coming (the sound alone relabelled behind
+             * its fill: sync_aback): taken as it comes after that one second, as before. The mosaic's follow path
+             * only: single input returns through the hold's rejoin buffer (the same scenario runs clean there) */
+            if (g_glueclass && a->nbs_fill_active && !a->nbs_feeding && a->multiview && g_audio_follow) {
+                int64_t fd  = frame->sample_rate > 0 ? av_rescale(frame->nb_samples, 1000000, frame->sample_rate) : 0;
+                int64_t gap = a->glue_raw_last_us + a->glue_raw_dur_us - (raw_us + fd);
+                int64_t mvw = a->dbg_in >= 0 && a->dbg_in < PTV_MAX_INPUT ?
+                              atomic_load_explicit(&g_rsx.mv_wall[a->dbg_in], memory_order_relaxed) : 0;
+                if (gap >= 0 && raw_us >= a->nbs_lo_us - 1000000) {
+                    if (!a->nbs_cu_wc || gap < a->nbs_cu_ref - 80000) {
+                        if (!a->nbs_cu_wc)
+                            av_log(NULL, AV_LOG_WARNING, "[PTV-ADISC] a%d(in%d) real frames resumed %"PRId64" ms behind "
+                                   "the silence already played — the fill goes on until they reach it\n",
+                                   a->dbg_k, a->dbg_in, (gap + fd) / 1000);
+                        if (!a->nbs_cu_wc) {
+                            a->nbs_cu_at  = a->af_step_at;
+                            a->nbs_cu_wc0 = now_wc;
+                        }
+                        a->nbs_cu_ref = gap;
+                        a->nbs_cu_wc  = now_wc;
+                    }
+                    if (now_wc - a->nbs_cu_wc < 1000000 ||
+                        (a->af_step_at == a->nbs_cu_at && now_wc - a->nbs_cu_wc0 < 4000000 &&
+                         (!mvw || now_wc - mvw > 500000))) {
+                        a->nbs_cu_n++;
+                        nbs_fill_quantum(a);
+                        return 0;
+                    }
+                    av_log(NULL, AV_LOG_WARNING, "[PTV-ADISC] a%d(in%d) the returning sound stays %"PRId64" ms behind "
+                           "the fill (no nearer in 1 s) — taken as it comes\n", a->dbg_k, a->dbg_in, (gap + fd) / 1000);
+                } else if (a->nbs_cu_n)
+                    av_log(NULL, AV_LOG_INFO, "[PTV-ADISC] a%d(in%d) the returning sound reached the fill: %d frames "
+                           "(%.1f s) behind it dropped\n", a->dbg_k, a->dbg_in, a->nbs_cu_n,
+                           a->nbs_cu_n * fd / 1e6);
+                a->nbs_cu_wc = 0;
+                a->nbs_cu_n  = 0;
+            }
             if (g_glueclass && a->nbs_fill_active && !a->nbs_feeding) {
                 a->nbs_fill_active = 0;
                 if (a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO && !a->hold_fill_us)
@@ -2799,11 +2926,16 @@ graph_in:
         if (a->vm_feeding && a->vm_out_us != AV_NOPTS_VALUE && frame->pts != AV_NOPTS_VALUE) {
             int64_t h0;
             pthread_mutex_lock(a->h0_lock); h0 = *a->h0; pthread_mutex_unlock(a->h0_lock);
-            if (h0 != AV_NOPTS_VALUE)               /* output = door - h0: exactly where the video put this content */
-                frame->pts = av_rescale_q(a->vm_out_us + h0 + g_vph_bias_us, AV_TIME_BASE_Q, a->ist_tb);
-            a->vph_wc = 0;                          /* 2.2.2 T-499: the record holds the picture's phase already; the
-                                                     * first house_skew-door frame after it starts on the target */
-            a->vph_us = atomic_load_explicit(&g_vph_tgt_us, memory_order_relaxed);
+            /* output = door - h0: where the video put this content, with the house_skew its picture was shown with.
+             * 2.2.3 T-517: the sub-tick part is the house_skew door's phase term (T-499), not the picture's own rounding
+             * (the record dropped it): film pictures round to the grid up to a tick apart, and each one placed its
+             * sound — '[PTV-ATRIM] input stepped back 17 ms' ~6 times a second after every hold (the door stays on).
+             * The phase term follows a steady picture phase (and nets its wraps) as on the house_skew door; film = 0 */
+            if (h0 != AV_NOPTS_VALUE) {
+                int64_t sk = a->vm_out_us + h0 - av_rescale_q(frame->pts, a->ist_tb, AV_TIME_BASE_Q);
+                frame->pts = av_rescale_q(a->vm_out_us + h0 + (g_vphase ? vph_door(a, frame, sk) : g_vph_bias_us),
+                                          AV_TIME_BASE_Q, a->ist_tb);
+            }
         } else if (g_avlock && a->house_skew && !(a->multiview && g_audio_follow) && frame->pts != AV_NOPTS_VALUE &&
             !a->hold_feeding) {
             int64_t sk = hs_door(a, frame, *a->house_skew);
@@ -3790,6 +3922,9 @@ static void nbs_fill_quantum(AudioState *a)
         a->nbs_last_wall_us = 0;
         a->nbs_carry_us     = 0;
         a->nbs_engage_wc    = av_gettime_relative();
+        a->nbs_lo_us        = a->glue_raw_last_us + a->glue_raw_dur_us;
+        a->nbs_cu_wc        = 0;
+        a->nbs_cu_n         = 0;
         av_log(NULL, AV_LOG_WARNING,
                "[PTV-ADISC] a%d(in%d) silence-fill ENGAGED — nothing decoding on this track while "
                "video flows (packets corrupt-discarded, or none arriving for 2 s); synthesizing "

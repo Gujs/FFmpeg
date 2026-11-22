@@ -5,6 +5,7 @@
 #include <stdatomic.h>
 #include <time.h>
 
+#include "libavutil/avstring.h"
 #include "libavutil/avutil.h"
 #include "libavutil/log.h"
 #include "libavutil/opt.h"
@@ -108,6 +109,49 @@ typedef struct MvTlSlot {
     int     pend_gap;                               /* the pending picture: the full queue dropped pictures before it */
 } MvTlSlot;
 
+/* TEST-ONLY (PTV_TEST_MVSTEP_AT=K:FILE[:MS], 2.2.3 T-523): slot K's lag steps take their boundary at the first flash of the
+ * kit's ruler schedule (FILE = a SRC.markers.json: its first list, source seconds) + MS at or past the boundary they chose — a
+ * step whose boundary lands on a flash (or MS into it), the race of the sound's boundary with the picture's made
+ * deterministic. Never set in production */
+static int64_t mv_test_step_at(int k, int64_t nat, int64_t h0)
+{
+    static int init, tk = -1, nt;
+    static int64_t tt[4096], off;
+    int i;
+    if (!init) {
+        const char *e = getenv("PTV_TEST_MVSTEP_AT");
+        char path[1024];
+        FILE *f = NULL;
+        init = 1;
+        if (e && strchr(e, ':')) {
+            char *c;
+            av_strlcpy(path, strchr(e, ':') + 1, sizeof(path));
+            if ((c = strrchr(path, ':'))) {
+                *c  = 0;
+                off = (int64_t)(atof(c + 1) * 1000);
+            }
+            f = fopen(path, "r");
+        }
+        if (f) {
+            int ch, depth = 0;
+            double v;
+            tk = atoi(e);
+            while ((ch = fgetc(f)) != EOF && depth < 2)       /* into the first inner list */
+                depth += ch == '[';
+            while (nt < 4096 && fscanf(f, " %lf ,", &v) == 1)  /* up to its ']' */
+                tt[nt++] = (int64_t)(v * 1e6 + 0.5) + off;
+            fclose(f);
+            av_log(NULL, AV_LOG_WARNING, "[PTV-TEST] in%d lag steps on the flashes of %s %+"PRId64" ms (%d)\n", tk, path, off / 1000, nt);
+        }
+    }
+    if (k != tk || h0 == AV_NOPTS_VALUE)
+        return nat;
+    for (i = 0; i < nt; i++)
+        if (tt[i] - h0 >= nat)
+            return tt[i] - h0;
+    return nat;
+}
+
 /* A lag step takes effect at a CONTENT boundary, for the picture and the sound alike. The sound for the content in flight
  * is already placed with the old lag (it waits in the delivery gate with its timestamps): a step at a moment in time
  * moved the picture while that sound stayed, and they skipped different content (mv04 sync_flapping, a -2.4 s re-lock:
@@ -127,16 +171,26 @@ static void mv_tl_step(CompositorCtx *c, int k, MvTlSlot *s, int64_t lag, int64_
         s->nat = s->shown_src + s->cad;
         if (ah && h0 != AV_NOPTS_VALUE)
             s->nat = FFMAX(s->nat, ah - h0 + 200000);   /* + what the sound may place before it sees the step */
+        s->nat = mv_test_step_at(k, s->nat, h0);
         s->stepping = 1;
     }
+    /* 2.2.3 T-523: a step down skips the content from the old due line to the boundary, pictures and sound alike, as an
+     * overflow's does, when the sound has not placed it yet (a drift step: a tick inside the 200 ms above): those pictures
+     * are due no earlier than the boundary's own and were superseded — or one waiting there held the boundary's picture a
+     * tick — while the sound dropped the content after the boundary: a flash just past it shown a tick before its beep
+     * (+33 ms). A larger step down keeps both skipping after the boundary (the pictures before it shown on the old lag, then
+     * the newest due; the sound's drop from the boundary on) */
+    if (!s->gapstep)
+        s->skip_from = lag < s->lag && h0 != AV_NOPTS_VALUE && s->nat - (s->lag - lag) >= ah - h0
+                     ? s->nat - (s->lag - lag) : s->nat;
     s->nlag      = lag;
     s->relock_wc = now_us;
     s->nmin      = 0;                               /* the depth history read the old lag: 60 s of fresh evidence
                                                      * before the next drift step (one 0.7 s source hole stepped
                                                      * +40 ms every 10 s to +240 ms: Curiosity replay) */
     atomic_store_explicit(&c->inputs[k].tl_nlag_us, s->real + (lag - s->lag), memory_order_relaxed);
-    /* an overflow step: the picture skipped from the old due line (the boundary less the step) to the boundary */
-    atomic_store_explicit(&c->inputs[k].tl_skip_us, s->gapstep && h0 != AV_NOPTS_VALUE ? s->skip_from + h0 : INT64_MAX,
+    /* a step down: the picture skips from the old due line (the boundary less the step) to the boundary, the sound too */
+    atomic_store_explicit(&c->inputs[k].tl_skip_us, s->skip_from < s->nat && h0 != AV_NOPTS_VALUE ? s->skip_from + h0 : INT64_MAX,
                           memory_order_relaxed);
     atomic_store_explicit(&c->inputs[k].tl_at_us, h0 != AV_NOPTS_VALUE ? s->nat + h0 : INT64_MIN, memory_order_release);
 }
@@ -175,7 +229,7 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
     pthread_mutex_lock(&c->inputs[k].h0_lock); h0 = c->inputs[k].h0; pthread_mutex_unlock(&c->inputs[k].h0_lock);
     dry = s->pop_wc && now_us - s->pop_wc >= 500000;
     for (;;) {
-        int64_t fs;
+        int64_t fs, fd;
         nx = *pending;
         *pending = NULL;
         gap = s->pend_gap;
@@ -217,11 +271,17 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
         /* the picture nearest the tick: due half a picture ahead of it — half a tick, or half the slot's own period
          * when it is faster than the house. A 59.94 slot in 29.97 put every second picture ON the half-tick line,
          * and a 1/90000 s stamp difference moved it across: 1-3-1-3 pictures a tick instead of 2 (T-341) */
-        if (s->stepping && s->gapstep && fs >= s->skip_from && fs < s->nat) {   /* inside an overflow step's skip */
-            av_frame_free(&nx);
-            continue;
+        fd = fs;
+        if (s->stepping && fs >= s->skip_from && fs < s->nat) {   /* inside a step's skip (T-523: a step down's too) */
+            if (fs + s->cad <= s->nat) {
+                av_frame_free(&nx);
+                continue;
+            }
+            fd = s->nat;                            /* 2.2.3 T-523: across the boundary it shows the content at the
+                                                     * boundary — due at the boundary's place (dropped, a flash there
+                                                     * showed from its next picture, its beep from the boundary: -23 ms) */
         }
-        if (fs > out - mv_tl_lag(s, fs) + FFMIN(half, s->cad / 2)) {
+        if (fd > out - mv_tl_lag(s, fd) + FFMIN(half, s->cad / 2)) {
             /* 2.1 T-411/T-414: the full queue dropped the pictures before this one (a decoder catching up after the
              * compose, a burst past the queue's capacity): waiting for its time shows nothing meanwhile (up to the
              * queue's 5.3 s: bars every 5.3 s on a mass restart's slots, a bursty slot's re-lock never due). An
@@ -249,7 +309,7 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
                 }
             }
         }
-        if (fs > out - mv_tl_lag(s, fs) + FFMIN(half, s->cad / 2)) {
+        if (fd > out - mv_tl_lag(s, fd) + FFMIN(half, s->cad / 2)) {
             /* content far ahead of its time (10 s past the margin) with nothing shown for 3 s — labels the timeline
              * left ahead: re-lock behind it with the primed margin. Content a burst brings ahead of its time is
              * normal for a bursty source and waits (re-locking on 1 s churned an HLS-burst slot every few seconds) */
@@ -332,7 +392,11 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
                 s->real = s->lag;
             /* ... by at most a picture per sample: two source pictures labelled 29 pictures old (RAV slot 1, a 29.97i
              * feed, at 36 s) moved it 30 ms, the sound chased it there and back in half-frame steps and kept -7.5 ms */
-            {
+            /* 2.2.3 T-518: ... and only from a picture on its place. A backlog's pictures are shown late while the slot
+             * catches up (above) and realize no lag: 3.8 s of them walked this +126 ms (a picture per sample, / 32), the
+             * sound was re-placed after it ("+81.2 ms (drift)") and played up to 116 ms late for 6 s after the return
+             * (sync_catchup_8, flash against beep) */
+            if (smp - s->lag <= 500000) {
                 int64_t w = FFMAX(c->tick_dur_us, s->cad);
                 s->real += av_clip64(smp - s->real, -w, w) / 32;
             }
@@ -485,13 +549,13 @@ void *compositor_thread(void *arg)
     int64_t rung_pts[PTV_MAX_RUNG] = {0};
     /* 1.0.1-pre16 mv sensor port: per-slot video-side EMA state (the compositor is the ONE
      * writer of g_rsx.mv_ema/mv_wall[*] on mv — the single-input master-rung mirror). τ ≈ 30s
-     * of ticks, divisor verbatim from the single-input sensor (ptvencoder_clock.c). */
+     * (2.2.3 T-515: of pictures shown, each weighing the time since the last one). */
     int64_t rs_mv_ema[PTV_MAX_INPUT] = {0};
     int     rs_mv_seed[PTV_MAX_INPUT] = {0};
-    int64_t rs_mv_div;
     int64_t rs_mv_src[PTV_MAX_INPUT];         /* 2.0.1 T-362: the slot's last displayed source pts */
     int64_t rs_mv_adv[PTV_MAX_INPUT] = {0};   /* 2.0.1 T-362: the tick its displayed picture last changed */
     int64_t rs_mv_rel[PTV_MAX_INPUT] = {0};   /* 2.0.1 T-362: -1 in a hold, else the tick it ended (0 = none) */
+    int64_t rs_mv_ftk[PTV_MAX_INPUT] = {0};   /* 2.2.3 T-515: the output time of the last picture measured */
     int     born[PTV_MAX_INPUT] = {0};   /* pre17: slot has displayed its first fresh frame
                                           * (clears the slot's birth slate-mask bit below) */
     AVFrame *filt = av_frame_alloc();
@@ -517,8 +581,6 @@ void *compositor_thread(void *arg)
         if (!c->inputs[k].deferred)   /* 2.0.2 T-386: a slot not live at the start must not freeze the live slots'
                                        * correction until it joins (GAFamily: 3 days without correction) */
             atomic_fetch_or_explicit(&g_mv_slate_mask, 1 << k, memory_order_relaxed);
-    rs_mv_div = c->tick_dur_us > 0 ? 30000000 / c->tick_dur_us : 750;
-    if (rs_mv_div < 8) rs_mv_div = 8;
     if (n_prime > g_frameq_cap - 8) n_prime = g_frameq_cap - 8;
     if (n_prime < 0) n_prime = 0;
     res_occ_tgt = n_prime > 4 ? n_prime : 4;   /* v0.9.13 servo target = the primed jitter depth,
@@ -783,7 +845,18 @@ void *compositor_thread(void *arg)
                             rs_mv_src[k] = disp_src;
                             rs_mv_adv[k] = tick;
                         }
-                        if (mv_tick_us(c, tick) - mv_tick_us(c, rs_mv_adv[k]) >= 500000) {
+                        /* 2.2.3 T-518 (measured, cow-2 MV_1x2_AmericanStories_AWE + sync_catchup_8): a source back from
+                         * an 8 s stall with its backlog at 2.6x real time — the slot shows the backlog's pictures late
+                         * while it catches up (mv_tl_pick: 6.6 s late at the return, each less late than the one before,
+                         * on its place 3.8 s later). They move, so the hold rule above released after 1 s and the EMA
+                         * seeded on a picture still 4.7 s late: lipsync= +4762 ms decaying over 3 min on a slot in sync
+                         * ([PTV-SYNCCHK] "in sync +0 ms ... lipsync +3864 ms"). A picture more than 0.5 s late is the
+                         * frame sync catching up or about to re-lock (it re-locks behind pictures that stay late: the
+                         * lag step reseeds) — no content to measure either: `--`, the EMA reseeds 1 s after the
+                         * pictures are back within 0.5 s of their place. One burst (sync_stop_8) is over inside that
+                         * second and never showed it */
+                        if (mv_tick_us(c, tick) - mv_tick_us(c, rs_mv_adv[k]) >= 500000 ||
+                            mv_tick_us(c, tick) - mv_tl_lag(&tl_slot[k], disp_src - h0k) - (disp_src - h0k) > 500000) {
                             rs_mv_seed[k] = 0;
                             rs_mv_rel[k]  = -1;
                         } else if (rs_mv_rel[k] == -1)
@@ -791,10 +864,25 @@ void *compositor_thread(void *arg)
                         else if (rs_mv_rel[k] > 0 && mv_tick_us(c, tick) - mv_tick_us(c, rs_mv_rel[k]) < 1000000)
                             ;
                         else {
+                            /* 2.2.3 T-515: a picture is measured once, where it is first shown, and weighs the time
+                             * since the last one (tau stays 30 s). Per tick, a rate-converted slot's repeats weighed
+                             * twice — and the pictures held two ticks are the ones shown late (nearest-tick placement):
+                             * lipsync= read the sound early by that much on a 25p slot in 29.97, beside the delay
+                             * line below the sound (T-514: the ruler read +0.2..+1.6 ms, the sensor +4.8..+13.6) */
                             rs_mv_rel[k] = 0;
-                            if (!rs_mv_seed[k]) { rs_mv_ema[k] = m; rs_mv_seed[k] = 1; }
-                            else rs_mv_ema[k] += (m - rs_mv_ema[k]) / rs_mv_div;
-                            atomic_store_explicit(&g_rsx.mv_ema[k], rs_mv_ema[k], memory_order_relaxed);
+                            if (fresh && !rs_mv_seed[k]) {
+                                rs_mv_ema[k] = tl_slot[k].real - h0k;   /* T-515: the realized lag, not one picture's
+                                                                         * rounding (+-17 ms on a 25p slot in 29.97,
+                                                                         * decaying over 30 s after every lag step) */
+                                rs_mv_seed[k] = 1;
+                                rs_mv_ftk[k] = mv_tick_us(c, tick);
+                            } else if (fresh) {
+                                int64_t dt = av_clip64(mv_tick_us(c, tick) - rs_mv_ftk[k], 0, 500000);
+                                rs_mv_ema[k] += (m - rs_mv_ema[k]) * dt / 30000000;
+                                rs_mv_ftk[k] = mv_tick_us(c, tick);
+                            }
+                            if (rs_mv_seed[k])
+                                atomic_store_explicit(&g_rsx.mv_ema[k], rs_mv_ema[k], memory_order_relaxed);
                             atomic_store_explicit(&g_rsx.mv_wall[k], now_us, memory_order_relaxed);
                         }
                     }

@@ -47,7 +47,7 @@
 const char program_name[] = "ptvencoder";
 const int  program_birth_year = 2026;
 
-#define PTVENCODER_VERSION "2.2.2"   /* bump per release; notes go in ptvencoder-changelog.md */
+#define PTVENCODER_VERSION "2.2.3-pre1"   /* bump per release; notes go in ptvencoder-changelog.md */
 #define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 int     g_diag;
 /* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -126,15 +126,17 @@ int g_mv_ccvmap = 1;
 int64_t g_max_delay_us = -1;
 static pthread_mutex_t vmap_lock = PTHREAD_MUTEX_INITIALIZER;
 static int64_t vmap_src[PTV_VMAP_N], vmap_out[PTV_VMAP_N], vmap_wc[PTV_VMAP_N];
+static int64_t vmap_res[PTV_VMAP_N];            /* 2.2.3 T-517: the frame's sub-tick rounding (T-499 r), us */
 static int     vmap_w, vmap_n;                  /* next write slot, entries held */
 
-void ptv_vmap_push(int64_t src_us, int64_t out_us)
+void ptv_vmap_push(int64_t src_us, int64_t out_us, int64_t res_us)
 {
     pthread_mutex_lock(&vmap_lock);
     if (vmap_n && src_us < vmap_src[(vmap_w + PTV_VMAP_N - 1) % PTV_VMAP_N] - 1000000)
         vmap_n = 0;                             /* the content timeline stepped back: a new epoch */
     vmap_src[vmap_w] = src_us;
     vmap_out[vmap_w] = out_us;
+    vmap_res[vmap_w] = res_us;
     vmap_wc[vmap_w]  = av_gettime_relative();
     vmap_w = (vmap_w + 1) % PTV_VMAP_N;
     if (vmap_n < PTV_VMAP_N)
@@ -176,6 +178,14 @@ int ptv_vmap_newest(int64_t since_wc, int64_t *src_us, int64_t *out_us)
  * was never shown (skipped, erased, lost in an outage); 0 = not yet (or nothing recorded); -1 = c_us is older than everything held by > 1 s. */
 int ptv_vmap_lookup(int64_t c_us, int64_t *out_us, int64_t *gap_us)
 {
+    return ptv_vmap_lookup_res(c_us, out_us, gap_us, NULL);
+}
+
+/* 2.2.3 T-517: ... and *res_us = the sub-tick rounding of the frame that placed c_us (the time between its tick and its
+ * label's house time: what content_index() rounded away, T-499's r; 0 = not known). out_us - res_us = the placement
+ * with the house_skew that frame was shown with, without its own rounding */
+int ptv_vmap_lookup_res(int64_t c_us, int64_t *out_us, int64_t *gap_us, int64_t *res_us)
+{
     int k, i, hit = -1, ret, newest, held = 0;
     pthread_mutex_lock(&vmap_lock);
     for (k = 0; k < vmap_n; k++) {             /* newest -> oldest: the oldest entry still >= c_us */
@@ -204,6 +214,8 @@ int ptv_vmap_lookup(int64_t c_us, int64_t *out_us, int64_t *gap_us)
     else {
         *out_us = vmap_out[hit] - (vmap_src[hit] - c_us);
         *gap_us = vmap_src[hit] - c_us;
+        if (res_us)
+            *res_us = vmap_res[hit];
         if (k < vmap_n && c_us < vmap_src[hit]) {
             /* c_us lies between two shown frames: if the output ran on further than the content between them (a hold
              * or an outage the timeline erased — the labels continue across it), c_us itself was never shown */
