@@ -888,6 +888,27 @@ static void vwait_follow_video(DemuxArgs *d, int64_t vpos, int64_t dpo)
  * multiple-of-2^bits offset so every downstream consumer sees one continuous
  * timeline. Keyed on DTS (decode order, monotonic); the SAME offset is added to
  * PTS so A/V copy stays aligned. mpegtsenc masks back to 33 bits on the wire. */
+/* 2.2.3 T-530: the program's position for a half-wrap step — the unwrapped last label of the other dense (video / audio)
+ * stream delivered most recently within 10 s, in this stream's time base (same time base only, as in mpegts);
+ * AV_NOPTS_VALUE when there is none (the stream decides on its own, as before) */
+static int64_t halfwrap_ref(const DemuxArgs *d, int si, int64_t wall_now)
+{
+    const AVStream *st = d->ifmt->streams[si];
+    int64_t best = AV_NOPTS_VALUE, best_wc = 0;
+    int o;
+
+    for (o = 0; o < d->nb_streams_open && o < (int)d->ifmt->nb_streams; o++) {
+        const AVStream *os = d->ifmt->streams[o];
+        if (o == si || d->wrap_last[o] == AV_NOPTS_VALUE || d->wrap_wall_last[o] <= best_wc ||
+            wall_now - d->wrap_wall_last[o] > 10000000 || av_cmp_q(os->time_base, st->time_base) ||
+            (os->codecpar->codec_type != AVMEDIA_TYPE_VIDEO && os->codecpar->codec_type != AVMEDIA_TYPE_AUDIO))
+            continue;
+        best    = d->wrap_last[o] + d->wrap_off[o];
+        best_wc = d->wrap_wall_last[o];
+    }
+    return best;
+}
+
 static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
 {
     AVStream *st = d->ifmt->streams[pkt->stream_index];
@@ -1080,6 +1101,29 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                        "[PTV-DISCONT] stream %d: re-anchored after %.1fh silence (%+"PRId64" wraps; "
                        "delta heuristic aliases past %.1fh)\n",
                        pkt->stream_index, (wall_now - wl) / 3600.0e6, k, guard_us / 3600.0e6);
+            }
+            else if (llabs(llabs(delta) - half) < av_rescale(600, st->time_base.den, st->time_base.num) &&
+                     (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO || st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) &&
+                     halfwrap_ref(d, pkt->stream_index, wall_now) != AV_NOPTS_VALUE) {
+                /* 2.2.3 T-530: a step of about HALF the wrap (2^32 ticks, 13.25 h) reads +half on one stream and -half
+                 * on the next by a few hundred ms either way — the +-half rule below decides each stream on its own,
+                 * so the video and the audio of one program step ended 2^33 apart (glo-4 EPIC_BHARAT, an HLS source
+                 * whose PCR and labels jump +2^32 - 1.2 s: [PTV-TL] video J +95443.758 s, the audio MUTED as off the
+                 * program clock, wire A/V -15 s, sync_check restarts; key sync_halfwrap T056_HW_GAP=1.6: the audio
+                 * 2^33 off, MUXGUARD exit). There the wrap count is the one that lands the packet nearest the other
+                 * dense stream of the program (the one delivered last): the program steps once, its streams together.
+                 * Also the return from one label with bit 32 set (EPIC 22:46): it lands back by the other stream. */
+                int64_t ref = halfwrap_ref(d, pkt->stream_index, wall_now);
+                int64_t cur = raw + d->wrap_off[pkt->stream_index], k;
+                int64_t diff = ref - cur;
+                k = diff >= 0 ? (diff + half) / mask : -((-diff + half) / mask);
+                if (k) {
+                    d->wrap_off[pkt->stream_index] += k * mask;
+                    if (ol) ol->wrap_dw = k * mask;
+                }
+                av_log(NULL, AV_LOG_WARNING, "[PTV-DISCONT] stream %d: a half-wrap step (%+.3f s) — wrap taken by the "
+                       "program (%+"PRId64" wraps, nearest the other stream)\n",
+                       pkt->stream_index, delta * av_q2d(st->time_base), k);
             }
             else if (delta < -half) {
                 d->wrap_off[pkt->stream_index] += mask;  /* 33-bit wrap: rolled forward */
