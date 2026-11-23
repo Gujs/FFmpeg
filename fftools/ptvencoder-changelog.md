@@ -5,6 +5,23 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.3-pre3 — 2.2.3-pre2 + sound through a rejoin after a video-only hole (T-503, T-528)
+
+**T-503 — a rejoin's wait after a video-only hold no longer skips live sound.** When the source's video stops while its
+sound keeps flowing, the returning first picture waits about a base cushion for its slot (T-472). Those waiting ticks were
+counted into house_skew because the video was being read again, so the sound jumped ahead by up to the cushion (3.88 s at
+a 4 s pre-roll) and then the next seconds were dropped as overlap: 1-3 returning pictures without their sound on every
+video-null event since 2.2.1-rc4. The wait now counts as a video-only repeat, like the hold itself.
+
+**T-528 — the silence fill never runs past the picture on air.** On sources with subtitles/teletext (record door active)
+the fill after a video-only hole started from the last real frame placed, which in such a hole was before the hole; it read
+up to 1.4 s past the returning sound and dropped it as overlap (1-2 pictures without sound, since 2.2.1-rc7). The fill is
+now bounded by where the video is on air, so the wire stays continuous but no returning sound is thrown away.
+
+Keys: every sync_vnull_20 (vt-nowall, rich2997b/5994b/25b/50b) now judged strictly (`T056_UNPAIRED_MAX=0`, no returning
+picture may lack its beep): 5/5 FAIL on 2.2.3-pre2, 5/5 PASS on pre3. Full gate (media-v47, 414 keys): no change against
+pre2 except these, the only FAILs the two known SCTE-35 lead-outage keys.
+
 ## 2.2.3-pre2 — 2.2.3-pre1 + two mosaic slots never share a regulator port (T-526), the legend explains a slot's sk (T-522)
 
 **T-526 — two mosaic slots' regulators never share a loopback port.** Each input regulator hands its paced packets to the
