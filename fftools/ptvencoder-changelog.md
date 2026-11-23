@@ -5,6 +5,23 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.3-pre4 — 2.2.3-pre3 + a half-wrap source step keeps sound and picture together (T-530)
+
+**T-530 — a source that steps its whole program by half the timestamp wrap no longer splits video and audio.** glo-4
+EPIC_BHARAT (an HLS source, the ingest copies its bytes) steps its PCR and every label by about 2^32 ticks (13.25 h, half the
+33-bit wrap: `[PTV-REG] in0 PCR jump +47720.6 s`) every few hours. Each stream decided "forward or backward wrap" from its own
+last label; a step that close to half lands a few hundred ms either side of it on the video and the audio (a delivery hole,
+the interleave), so the two ended 2^33 apart: `[PTV-TL]` video `+95443.758 s`, the audio MUTED as off the program clock, the
+wire A/V offset -15 s and a sync_check restart (00:44, 10:01, 17:52, 22:48 on 2026-11-22; EPIC_MUSIC too). A step within 10
+minutes of half now takes the wrap that lands it nearest the other stream of the program, so the program steps once. The
+return from a single label with bit 32 set (EPIC 22:46) lands back by the other stream as well. Logged as `[PTV-DISCONT]
+stream N: a half-wrap step (... s) — wrap taken by the program`.
+
+Keys (kit 86c3312, media-v48 `b1a91b69a32a`): `sync_halfwrap` (the whole program +2^32 - 1.26 s at 40 s and again at 85 s)
+with a 1.6 s hole before each FAILs on 2.2.3-pre3 (the audio 2^33 off, MUXGUARD exit) and PASSes on pre4; with a 1.2 s hole
+(the step within ms of half), without a hole and on std, and the HLS-repeat keys `sync_hlsrepeat_12` / `_2` (a hole, content
+back, the audio first; one video label with bit 32 set after / before the step) PASS.
+
 ## 2.2.3-pre3 — 2.2.3-pre2 + sound through a rejoin after a video-only hole (T-503, T-528)
 
 **T-503 — a rejoin's wait after a video-only hold no longer skips live sound.** When the source's video stops while its
