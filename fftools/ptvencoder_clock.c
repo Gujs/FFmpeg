@@ -1499,7 +1499,8 @@ void *output_thread(void *arg)
             PTV_HB_OUT(PTV_HB_OUT_LOOP);   /* 1.0.1-pre21 heartbeat: stats-thread loop top */
         /* 2.2.1 T-472: a rejoin's first picture waits in nextf until its slot is due (rj_prime_park). These ticks are
          * the hold's own repeats — a dup each, the hold picture on air, house_skew and the fills' clock moving on — not
-         * cadence residence, so the audio fill runs up to the tick the picture is shown on. Bounded by the base cushion
+         * cadence residence, so the audio fill runs up to the tick the picture is shown on (2.2.3 T-503: not after a
+         * video-only hold — the sound kept flowing, the wait is a video-only repeat). Bounded by the base cushion
          * (+2 ticks: h0 or the map moving under it must not hold the picture back) */
         if (rj_park && (!next_have || content_index(v, nextf->pts) <= last_vpts + 1 ||
                         ++rj_park_n > sp_cap(v, base_sp) + 2))
@@ -2123,6 +2124,14 @@ void *output_thread(void *arg)
                 int64_t vr = atomic_load_explicit(&g_src_vread_wc, memory_order_relaxed);
                 int64_t ar = atomic_load_explicit(&g_src_aread_wc, memory_order_relaxed);
                 vo_rep = vr && ar && nwv - vr >= 500000 && nwv - ar < 1000000;
+                /* 2.2.3 T-503: also a rejoin's wait for its slot (T-472) after a video-only hold — the video is read
+                 * again (the frame queue fills), so the rule above saw no outage, and the wait's repeats (the base
+                 * cushion, 3.88 s at a 4 s pre-roll) went into house_skew: the live sound was skipped by that much while
+                 * the picture waited ([PTV-ASTEP] +80..+600 ms steps) and the next 4 s dropped as overlap when house_skew
+                 * came back ([PTV-ATRIM] stepped back 4 s) — 1-3 returning pictures without their beep on every
+                 * sync_vnull_20 since 2.2.1-rc4. The sound never stopped: its place is its label, as through the hold */
+                if (!vo_rep && rj_park && vo_extra && ar && nwv - ar < 1000000)
+                    vo_rep = 1;
                 if (vo_rep) { vo_extra++; vo_fresh_n = 0; }
             }
             /* content moves again: house_skew back on the formula (the rejoin's map step lands here). 2.0.0 T-345: not on
