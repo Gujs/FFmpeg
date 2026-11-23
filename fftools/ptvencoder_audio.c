@@ -4083,6 +4083,19 @@ static void hold_fill_quantum(AudioState *a)
     door   = a->acomp_exp_us;
     if (target - door > 2000000)
         target = door + 2000000;                 /* catch up at most 2 s per sentinel (100 ms apart) */
+    /* 2.2.3 T-528: and never past where the video is on air — the record door's bound above (house output + h0 is the
+     * door's own domain whatever house_skew is). After a hold under the record door this target starts from the last
+     * REAL frame placed, and in a video-only hole none was (they waited at the record door and were dropped whole
+     * behind its fill; T-478 keeps the snapshot of the last one played): from 35.9 s + 17 s of hold ticks it read 1.4 s
+     * past the returning sound, the fill leapt there and the returning sound was dropped as overlap — 1-2 returning
+     * pictures without their beep on every rich*b sync_vnull_20 since 2.2.1-rc7. The bound follows the pictures in real
+     * time, so the fill still keeps the wire continuous (T-478); it only stops filling sound for pictures not shown */
+    {
+        int64_t h0, pos = atomic_load_explicit(&g_house_out_us, memory_order_relaxed);
+        pthread_mutex_lock(a->h0_lock); h0 = *a->h0; pthread_mutex_unlock(a->h0_lock);
+        if (h0 != AV_NOPTS_VALUE && pos > 0)
+            target = FFMIN(target, pos + h0 + a->corr.corr_us + a->sstep_us - 200000);
+    }
     n = dur_us > 0 ? (int)((target - door) / dur_us) : 0;
     if (n < 1)
         return;
