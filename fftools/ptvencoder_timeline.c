@@ -133,6 +133,18 @@ void ptv_tl_grow(PtvTimeline *t, int nb_streams)
         t->nst = nb_streams;                   /* the new slot is zeroed: a stream that has not started */
 }
 
+/* 2.2.3 T-533: the video moved to another PID (taken over in-process): that stream continues the old one's path — the
+ * old one's state moves to it, the old slot is a stream that has not started (it may carry the video again later) */
+void ptv_tl_follow(PtvTimeline *t, int from, int to)
+{
+    if (!t || from < 0 || to < 0 || from >= t->nst || to >= t->nst || from == to)
+        return;
+    t->st[to] = t->st[from];
+    memset(&t->st[from], 0, sizeof(t->st[from]));
+    if (t->active && t->trig == from)
+        t->trig = to;
+}
+
 void ptv_tl_free(PtvTimeline **pt)
 {
     PtvTimeline *t = *pt;

@@ -2345,6 +2345,7 @@ void *demux_thread(void *arg);
 extern int64_t g_tl_open_us;             /* a dense packet this far off its path opens an event (PTV_TL_OPEN_MS, 500) */
 PtvTimeline *ptv_tl_alloc(int nb_streams, int cap);
 void ptv_tl_grow(PtvTimeline *t, int nb_streams);   /* 2.2: an adopted stream joins (up to cap) */
+void ptv_tl_follow(PtvTimeline *t, int from, int to); /* 2.2.3 T-533: a moved video continues the old stream's path */
 void ptv_tl_free(PtvTimeline **t);
 int  ptv_tl_ingest(DemuxArgs *d, AVPacket *pkt);
 void ptv_tl_cut(DemuxArgs *d, int64_t cut_us);
