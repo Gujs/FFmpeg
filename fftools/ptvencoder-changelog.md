@@ -5,6 +5,25 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.3-pre7 — 2.2.3-pre6 + a moved video continues the program's timeline (T-533)
+
+**T-533 — a video that moves to a new PID keeps the bound stream's timeline, and a move back is taken over too.** cow-1
+Western_Bound_Int 2026-11-23 09:31 CST (Amagi SSAI break edges via our ingest; the cor-1 control on 2.2.2 the same, worse):
+the source stepped its program clock back 120.1 s (erased: k +120.1 s), then 5 s later moved video 0x100 -> 0x1e1 and audio
+0x101 -> 0x1ec with the labels going on. The audio take-over (T-484) keeps the old stream's state; the video take-over (T-387)
+started the new stream from a fresh one, without k. Picture and sound ended up 120 s apart: ~30 s of silence, then the sound
+placed +100..+119 s and sync_check restarts. Present in every 2.2.x. The moved video now continues the old stream: k
+(wrap_off), the wrap and wall references, the edit ledger the sync check reads and the timeline path move with it
+(`ptv_tl_follow`); a label difference at the move is an ordinary timeline event. A video moving BACK to a PID it left (the
+break ends on the old PIDs) is now taken over the same way (`video moved to pid ... taken over in-process`) instead of being
+dropped until the 30 s LOST reopen.
+
+Keys (kit 2230d28, media-v50 `60d5496d714f`): `vt-t533 move` / `vt-t533 back` (production single input, the cap-wbint
+capture with the break edge rebuilt from the production log: -120.1 s step, video+audio PID move 5 s later, b moves back
+20 s after; judged by lip sync against the unmoved source by content) FAIL on 2.2.3-pre6 (content live share 0.73 / 0.69, no
+reliable window after the move) and PASS here (worst -13 / -3 ms). Full gate (media-v48, 427 keys) against pre6's gate:
+0 regressions.
+
 ## 2.2.3-pre6 — 2.2.3-pre5 + a mosaic slot's sound stays with its pictures after a source PCR step back (T-532)
 
 **T-532 — a mosaic slot re-locks to the lag its pictures show once they stay late by more than 2 ticks (was 0.5 s).** cow-2
