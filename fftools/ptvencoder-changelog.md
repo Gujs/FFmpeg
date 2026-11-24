@@ -5,6 +5,23 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.3-pre6 — 2.2.3-pre5 + a mosaic slot's sound stays with its pictures after a source PCR step back (T-532)
+
+**T-532 — a mosaic slot re-locks to the lag its pictures show once they stay late by more than 2 ticks (was 0.5 s).** cow-2
+MV_2x2_TruBlue_Law&Crime: TruBlue steps its PCR back about 0.7 s every 4-10 minutes and the input regulator holds it (`PCR
+jump -0.7 s — schedule continued (1.2 s held)`). At about one step in three the slot's buffer ran empty and its pictures were
+shown 0.23-0.26 s past the lag for ~10 s, catching up a tick a second. The sound follows the shown pictures' lag only through
+the smoothed `real` (~15 ms a second), so it played up to 0.27 s EARLY on air for 5-7 s (measured against the source), then
+about +40 ms for ~8 s. Present in 2.2.2 and every 2.2.3 pre. The late re-lock (late for 1 s at real-time pace) now engages
+beyond 2 ticks instead of 0.5 s; below 0.5 s it takes the lag the pictures show without adding the primed margin, so the sound
+joins them at the step's boundary (`[PTV-MV] inN re-locked: picture +NNN ms (late for 1 s)`); the buffer refills as the
+source catches up and the drift rules shed it later.
+
+Key (kit 20fdf0e, media-v49 `aad0bd3dfa05`): `mv-t532` (the production 2x2 mosaic, slot 1 = the cow-2 TruBlue source capture
+replayed on its recorded arrival times, 600 s; slot 1 judged against the source in 3 s windows) FAILs on 2.2.2 and 2.2.3-pre5
+(-244 / -243 ms at output 156 s, 5 consecutive windows) and PASSes here (no two consecutive windows beyond +-100 ms). Full gate
+(media-v48, 423 keys) against pre5's gate: 0 regressions.
+
 ## 2.2.3-pre5 — 2.2.3-pre4 + the sensor calibration off by default (T-534)
 
 **T-534 — the sync check no longer recalibrates the averaged lip-sync sensor (lipsync=, the slow corrector).** Since
