@@ -1415,6 +1415,65 @@ static int video_bind_send(DemuxArgs *d, AVFormatContext *f, int vs)
     return 0;
 }
 
+/* 2.2.3 T-533: the video moved to stream ni — it continues the bound stream's timeline. Every per-stream state the unwrap
+ * and the timeline keep (the program offset k inside wrap_off, the wrap and wall references, the edit ledger the sync
+ * check reads, the path) moves with it, as the audio's take-over keeps its stream's; a label difference at the move is
+ * then an ordinary timeline event. Was: ni started from zero — after a program event (cow-1 Western_Bound_Int 2026-11-23,
+ * an SSAI break: -120.1 s erased, k +120.1 s, then video and audio to new PIDs 5 s later) the video ran 120 s behind the
+ * program clock while the audio, on its own stream's offset, stayed on it: the sound placed +100..+119 s, 30 s of
+ * silence, sync_check restarts */
+static void video_follow(DemuxArgs *d, int was, int ni)
+{
+    AVRational tf = d->ifmt->streams[was]->time_base, tt = d->ifmt->streams[ni]->time_base;
+    d->wrap_off[ni] = av_rescale_q(d->wrap_off[was], tf, tt);
+    d->wrap_last[ni] = d->wrap_last[was] == AV_NOPTS_VALUE ? AV_NOPTS_VALUE : av_rescale_q(d->wrap_last[was], tf, tt);
+    d->wrap_wall_last[ni] = d->wrap_wall_last[was];
+    if (d->ts_outl)         d->ts_outl[ni]         = d->ts_outl[was];
+    if (d->edit_us)         d->edit_us[ni]         = d->edit_us[was];
+    if (d->gap_vsnap)       d->gap_vsnap[ni]       = d->gap_vsnap[was];
+    if (d->wall_cad_us)     d->wall_cad_us[ni]     = d->wall_cad_us[was];
+    if (d->pkt_wall_gap_us) d->pkt_wall_gap_us[ni] = d->pkt_wall_gap_us[was];
+    if (d->tail_gap_us)     d->tail_gap_us[ni]     = d->tail_gap_us[was];
+    if (d->tail_wc_us)      d->tail_wc_us[ni]      = d->tail_wc_us[was];
+    ptv_tl_follow(d->tl, was, ni);
+}
+
+/* 2.0.2 T-387 / 2.2 / 2.2.3 T-533: stream si (video, not the bound one) delivers while the bound video is silent >= 2 s:
+ * after 25 such packets the video has moved — taken over in-process (a decoder for it ahead of its next packet, the
+ * picture resumes at its next keyframe). Since T-533 also a stream followed before: the source moving BACK (an SSAI break
+ * ends on the PIDs it left; was: those packets were dropped, the picture dark until the 30 s LOST reopen). Returns 1 when
+ * taken over, 0 when not (yet); no decoder to bind = the reopen, as before */
+static int video_take_over(DemuxArgs *d, int si)
+{
+    int64_t now = av_gettime_relative();
+    int was = d->vstream;
+    if (!d->reopen || d->vmove_force || was < 0 || si == was ||
+        d->ifmt->streams[si]->codecpar->codec_type != AVMEDIA_TYPE_VIDEO)
+        return 0;
+    if (!d->v_last_wc || now - d->v_last_wc < 2000000) {
+        d->vmove_n = 0;
+        return 0;
+    }
+    if (++d->vmove_n < 25)
+        return 0;
+    if (si < d->nb_streams_cap && video_bind_send(d, d->ifmt, si) >= 0) {
+        av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] input '%s': video moved to pid 0x%x (pid 0x%x silent %.1f s) — "
+               "taken over in-process, the picture resumes at its next keyframe\n", d->url, d->ifmt->streams[si]->id,
+               d->ifmt->streams[was]->id, (now - d->v_last_wc) / 1e6);
+        ptv_tl_grow(d->tl, si + 1);
+        video_follow(d, was, si);
+        d->vstream = si;
+        if (d->in) d->in->vstream = si;
+        d->vmove_n = 0;
+        d->v_last_wc = now;
+        return 1;
+    }
+    d->vmove_force = 1;
+    av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] input '%s': video moved to pid 0x%x (pid 0x%x silent %.1f s) — reopening\n",
+           d->url, d->ifmt->streams[si]->id, d->ifmt->streams[was]->id, (now - d->v_last_wc) / 1e6);
+    return 0;
+}
+
 static int slot_bind(DemuxArgs *d)
 {
     struct Input *in = d->in;
@@ -1967,29 +2026,8 @@ void *demux_thread(void *arg)
              * it ahead of its next packet; the picture resumes at its next keyframe) — no reopen, so nothing already
              * played is read again and the cushion is not primed again (the reopen's rough resume: audio overlap trimmed,
              * the picture ~2 s ahead of the sound). No spare slot left: the reopen, as before */
-            if (!adopt && d->reopen && !d->vmove_force && d->vstream >= 0 &&
-                ls->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-                int64_t now = av_gettime_relative();
-                if (!d->v_last_wc || now - d->v_last_wc < 2000000)
-                    d->vmove_n = 0;
-                else if (++d->vmove_n >= 25) {
-                    int was = d->vstream;
-                    if (pkt->stream_index < d->nb_streams_cap && video_bind_send(d, d->ifmt, pkt->stream_index) >= 0) {
-                        av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] input '%s': video moved to pid 0x%x (pid 0x%x silent %.1f s) — "
-                               "taken over in-process, the picture resumes at its next keyframe\n", d->url, ls->id,
-                               d->ifmt->streams[was]->id, (now - d->v_last_wc) / 1e6);
-                        d->vstream = pkt->stream_index;
-                        if (d->in) d->in->vstream = pkt->stream_index;
-                        d->vmove_n = 0;
-                        d->v_last_wc = now;
-                        adopt = 1;
-                    } else {
-                        d->vmove_force = 1;
-                        av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] input '%s': video moved to pid 0x%x (pid 0x%x silent "
-                               "%.1f s) — reopening\n", d->url, ls->id, d->ifmt->streams[was]->id, (now - d->v_last_wc) / 1e6);
-                    }
-                }
-            }
+            if (!adopt && video_take_over(d, pkt->stream_index))
+                adopt = 1;
             /* 2.2.1 T-484: the source renumbered its audio (renumber_return: 0x101 -> 0x201 with the video's move; the
              * video was taken over above, the sound stayed dark for good — "audio track 0 silent for 10 s"). A late-born
              * AUDIO stream that delivers for 1 s while a bound audio stream of the same codec is silent >= 2 s (the same
@@ -2056,6 +2094,10 @@ void *demux_thread(void *arg)
             av_packet_unref(pkt);
             continue;
         }
+        /* 2.2.3 T-533: the video moving back to a stream followed before (the SSAI break ends on the PIDs it left) */
+        if (pkt->stream_index != d->vstream && d->vstream >= 0 &&
+            d->ifmt->streams[pkt->stream_index]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+            video_take_over(d, pkt->stream_index);
         {
             int64_t pnow = av_gettime_relative();
             if (pkt->stream_index == d->vstream) {
