@@ -2245,12 +2245,20 @@ static int vm_mode(const AudioState *a)
 static int vm_drain(AudioState *a, int force)
 {
     int64_t now = av_gettime_relative(), tick = atomic_load_explicit(&g_house_tick_us, memory_order_relaxed);
+    /* 2.2.3 T-529: a video-only outage (video packets gone >= 0.5 s while the source's audio keeps arriving, the clock's
+     * T-076 rule) — the pictures of this sound will never come: it continues now (spec §5.1 "audio continues"). Waiting
+     * starved the track for 3 s, its silence fill started and the released frames landed ~1.25 s behind the fill and were
+     * dropped whole: 13 of a 20 s hole silent on every build since 2.1.0-pre1 (sync_vnull_*). A burst or a whole-source
+     * stall still waits (its sound stops with the video and arrives with the backlog: sync_storm / bursty, T-409). */
+    int64_t vr = atomic_load_explicit(&g_src_vread_wc, memory_order_relaxed);
+    int64_t ar = atomic_load_explicit(&g_src_aread_wc, memory_order_relaxed);
+    int vonly = g_vo_hold && vr && ar && now - vr >= 500000 && now - ar < 1000000;
     int ret = 0;
     while (a->vm_n && ret >= 0) {
         AVFrame *f = a->vm_q[0];
         int64_t o = AV_NOPTS_VALUE, gap = 0, res = 0, lab = av_rescale_q(f->best_effort_timestamp, a->ist_tb, AV_TIME_BASE_Q);
         int r = ptv_vmap_lookup_res(lab, &o, &gap, &res);
-        if (r == 0 && !force && (now - a->vm_wc[0] < 3000000 ||
+        if (r == 0 && !force && !vonly && (now - a->vm_wc[0] < 3000000 ||
             now - atomic_load_explicit(&g_src_fresh_wc, memory_order_relaxed) < 500000))
             break;                                  /* not on air yet: wait while the video still shows new pictures (a burst
                                                      * backlog waits its whole bank delay), at least 3 s */
