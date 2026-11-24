@@ -2430,7 +2430,8 @@ void *output_thread(void *arg)
                 if (!src_lost_logged && arr && nw - arr >= g_lost_after_us) {
                     src_lost_logged = 1;
                     av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 STALLED \xe2\x86\x92 LOST%s: no video "
-                           "packets for %.0f s\n", g_src_hold_act ? "" : " (observe-only)", (nw - arr) / 1e6);
+                           "packets for %.0f s%s\n", g_src_hold_act ? "" : " (observe-only)", (nw - arr) / 1e6,
+                           ptv_src_audio_flowing() ? " — its sound keeps arriving: no reopen while it does (T-529)" : "");
                 }
                 if (nw >= src_note) {   /* reminders: 1/min for 10 min, then every 10 min */
                     av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 still STALLED after %.0f s\n",

@@ -2066,6 +2066,7 @@ extern _Atomic int64_t g_src_fresh_wc;    /* 2.0.0-pre6: wall us of the master's
 extern _Atomic int     g_src_icb_armed;   /* 2.0.0-pre5: the no-video read interrupt is live (single input) */
 extern int             g_backoff_s[8], g_backoff_n;   /* -reopen_backoff (s), 2.0.0-pre2/pre5 */
 int ptv_src_interrupt(void *opaque);     /* 2.0.0-pre5: AVIOInterruptCB — no video read for -lost_after */
+int ptv_src_audio_flowing(void);         /* 2.2.3 T-529: the single input's audio read in the last second */
 void ptv_copy_fill(struct DemuxArgs *d, int64_t now);   /* 2.0.0-pre6: copied AC-3 silence */
 extern _Atomic int64_t g_acq_since;      /* 2.0.0-pre7: wall us a single input began waiting for its source (0 = not) */
 /* 2.0.0-pre8 (T-056 §5.1): the stats line's afill= — current silence-fill run per transcoded track (hold or NBS fill)
