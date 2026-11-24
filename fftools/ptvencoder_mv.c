@@ -354,13 +354,20 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
          * the source comes back on time: no re-prime (it added the margin to the lag at every outage) */
         if (src != AV_NOPTS_VALUE && !s->stepping) {
             int64_t late = out - s->lag - src;
-            if (late <= 500000)
+            /* 2.2.3 T-532: late by more than 2 ticks (was 0.5 s). A source PCR step back held by the regulator (TruBlue
+             * -0.7 s, 1.2 s held) left a slot's pictures 0.23-0.26 s late with the buffer empty for ~10 s, catching up a
+             * tick a second: the sound follows the shown pictures' lag only through `real` (1/32 of a tick a picture,
+             * ~15 ms/s) and played up to 0.27 s EARLY for 5-7 s, then ~+40 ms past them (cow-2 TruBlue mosaic,
+             * mv-t532). Below 0.5 s the slot re-locks to the lag its pictures show: nothing held, the sound joins them
+             * at the step's boundary; the buffer refills as the source catches up and the drift rules shed it later */
+            if (late <= 2 * c->tick_dur_us)
                 s->late_wc = 0;
             else if (!s->late_wc || late < s->late_ref - 2 * c->tick_dur_us) {
                 s->late_wc  = now_us;               /* late, or catching up: (re)start the second */
                 s->late_ref = late;
             } else if (now_us - s->late_wc >= 1000000)
-                relock = out - src + margin;        /* late for 1 s at real-time pace: hold for the primed margin */
+                relock = out - src + (late > 500000 ? margin : 0);   /* late for 1 s at real-time pace: beyond 0.5 s
+                                                                       * hold for the primed margin too */
         }
         if (relock != AV_NOPTS_VALUE && relock - s->lag >= c->tick_dur_us) {   /* grows only */
             av_log(NULL, AV_LOG_WARNING, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (late for 1 s)\n", k,
