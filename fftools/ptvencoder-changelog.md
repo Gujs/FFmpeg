@@ -5,6 +5,23 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.3-pre5 — 2.2.3-pre4 + the sensor calibration off by default (T-534)
+
+**T-534 — the sync check no longer recalibrates the averaged lip-sync sensor (lipsync=, the slow corrector).** Since
+2.2.1-rc10 (T-488) every post-event sync check verdict stored `calibrated A -> B ms` = the sensor's reading minus the
+check's, with no test that the averaged sensor had settled. After a loss burst it is still decaying from the event, so a
+transient was kept as a permanent bias and the slow corrector (dwell 300 s + 180 s quiet) then moved the sound by it:
+cow-1 Fintech_247 2026-11-23, `calibrated +0 -> +210 ms` 14 s after a 1.5 s near-total loss, the corrector steered -203 ms
+and the sound ran ~0.2 s EARLY on air (measured against the source) while lipsync= read about 0. The calibration is now off;
+`PTV_RSCAL=1` turns it back on (A/B only), `PTV_NO_RSCAL` is unchanged. T-488's own fix, the sync check's step as a door
+actuator the corrector does not steer back (rc10), carries T-488 alone: its keys `vt-tbseed` (content worst +2.1 ms, the
+-196 ms step kept) and `vt-tbsplice` (40 min, worst +20.9 ms) PASS without the calibration.
+
+Keys (kit 0fedcf2, media-v48 `b1a91b69a32a`): `vt-t534` / `std-t534` (Cinestar 10 % loss for 200 s; every lipsync= reading
+of the last 60 s within +-25 ms) FAIL on 2.2.3-pre4 and 2.2.2 (calibrated +99 ms, the corrector's reading -97 ms at the end)
+and PASS here. Full gate with the calibration off (pre4 + PTV_NO_RSCAL=1, 423 keys): 0 regressions against pre4's gate;
+the 12 keys that calibrated on pre4 (4 by 50 ms or more) all PASS without it.
+
 ## 2.2.3-pre4 — 2.2.3-pre3 + a half-wrap source step keeps sound and picture together (T-530)
 
 **T-530 — a source that steps its whole program by half the timestamp wrap no longer splits video and audio.** glo-4
