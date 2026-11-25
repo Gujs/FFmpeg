@@ -5,6 +5,32 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.3 — release: 2.2.3-pre7 unchanged, version only
+
+**Same code as 2.2.3-pre7** (adaptive-2.2 fab1f5fd15); only `PTVENCODER_VERSION` changes. Released by the written criteria
+(owner 2026-11-20: "release needs to keep channels stable and in a/v sync"), not by sign-off. What makes it the release:
+- **Soak of pre7** (2026-11-24 ~21:39 CET -> 2026-11-25 21:45 CET, 24 h incl. the US night) on the soak tier live-transcoder (8) +
+  tmtg-cow-transcoder-1 (64) + tmtg-cow-transcoder-2 (29) = 101 channels, every one on its first start: 0 fatal, 0 rung
+  divergence, 0 SELFHEAL, 0 unclean, 0 held-4 s, 0 half-wrap / timeline-wrap events, 0 calibrations; 1153 sync-check verdicts,
+  0 `[PTV-SYNCCHK] STEPPED`; 0 of 101 channels beyond +-25 ms at the end. One unexpected exit = by design: cow-1
+  Nothing_But_Sportz, started under the fallback while its source was gone, exited 5 for the re-probe 60 s after the source came
+  back (-fallback_rebind). Every lip-sync reading beyond +-25 ms explained: source events seen the same on the 2.2.2 / 2.0.2
+  controls (TVP_World corruption at the deploy minute, GBN source outage, Biohackingville audio gap, one-reading 44 ms on
+  Curiosity_* / Catholic_History at a source frame loss), and the mosaic meter's one-frame readings on cow-2 REVn in0 (T-536:
+  isolated -31..-33 ms samples, no correction between them, the per-track meter at -7..+1 ms; same rate on 2.2.3-pre3;
+  owner 2026-11-25: not blocking).
+- **pre7 gate** (12 lanes, kit 2230d28, media-v48 + v50 keys): 427 keys, 0 regressions vs pre6; the only FAILs the 2 accepted
+  SCTE-35 KNOWN lead-outage keys.
+- **What 2.2.3 brings over 2.2.2:** mosaic catch-up without losing the slot's sound (T-518, T-519), film through a hold
+  (T-517), the mosaic sensor counts the follow delay (T-515), a mosaic lag step keeps the marker's sound with its picture
+  (T-523), two mosaic slots never share a regulator port (T-526), sound through a rejoin after a video-only hole (T-503,
+  T-528), a half-wrap source step keeps sound and picture together (T-530), the sensor calibration off by default (T-534,
+  PTV_RSCAL=1 = on), a mosaic slot's sound stays with its pictures after a source PCR step back (T-532), a moved video
+  continues the program's timeline and a move back is taken over (T-533).
+- Known, not blocking: T-533 not yet exercised live (no Western Bound PID-move break during the soak; synthetic keys PASS);
+  T-536 the REVn mosaic meter one-frame samples; T-529 (a video-only hole silences flowing sound, since 2.1) is fixed in the
+  next dev (2.2.4-pre1).
+
 ## 2.2.3-pre7 — 2.2.3-pre6 + a moved video continues the program's timeline (T-533)
 
 **T-533 — a video that moves to a new PID keeps the bound stream's timeline, and a move back is taken over too.** cow-1
