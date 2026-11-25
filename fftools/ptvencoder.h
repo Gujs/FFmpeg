@@ -1339,6 +1339,8 @@ typedef struct AudioState {
     int              vm_on;                  /* T-488: the record door is placing (for its on/off DIAG line) */
     int64_t          vm_last_lab, vm_last_out;   /* the previous record-door frame: label, placement (or NOPTS) */
     int64_t          hold_drop_n;                     /* 2.0.0-pre9.4: real frames dropped while the source held */
+    int64_t          vo_run_wc0, vo_last_wc;          /* 2.2.4 T-535: start / last arrival of the current run of real frames */
+    int64_t          vo_hs0;                          /* T-535: house_skew when this hold began */
     int              rj_n, rj_released, rj_releasing, rj_cls_seq0;
     int64_t          rj_t0;                           /* wall us the first frame was buffered */
     int64_t          rj_hold_wc;                      /* T-489: the hold (g_src_hold_start) the buffer was armed for */
