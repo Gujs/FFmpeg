@@ -5,6 +5,22 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.4-pre1 — 2.2.3 + the sound continues through a video-only outage (T-529)
+
+**T-529 — a hole in the picture alone no longer silences sound that keeps arriving.** Since 2.1 (T-409) the record door held
+real audio frames up to 3 s for pictures that never came; the track starved, the silence fill took over, and the frames released
+afterwards (~1.25 s behind the fill) were dropped whole: a 20 s video-only hole was ~13 s silent, a 40 s hole ~32 s (2.0.2-pre8
+kept the tone; spec §5.1 / T-076 say the audio continues when only the video stops). Two changes:
+- The door does not wait in a video-only outage — the clock's T-076 rule (video read >= 0.5 s ago, audio read < 1 s ago).
+- No reopen while the source's audio keeps arriving: the no-video read cut at 1 x `-lost_after` (30 s) no longer pre-empts the
+  demux's own 2 x rule while audio flows; the LOST line says `its sound keeps arriving: no reopen while it does`. A 90 s
+  video-only hole now keeps its sound throughout and the picture's return is in sync at once.
+
+Keys (kit 8e2107b fixture judge: every `sync_vnull_*` run, the windows from the first frozen one to the event end must be TONE):
+`rich2997b sync_vnull_20/40` FAIL on 2.2.3 (silent ~13 / ~32 s), PASS here; a 90 s hole 89/89 TONE, sync after the return 0 ms.
+Full gate of the same code (full-t529c, kit 78c07ab, media-v48): 427 keys, 0 regressions vs pre7's gate; only the 2 accepted
+SCTE-35 KNOWN lead-outage keys FAIL. Open follow-up T-535: an audio gap inside such a hold still silences the rest of the hold.
+
 ## 2.2.3 — release: 2.2.3-pre7 unchanged, version only
 
 **Same code as 2.2.3-pre7** (adaptive-2.2 fab1f5fd15); only `PTVENCODER_VERSION` changes. Released by the written criteria
