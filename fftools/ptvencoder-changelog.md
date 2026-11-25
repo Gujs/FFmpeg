@@ -5,6 +5,22 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.4-pre2 — 2.2.4-pre1 + the sound that comes back inside a video-only hold continues (T-535)
+
+**T-535 — an audio gap inside a video-only outage no longer silences the rest of the hold.** In a video-only outage (T-529)
+an audio gap of 3 s or more started the track's silence fill, and every real frame after the gap was then dropped as a fragment
+of the hold (T-083) until the picture returned: a 40 s video-only hole with a 5 s audio gap at 45 s was silent for 18 s after the
+sound was back. Now, while the outage is video-only (the clock's T-076 rule) and the real frames have arrived steadily for 1 s,
+the fill ends as at a hold's end and they continue through the record door, placed with the house_skew of the hold's start (the
+master grew it by 4.2 s while the sound was missing; without that 5 s of the hole were lost again). A sporadic fragment of a
+whole-source outage is no 1 s run and is still dropped. Log: `[PTV-SRC] aN(inM) the sound is back in a video-only hold — the
+fill ends after X s, real frames continue (house_skew +N ms kept from the hold's start)`.
+
+Keys (kit c6b8e4d, media-v51 `177ebc9ef5f8`): `rich2997b-t535 / rich25b-t535 sync_vnull_40` (T056_VN_AGAP=45:5: the audio PID
+nulled 45-50 s inside the 30-70 s video hole; every hole window outside the gap must be TONE): 2.2.4-pre1 code 20/38 TONE -> 39/39,
+lip sync after the return +0.6 ms. 30 targeted keys (the T-529 set + Cinestar loss 100/500, storm, bursty, flapping, audio gap,
+stop, blip, loss) PASS.
+
 ## 2.2.4-pre1 — 2.2.3 + the sound continues through a video-only outage (T-529)
 
 **T-529 — a hole in the picture alone no longer silences sound that keeps arriving.** Since 2.1 (T-409) the record door held
