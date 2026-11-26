@@ -5,6 +5,20 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.4-pre3 — 2.2.4-pre2 + no output PTS hole at a small label step on film / slower sources (T-504)
+
+**T-504 — the film / slower-source pop path fills a small source label step with repeats.** That path pops a picture by
+content time and holds it at most its cadence's residence (film: one tick extra). At that cap a picture whose slot was still
+ahead — a small forward step of the source's video labels (a splice, a re-phase) — was popped and stamped on its content
+index, so the output skipped the ticks between: on a 3:2 soft-telecine source a +50 ms step left a 1-tick hole on every rung
+of the ladder, +120 ms a 3-tick hole (GOALS #1: never a timestamp hole). T-501 (2.2.2) fills such a step on the plain path
+only. Now the same rule applies at the cap: a step under 200 ms that our own queue did not make, on a clean picture, is filled
+with whole-picture repeats up to its slot (residence: house_skew and the sound do not move). `PTV_NO_VGAP_SRC=1` reverts.
+
+Keys (kit 472cc5d, media-v53 `474ab94eeeac`): holekey `prod-t504 tele_vstep50 / tele_vstep120` (the production 6-rung ladder
+on the 3:2 set with its video labels +50 / +120 ms from 120 s) FAIL on 2.2.4-pre2 on every rung -> PASS; `tele_vstep20` and the
+unstepped control PASS on both; the same +120 ms step on the 30p original passes on both.
+
 ## 2.2.4-pre2 — 2.2.4-pre1 + the sound that comes back inside a video-only hold continues (T-535)
 
 **T-535 — an audio gap inside a video-only outage no longer silences the rest of the hold.** In a video-only outage (T-529)
