@@ -5,6 +5,21 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.4-pre4 — 2.2.4-pre3 + a mosaic slot with a sliding phase keeps its sound in place (T-536)
+
+**T-536 — the sound of a mosaic slot whose phase slides against the house no longer jumps after its pictures.** A slot whose
+pictures walk through the pick window (a 30.00 fps source in a 29.97 mosaic, or a source clock off ours: cow-2 REVn in0, a
+30.00 source at +1000..+1800 ppm) jumps back a whole picture each time it leaves the window (every ~33 s there). The sound
+followed the pictures' 1/32 average (re-placed in 10.7 ms steps) and took each jump over ~3 s: +21..+29 ms on air at every jump
+(the -31..-54 ms single status readings on REVn). Now the slot's realized lag is its lag + the MIDDLE of where the shown pictures
+landed over the last 60 s (6 bins of 10 s; re-seeded at a re-lock, not at a drift step): as a frame sync, the error is the
+picture's own phase, within half a picture, and the sound is not re-placed for it. A slot whose phase stands still keeps its
+sound on its pictures exactly, as before.
+
+Key (kit 6481171, media-v54 `11f7402e2bb7`): `mv-t536 slide` (t536key.sh: the production 1x2 mosaic, slot 0 an exact 30.000 fps
+ruler, 1100 ppm, 300 s; every slot-0 marker within +-21 ms): 2.2.4-pre3 worst +29 ms (15 markers beyond 17 ms) -> worst
+18.0 ms, slot-0 sound re-placements 26 -> 3. All 60 mosaic keys of the gate PASS.
+
 ## 2.2.4-pre3 — 2.2.4-pre2 + no output PTS hole at a small label step on film / slower sources (T-504)
 
 **T-504 — the film / slower-source pop path fills a small source label step with repeats.** That path pops a picture by
