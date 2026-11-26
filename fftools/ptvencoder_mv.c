@@ -107,8 +107,9 @@ typedef struct MvTlSlot {
                                                      * boundary, from skip_from on, is gone (pictures there are dropped) */
     int64_t skip_from;
     int     pend_gap;                               /* the pending picture: the full queue dropped pictures before it */
-    int64_t ph_lo[6], ph_hi[6], ph_wc;              /* 2.2.4 T-536: the shown pictures' place in the pick window (smp -
-                                                     * lag), lowest / highest per 10 s bin; the newest bin opened at ph_wc */
+    int64_t ph_sum[6], ph_wc;                       /* 2.2.4 T-536: the shown pictures' place in the pick window (smp -
+                                                     * lag), summed per 10 s bin; the newest bin opened at ph_wc */
+    int     ph_cnt[6];                              /* ... pictures per bin */
     int     ph_n;                                   /* ... bins so far (0 = none: re-seeded at a re-lock) */
 } MvTlSlot;
 
@@ -403,41 +404,41 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
             }
             if (!s->shown_wc)
                 s->real = s->lag;
-            /* 2.2.4 T-536: the sound sits at the MIDDLE of where the shown pictures land, not on their average. The pick
-             * window puts a picture between half a picture early and half a picture late of the lag (above): a slot
-             * whose phase to the house SLIDES (a 30.00 source in a 29.97 mosaic, or a source clock off ours) walks
+            /* 2.2.4 T-536: the sound sits on the shown pictures' place averaged over the last minute, not over ~1 s.
+             * The pick window puts a picture between half a picture early and half a picture late of the lag (above): a
+             * slot whose phase to the house SLIDES (a 30.00 source in a 29.97 mosaic, or a source clock off ours) walks
              * through that window and jumps back a whole picture each time it leaves it (30.00 in 29.97: every 33.4 s).
              * The 1/32 average (~1 s) followed the walk and the sound with it (re-placed in 10.7 ms steps); at the jump
              * the picture moved a whole picture at once and the sound followed over ~3 s: +21..+29 ms on air at every
              * jump (cow-2 REVn in0, mv02-t536). A frame sync leaves the sound alone and drops / repeats whole pictures:
-             * placed at the middle of the window the pictures use, the error is the picture's own phase, within half
-             * a picture, and the sound is never re-placed for it. A slot whose phase stands still (the same rate:
-             * lowest = highest) keeps the sound on its pictures exactly, as before (a 25p slot in 25p: L 21 ms showed
-             * every picture 40 ms late). The window = the last 60 s (6 bins of 10 s); re-seeded at a re-lock
-             * (a new phase), not at a drift step (the walk goes on across it).
+             * averaged over a minute (more than one walk) the place is the middle of the window the pictures use, the
+             * error is the picture's own phase, within half a picture, and the sound is not re-placed for it (a partial
+             * walk in the window moves the mean ~1.5 ms). A slot whose phase stands still keeps the sound on its
+             * pictures' average, as before. The mean, not the middle of lowest and highest: one jittered picture moves
+             * the middle by up to half a picture (a slot at the window's edge, under load: mv01 sync_gap_20 -34 ms).
+             * The window = the last 60 s (6 bins of 10 s); re-seeded at a re-lock (a new phase), not at a drift step
+             * (the walk goes on across it).
              * Only a picture on its place counts (2.2.3 T-518: a backlog's late pictures realize no lag — 3.8 s of them
              * walked the average +126 ms; two pictures labelled 29 pictures old moved it 30 ms) */
             {
                 int64_t dev = smp - s->lag, c2 = FFMIN(half, s->cad / 2);
                 if (dev >= -c2 - 2000 && dev <= s->cad - c2 + 2000) {
-                    int64_t lo, hi;
-                    int x, nb;
+                    int64_t sum = 0;
+                    int x, nb, cnt = 0;
                     if (!s->ph_n || now_us - s->ph_wc >= 10000000) {
-                        s->ph_lo[s->ph_n % 6] = s->ph_hi[s->ph_n % 6] = dev;
+                        s->ph_sum[s->ph_n % 6] = 0;
+                        s->ph_cnt[s->ph_n % 6] = 0;
                         s->ph_n++;
                         s->ph_wc = now_us;
-                    } else {
-                        s->ph_lo[(s->ph_n - 1) % 6] = FFMIN(s->ph_lo[(s->ph_n - 1) % 6], dev);
-                        s->ph_hi[(s->ph_n - 1) % 6] = FFMAX(s->ph_hi[(s->ph_n - 1) % 6], dev);
                     }
+                    s->ph_sum[(s->ph_n - 1) % 6] += dev;
+                    s->ph_cnt[(s->ph_n - 1) % 6]++;
                     nb = FFMIN(s->ph_n, 6);
-                    lo = s->ph_lo[0];
-                    hi = s->ph_hi[0];
-                    for (x = 1; x < nb; x++) {
-                        lo = FFMIN(lo, s->ph_lo[x]);
-                        hi = FFMAX(hi, s->ph_hi[x]);
+                    for (x = 0; x < nb; x++) {
+                        sum += s->ph_sum[x];
+                        cnt += s->ph_cnt[x];
                     }
-                    s->real = s->lag + (lo + hi) / 2;
+                    s->real = s->lag + sum / cnt;
                 }
             }
         }
