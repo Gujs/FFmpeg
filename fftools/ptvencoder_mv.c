@@ -107,6 +107,9 @@ typedef struct MvTlSlot {
                                                      * boundary, from skip_from on, is gone (pictures there are dropped) */
     int64_t skip_from;
     int     pend_gap;                               /* the pending picture: the full queue dropped pictures before it */
+    int64_t ph_lo[6], ph_hi[6], ph_wc;              /* 2.2.4 T-536: the shown pictures' place in the pick window (smp -
+                                                     * lag), lowest / highest per 10 s bin; the newest bin opened at ph_wc */
+    int     ph_n;                                   /* ... bins so far (0 = none: re-seeded at a re-lock) */
 } MvTlSlot;
 
 /* TEST-ONLY (PTV_TEST_MVSTEP_AT=K:FILE[:MS], 2.2.3 T-523): slot K's lag steps take their boundary at the first flash of the
@@ -301,6 +304,7 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
                        "pictures before this one are gone, %"PRId64" dropped so far)\n", k, (out - tgt - s->lag) / 1000,
                        s->ovf_seen);
                 mv_tl_step(c, k, s, out - tgt, h0, now_us, tgt);
+                s->ph_n = 0;                        /* a new phase (T-536) */
                 s->ovf_wc = now_us;
                 gap = 0;
                 if (fs < tgt) {                     /* this one is inside the skip too */
@@ -318,6 +322,7 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
                 av_log(NULL, AV_LOG_WARNING, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (content ahead)\n",
                        k, (out - fs + margin - s->lag) / 1000);
                 mv_tl_step(c, k, s, out - fs + margin, h0, now_us, AV_NOPTS_VALUE);
+                s->ph_n = 0;                        /* a new phase (T-536) */
             }
             *pending = nx;                          /* not due yet */
             s->pend_gap = gap;
@@ -374,6 +379,7 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
                    (relock - s->lag) / 1000);
             s->late_wc = 0;
             mv_tl_step(c, k, s, relock, h0, now_us, AV_NOPTS_VALUE);
+            s->ph_n = 0;                            /* a new phase (T-536) */
         } else
             relock = AV_NOPTS_VALUE;
         if (src != AV_NOPTS_VALUE) {
@@ -397,15 +403,42 @@ static AVFrame *mv_tl_pick(CompositorCtx *c, int k, int64_t tick, int64_t now_us
             }
             if (!s->shown_wc)
                 s->real = s->lag;
-            /* ... by at most a picture per sample: two source pictures labelled 29 pictures old (RAV slot 1, a 29.97i
-             * feed, at 36 s) moved it 30 ms, the sound chased it there and back in half-frame steps and kept -7.5 ms */
-            /* 2.2.3 T-518: ... and only from a picture on its place. A backlog's pictures are shown late while the slot
-             * catches up (above) and realize no lag: 3.8 s of them walked this +126 ms (a picture per sample, / 32), the
-             * sound was re-placed after it ("+81.2 ms (drift)") and played up to 116 ms late for 6 s after the return
-             * (sync_catchup_8, flash against beep) */
-            if (smp - s->lag <= 500000) {
-                int64_t w = FFMAX(c->tick_dur_us, s->cad);
-                s->real += av_clip64(smp - s->real, -w, w) / 32;
+            /* 2.2.4 T-536: the sound sits at the MIDDLE of where the shown pictures land, not on their average. The pick
+             * window puts a picture between half a picture early and half a picture late of the lag (above): a slot
+             * whose phase to the house SLIDES (a 30.00 source in a 29.97 mosaic, or a source clock off ours) walks
+             * through that window and jumps back a whole picture each time it leaves it (30.00 in 29.97: every 33.4 s).
+             * The 1/32 average (~1 s) followed the walk and the sound with it (re-placed in 10.7 ms steps); at the jump
+             * the picture moved a whole picture at once and the sound followed over ~3 s: +21..+29 ms on air at every
+             * jump (cow-2 REVn in0, mv02-t536). A frame sync leaves the sound alone and drops / repeats whole pictures:
+             * placed at the middle of the window the pictures use, the error is the picture's own phase, within half
+             * a picture, and the sound is never re-placed for it. A slot whose phase stands still (the same rate:
+             * lowest = highest) keeps the sound on its pictures exactly, as before (a 25p slot in 25p: L 21 ms showed
+             * every picture 40 ms late). The window = the last 60 s (6 bins of 10 s); re-seeded at a re-lock
+             * (a new phase), not at a drift step (the walk goes on across it).
+             * Only a picture on its place counts (2.2.3 T-518: a backlog's late pictures realize no lag — 3.8 s of them
+             * walked the average +126 ms; two pictures labelled 29 pictures old moved it 30 ms) */
+            {
+                int64_t dev = smp - s->lag, c2 = FFMIN(half, s->cad / 2);
+                if (dev >= -c2 - 2000 && dev <= s->cad - c2 + 2000) {
+                    int64_t lo, hi;
+                    int x, nb;
+                    if (!s->ph_n || now_us - s->ph_wc >= 10000000) {
+                        s->ph_lo[s->ph_n % 6] = s->ph_hi[s->ph_n % 6] = dev;
+                        s->ph_n++;
+                        s->ph_wc = now_us;
+                    } else {
+                        s->ph_lo[(s->ph_n - 1) % 6] = FFMIN(s->ph_lo[(s->ph_n - 1) % 6], dev);
+                        s->ph_hi[(s->ph_n - 1) % 6] = FFMAX(s->ph_hi[(s->ph_n - 1) % 6], dev);
+                    }
+                    nb = FFMIN(s->ph_n, 6);
+                    lo = s->ph_lo[0];
+                    hi = s->ph_hi[0];
+                    for (x = 1; x < nb; x++) {
+                        lo = FFMIN(lo, s->ph_lo[x]);
+                        hi = FFMAX(hi, s->ph_hi[x]);
+                    }
+                    s->real = s->lag + (lo + hi) / 2;
+                }
             }
         }
         if (src != AV_NOPTS_VALUE)
