@@ -1530,7 +1530,20 @@ void *output_thread(void *arg)
                  * source's 24 a second — until the queue was empty, and from then on the output ran on the empty queue:
                  * -1 tick of house_skew at every 1.5-tick label step, +1 at every repeat on empty, the sound cut and
                  * padded 33 ms each time (PATRIOT-OAN 2026-11-20: 3654 "[PTV-ATRIM] input stepped back 33 ms") */
-                if (nc < 0 || nc + vg_lag <= last_vpts + 1 || held_extra >= cap) {   /* due, unstampable, or residence CAP hit */
+                /* 2.2.4 T-504: at the residence CAP a picture whose slot is still ahead is a small forward step of the source's
+                 * labels (a splice, a label re-phase), not cadence: popped, it was stamped on its content index and the output
+                 * skipped the ticks between (3:2 film + a +50 ms video step: one 1-tick hole on every rung, +120 ms: a 3-tick
+                 * hole). Filled as T-501 fills it on the plain path: whole-picture repeats up to its slot (residence, the
+                 * output PTS one tick per picture), only for a step under PTV_VGAP_SRC_US that our own queue did not make (no
+                 * drop since this picture was taken) on a clean picture. PTV_NO_VGAP_SRC=1 reverts (g_vgap_src) */
+                int64_t fgs = nc >= 0 ? nc + vg_lag - last_vpts - 1 : 0;
+                int fgap = held_extra >= cap && g_vgap_src && fgs > 0 && fgs * v->tick_dur_us < PTV_VGAP_SRC_US &&
+                           vg_fd_last >= 0 && (v->framedrop_src ? *v->framedrop_src : v->framedrop) == vg_fd_last &&
+                           !av_dict_get(nextf->metadata, "ptv_dmg", NULL, 0);
+                if (fgap) {
+                    cadence_hold = 1;
+                    vgap_src_n++;
+                } else if (nc < 0 || nc + vg_lag <= last_vpts + 1 || held_extra >= cap) {   /* due, unstampable, or residence CAP hit */
                     av_frame_unref(held); av_frame_move_ref(held, nextf); av_frame_free(&nextf);
                     next_have = 0; fresh = 1; held_src_pts = held->pts; held_extra = 0; vgap_park = 0;
                 } else
@@ -2430,7 +2443,8 @@ void *output_thread(void *arg)
                 if (!src_lost_logged && arr && nw - arr >= g_lost_after_us) {
                     src_lost_logged = 1;
                     av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 STALLED \xe2\x86\x92 LOST%s: no video "
-                           "packets for %.0f s\n", g_src_hold_act ? "" : " (observe-only)", (nw - arr) / 1e6);
+                           "packets for %.0f s%s\n", g_src_hold_act ? "" : " (observe-only)", (nw - arr) / 1e6,
+                           ptv_src_audio_flowing() ? " — its sound keeps arriving: no reopen while it does (T-529)" : "");
                 }
                 if (nw >= src_note) {   /* reminders: 1/min for 10 min, then every 10 min */
                     av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 still STALLED after %.0f s\n",

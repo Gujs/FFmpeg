@@ -1339,6 +1339,8 @@ typedef struct AudioState {
     int              vm_on;                  /* T-488: the record door is placing (for its on/off DIAG line) */
     int64_t          vm_last_lab, vm_last_out;   /* the previous record-door frame: label, placement (or NOPTS) */
     int64_t          hold_drop_n;                     /* 2.0.0-pre9.4: real frames dropped while the source held */
+    int64_t          vo_run_wc0, vo_last_wc;          /* 2.2.4 T-535: start / last arrival of the current run of real frames */
+    int64_t          vo_hs0;                          /* T-535: house_skew when this hold began */
     int              rj_n, rj_released, rj_releasing, rj_cls_seq0;
     int64_t          rj_t0;                           /* wall us the first frame was buffered */
     int64_t          rj_hold_wc;                      /* T-489: the hold (g_src_hold_start) the buffer was armed for */
@@ -2066,6 +2068,7 @@ extern _Atomic int64_t g_src_fresh_wc;    /* 2.0.0-pre6: wall us of the master's
 extern _Atomic int     g_src_icb_armed;   /* 2.0.0-pre5: the no-video read interrupt is live (single input) */
 extern int             g_backoff_s[8], g_backoff_n;   /* -reopen_backoff (s), 2.0.0-pre2/pre5 */
 int ptv_src_interrupt(void *opaque);     /* 2.0.0-pre5: AVIOInterruptCB — no video read for -lost_after */
+int ptv_src_audio_flowing(void);         /* 2.2.3 T-529: the single input's audio read in the last second */
 void ptv_copy_fill(struct DemuxArgs *d, int64_t now);   /* 2.0.0-pre6: copied AC-3 silence */
 extern _Atomic int64_t g_acq_since;      /* 2.0.0-pre7: wall us a single input began waiting for its source (0 = not) */
 /* 2.0.0-pre8 (T-056 §5.1): the stats line's afill= — current silence-fill run per transcoded track (hold or NBS fill)

@@ -5,6 +5,78 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.4-pre3 — 2.2.4-pre2 + no output PTS hole at a small label step on film / slower sources (T-504)
+
+**T-504 — the film / slower-source pop path fills a small source label step with repeats.** That path pops a picture by
+content time and holds it at most its cadence's residence (film: one tick extra). At that cap a picture whose slot was still
+ahead — a small forward step of the source's video labels (a splice, a re-phase) — was popped and stamped on its content
+index, so the output skipped the ticks between: on a 3:2 soft-telecine source a +50 ms step left a 1-tick hole on every rung
+of the ladder, +120 ms a 3-tick hole (GOALS #1: never a timestamp hole). T-501 (2.2.2) fills such a step on the plain path
+only. Now the same rule applies at the cap: a step under 200 ms that our own queue did not make, on a clean picture, is filled
+with whole-picture repeats up to its slot (residence: house_skew and the sound do not move). `PTV_NO_VGAP_SRC=1` reverts.
+
+Keys (kit 472cc5d, media-v53 `474ab94eeeac`): holekey `prod-t504 tele_vstep50 / tele_vstep120` (the production 6-rung ladder
+on the 3:2 set with its video labels +50 / +120 ms from 120 s) FAIL on 2.2.4-pre2 on every rung -> PASS; `tele_vstep20` and the
+unstepped control PASS on both; the same +120 ms step on the 30p original passes on both.
+
+## 2.2.4-pre2 — 2.2.4-pre1 + the sound that comes back inside a video-only hold continues (T-535)
+
+**T-535 — an audio gap inside a video-only outage no longer silences the rest of the hold.** In a video-only outage (T-529)
+an audio gap of 3 s or more started the track's silence fill, and every real frame after the gap was then dropped as a fragment
+of the hold (T-083) until the picture returned: a 40 s video-only hole with a 5 s audio gap at 45 s was silent for 18 s after the
+sound was back. Now, while the outage is video-only (the clock's T-076 rule) and the real frames have arrived steadily for 1 s,
+the fill ends as at a hold's end and they continue through the record door, placed with the house_skew of the hold's start (the
+master grew it by 4.2 s while the sound was missing; without that 5 s of the hole were lost again). A sporadic fragment of a
+whole-source outage is no 1 s run and is still dropped. Log: `[PTV-SRC] aN(inM) the sound is back in a video-only hold — the
+fill ends after X s, real frames continue (house_skew +N ms kept from the hold's start)`.
+
+Keys (kit c6b8e4d, media-v51 `177ebc9ef5f8`): `rich2997b-t535 / rich25b-t535 sync_vnull_40` (T056_VN_AGAP=45:5: the audio PID
+nulled 45-50 s inside the 30-70 s video hole; every hole window outside the gap must be TONE): 2.2.4-pre1 code 20/38 TONE -> 39/39,
+lip sync after the return +0.6 ms. 30 targeted keys (the T-529 set + Cinestar loss 100/500, storm, bursty, flapping, audio gap,
+stop, blip, loss) PASS.
+
+## 2.2.4-pre1 — 2.2.3 + the sound continues through a video-only outage (T-529)
+
+**T-529 — a hole in the picture alone no longer silences sound that keeps arriving.** Since 2.1 (T-409) the record door held
+real audio frames up to 3 s for pictures that never came; the track starved, the silence fill took over, and the frames released
+afterwards (~1.25 s behind the fill) were dropped whole: a 20 s video-only hole was ~13 s silent, a 40 s hole ~32 s (2.0.2-pre8
+kept the tone; spec §5.1 / T-076 say the audio continues when only the video stops). Two changes:
+- The door does not wait in a video-only outage — the clock's T-076 rule (video read >= 0.5 s ago, audio read < 1 s ago).
+- No reopen while the source's audio keeps arriving: the no-video read cut at 1 x `-lost_after` (30 s) no longer pre-empts the
+  demux's own 2 x rule while audio flows; the LOST line says `its sound keeps arriving: no reopen while it does`. A 90 s
+  video-only hole now keeps its sound throughout and the picture's return is in sync at once.
+
+Keys (kit 8e2107b fixture judge: every `sync_vnull_*` run, the windows from the first frozen one to the event end must be TONE):
+`rich2997b sync_vnull_20/40` FAIL on 2.2.3 (silent ~13 / ~32 s), PASS here; a 90 s hole 89/89 TONE, sync after the return 0 ms.
+Full gate of the same code (full-t529c, kit 78c07ab, media-v48): 427 keys, 0 regressions vs pre7's gate; only the 2 accepted
+SCTE-35 KNOWN lead-outage keys FAIL. Open follow-up T-535: an audio gap inside such a hold still silences the rest of the hold.
+
+## 2.2.3 — release: 2.2.3-pre7 unchanged, version only
+
+**Same code as 2.2.3-pre7** (adaptive-2.2 fab1f5fd15); only `PTVENCODER_VERSION` changes. Released by the written criteria
+(owner 2026-11-20: "release needs to keep channels stable and in a/v sync"), not by sign-off. What makes it the release:
+- **Soak of pre7** (2026-11-24 ~21:39 CET -> 2026-11-25 21:45 CET, 24 h incl. the US night) on the soak tier live-transcoder (8) +
+  tmtg-cow-transcoder-1 (64) + tmtg-cow-transcoder-2 (29) = 101 channels, every one on its first start: 0 fatal, 0 rung
+  divergence, 0 SELFHEAL, 0 unclean, 0 held-4 s, 0 half-wrap / timeline-wrap events, 0 calibrations; 1153 sync-check verdicts,
+  0 `[PTV-SYNCCHK] STEPPED`; 0 of 101 channels beyond +-25 ms at the end. One unexpected exit = by design: cow-1
+  Nothing_But_Sportz, started under the fallback while its source was gone, exited 5 for the re-probe 60 s after the source came
+  back (-fallback_rebind). Every lip-sync reading beyond +-25 ms explained: source events seen the same on the 2.2.2 / 2.0.2
+  controls (TVP_World corruption at the deploy minute, GBN source outage, Biohackingville audio gap, one-reading 44 ms on
+  Curiosity_* / Catholic_History at a source frame loss), and the mosaic meter's one-frame readings on cow-2 REVn in0 (T-536:
+  isolated -31..-33 ms samples, no correction between them, the per-track meter at -7..+1 ms; same rate on 2.2.3-pre3;
+  owner 2026-11-25: not blocking).
+- **pre7 gate** (12 lanes, kit 2230d28, media-v48 + v50 keys): 427 keys, 0 regressions vs pre6; the only FAILs the 2 accepted
+  SCTE-35 KNOWN lead-outage keys.
+- **What 2.2.3 brings over 2.2.2:** mosaic catch-up without losing the slot's sound (T-518, T-519), film through a hold
+  (T-517), the mosaic sensor counts the follow delay (T-515), a mosaic lag step keeps the marker's sound with its picture
+  (T-523), two mosaic slots never share a regulator port (T-526), sound through a rejoin after a video-only hole (T-503,
+  T-528), a half-wrap source step keeps sound and picture together (T-530), the sensor calibration off by default (T-534,
+  PTV_RSCAL=1 = on), a mosaic slot's sound stays with its pictures after a source PCR step back (T-532), a moved video
+  continues the program's timeline and a move back is taken over (T-533).
+- Known, not blocking: T-533 not yet exercised live (no Western Bound PID-move break during the soak; synthetic keys PASS);
+  T-536 the REVn mosaic meter one-frame samples; T-529 (a video-only hole silences flowing sound, since 2.1) is fixed in the
+  next dev (2.2.4-pre1).
+
 ## 2.2.3-pre7 — 2.2.3-pre6 + a moved video continues the program's timeline (T-533)
 
 **T-533 — a video that moves to a new PID keeps the bound stream's timeline, and a move back is taken over too.** cow-1

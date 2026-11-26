@@ -1219,6 +1219,13 @@ void ptv_acq_heartbeat(void)
 static DemuxArgs *icb_da;
 static pthread_t  icb_tid;
 
+/* 2.2.3 T-529: the single input's audio keeps arriving (a transcoded-audio packet read in the last second) */
+int ptv_src_audio_flowing(void)
+{
+    int64_t ar = atomic_load_explicit(&g_src_aread_wc, memory_order_relaxed);
+    return ar && av_gettime_relative() - ar < 1000000;
+}
+
 int ptv_src_interrupt(void *opaque)
 {
     int64_t vr;
@@ -1234,6 +1241,12 @@ int ptv_src_interrupt(void *opaque)
     if (!atomic_load_explicit(&g_src_icb_armed, memory_order_relaxed))
         return 0;
     vr = atomic_load_explicit(&g_src_vread_wc, memory_order_relaxed);
+    /* 2.2.3 T-529: no cut while the source's audio keeps arriving — a video-only outage keeps the sound (spec §5.1). The
+     * reopen stopped the reads for ~7 s and the hold's fill then covered the rest of the hole: a 90 s hole lost its last
+     * 28 s, a 40 s hole (cut at 30 s) 8 s, on every build since 2.0.0-pre5. A moved video is taken over in-process
+     * (T-387, T-533); once the audio stops too the read is cut at once (vr is older than -lost_after by then). */
+    if (ptv_src_audio_flowing())
+        return 0;
     return vr && av_gettime_relative() - vr > g_lost_after_us;
 }
 
@@ -1878,9 +1891,10 @@ void *demux_thread(void *arg)
                                   av_thread_message_queue_nb_elems(d->video_q),
                                   memory_order_relaxed);
         }
-        {   /* 2.0.0-pre5: video gone while other packets (audio) keep flowing — reopen after 2 x -lost_after */
+        {   /* 2.0.0-pre5: video gone while other packets keep flowing — reopen after 2 x -lost_after. 2.2.3 T-529: not
+             * while the source's audio arrives (the sound continues through a video-only outage, spec §5.1) */
             int64_t vr = atomic_load_explicit(&g_src_vread_wc, memory_order_relaxed);
-            rd_force = (d->reopen && d->single && vr &&
+            rd_force = (d->reopen && d->single && vr && !ptv_src_audio_flowing() &&
                         av_gettime_relative() - vr > 2 * g_lost_after_us) || d->vmove_force;
         }
         if (rd_force || (rd_ret = av_read_frame(d->ifmt, pkt)) < 0) {
