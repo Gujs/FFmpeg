@@ -1112,17 +1112,24 @@ static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
                  * program clock, wire A/V -15 s, sync_check restarts; key sync_halfwrap T056_HW_GAP=1.6: the audio
                  * 2^33 off, MUXGUARD exit). There the wrap count is the one that lands the packet nearest the other
                  * dense stream of the program (the one delivered last): the program steps once, its streams together.
-                 * Also the return from one label with bit 32 set (EPIC 22:46): it lands back by the other stream. */
+                 * Also the return from one label with bit 32 set (EPIC 22:46): it lands back by the other stream.
+                 * 2.2.4 T-537: the correction is counted in HALF wraps (2^32 ticks), not whole ones. glo-4 EPIC_MUSIC
+                 * (2026-11-27 02:57 + 03:22 GMT, 2.2.3): only the VIDEO's labels (and its PCR) flipped bit 32 —
+                 * -2^32 for 0.7 s, back, -2^32 for 0.3 s, back — and the audio never moved. Rounded to whole 2^33
+                 * wraps, a 2^32 error stays 2^32 either way ('+0 wraps' / '+1 wraps'): [PTV-TL] then took one step as a
+                 * new domain and the return as sent, video and sound left 2^32 apart (lipsync= +4.77e7 ms, sync_check
+                 * restarts). In half wraps the stepped stream lands back next to the other one at every step; a whole
+                 * program step of ~half (T-530) is then undone on each stream as it crosses (both stay together). */
                 int64_t ref = halfwrap_ref(d, pkt->stream_index, wall_now);
                 int64_t cur = raw + d->wrap_off[pkt->stream_index], k;
                 int64_t diff = ref - cur;
-                k = diff >= 0 ? (diff + half) / mask : -((-diff + half) / mask);
+                k = diff >= 0 ? (diff + half / 2) / half : -((-diff + half / 2) / half);
                 if (k) {
-                    d->wrap_off[pkt->stream_index] += k * mask;
-                    if (ol) ol->wrap_dw = k * mask;
+                    d->wrap_off[pkt->stream_index] += k * half;
+                    if (ol) ol->wrap_dw = k * half;
                 }
                 av_log(NULL, AV_LOG_WARNING, "[PTV-DISCONT] stream %d: a half-wrap step (%+.3f s) — wrap taken by the "
-                       "program (%+"PRId64" wraps, nearest the other stream)\n",
+                       "program (%+"PRId64" half wraps, nearest the other stream)\n",
                        pkt->stream_index, delta * av_q2d(st->time_base), k);
             }
             else if (delta < -half) {
