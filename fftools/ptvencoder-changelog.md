@@ -5,6 +5,24 @@ Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-
 keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 the v2 `0001` patch (additive, travels with the source to the build box).
 
+## 2.2.4-pre5 — 2.2.4-pre4 + a stream whose labels flip bit 32 lands back by its partner (T-537)
+
+**T-537 — a half-wrap step is undone in half wraps.** glo-4 EPIC_MUSIC (2.2.3, 2026-11-27 02:57 and 03:22 GMT): only the
+video's labels and its PCR flipped bit 32 (-2^32 ticks for 0.7 s, back, -2^32 for 0.3 s, back), right after a 3.2 s stall;
+the audio never moved. The T-530 rule (2.2.3-pre4) took a step of about half the 33-bit wrap to the wrap count nearest the
+other stream, but counted in whole 2^33 wraps: a 2^32 error stays 2^32 either way ('+0 wraps' when the step read just under
+half). The timeline then took one step as a new domain and the return as sent: video and sound 2^32 ticks (13.3 h) apart,
+lipsync= +4.77e7 ms, sync_check restarts, ~33 min with the sound lost. Now the correction is counted in half wraps: the
+stepped stream lands back next to the other one at every step and nothing reaches the timeline but the real part of the
+step. A whole-program step of about half (T-530) is undone on each stream as it crosses: both stay together and the
+timeline sees only the small real step. Log: `[PTV-DISCONT] stream N: a half-wrap step (...) — wrap taken by the program
+(+-1 half wraps, nearest the other stream)`.
+
+Keys (kit 9f4afe8, media-v55 `4e9fd1272c9e`): `vt-t537` (sync_hwflip, T056_HW_GAP=3.2 T056_HWF_X=-4.2: the first step
+just under half, as at 03:22) 2.2.4-pre4 FAIL (lip sync -47679144 ms, video PTS hole 47718 s, PIDs dark 2.5-2.9 s) -> PASS
+(lip sync +0/+1 ms); `vt-t537n` (no stall, steps at exactly half) pre4 FAIL (video PTS holes up to 1 s, PCR) -> PASS with no
+timeline event; `vt-t537g` (stall, steps just over half) PASS on both. The 8 T-530 keys PASS.
+
 ## 2.2.4-pre4 — 2.2.4-pre3 + a mosaic slot with a sliding phase keeps its sound in place (T-536)
 
 **T-536 — the sound of a mosaic slot whose phase slides against the house no longer jumps after its pictures.** A slot whose
